@@ -1,0 +1,121 @@
+// North Star v0 Example: Dual-Bus Motor Controller
+// Stress-tests: main() + static spawn, reusable task blueprints, SVD hardware ops,
+// zero-copy circular DMA, ISR priority boost, noyield, explicit types, and return/error/catch.
+
+import chip.stm32g4 as hw;
+
+packed struct CmdFrame {
+    u8    op;
+    u16be setpoint;   // Wire endianness handled natively by type
+    u16be crc;
+}
+
+enum ParseErr { TooShort, BadCrc }
+enum SupEvent { Overcurrent, BadPacket, IdleCheck }
+
+// ── Static OS & Hardware Endpoints (zero heap, wakeup- & multicore-aware) ──
+@dma_safe ping_pong<u8, 64> uart1_dma;
+@dma_safe ping_pong<u8, 64> uart2_dma;
+
+watch<u16>                  motor1_rpm = 0;
+watch<u16>                  motor2_rpm = 0;
+inbox<SupEvent, 8>          sup_inbox;
+
+// ── Hardware Interrupts (compiler enforces noyield + zero raw-global access) ─
+isr EXTI0 {
+    hw.GPIOA.clear_pin(MOTOR_EN);                      // <1 us hardware safe-off
+    sup_inbox.post(Overcurrent, boost: @critical);     // Wakes supervisor at @critical
+}
+
+isr DMA1_CH5 {
+    hw.DMA1.CH5.clear_irq(HALF_TRANSFER | FULL_TRANSFER);
+    uart1_dma.flip();                                  // Zero-copy swap + wakes bus 1 task
+}
+
+isr DMA1_CH6 {
+    hw.DMA1.CH6.clear_irq(HALF_TRANSFER | FULL_TRANSFER);
+    uart2_dma.flip();                                  // Zero-copy swap + wakes bus 2 task
+}
+
+// ── Pure / Yield-Capable Helper Functions ───────────────────────────────────
+u16 parse_setpoint([]u8 buf) error ParseErr {
+    if (buf.len < 5) {
+        error TooShort;
+    }
+    CmdFrame frame = CmdFrame.from_bytes(buf[0..5]) catch {
+        error TooShort;
+    };
+    if (crc16(buf[0..3]) != frame.crc) {
+        error BadCrc;
+    }
+    return frame.setpoint;
+}
+
+// ── Reusable Task Blueprints (do nothing until spawned; 100% static RAM) ────
+task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
+    i32 integral = 0;                                  // Persists across yields in static frame
+
+    every 1ms {                                        // Drift-free periodic deadline
+        u16 target = target_rpm.read();
+        u16 actual = adc_read_rpm(pwm_ch);             // Yields automatically until conversion done
+
+        noyield {                                      // Task-atomic: registers stay hot, no interleave
+            u16 duty = pi_step(target, actual, &integral);
+            hw.TIM1.set_compare(pwm_ch, duty);
+        }
+    }
+}
+
+task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
+    loop {
+        []u8 half = rx_dma.wait_chunk();               // Yields; compiler prevents DMA buffer clash
+
+        u16 rpm = parse_setpoint(half) catch (ParseErr err) {
+            sup_inbox.post(BadPacket);
+            continue;
+        };
+
+        out_rpm.publish(rpm);
+    }
+}
+
+// ── Sequential Entry Point ──────────────────────────────────────────────────
+fn main() {
+    // 1. Explicit sequential hardware setup before tasks or IRQs start:
+    setup_clocks();
+    sys.use_systick(170_000_000);                      // Binds time literals & enables WFI sleep
+    configure_circular_uart_dma(hw.DMA1.CH5, hw.USART1, &uart1_dma);
+    configure_circular_uart_dma(hw.DMA1.CH6, hw.USART2, &uart2_dma);
+
+    // 2. Can run sequential/yielding boot checks before spawning control loops:
+    run_power_on_self_test();
+
+    // 3. Static task instantiation (compiler allocates exact static frames per spawn):
+    spawn motor_control(&motor1_rpm, 1) @critical;
+    spawn motor_control(&motor2_rpm, 2) @critical;
+    spawn fieldbus_listener(&uart1_dma, &motor1_rpm) @normal;
+    spawn fieldbus_listener(&uart2_dma, &motor2_rpm) @normal;
+
+    // 4. `main` continues as the @low-priority supervisor task:
+    set_priority(@low);
+    u32 bad_packets = 0;
+
+    loop {
+        // Sequential wait + fallback `or` (no `select` needed):
+        SupEvent ev = sup_inbox.recv(timeout: 5s) or IdleCheck;
+
+        switch (ev) {
+            Overcurrent => {
+                motor1_rpm.publish(0);
+                motor2_rpm.publish(0);
+                save_fault_record(bad_packets);        // Nested yielding flash write; runs @critical
+            }                                          // Priority restores to @low at end of turn
+            BadPacket => {
+                bad_packets += 1;
+            }
+            IdleCheck => {
+                scrub_flash_crc();                     // Long loop auto-chunks via should_share()
+            }
+        }
+    }
+}

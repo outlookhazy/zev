@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/zev-ast",
+    "crates/zev-parser",
+    "crates/zev-sema",
+    "crates/zev-mir",
+    "crates/zev-codegen-c",
+    "crates/zev-codegen-llvm",
+    "crates/zev-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Charles Galant <cgalant@gmail.com>"]
+license = "Apache-2.0 WITH LLVM-exception"
+repository = "https://github.com/outlookhazy/zev"
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0

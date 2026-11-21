@@ -1,0 +1,11 @@
+[package]
+name = "zev-mir"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coroutine State-Machine & Kernel MIR + Static RAM Packer for the Zev Language-OS"
+
+[dependencies]
+zev-ast = { path = "../zev-ast" }

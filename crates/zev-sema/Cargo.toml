@@ -1,0 +1,14 @@
+[package]
+name = "zev-sema"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Whole-program static verifier and semantic analyzer for the Zev Language-OS"
+
+[dependencies]
+zev-ast = { path = "../zev-ast" }
+
+[dev-dependencies]
+zev-parser = { path = "../zev-parser" }

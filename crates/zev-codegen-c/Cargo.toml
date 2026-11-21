@@ -1,0 +1,15 @@
+[package]
+name = "zev-codegen-c"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Freestanding C99 Emitter & Synthesized Cooperative Kernel for the Zev Language-OS"
+
+[dependencies]
+zev-mir = { path = "../zev-mir" }
+
+[dev-dependencies]
+zev-ast = { path = "../zev-ast" }
+zev-parser = { path = "../zev-parser" }

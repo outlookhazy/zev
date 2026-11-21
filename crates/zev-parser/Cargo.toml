@@ -1,0 +1,11 @@
+[package]
+name = "zev-parser"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lexer and recursive-descent parser for the Zev Language-OS (.zev)"
+
+[dependencies]
+zev-ast = { path = "../zev-ast" }

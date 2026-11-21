@@ -1,0 +1,10 @@
+[package]
+name = "zev-ast"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Abstract Syntax Tree and source span types for the Zev Language-OS compiler"
+
+[dependencies]

@@ -1,0 +1,307 @@
+// Self-Contained End-to-End Deterministic Simulation Demo (`zevc run examples/sim_demo.zev`)
+//
+// Exercises all v0 Language-OS pillars on a scripted host timeline:
+//   1. Sequential phased boot (`main()`) + multi-instance static `spawn` (x2 motor_control, x2 fieldbus_listener)
+//   2. Drift-free `every 1ms` PI control loops with task-atomic `noyield` blocks
+//   3. Zero-copy `@dma_safe ping_pong` UART DMA + `packed struct` `u16be` decoding + `error`/`catch`
+//   4. `EXTI0` overcurrent ISR with `boost: @critical` waking `@low` supervisor at `@critical` & restoring `@low`
+//   5. Disjoint child coroutine frame `union` aliasing (`save_fault_record` vs `scrub_flash_crc`)
+//   6. Tickless idle + `@dma_safe` wake-lock sleep-depth clamping (`Deep` -> `Light` -> `Deep`)
+
+import chip.stm32g4 as hw;
+
+// ── Host Deterministic Simulation Hooks (provided by synthesized C99 runtime) ─
+extern "C" fn syn_sim_enable_trace(bool en);
+extern "C" fn syn_sim_log(u32 tag, u32 a, u32 b);
+extern "C" fn syn_sim_push_uart1_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
+extern "C" fn syn_sim_push_uart2_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
+extern "C" fn syn_sim_fire_isr_EXTI0();
+extern "C" u32 syn_sim_sleep_depth();
+extern "C" fn syn_sim_set_dma_active(u32 active);
+extern "C" fn syn_sim_exit(i32 code);
+
+// ── Wire Protocol & Event Types ─────────────────────────────────────────────
+
+packed struct CmdFrame {
+    u8    op;
+    u16be setpoint;   // Big-endian wire encoding decoded natively
+    u16be crc;
+}
+
+enum ParseErr { TooShort, BadCrc }
+enum SupEvent { Overcurrent, BadPacket, IdleCheck }
+
+// ── Static Zero-Heap OS & Hardware Primitives ───────────────────────────────
+
+@dma_safe ping_pong<u8, 64> uart1_dma;
+@dma_safe ping_pong<u8, 64> uart2_dma;
+
+watch<u16>         motor1_rpm = 0;
+watch<u16>         motor2_rpm = 0;
+watch<u16>         motor1_duty = 0;
+watch<u16>         motor2_duty = 0;
+watch<u32>         diag_telemetry = 0;
+inbox<SupEvent, 8> sup_inbox;
+
+// ── Hardware Interrupt Service Routines (`noyield` + ISR isolation enforced) ─
+
+isr EXTI0 {
+    hw.GPIOA.clear_pin(MOTOR_EN);                      // Immediate <1us hardware safe-off
+    sup_inbox.post(Overcurrent, boost: @critical);     // Elevates supervisor to @critical for 1 turn
+}
+
+isr DMA1_CH5 {
+    hw.DMA1.CH5.clear_irq(HALF_TRANSFER | FULL_TRANSFER);
+    uart1_dma.flip();                                  // Zero-copy buffer swap + wakes UART1 listener
+}
+
+isr DMA1_CH6 {
+    hw.DMA1.CH6.clear_irq(HALF_TRANSFER | FULL_TRANSFER);
+    uart2_dma.flip();                                  // Zero-copy buffer swap + wakes UART2 listener
+}
+
+// ── Pure & Yielding Firmware Helpers ────────────────────────────────────────
+
+fn setup_clocks() {
+    critical {
+        hw.RCC.enable_pll_170mhz();
+    }
+}
+
+fn configure_circular_uart_dma(u32 dma_ch, u32 usart, ping_pong<u8, 64> *rx_ring) {
+    critical {
+        hw.DMA1.bind_circular_rx(dma_ch, usart, rx_ring);
+    }
+}
+
+fn run_power_on_self_test() {
+    u32 vbus_mv = 24000;
+    u32 gate_ok = 1;
+    checkpoint();
+    diag_telemetry.publish(vbus_mv + gate_ok);
+}
+
+u16 crc16([]u8 buf) {
+    u16 s1 = 85;
+    u16 s2 = 170;
+    if (buf.len >= 1) {
+        s1 = (s1 + buf[0]) & 255;
+        s2 = (s2 + s1) & 255;
+    }
+    if (buf.len >= 2) {
+        s1 = (s1 + buf[1]) & 255;
+        s2 = (s2 + s1) & 255;
+    }
+    if (buf.len >= 3) {
+        s1 = (s1 + buf[2]) & 255;
+        s2 = (s2 + s1) & 255;
+    }
+    return (s2 * 256) | s1;
+}
+
+u16 parse_setpoint([]u8 buf) error ParseErr {
+    if (buf.len < 5) {
+        error TooShort;
+    }
+    CmdFrame frame = CmdFrame.from_bytes(buf[0..5]) catch {
+        error TooShort;
+    };
+    if (crc16(buf[0..3]) != frame.crc) {
+        error BadCrc;
+    }
+    return frame.setpoint;
+}
+
+u16 adc_read_rpm(u8 pwm_ch) {
+    u16 ch_bias = pwm_ch;
+    u16 sample = 600 + (ch_bias * 100);
+    checkpoint();
+    return sample + ch_bias;
+}
+
+u16 pi_step(u16 target, u16 actual, i32 *integral) {
+    i32 tgt = target;
+    i32 act = actual;
+    i32 err = tgt - act;
+    i32 next_int = *integral + err;
+    if (next_int > 10000) {
+        next_int = 10000;
+    }
+    if (next_int < -10000) {
+        next_int = -10000;
+    }
+    *integral = next_int;
+
+    i32 out = (err / 2) + (next_int / 16);
+    if (out < 0) {
+        return 0;
+    }
+    if (out > 1000) {
+        return 1000;
+    }
+    u16 duty = out;
+    return duty;
+}
+
+fn save_fault_record(u32 bad_packets) {
+    u32 flash_page = 0x0807_F800;
+    u32 magic = 0xFA01_0000;
+    u32 pkt_cnt = bad_packets;
+    u32 digest = magic + pkt_cnt + 0x5A5A;
+
+    checkpoint();
+
+    u32 record_word = flash_page + digest + pkt_cnt;
+    checkpoint();
+
+    diag_telemetry.publish(record_word);
+}
+
+fn scrub_flash_crc() {
+    u32 sector_addr = 0x0800_0000;
+    u32 end_addr = 0x0800_0400;
+    u32 rolling_crc = 0xFFFF;
+    u32 words_checked = 0;
+
+    loop {
+        if (sector_addr >= end_addr) {
+            break;
+        }
+        rolling_crc = (rolling_crc + sector_addr + words_checked) & 0xFFFF;
+        sector_addr += 256;
+        words_checked += 64;
+        checkpoint();
+    }
+
+    diag_telemetry.publish(rolling_crc + words_checked);
+}
+
+// ── Reusable Parameterized Task Blueprints ──────────────────────────────────
+
+task motor_control(watch<u16> *target_rpm, watch<u16> *out_duty, u8 pwm_ch) {
+    i32 integral = 0;
+
+    every 1ms {
+        u16 target = target_rpm.read();
+        u16 actual = adc_read_rpm(pwm_ch);
+
+        noyield {
+            u16 duty = pi_step(target, actual, &integral);
+            hw.TIM1.set_compare(pwm_ch, duty);
+            out_duty.publish(duty);
+        }
+    }
+}
+
+task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
+    loop {
+        []u8 half = rx_dma.wait_chunk();
+
+        u16 rpm = parse_setpoint(half) catch (ParseErr err) {
+            sup_inbox.post(BadPacket);
+            continue;
+        };
+
+        out_rpm.publish(rpm);
+    }
+}
+
+// ── Deterministic Host Simulation Stimulus Task ─────────────────────────────
+
+task sim_stimulus() {
+    u32 tick = 0;
+
+    every 1ms {
+        tick += 1;
+
+        if (tick == 1) {
+            // Milestone 1: Active @dma_safe ping_pong clamps sleep depth to Light
+            u32 depth_locked = syn_sim_sleep_depth();
+            syn_sim_log(1, depth_locked, 0);
+
+            // Inject valid big-endian u16be frame on UART1: setpoint = 0x0960 (2400 RPM), crc = 0x1EBF
+            syn_sim_push_uart1_frame(1, 9, 96, 30, 191);
+            // Inject valid big-endian u16be frame on UART2: setpoint = 0x0708 (1800 RPM), crc = 0xC265
+            syn_sim_push_uart2_frame(1, 7, 8, 194, 101);
+        }
+
+        if (tick == 4) {
+            // Milestone 2: Verify u16be decoded RPMs & 1ms PI duties
+            u32 r1 = motor1_rpm.read();
+            u32 r2 = motor2_rpm.read();
+            syn_sim_log(2, r1, r2);
+            u32 d1 = motor1_duty.read();
+            u32 d2 = motor2_duty.read();
+            syn_sim_log(3, d1, d2);
+
+            // Milestone 3: Inject corrupted CRC frame on UART1 -> triggers error BadCrc -> catch -> BadPacket
+            syn_sim_push_uart1_frame(1, 11, 184, 222, 173);
+        }
+
+        if (tick == 6) {
+            // Milestone 4: Trigger IdleCheck background flash scrub before fault
+            sup_inbox.post(IdleCheck);
+        }
+
+        if (tick == 9) {
+            // Milestone 5: Fire hardware Overcurrent EXTI0 ISR (boosts @low supervisor to @critical!)
+            syn_sim_fire_isr_EXTI0();
+        }
+
+        if (tick == 11) {
+            // Milestone 6: Verify motors safely zeroed, fault record committed, and release DMA wake-lock
+            u32 r1_after = motor1_rpm.read();
+            u32 r2_after = motor2_rpm.read();
+            syn_sim_log(4, r1_after, r2_after);
+
+            syn_sim_set_dma_active(0);
+        }
+
+        if (tick == 12) {
+            // Milestone 7: Confirm tickless idle entered DEEP sleep after DMA release & exit cleanly
+            u32 depth_unlocked = syn_sim_sleep_depth();
+            syn_sim_log(5, depth_unlocked, diag_telemetry.read());
+
+            syn_sim_exit(0);
+        }
+    }
+}
+
+// ── Sequential Entry Point & @low Supervisor Loop ───────────────────────────
+
+fn main() {
+    syn_sim_enable_trace(true);
+    setup_clocks();
+    sys.use_systick(170_000_000);
+    configure_circular_uart_dma(hw.DMA1.CH5, hw.USART1, &uart1_dma);
+    configure_circular_uart_dma(hw.DMA1.CH6, hw.USART2, &uart2_dma);
+
+    run_power_on_self_test();
+
+    spawn motor_control(&motor1_rpm, &motor1_duty, 1) @critical;
+    spawn motor_control(&motor2_rpm, &motor2_duty, 2) @critical;
+    spawn fieldbus_listener(&uart1_dma, &motor1_rpm) @normal;
+    spawn fieldbus_listener(&uart2_dma, &motor2_rpm) @normal;
+    spawn sim_stimulus() @high;
+
+    set_priority(@low);
+    u32 bad_packets = 0;
+
+    loop {
+        SupEvent ev = sup_inbox.recv(timeout: 5s) or IdleCheck;
+
+        switch (ev) {
+            Overcurrent => {
+                motor1_rpm.publish(0);
+                motor2_rpm.publish(0);
+                save_fault_record(bad_packets);
+            }
+            BadPacket => {
+                bad_packets += 1;
+            }
+            IdleCheck => {
+                scrub_flash_crc();
+            }
+        }
+    }
+}

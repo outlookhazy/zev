@@ -1,0 +1,119 @@
+// Companion support module for examples/motor_controller.zev
+// Implements clock/DMA setup, power-on self-test, yielding ADC readout,
+// task-atomic PI controller + wire checksum, and disjoint yielding flash
+// helpers (`save_fault_record` and `scrub_flash_crc`) whose coroutine frames
+// union-overlap inside `main`'s static supervisor frame.
+
+import chip.stm32g4 as hw;
+
+watch<u32> flash_diag_status = 0;
+
+// ── Hardware Boot & Peripheral Setup (Sequential / Non-Yielding) ────────────
+
+fn setup_clocks() {
+    critical {
+        hw.RCC.enable_pll_170mhz();
+    }
+}
+
+fn configure_circular_uart_dma(u32 dma_ch, u32 usart, ping_pong<u8, 64> *rx_ring) {
+    critical {
+        hw.DMA1.bind_circular_rx(dma_ch, usart, rx_ring);
+    }
+}
+
+fn run_power_on_self_test() {
+    u32 rail_mv = 3300;
+    u32 gate_drv_ok = 1;
+    checkpoint();
+    u32 boot_sig = (rail_mv * 16) + gate_drv_ok;
+    flash_diag_status.publish(boot_sig);
+}
+
+// ── Control-Loop & Fieldbus Helpers ─────────────────────────────────────────
+
+u16 crc16([]u8 buf) {
+    u16 s1 = 85;
+    u16 s2 = 170;
+    if (buf.len >= 1) {
+        s1 = (s1 + buf[0]) & 255;
+        s2 = (s2 + s1) & 255;
+    }
+    if (buf.len >= 2) {
+        s1 = (s1 + buf[1]) & 255;
+        s2 = (s2 + s1) & 255;
+    }
+    if (buf.len >= 3) {
+        s1 = (s1 + buf[2]) & 255;
+        s2 = (s2 + s1) & 255;
+    }
+    return (s2 * 256) | s1;
+}
+
+u16 adc_read_rpm(u8 pwm_ch) {
+    u16 ch_offset = pwm_ch;
+    u16 raw_sample = 1200 + (ch_offset * 50);
+    checkpoint();
+    u16 filtered_rpm = raw_sample + ch_offset;
+    return filtered_rpm;
+}
+
+u16 pi_step(u16 target, u16 actual, i32 *integral) {
+    i32 tgt = target;
+    i32 act = actual;
+    i32 err = tgt - act;
+    i32 next_int = *integral + err;
+    if (next_int > 10000) {
+        next_int = 10000;
+    }
+    if (next_int < -10000) {
+        next_int = -10000;
+    }
+    *integral = next_int;
+
+    i32 out = (err / 2) + (next_int / 16);
+    if (out < 0) {
+        return 0;
+    }
+    if (out > 1000) {
+        return 1000;
+    }
+    u16 duty = out;
+    return duty;
+}
+
+// ── Mutually Exclusive Yielding Supervisor Workflows (Union-Aliased Frames) ─
+
+fn save_fault_record(u32 bad_packets) {
+    u32 flash_page_addr = 0x0807_F800;
+    u32 record_magic = 0xFA01_0000;
+    u32 fault_count = bad_packets;
+    u32 header_sum = record_magic + fault_count + 0x5A5A;
+
+    // Yield while flash page erase completes without stalling @critical loops
+    checkpoint();
+
+    u32 commit_word = flash_page_addr + header_sum + fault_count;
+    checkpoint();
+
+    flash_diag_status.publish(commit_word);
+}
+
+fn scrub_flash_crc() {
+    u32 sector_addr = 0x0800_0000;
+    u32 end_addr = 0x0800_0400;
+    u32 rolling_crc = 0xFFFF;
+    u32 words_checked = 0;
+
+    loop {
+        if (sector_addr >= end_addr) {
+            break;
+        }
+        rolling_crc = (rolling_crc + sector_addr + words_checked) & 0xFFFF;
+        sector_addr += 256;
+        words_checked += 64;
+        checkpoint();
+    }
+
+    flash_diag_status.publish(rolling_crc + words_checked);
+}

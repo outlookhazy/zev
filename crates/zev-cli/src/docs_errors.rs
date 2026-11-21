@@ -1,0 +1,934 @@
+//! Complete structured error explainers (`P0001`..`P0010` and `E0001`..`E0024`) for `zevc doc`.
+
+pub struct ErrorDoc {
+    pub code: &'static str,
+    pub summary: &'static str,
+    pub topic: &'static str,
+    pub why: &'static str,
+    pub bad_zev: &'static str,
+    pub good_zev: &'static str,
+}
+
+pub const ERROR_DOCS: &[ErrorDoc] = &[
+    // ── Parser Foreign-Idiom Traps (P0001..P0010) ───────────────────────────
+    ErrorDoc {
+        code: "P0001",
+        summary: "Foreign `let` / `var` / `mut` variable binding instead of explicit C-style `Type name`",
+        topic: "syntax",
+        why: "In bare-metal firmware, every local variable lives either in CPU registers or inside a compile-time-sized static coroutine frame. Zev requires explicit C-style bit-width types (`u8`, `u16`, `u32`, `i32`, `bool`, `[]u8`) at every declaration so overflow boundaries and static SRAM costs are never hidden behind type inference.",
+        bad_zev: "\
+fn main() {
+    let mut rpm: u16 = 1800;
+    var duty = 500;
+}",
+        good_zev: "\
+fn main() {
+    u16 rpm = 1800;
+    u16 duty = rpm / 4;
+    if (duty > 0) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0002",
+        summary: "Rust/Zig/Go `name: Type` parameter or `-> RetType` function return syntax",
+        topic: "syntax",
+        why: "Zev uses C-style return-first signatures (`RetType name(Type param)`) for value-returning functions and `fn name(Type param)` strictly for `void`-returning functions. Function pointer types still write `fn(T1) -> Ret`, but function definitions never use `:` or `->`.",
+        bad_zev: "\
+fn clamp_duty(val: u16, limit: u16) -> u16 {
+    if (val > limit) { return limit; }
+    return val;
+}",
+        good_zev: "\
+u16 clamp_duty(u16 val, u16 limit) {
+    if (val > limit) {
+        return limit;
+    }
+    return val;
+}
+
+fn main() {
+    u16 d = clamp_duty(1200, 1000);
+    if (d == 1000) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0003",
+        summary: "`async` or `.await` used in a call-graph-inferred cooperative language",
+        topic: "yielding",
+        why: "Zev eliminates function coloring: any function that calls a blocking primitive (`wait_chunk()`, `recv()`, `wait()`, `delay()`, `checkpoint()`) yields transparently on the single hardware stack, and its live locals pack into the caller's static coroutine frame automatically. Instead of marking async paths, Zev marks atomic paths (`noyield { ... }`, `critical { ... }`, `isr`).",
+        bad_zev: "\
+async fn read_sensor() -> u16 {
+    checkpoint().await;
+    return 400;
+}",
+        good_zev: "\
+u16 read_sensor() {
+    u16 base = 400;
+    checkpoint();
+    return base + 12;
+}
+
+fn main() {
+    u16 v = read_sensor();
+    if (v > 0) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0004",
+        summary: "Go/Rust `select` block used instead of sequential Active-Object `inbox` + `switch`",
+        topic: "primitives",
+        why: "Multi-channel `select` requires dynamic wait-list registration across N queues per task turn. Zev keeps per-task scheduler state strictly O(1) (`single wait_obj + single deadline`): funnel events from ISRs and peer tasks into one typed `inbox<Ev, N>`, wait with `recv(timeout: ...) or Fallback`, and branch with `switch (ev)`.",
+        bad_zev: "\
+fn main() {
+    select {
+        ev = fault_ch.recv() => { handle(ev); }
+        _ = after(1s) => { heartbeat(); }
+    }
+}",
+        good_zev: "\
+enum SupEv { Fault, Heartbeat }
+inbox<SupEv, 8> sup_q;
+watch<u32> beats = 0;
+
+fn main() {
+    set_priority(@low);
+    loop {
+        SupEv ev = sup_q.recv(timeout: 1s) or Heartbeat;
+        switch (ev) {
+            Fault => { return; }
+            Heartbeat => {
+                beats.publish(beats.read() + 1);
+                return;
+            }
+        }
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0005",
+        summary: "`match` keyword used instead of Zev's `switch (expr) { Variant => { ... } }`",
+        topic: "syntax",
+        why: "Zev uses C-familiar `switch (scrutinee)` paired with clean non-fallthrough `Variant => { ... }` fat-arrow arms (no accidental C fallthrough bugs and no `match` keyword).",
+        bad_zev: "\
+enum Mode { Idle, Active }
+fn main() {
+    Mode m = Active;
+    match m {
+        Idle => {}
+        Active => {}
+    }
+}",
+        good_zev: "\
+enum Mode { Idle, Active }
+
+fn main() {
+    Mode m = Active;
+    switch (m) {
+        Idle => { return; }
+        Active => { return; }
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0006",
+        summary: "Zig-style `catch |err|` pipe capture instead of `catch (ErrType err)`",
+        topic: "errors",
+        why: "Zev keeps variable declarations uniform everywhere—including `catch` clauses—using explicit parenthesized `(ErrType err)` or `(ErrType err, ValType partial)` bindings.",
+        bad_zev: "\
+enum ParseErr { BadCrc }
+u16 decode([]u8 b) error ParseErr { error BadCrc; }
+fn main() {
+    []u8 empty;
+    u16 v = decode(empty) catch |err| { return; };
+}",
+        good_zev: "\
+enum ParseErr { BadCrc }
+
+u16 decode(u8 b) error ParseErr {
+    if (b == 0) {
+        error BadCrc;
+    }
+    return b;
+}
+
+fn main() {
+    u16 v = decode(0) catch (ParseErr err) {
+        return;
+    };
+    if (v > 0) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0007",
+        summary: "Zig/Rust `!Type`, `try`, or `return error.X` / `Err(...)` instead of dual-exit `error`",
+        topic: "errors",
+        why: "Zev models normal completion (`return val;` -> `r1 == 0`) and failure (`error [Reason [, partial]];` -> `r1 != 0`) as distinct dual exits returned in two CPU registers `(r0, r1)`. Declare fallibility after the parameter list (`u16 f() error ErrEnum`), fail with `error Variant;`, and handle with `catch` or `or`.",
+        bad_zev: "\
+enum IoErr { Timeout }
+!u16 read_reg() {
+    return error.Timeout;
+}
+fn main() {
+    u16 x = try read_reg();
+}",
+        good_zev: "\
+enum IoErr { Timeout }
+
+u16 read_reg(bool ok) error IoErr {
+    if (!ok) {
+        error Timeout;
+    }
+    return 250;
+}
+
+fn main() {
+    u16 x = read_reg(false) or 0;
+    if (x == 0) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0008",
+        summary: "`for` loop used instead of `while (cond)`, `loop`, or `every <duration>`",
+        topic: "syntax",
+        why: "Zev v0 provides three explicit loop constructs mapped directly to scheduler semantics: `while (cond) { ... }` (bounded condition loop), `loop { ... }` (unbounded cooperative loop with `should_share()` chunking), and `every 1ms { ... }` (drift-free periodic deadline loop).",
+        bad_zev: "\
+fn main() {
+    for (u32 i = 0; i < 4; i += 1) {
+        checkpoint();
+    }
+}",
+        good_zev: "\
+fn main() {
+    u32 i = 0;
+    while (i < 4) {
+        i += 1;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0009",
+        summary: "Rust `'a` lifetime annotation or `&mut` reference used instead of `*T` / `&x` / `[]T`",
+        topic: "dma",
+        why: "Zev achieves memory and DMA lease safety with zero `'a` lifetime syntax: `zev-sema` infers lexical scope depth and `wait_chunk()` lease provenance across pointers `*T`, slices `[]T`, and wrapper structs automatically.",
+        bad_zev: "\
+struct Reader<'a> {
+    buf: &'a [u8],
+}
+fn step(acc: &mut i32) { *acc += 1; }",
+        good_zev: "\
+struct ByteReader {
+    []u8  buf;
+    usize pos;
+}
+
+fn step(i32 *acc) {
+    *acc += 1;
+}
+
+fn main() {
+    i32 x = 0;
+    step(&x);
+}",
+    },
+    ErrorDoc {
+        code: "P0010",
+        summary: "`static` variable or `pub` visibility modifier used instead of Zev task frames / primitives",
+        topic: "primitives",
+        why: "Zev has no `pub` visibility keyword in v0 and forbids `static` mutable variables: persistent per-task state is simply declared as a normal local variable at the top of a `task` (automatically hoisted into that instance's static coroutine frame), immutable constants use `const`, and shared state uses `watch<T>` or `inbox<T, N>`.",
+        bad_zev: "\
+pub static u32 counter = 0;
+pub task blink() {
+    static u32 ticks = 0;
+    every 10ms { ticks += 1; }
+}",
+        good_zev: "\
+const u32 LIMIT = 100;
+watch<u32> counter = 0;
+
+task blink() {
+    u32 ticks = 0;
+    every 10ms {
+        if (ticks < LIMIT) {
+            ticks += 1;
+            counter.publish(ticks);
+        }
+    }
+}
+
+fn main() {
+    spawn blink() @normal;
+}",
+    },
+
+    // ── Semantic & Static-Verifier Diagnostics (E0001..E0024) ───────────────
+    ErrorDoc {
+        code: "E0001",
+        summary: "Illegal raw mutable global variable declared at top level",
+        topic: "primitives",
+        why: "Raw mutable globals create data races between hardware ISRs, cooperative tasks, and symmetric multicore targets. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `chan<T, N>`, `signal`, `ping_pong<T, N>`, `lease<T, N>`).",
+        bad_zev: "\
+u32 latest_rpm = 0;
+
+fn main() {
+    latest_rpm = 1500;
+}",
+        good_zev: "\
+const u16 MAX_RPM = 3000;
+watch<u16> latest_rpm = 0;
+
+fn main() {
+    latest_rpm.publish(MAX_RPM);
+}",
+    },
+    ErrorDoc {
+        code: "E0002",
+        summary: "Task, ISR, or function reads/writes a raw mutable global (isolation violation)",
+        topic: "primitives",
+        why: "ISRs can preempt any task between instructions unless masked, and tasks run independently across turns/cores. Replacing raw shared globals with `watch<T>` (latest value) or `inbox<Ev, N>` (event queue with optional `boost: @critical`) makes cross-context dataflow atomic and wakeup-aware.",
+        bad_zev: "\
+bool overcurrent_latched = false;
+
+isr EXTI0 {
+    overcurrent_latched = true;
+}
+fn main() {}",
+        good_zev: "\
+enum FaultEv { Overcurrent }
+inbox<FaultEv, 4> fault_inbox;
+
+isr EXTI0 {
+    fault_inbox.post(Overcurrent, boost: @critical);
+}
+
+fn main() {
+    FaultEv ev = fault_inbox.recv(timeout: 10ms) or Overcurrent;
+    switch (ev) {
+        Overcurrent => { return; }
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0003",
+        summary: "Yielding call, `checkpoint()`, or auto-yield `loop` inside `noyield { ... }`",
+        topic: "yielding",
+        why: "`noyield { ... }` guarantees task-atomicity: no other cooperative task can interleave mid-update, and transient locals stay in hot CPU registers instead of being hoisted into the static coroutine frame. Move yielding I/O outside `noyield`, and pass the fetched value in.",
+        bad_zev: "\
+u16 adc_sample() {
+    checkpoint();
+    return 900;
+}
+fn main() {
+    noyield {
+        u16 s = adc_sample();
+    }
+}",
+        good_zev: "\
+u16 adc_sample() {
+    checkpoint();
+    return 900;
+}
+
+u16 compute_duty(u16 sample) {
+    return sample / 2;
+}
+
+fn main() {
+    u16 s = adc_sample();
+    noyield {
+        u16 duty = compute_duty(s);
+        if (duty > 0) {
+            return;
+        }
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0004",
+        summary: "Yielding call or `checkpoint()` inside hardware-IRQ-masked `critical { ... }`",
+        topic: "yielding",
+        why: "`critical { ... }` masks hardware interrupts (`cpsid i` / `csrci mstatus, 8`). Yielding to the scheduler while interrupts are masked would either deadlock waiting for an IRQ or corrupt interrupt-mask state across tasks.",
+        bad_zev: "\
+import chip.stm32g4 as hw;
+fn main() {
+    critical {
+        hw.RCC.enable_pll_170mhz();
+        delay(1ms);
+    }
+}",
+        good_zev: "\
+import chip.stm32g4 as hw;
+
+fn main() {
+    critical {
+        hw.RCC.enable_pll_170mhz();
+    }
+    delay(1ms);
+}",
+    },
+    ErrorDoc {
+        code: "E0005",
+        summary: "Yielding call, `checkpoint()`, or auto-yield `loop` inside an `isr` handler",
+        topic: "yielding",
+        why: "Hardware ISRs run on the interrupt context preempting the active task on the shared hardware stack; an ISR must execute in microseconds and return immediately. Perform minimal hardware safe-off in the `isr`, then wake a task non-blockingly with `inbox.post(Ev, boost: @critical)` or `signal.notify()`.",
+        bad_zev: "\
+fn write_flash_log() {
+    checkpoint();
+}
+isr EXTI0 {
+    write_flash_log();
+}
+fn main() {}",
+        good_zev: "\
+enum SupEv { Fault, Idle }
+inbox<SupEv, 4> sup_inbox;
+
+fn write_flash_log() {
+    checkpoint();
+}
+
+isr EXTI0 {
+    sup_inbox.post(Fault, boost: @critical);
+}
+
+fn main() {
+    SupEv ev = sup_inbox.recv(timeout: 5ms) or Idle;
+    switch (ev) {
+        Fault => { write_flash_log(); }
+        Idle => {}
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0006",
+        summary: "Passing a yielding function as a callback pointer to an `extern \"C\"` function",
+        topic: "yielding",
+        why: "Zev tasks share a single hardware stack. If C code invokes a Zev callback while C stack frames are active on the stack, a stackless coroutine yield would unwind right through the active C frames. Callbacks passed to C must be strictly non-yielding.",
+        bad_zev: "\
+extern \"C\" fn register_hook(fn() -> void cb);
+fn bad_hook() {
+    checkpoint();
+}
+fn main() {
+    register_hook(bad_hook);
+}",
+        good_zev: "\
+extern \"C\" fn register_hook(fn() -> void cb);
+signal hook_fired;
+
+fn fast_nonyielding_hook() {
+    hook_fired.notify();
+}
+
+fn main() {
+    register_hook(fast_nonyielding_hook);
+}",
+    },
+    ErrorDoc {
+        code: "E0007",
+        summary: "Unbounded `loop { ... }` inside `critical { ... }`",
+        topic: "yielding",
+        why: "Hardware interrupts are masked inside `critical { ... }`, so execution time must be strictly bounded to protect real-time IRQ latency. Use a bounded `while (retries < N)` condition if polling a short hardware status bit, or move loops outside `critical`.",
+        bad_zev: "\
+fn main() {
+    critical {
+        loop {
+            break;
+        }
+    }
+}",
+        good_zev: "\
+fn main() {
+    critical {
+        u32 spins = 0;
+        while (spins < 8) {
+            spins += 1;
+        }
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0008",
+        summary: "Pointer, slice, or wrapper struct escapes to an outer lexical scope (`dest_depth < origin_depth`)",
+        topic: "dma",
+        why: "Without a garbage collector or `'a` lifetime annotations, Zev enforces stack and DMA safety by tracking origin lexical depth (`static = 0`, `fn/task = 1`, nested `{ ... } = 2..N`). A reference or DMA slice created in an inner scope cannot be assigned into a variable declared in a longer-lived outer scope.",
+        bad_zev: "\
+@dma_safe ping_pong<u8, 64> rx_dma;
+task listener() {
+    []u8 saved = rx_dma.wait_chunk();
+    {
+        []u8 inner = rx_dma.wait_chunk();
+        saved = inner;
+    }
+}
+fn main() { spawn listener() @normal; }",
+        good_zev: "\
+struct ByteReader {
+    []u8  buf;
+    usize pos;
+}
+
+u8 peek_first(ByteReader r) {
+    if (r.buf.len == 0) {
+        return 0;
+    }
+    return r.buf[r.pos];
+}
+
+@dma_safe ping_pong<u8, 64> rx_dma;
+watch<u8> last_hdr = 0;
+
+task listener() {
+    loop {
+        []u8 half = rx_dma.wait_chunk();
+        ByteReader reader = ByteReader{ buf: half, pos: 0 };
+        last_hdr.publish(peek_first(reader));
+    }
+}
+
+fn main() {
+    spawn listener() @normal;
+}",
+    },
+    ErrorDoc {
+        code: "E0009",
+        summary: "Returning a pointer, slice, or wrapper backed by a callee-local variable or DMA lease",
+        topic: "dma",
+        why: "Returning `&local` or a local-leased `wait_chunk()` slice upward out of a function would leave the caller holding a dangling pointer to a destroyed stack frame or unguarded DMA buffer. Return value types (scalars/structs) upward, or pass slices downward into helpers.",
+        bad_zev: "\
+*u32 bad_ptr() {
+    u32 tmp = 42;
+    return &tmp;
+}
+fn main() {}",
+        good_zev: "\
+[]u8 trim_header([]u8 packet) {
+    if (packet.len < 2) {
+        return packet;
+    }
+    return packet[2..packet.len];
+}
+
+@dma_safe ping_pong<u8, 32> rx_dma;
+watch<usize> payload_len = 0;
+
+task worker() {
+    loop {
+        []u8 raw = rx_dma.wait_chunk();
+        []u8 body = trim_header(raw);
+        payload_len.publish(body.len);
+    }
+}
+
+fn main() {
+    spawn worker() @normal;
+}",
+    },
+    ErrorDoc {
+        code: "E0010",
+        summary: "Passing a non-static pointer or slice into `spawn`",
+        topic: "dma",
+        why: "Spawned tasks outlive the initial boot setup phase of `main()`. Task endpoint parameters must point to top-level static OS primitives (e.g. `&motor1_rpm`, `&uart1_dma`), never to transient local variables inside `main()`.",
+        bad_zev: "\
+task worker(u32 *cfg) {
+    every 10ms {
+        if (*cfg > 0) {}
+    }
+}
+fn main() {
+    u32 local_cfg = 10;
+    spawn worker(&local_cfg) @normal;
+}",
+        good_zev: "\
+watch<u32> shared_cfg = 10;
+
+task worker(watch<u32> *cfg) {
+    every 10ms {
+        u32 v = cfg.read();
+        if (v > 0) {}
+    }
+}
+
+fn main() {
+    spawn worker(&shared_cfg) @normal;
+}",
+    },
+    ErrorDoc {
+        code: "E0011",
+        summary: "Stale DMA lease read after a subsequent `wait_chunk()` swap",
+        topic: "dma",
+        why: "`ping_pong<T, N>` double-buffers zero-copy DMA: while the CPU reads half A, DMA hardware overwrites half B. Calling `rx_dma.wait_chunk()` a second time swaps ownership so DMA can overwrite half A—making any slice, sub-slice, or wrapper struct derived from the first `wait_chunk()` stale. Copy out any scalar/struct fields you need before calling `wait_chunk()` again.",
+        bad_zev: "\
+@dma_safe ping_pong<u8, 64> rx_dma;
+task bad_reader() {
+    []u8 first = rx_dma.wait_chunk();
+    []u8 second = rx_dma.wait_chunk();
+    u8 sum = first[0] + second[0];
+}
+fn main() { spawn bad_reader() @normal; }",
+        good_zev: "\
+@dma_safe ping_pong<u8, 64> rx_dma;
+watch<u8> combined = 0;
+
+task good_reader() {
+    loop {
+        []u8 first = rx_dma.wait_chunk();
+        u8 b0 = first[0];
+        []u8 second = rx_dma.wait_chunk();
+        u8 b1 = second[0];
+        combined.publish(b0 + b1);
+    }
+}
+
+fn main() {
+    spawn good_reader() @normal;
+}",
+    },
+    ErrorDoc {
+        code: "E0012",
+        summary: "Recursive call cycle across a yielding path",
+        topic: "yielding",
+        why: "Zev compiles every task and yielding function into a fixed-size static coroutine frame at compile time with zero heap and zero per-task stacks. A recursive yielding cycle (`a -> b -> a`) would require unbounded coroutine frame nesting. Rewrite yielding recursion as an iterative `while` or `loop`.",
+        bad_zev: "\
+fn step_a(u32 n) {
+    checkpoint();
+    if (n > 0) { step_b(n - 1); }
+}
+fn step_b(u32 n) {
+    step_a(n);
+}
+fn main() { step_a(3); }",
+        good_zev: "\
+fn step_iterative(u32 count) {
+    u32 rem = count;
+    while (rem > 0) {
+        checkpoint();
+        rem -= 1;
+    }
+}
+
+fn main() {
+    step_iterative(3);
+}",
+    },
+    ErrorDoc {
+        code: "E0013",
+        summary: "Duration literal is zero, sub-tick (truncates to 0), or not an exact tick multiple",
+        topic: "tasks",
+        why: "The cooperative scheduler's default tick period is `1ms` (`1000us`). Writing `every 500us` on a `1ms` tick would silently truncate to `0` ticks or drift by 50%. Use `>= 1ms` multiples of the tick period (or sub-millisecond hardware timers/ISRs for microsecond waveforms).",
+        bad_zev: "\
+task fast_poll() {
+    every 500us {
+    }
+}
+fn main() { spawn fast_poll() @high; }",
+        good_zev: "\
+watch<u32> samples = 0;
+
+task fast_poll() {
+    u32 cnt = 0;
+    every 1ms {
+        cnt += 1;
+        samples.publish(cnt);
+    }
+}
+
+fn main() {
+    spawn fast_poll() @high;
+}",
+    },
+    ErrorDoc {
+        code: "E0014",
+        summary: "`return` statement missing a value or returning wrong type for signature",
+        topic: "errors",
+        why: "Value-returning functions (`u16 foo()`) must return an expression assignable to their declared return type on normal exit paths, whereas `fn name()` (`void`), `task`, and `isr` items use bare `return;` without a value.",
+        bad_zev: "\
+u16 get_rpm() {
+    return;
+}
+fn main() {}",
+        good_zev: "\
+u16 get_rpm() {
+    return 1500;
+}
+
+fn main() {
+    u16 r = get_rpm();
+    if (r == 1500) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0015",
+        summary: "`error` exit statement does not match function's `error` / `error ErrType` signature",
+        topic: "errors",
+        why: "Zev supports three exact `error` exit forms matched to the function header:\n  1. Untyped `u16 f() error` -> exit with bare `error;` (or `error, partial_val;`).\n  2. Typed `u16 f() error MyErr` -> exit with `error Variant;`.\n  3. Typed + partial progress `usize f() error MyErr` -> exit with `error Variant, partial_val;`.\nFunctions without `error` in their signature cannot use the `error` statement.",
+        bad_zev: "\
+enum ParseErr { BadCrc }
+u16 check_frame() {
+    error BadCrc;
+}
+fn main() {}",
+        good_zev: "\
+enum ParseErr { TooShort, BadCrc }
+
+u16 check_frame(u8 len, bool crc_ok) error ParseErr {
+    if (len < 5) {
+        error TooShort;
+    }
+    if (!crc_ok) {
+        error BadCrc;
+    }
+    return 1800;
+}
+
+fn main() {
+    u16 rpm = check_frame(5, true) or 0;
+    if (rpm > 0) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0016",
+        summary: "Fallible call or timeout wait is not handled with `catch` or `or`",
+        topic: "errors",
+        why: "Ignoring hardware or protocol errors silently is a classic source of embedded field failures. Every call to an `error`-returning function—or primitive wait with `timeout: ...`—must explicitly handle failure with postfix `or <fallback>` or `catch (...) { ... }`.",
+        bad_zev: "\
+enum BusErr { Nack }
+u8 i2c_read() error BusErr {
+    error Nack;
+}
+fn main() {
+    u8 val = i2c_read();
+}",
+        good_zev: "\
+enum BusErr { Nack }
+
+u8 i2c_read(bool present) error BusErr {
+    if (!present) {
+        error Nack;
+    }
+    return 0x42;
+}
+
+fn main() {
+    u8 v1 = i2c_read(false) or 0;
+    u8 v2 = i2c_read(true) catch (BusErr err) {
+        return;
+    };
+    if (v1 + v2 > 0) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0017",
+        summary: "Invalid `catch` parameter count/types or non-diverging `catch` block",
+        topic: "errors",
+        why: "A `catch` clause binds `(ErrType err)` (or `(ErrType err, RetType partial)` when inspecting partial progress) for typed errors, and takes no typed error binding for untyped `error` functions. When assigning the result (`u16 x = f() catch ...;`), the `catch` block must either diverge (`return;`, `continue;`, `break;`, `error ...;`) or evaluate to a replacement value.",
+        bad_zev: "\
+enum ParseErr { BadCrc }
+u16 parse(u8 b) error ParseErr {
+    if (b == 0) { error BadCrc; }
+    return b;
+}
+fn main() {
+    u16 x = parse(0) catch (u32 wrong_ty) {
+    };
+}",
+        good_zev: "\
+struct DecodedPacket {
+    u8  cmd;
+    u16 val;
+}
+
+enum IoErr { Timeout }
+
+DecodedPacket read_pkt(u32 limit) error IoErr {
+    if (limit > 4) {
+        error Timeout, DecodedPacket{ cmd: 9, val: 4 };
+    }
+    return DecodedPacket{ cmd: 1, val: limit as u16 };
+}
+
+fn main() {
+    u32 recoveries = 0;
+    DecodedPacket pkt = read_pkt(8) catch (IoErr err, DecodedPacket partial) {
+        recoveries += 1;
+        DecodedPacket{ cmd: partial.cmd, val: partial.val + 100 }
+    };
+    if (recoveries == 1 && pkt.val == 104) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0018",
+        summary: "Invalid `or` fallback expression (infallible LHS or mismatched fallback type)",
+        topic: "errors",
+        why: "Postfix `expr or fallback` unwraps a fallible expression (`error` function call or `recv(timeout: ...)`), substituting `fallback` of the exact same value type when `expr` fails. Do not attach `or` to an infallible call (like `inbox.recv()` without `timeout:`).",
+        bad_zev: "\
+enum Ev { Ping, Idle }
+inbox<Ev, 4> q;
+fn main() {
+    Ev e = q.recv() or Idle;
+}",
+        good_zev: "\
+enum Ev { Ping, Idle }
+inbox<Ev, 4> q;
+
+fn main() {
+    Ev e = q.recv(timeout: 10ms) or Idle;
+    switch (e) {
+        Ping => { return; }
+        Idle => { return; }
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0019",
+        summary: "Type mismatch in variable initialization, assignment, operator, or call argument",
+        topic: "syntax",
+        why: "Zev enforces strict width and signedness safety across assignments, operators, and function calls. Use matching integer/signed types or an explicit `expr as TargetType` scalar cast when narrowing or crossing signed/unsigned boundaries.",
+        bad_zev: "\
+fn main() {
+    u16 rpm = true;
+}",
+        good_zev: "\
+fn main() {
+    u32 raw = 1800;
+    u16 rpm = raw as u16;
+    if (rpm == 1800) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0020",
+        summary: "Undefined identifier, type, field, or invalid OS primitive method name",
+        topic: "syntax",
+        why: "Every variable, function, enum variant, struct field, and OS primitive method is resolved statically. Check primitive method names carefully: `watch` uses `.read()` / `.publish(v)`, `inbox` uses `.post(v [, boost: @prio])` / `.recv([timeout: dur])`, `chan` uses `.send(v)` / `.recv()`, `signal` uses `.notify()` / `.wait()`, and `ping_pong` uses `.wait_chunk()` / `.flip()`.",
+        bad_zev: "\
+watch<u16> rpm = 0;
+fn main() {
+    rpm.push(1200);
+}",
+        good_zev: "\
+watch<u16> rpm = 0;
+
+fn main() {
+    rpm.publish(1200);
+    u16 cur = rpm.read();
+    if (cur == 1200) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0021",
+        summary: "Duplicate definition of a top-level item or same-scope local variable",
+        topic: "syntax",
+        why: "Each top-level declaration (`fn`, `task`, `isr`, `struct`, `enum`, `const`, OS primitive) and each local variable within the same lexical block must have a unique name.",
+        bad_zev: "\
+fn main() {
+    u16 duty = 100;
+    u16 duty = 200;
+}",
+        good_zev: "\
+fn main() {
+    u16 duty = 100;
+    duty = 200;
+    if (duty == 200) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0022",
+        summary: "Attempt to mutate an immutable `const` or non-lvalue expression",
+        topic: "syntax",
+        why: "`const` items live in read-only flash (`.rodata`) and cannot be modified at runtime. Use a local variable for task-private mutable state or `watch<T>` for shared single-writer state.",
+        bad_zev: "\
+const u32 MAX_DUTY = 1000;
+fn main() {
+    MAX_DUTY = 500;
+}",
+        good_zev: "\
+const u32 MAX_DUTY = 1000;
+
+fn main() {
+    u32 current_duty = MAX_DUTY / 2;
+    if (current_duty == 500) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "E0023",
+        summary: "Invalid control flow (`break`/`continue` outside loop, or `spawn`/`set_priority` outside `main`)",
+        topic: "tasks",
+        why: "To guarantee 100% compile-time static task slot allocation, `spawn` and `set_priority` are only permitted inside `fn main()` (never dynamically inside loops or helper tasks), and `break`/`continue` must appear inside `loop`, `while`, or `every`.",
+        bad_zev: "\
+task worker() {}
+task spawner() {
+    spawn worker() @normal;
+}
+fn main() { spawn spawner() @normal; }",
+        good_zev: "\
+watch<u32> ticks = 0;
+
+task worker() {
+    u32 n = 0;
+    every 5ms {
+        n += 1;
+        ticks.publish(n);
+    }
+}
+
+fn main() {
+    spawn worker() @normal;
+    set_priority(@low);
+}",
+    },
+    ErrorDoc {
+        code: "E0024",
+        summary: "Invalid type layout or operation (e.g. pointer/slice in `packed struct` or `void` variable)",
+        topic: "syntax",
+        why: "`packed struct` represents wire-exact protocol frames decoded via `Type.from_bytes(slice)`, so all fields must be fixed-width integer/endian scalars (`u8`, `u16be`, `u32le`, etc.—never pointers or fat slices). Use a normal `struct` for in-memory slice wrappers like `ByteReader`.",
+        bad_zev: "\
+packed struct BadWire {
+    u8   op;
+    []u8 payload;
+}
+fn main() {}",
+        good_zev: "\
+packed struct WireHdr {
+    u8    op;
+    u16be length;
+    u16be crc;
+}
+
+struct PacketView {
+    WireHdr hdr;
+    []u8    payload;
+}
+
+fn main() {
+    WireHdr h = WireHdr{ op: 1, length: 4, crc: 0x1234 };
+    if (h.op == 1) {
+        return;
+    }
+}",
+    },
+];

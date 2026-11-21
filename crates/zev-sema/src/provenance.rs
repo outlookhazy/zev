@@ -1,0 +1,281 @@
+//! Lexical scope-depth, local-reference, DMA lease generation, and C-callback provenance tracking.
+//!
+//! Enforces memory and DMA buffer safety with zero `'a` lifetime annotations:
+//! - Scope depths: `0 = static`, `1 = fn/task body`, `2..N = nested blocks`.
+//! - DMA leases (`ping_pong.wait_chunk()` / `lease.wait_chunk()`): tied to a canonical endpoint key
+//!   and monotonic generation counter; invalidated on any subsequent `wait_chunk()` on the same source.
+
+use std::collections::{BTreeMap, BTreeSet};
+use zev_ast::Span;
+
+/// A single active DMA buffer lease token produced by `x.wait_chunk()`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LeaseToken {
+    /// Canonical DMA endpoint identifier (e.g. `"uart1_dma"` or param `"rx_dma"`).
+    pub source: String,
+    /// Generation number of `source` at the moment this lease was acquired.
+    pub generation: u64,
+    /// Source span of the `wait_chunk()` call that produced this lease.
+    pub acquired_at: Span,
+}
+
+impl PartialOrd for LeaseToken {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for LeaseToken {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (
+            &self.source,
+            self.generation,
+            self.acquired_at.start,
+            self.acquired_at.end,
+        )
+            .cmp(&(
+                &other.source,
+                other.generation,
+                other.acquired_at.start,
+                other.acquired_at.end,
+            ))
+    }
+}
+
+/// Abstract provenance carried by expressions and variables.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Provenance {
+    /// Maximum lexical scope depth of any referenced data (`0` = static/pure value,
+    /// `1` = fn/task body or parameter, `2..N` = nested blocks).
+    pub origin_depth: u32,
+    /// Depth of the memory location pointed to when dereferencing `*p = val`
+    /// (`Some(0)` for static globals, `Some(d)` for `&local` at depth `d`, `None` for non-pointers).
+    pub pointee_depth: Option<u32>,
+    /// True if `pointee` is a caller-owned location (pointer parameter) that local/leased refs cannot escape into.
+    pub pointee_is_caller_or_static: bool,
+    /// Names of current-function local variables (or local DMA leases) referenced by this value.
+    pub local_origins: BTreeSet<String>,
+    /// Indices of current-function parameters referenced by this value (for interprocedural return summaries).
+    pub param_origins: BTreeSet<usize>,
+    /// Active DMA buffer leases referenced by this value (directly or via wrapper struct fields).
+    pub leases: BTreeSet<LeaseToken>,
+    /// Declared function names referenced as function pointers (directly or inside structs).
+    pub fn_callbacks: BTreeSet<String>,
+}
+
+impl Provenance {
+    /// Pure value / static data provenance (`origin_depth = 0`, no locals or leases).
+    pub fn pure_static() -> Self {
+        Self::default()
+    }
+
+    /// Provenance for taking `&global_item` (`origin_depth = 0`, points to static depth `0`).
+    pub fn addr_of_static() -> Self {
+        Self {
+            origin_depth: 0,
+            pointee_depth: Some(0),
+            pointee_is_caller_or_static: true,
+            ..Self::default()
+        }
+    }
+
+    /// Provenance for a function/task parameter of reference-bearing type at parameter index `idx`.
+    pub fn for_param(idx: usize, is_ptr: bool, target_prim: Option<String>) -> Self {
+        let mut p = Self {
+            origin_depth: 1,
+            pointee_depth: if is_ptr { Some(0) } else { None },
+            pointee_is_caller_or_static: is_ptr,
+            ..Self::default()
+        };
+        p.param_origins.insert(idx);
+        let _ = target_prim;
+        p
+    }
+
+    /// Provenance for taking `&local_var` or slicing a local array declared at `decl_depth`.
+    pub fn addr_of_local(name: impl Into<String>, decl_depth: u32) -> Self {
+        let mut local_origins = BTreeSet::new();
+        local_origins.insert(name.into());
+        Self {
+            origin_depth: decl_depth,
+            pointee_depth: Some(decl_depth),
+            pointee_is_caller_or_static: false,
+            local_origins,
+            ..Self::default()
+        }
+    }
+
+    /// Provenance for a DMA slice newly acquired via `source.wait_chunk()` at `scope_depth`.
+    pub fn dma_lease(source: String, generation: u64, scope_depth: u32, span: Span) -> Self {
+        let mut leases = BTreeSet::new();
+        leases.insert(LeaseToken {
+            source: source.clone(),
+            generation,
+            acquired_at: span,
+        });
+        let mut local_origins = BTreeSet::new();
+        local_origins.insert(format!("<dma lease {}>", source));
+        Self {
+            origin_depth: scope_depth,
+            pointee_depth: Some(scope_depth),
+            pointee_is_caller_or_static: false,
+            local_origins,
+            param_origins: BTreeSet::new(),
+            leases,
+            fn_callbacks: BTreeSet::new(),
+        }
+    }
+
+    /// Provenance for a function identifier used as a callback value.
+    pub fn fn_callback(fn_name: impl Into<String>) -> Self {
+        let mut fn_callbacks = BTreeSet::new();
+        fn_callbacks.insert(fn_name.into());
+        Self {
+            fn_callbacks,
+            ..Self::default()
+        }
+    }
+
+    /// Combine provenances (e.g. across struct literal fields, `or` fallback, or control-flow join).
+    pub fn merge(&self, other: &Self) -> Self {
+        let pointee_depth = match (self.pointee_depth, other.pointee_depth) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        Self {
+            origin_depth: self.origin_depth.max(other.origin_depth),
+            pointee_depth,
+            pointee_is_caller_or_static: self.pointee_is_caller_or_static
+                || other.pointee_is_caller_or_static,
+            local_origins: self
+                .local_origins
+                .union(&other.local_origins)
+                .cloned()
+                .collect(),
+            param_origins: self
+                .param_origins
+                .union(&other.param_origins)
+                .copied()
+                .collect(),
+            leases: self.leases.union(&other.leases).cloned().collect(),
+            fn_callbacks: self
+                .fn_callbacks
+                .union(&other.fn_callbacks)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Strip reference/lease provenance when producing a pure non-reference value (e.g. `u16`, `usize`, `bool`),
+    /// while preserving `fn_callbacks` only if applicable.
+    pub fn into_scalar_value(self) -> Self {
+        Self::pure_static()
+    }
+
+    /// Returns `true` if this value carries any local stack origin or active DMA lease that
+    /// cannot outlive the current function frame.
+    pub fn has_non_returning_origin(&self) -> bool {
+        !self.local_origins.is_empty() || !self.leases.is_empty() || self.origin_depth > 1
+    }
+}
+
+/// Tracks current valid DMA lease generations and invalidation spans across control flow.
+#[derive(Clone, Debug, Default)]
+pub struct LeaseEnv {
+    /// Current generation number per DMA source (`0` = never waited yet).
+    current_gen: BTreeMap<String, u64>,
+    /// Span of the most recent `wait_chunk()` that invalidated prior generations for `source`.
+    last_wait_span: BTreeMap<String, Span>,
+    /// Monotonic global counter so merged control-flow branches never accidentally collide.
+    next_id: u64,
+}
+
+impl LeaseEnv {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Advance the DMA lease generation for `source` upon `source.wait_chunk()`,
+    /// invalidating all previously acquired leases from `source`.
+    pub fn acquire_next(&mut self, source: &str, span: Span) -> u64 {
+        self.next_id += 1;
+        let gen = self.next_id;
+        self.current_gen.insert(source.to_string(), gen);
+        self.last_wait_span.insert(source.to_string(), span);
+        gen
+    }
+
+    /// Check if `token` is still valid in the current state.
+    /// Returns `Err(invalidated_by_span)` if a subsequent `wait_chunk()` has invalidated it.
+    pub fn check_valid(&self, token: &LeaseToken) -> Result<(), Option<Span>> {
+        match self.current_gen.get(&token.source) {
+            Some(&cur) if cur == token.generation => Ok(()),
+            _ => Err(self.last_wait_span.get(&token.source).copied()),
+        }
+    }
+
+    /// Check all leases in `prov`, returning the first stale lease and the span that invalidated it.
+    pub fn find_stale_lease<'a>(
+        &self,
+        prov: &'a Provenance,
+    ) -> Option<(&'a LeaseToken, Option<Span>)> {
+        for token in &prov.leases {
+            if let Err(inv_span) = self.check_valid(token) {
+                return Some((token, inv_span));
+            }
+        }
+        None
+    }
+
+    /// Join two branch lease environments after `if / else` or `switch` arms.
+    /// If a DMA source's generation differs across branches, any lease held from before or
+    /// only one branch is conservatively invalidated.
+    pub fn join_branches(&mut self, branches: &[LeaseEnv]) {
+        for b in branches {
+            self.next_id = self.next_id.max(b.next_id);
+        }
+        let mut all_sources: BTreeSet<String> = self.current_gen.keys().cloned().collect();
+        for b in branches {
+            all_sources.extend(b.current_gen.keys().cloned());
+        }
+        for src in all_sources {
+            let mut gens = BTreeSet::new();
+            let mut latest_span = self.last_wait_span.get(&src).copied();
+            if branches.is_empty() {
+                continue;
+            }
+            for b in branches {
+                gens.insert(b.current_gen.get(&src).copied().unwrap_or(0));
+                if let Some(sp) = b.last_wait_span.get(&src).copied() {
+                    latest_span = Some(sp);
+                }
+            }
+            if gens.len() == 1 {
+                let g = *gens.iter().next().unwrap();
+                if g > 0 {
+                    self.current_gen.insert(src.clone(), g);
+                }
+            } else {
+                // Branches diverged on DMA acquisitions -> bump to a fresh post-join generation.
+                self.next_id += 1;
+                self.current_gen.insert(src.clone(), self.next_id);
+            }
+            if let Some(sp) = latest_span {
+                self.last_wait_span.insert(src, sp);
+            }
+        }
+    }
+
+    /// Sources whose lease generation changed between `before` and `after`.
+    pub fn modified_sources_since(&self, before: &LeaseEnv) -> BTreeMap<String, Option<Span>> {
+        let mut out = BTreeMap::new();
+        for (src, &gen) in &self.current_gen {
+            if before.current_gen.get(src).copied().unwrap_or(0) != gen {
+                out.insert(src.clone(), self.last_wait_span.get(src).copied());
+            }
+        }
+        out
+    }
+}
