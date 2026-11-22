@@ -97,6 +97,8 @@ pub struct SpawnedTaskRam {
     pub priority: MirPriority,
     pub core_pin: Option<u8>,
     pub is_main_supervisor: bool,
+    pub provenance_path: Vec<String>,
+    pub conditional: bool,
     pub frame_bytes_32: usize,
     pub naive_frame_bytes_32: usize,
     pub union_saved_bytes_32: usize,
@@ -108,6 +110,16 @@ pub struct SpawnedTaskRam {
     pub hoisted_vars: Vec<VarRamInfo>,
     pub stack_vars: Vec<VarRamInfo>,
     pub child_slots: Vec<ChildSlotRamInfo>,
+}
+
+/// Static RAM visibility for a `SoftYielding` function compiled into both a coroutine
+/// state machine (`name`) and a zero-frame direct stack clone (`noyield_name`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DualSpecializedFnRam {
+    pub name: String,
+    pub noyield_name: String,
+    pub frame_bytes_32: usize,
+    pub frame_bytes_64: usize,
 }
 
 /// Static RAM allocation for a top-level OS or DMA primitive.
@@ -144,6 +156,7 @@ pub struct RamReport {
     pub spawned_tasks: Vec<SpawnedTaskRam>,
     pub primitives: Vec<PrimitiveRam>,
     pub boot_frames: Vec<(String, usize, usize)>,
+    pub dual_specialized_fns: Vec<DualSpecializedFnRam>,
     pub mcu32: ArchRamTotals,
     pub host64: ArchRamTotals,
 }
@@ -171,13 +184,14 @@ impl RamReport {
                     Some(c) => format!(" @core({c})"),
                     None => String::new(),
                 };
+                let cond_tag = if t.conditional { " [conditional]" } else { "" };
                 let label = if t.is_main_supervisor {
                     "main (supervisor)".to_string()
                 } else {
                     format!("{} ({})", t.instance_name, t.blueprint_name)
                 };
                 out.push_str(&format!(
-                    "  #{:<3} {:<24} {:<10} {:>8} B {:>8} B {:>9} B {:>7} B{}\n",
+                    "  #{:<3} {:<24} {:<10} {:>8} B {:>8} B {:>9} B {:>7} B{}{}\n",
                     t.slot_id,
                     label,
                     t.priority.label(),
@@ -185,8 +199,17 @@ impl RamReport {
                     t.tcb_bytes_32,
                     t.union_saved_bytes_32,
                     t.frame_bytes_64,
-                    core_tag
+                    core_tag,
+                    cond_tag
                 ));
+
+                if t.provenance_path.len() > 2 || t.conditional {
+                    out.push_str(&format!(
+                        "       boot provenance  : {}{}\n",
+                        t.provenance_path.join(" -> "),
+                        cond_tag
+                    ));
+                }
 
                 let user_hoisted: Vec<String> = t
                     .hoisted_vars
@@ -344,6 +367,18 @@ impl RamReport {
             "  {:<34} {:>10} B {:>12} B\n",
             "Dynamic Heap Allocation", self.mcu32.heap_bytes, self.host64.heap_bytes
         ));
+
+        if !self.dual_specialized_fns.is_empty() {
+            out.push_str("\n6. Dual-Specialized Functions\n");
+            out.push_str("--------------------------------------------------------------------------------\n");
+            for ds in &self.dual_specialized_fns {
+                out.push_str(&format!(
+                    "  {:<28} coro: {:>4} B (32b) / {:>4} B (64b) | noyield clone `{}`: 0 B frame\n",
+                    ds.name, ds.frame_bytes_32, ds.frame_bytes_64, ds.noyield_name
+                ));
+            }
+        }
+
         out.push_str("================================================================================\n");
         out
     }
@@ -474,26 +509,12 @@ impl<'a> LayoutCtx<'a> {
                 self.struct_layout(&[el, SizeAlign::new(4, 4)], false)
             }
             MirPrimKind::Inbox { elem, cap } => {
-                // `{ T buf[N]; uint8_t boost[N]; syn_task_t *waiter; uint16_t head, tail, count; }`
+                // `{ T buf[N]; uint8_t boost_buf[N]; syn_task_t *rx_waiter; syn_task_t *tx_waiter; uint16_t head, tail, count; }`
                 let el = self.type_layout(elem, abi);
                 self.struct_layout(
                     &[
                         SizeAlign::new(el.size * cap, el.align),
                         SizeAlign::new(*cap, 1),
-                        SizeAlign::new(ptr, ptr),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(2, 2),
-                    ],
-                    false,
-                )
-            }
-            MirPrimKind::Chan { elem, cap } => {
-                // `{ T buf[N]; syn_task_t *rx_waiter; syn_task_t *tx_waiter; uint16_t head, tail, count; }`
-                let el = self.type_layout(elem, abi);
-                self.struct_layout(
-                    &[
-                        SizeAlign::new(el.size * cap, el.align),
                         SizeAlign::new(ptr, ptr),
                         SizeAlign::new(ptr, ptr),
                         SizeAlign::new(2, 2),
@@ -656,6 +677,8 @@ pub fn compute_ram_report(
             priority: sp.priority,
             core_pin: sp.core_pin,
             is_main_supervisor: sp.is_main_supervisor,
+            provenance_path: sp.provenance_path.clone(),
+            conditional: sp.conditional,
             frame_bytes_32: m.packed_32.size,
             naive_frame_bytes_32: m.naive_32.size,
             union_saved_bytes_32: saved_32,
@@ -668,6 +691,22 @@ pub fn compute_ram_report(
             stack_vars: bp_rep.stack_vars,
             child_slots: bp_rep.child_slots,
         });
+    }
+
+    let mut dual_specialized_fns = Vec::new();
+    for f in functions {
+        if f.is_yielding {
+            let ny_name = format!("{}__noyield", f.name);
+            if fn_map.contains_key(ny_name.as_str()) {
+                let m = fn_cache.get(&f.name).copied().unwrap_or_default();
+                dual_specialized_fns.push(DualSpecializedFnRam {
+                    name: f.name.clone(),
+                    noyield_name: ny_name,
+                    frame_bytes_32: m.packed_32.size,
+                    frame_bytes_64: m.packed_64.size,
+                });
+            }
+        }
     }
 
     let mut prim_rams = Vec::new();
@@ -710,6 +749,7 @@ pub fn compute_ram_report(
         spawned_tasks,
         primitives: prim_rams,
         boot_frames,
+        dual_specialized_fns,
         mcu32,
         host64,
     }

@@ -6,7 +6,8 @@ mod runner;
 
 use cli::{parse_args, Command, HELP_TEXT};
 use diag::{
-    primary_doc_cmd, render_check_json_err, render_check_json_ok, JsonDiag, SourceFile,
+    format_check_human_ok, primary_doc_cmd, render_check_json_err, render_check_json_ok, JsonDiag,
+    SourceFile,
 };
 use runner::TempWorkDir;
 use std::collections::HashMap;
@@ -255,6 +256,8 @@ fn main() -> ExitCode {
         },
         Command::Check { files, json } => match load_and_check_detailed(&files) {
             Ok(bundle) => {
+                let dual_vec: Vec<String> =
+                    bundle.sema.dual_specialized_fns.iter().cloned().collect();
                 if json {
                     println!(
                         "{}",
@@ -263,15 +266,19 @@ fn main() -> ExitCode {
                             bundle.sema.spawned_tasks.len(),
                             bundle.sema.primitives.len(),
                             bundle.sema.tick_period_us,
+                            &dual_vec,
                         )
                     );
                 } else {
                     println!(
-                        "OK ({} file(s) verified, {} task instance(s), {} primitive(s), tick={}us)",
-                        files.len(),
-                        bundle.sema.spawned_tasks.len(),
-                        bundle.sema.primitives.len(),
-                        bundle.sema.tick_period_us,
+                        "{}",
+                        format_check_human_ok(
+                            files.len(),
+                            bundle.sema.spawned_tasks.len(),
+                            bundle.sema.primitives.len(),
+                            bundle.sema.tick_period_us,
+                            &dual_vec,
+                        )
                     );
                 }
                 ExitCode::SUCCESS
@@ -652,6 +659,12 @@ mod tests {
             ("p9a.zev", "struct Reader<'a> { []u8 buf; }\n", "P0009"),
             ("p9b.zev", "fn step(&mut i32 acc) {}\n", "P0009"),
             ("p10.zev", "pub fn main() {}\n", "P0010"),
+            (
+                "p11.zev",
+                "task ctrl() { every 5ms { checkpoint(); } }\nfn main() { spawn ctrl() @normal; }\n",
+                "P0011",
+            ),
+            ("p12.zev", "chan<u32, 4> q;\nfn main() {}\n", "P0012"),
         ];
 
         for (fname, src, expected_code) in cases {
@@ -708,13 +721,105 @@ mod tests {
             "enum IoErr { Timeout }\nu32 read_chunk() error IoErr {\n    error Timeout, 12;\n}\nfn main() {\n    u32 n = read_chunk() catch (IoErr e, u32 partial) {\n        return;\n    };\n}\n",
         )
         .unwrap_or_else(|e| panic!("partial_ok.zev must pass:\n{}", e.human));
+        let ok_dual: Vec<String> = ok.sema.dual_specialized_fns.iter().cloned().collect();
         let ok_json = render_check_json_ok(
             1,
             ok.sema.spawned_tasks.len(),
             ok.sema.primitives.len(),
             ok.sema.tick_period_us,
+            &ok_dual,
         );
         assert!(ok_json.starts_with("{\"ok\": true"));
+        assert!(ok_json.contains("\"dual_specialized_functions\": []"), "json={ok_json}");
+    }
+
+    #[test]
+    fn check_json_and_human_report_dual_specialized_and_wave1_sema_codes() {
+        let dual_src = "\
+watch<u32> latest = 0;
+
+u32 hash_chunk(u32 seed) {
+    u32 acc = seed;
+    for (u32 i in 0..4) {
+        acc = (acc * 33) ^ i;
+        checkpoint();
+    }
+    return acc;
+}
+
+task bg_hasher() {
+    u32 round = 1;
+    loop every 5ms {
+        u32 h = hash_chunk(round);
+        latest.publish(h);
+        round += 1;
+    }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    noyield {
+        u32 boot_h = hash_chunk(42);
+        latest.publish(boot_h);
+    }
+    spawn bg_hasher() @normal;
+}
+";
+        let bundle = check_temp_file("dual.zev", dual_src)
+            .unwrap_or_else(|e| panic!("dual.zev must check cleanly:\n{}", e.human));
+        let dual_vec: Vec<String> = bundle.sema.dual_specialized_fns.iter().cloned().collect();
+        assert_eq!(dual_vec, vec!["hash_chunk".to_string()]);
+
+        let json = render_check_json_ok(
+            1,
+            bundle.sema.spawned_tasks.len(),
+            bundle.sema.primitives.len(),
+            bundle.sema.tick_period_us,
+            &dual_vec,
+        );
+        assert!(
+            json.contains("\"dual_specialized_functions\": [\"hash_chunk\"]"),
+            "json={json}"
+        );
+
+        let human = format_check_human_ok(
+            1,
+            bundle.sema.spawned_tasks.len(),
+            bundle.sema.primitives.len(),
+            bundle.sema.tick_period_us,
+            &dual_vec,
+        );
+        assert!(
+            human.contains(", dual_specialized=[hash_chunk]"),
+            "human={human}"
+        );
+
+        // Verify Wave 1 E0025, E0026, E0027 codes & doc pointers end-to-end
+        let wave1_errs = [
+            (
+                "e25.zev",
+                "fn main() { return; u32 dead = 1; }\n",
+                "E0025",
+            ),
+            (
+                "e26.zev",
+                "task one_shot() { checkpoint(); }\nfn main() { spawn one_shot() @normal; }\n",
+                "E0026",
+            ),
+            (
+                "e27.zev",
+                "task worker() { loop { checkpoint(); } }\nfn main() { for (u32 i in 0..2) { spawn worker() @normal; } }\n",
+                "E0027",
+            ),
+        ];
+        for (fname, src, code) in wave1_errs {
+            let Err(fail) = check_temp_file(fname, src) else {
+                panic!("expected `{fname}` to fail with `{code}`");
+            };
+            assert!(fail.human.contains(&format!("error[{code}]")), "human=\n{}", fail.human);
+            assert!(fail.human.contains(&format!("zevc doc {code}")), "human=\n{}", fail.human);
+            assert!(docs::lookup_doc(Some(code), false).is_ok());
+        }
     }
 
     #[test]
@@ -745,7 +850,7 @@ DecodedPacket decode_bad() error PacketErr {
 }
 
 task monitor() {
-    every 5ms {
+    loop every 5ms {
         println(\"tick\");
     }
 }

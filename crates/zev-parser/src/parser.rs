@@ -320,12 +320,43 @@ impl<'a> Parser<'a> {
     }
 
     fn trap_p0008(&self, span: Span) -> ParseError {
-        self.err_at("`for` loops are not supported in Zev v0", span)
-            .with_code("P0008")
-            .with_doc_topic("syntax")
-            .with_hint(
-                "rewrite using `while (cond) { ... }`, `loop { ... }`, or `every 10ms { ... }`",
-            )
+        self.err_at(
+            "C-style `for (;;)` and untyped `for` loops are not supported; use bounded `for (usize i in 0..n) { ... }`, `for (u8 b in slice) { ... }`, `while (cond)`, or `loop`",
+            span,
+        )
+        .with_code("P0008")
+        .with_doc_topic("syntax")
+        .with_hint(
+            "write an explicit loop variable type with `in`: `for (usize i in 0..n) { ... }`, `for (u32 i in 0..=last) { ... }`, or `for (u8 b in slice) { ... }`",
+        )
+    }
+
+    fn trap_p0011(&self, span: Span, period_hint: Option<&str>) -> ParseError {
+        let example = match period_hint.filter(|s| !s.is_empty()) {
+            Some(p) => format!(
+                "replace `every {p} {{ ... }}` with `loop every {p} {{ ... }}` (periodic loops also accept runtime expressions like `loop every period_ms {{ ... }}`)"
+            ),
+            None => "replace bare `every <period> { ... }` with `loop every 20ms { ... }` or `loop every period_expr { ... }`".to_owned(),
+        };
+        self.err_at(
+            "bare `every` loops are deprecated/ambiguous; write `loop every 20ms { ... }` so sequential loop control flow is explicit",
+            span,
+        )
+        .with_code("P0011")
+        .with_doc_topic("tasks")
+        .with_hint(example)
+    }
+
+    fn trap_p0012(&self, span: Span) -> ParseError {
+        self.err_at(
+            "`chan<T, N>` has been unified into `inbox<T, N>` (which supports both `.post()` and backpressured `.send()`); replace `chan<...>` with `inbox<...>`",
+            span,
+        )
+        .with_code("P0012")
+        .with_doc_topic("primitives")
+        .with_hint(
+            "declare `inbox<T, N> name;` instead of `chan<T, N> name;` (use `.post(v)` from ISRs/tasks, yielding `.send(v)` from tasks, and `.recv()` / `.try_recv()` to consume)",
+        )
     }
 
     fn trap_p0009_lifetime(&self, lt: &str, span: Span) -> ParseError {
@@ -366,7 +397,7 @@ impl<'a> Parser<'a> {
             .with_code("P0010")
             .with_doc_topic("primitives")
             .with_hint(
-                "task locals declared before `loop`/`every` (e.g. `i32 integral = 0;`) persist in static task frames automatically; top-level constants use `const`, and shared task/ISR state uses `watch<T>`, `inbox<T, N>`, `chan<T, N>`, or `signal` (omit `pub`)",
+                "task locals declared before `loop`/`loop every` (e.g. `i32 integral = 0;`) persist in static task frames automatically; top-level constants use `const`, and shared task/ISR state uses `watch<T>`, `inbox<T, N>`, or `signal` (omit `pub`)",
             )
     }
 
@@ -382,6 +413,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwMatch => Some(self.trap_p0005(tok.span)),
             TokenKind::KwTry => Some(self.trap_p0007("`try`", tok.span)),
             TokenKind::KwFor => Some(self.trap_p0008(tok.span)),
+            TokenKind::KwEvery => Some(self.trap_p0011(tok.span, None)),
             TokenKind::KwStatic => Some(self.trap_p0010("static", tok.span)),
             TokenKind::KwPub => Some(self.trap_p0010("pub", tok.span)),
             TokenKind::Question => Some(self.trap_p0007("`?` operator", tok.span)),
@@ -472,6 +504,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwSelect => return Err(self.trap_p0004(cur_span)),
             TokenKind::KwMatch => return Err(self.trap_p0005(cur_span)),
             TokenKind::KwFor => return Err(self.trap_p0008(cur_span)),
+            TokenKind::KwEvery => return Err(self.trap_p0011(cur_span, None)),
             TokenKind::Bang => {
                 return Err(self.trap_p0007("Zig-style `!Type` error-union return type", cur_span));
             }
@@ -1297,7 +1330,25 @@ impl<'a> Parser<'a> {
                             start.merge(gt_span),
                         )
                     }
-                    "chan" | "inbox" | "ping_pong" | "lease"
+                    "chan" if self.peek_n_kind(1) == TokenKind::Lt => {
+                        // Trap retired `chan<T, N>` (or `chan<T>`) with `P0012` -> unified `inbox<T, N>`!
+                        self.bump(); // `chan`
+                        let lt_tok = self.expect(&TokenKind::Lt)?;
+                        let mut end_span = lt_tok.span;
+                        let mut depth = 1usize;
+                        while depth > 0 && !self.at(&TokenKind::Eof) && !self.at(&TokenKind::Semi) {
+                            let tok = self.bump();
+                            end_span = tok.span;
+                            match tok.kind {
+                                TokenKind::Lt => depth += 1,
+                                TokenKind::Gt => depth = depth.saturating_sub(1),
+                                TokenKind::Shr => depth = depth.saturating_sub(2),
+                                _ => {}
+                            }
+                        }
+                        return Err(self.trap_p0012(start.merge(end_span)));
+                    }
+                    "inbox" | "ping_pong" | "lease"
                         if self.peek_n_kind(1) == TokenKind::Lt =>
                     {
                         self.bump();
@@ -1307,10 +1358,6 @@ impl<'a> Parser<'a> {
                         let cap = self.parse_usize_literal("OS primitive capacity")?;
                         let gt_span = self.expect_type_gt()?;
                         let os_ty = match s_clone.as_str() {
-                            "chan" => OsPrimitiveType::Chan {
-                                elem: Box::new(elem),
-                                cap,
-                            },
                             "inbox" => OsPrimitiveType::Inbox {
                                 elem: Box::new(elem),
                                 cap,
@@ -1599,7 +1646,6 @@ impl<'a> Parser<'a> {
             TokenKind::KwSelect => return Err(self.trap_p0004(cur_span)),
             TokenKind::KwMatch => return Err(self.trap_p0005(cur_span)),
             TokenKind::KwTry => return Err(self.trap_p0007("`try`", cur_span)),
-            TokenKind::KwFor => return Err(self.trap_p0008(cur_span)),
             TokenKind::KwStatic => return Err(self.trap_p0010("static", cur_span)),
             TokenKind::KwPub => return Err(self.trap_p0010("pub", cur_span)),
             TokenKind::Lifetime(ref lt) => return Err(self.trap_p0009_lifetime(lt, cur_span)),
@@ -1674,13 +1720,10 @@ impl<'a> Parser<'a> {
             }
             TokenKind::KwIf => self.parse_if_stmt(attrs, start),
             TokenKind::KwWhile => self.parse_while_stmt(attrs, start),
-            TokenKind::KwLoop => {
-                self.bump();
-                let body = self.parse_block()?;
-                let span = start.merge(body.span);
-                Ok(Stmt::with_attrs(attrs, StmtKind::Loop { body }, span))
-            }
-            TokenKind::KwEvery => self.parse_every_stmt(attrs, start),
+            TokenKind::KwFor => self.parse_for_stmt(attrs, start),
+            TokenKind::KwLoop => self.parse_loop_stmt(attrs, start),
+            TokenKind::KwEvery => self.parse_bare_every_trap(),
+            TokenKind::KwDefer => self.parse_defer_stmt(attrs, start),
             TokenKind::KwNoYield => {
                 self.bump();
                 let body = self.parse_block()?;
@@ -1710,6 +1753,15 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::with_attrs(
                     attrs,
                     StmtKind::Break,
+                    start.merge(semi.span),
+                ))
+            }
+            TokenKind::KwRestart => {
+                self.bump();
+                let semi = self.expect(&TokenKind::Semi)?;
+                Ok(Stmt::with_attrs(
+                    attrs,
+                    StmtKind::Restart,
                     start.merge(semi.span),
                 ))
             }
@@ -1974,42 +2026,173 @@ impl<'a> Parser<'a> {
         Ok(Stmt::with_attrs(attrs, StmtKind::While { cond, body }, span))
     }
 
-    fn parse_every_stmt(&mut self, attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
-        self.expect(&TokenKind::KwEvery)?;
-        let has_parens = self.eat(&TokenKind::LParen);
-        let tok = self.peek_token();
-        let interval = match tok.kind {
-            TokenKind::Duration(value, unit) => {
-                self.bump();
-                DurationLit {
-                    value,
-                    unit,
-                    span: tok.span,
-                }
-            }
-            _ => {
+    /// Parse `loop { ... }` or `loop every <period_expr> { ... }`.
+    fn parse_loop_stmt(&mut self, attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::KwLoop)?;
+        if self.eat(&TokenKind::KwEvery) {
+            if self.at(&TokenKind::LBrace) || self.at(&TokenKind::Eof) {
                 return Err(self
                     .err_at(
                         format!(
-                            "expected duration literal (e.g. `1ms`, `500us`, `5s`) after `every`, found {}",
-                            tok.kind
+                            "expected period expression (e.g. `20ms` or `period_ms`) after `loop every`, found {}",
+                            self.peek_kind()
                         ),
-                        tok.span,
+                        self.peek_span(),
                     )
                     .with_doc_topic("tasks")
-                    .with_hint("add a time unit suffix such as `ms`, `us`, or `s`"));
+                    .with_hint("write `loop every 20ms { ... }` or `loop every period_var { ... }`"));
+            }
+            // Parse period expression with `allow_struct_lit = false` so `loop every period_ms { ... }`
+            // never treats `period_ms { ... }` as a struct literal (`loop every (period_ms) { ... }` works too).
+            let period = self.parse_condition_expr()?;
+            let body = self.parse_block()?;
+            let span = start.merge(body.span);
+            Ok(Stmt::with_attrs(
+                attrs,
+                StmtKind::LoopEvery {
+                    period: Box::new(period),
+                    body,
+                },
+                span,
+            ))
+        } else {
+            let body = self.parse_block()?;
+            let span = start.merge(body.span);
+            Ok(Stmt::with_attrs(attrs, StmtKind::Loop { body }, span))
+        }
+    }
+
+    /// Consume bare `every ...` up to `{` and emit `P0011` guiding users to `loop every <period> { ... }`.
+    fn parse_bare_every_trap(&mut self) -> Result<Stmt, ParseError> {
+        let every_tok = self.expect(&TokenKind::KwEvery)?;
+        let period_start = self.peek_span();
+        let mut last_span = every_tok.span;
+        let mut has_period_toks = false;
+        while !self.at(&TokenKind::LBrace)
+            && !self.at(&TokenKind::Semi)
+            && !self.at(&TokenKind::RBrace)
+            && !self.at(&TokenKind::Eof)
+        {
+            last_span = self.bump().span;
+            has_period_toks = true;
+        }
+        let period_str = if has_period_toks {
+            self.source
+                .get(period_start.start as usize..last_span.end as usize)
+                .map(str::trim)
+        } else {
+            None
+        };
+        Err(self.trap_p0011(every_tok.span.merge(last_span), period_str))
+    }
+
+    /// Parse bounded `for (Type x in start..end) { ... }`, `for (Type x in start..=end) { ... }`,
+    /// or `for (Type x in slice_or_array) { ... }`; trap C-style `for (;;)` and untyped `for` as `P0008`.
+    fn parse_for_stmt(&mut self, attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::KwFor)?;
+
+        if !self.eat(&TokenKind::LParen) {
+            return Err(self.trap_p0008(start.merge(self.peek_span())));
+        }
+
+        if self.at(&TokenKind::Semi) || self.at(&TokenKind::RParen) {
+            return Err(self.trap_p0008(start.merge(self.peek_span())));
+        }
+
+        let (ty, var_name) = match self.parse_typed_declarator("`for` loop binding") {
+            Ok(pair) => pair,
+            Err(e) => {
+                // Preserve specific type traps like `chan<...>` (`P0012`) or `&mut`/`'a` (`P0009`);
+                // map untyped / C-style `for (i = 0; ...)` or `for (let i ...)` to `P0008`.
+                if matches!(e.code, Some("P0009" | "P0012")) {
+                    return Err(e);
+                }
+                return Err(self.trap_p0008(start.merge(self.peek_span())));
             }
         };
-        if has_parens {
-            self.expect(&TokenKind::RParen)?;
+
+        // Contextual `"in"` check right after `(TypeExpr, Ident)`
+        let has_in = matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "in");
+        if !has_in {
+            return Err(self.trap_p0008(start.merge(self.peek_span())));
         }
-        let body = self.parse_block()?;
-        let span = start.merge(body.span);
-        Ok(Stmt::with_attrs(
-            attrs,
-            StmtKind::Every { interval, body },
-            span,
-        ))
+        self.bump(); // contextual `"in"`
+
+        let prev_allow = self.allow_struct_lit;
+        self.allow_struct_lit = true;
+
+        let first = match self.parse_expr() {
+            Ok(e) => e,
+            Err(err) => {
+                self.allow_struct_lit = prev_allow;
+                return Err(err);
+            }
+        };
+
+        if self.at(&TokenKind::DotDot) || self.at(&TokenKind::DotDotEq) {
+            let inclusive = self.bump().kind == TokenKind::DotDotEq;
+            let end_expr = match self.parse_expr() {
+                Ok(e) => e,
+                Err(err) => {
+                    self.allow_struct_lit = prev_allow;
+                    return Err(err);
+                }
+            };
+            self.allow_struct_lit = prev_allow;
+            self.expect(&TokenKind::RParen)?;
+            let body = self.parse_block()?;
+            let span = start.merge(body.span);
+            Ok(Stmt::with_attrs(
+                attrs,
+                StmtKind::ForRange {
+                    var_ty: ty,
+                    var_name,
+                    start: Box::new(first),
+                    end: Box::new(end_expr),
+                    inclusive,
+                    body,
+                },
+                span,
+            ))
+        } else {
+            self.allow_struct_lit = prev_allow;
+            self.expect(&TokenKind::RParen)?;
+            let body = self.parse_block()?;
+            let span = start.merge(body.span);
+            Ok(Stmt::with_attrs(
+                attrs,
+                StmtKind::ForEach {
+                    elem_ty: ty,
+                    elem_name: var_name,
+                    iter: Box::new(first),
+                    body,
+                },
+                span,
+            ))
+        }
+    }
+
+    /// Parse `defer expr_or_stmt;` or `defer { stmt* }` (no trailing `;` required on `{ ... }`).
+    fn parse_defer_stmt(&mut self, attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
+        self.expect(&TokenKind::KwDefer)?;
+        if self.at(&TokenKind::LBrace) {
+            let b = self.parse_block()?;
+            let b_span = b.span;
+            let inner = Stmt::new(StmtKind::Block(b), b_span);
+            Ok(Stmt::with_attrs(
+                attrs,
+                StmtKind::Defer(Box::new(inner)),
+                start.merge(b_span),
+            ))
+        } else {
+            let inner = self.parse_stmt_in_block(false)?;
+            let end = inner.span;
+            Ok(Stmt::with_attrs(
+                attrs,
+                StmtKind::Defer(Box::new(inner)),
+                start.merge(end),
+            ))
+        }
     }
 
     fn parse_switch_stmt(&mut self, attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
@@ -2174,6 +2357,11 @@ impl<'a> Parser<'a> {
                 let t = self.bump();
                 let end = self.eat_arm_terminator(t.span)?;
                 Ok(Stmt::new(StmtKind::Break, start.merge(end)))
+            }
+            TokenKind::KwRestart => {
+                let t = self.bump();
+                let end = self.eat_arm_terminator(t.span)?;
+                Ok(Stmt::new(StmtKind::Restart, start.merge(end)))
             }
             TokenKind::Ident(ref s)
                 if s == "checkpoint"

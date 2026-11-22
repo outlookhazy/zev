@@ -66,10 +66,27 @@ mod tests {
             .to_path_buf()
     }
 
+    /// Parse a workspace `.zev` example file, transparently normalizing pre-migration
+    /// bare `\n    every ` loops if `examples/*.zev` have not yet been migrated in a later stage.
+    fn parse_workspace_example(path: &Path) -> Program {
+        let display = path.display().to_string();
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read `{display}`: {e}"));
+        match parse_str_named(&raw, &display) {
+            Ok(prog) => prog,
+            Err(e) if e.code == Some("P0011") => {
+                let migrated = raw.replace("\n    every ", "\n    loop every ");
+                parse_str_named(&migrated, &display)
+                    .unwrap_or_else(|e2| panic!("failed to parse migrated `{display}`:\n{e2}"))
+            }
+            Err(e) => panic!("failed to parse `{display}`:\n{e}"),
+        }
+    }
+
     #[test]
     fn parses_north_star_motor_controller() {
         let path = repo_root().join("examples/motor_controller.zev");
-        let program = parse_file(&path).unwrap_or_else(|e| panic!("failed to parse:\n{e}"));
+        let program = parse_workspace_example(&path);
 
         // 1 import + 1 packed struct + 2 enums + 5 OS primitives + 3 ISRs + 1 helper fn + 2 tasks + 1 main fn = 16 items
         assert_eq!(program.items.len(), 16, "unexpected item count");
@@ -196,8 +213,7 @@ mod tests {
         ] {
             let path = repo_root().join(rel);
             if path.exists() {
-                let prog = parse_file(&path)
-                    .unwrap_or_else(|e| panic!("failed to parse {rel}:\n{e}"));
+                let prog = parse_workspace_example(&path);
                 assert!(!prog.items.is_empty());
             }
         }
@@ -295,7 +311,7 @@ mod tests {
         let src = r#"
             const u32 MAX_CHAN = 16;
             signal irq_ready;
-            chan<u32, 16> work_q;
+            inbox<u32, 16> work_q;
             lease<u8, 128> spi_buf;
             u32 illegal_mutable_global = 42;
 
@@ -369,16 +385,16 @@ mod tests {
 
     #[test]
     fn formats_clear_line_col_diagnostics_and_doc_pointers_on_syntax_errors() {
-        let bad_src = "fn broken() {\n    every 10 {\n        checkpoint();\n    }\n}\n";
+        let bad_src = "fn broken() {\n    loop every {\n        checkpoint();\n    }\n}\n";
         let err = parse_str_named(bad_src, "bad_timer.zev").unwrap_err();
         assert_eq!(err.span.line, 2);
-        assert_eq!(err.span.col, 11);
+        assert_eq!(err.span.col, 16);
         assert_eq!(err.code, None);
         assert_eq!(err.doc_topic, Some("tasks"));
         let formatted = err.to_string();
-        assert!(formatted.contains("bad_timer.zev:2:11: error:"));
-        assert!(formatted.contains("every 10 {"));
-        assert!(formatted.contains("^^"));
+        assert!(formatted.contains("bad_timer.zev:2:16: error:"));
+        assert!(formatted.contains("loop every {"));
+        assert!(formatted.contains("^"));
         assert!(formatted.contains("= docs: run 'zevc doc tasks'"));
 
         // Verify fallback `zevc doc syntax` when neither code nor doc_topic is set
@@ -502,7 +518,7 @@ mod tests {
                 fn main() { a(); }
             "#,
             r#"
-                task fast() { every 500us { } }
+                task fast() { loop every 500us { } }
                 fn main() { sys.use_systick(170_000_000); spawn fast() @high; }
             "#,
             r#"
@@ -729,14 +745,204 @@ mod tests {
             "fn main() { for (u32 i = 0; i < 4; i += 1) { } }",
             "P0008",
             "syntax",
-            "while",
+            "for (usize i in 0..n)",
+        );
+        assert_trap(
+            "fn main() { for (;;) { } }",
+            "P0008",
+            "syntax",
+            "for (usize i in 0..n)",
         );
         assert_trap(
             "fn main() { for x in buf { } }",
             "P0008",
             "syntax",
-            "every",
+            "for (u8 b in slice)",
         );
+        assert_trap(
+            "fn main() { for (i in 0..8) { } }",
+            "P0008",
+            "syntax",
+            "for (usize i in 0..n)",
+        );
+    }
+
+    #[test]
+    fn trap_p0011_bare_every() {
+        assert_trap(
+            "task ctrl() { every 20ms { checkpoint(); } }",
+            "P0011",
+            "tasks",
+            "loop every 20ms",
+        );
+        assert_trap(
+            "task ctrl(u32 p) { every p { checkpoint(); } }",
+            "P0011",
+            "tasks",
+            "loop every p",
+        );
+    }
+
+    #[test]
+    fn trap_p0012_retired_chan() {
+        assert_trap(
+            "chan<u32, 16> work_q;",
+            "P0012",
+            "primitives",
+            "inbox<T, N>",
+        );
+        assert_trap(
+            "task worker(chan<u8, 8> *q) { loop { checkpoint(); } }",
+            "P0012",
+            "primitives",
+            "inbox<T, N>",
+        );
+    }
+
+    #[test]
+    fn parses_wave1_restart_defer_for_in_and_loop_every() {
+        let src = r#"
+            inbox<u8, 8> cmd_q;
+
+            fn spi_cs_low() {}
+            fn spi_cs_high() {}
+
+            u32 sum_packet([]u8 buf, u32 limit) {
+                spi_cs_low();
+                defer spi_cs_high();
+                defer {
+                    u8 chan = 1;
+                    u32 in = chan as u32;
+                }
+
+                u32 acc = 0;
+                for (usize i in 0..8) {
+                    acc += i as u32;
+                }
+                for (u32 j in 0..=limit) {
+                    acc += j;
+                }
+                for (usize k in 0..buf.len) {
+                    acc += buf[k] as u32;
+                }
+                for (u8 b in buf) {
+                    acc += b as u32;
+                }
+                for (u8 sub_b in buf[0..2]) {
+                    acc += sub_b as u32;
+                }
+                return acc;
+            }
+
+            task fault_tolerant_worker(u32 period_ms) {
+                u32 errs = 0;
+                loop every 20ms {
+                    if (errs > 3) {
+                        restart;
+                    }
+                    switch (errs) {
+                        9 => restart,
+                        _ => errs += 1,
+                    }
+                }
+            }
+
+            task dynamic_rate_worker(u32 period_ticks) {
+                loop every period_ticks {
+                    checkpoint();
+                }
+                loop every (period_ticks * 2) {
+                    checkpoint();
+                }
+            }
+        "#;
+
+        let prog = parse_str(src).unwrap_or_else(|e| panic!("Wave 1 parse failed:\n{e}"));
+        assert_eq!(prog.items.len(), 6);
+
+        // Inspect `sum_packet`: 1 call + 2 defers + 1 var_decl + 3 ForRange + 2 ForEach + 1 return = 10 stmts
+        let sum_fn = match &prog.items[3].kind {
+            ItemKind::Fn(f) => f,
+            other => panic!("expected Fn, got {other:?}"),
+        };
+        let stmts = &sum_fn.body.as_ref().unwrap().stmts;
+        assert_eq!(stmts.len(), 10);
+
+        match &stmts[1].kind {
+            StmtKind::Defer(inner) => assert!(matches!(inner.kind, StmtKind::Expr(_))),
+            other => panic!("expected single-stmt Defer, got {other:?}"),
+        }
+        match &stmts[2].kind {
+            StmtKind::Defer(inner) => assert!(matches!(inner.kind, StmtKind::Block(_))),
+            other => panic!("expected block Defer, got {other:?}"),
+        }
+        match &stmts[4].kind {
+            StmtKind::ForRange {
+                var_name,
+                inclusive,
+                ..
+            } => {
+                assert_eq!(var_name.as_str(), "i");
+                assert!(!*inclusive);
+            }
+            other => panic!("expected exclusive ForRange, got {other:?}"),
+        }
+        match &stmts[5].kind {
+            StmtKind::ForRange {
+                var_name,
+                inclusive,
+                ..
+            } => {
+                assert_eq!(var_name.as_str(), "j");
+                assert!(*inclusive);
+            }
+            other => panic!("expected inclusive ForRange, got {other:?}"),
+        }
+        match &stmts[6].kind {
+            StmtKind::ForRange { end, inclusive, .. } => {
+                assert!(!*inclusive);
+                assert!(matches!(end.kind, ExprKind::Field { .. }));
+            }
+            other => panic!("expected `0..buf.len` ForRange, got {other:?}"),
+        }
+        assert!(matches!(stmts[7].kind, StmtKind::ForEach { .. }));
+        assert!(matches!(stmts[8].kind, StmtKind::ForEach { .. }));
+
+        // Inspect `fault_tolerant_worker`: `LoopEvery` containing `StmtKind::Restart`
+        let worker1 = match &prog.items[4].kind {
+            ItemKind::Task(t) => t,
+            other => panic!("expected Task, got {other:?}"),
+        };
+        match &worker1.body.stmts[1].kind {
+            StmtKind::LoopEvery { period, body } => {
+                assert!(matches!(period.kind, ExprKind::Literal(Literal::Duration(_))));
+                match &body.stmts[0].kind {
+                    StmtKind::If { then_block, .. } => {
+                        assert!(matches!(then_block.stmts[0].kind, StmtKind::Restart));
+                    }
+                    other => panic!("expected If, got {other:?}"),
+                }
+            }
+            other => panic!("expected LoopEvery, got {other:?}"),
+        }
+
+        // Inspect `dynamic_rate_worker`: `loop every period_ticks` & `loop every (period_ticks * 2)`
+        let worker2 = match &prog.items[5].kind {
+            ItemKind::Task(t) => t,
+            other => panic!("expected Task, got {other:?}"),
+        };
+        match &worker2.body.stmts[0].kind {
+            StmtKind::LoopEvery { period, .. } => {
+                assert!(matches!(period.kind, ExprKind::Ident(_)));
+            }
+            other => panic!("expected identifier period LoopEvery, got {other:?}"),
+        }
+        match &worker2.body.stmts[1].kind {
+            StmtKind::LoopEvery { period, .. } => {
+                assert!(matches!(period.kind, ExprKind::Binary { .. }));
+            }
+            other => panic!("expected binary period LoopEvery, got {other:?}"),
+        }
     }
 
     #[test]

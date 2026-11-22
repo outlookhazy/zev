@@ -2,7 +2,7 @@
 //
 // End-to-end zero-C, zero-heap, zero-glue Language-OS demonstration running on real
 // emulated Cortex-M3 silicon in `qemu-system-arm`:
-//   1. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `every 1ms`, `noyield`)
+//   1. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `loop every 1ms`, `noyield`)
 //   2. Zero-copy `@dma_safe ping_pong<u8, 64>` UART DMA + `packed struct` `u16be` + `error`/`catch`
 //   3. Real NVIC IRQ5 (`DMA1_CH5`) & IRQ0 (`EXTI0`) hardware preemption via `NVIC_ISPR0`
 //   4. ISR `boost: @critical` priority elevation into `sup_inbox` + automatic `@low` restore
@@ -58,16 +58,8 @@ isr DMA1_CH5 {
 u16 crc16_cmd([]u8 buf) {
     u16 s1 = 85;
     u16 s2 = 170;
-    if (buf.len >= 1) {
-        s1 = (s1 + buf[0]) & 255;
-        s2 = (s2 + s1) & 255;
-    }
-    if (buf.len >= 2) {
-        s1 = (s1 + buf[1]) & 255;
-        s2 = (s2 + s1) & 255;
-    }
-    if (buf.len >= 3) {
-        s1 = (s1 + buf[2]) & 255;
+    for (u8 b in buf) {
+        s1 = (s1 + (b as u16)) & 255;
         s2 = (s2 + s1) & 255;
     }
     return (s2 * 256) | s1;
@@ -138,14 +130,9 @@ fn save_fault_record(u32 bad_packets) {
 fn scrub_flash_crc() {
     u32 addr = 0;
     u32 crc_acc = 0x1234;
-    u32 blocks = 0;
-    loop {
-        if (blocks >= 3) {
-            break;
-        }
+    for (u32 blocks in 0..3) {
         crc_acc = (crc_acc + addr + blocks) & 0xFFFF;
         addr += 64;
-        blocks += 1;
         checkpoint();
     }
     flash_diag.publish(crc_acc);
@@ -155,7 +142,7 @@ fn scrub_flash_crc() {
 task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
     i32 integral = 0;
 
-    every 1ms {
+    loop every 1ms {
         u16 target = target_rpm.read();
         u16 actual = adc_read_rpm(pwm_ch);
 

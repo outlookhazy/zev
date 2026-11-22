@@ -35,16 +35,8 @@ fn run_power_on_self_test() {
 u16 crc16([]u8 buf) {
     u16 s1 = 85;
     u16 s2 = 170;
-    if (buf.len >= 1) {
-        s1 = (s1 + buf[0]) & 255;
-        s2 = (s2 + s1) & 255;
-    }
-    if (buf.len >= 2) {
-        s1 = (s1 + buf[1]) & 255;
-        s2 = (s2 + s1) & 255;
-    }
-    if (buf.len >= 3) {
-        s1 = (s1 + buf[2]) & 255;
+    for (u8 b in buf) {
+        s1 = (s1 + (b as u16)) & 255;
         s2 = (s2 + s1) & 255;
     }
     return (s2 * 256) | s1;
@@ -101,14 +93,10 @@ fn save_fault_record(u32 bad_packets) {
 
 fn scrub_flash_crc() {
     u32 sector_addr = 0x0800_0000;
-    u32 end_addr = 0x0800_0400;
     u32 rolling_crc = 0xFFFF;
     u32 words_checked = 0;
 
-    loop {
-        if (sector_addr >= end_addr) {
-            break;
-        }
+    for (u32 step in 0..4) {
         rolling_crc = (rolling_crc + sector_addr + words_checked) & 0xFFFF;
         sector_addr += 256;
         words_checked += 64;

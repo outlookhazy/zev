@@ -2,7 +2,7 @@
 //
 // Exercises all v0 Language-OS pillars on a scripted host timeline:
 //   1. Sequential phased boot (`main()`) + multi-instance static `spawn` (x2 motor_control, x2 fieldbus_listener)
-//   2. Drift-free `every 1ms` PI control loops with task-atomic `noyield` blocks
+//   2. Drift-free `loop every 1ms` PI control loops with task-atomic `noyield` blocks
 //   3. Zero-copy `@dma_safe ping_pong` UART DMA + `packed struct` `u16be` decoding + `error`/`catch`
 //   4. `EXTI0` overcurrent ISR with `boost: @critical` waking `@low` supervisor at `@critical` & restoring `@low`
 //   5. Disjoint child coroutine frame `union` aliasing (`save_fault_record` vs `scrub_flash_crc`)
@@ -84,16 +84,8 @@ fn run_power_on_self_test() {
 u16 crc16([]u8 buf) {
     u16 s1 = 85;
     u16 s2 = 170;
-    if (buf.len >= 1) {
-        s1 = (s1 + buf[0]) & 255;
-        s2 = (s2 + s1) & 255;
-    }
-    if (buf.len >= 2) {
-        s1 = (s1 + buf[1]) & 255;
-        s2 = (s2 + s1) & 255;
-    }
-    if (buf.len >= 3) {
-        s1 = (s1 + buf[2]) & 255;
+    for (u8 b in buf) {
+        s1 = (s1 + (b as u16)) & 255;
         s2 = (s2 + s1) & 255;
     }
     return (s2 * 256) | s1;
@@ -159,14 +151,10 @@ fn save_fault_record(u32 bad_packets) {
 
 fn scrub_flash_crc() {
     u32 sector_addr = 0x0800_0000;
-    u32 end_addr = 0x0800_0400;
     u32 rolling_crc = 0xFFFF;
     u32 words_checked = 0;
 
-    loop {
-        if (sector_addr >= end_addr) {
-            break;
-        }
+    for (u32 step in 0..4) {
         rolling_crc = (rolling_crc + sector_addr + words_checked) & 0xFFFF;
         sector_addr += 256;
         words_checked += 64;
@@ -181,7 +169,7 @@ fn scrub_flash_crc() {
 task motor_control(watch<u16> *target_rpm, watch<u16> *out_duty, u8 pwm_ch) {
     i32 integral = 0;
 
-    every 1ms {
+    loop every 1ms {
         u16 target = target_rpm.read();
         u16 actual = adc_read_rpm(pwm_ch);
 
@@ -211,7 +199,7 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
 task sim_stimulus() {
     u32 tick = 0;
 
-    every 1ms {
+    loop every 1ms {
         tick += 1;
 
         if (tick == 1) {

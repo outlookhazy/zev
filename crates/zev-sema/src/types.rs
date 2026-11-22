@@ -56,7 +56,6 @@ pub enum NamespaceKind {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PrimitiveKind {
     Signal,
-    Chan,
     Inbox,
     Watch,
     PingPong,
@@ -67,7 +66,6 @@ impl PrimitiveKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Signal => "signal",
-            Self::Chan => "chan",
             Self::Inbox => "inbox",
             Self::Watch => "watch",
             Self::PingPong => "ping_pong",
@@ -92,7 +90,6 @@ impl fmt::Display for PrimitiveKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ResolvedOsPrimitive {
     Signal,
-    Chan { elem: Box<Ty>, cap: usize },
     Inbox { elem: Box<Ty>, cap: usize },
     Watch { elem: Box<Ty> },
     PingPong { elem: Box<Ty>, cap: usize },
@@ -103,7 +100,6 @@ impl ResolvedOsPrimitive {
     pub const fn kind(&self) -> PrimitiveKind {
         match self {
             Self::Signal => PrimitiveKind::Signal,
-            Self::Chan { .. } => PrimitiveKind::Chan,
             Self::Inbox { .. } => PrimitiveKind::Inbox,
             Self::Watch { .. } => PrimitiveKind::Watch,
             Self::PingPong { .. } => PrimitiveKind::PingPong,
@@ -114,8 +110,7 @@ impl ResolvedOsPrimitive {
     pub fn elem_ty(&self) -> Option<&Ty> {
         match self {
             Self::Signal => None,
-            Self::Chan { elem, .. }
-            | Self::Inbox { elem, .. }
+            Self::Inbox { elem, .. }
             | Self::Watch { elem }
             | Self::PingPong { elem, .. }
             | Self::Lease { elem, .. } => Some(elem),
@@ -125,10 +120,9 @@ impl ResolvedOsPrimitive {
     pub const fn capacity(&self) -> Option<usize> {
         match self {
             Self::Signal | Self::Watch { .. } => None,
-            Self::Chan { cap, .. }
-            | Self::Inbox { cap, .. }
-            | Self::PingPong { cap, .. }
-            | Self::Lease { cap, .. } => Some(*cap),
+            Self::Inbox { cap, .. } | Self::PingPong { cap, .. } | Self::Lease { cap, .. } => {
+                Some(*cap)
+            }
         }
     }
 }
@@ -137,7 +131,6 @@ impl fmt::Display for ResolvedOsPrimitive {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Signal => write!(f, "signal"),
-            Self::Chan { elem, cap } => write!(f, "chan<{}, {}>", elem, cap),
             Self::Inbox { elem, cap } => write!(f, "inbox<{}, {}>", elem, cap),
             Self::Watch { elem } => write!(f, "watch<{}>", elem),
             Self::PingPong { elem, cap } => write!(f, "ping_pong<{}, {}>", elem, cap),
@@ -402,8 +395,7 @@ impl Ty {
             Self::OsPrimitive(p) => match p {
                 ResolvedOsPrimitive::Signal => 4,
                 ResolvedOsPrimitive::Watch { elem } => elem.byte_size(ptr_bytes, structs) + 4,
-                ResolvedOsPrimitive::Chan { elem, cap }
-                | ResolvedOsPrimitive::Inbox { elem, cap } => {
+                ResolvedOsPrimitive::Inbox { elem, cap } => {
                     elem.byte_size(ptr_bytes, structs) * cap + 16
                 }
                 ResolvedOsPrimitive::PingPong { elem, cap } => {

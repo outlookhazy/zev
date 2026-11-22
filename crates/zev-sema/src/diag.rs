@@ -11,11 +11,11 @@ pub enum DiagnosticKind {
     IllegalMutableGlobal,
     /// `task`, `isr`, or `fn` reading or writing an illegal mutable global (`E0002`).
     GlobalIsolationViolation,
-    /// Yielding call, `every`, `checkpoint`, or auto-yield `loop` inside `noyield { ... }` (`E0003`).
+    /// Hard-blocking call, `loop every`, `checkpoint`, `defer` yield, or auto-yield `loop` inside `noyield { ... }` (`E0003`).
     YieldInNoYield,
-    /// Yielding call, `every`, or `checkpoint` inside `critical { ... }` (`E0004`).
+    /// Yielding call, `loop every`, or `checkpoint` inside `critical { ... }` (`E0004`).
     YieldInCritical,
-    /// Yielding call, `every`, `checkpoint`, or auto-yield `loop` inside `isr` (`E0005`).
+    /// Yielding call, `loop every`, `checkpoint`, or auto-yield `loop` inside `isr` (`E0005`).
     YieldInIsr,
     /// Passing a yielding function as a callback pointer to an `extern "C"` function (`E0006`).
     YieldingCallbackToExternC,
@@ -25,7 +25,7 @@ pub enum DiagnosticKind {
     ScopeDepthEscape,
     /// Returning a pointer, slice, or ref-bearing struct backed by a callee-local variable or DMA lease (`E0009`).
     ReturnLocalReference,
-    /// Passing a non-static pointer/slice/lease into `spawn` (`E0010`).
+    /// Passing a non-static pointer/slice/lease into `spawn` or a boot-spawning helper (`E0010`).
     SpawnNonStaticReference,
     /// Reading a variable or wrapper struct derived from `wait_chunk()` after a subsequent `wait_chunk()` (`E0011`).
     StaleDmaLease,
@@ -51,15 +51,21 @@ pub enum DiagnosticKind {
     DuplicateDefinition,
     /// Attempt to mutate an immutable `const` or non-lvalue expression (`E0022`).
     ImmutableAssignment,
-    /// `break` or `continue` outside a loop, or `spawn` / `set_priority` in invalid context (`E0023`).
+    /// `break`/`continue` outside a loop, `restart` outside a task, or control-flow transfer inside `defer` (`E0023`).
     InvalidControlFlow,
     /// Invalid type definition or unsupported operation (e.g. pointer/slice inside `packed struct`) (`E0024`).
     InvalidOperation,
+    /// Statement following diverging control flow (`return`, `error`, `break`, `continue`, `restart`, `sys.exit`, or non-breaking `loop`) (`E0025`).
+    UnreachableCode,
+    /// `return` inside a `task` or a `task` body that can fall off its closing `}` without diverging (`E0026`).
+    NonDivergingTask,
+    /// `spawn` (or call to a boot-spawning `fn`) inside a `task`, `isr`, loop, recursive cycle, or post-supervisor code (`E0027`).
+    InvalidSpawnContext,
 }
 
 impl DiagnosticKind {
-    /// All 24 semantic error kinds (`E0001`..`E0024`) in code order.
-    pub const ALL: [Self; 24] = [
+    /// All 27 semantic error kinds (`E0001`..`E0027`) in code order.
+    pub const ALL: [Self; 27] = [
         Self::IllegalMutableGlobal,
         Self::GlobalIsolationViolation,
         Self::YieldInNoYield,
@@ -84,9 +90,12 @@ impl DiagnosticKind {
         Self::ImmutableAssignment,
         Self::InvalidControlFlow,
         Self::InvalidOperation,
+        Self::UnreachableCode,
+        Self::NonDivergingTask,
+        Self::InvalidSpawnContext,
     ];
 
-    /// Stable error code (`"E0001"`..`"E0024"`).
+    /// Stable error code (`"E0001"`..`"E0027"`).
     pub const fn code(self) -> &'static str {
         match self {
             Self::IllegalMutableGlobal => "E0001",
@@ -113,6 +122,9 @@ impl DiagnosticKind {
             Self::ImmutableAssignment => "E0022",
             Self::InvalidControlFlow => "E0023",
             Self::InvalidOperation => "E0024",
+            Self::UnreachableCode => "E0025",
+            Self::NonDivergingTask => "E0026",
+            Self::InvalidSpawnContext => "E0027",
         }
     }
 
@@ -130,7 +142,10 @@ impl DiagnosticKind {
             | Self::ReturnLocalReference
             | Self::SpawnNonStaticReference
             | Self::StaleDmaLease => "dma",
-            Self::InvalidDurationResolution | Self::InvalidControlFlow => "tasks",
+            Self::InvalidDurationResolution
+            | Self::InvalidControlFlow
+            | Self::NonDivergingTask
+            | Self::InvalidSpawnContext => "tasks",
             Self::ReturnMismatch
             | Self::ErrorSpecMismatch
             | Self::UnhandledFallibleExpr
@@ -140,7 +155,8 @@ impl DiagnosticKind {
             | Self::UndefinedSymbol
             | Self::DuplicateDefinition
             | Self::ImmutableAssignment
-            | Self::InvalidOperation => "syntax",
+            | Self::InvalidOperation
+            | Self::UnreachableCode => "syntax",
         }
     }
 
@@ -160,10 +176,10 @@ impl DiagnosticKind {
                 "replace mutable globals with `const Type NAME = val;` (immutable), `watch<Type> name = init;` (latest value), or `inbox<Event, 8> name;` (queued events)"
             }
             Self::GlobalIsolationViolation => {
-                "tasks and ISRs communicate exclusively through static OS primitives (`watch<T>`, `inbox<T, N>`, `chan<T, N>`, `signal`, `ping_pong<T, N>`, `lease<T, N>`)"
+                "tasks and ISRs communicate exclusively through static OS primitives (`watch<T>`, `inbox<T, N>`, `signal`, `ping_pong<T, N>`, `lease<T, N>`)"
             }
             Self::YieldInNoYield => {
-                "move yielding calls/waits outside `noyield { ... }`, or use a bounded `while (cond)` loop inside `noyield`"
+                "move hard-blocking calls/waits outside `noyield { ... }`, or use a bounded `for (usize i in 0..n)` / `while (cond)` loop inside `noyield`"
             }
             Self::YieldInCritical => {
                 "`critical { ... }` masks hardware IRQs—move yielding calls/waits outside `critical` and keep only short atomic register ops inside"
@@ -175,7 +191,7 @@ impl DiagnosticKind {
                 "stackless coroutine yields cannot unwind through C stack frames; pass a non-yielding `fn` to `extern \"C\"`"
             }
             Self::UnboundedLoopInCritical => {
-                "IRQ-masked `critical { ... }` blocks must stay bounded; move `loop { ... }` outside `critical`"
+                "IRQ-masked `critical { ... }` blocks must stay bounded; move `loop { ... }` outside `critical` or use a bounded `for` / `while` outside IRQ-masked code"
             }
             Self::ScopeDepthEscape => {
                 "slices/pointers and structs wrapping them cannot escape to an outer lexical scope (`dest_depth < origin_depth`); pass them down into a helper `fn` or copy needed bytes into a value/array"
@@ -223,10 +239,19 @@ impl DiagnosticKind {
                 "`const` globals and OS primitive endpoints cannot be reassigned directly; use a local variable or primitive methods (`.publish(val)`, `.post(ev)`)"
             }
             Self::InvalidControlFlow => {
-                "`break;` and `continue;` belong inside `loop`/`while`/`every`, and `spawn` belongs in sequential boot setup (`fn main()`)"
+                "`break;` and `continue;` belong inside loops, `restart;` belongs inside a `task`, and `defer` blocks cannot transfer control flow out of scope"
             }
             Self::InvalidOperation => {
                 "check Zev type/item constraints (`packed struct` holds wire-exact scalars only; `task` blueprints are instantiated via `spawn task_name(...)`)"
+            }
+            Self::UnreachableCode => {
+                "remove unreachable statements after `return`, `error`, `break`, `continue`, `restart`, `sys.exit`, or a non-breaking `loop` / `loop every`"
+            }
+            Self::NonDivergingTask => {
+                "tasks are permanent subsystem actors: run a steady-state `loop { ... }` or `loop every 10ms { ... }`, park on `inbox.recv()`/`signal.wait()`, use `restart;` to reset to entry, or move finite one-shot workflows into a yielding `fn`"
+            }
+            Self::InvalidSpawnContext => {
+                "`spawn` is only permitted during sequential boot in `fn main()` and non-loop, non-recursive boot-helper `fn`s called before `main()`'s supervisor loop"
             }
         }
     }
@@ -263,7 +288,7 @@ impl Diagnostic {
         self
     }
 
-    /// Stable error code (`"E0001"`..`"E0024"`).
+    /// Stable error code (`"E0001"`..`"E0027"`).
     pub const fn code(&self) -> &'static str {
         self.kind.code()
     }

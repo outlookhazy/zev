@@ -1,8 +1,10 @@
-//! Whole-program call graph, shortest-path yield call-chain inference, C-callback checks,
-//! and Tarjan SCC yielding-recursion cycle detection.
+//! Whole-program call graph, 3-tier `FnEffect` inference, dual-specialization reachability,
+//! shortest-path yield/spawn call-chain traces, C-callback checks, and Tarjan SCC cycle detection.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use zev_ast::Span;
+
+use crate::model::FnEffect;
 
 /// Kind of executable root/callable node in the call graph.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -13,12 +15,16 @@ pub enum CallableKind {
     Isr,
 }
 
-/// Restricted atomic context active at a call site.
+/// Restricted atomic or control-flow context active at a call site.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct CallContext {
     pub in_noyield: bool,
     pub in_critical: bool,
     pub in_isr: bool,
+    pub in_defer: bool,
+    pub in_loop: bool,
+    pub after_diverge: bool,
+    pub after_main_supervisor: bool,
 }
 
 /// Recorded call edge from `caller` to `callee` (`fn`).
@@ -45,15 +51,25 @@ pub struct CallNode {
     pub name: String,
     pub kind: CallableKind,
     pub direct_yield: bool,
+    pub direct_effect: FnEffect,
     pub direct_yield_reason: Option<String>,
+    pub direct_hard_yield_reason: Option<String>,
     pub can_yield: bool,
+    pub effect: FnEffect,
+    /// Transitive maximum effect across all outgoing edges (even across `noyield` blocks),
+    /// used to ensure `critical`, `isr`, `defer`, and `extern "C"` never invoke soft-yielding compute.
+    pub any_yield_effect: FnEffect,
+    pub direct_spawn_task: Option<String>,
+    pub spawns_in_boot: bool,
+    /// Shortest witness chain explaining why `spawns_in_boot` is true.
+    pub spawn_chain: Vec<String>,
     /// Shortest witness chain explaining why `can_yield` is true
     /// (e.g. `["log_fault()", "write_page()", "checkpoint() [yields here]"]`).
     pub yield_chain: Vec<String>,
     pub span: Span,
 }
 
-/// Whole-program call graph and yield-inference engine.
+/// Whole-program call graph and yield/boot-spawn inference engine.
 #[derive(Clone, Debug, Default)]
 pub struct CallGraph {
     pub nodes: BTreeMap<String, CallNode>,
@@ -73,27 +89,59 @@ impl CallGraph {
                 name,
                 kind,
                 direct_yield: false,
+                direct_effect: FnEffect::NonYielding,
                 direct_yield_reason: None,
+                direct_hard_yield_reason: None,
                 can_yield: false,
+                effect: FnEffect::NonYielding,
+                any_yield_effect: FnEffect::NonYielding,
+                direct_spawn_task: None,
+                spawns_in_boot: false,
+                spawn_chain: Vec::new(),
                 yield_chain: Vec::new(),
                 span,
             },
         );
     }
 
-    pub fn mark_direct_yield(&mut self, name: &str, reason: impl Into<String>) {
+    pub fn mark_direct_yield(&mut self, name: &str, tier: FnEffect, reason: impl Into<String>) {
+        if !tier.can_yield() {
+            return;
+        }
         if let Some(node) = self.nodes.get_mut(name) {
             if node.kind == CallableKind::ExternCFn {
                 return;
             }
+            let r = clean_yield_site_label(&reason.into());
             node.direct_yield = true;
+            node.direct_effect = node.direct_effect.max(tier);
+            node.effect = node.effect.max(tier);
+            node.any_yield_effect = node.any_yield_effect.max(tier);
             node.can_yield = true;
             if node.direct_yield_reason.is_none() {
-                let r = clean_yield_site_label(&reason.into());
                 node.direct_yield_reason = Some(r.clone());
                 node.yield_chain = vec![
                     format_callable_step(&node.name),
                     format!("{} [yields here]", r),
+                ];
+            }
+            if tier == FnEffect::HardBlocking && node.direct_hard_yield_reason.is_none() {
+                node.direct_hard_yield_reason = Some(r);
+            }
+        }
+    }
+
+    pub fn mark_direct_spawn(&mut self, name: &str, task_name: &str) {
+        if let Some(node) = self.nodes.get_mut(name) {
+            if node.kind == CallableKind::ExternCFn {
+                return;
+            }
+            node.spawns_in_boot = true;
+            if node.direct_spawn_task.is_none() {
+                node.direct_spawn_task = Some(task_name.to_string());
+                node.spawn_chain = vec![
+                    format_callable_step(&node.name),
+                    format!("spawn {}", task_name),
                 ];
             }
         }
@@ -107,23 +155,61 @@ impl CallGraph {
         self.extern_callbacks.push(site);
     }
 
-    /// Run fixed-point transitive `can_yield` inference across all functions and tasks,
-    /// then populate exact BFS shortest-hop `yield_chain` traces to a direct yield site.
-    /// `extern "C"` functions remain `can_yield = false`.
+    /// Run fixed-point 3-tier `FnEffect` and `spawns_in_boot` inference across all functions and tasks,
+    /// then populate shortest-hop `yield_chain` and `spawn_chain` traces.
+    /// `extern "C"` functions remain `NonYielding`.
     pub fn infer_yields(&mut self) {
+        for node in self.nodes.values_mut() {
+            if node.kind == CallableKind::ExternCFn {
+                node.effect = FnEffect::NonYielding;
+                node.any_yield_effect = FnEffect::NonYielding;
+                node.can_yield = false;
+            } else {
+                node.effect = node.direct_effect;
+                node.any_yield_effect = node.direct_effect;
+                node.can_yield = node.effect.can_yield();
+            }
+        }
+
+        // 1. Propagate coroutine `effect` (`SoftYielding` suppressed across `noyield` edges; `HardBlocking` always propagates)
+        //    and `any_yield_effect` (propagates across all edges for `critical`/`isr`/`defer`/`extern "C"` checks).
         loop {
             let mut changed = false;
             for edge in &self.edges {
-                let callee_yields = self
+                let Some((callee_eff, callee_any_eff, callee_spawns)) = self
                     .nodes
                     .get(&edge.callee)
-                    .is_some_and(|c| c.can_yield);
-                if callee_yields {
-                    if let Some(caller) = self.nodes.get_mut(&edge.caller) {
-                        if caller.kind != CallableKind::ExternCFn && !caller.can_yield {
-                            caller.can_yield = true;
-                            changed = true;
-                        }
+                    .map(|c| (c.effect, c.any_yield_effect, c.spawns_in_boot))
+                else {
+                    continue;
+                };
+
+                if let Some(caller) = self.nodes.get_mut(&edge.caller) {
+                    if caller.kind == CallableKind::ExternCFn {
+                        continue;
+                    }
+
+                    let edge_eff = match callee_eff {
+                        FnEffect::HardBlocking => FnEffect::HardBlocking,
+                        FnEffect::SoftYielding if !edge.ctx.in_noyield => FnEffect::SoftYielding,
+                        _ => FnEffect::NonYielding,
+                    };
+                    let next_eff = caller.effect.max(edge_eff);
+                    if next_eff != caller.effect {
+                        caller.effect = next_eff;
+                        caller.can_yield = next_eff.can_yield();
+                        changed = true;
+                    }
+
+                    let next_any = caller.any_yield_effect.max(callee_any_eff);
+                    if next_any != caller.any_yield_effect {
+                        caller.any_yield_effect = next_any;
+                        changed = true;
+                    }
+
+                    if callee_spawns && caller.kind == CallableKind::Fn && !caller.spawns_in_boot {
+                        caller.spawns_in_boot = true;
+                        changed = true;
                     }
                 }
             }
@@ -132,20 +218,113 @@ impl CallGraph {
             }
         }
 
-        // Compute shortest BFS witness chain from every yielding node down to a `direct_yield` leaf.
+        // 2. Populate shortest witness chains for `can_yield` and `spawns_in_boot`.
         let names: Vec<String> = self.nodes.keys().cloned().collect();
         for name in names {
-            if self.nodes.get(&name).is_some_and(|n| n.can_yield) {
+            let (needs_yield_chain, needs_spawn_chain) = self
+                .nodes
+                .get(&name)
+                .map(|n| (n.can_yield, n.spawns_in_boot))
+                .unwrap_or((false, false));
+            if needs_yield_chain {
                 let chain = self.shortest_yield_chain(&name);
                 if let Some(node) = self.nodes.get_mut(&name) {
                     node.yield_chain = chain;
                 }
             }
+            if needs_spawn_chain {
+                let sc = self.shortest_spawn_chain(&name);
+                if let Some(node) = self.nodes.get_mut(&name) {
+                    node.spawn_chain = sc;
+                }
+            }
         }
     }
 
-    /// Compute the shortest call-chain path from `start` down to a direct yield operation,
-    /// formatted as `["f1()", "f2()", "checkpoint() [yields here]"]`.
+    /// Compute `(soft_yielding_in_coro, soft_yielding_in_noyield, dual_specialized_fns)` via 2-state
+    /// `(node, Coro | NoYield)` reachability from `main`, all `task`s, and uncalled root `fn`s.
+    pub fn compute_soft_specializations(
+        &self,
+    ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+        #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        enum ExecMode {
+            Coro,
+            NoYield,
+        }
+
+        let mut has_incoming: BTreeSet<&str> = BTreeSet::new();
+        let mut adj: BTreeMap<&str, Vec<&CallEdge>> = BTreeMap::new();
+        for e in &self.edges {
+            if self.nodes.contains_key(&e.callee) {
+                has_incoming.insert(e.callee.as_str());
+                adj.entry(e.caller.as_str()).or_default().push(e);
+            }
+        }
+
+        let mut queue: VecDeque<(&str, ExecMode)> = VecDeque::new();
+        let mut visited: BTreeSet<(&str, ExecMode)> = BTreeSet::new();
+
+        for (name, node) in &self.nodes {
+            let is_root = match node.kind {
+                CallableKind::Task => true,
+                CallableKind::Fn => name == "main" || !has_incoming.contains(name.as_str()),
+                CallableKind::ExternCFn | CallableKind::Isr => false,
+            };
+            if is_root && visited.insert((name.as_str(), ExecMode::Coro)) {
+                queue.push_back((name.as_str(), ExecMode::Coro));
+            }
+        }
+
+        let mut soft_in_coro = BTreeSet::new();
+        let mut soft_in_noyield = BTreeSet::new();
+
+        while let Some((curr, mode)) = queue.pop_front() {
+            let Some(out_edges) = adj.get(curr) else {
+                continue;
+            };
+            for edge in out_edges {
+                // Calls inside `critical`, `isr`, or `defer` are illegal if yielding, never stack-specialized.
+                if edge.ctx.in_critical || edge.ctx.in_isr || edge.ctx.in_defer {
+                    continue;
+                }
+                let Some(callee_node) = self.nodes.get(&edge.callee) else {
+                    continue;
+                };
+                if callee_node.kind != CallableKind::Fn {
+                    continue;
+                }
+                let next_mode = if mode == ExecMode::NoYield || edge.ctx.in_noyield {
+                    ExecMode::NoYield
+                } else {
+                    ExecMode::Coro
+                };
+
+                if callee_node.effect == FnEffect::SoftYielding {
+                    match next_mode {
+                        ExecMode::Coro => {
+                            soft_in_coro.insert(callee_node.name.clone());
+                        }
+                        ExecMode::NoYield => {
+                            soft_in_noyield.insert(callee_node.name.clone());
+                        }
+                    }
+                }
+
+                if visited.insert((callee_node.name.as_str(), next_mode)) {
+                    queue.push_back((callee_node.name.as_str(), next_mode));
+                }
+            }
+        }
+
+        let dual_specialized: BTreeSet<String> = soft_in_coro
+            .intersection(&soft_in_noyield)
+            .cloned()
+            .collect();
+
+        (soft_in_coro, soft_in_noyield, dual_specialized)
+    }
+
+    /// Shortest call-chain path from `start` down to any active direct yield operation.
     pub fn shortest_yield_chain(&self, start: &str) -> Vec<String> {
         let Some(start_node) = self.nodes.get(start) else {
             return Vec::new();
@@ -164,13 +343,151 @@ impl CallGraph {
             ];
         }
 
-        // Build deterministic outgoing adjacency map.
+        self.bfs_yield_chain(
+            start,
+            |e, callee| {
+                callee.effect == FnEffect::HardBlocking
+                    || (callee.effect == FnEffect::SoftYielding && !e.ctx.in_noyield)
+            },
+            |n| n.direct_yield.then(|| n.direct_yield_reason.as_deref().unwrap_or("yield")),
+        )
+    }
+
+    /// Shortest call-chain path from `start` down to any direct yield (even through `noyield` wrappers),
+    /// used for `critical`, `isr`, `defer`, and `extern "C"` diagnostics.
+    pub fn shortest_any_yield_chain(&self, start: &str) -> Vec<String> {
+        let Some(start_node) = self.nodes.get(start) else {
+            return Vec::new();
+        };
+        if !start_node.any_yield_effect.can_yield() {
+            return Vec::new();
+        }
+        if start_node.direct_yield {
+            let site = start_node
+                .direct_yield_reason
+                .as_deref()
+                .unwrap_or("yield");
+            return vec![
+                format_callable_step(start),
+                format!("{} [yields here]", site),
+            ];
+        }
+
+        self.bfs_yield_chain(
+            start,
+            |_e, callee| callee.any_yield_effect.can_yield(),
+            |n| n.direct_yield.then(|| n.direct_yield_reason.as_deref().unwrap_or("yield")),
+        )
+    }
+
+    /// Shortest call-chain path from `start` down to a `HardBlocking` direct yield operation,
+    /// used when reporting `E0003` inside `noyield { ... }` (where `SoftYielding` calls are permitted).
+    pub fn shortest_hard_yield_chain(&self, start: &str) -> Vec<String> {
+        let Some(start_node) = self.nodes.get(start) else {
+            return Vec::new();
+        };
+        if start_node.effect != FnEffect::HardBlocking {
+            return Vec::new();
+        }
+        if start_node.direct_effect == FnEffect::HardBlocking {
+            let site = start_node
+                .direct_hard_yield_reason
+                .as_deref()
+                .or(start_node.direct_yield_reason.as_deref())
+                .unwrap_or("yield");
+            return vec![
+                format_callable_step(start),
+                format!("{} [yields here]", site),
+            ];
+        }
+
+        self.bfs_yield_chain(
+            start,
+            |_e, callee| callee.effect == FnEffect::HardBlocking,
+            |n| {
+                (n.direct_effect == FnEffect::HardBlocking).then(|| {
+                    n.direct_hard_yield_reason
+                        .as_deref()
+                        .or(n.direct_yield_reason.as_deref())
+                        .unwrap_or("yield")
+                })
+            },
+        )
+    }
+
+    /// Shortest call-chain path from `start` down to a `spawn` statement.
+    pub fn shortest_spawn_chain(&self, start: &str) -> Vec<String> {
+        let Some(start_node) = self.nodes.get(start) else {
+            return Vec::new();
+        };
+        if !start_node.spawns_in_boot {
+            return Vec::new();
+        }
+        if let Some(t) = &start_node.direct_spawn_task {
+            return vec![format_callable_step(start), format!("spawn {}", t)];
+        }
+
         let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for e in &self.edges {
-            if self.nodes.get(&e.callee).is_some_and(|n| n.can_yield) {
+            if self.nodes.get(&e.callee).is_some_and(|n| n.spawns_in_boot) {
                 adj.entry(e.caller.as_str())
                     .or_default()
                     .push(e.callee.as_str());
+            }
+        }
+        for list in adj.values_mut() {
+            list.sort_unstable();
+            list.dedup();
+        }
+
+        let mut queue: VecDeque<&str> = VecDeque::new();
+        let mut parent: BTreeMap<&str, &str> = BTreeMap::new();
+        let mut visited: BTreeSet<&str> = BTreeSet::new();
+        queue.push_back(start);
+        visited.insert(start);
+
+        while let Some(curr) = queue.pop_front() {
+            if let Some(neighbors) = adj.get(curr) {
+                for &nxt in neighbors {
+                    if !visited.insert(nxt) {
+                        continue;
+                    }
+                    parent.insert(nxt, curr);
+                    if let Some(nxt_node) = self.nodes.get(nxt) {
+                        if let Some(task_name) = &nxt_node.direct_spawn_task {
+                            let mut hops = vec![format_callable_step(nxt)];
+                            let mut p = nxt;
+                            while let Some(&prev) = parent.get(p) {
+                                hops.push(format_callable_step(prev));
+                                p = prev;
+                            }
+                            hops.reverse();
+                            hops.push(format!("spawn {}", task_name));
+                            return hops;
+                        }
+                    }
+                    queue.push_back(nxt);
+                }
+            }
+        }
+
+        vec![format_callable_step(start)]
+    }
+
+    fn bfs_yield_chain<'a>(
+        &'a self,
+        start: &'a str,
+        edge_ok: impl Fn(&CallEdge, &CallNode) -> bool,
+        leaf_site: impl Fn(&'a CallNode) -> Option<&'a str>,
+    ) -> Vec<String> {
+        let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for e in &self.edges {
+            if let Some(c) = self.nodes.get(&e.callee) {
+                if edge_ok(e, c) {
+                    adj.entry(e.caller.as_str())
+                        .or_default()
+                        .push(e.callee.as_str());
+                }
             }
         }
         for list in adj.values_mut() {
@@ -193,7 +510,7 @@ impl CallGraph {
                     }
                     parent.insert(nxt, curr);
                     if let Some(nxt_node) = self.nodes.get(nxt) {
-                        if nxt_node.direct_yield {
+                        if let Some(site) = leaf_site(nxt_node) {
                             let mut fn_hops = vec![format_callable_step(nxt)];
                             let mut p = nxt;
                             while let Some(&prev) = parent.get(p) {
@@ -201,10 +518,6 @@ impl CallGraph {
                                 p = prev;
                             }
                             fn_hops.reverse();
-                            let site = nxt_node
-                                .direct_yield_reason
-                                .as_deref()
-                                .unwrap_or("yield");
                             fn_hops.push(format!("{} [yields here]", site));
                             return fn_hops;
                         }
@@ -228,17 +541,36 @@ impl CallGraph {
         set.into_iter().collect()
     }
 
-    /// Distinct sorted yielding callees of `caller` (after `infer_yields`).
+    /// Distinct sorted yielding coroutine callees of `caller` (after `infer_yields`).
+    /// Excludes `SoftYielding` callees invoked exclusively inside `noyield { ... }`.
     pub fn yielding_callees_of(&self, caller: &str) -> Vec<String> {
-        self.callees_of(caller)
-            .into_iter()
-            .filter(|callee| self.nodes.get(callee).is_some_and(|n| n.can_yield))
-            .collect()
+        let mut set = BTreeSet::new();
+        for e in &self.edges {
+            if e.caller != caller {
+                continue;
+            }
+            if let Some(c) = self.nodes.get(&e.callee) {
+                let yields_at_edge = c.effect == FnEffect::HardBlocking
+                    || (c.effect == FnEffect::SoftYielding && !e.ctx.in_noyield);
+                if yields_at_edge {
+                    set.insert(e.callee.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
     }
 
     /// Detect all call-graph cycles containing at least one yielding function (`can_yield == true`).
-    /// Returns `(cycle_path, call_span)` pairs such as `(["a", "b", "a"], span)`.
     pub fn find_yielding_cycles(&self) -> Vec<(Vec<String>, Span)> {
+        self.find_cycles_matching(|n| n.can_yield)
+    }
+
+    /// Detect all call-graph cycles containing at least one boot-spawning function (`spawns_in_boot == true`).
+    pub fn find_spawning_cycles(&self) -> Vec<(Vec<String>, Span)> {
+        self.find_cycles_matching(|n| n.spawns_in_boot)
+    }
+
+    fn find_cycles_matching(&self, pred: impl Fn(&CallNode) -> bool) -> Vec<(Vec<String>, Span)> {
         let mut adj: BTreeMap<String, Vec<(String, Span)>> = BTreeMap::new();
         for name in self.nodes.keys() {
             adj.insert(name.clone(), Vec::new());
@@ -336,10 +668,10 @@ impl CallGraph {
                 continue;
             }
 
-            let has_yield = scc
+            let matches_pred = scc
                 .iter()
-                .any(|f| self.nodes.get(f).is_some_and(|n| n.can_yield));
-            if !has_yield {
+                .any(|f| self.nodes.get(f).is_some_and(&pred));
+            if !matches_pred {
                 continue;
             }
 

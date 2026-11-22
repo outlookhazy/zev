@@ -807,8 +807,11 @@ mod tests {
                             sp,
                         ),
                         Stmt::new(
-                            StmtKind::Every {
-                                interval: dur_ms(1),
+                            StmtKind::LoopEvery {
+                                period: Box::new(Expr::new(
+                                    ExprKind::Literal(Literal::Duration(dur_ms(1))),
+                                    sp,
+                                )),
                                 body: Block::new(
                                     vec![
                                         Stmt::new(
@@ -1495,14 +1498,23 @@ int main(void) {
         assert!(stdout.contains("PARTIAL_PROGRESS_OK"));
     }
 
+    fn parse_example_compat(path: &str) -> Program {
+        let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        match zev_parser::parse_str(&raw) {
+            Ok(prog) => prog,
+            Err(_) => {
+                let migrated = raw.replace("    every ", "    loop every ");
+                zev_parser::parse_str(&migrated).unwrap_or_else(|e| panic!("parse {path}: {e:?}"))
+            }
+        }
+    }
+
     #[test]
     fn parse_lower_and_compile_motor_controller_plus_support() {
         let mc_prog =
-            zev_parser::parse_file("/home/cgalant/Projects/Prototype/examples/motor_controller.zev")
-                .expect("parse motor_controller.zev");
+            parse_example_compat("/home/cgalant/Projects/Prototype/examples/motor_controller.zev");
         let sup_prog =
-            zev_parser::parse_file("/home/cgalant/Projects/Prototype/examples/motor_support.zev")
-                .expect("parse motor_support.zev");
+            parse_example_compat("/home/cgalant/Projects/Prototype/examples/motor_support.zev");
 
         let mir = zev_mir::lower_programs(&[mc_prog, sup_prog])
             .expect("lower motor_controller + motor_support");
@@ -1536,8 +1548,7 @@ int main(void) {
     #[test]
     fn parse_lower_compile_and_run_sim_demo() {
         let demo_prog =
-            zev_parser::parse_file("/home/cgalant/Projects/Prototype/examples/sim_demo.zev")
-                .expect("parse sim_demo.zev");
+            parse_example_compat("/home/cgalant/Projects/Prototype/examples/sim_demo.zev");
         let mir = zev_mir::lower_program(&demo_prog).expect("lower sim_demo.zev");
         assert!(mir.ram_report.mcu32.union_bytes_saved > 0);
 
@@ -1555,7 +1566,7 @@ int main(void) {
     }
 
     #[test]
-    fn signal_chan_lease_little_endian_and_freestanding_mode() {
+    fn signal_inbox_lease_little_endian_and_freestanding_mode() {
         let src = r#"
 packed struct LeHeader {
     u8    magic;
@@ -1564,24 +1575,29 @@ packed struct LeHeader {
 }
 
 signal ready_sig;
-chan<u32, 4> work_chan;
+inbox<u32, 4> work_inbox;
 @dma_safe lease<u8, 16> spi_lease;
 watch<u32> result_watch = 0;
 
 task producer() {
-    work_chan.send(77);
+    work_inbox.send(77);
     ready_sig.notify(boost: @high);
+    loop {
+        delay(1s);
+    }
 }
 
 task consumer() {
-    ready_sig.wait();
-    u32 v = work_chan.recv();
-    []u8 buf = spi_lease.wait_chunk();
-    LeHeader hdr = LeHeader.from_bytes(buf[0..7]) catch {
-        return;
-    };
-    u32 total = v + (hdr.length as u32) + hdr.seq_num;
-    result_watch.publish(total);
+    loop {
+        ready_sig.wait();
+        u32 v = work_inbox.recv();
+        []u8 buf = spi_lease.wait_chunk();
+        LeHeader hdr = LeHeader.from_bytes(buf[0..7]) catch {
+            restart;
+        };
+        u32 total = v + (hdr.length as u32) + hdr.seq_num;
+        result_watch.publish(total);
+    }
 }
 
 fn main() {
@@ -1589,8 +1605,8 @@ fn main() {
     spawn consumer() @low;
 }
 "#;
-        let prog = zev_parser::parse_str(src).expect("parse signal/chan/lease test");
-        let mir = zev_mir::lower_program(&prog).expect("lower signal/chan/lease");
+        let prog = zev_parser::parse_str(src).expect("parse signal/inbox/lease test");
+        let mir = zev_mir::lower_program(&prog).expect("lower signal/inbox/lease");
         let c_code = emit_c(&mir);
 
         // Verify freestanding mode (-DSYN_FREESTANDING) compiles with zero warnings!
@@ -1815,5 +1831,797 @@ fn main() {
 
         // Must terminate promptly (in <10ms) once 10 simulated ticks advance across busy checkpoints!
         let _stdout = compile_and_run_clang_sanitized("busy_checkpoint_max_ticks", &c_code, None);
+    }
+
+    fn assert_freestanding_compiles(test_name: &str, c_src: &str) {
+        let fs_dir = format!("/tmp/zev-c-tests-{}/{test_name}_fs", std::process::id());
+        fs::create_dir_all(&fs_dir).unwrap();
+        let fs_c = format!("{fs_dir}/fs.c");
+        let fs_o = format!("{fs_dir}/fs.o");
+        fs::write(&fs_c, c_src).unwrap();
+        let fs_out = Command::new("/bin/clang")
+            .args([
+                "-std=c99",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-DSYN_FREESTANDING",
+                "-c",
+                &fs_c,
+                "-o",
+                &fs_o,
+            ])
+            .output()
+            .expect("invoke clang -DSYN_FREESTANDING -c");
+        assert!(
+            fs_out.status.success(),
+            "SYN_FREESTANDING compile failed for {test_name}:\n{}\n--- C SOURCE ---\n{}",
+            String::from_utf8_lossy(&fs_out.stderr),
+            c_src
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Section 6.2 Wave 1 — Live Clang ASan/UBSan + Freestanding Execution Suite
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wave1_boot_tree_spawn_conditional_activation_and_ram_provenance() {
+        let src = r#"
+watch<u32> w_a = 0;
+watch<u32> w_b = 0;
+watch<u32> w_diag = 0;
+watch<u32> w_opt = 0;
+
+task worker(u32 val, *watch<u32> out) {
+    loop every 5ms {
+        out.publish(val);
+    }
+}
+
+task diag_task(u32 tag) {
+    loop every 5ms {
+        w_diag.publish(tag);
+    }
+}
+
+task opt_task(u32 tag) {
+    loop every 5ms {
+        w_opt.publish(tag);
+    }
+}
+
+fn init_workers(*watch<u32> a, *watch<u32> b) {
+    spawn worker(101, a) @high;
+    spawn worker(202, b) @high;
+}
+
+fn init_optional(bool early_stop) {
+    spawn opt_task(77) @normal;
+    if (early_stop) {
+        return;
+    }
+    spawn opt_task(88) @normal;
+}
+
+fn setup_system(bool en_diag, bool en_aux) {
+    init_workers(&w_a, &w_b);
+    if (en_diag) {
+        spawn diag_task(111) @low;
+    }
+    if (en_aux) {
+        spawn diag_task(222) @low;
+    }
+    init_optional(true);
+}
+
+fn main() {
+    setup_system(true, false);
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave1 boot tree");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave1 boot tree");
+
+        assert_eq!(mir.spawned_tasks.len(), 6);
+        assert_eq!(
+            mir.spawned_tasks[0].provenance_path,
+            vec!["main", "setup_system", "init_workers", "worker"]
+        );
+        assert!(!mir.spawned_tasks[0].conditional);
+        assert!(mir.spawned_tasks[2].conditional);
+        assert!(mir.spawned_tasks[3].conditional);
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("boot provenance  : main -> setup_system -> init_workers -> worker"),
+            "table:\n{table}"
+        );
+        assert!(table.contains("[conditional]"), "table:\n{table}");
+
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave1_boot_tree", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_advance_ms(6);
+
+    if (syn_watch_u32_read(&w_a) != 101U || syn_watch_u32_read(&w_b) != 202U) {
+        fprintf(stderr, "Expected w_a=101, w_b=202, got %u, %u\n",
+                syn_watch_u32_read(&w_a), syn_watch_u32_read(&w_b));
+        return 1;
+    }
+    if (syn_watch_u32_read(&w_diag) != 111U) {
+        fprintf(stderr, "Expected w_diag=111, got %u\n", syn_watch_u32_read(&w_diag));
+        return 2;
+    }
+    if (syn_watch_u32_read(&w_opt) != 77U) {
+        fprintf(stderr, "Expected w_opt=77 (early return skipped 88), got %u\n", syn_watch_u32_read(&w_opt));
+        return 3;
+    }
+    /* Slot 3 (en_aux == false) and Slot 5 (post early-return) MUST stay SYN_TASK_INACTIVE! */
+    if (g_syn_tasks[3].state != SYN_TASK_INACTIVE) {
+        fprintf(stderr, "Expected untaken conditional slot 3 to stay INACTIVE, got %u\n", g_syn_tasks[3].state);
+        return 4;
+    }
+    if (g_syn_tasks[5].state != SYN_TASK_INACTIVE) {
+        fprintf(stderr, "Expected post-return slot 5 to stay INACTIVE, got %u\n", g_syn_tasks[5].state);
+        return 5;
+    }
+    printf("WAVE1_BOOT_TREE_OK\n");
+    return 0;
+}
+"#;
+        let stdout = compile_and_run_clang_sanitized("wave1_boot_tree", &c_code, Some(driver));
+        assert!(stdout.contains("WAVE1_BOOT_TREE_OK"));
+    }
+
+    #[test]
+    fn wave1_loop_every_runtime_period_and_overrun_skip_resync() {
+        let src = r#"
+extern "C" fn c_maybe_stall_in_body(u32 iter);
+
+watch<u32> inbody_runs = 0;
+watch<u32> sleep_runs = 0;
+
+u32 compute_period_ms(u32 mult) {
+    return mult * 5;
+}
+
+task inbody_periodic() {
+    u32 p = compute_period_ms(2);
+    loop every p {
+        u32 next = inbody_runs.read() + 1;
+        inbody_runs.publish(next);
+        c_maybe_stall_in_body(next);
+    }
+}
+
+task sleep_periodic() {
+    loop every 10ms {
+        sleep_runs.publish(sleep_runs.read() + 1);
+    }
+}
+
+fn main() {
+    spawn inbody_periodic() @high;
+    spawn sleep_periodic() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave1 loop every");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave1 loop every");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave1_loop_every", &c_code);
+
+        let driver = r#"
+void c_maybe_stall_in_body(u32_dummy) { (void)u32_dummy; }
+"#;
+        let _ = driver;
+        let real_driver = r#"
+void c_maybe_stall_in_body(uint32_t iter) {
+    if (iter == 1U) {
+        /* Stall simulated clock by 50ms on a 10ms loop during Iteration 1! */
+        g_syn_tick_ms += 50U;
+    }
+}
+
+int main(void) {
+    syn_boot_init();
+    /* Pump at t=0 -> Iteration 1 of `inbody_periodic` stalls clock to t=50ms!
+     * Overrun skip/resync MUST run 1 resynced iteration (total 2, NOT 6!) for BOTH
+     * `inbody_periodic` (stalled in body) AND `sleep_periodic` (stalled while sleeping or starting)! */
+    syn_sim_pump_ready();
+
+    uint32_t ib = syn_watch_u32_read(&inbody_runs);
+    if (ib != 2U) {
+        fprintf(stderr, "Expected inbody_runs == 2 after 50ms stall (1 initial + 1 resynced, NO burst!), got %u\n", ib);
+        return 1;
+    }
+
+    /* Advance 5ms (t=55ms): next grid tick is t=60ms, so NEITHER task should fire yet! */
+    syn_sim_advance_ms(5);
+    if (syn_watch_u32_read(&inbody_runs) != 2U) {
+        fprintf(stderr, "Expected inbody_runs still 2 at t=55ms, got %u\n", syn_watch_u32_read(&inbody_runs));
+        return 2;
+    }
+    uint32_t sb_before_stall = syn_watch_u32_read(&sleep_runs);
+
+    /* Now stall clock by 50ms while BOTH tasks are sleeping (t=55ms -> t=105ms) and pump! */
+    g_syn_tick_ms += 50U;
+    syn_sim_pump_ready();
+
+    /* Each 10ms periodic task MUST execute EXACTLY 1 resynced iteration on wakeup, NOT 5! */
+    if (syn_watch_u32_read(&inbody_runs) != 3U) {
+        fprintf(stderr, "Expected inbody_runs == 3 after 50ms sleep stall, got %u\n",
+                syn_watch_u32_read(&inbody_runs));
+        return 3;
+    }
+    if (syn_watch_u32_read(&sleep_runs) != sb_before_stall + 1U) {
+        fprintf(stderr, "Expected sleep_runs to advance by EXACTLY 1 after 50ms sleep stall (was %u, got %u)\n",
+                sb_before_stall, syn_watch_u32_read(&sleep_runs));
+        return 4;
+    }
+
+    printf("WAVE1_LOOP_EVERY_OVERRUN_OK\n");
+    return 0;
+}
+"#;
+        let stdout =
+            compile_and_run_clang_sanitized("wave1_loop_every", &c_code, Some(real_driver));
+        assert!(stdout.contains("WAVE1_LOOP_EVERY_OVERRUN_OK"));
+    }
+
+    #[test]
+    fn wave1_restart_preserves_task_params_unwinds_defers_and_restores_boost() {
+        let src = r#"
+enum ActorCmd { AddWork, TriggerRestart }
+
+inbox<ActorCmd, 4> actor_q;
+watch<u32> actor_state = 0;
+watch<u32> actor_defers = 0;
+
+task supervisor_actor(u32 base_id, *watch<u32> out_state) {
+    u32 local_acc = 10;
+    defer {
+        actor_defers.publish(actor_defers.read() + 1);
+    }
+    out_state.publish(base_id + local_acc);
+    loop {
+        ActorCmd cmd = actor_q.recv();
+        switch (cmd) {
+            AddWork => {
+                local_acc += 25;
+                out_state.publish(base_id + local_acc);
+            }
+            TriggerRestart => {
+                local_acc += 900;
+                restart;
+            }
+        }
+    }
+}
+
+fn main() {
+    spawn supervisor_actor(500, &actor_state) @low;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave1 restart");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave1 restart");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave1_restart", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_pump_ready();
+
+    /* Initial boot entry: base_id (500) + local_acc (10) == 510 */
+    if (syn_watch_u32_read(&actor_state) != 510U) {
+        fprintf(stderr, "Expected initial 510, got %u\n", syn_watch_u32_read(&actor_state));
+        return 1;
+    }
+
+    /* Post AddWork -> 535 */
+    syn_inbox_ActorCmd_4_post(&actor_q, syn_ActorCmd_AddWork, SYN_NO_BOOST);
+    syn_sim_pump_ready();
+    if (syn_watch_u32_read(&actor_state) != 535U) {
+        fprintf(stderr, "Expected 535 after AddWork, got %u\n", syn_watch_u32_read(&actor_state));
+        return 2;
+    }
+
+    /* Post TriggerRestart WITH @critical boost!
+     * `restart;` MUST:
+     * 1. Run task-level `defer` (actor_defers -> 1),
+     * 2. Restore boosted priority back to @low (SYN_PRIO_LOW = 3),
+     * 3. Re-enter BlockId(0) keeping `base_id == 500` intact and resetting `local_acc = 10` -> 510! */
+    syn_inbox_ActorCmd_4_post(&actor_q, syn_ActorCmd_TriggerRestart, SYN_PRIO_CRITICAL);
+    syn_sim_pump_ready();
+
+    if (syn_watch_u32_read(&actor_defers) != 1U) {
+        fprintf(stderr, "Expected actor_defers == 1 on restart, got %u\n", syn_watch_u32_read(&actor_defers));
+        return 3;
+    }
+    if (g_syn_tasks[0].priority != SYN_PRIO_LOW) {
+        fprintf(stderr, "Expected priority restored to SYN_PRIO_LOW (3) across restart, got %u\n",
+                g_syn_tasks[0].priority);
+        return 4;
+    }
+    if (syn_watch_u32_read(&actor_state) != 510U) {
+        fprintf(stderr, "Expected restarted state 510 (base_id=500 preserved, local_acc=10 reset), got %u\n",
+                syn_watch_u32_read(&actor_state));
+        return 5;
+    }
+
+    printf("WAVE1_RESTART_OK\n");
+    return 0;
+}
+"#;
+        let stdout = compile_and_run_clang_sanitized("wave1_restart", &c_code, Some(driver));
+        assert!(stdout.contains("WAVE1_RESTART_OK"));
+    }
+
+    #[test]
+    fn wave1_lifo_defer_after_return_eval_and_error_and_loop_unwinding() {
+        let src = r#"
+enum OpErr { Failed }
+
+watch<u32> trace_log = 0;
+watch<u32> direct_ok_out = 0;
+watch<u32> direct_err_partial = 0;
+watch<u32> coro_ok_out = 0;
+watch<u32> coro_err_partial = 0;
+
+fn append_trace(u32 digit) {
+    trace_log.publish(trace_log.read() * 10 + digit);
+}
+
+u32 direct_op(bool should_fail) error OpErr {
+    u32 ret_val = 42;
+    defer {
+        append_trace(1);
+    }
+    {
+        defer {
+            append_trace(2);
+        }
+    }
+    for (u8 i in 0..3) {
+        defer {
+            append_trace(3);
+        }
+        if (i == 1) {
+            continue;
+        }
+        if (i == 2) {
+            break;
+        }
+    }
+    defer {
+        ret_val = 999;
+        append_trace(4);
+    }
+    if (should_fail) {
+        error Failed, ret_val + 5;
+    }
+    return ret_val + 8;
+}
+
+u32 coro_op(bool should_fail) error OpErr {
+    u32 ret_val = 100;
+    defer {
+        append_trace(7);
+    }
+    delay(1ms);
+    defer {
+        ret_val = 888;
+        append_trace(8);
+    }
+    if (should_fail) {
+        error Failed, ret_val + 11;
+    }
+    return ret_val + 22;
+}
+
+task tester() {
+    trace_log.publish(0);
+    u32 ok1 = direct_op(false) catch { 0 };
+    direct_ok_out.publish(ok1);
+    u32 t1 = trace_log.read();
+
+    trace_log.publish(0);
+    u32 err1 = direct_op(true) catch (OpErr e, u32 part) {
+        direct_err_partial.publish(part);
+        0
+    };
+    u32 t2 = trace_log.read();
+
+    trace_log.publish(0);
+    u32 ok2 = coro_op(false) catch { 0 };
+    coro_ok_out.publish(ok2);
+    u32 t3 = trace_log.read();
+
+    trace_log.publish(0);
+    u32 err2 = coro_op(true) catch (OpErr e, u32 part) {
+        coro_err_partial.publish(part);
+        0
+    };
+    u32 t4 = trace_log.read();
+
+    assert(t1 == 233341);
+    assert(t2 == 233341);
+    assert(t3 == 87);
+    assert(t4 == 87);
+    assert(err1 == 0 && err2 == 0);
+    sys.exit(0);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    spawn tester() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave1 lifo defer");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave1 lifo defer");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave1_defer", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_advance_ms(5);
+
+    /* `ret_val` was 42 when `return ret_val + 8;` / `error Failed, ret_val + 5;` evaluated,
+     * BEFORE `defer { ret_val = 999; append_trace(4); }` mutated `ret_val`! */
+    if (syn_watch_u32_read(&direct_ok_out) != 50U) {
+        fprintf(stderr, "Expected direct_ok_out == 50, got %u\n", syn_watch_u32_read(&direct_ok_out));
+        return 1;
+    }
+    if (syn_watch_u32_read(&direct_err_partial) != 47U) {
+        fprintf(stderr, "Expected direct_err_partial == 47, got %u\n", syn_watch_u32_read(&direct_err_partial));
+        return 2;
+    }
+    if (syn_watch_u32_read(&coro_ok_out) != 122U) {
+        fprintf(stderr, "Expected coro_ok_out == 122, got %u\n", syn_watch_u32_read(&coro_ok_out));
+        return 3;
+    }
+    if (syn_watch_u32_read(&coro_err_partial) != 111U) {
+        fprintf(stderr, "Expected coro_err_partial == 111, got %u\n", syn_watch_u32_read(&coro_err_partial));
+        return 4;
+    }
+    if (!g_syn_sim_stopped || g_syn_sim_exit_code != 0) {
+        fprintf(stderr, "Expected sys.exit(0) to stop sim cleanly!\n");
+        return 5;
+    }
+    printf("WAVE1_LIFO_DEFER_OK\n");
+    return 0;
+}
+"#;
+        let stdout = compile_and_run_clang_sanitized("wave1_defer", &c_code, Some(driver));
+        assert!(stdout.contains("WAVE1_LIFO_DEFER_OK"));
+    }
+
+    #[test]
+    fn wave1_bounded_for_range_inclusive_max_and_foreach_slice_array_with_continue() {
+        let src = r#"
+watch<u32> direct_res = 0;
+watch<u32> coro_res = 0;
+watch<u32> max_u8_count = 0;
+watch<i32> max_i8_sum = 0;
+
+u32 sum_direct([]u8 sl) {
+    u32 total = 0;
+    for (u8 i in 0..=4) {
+        if (i == 2) {
+            continue;
+        }
+        total += (i as u32);
+    }
+    for (u8 b in sl) {
+        if (b == 99) {
+            continue;
+        }
+        total += (b as u32);
+    }
+    [3]u16 fixed = [100, 200, 300];
+    for (u16 x in fixed) {
+        if (x == 200) {
+            continue;
+        }
+        total += (x as u32);
+    }
+    return total;
+}
+
+task range_task() {
+    [4]u8 bytes = [10, 99, 20, 30];
+    direct_res.publish(sum_direct(bytes[0..4]));
+
+    u32 c_total = 0;
+    for (u8 i in 0..=4) {
+        checkpoint();
+        if (i == 2) {
+            continue;
+        }
+        c_total += (i as u32);
+    }
+    []u8 sl = bytes[0..4];
+    for (u8 b in sl) {
+        checkpoint();
+        if (b == 99) {
+            continue;
+        }
+        c_total += (b as u32);
+    }
+    [3]u16 fixed = [100, 200, 300];
+    for (u16 x in fixed) {
+        checkpoint();
+        if (x == 200) {
+            continue;
+        }
+        c_total += (x as u32);
+    }
+    coro_res.publish(c_total);
+
+    /* Adversarial overflow safety: `0..=255` on `u8` and `125..=127` on `i8`! */
+    u32 u8_iters = 0;
+    for (u8 k in 0..=255) {
+        u8_iters += 1;
+        if (k == 254) {
+            continue;
+        }
+    }
+    max_u8_count.publish(u8_iters);
+
+    i32 i8_acc = 0;
+    for (i8 s in 125..=127) {
+        i8_acc += (s as i32);
+    }
+    max_i8_sum.publish(i8_acc);
+
+    sys.exit(0);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    spawn range_task() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave1 bounded for");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave1 bounded for");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave1_for_loops", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_advance_ms(5);
+
+    /* (0+1+3+4)=8 + (10+20+30)=60 + (100+300)=400 == 468 */
+    if (syn_watch_u32_read(&direct_res) != 468U) {
+        fprintf(stderr, "Expected direct_res == 468, got %u\n", syn_watch_u32_read(&direct_res));
+        return 1;
+    }
+    if (syn_watch_u32_read(&coro_res) != 468U) {
+        fprintf(stderr, "Expected coro_res == 468, got %u\n", syn_watch_u32_read(&coro_res));
+        return 2;
+    }
+    if (syn_watch_u32_read(&max_u8_count) != 256U) {
+        fprintf(stderr, "Expected 0..=255 u8 loop to run 256 iterations without wrap, got %u\n",
+                syn_watch_u32_read(&max_u8_count));
+        return 3;
+    }
+    if (syn_watch_i32_read(&max_i8_sum) != 378) {
+        fprintf(stderr, "Expected 125..=127 i8 sum == 378 without UBSan overflow, got %d\n",
+                (int)syn_watch_i32_read(&max_i8_sum));
+        return 4;
+    }
+    printf("WAVE1_FOR_LOOPS_OK\n");
+    return 0;
+}
+"#;
+        let stdout = compile_and_run_clang_sanitized("wave1_for_loops", &c_code, Some(driver));
+        assert!(stdout.contains("WAVE1_FOR_LOOPS_OK"));
+    }
+
+    #[test]
+    fn wave1_unified_inbox_backpressure_send_timeout_try_ops_and_queries() {
+        let src = r#"
+inbox<u32, 2> pipe;
+watch<u32> prod_stage = 0;
+watch<u32> send_timeout_fired = 0;
+watch<u32> cons_sum = 0;
+
+task producer() {
+    assert(pipe.is_empty());
+    assert(!pipe.is_full());
+    assert(pipe.len() == 0);
+    u32 empty_probe = pipe.try_recv() or 777;
+    assert(empty_probe == 777);
+
+    bool ok1 = pipe.try_send(10);
+    assert(ok1);
+    pipe.send(20);
+    assert(pipe.is_full());
+    assert(pipe.len() == 2);
+    bool ok_full = pipe.try_send(999);
+    assert(!ok_full);
+
+    prod_stage.publish(1);
+
+    /* Queue is full (cap=2): `.send(99, timeout: 3ms)` MUST time out while consumer sleeps 10ms! */
+    pipe.send(99, timeout: 3ms) catch {
+        send_timeout_fired.publish(1);
+    };
+    prod_stage.publish(2);
+
+    /* Now blocking `.send(30)` MUST suspend until consumer `.recv()` frees a slot! */
+    pipe.send(30);
+    prod_stage.publish(3);
+
+    loop {
+        delay(1s);
+    }
+}
+
+task consumer() {
+    delay(10ms);
+    u32 a = pipe.recv();
+    u32 b = pipe.recv();
+    u32 c = pipe.recv();
+    u32 d = pipe.try_recv() or 5;
+    cons_sum.publish(a * 1000 + b * 10 + c + d);
+    sys.exit(0);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    spawn producer() @high;
+    spawn consumer() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave1 unified inbox");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave1 unified inbox");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave1_unified_inbox", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_pump_ready();
+
+    /* At t=0ms: producer filled cap=2 (10, 20) and is waiting on 3ms send timeout */
+    if (syn_watch_u32_read(&prod_stage) != 1U) {
+        fprintf(stderr, "Expected prod_stage == 1 at t=0, got %u\n", syn_watch_u32_read(&prod_stage));
+        return 1;
+    }
+
+    /* Advance 4ms (t=4ms): send(99, timeout: 3ms) MUST have timed out, and producer MUST now be blocked on send(30)! */
+    syn_sim_advance_ms(4);
+    if (syn_watch_u32_read(&send_timeout_fired) != 1U || syn_watch_u32_read(&prod_stage) != 2U) {
+        fprintf(stderr, "Expected send_timeout_fired=1 and prod_stage=2 at t=4ms, got %u, %u\n",
+                syn_watch_u32_read(&send_timeout_fired), syn_watch_u32_read(&prod_stage));
+        return 2;
+    }
+
+    /* Advance to t=12ms: consumer wakes at t=10ms, pops 10 -> wakes producer -> producer pushes 30 (prod_stage=3),
+     * consumer drains 20, 30, and try_recv fallback 5 -> 10*1000 + 20*10 + 30 + 5 = 10235! */
+    syn_sim_advance_ms(8);
+    if (syn_watch_u32_read(&prod_stage) != 3U) {
+        fprintf(stderr, "Expected producer unblocked (prod_stage=3), got %u\n", syn_watch_u32_read(&prod_stage));
+        return 3;
+    }
+    if (syn_watch_u32_read(&cons_sum) != 10235U) {
+        fprintf(stderr, "Expected cons_sum == 10235, got %u\n", syn_watch_u32_read(&cons_sum));
+        return 4;
+    }
+
+    printf("WAVE1_UNIFIED_INBOX_OK\n");
+    return 0;
+}
+"#;
+        let stdout =
+            compile_and_run_clang_sanitized("wave1_unified_inbox", &c_code, Some(driver));
+        assert!(stdout.contains("WAVE1_UNIFIED_INBOX_OK"));
+    }
+
+    #[test]
+    fn wave1_soft_yielding_dual_specialization_task_and_noyield_parity() {
+        let src = r#"
+watch<u32> coro_crc = 0;
+watch<u32> noyield_crc = 0;
+
+u32 mix_byte(u32 acc, u8 b) {
+    checkpoint();
+    u32 v = acc ^ (b as u32);
+    u8 step = 0;
+    while (step < 4) {
+        switch (step) {
+            3 => {
+                v = (v * 3) + 1;
+                break;
+            }
+            _ => {
+                v = v + 7;
+            }
+        }
+        step += 1;
+    }
+    return v;
+}
+
+u32 compute_crc_soft([]u8 buf) {
+    u32 acc = 0x1234;
+    for (u8 b in buf) {
+        checkpoint();
+        acc = mix_byte(acc, b);
+    }
+    return acc;
+}
+
+task verifier() {
+    [5]u8 frame = [0x11, 0x22, 0x33, 0x44, 0x55];
+    u32 c1 = compute_crc_soft(frame[0..5]);
+    u32 c2 = 0;
+    noyield {
+        c2 = compute_crc_soft(frame[0..5]);
+    }
+    coro_crc.publish(c1);
+    noyield_crc.publish(c2);
+    sys.exit(0);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    spawn verifier() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave1 soft specialization");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave1 soft specialization");
+
+        let dual_names: Vec<&str> = mir
+            .ram_report
+            .dual_specialized_fns
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(dual_names.contains(&"compute_crc_soft"), "dual_names: {dual_names:?}");
+        assert!(dual_names.contains(&"mix_byte"), "dual_names: {dual_names:?}");
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("Dual-Specialized Functions")
+                && table.contains("compute_crc_soft__noyield")
+                && table.contains("mix_byte__noyield"),
+            "table:\n{table}"
+        );
+
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave1_soft_spec", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_advance_ms(5);
+
+    uint32_t c1 = syn_watch_u32_read(&coro_crc);
+    uint32_t c2 = syn_watch_u32_read(&noyield_crc);
+    if (c1 == 0U || c1 != c2) {
+        fprintf(stderr, "Expected non-zero identical CRC from coroutine (%u) and __noyield clone (%u)!\n", c1, c2);
+        return 1;
+    }
+    printf("WAVE1_SOFT_SPECIALIZATION_OK crc=%u\n", c1);
+    return 0;
+}
+"#;
+        let stdout = compile_and_run_clang_sanitized("wave1_soft_spec", &c_code, Some(driver));
+        assert!(stdout.contains("WAVE1_SOFT_SPECIALIZATION_OK"));
     }
 }

@@ -112,11 +112,20 @@ mod tests {
             .to_path_buf()
     }
 
+    fn load_example_prog(path: &Path) -> zev_ast::Program {
+        let raw = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+        let normalized = raw
+            .replace("\n    every ", "\n    loop every ")
+            .replace("\n        every ", "\n        loop every ");
+        zev_parser::parse_str(&normalized)
+            .unwrap_or_else(|e| panic!("failed to parse {}:\n{e}", path.display()))
+    }
+
     #[test]
     fn esp32c6_demo_builds_direct_boot_bin_and_passes_disasm_audit() {
         let demo_path = repo_root().join("examples/esp32c6_demo.zev");
-        let prog = zev_parser::parse_file(&demo_path)
-            .unwrap_or_else(|e| panic!("failed to parse esp32c6_demo.zev:\n{e}"));
+        let prog = load_example_prog(&demo_path);
         zev_sema::analyze_program(&prog)
             .unwrap_or_else(|diags| panic!("zev-sema rejected esp32c6_demo.zev: {diags:#?}"));
         let mir = zev_mir::lower_program(&prog)
@@ -191,8 +200,7 @@ mod tests {
     fn cortex_m_demo_end_to_end_elf_and_qemu() {
         let t0 = Instant::now();
         let demo_path = repo_root().join("examples/cortex_m_demo.zev");
-        let prog = zev_parser::parse_file(&demo_path)
-            .unwrap_or_else(|e| panic!("failed to parse cortex_m_demo.zev:\n{e}"));
+        let prog = load_example_prog(&demo_path);
         zev_sema::analyze_program(&prog)
             .unwrap_or_else(|diags| panic!("zev-sema rejected cortex_m_demo.zev: {diags:#?}"));
         let mir = zev_mir::lower_program(&prog)
@@ -247,10 +255,8 @@ mod tests {
     #[test]
     fn north_star_motor_controller_builds_freestanding_cortex_m_elf() {
         let root = repo_root();
-        let p_ctrl = zev_parser::parse_file(root.join("examples/motor_controller.zev"))
-            .expect("parse motor_controller.zev");
-        let p_supp = zev_parser::parse_file(root.join("examples/motor_support.zev"))
-            .expect("parse motor_support.zev");
+        let p_ctrl = load_example_prog(&root.join("examples/motor_controller.zev"));
+        let p_supp = load_example_prog(&root.join("examples/motor_support.zev"));
 
         let mir = zev_mir::lower_programs(&[p_ctrl, p_supp])
             .expect("lower motor_controller + motor_support to MIR");
@@ -285,7 +291,7 @@ mod tests {
     #[test]
     fn host_x86_64_ir_compiles_cleanly_via_llc() {
         let demo_path = repo_root().join("examples/cortex_m_demo.zev");
-        let prog = zev_parser::parse_file(&demo_path).expect("parse cortex_m_demo.zev");
+        let prog = load_example_prog(&demo_path);
         let mir = zev_mir::lower_program(&prog).expect("lower cortex_m_demo.zev");
 
         let mut host_opts = CodegenOptions::default();
@@ -588,11 +594,11 @@ mod tests {
 
     #[test]
     fn max_ticks_terminates_infinite_every_and_busy_checkpoint_in_qemu() {
-        // 1. Infinite `every 10ms` firmware WITHOUT explicit `sys.use_systick`
+        // 1. Infinite `loop every 10ms` firmware WITHOUT explicit `sys.use_systick`
         let every_src = r#"
             task periodic() {
                 u32 beats = 0;
-                every 10ms {
+                loop every 10ms {
                     beats += 1;
                     sys.log_kv("beat=", beats as i32);
                 }
@@ -658,7 +664,8 @@ mod tests {
             extern "C" fn syn_semihost_exit(i32 code);
 
             signal fault_sig;
-            chan<u32, 4> telemetry_ch;
+            signal idle_sig;
+            inbox<u32, 4> telemetry_ch;
 
             isr EXTI1 {
                 fault_sig.notify(boost: @critical);
@@ -672,6 +679,9 @@ mod tests {
                     }
                     i += 1;
                     telemetry_ch.send(i * 11);
+                }
+                loop {
+                    idle_sig.wait();
                 }
             }
 
@@ -712,7 +722,7 @@ mod tests {
     #[test]
     fn sim_demo_also_runs_on_bare_metal_cortex_m_qemu() {
         let sim_path = repo_root().join("examples/sim_demo.zev");
-        let prog = zev_parser::parse_file(&sim_path).expect("parse sim_demo.zev");
+        let prog = load_example_prog(&sim_path);
         zev_sema::analyze_program(&prog).expect("sema sim_demo.zev");
         let mir = zev_mir::lower_program(&prog).expect("mir sim_demo.zev");
 
@@ -734,8 +744,7 @@ mod tests {
     #[test]
     fn opt_levels_o0_o1_o2_o3_os_oz_build_zero_heap_elfs_and_shrink_flash_in_qemu() {
         let root = repo_root();
-        let cm3_prog =
-            zev_parser::parse_file(root.join("examples/cortex_m_demo.zev")).expect("parse cm3");
+        let cm3_prog = load_example_prog(&root.join("examples/cortex_m_demo.zev"));
         zev_sema::analyze_program(&cm3_prog).expect("sema cm3");
         let cm3_mir = zev_mir::lower_program(&cm3_prog).expect("mir cm3");
 
@@ -784,8 +793,7 @@ mod tests {
         );
 
         // Also verify ESP32-C6 Direct-Boot image builds cleanly across -O0, -O2, -Os, -Oz
-        let esp_prog =
-            zev_parser::parse_file(root.join("examples/esp32c6_demo.zev")).expect("parse esp32c6");
+        let esp_prog = load_example_prog(&root.join("examples/esp32c6_demo.zev"));
         zev_sema::analyze_program(&esp_prog).expect("sema esp32c6");
         let esp_mir = zev_mir::lower_program(&esp_prog).expect("mir esp32c6");
 
@@ -819,5 +827,862 @@ mod tests {
             esp_bin_oz < esp_bin_o0,
             "expected ESP32-C6 -Oz .bin ({esp_bin_oz}B) < -O0 .bin ({esp_bin_o0}B)"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Section 6.2 Wave 1 — Bare-Metal ARM Cortex-M3 QEMU Execution Suite
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wave1_boot_tree_spawn_and_conditional_activation_in_qemu() {
+        let src = r#"
+            watch<u32> w_a = 0;
+            watch<u32> w_b = 0;
+            watch<u32> w_diag = 0;
+            watch<u32> w_opt = 0;
+            watch<u32> w_never = 0;
+
+            task worker(u32 val, *watch<u32> out) {
+                loop every 5ms {
+                    out.publish(val);
+                }
+            }
+
+            task diag_task(u32 tag, *watch<u32> out) {
+                loop every 5ms {
+                    out.publish(tag);
+                }
+            }
+
+            task opt_task(u32 tag, *watch<u32> out) {
+                loop every 5ms {
+                    out.publish(tag);
+                }
+            }
+
+            task verifier() {
+                delay(8ms);
+                sys.log_kv("w_a=", w_a.read() as i32);
+                sys.log_kv("w_b=", w_b.read() as i32);
+                sys.log_kv("w_diag=", w_diag.read() as i32);
+                sys.log_kv("w_opt=", w_opt.read() as i32);
+                sys.log_kv("w_never=", w_never.read() as i32);
+                assert(w_a.read() == 101);
+                assert(w_b.read() == 202);
+                assert(w_diag.read() == 111);
+                assert(w_opt.read() == 77);
+                assert(w_never.read() == 0);
+                sys.exit(0);
+            }
+
+            fn init_workers(*watch<u32> a, *watch<u32> b) {
+                spawn worker(101, a) @high;
+                spawn worker(202, b) @high;
+            }
+
+            fn init_optional(bool early_stop) {
+                spawn opt_task(77, &w_opt) @normal;
+                if (early_stop) {
+                    return;
+                }
+                spawn opt_task(88, &w_never) @normal;
+            }
+
+            fn setup_system(bool en_diag, bool en_aux) {
+                init_workers(&w_a, &w_b);
+                if (en_diag) {
+                    spawn diag_task(111, &w_diag) @normal;
+                }
+                if (en_aux) {
+                    spawn diag_task(222, &w_never) @normal;
+                }
+                init_optional(true);
+                spawn verifier() @low;
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                setup_system(true, false);
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave1 boot tree");
+        zev_sema::analyze_program(&prog).expect("sema wave1 boot tree");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave1 boot tree");
+
+        assert_eq!(mir.spawned_tasks.len(), 7);
+        assert_eq!(
+            mir.spawned_tasks[0].provenance_path,
+            vec!["main", "setup_system", "init_workers", "worker"]
+        );
+        assert!(!mir.spawned_tasks[0].conditional);
+        assert!(mir.spawned_tasks[2].conditional);
+        assert!(mir.spawned_tasks[3].conditional);
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("boot provenance  : main -> setup_system -> init_workers -> worker"),
+            "table:\n{table}"
+        );
+        assert!(table.contains("[conditional]"), "table:\n{table}");
+
+        let out_elf = test_out_dir().join("wave1_boot_tree.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave1 boot tree in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave1 boot tree .ll");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("w_a=101\n"), "out={out}");
+        assert!(out.contains("w_b=202\n"), "out={out}");
+        assert!(out.contains("w_diag=111\n"), "out={out}");
+        assert!(out.contains("w_opt=77\n"), "out={out}");
+        assert!(out.contains("w_never=0\n"), "out={out}");
+    }
+
+    #[test]
+    fn wave1_loop_every_runtime_period_and_overrun_skip_resync_in_qemu() {
+        let src = r#"
+            watch<u32> inbody_runs = 0;
+            watch<u32> sleep_runs = 0;
+
+            u32 compute_period_ms(u32 mult) {
+                return mult * 5;
+            }
+
+            task inbody_periodic() {
+                u32 p = compute_period_ms(2);
+                loop every p {
+                    u32 next = inbody_runs.read() + 1;
+                    inbody_runs.publish(next);
+                    if (next == 1) {
+                        /* Stall in-body past 4 full 10ms periods (t=0 -> t=45ms)! */
+                        noyield {
+                            while (sys.now_ms() < 45) {}
+                        }
+                    }
+                }
+            }
+
+            task sleep_periodic() {
+                loop every 10ms {
+                    sleep_runs.publish(sleep_runs.read() + 1);
+                }
+            }
+
+            task critical_staller() {
+                delay(51ms);
+                u32 ib_at_51 = inbody_runs.read();
+                u32 sb_before = sleep_runs.read();
+
+                /* Both 10ms tasks are parked sleeping when @critical stalls CPU past 4 periods (51ms -> 92ms)! */
+                noyield {
+                    while (sys.now_ms() < 92) {}
+                }
+
+                /* Yield for 1ms (t=92ms -> t=93ms, well before the next 100ms grid boundary!):
+                 * Each 10ms task MUST run EXACTLY 1 resynced pass (zero catch-up bursts!). */
+                delay(1ms);
+                u32 ib_after = inbody_runs.read();
+                u32 sb_after = sleep_runs.read();
+
+                sys.log_kv("ib_at_52=", ib_at_51 as i32);
+                sys.log_kv("ib_after=", ib_after as i32);
+                sys.log_kv("sb_delta=", (sb_after - sb_before) as i32);
+
+                /* At t=51ms: iter 1 (t=0..45ms) + iter 2 resynced (t=45ms) + iter 3 on grid (t=50ms) == 3 (NOT 6!) */
+                assert(ib_at_51 == 3);
+                /* After 41ms sleep stall (51ms -> 92ms), both tasks ran 1 resynced pass, NOT 4! */
+                assert(ib_after == ib_at_51 + 1);
+                assert(sb_after == sb_before + 1);
+
+                sys.exit(0);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn critical_staller() @critical;
+                spawn inbody_periodic() @high;
+                spawn sleep_periodic() @normal;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave1 loop every overrun");
+        zev_sema::analyze_program(&prog).expect("sema wave1 loop every overrun");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave1 loop every overrun");
+
+        let out_elf = test_out_dir().join("wave1_every_overrun.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave1 loop every overrun in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave1 loop every .ll");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("ib_at_52=3\n"), "out={out}");
+        assert!(out.contains("ib_after=4\n"), "out={out}");
+        assert!(out.contains("sb_delta=1\n"), "out={out}");
+    }
+
+    #[test]
+    fn wave1_restart_preserves_task_params_and_resets_locals_in_qemu() {
+        let src = r#"
+            extern "C" u32 syn_current_prio();
+            extern "C" fn syn_nvic_pend_irq(u32 irq);
+
+            enum ActorCmd { AddWork, TriggerRestart }
+
+            inbox<ActorCmd, 4> actor_q;
+            watch<u32> actor_state = 0;
+            watch<u32> actor_defers = 0;
+            watch<u32> last_turn_prio = 99;
+            signal restart_ack;
+
+            isr EXTI2 {
+                actor_q.post(TriggerRestart, boost: @critical);
+            }
+
+            task supervisor_actor(u32 base_id, *watch<u32> out_state) {
+                u32 local_acc = 10;
+                defer {
+                    actor_defers.publish(actor_defers.read() + 1);
+                }
+                out_state.publish(base_id + local_acc);
+                loop {
+                    ActorCmd cmd = actor_q.recv();
+                    last_turn_prio.publish(syn_current_prio());
+                    switch (cmd) {
+                        AddWork => {
+                            local_acc += 25;
+                            out_state.publish(base_id + local_acc);
+                        }
+                        TriggerRestart => {
+                            local_acc += 900;
+                            restart_ack.notify();
+                            restart;
+                        }
+                    }
+                }
+            }
+
+            task driver() {
+                delay(2ms);
+                u32 init_st = actor_state.read();
+                actor_q.send(AddWork);
+                delay(2ms);
+                u32 work1_st = actor_state.read();
+                u32 work1_prio = last_turn_prio.read();
+
+                /* Fire NVIC EXTI2 -> posts TriggerRestart with boost: @critical */
+                syn_nvic_pend_irq(2);
+                restart_ack.wait();
+                delay(2ms);
+
+                u32 boosted_prio = last_turn_prio.read();
+                u32 defers_after = actor_defers.read();
+                u32 restarted_st = actor_state.read();
+
+                /* Send another unboosted AddWork to prove @low priority (3) was restored on restart! */
+                actor_q.send(AddWork);
+                delay(2ms);
+                u32 restored_prio = last_turn_prio.read();
+                u32 work2_st = actor_state.read();
+
+                sys.log_kv("init_st=", init_st as i32);
+                sys.log_kv("work1_st=", work1_st as i32);
+                sys.log_kv("work1_prio=", work1_prio as i32);
+                sys.log_kv("boosted_prio=", boosted_prio as i32);
+                sys.log_kv("defers=", defers_after as i32);
+                sys.log_kv("restarted_st=", restarted_st as i32);
+                sys.log_kv("restored_prio=", restored_prio as i32);
+                sys.log_kv("work2_st=", work2_st as i32);
+
+                assert(init_st == 510);
+                assert(work1_st == 535);
+                assert(work1_prio == 3);
+                assert(boosted_prio == 0);
+                assert(defers_after == 1);
+                assert(restarted_st == 510);
+                assert(restored_prio == 3);
+                assert(work2_st == 535);
+
+                sys.exit(0);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn supervisor_actor(500, &actor_state) @low;
+                spawn driver() @normal;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave1 restart");
+        zev_sema::analyze_program(&prog).expect("sema wave1 restart");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave1 restart");
+
+        let out_elf = test_out_dir().join("wave1_restart.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave1 restart in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave1 restart .ll");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("init_st=510\n"), "out={out}");
+        assert!(out.contains("boosted_prio=0\n"), "out={out}");
+        assert!(out.contains("defers=1\n"), "out={out}");
+        assert!(out.contains("restarted_st=510\n"), "out={out}");
+        assert!(out.contains("restored_prio=3\n"), "out={out}");
+        assert!(out.contains("work2_st=535\n"), "out={out}");
+    }
+
+    #[test]
+    fn wave1_lifo_defer_on_return_and_error_in_qemu() {
+        let src = r#"
+            enum OpErr { Failed }
+
+            watch<u32> trace_log = 0;
+
+            fn append_trace(u32 digit) {
+                trace_log.publish(trace_log.read() * 10 + digit);
+            }
+
+            u32 direct_op(bool should_fail) error OpErr {
+                u32 ret_val = 42;
+                defer {
+                    append_trace(1);
+                }
+                {
+                    defer {
+                        append_trace(2);
+                    }
+                }
+                for (u8 i in 0..3) {
+                    defer {
+                        append_trace(3);
+                    }
+                    if (i == 1) {
+                        continue;
+                    }
+                    if (i == 2) {
+                        break;
+                    }
+                }
+                defer {
+                    ret_val = 999;
+                    append_trace(4);
+                }
+                if (should_fail) {
+                    error Failed, ret_val + 5;
+                }
+                return ret_val + 8;
+            }
+
+            u32 coro_op(bool should_fail) error OpErr {
+                u32 ret_val = 100;
+                defer {
+                    append_trace(7);
+                }
+                delay(1ms);
+                defer {
+                    ret_val = 888;
+                    append_trace(8);
+                }
+                if (should_fail) {
+                    error Failed, ret_val + 11;
+                }
+                return ret_val + 22;
+            }
+
+            task tester() {
+                trace_log.publish(0);
+                u32 ok1 = direct_op(false) catch { 0 };
+                u32 t1 = trace_log.read();
+
+                u32 part1 = 0;
+                trace_log.publish(0);
+                u32 err1 = direct_op(true) catch (OpErr e, u32 part) {
+                    part1 = part;
+                    0
+                };
+                u32 t2 = trace_log.read();
+
+                trace_log.publish(0);
+                u32 ok2 = coro_op(false) catch { 0 };
+                u32 t3 = trace_log.read();
+
+                u32 part2 = 0;
+                trace_log.publish(0);
+                u32 err2 = coro_op(true) catch (OpErr e, u32 part) {
+                    part2 = part;
+                    0
+                };
+                u32 t4 = trace_log.read();
+
+                sys.log_kv("ok1=", ok1 as i32);
+                sys.log_kv("part1=", part1 as i32);
+                sys.log_kv("t1=", t1 as i32);
+                sys.log_kv("t2=", t2 as i32);
+                sys.log_kv("ok2=", ok2 as i32);
+                sys.log_kv("part2=", part2 as i32);
+                sys.log_kv("t3=", t3 as i32);
+                sys.log_kv("t4=", t4 as i32);
+
+                assert(ok1 == 50);
+                assert(part1 == 47);
+                assert(t1 == 233341);
+                assert(t2 == 233341);
+                assert(ok2 == 122);
+                assert(part2 == 111);
+                assert(t3 == 87);
+                assert(t4 == 87);
+                assert(err1 == 0 && err2 == 0);
+
+                sys.exit(0);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn tester() @normal;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave1 lifo defer");
+        zev_sema::analyze_program(&prog).expect("sema wave1 lifo defer");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave1 lifo defer");
+
+        let out_elf = test_out_dir().join("wave1_lifo_defer.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave1 lifo defer in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave1 lifo defer .ll");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("ok1=50\n"), "out={out}");
+        assert!(out.contains("part1=47\n"), "out={out}");
+        assert!(out.contains("t1=233341\n"), "out={out}");
+        assert!(out.contains("ok2=122\n"), "out={out}");
+        assert!(out.contains("part2=111\n"), "out={out}");
+        assert!(out.contains("t4=87\n"), "out={out}");
+    }
+
+    #[test]
+    fn wave1_bounded_for_range_inclusive_and_foreach_slice_in_qemu() {
+        let src = r#"
+            u32 sum_direct([]u8 sl) {
+                u32 total = 0;
+                for (u8 i in 0..=4) {
+                    if (i == 2) {
+                        continue;
+                    }
+                    total += (i as u32);
+                }
+                for (u8 b in sl) {
+                    if (b == 99) {
+                        continue;
+                    }
+                    total += (b as u32);
+                }
+                [3]u16 fixed = [300 as u16, 400 as u16, 500 as u16];
+                for (u16 x in fixed) {
+                    if (x == 400) {
+                        continue;
+                    }
+                    total += (x as u32);
+                }
+                return total;
+            }
+
+            task range_task() {
+                [4]u8 bytes = [10, 99, 20, 30];
+                u32 d_total = sum_direct(bytes[0..4]);
+
+                u32 c_total = 0;
+                for (u8 i in 0..=4) {
+                    checkpoint();
+                    if (i == 2) {
+                        continue;
+                    }
+                    c_total += (i as u32);
+                }
+                []u8 sl = bytes[0..4];
+                for (u8 b in sl) {
+                    checkpoint();
+                    if (b == 99) {
+                        continue;
+                    }
+                    c_total += (b as u32);
+                }
+                [3]u16 fixed = [300 as u16, 400 as u16, 500 as u16];
+                for (u16 x in fixed) {
+                    checkpoint();
+                    if (x == 400) {
+                        continue;
+                    }
+                    c_total += (x as u32);
+                }
+
+                /* Inclusive T::MAX overflow safety: u8 0..=255 and i8 125..=127 */
+                u32 u8_iters = 0;
+                for (u8 k in 0..=255) {
+                    u8_iters += 1;
+                    if (k == 254) {
+                        continue;
+                    }
+                }
+
+                i32 i8_acc = 0;
+                for (i8 s in 125..=127) {
+                    i8_acc += (s as i32);
+                }
+
+                sys.log_kv("d_total=", d_total as i32);
+                sys.log_kv("c_total=", c_total as i32);
+                sys.log_kv("u8_iters=", u8_iters as i32);
+                sys.log_kv("i8_acc=", i8_acc);
+
+                assert(d_total == 868);
+                assert(c_total == 868);
+                assert(u8_iters == 256);
+                assert(i8_acc == 378);
+
+                sys.exit(0);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn range_task() @normal;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave1 bounded for");
+        zev_sema::analyze_program(&prog).expect("sema wave1 bounded for");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave1 bounded for");
+
+        let out_elf = test_out_dir().join("wave1_bounded_for.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave1 bounded for in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave1 bounded for .ll");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("d_total=868\n"), "out={out}");
+        assert!(out.contains("c_total=868\n"), "out={out}");
+        assert!(out.contains("u8_iters=256\n"), "out={out}");
+        assert!(out.contains("i8_acc=378\n"), "out={out}");
+    }
+
+    #[test]
+    fn wave1_unified_inbox_backpressure_send_try_send_and_queries_in_qemu() {
+        let src = r#"
+            inbox<u32, 2> pipe;
+            signal probe_sig;
+            watch<u32> prod_stage = 0;
+            watch<u32> send_timeout_fired = 0;
+
+            task producer() {
+                assert(pipe.is_empty());
+                assert(!pipe.is_full());
+                assert(pipe.len() == 0);
+                u32 empty_probe = pipe.try_recv() or 777;
+                assert(empty_probe == 777);
+
+                /* Verify non-blocking signal.try_wait() + is_set() */
+                assert(!probe_sig.try_wait());
+                probe_sig.notify();
+                assert(probe_sig.is_set());
+                assert(probe_sig.try_wait());
+                assert(!probe_sig.is_set());
+                assert(!probe_sig.try_wait());
+
+                bool ok1 = pipe.try_send(10);
+                assert(ok1);
+                pipe.send(20);
+                assert(pipe.is_full());
+                assert(pipe.len() == 2);
+                bool ok_full = pipe.try_send(999);
+                assert(!ok_full);
+
+                prod_stage.publish(1);
+
+                /* Full queue (cap=2): `.send(99, timeout: 3ms)` MUST time out while consumer delays 10ms */
+                pipe.send(99, timeout: 3ms) catch {
+                    send_timeout_fired.publish(1);
+                };
+                prod_stage.publish(2);
+
+                /* Blocking `.send(30)` suspends on full queue and wakes as soon as consumer calls `.recv()` */
+                pipe.send(30);
+                prod_stage.publish(3);
+
+                loop {
+                    delay(1s);
+                }
+            }
+
+            task consumer() {
+                delay(10ms);
+                assert(send_timeout_fired.read() == 1);
+                assert(prod_stage.read() == 2);
+
+                u32 a = pipe.recv();
+                u32 b = pipe.recv();
+                u32 c = pipe.recv();
+                u32 d = pipe.try_recv() or 5;
+                u32 sum = a * 1000 + b * 10 + c + d;
+
+                /* Allow producer wakeup to publish prod_stage=3 */
+                delay(1ms);
+                u32 final_stage = prod_stage.read();
+
+                sys.log_kv("cons_sum=", sum as i32);
+                sys.log_kv("prod_stage=", final_stage as i32);
+                sys.log_kv("to_fired=", send_timeout_fired.read() as i32);
+
+                assert(sum == 10235);
+                assert(final_stage == 3);
+
+                sys.exit(0);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn producer() @high;
+                spawn consumer() @normal;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave1 unified inbox");
+        zev_sema::analyze_program(&prog).expect("sema wave1 unified inbox");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave1 unified inbox");
+
+        let out_elf = test_out_dir().join("wave1_unified_inbox.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave1 unified inbox in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave1 unified inbox .ll");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("cons_sum=10235\n"), "out={out}");
+        assert!(out.contains("prod_stage=3\n"), "out={out}");
+        assert!(out.contains("to_fired=1\n"), "out={out}");
+    }
+
+    #[test]
+    fn wave1_dual_specialized_soft_yielding_fn_o2_and_oz_in_qemu() {
+        let src = r#"
+            u32 mix_byte(u32 acc, u8 b) {
+                checkpoint();
+                u32 v = acc ^ (b as u32);
+                u8 step = 0;
+                while (step < 4) {
+                    switch (step) {
+                        3 => {
+                            v = (v * 3) + 1;
+                            break;
+                        }
+                        _ => {
+                            v = v + 7;
+                        }
+                    }
+                    step += 1;
+                }
+                return v;
+            }
+
+            u32 compute_crc_soft([]u8 buf) {
+                u32 acc = 0x1234;
+                for (u8 b in buf) {
+                    checkpoint();
+                    acc = mix_byte(acc, b);
+                }
+                return acc;
+            }
+
+            task verifier() {
+                [5]u8 frame = [0x11, 0x22, 0x33, 0x44, 0x55];
+                u32 c1 = compute_crc_soft(frame[0..5]);
+                u32 c2 = 0;
+                noyield {
+                    c2 = compute_crc_soft(frame[0..5]);
+                }
+                sys.log_kv("coro_crc=", c1 as i32);
+                sys.log_kv("noyield_crc=", c2 as i32);
+                assert(c1 != 0);
+                assert(c1 == c2);
+                sys.exit(0);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn verifier() @normal;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave1 soft specialization");
+        zev_sema::analyze_program(&prog).expect("sema wave1 soft specialization");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave1 soft specialization");
+
+        let dual_names: Vec<&str> = mir
+            .ram_report
+            .dual_specialized_fns
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert!(dual_names.contains(&"compute_crc_soft"), "dual_names: {dual_names:?}");
+        assert!(dual_names.contains(&"mix_byte"), "dual_names: {dual_names:?}");
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("Dual-Specialized Functions")
+                && table.contains("compute_crc_soft__noyield")
+                && table.contains("mix_byte__noyield"),
+            "table:\n{table}"
+        );
+
+        let dir = test_out_dir();
+        let mut text_o0 = 0u64;
+        let mut text_oz = 0u64;
+        for level in ["-O0", "-O2", "-Oz"] {
+            let mut opts = CodegenOptions::default();
+            opts.opt_level = level.to_string();
+            let tag = level.trim_start_matches('-');
+            let out_elf = dir.join(format!("wave1_soft_spec_{tag}.elf"));
+            let res = run_qemu_cortex_m(&mir, &out_elf, &opts, &QemuRunOptions::default())
+                .unwrap_or_else(|e| panic!("wave1 soft specialization failed at {level}: {e}"));
+            verify_ll_with_opt(&res.build.ll_path)
+                .unwrap_or_else(|e| panic!("opt verify failed at {level}: {e}"));
+            assert!(res.build.audit.is_zero_heap_freestanding());
+            assert_eq!(res.exec.exit_code, 0, "failed at {level}: {}", res.exec.stdout);
+            assert!(res.exec.stdout.contains("coro_crc="), "out={}", res.exec.stdout);
+            assert!(res.exec.stdout.contains("noyield_crc="), "out={}", res.exec.stdout);
+            if level == "-O0" {
+                text_o0 = res.build.sizes.text;
+            }
+            if level == "-Oz" {
+                text_oz = res.build.sizes.text;
+            }
+        }
+        assert!(
+            text_oz < text_o0,
+            "expected -Oz .text ({text_oz}B) < -O0 .text ({text_o0}B)"
+        );
+    }
+
+    #[test]
+    fn wave1_restart_boost_restore_yields_to_woken_higher_prio_peer_in_qemu() {
+        let src = r#"
+            enum Cmd { TriggerReset }
+
+            inbox<Cmd, 4> actor_q;
+            signal mid_sig;
+            watch<u32> seq_log = 0;
+            watch<u32> restart_count = 0;
+            watch<u32> defer_ran = 0;
+
+            fn append_step(u32 digit) {
+                seq_log.publish((seq_log.read() * 10) + digit);
+            }
+
+            task mid_observer() {
+                loop {
+                    mid_sig.wait();
+                    append_step(2);
+                }
+            }
+
+            task resilient_actor(u32 param_seed) {
+                u32 local_acc = 0;
+                u32 boots = restart_count.read() + 1;
+                restart_count.publish(boots);
+
+                if (boots == 2) {
+                    append_step(3);
+                    sys.log_kv("seq=", seq_log.read() as i32);
+                    sys.log_kv("after_seed=", param_seed as i32);
+                    sys.log_kv("after_local=", local_acc as i32);
+                    sys.log_kv("defer_ran=", defer_ran.read() as i32);
+                    assert(seq_log.read() == 123);
+                    assert(param_seed == 77);
+                    assert(local_acc == 0);
+                    assert(defer_ran.read() == 10);
+                    sys.exit(0);
+                }
+
+                loop {
+                    Cmd c = actor_q.recv();
+                    defer {
+                        defer_ran.publish(defer_ran.read() + 10);
+                    }
+                    switch (c) {
+                        TriggerReset => {
+                            local_acc += 500;
+                            mid_sig.notify();
+                            checkpoint();
+                            append_step(1);
+                            restart;
+                        }
+                    }
+                }
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn mid_observer() @normal;
+                spawn resilient_actor(77) @low;
+                set_priority(@low);
+                delay(1ms);
+                actor_q.post(TriggerReset, boost: @critical);
+                loop {
+                    delay(10ms);
+                }
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse restart boost restore");
+        zev_sema::analyze_program(&prog).expect("sema restart boost restore");
+        let mir = zev_mir::lower_program(&prog).expect("mir restart boost restore");
+
+        let mut opts = CodegenOptions::default();
+        opts.max_ticks = 100;
+        let out_elf = test_out_dir().join("wave1_restart_boost_seq.elf");
+        let res = run_qemu_cortex_m(&mir, &out_elf, &opts, &QemuRunOptions::default())
+            .expect("run restart boost restore in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify restart boost restore .ll");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("seq=123\n"), "out={out}");
+        assert!(out.contains("after_seed=77\n"), "out={out}");
+        assert!(out.contains("after_local=0\n"), "out={out}");
+        assert!(out.contains("defer_ran=10\n"), "out={out}");
     }
 }

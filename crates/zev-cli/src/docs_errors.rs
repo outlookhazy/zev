@@ -1,4 +1,4 @@
-//! Complete structured error explainers (`P0001`..`P0010` and `E0001`..`E0024`) for `zevc doc`.
+//! Complete structured error explainers (`P0001`..`P0012` and `E0001`..`E0027`) for `zevc doc`.
 
 pub struct ErrorDoc {
     pub code: &'static str,
@@ -10,7 +10,7 @@ pub struct ErrorDoc {
 }
 
 pub const ERROR_DOCS: &[ErrorDoc] = &[
-    // ── Parser Foreign-Idiom Traps (P0001..P0010) ───────────────────────────
+    // ── Parser Foreign-Idiom Traps (P0001..P0012) ───────────────────────────
     ErrorDoc {
         code: "P0001",
         summary: "Foreign `let` / `var` / `mut` variable binding instead of explicit C-style `Type name`",
@@ -198,9 +198,9 @@ fn main() {
     },
     ErrorDoc {
         code: "P0008",
-        summary: "`for` loop used instead of `while (cond)`, `loop`, or `every <duration>`",
+        summary: "C-style `for (;;)` or untyped `for i in 0..n` instead of typed bounded `for..in`",
         topic: "syntax",
-        why: "Zev v0 provides three explicit loop constructs mapped directly to scheduler semantics: `while (cond) { ... }` (bounded condition loop), `loop { ... }` (unbounded cooperative loop with `should_share()` chunking), and `every 1ms { ... }` (drift-free periodic deadline loop).",
+        why: "Zev forbids C's arbitrary 3-clause `for (;;)` (which can hide unbounded loops inside atomic blocks) and untyped `for i in 0..n` bindings. Use explicit typed bounded `for (usize i in 0..n) { ... }`, inclusive `for (u8 i in 0..=max) { ... }`, or slice/array iteration `for (u8 b in slice) { ... }`.",
         bad_zev: "\
 fn main() {
     for (u32 i = 0; i < 4; i += 1) {
@@ -209,9 +209,16 @@ fn main() {
 }",
         good_zev: "\
 fn main() {
-    u32 i = 0;
-    while (i < 4) {
-        i += 1;
+    u8 data[4] = [10, 20, 30, 40];
+    u32 sum = 0;
+    for (u8 b in data) {
+        sum += b as u32;
+    }
+    for (usize i in 0..4) {
+        sum += i as u32;
+    }
+    if (sum > 0) {
+        return;
     }
 }",
     },
@@ -244,12 +251,12 @@ fn main() {
         code: "P0010",
         summary: "`static` variable or `pub` visibility modifier used instead of Zev task frames / primitives",
         topic: "primitives",
-        why: "Zev has no `pub` visibility keyword in v0 and forbids `static` mutable variables: persistent per-task state is simply declared as a normal local variable at the top of a `task` (automatically hoisted into that instance's static coroutine frame), immutable constants use `const`, and shared state uses `watch<T>` or `inbox<T, N>`.",
+        why: "Zev v0.1 is whole-program compiled without `pub` visibility modifiers and forbids `static` mutable variables: persistent per-task state is declared as a normal local variable at the top of a `task` (automatically hoisted into that instance's static coroutine frame), immutable constants use `const`, and shared state uses `watch<T>` or `inbox<T, N>`.",
         bad_zev: "\
 pub static u32 counter = 0;
 pub task blink() {
     static u32 ticks = 0;
-    every 10ms { ticks += 1; }
+    loop every 10ms { ticks += 1; }
 }",
         good_zev: "\
 const u32 LIMIT = 100;
@@ -257,7 +264,7 @@ watch<u32> counter = 0;
 
 task blink() {
     u32 ticks = 0;
-    every 10ms {
+    loop every 10ms {
         if (ticks < LIMIT) {
             ticks += 1;
             counter.publish(ticks);
@@ -269,13 +276,72 @@ fn main() {
     spawn blink() @normal;
 }",
     },
+    ErrorDoc {
+        code: "P0011",
+        summary: "Deprecated bare `every <period> { ... }` loop instead of explicit `loop every <period_expr> { ... }`",
+        topic: "tasks",
+        why: "Spelling periodic deadline loops `loop every <period_expr> { ... }` makes sequential loop control flow (`continue;`, `break;`, divergence) visually explicit, supports runtime integer/tick period expressions alongside duration literals (`20ms`), and automatically skips/resyncs missed deadlines on overrun instead of bursting back-to-back catch-up iterations.",
+        bad_zev: "\
+task ctrl() {
+    every 20ms {
+        checkpoint();
+    }
+}
+fn main() { spawn ctrl() @high; }",
+        good_zev: "\
+watch<u32> ticks = 0;
 
-    // ── Semantic & Static-Verifier Diagnostics (E0001..E0024) ───────────────
+task ctrl(u32 period_ms) {
+    u32 count = 0;
+    loop every period_ms {
+        count += 1;
+        ticks.publish(count);
+    }
+}
+
+fn main() {
+    spawn ctrl(20) @high;
+}",
+    },
+    ErrorDoc {
+        code: "P0012",
+        summary: "Retired `chan<T, N>` type used instead of unified `inbox<T, N>`",
+        topic: "primitives",
+        why: "`chan<T, N>` and `inbox<T, N>` have been unified into a single bounded static queue `inbox<T, N>` supporting both non-blocking ISR/task `.post(v [, boost: @prio])` / `.try_send(v)` and task-only backpressured yielding `.send(v [, timeout: dur])`, alongside `.recv([timeout: dur])` and `.try_recv()`.",
+        bad_zev: "\
+chan<u32, 8> work_q;
+fn main() {}",
+        good_zev: "\
+inbox<u32, 8> work_q;
+watch<u32> processed = 0;
+
+task producer() {
+    u32 seq = 1;
+    loop every 10ms {
+        work_q.send(seq);
+        seq += 1;
+    }
+}
+
+task consumer() {
+    loop {
+        u32 item = work_q.recv();
+        processed.publish(item);
+    }
+}
+
+fn main() {
+    spawn producer() @normal;
+    spawn consumer() @high;
+}",
+    },
+
+    // ── Semantic & Static-Verifier Diagnostics (E0001..E0027) ───────────────
     ErrorDoc {
         code: "E0001",
         summary: "Illegal raw mutable global variable declared at top level",
         topic: "primitives",
-        why: "Raw mutable globals create data races between hardware ISRs, cooperative tasks, and symmetric multicore targets. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `chan<T, N>`, `signal`, `ping_pong<T, N>`, `lease<T, N>`).",
+        why: "Raw mutable globals create data races between hardware ISRs, cooperative tasks, and symmetric multicore targets. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `signal`, `ping_pong<T, N>`, `lease<T, N>`).",
         bad_zev: "\
 u32 latest_rpm = 0;
 
@@ -319,12 +385,12 @@ fn main() {
     },
     ErrorDoc {
         code: "E0003",
-        summary: "Yielding call, `checkpoint()`, or auto-yield `loop` inside `noyield { ... }`",
+        summary: "`HardBlocking` call, direct `checkpoint()`, `defer` yield, or auto-yield `loop` inside `noyield`",
         topic: "yielding",
-        why: "`noyield { ... }` guarantees task-atomicity: no other cooperative task can interleave mid-update, and transient locals stay in hot CPU registers instead of being hoisted into the static coroutine frame. Move yielding I/O outside `noyield`, and pass the fetched value in.",
+        why: "`noyield { ... }` guarantees task-atomicity: no other cooperative task can interleave mid-update, and transient locals stay in CPU registers. `SoftYielding` helper `fn`s (terminating functions that only call `checkpoint()`) automatically specialize a direct `0 B`-`.bss` stack clone inside `noyield`, whereas `HardBlocking` waits (`delay`, `recv`, `send`, `wait_chunk`), direct `checkpoint()`, and unbounded `loop` are rejected.",
         bad_zev: "\
 u16 adc_sample() {
-    checkpoint();
+    delay(1ms);
     return 900;
 }
 fn main() {
@@ -334,7 +400,7 @@ fn main() {
 }",
         good_zev: "\
 u16 adc_sample() {
-    checkpoint();
+    delay(1ms);
     return 900;
 }
 
@@ -464,10 +530,12 @@ fn main() {
         bad_zev: "\
 @dma_safe ping_pong<u8, 64> rx_dma;
 task listener() {
-    []u8 saved = rx_dma.wait_chunk();
-    {
-        []u8 inner = rx_dma.wait_chunk();
-        saved = inner;
+    loop {
+        []u8 saved = rx_dma.wait_chunk();
+        {
+            []u8 inner = rx_dma.wait_chunk();
+            saved = inner;
+        }
     }
 }
 fn main() { spawn listener() @normal; }",
@@ -535,12 +603,12 @@ fn main() {
     },
     ErrorDoc {
         code: "E0010",
-        summary: "Passing a non-static pointer or slice into `spawn`",
+        summary: "Passing a non-static pointer or slice into `spawn` (directly or via boot helper)",
         topic: "dma",
-        why: "Spawned tasks outlive the initial boot setup phase of `main()`. Task endpoint parameters must point to top-level static OS primitives (e.g. `&motor1_rpm`, `&uart1_dma`), never to transient local variables inside `main()`.",
+        why: "Spawned tasks outlive the initial boot setup phase of `main()`. Task endpoint parameters must point to top-level static OS primitives (e.g. `&motor1_rpm`, `&uart1_dma`), never to transient local variables inside `main()` or boot helpers.",
         bad_zev: "\
 task worker(u32 *cfg) {
-    every 10ms {
+    loop every 10ms {
         if (*cfg > 0) {}
     }
 }
@@ -552,7 +620,7 @@ fn main() {
 watch<u32> shared_cfg = 10;
 
 task worker(watch<u32> *cfg) {
-    every 10ms {
+    loop every 10ms {
         u32 v = cfg.read();
         if (v > 0) {}
     }
@@ -570,9 +638,11 @@ fn main() {
         bad_zev: "\
 @dma_safe ping_pong<u8, 64> rx_dma;
 task bad_reader() {
-    []u8 first = rx_dma.wait_chunk();
-    []u8 second = rx_dma.wait_chunk();
-    u8 sum = first[0] + second[0];
+    loop {
+        []u8 first = rx_dma.wait_chunk();
+        []u8 second = rx_dma.wait_chunk();
+        u8 sum = first[0] + second[0];
+    }
 }
 fn main() { spawn bad_reader() @normal; }",
         good_zev: "\
@@ -622,12 +692,13 @@ fn main() {
     },
     ErrorDoc {
         code: "E0013",
-        summary: "Duration literal is zero, sub-tick (truncates to 0), or not an exact tick multiple",
+        summary: "Duration literal or period is zero, sub-tick (truncates to 0), or not an exact tick multiple",
         topic: "tasks",
-        why: "The cooperative scheduler's default tick period is `1ms` (`1000us`). Writing `every 500us` on a `1ms` tick would silently truncate to `0` ticks or drift by 50%. Use `>= 1ms` multiples of the tick period (or sub-millisecond hardware timers/ISRs for microsecond waveforms).",
+        why: "The cooperative scheduler's default tick period is `1ms` (`1000us`). Writing `loop every 500us` on a `1ms` tick (or `loop every 0`) would silently truncate to `0` ticks or drift by 50%. Use `>= 1ms` multiples of the tick period (or sub-millisecond hardware timers/ISRs for microsecond waveforms).",
         bad_zev: "\
 task fast_poll() {
-    every 500us {
+    loop every 500us {
+        checkpoint();
     }
 }
 fn main() { spawn fast_poll() @high; }",
@@ -636,7 +707,7 @@ watch<u32> samples = 0;
 
 task fast_poll() {
     u32 cnt = 0;
-    every 1ms {
+    loop every 1ms {
         cnt += 1;
         samples.publish(cnt);
     }
@@ -650,7 +721,7 @@ fn main() {
         code: "E0014",
         summary: "`return` statement missing a value or returning wrong type for signature",
         topic: "errors",
-        why: "Value-returning functions (`u16 foo()`) must return an expression assignable to their declared return type on normal exit paths, whereas `fn name()` (`void`), `task`, and `isr` items use bare `return;` without a value.",
+        why: "Value-returning functions (`u16 foo()`) must return an expression assignable to their declared return type on normal exit paths, whereas `fn name()` (`void`) and `isr` items use bare `return;` without a value (and `task` items are immortal actors that use `restart;` instead of `return;`).",
         bad_zev: "\
 u16 get_rpm() {
     return;
@@ -818,7 +889,7 @@ fn main() {
         code: "E0020",
         summary: "Undefined identifier, type, field, or invalid OS primitive method name",
         topic: "syntax",
-        why: "Every variable, function, enum variant, struct field, and OS primitive method is resolved statically. Check primitive method names carefully: `watch` uses `.read()` / `.publish(v)`, `inbox` uses `.post(v [, boost: @prio])` / `.recv([timeout: dur])`, `chan` uses `.send(v)` / `.recv()`, `signal` uses `.notify()` / `.wait()`, and `ping_pong` uses `.wait_chunk()` / `.flip()`.",
+        why: "Every variable, function, enum variant, struct field, and OS primitive method is resolved statically. Check primitive method names carefully: `watch` uses `.read()` / `.publish(v)`, unified `inbox` uses `.post(v [, boost: @prio])` / `.try_send(v)` / `.send(v [, timeout: dur])` / `.recv([timeout: dur])` / `.try_recv()`, `signal` uses `.notify()` / `.wait()`, and `ping_pong` uses `.wait_chunk()` / `.flip()`.",
         bad_zev: "\
 watch<u16> rpm = 0;
 fn main() {
@@ -876,21 +947,25 @@ fn main() {
     },
     ErrorDoc {
         code: "E0023",
-        summary: "Invalid control flow (`break`/`continue` outside loop, or `spawn`/`set_priority` outside `main`)",
+        summary: "Invalid control flow (`break`/`continue` outside loop, `restart` outside `task`, or jump inside `defer`)",
         topic: "tasks",
-        why: "To guarantee 100% compile-time static task slot allocation, `spawn` and `set_priority` are only permitted inside `fn main()` (never dynamically inside loops or helper tasks), and `break`/`continue` must appear inside `loop`, `while`, or `every`.",
+        why: "`break;` and `continue;` must appear inside a loop (`loop`, `loop every`, `while`, or `for`), `restart;` is only valid inside a `task` body, `set_priority` belongs in `fn main()`, and `defer` cleanup blocks cannot jump out of scope via `return`, `error`, `break`, `continue`, or `restart`.",
         bad_zev: "\
-task worker() {}
-task spawner() {
-    spawn worker() @normal;
+fn helper() {
+    restart;
 }
-fn main() { spawn spawner() @normal; }",
+fn main() {
+    helper();
+}",
         good_zev: "\
 watch<u32> ticks = 0;
 
 task worker() {
     u32 n = 0;
-    every 5ms {
+    loop every 5ms {
+        if (n > 100) {
+            restart;
+        }
         n += 1;
         ticks.publish(n);
     }
@@ -929,6 +1004,107 @@ fn main() {
     if (h.op == 1) {
         return;
     }
+}",
+    },
+    ErrorDoc {
+        code: "E0025",
+        summary: "Unreachable statement after `return`, `error`, `break`, `continue`, `restart`, `sys.exit`, or diverging `loop`",
+        topic: "syntax",
+        why: "In safety-critical firmware, dead statements after an unconditional exit or after a `break`-less steady-state `loop` / `loop every` almost always indicate a misplaced hardware teardown or missing `break;` condition. Place per-task initialization before `loop { ... }`, or register scope-exit cleanup before the loop/exit via `defer <stmt>;`.",
+        bad_zev: "\
+task worker() {
+    loop every 10ms {
+        checkpoint();
+    }
+    u32 dead_after_loop = 1;
+}
+fn main() { spawn worker() @normal; }",
+        good_zev: "\
+watch<u32> status = 0;
+
+task worker() {
+    status.publish(1);
+    loop every 10ms {
+        status.publish(status.read() + 1);
+    }
+}
+
+fn main() {
+    spawn worker() @normal;
+}",
+    },
+    ErrorDoc {
+        code: "E0026",
+        summary: "Non-diverging `task` (`return;` inside a `task` or falling off a `task`'s closing `}`)",
+        topic: "tasks",
+        why: "Every `spawn` allocates a permanent static `.bss` task slot; a `task` that returns or falls off `}` silently leaves dead SRAM and can strand producer queues. Tasks model permanent subsystem actors (`loop { ... }` or `loop every <period> { ... }`), reset cleanly to entry via `restart;`, and park at `0%` CPU on `inbox.recv()`/`signal.wait()`. Move finite one-shot sequences (e.g. self-test, calibration) into ordinary yielding `fn`s.",
+        bad_zev: "\
+task one_shot() {
+    checkpoint();
+    return;
+}
+fn main() { spawn one_shot() @normal; }",
+        good_zev: "\
+enum Cmd { Step, ResetActor }
+inbox<Cmd, 4> cmd_q;
+watch<u32> boot_ok = 0;
+
+fn run_boot_self_test() {
+    checkpoint();
+    boot_ok.publish(1);
+}
+
+task subsystem_actor() {
+    u32 count = 0;
+    loop {
+        Cmd c = cmd_q.recv();
+        switch (c) {
+            Step => { count += 1; }
+            ResetActor => { restart; }
+        }
+    }
+}
+
+fn main() {
+    run_boot_self_test();
+    spawn subsystem_actor() @normal;
+}",
+    },
+    ErrorDoc {
+        code: "E0027",
+        summary: "Invalid `spawn` placement (`spawn` inside a `task`, `isr`, loop, recursion, or post-boot supervisor)",
+        topic: "tasks",
+        why: "To guarantee 1:1 compile-time `.bss` task slot allocation with zero heap, `spawn` is restricted to **Boot-Tree `spawn`**: `fn main()` (including conditional `if`/`switch` boot branches) and non-loop, non-recursive setup `fn`s called during `main()`'s sequential boot phase before its steady-state supervisor loop (`zevc ram` prints each slot's full provenance path `main -> init_bus -> worker`).",
+        bad_zev: "\
+task worker(u8 ch) {
+    loop every 10ms {
+        checkpoint();
+    }
+}
+fn main() {
+    for (u8 ch in 0..2) {
+        spawn worker(ch) @normal;
+    }
+}",
+        good_zev: "\
+watch<u32> bus1_ticks = 0;
+watch<u32> bus2_ticks = 0;
+
+task bus_worker(watch<u32> *out, u32 step) {
+    u32 acc = 0;
+    loop every 10ms {
+        acc += step;
+        out.publish(acc);
+    }
+}
+
+fn start_bus(watch<u32> *out, u32 step) {
+    spawn bus_worker(out, step) @normal;
+}
+
+fn main() {
+    start_bus(&bus1_ticks, 1);
+    start_bus(&bus2_ticks, 2);
 }",
     },
 ];

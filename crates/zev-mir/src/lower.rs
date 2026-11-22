@@ -1,12 +1,12 @@
 //! Lowering pass from `zev_ast::Program` into Coroutine State-Machine & Kernel MIR (`MirModule`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use zev_ast::{
     AssignOp, Attr, AttrKind, BinaryOp, Block, CallArg, DurationLit, ErrorSpec, Expr, ExprKind,
-    FnDecl, IsrDecl, ItemKind, Literal, OsPrimitiveType, PrimType, Priority, Program, Span, Stmt,
-    StmtKind, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
+    FnDecl, IsrDecl, ItemKind, Literal, OsPrimitiveType, PrimType, Priority, Program, Span,
+    SpawnStmt, Stmt, StmtKind, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
 };
 
 use crate::ir::{
@@ -35,6 +35,20 @@ impl fmt::Display for MirLowerError {
 
 impl std::error::Error for MirLowerError {}
 
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum MirFnEffect {
+    #[default]
+    NonYielding,
+    SoftYielding,
+    HardBlocking,
+}
+
+impl MirFnEffect {
+    const fn can_yield(self) -> bool {
+        !matches!(self, Self::NonYielding)
+    }
+}
+
 #[derive(Clone)]
 struct FnSig {
     params: Vec<MirType>,
@@ -42,6 +56,8 @@ struct FnSig {
     error_spec: MirErrorSpec,
     is_extern_c: bool,
     is_yielding: bool,
+    effect: MirFnEffect,
+    spawns_in_boot: bool,
 }
 
 #[derive(Clone)]
@@ -70,6 +86,9 @@ struct ModuleSymbols {
     primitives: BTreeMap<String, PrimInfo>,
     fns: BTreeMap<String, FnSig>,
     tasks: BTreeMap<String, Vec<MirType>>,
+    soft_yielding_in_coro: BTreeSet<String>,
+    soft_yielding_in_noyield: BTreeSet<String>,
+    dual_specialized_fns: BTreeSet<String>,
 }
 
 impl ModuleSymbols {
@@ -127,10 +146,6 @@ impl ModuleSymbols {
                 elem: Box::new(self.resolve_type(elem)),
             },
             OsPrimitiveType::Inbox { elem, cap } => MirPrimKind::Inbox {
-                elem: Box::new(self.resolve_type(elem)),
-                cap: *cap,
-            },
-            OsPrimitiveType::Chan { elem, cap } => MirPrimKind::Chan {
                 elem: Box::new(self.resolve_type(elem)),
                 cap: *cap,
             },
@@ -236,9 +251,11 @@ fn has_attr_dma_safe(attrs: &[Attr]) -> bool {
 }
 
 fn has_attr_manual_yield(attrs: &[Attr]) -> bool {
-    attrs
-        .iter()
-        .any(|a| matches!(a.kind, AttrKind::ManualYield))
+    attrs.iter().any(|a| match &a.kind {
+        AttrKind::ManualYield => true,
+        AttrKind::Custom { name, .. } => name == "noyield",
+        _ => false,
+    })
 }
 
 /// Lower multiple parsed `zev_ast::Program`s into a single optimized `MirModule`.
@@ -261,6 +278,9 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         primitives: BTreeMap::new(),
         fns: BTreeMap::new(),
         tasks: BTreeMap::new(),
+        soft_yielding_in_coro: BTreeSet::new(),
+        soft_yielding_in_noyield: BTreeSet::new(),
+        dual_specialized_fns: BTreeSet::new(),
     };
 
     let mut mir_imports = Vec::new();
@@ -398,6 +418,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                         error_spec,
                         is_extern_c: is_extern,
                         is_yielding: false,
+                        effect: MirFnEffect::NonYielding,
+                        spawns_in_boot: false,
                     },
                 );
 
@@ -421,7 +443,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             ItemKind::GlobalVar(gv) => {
                 return Err(MirLowerError {
                     message: format!(
-                        "mutable raw global `{}` is forbidden; use an OS primitive (`watch`, `inbox`, `chan`, `signal`, `ping_pong`)",
+                        "mutable raw global `{}` is forbidden; use an OS primitive (`watch`, `inbox`, `signal`, `ping_pong`)",
                         gv.name.name
                     ),
                     span: gv.span,
@@ -431,15 +453,21 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         }
     }
 
-    // Discover `sys.use_systick(hz)` in `main` if present.
+    let fn_decl_map: BTreeMap<String, &FnDecl> = raw_fn_decls
+        .iter()
+        .map(|fd| (fd.name.name.clone(), *fd))
+        .collect();
+
+    // Discover `sys.use_systick(hz)` in `main` (and boot helpers) if present.
     if let Some(md) = main_decl {
         if let Some(body) = &md.body {
-            discover_systick_config(&body.stmts, &mut syms);
+            let mut visited_boot = BTreeSet::new();
+            discover_systick_config(&body.stmts, &fn_decl_map, &mut visited_boot, &mut syms);
         }
     }
 
-    // Pass 2: Whole-program call-graph yield inference across `raw_fn_decls`.
-    infer_yielding_functions(&raw_fn_decls, &mut syms);
+    // Pass 2: Whole-program 3-tier `FnEffect`, `spawns_in_boot`, and `SoftYielding` specialization inference.
+    infer_effects_and_specializations(&raw_fn_decls, &raw_task_decls, main_decl, &mut syms);
 
     // Pass 3: Lower constants & top-level primitive initializers.
     let mut mir_consts = Vec::new();
@@ -486,7 +514,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
     for id in raw_isr_decls {
         let mut dctx = DirectLowerCtx::new(&syms, MirType::Void, MirErrorSpec::None);
         dctx.in_noyield = true;
-        let body = dctx.lower_block_stmts(&id.body.stmts)?;
+        let body = dctx.lower_top_level_stmts(&id.body.stmts)?;
         mir_isrs.push(MirIsr {
             name: id.vector.name.clone(),
             vars: dctx.vars,
@@ -494,65 +522,83 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         });
     }
 
-    // Pass 5: Lower Functions (both Direct non-yielding and Coroutine yielding functions).
+    // Pass 5: Lower Functions (Direct non-yielding, Coroutine yielding, and `__noyield` SoftYielding clones).
     let mut mir_functions = Vec::new();
-    for fd in raw_fn_decls {
+    for fd in &raw_fn_decls {
         let sig = syms.fns.get(&fd.name.name).unwrap().clone();
+        if sig.spawns_in_boot {
+            // Boot-tree setup helpers containing `spawn` are unrolled inline in `main()`'s sequential boot phase.
+            continue;
+        }
         let manual_yield = has_attr_manual_yield(&fd.attrs);
         let body_ast = fd.body.as_ref().unwrap();
 
-        let mut func = if sig.is_yielding {
-            let mut cctx = CoroutineLowerCtx::new(
-                &syms,
-                sig.ret_ty.clone(),
-                sig.error_spec.clone(),
-                manual_yield,
-            );
-            let mut param_ids = Vec::new();
-            for p in &fd.params {
-                let pty = syms.resolve_type(&p.ty);
-                let vid = cctx.declare_var(&p.name.name, pty, VarRole::Param);
-                param_ids.push(vid);
+        match sig.effect {
+            MirFnEffect::NonYielding => {
+                let mut dctx =
+                    DirectLowerCtx::new(&syms, sig.ret_ty.clone(), sig.error_spec.clone());
+                let mut param_ids = Vec::new();
+                for p in &fd.params {
+                    let pty = syms.resolve_type(&p.ty);
+                    let vid = dctx.declare_var(&p.name.name, pty, VarRole::Param);
+                    param_ids.push(vid);
+                }
+                let stmts = dctx.lower_top_level_stmts(&body_ast.stmts)?;
+                let mut func = MirFunction {
+                    name: fd.name.name.clone(),
+                    params: param_ids,
+                    ret_ty: sig.ret_ty,
+                    error_spec: sig.error_spec,
+                    manual_yield,
+                    is_yielding: false,
+                    vars: dctx.vars,
+                    body: MirFnBody::Direct(stmts),
+                };
+                analyze_fn_frame(&mut func);
+                mir_functions.push(func);
             }
-            cctx.lower_stmts(&body_ast.stmts)?;
-            cctx.finish_with_implicit_return();
+            MirFnEffect::HardBlocking => {
+                let mut func = lower_coroutine_fn_decl(fd, &sig, manual_yield, &syms)?;
+                analyze_fn_frame(&mut func);
+                mir_functions.push(func);
+            }
+            MirFnEffect::SoftYielding => {
+                let in_coro = syms.soft_yielding_in_coro.contains(&fd.name.name);
+                let in_noyield = syms.soft_yielding_in_noyield.contains(&fd.name.name);
+                let emit_coro = in_coro || !in_noyield;
+                let emit_noyield = in_noyield;
 
-            MirFunction {
-                name: fd.name.name.clone(),
-                params: param_ids,
-                ret_ty: sig.ret_ty,
-                error_spec: sig.error_spec,
-                manual_yield,
-                is_yielding: true,
-                vars: cctx.vars,
-                body: MirFnBody::Coroutine {
-                    blocks: cctx.blocks,
-                    child_slots: cctx.child_slots,
-                },
+                if emit_coro {
+                    let mut func = lower_coroutine_fn_decl(fd, &sig, manual_yield, &syms)?;
+                    analyze_fn_frame(&mut func);
+                    mir_functions.push(func);
+                }
+                if emit_noyield {
+                    let mut dctx =
+                        DirectLowerCtx::new(&syms, sig.ret_ty.clone(), sig.error_spec.clone());
+                    dctx.in_noyield = true;
+                    let mut param_ids = Vec::new();
+                    for p in &fd.params {
+                        let pty = syms.resolve_type(&p.ty);
+                        let vid = dctx.declare_var(&p.name.name, pty, VarRole::Param);
+                        param_ids.push(vid);
+                    }
+                    let stmts = dctx.lower_top_level_stmts(&body_ast.stmts)?;
+                    let mut ny_func = MirFunction {
+                        name: format!("{}__noyield", fd.name.name),
+                        params: param_ids,
+                        ret_ty: sig.ret_ty.clone(),
+                        error_spec: sig.error_spec.clone(),
+                        manual_yield,
+                        is_yielding: false,
+                        vars: dctx.vars,
+                        body: MirFnBody::Direct(stmts),
+                    };
+                    analyze_fn_frame(&mut ny_func);
+                    mir_functions.push(ny_func);
+                }
             }
-        } else {
-            let mut dctx = DirectLowerCtx::new(&syms, sig.ret_ty.clone(), sig.error_spec.clone());
-            let mut param_ids = Vec::new();
-            for p in &fd.params {
-                let pty = syms.resolve_type(&p.ty);
-                let vid = dctx.declare_var(&p.name.name, pty, VarRole::Param);
-                param_ids.push(vid);
-            }
-            let stmts = dctx.lower_block_stmts(&body_ast.stmts)?;
-            MirFunction {
-                name: fd.name.name.clone(),
-                params: param_ids,
-                ret_ty: sig.ret_ty,
-                error_spec: sig.error_spec,
-                manual_yield,
-                is_yielding: false,
-                vars: dctx.vars,
-                body: MirFnBody::Direct(stmts),
-            }
-        };
-
-        analyze_fn_frame(&mut func);
-        mir_functions.push(func);
+        }
     }
 
     // Pass 6: Lower Reusable `task` Blueprints.
@@ -567,7 +613,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             let vid = cctx.declare_var(&p.name.name, pty, VarRole::Param);
             param_ids.push(vid);
         }
-        cctx.lower_stmts(&td.body.stmts)?;
+        cctx.lower_top_level_stmts(&td.body.stmts)?;
         cctx.finish_with_implicit_return();
 
         let mut bp = MirTaskBlueprint {
@@ -589,6 +635,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         lower_main_entry(
             md,
             &syms,
+            &fn_decl_map,
             &mut mir_blueprints,
             &mut spawned_tasks,
         )?
@@ -600,6 +647,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             boot_yielding_callees: Vec::new(),
         }
     };
+
+    let dual_specialized_fns: Vec<String> = syms.dual_specialized_fns.iter().cloned().collect();
 
     let mut module = MirModule {
         tick_period_us: syms.tick_period_us,
@@ -614,6 +663,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         functions: mir_functions,
         task_blueprints: mir_blueprints,
         spawned_tasks,
+        dual_specialized_fns,
         boot,
         ram_report: RamReport::default(),
     };
@@ -622,165 +672,636 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
     Ok(module)
 }
 
+fn lower_coroutine_fn_decl(
+    fd: &FnDecl,
+    sig: &FnSig,
+    manual_yield: bool,
+    syms: &ModuleSymbols,
+) -> Result<MirFunction, MirLowerError> {
+    let body_ast = fd.body.as_ref().unwrap();
+    let mut cctx = CoroutineLowerCtx::new(
+        syms,
+        sig.ret_ty.clone(),
+        sig.error_spec.clone(),
+        manual_yield,
+    );
+    let mut param_ids = Vec::new();
+    for p in &fd.params {
+        let pty = syms.resolve_type(&p.ty);
+        let vid = cctx.declare_var(&p.name.name, pty, VarRole::Param);
+        param_ids.push(vid);
+    }
+    cctx.lower_top_level_stmts(&body_ast.stmts)?;
+    cctx.finish_with_implicit_return();
+
+    Ok(MirFunction {
+        name: fd.name.name.clone(),
+        params: param_ids,
+        ret_ty: sig.ret_ty.clone(),
+        error_spec: sig.error_spec.clone(),
+        manual_yield,
+        is_yielding: true,
+        vars: cctx.vars,
+        body: MirFnBody::Coroutine {
+            blocks: cctx.blocks,
+            child_slots: cctx.child_slots,
+        },
+    })
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Call-Graph Yield Inference & `main()` Splitting Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn discover_systick_config(stmts: &[Stmt], syms: &mut ModuleSymbols) {
+fn discover_systick_config(
+    stmts: &[Stmt],
+    fn_decls: &BTreeMap<String, &FnDecl>,
+    visited: &mut BTreeSet<String>,
+    syms: &mut ModuleSymbols,
+) {
     for stmt in stmts {
-        if let StmtKind::Expr(Expr {
-            kind: ExprKind::MethodCall {
-                receiver,
-                method,
-                args,
-            },
-            ..
-        }) = &stmt.kind
-        {
-            if let ExprKind::Ident(id) = &receiver.kind {
-                if id.name == "sys" && method.name == "use_systick" {
-                    if let Some(first) = args.first() {
-                        if let ExprKind::Literal(Literal::Int(hz)) = &first.value.kind {
-                            syms.systick_hz = Some(*hz);
+        match &stmt.kind {
+            StmtKind::Expr(Expr {
+                kind:
+                    ExprKind::MethodCall {
+                        receiver,
+                        method,
+                        args,
+                    },
+                ..
+            }) => {
+                if let ExprKind::Ident(id) = &receiver.kind {
+                    if id.name == "sys" && method.name == "use_systick" {
+                        if let Some(first) = args.first() {
+                            if let ExprKind::Literal(Literal::Int(hz)) = &first.value.kind {
+                                syms.systick_hz = Some(*hz);
+                            }
                         }
-                    }
-                } else if id.name == "sys" && method.name == "set_tick_us" {
-                    if let Some(first) = args.first() {
-                        if let ExprKind::Literal(Literal::Int(us)) = &first.value.kind {
-                            if *us > 0 {
-                                syms.tick_period_us = *us;
+                        if let Some(second) = args.get(1) {
+                            if let ExprKind::Literal(Literal::Duration(d)) = &second.value.kind {
+                                let us = d.as_micros();
+                                if us > 0 {
+                                    syms.tick_period_us = us;
+                                }
+                            }
+                        }
+                    } else if id.name == "sys" && method.name == "set_tick_us" {
+                        if let Some(first) = args.first() {
+                            if let ExprKind::Literal(Literal::Int(us)) = &first.value.kind {
+                                if *us > 0 {
+                                    syms.tick_period_us = *us;
+                                }
+                            }
+                        }
+                    } else if id.name == "sys"
+                        && matches!(method.name.as_str(), "set_tick" | "set_tick_period")
+                    {
+                        if let Some(first) = args.first() {
+                            if let ExprKind::Literal(Literal::Duration(d)) = &first.value.kind {
+                                let us = d.as_micros();
+                                if us > 0 {
+                                    syms.tick_period_us = us;
+                                }
                             }
                         }
                     }
                 }
             }
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { callee, .. },
+                ..
+            }) => {
+                if let ExprKind::Ident(id) = &callee.kind {
+                    if visited.insert(id.name.clone()) {
+                        if let Some(fd) = fn_decls.get(&id.name) {
+                            if let Some(b) = &fd.body {
+                                discover_systick_config(&b.stmts, fn_decls, visited, syms);
+                            }
+                        }
+                    }
+                }
+            }
+            StmtKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                discover_systick_config(&then_block.stmts, fn_decls, visited, syms);
+                if let Some(eb) = else_block {
+                    discover_systick_config(&eb.stmts, fn_decls, visited, syms);
+                }
+            }
+            StmtKind::Block(b) | StmtKind::NoYield { body: b } | StmtKind::Critical { body: b } => {
+                discover_systick_config(&b.stmts, fn_decls, visited, syms);
+            }
+            _ => {}
         }
     }
 }
 
-fn infer_yielding_functions(fn_decls: &[&FnDecl], syms: &mut ModuleSymbols) {
-    let mut direct_yield: BTreeSet<String> = BTreeSet::new();
-    let mut callees_of: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+#[derive(Clone)]
+struct RawCallEdge {
+    caller: String,
+    callee: String,
+    in_noyield: bool,
+    in_restricted: bool, // critical, defer, or isr
+}
+
+fn infer_effects_and_specializations(
+    fn_decls: &[&FnDecl],
+    task_decls: &[&TaskDecl],
+    main_decl: Option<&FnDecl>,
+    syms: &mut ModuleSymbols,
+) {
+    let mut direct_eff: BTreeMap<String, MirFnEffect> = BTreeMap::new();
+    let mut direct_spawns: BTreeSet<String> = BTreeSet::new();
+    let mut edges: Vec<RawCallEdge> = Vec::new();
+    let mut fn_names: BTreeSet<String> = BTreeSet::new();
 
     for fd in fn_decls {
+        let fname = fd.name.name.clone();
+        fn_names.insert(fname.clone());
         let manual = has_attr_manual_yield(&fd.attrs);
-        let mut direct = false;
-        let mut callees = BTreeSet::new();
+        let mut eff = MirFnEffect::NonYielding;
+        let mut spawns = false;
         if let Some(body) = &fd.body {
-            scan_stmts_yield(&body.stmts, manual, false, syms, &mut direct, &mut callees);
+            scan_stmts_effect(
+                &fname,
+                &body.stmts,
+                manual,
+                false,
+                false,
+                &mut eff,
+                &mut spawns,
+                &mut edges,
+            );
         }
-        if direct {
-            direct_yield.insert(fd.name.name.clone());
+        direct_eff.insert(fname.clone(), eff);
+        if spawns {
+            direct_spawns.insert(fname);
         }
-        callees_of.insert(fd.name.name.clone(), callees);
     }
 
-    let mut yielding = direct_yield;
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for (fname, callees) in &callees_of {
-            if !yielding.contains(fname) && callees.iter().any(|c| yielding.contains(c)) {
-                yielding.insert(fname.clone());
+    if let Some(md) = main_decl {
+        let manual = has_attr_manual_yield(&md.attrs);
+        let mut eff = MirFnEffect::NonYielding;
+        let mut spawns = false;
+        if let Some(body) = &md.body {
+            scan_stmts_effect(
+                "main",
+                &body.stmts,
+                manual,
+                false,
+                false,
+                &mut eff,
+                &mut spawns,
+                &mut edges,
+            );
+        }
+    }
+
+    for td in task_decls {
+        let tkey = format!("task::{}", td.name.name);
+        let manual = has_attr_manual_yield(&td.attrs);
+        let mut eff = MirFnEffect::NonYielding;
+        let mut spawns = false;
+        scan_stmts_effect(
+            &tkey,
+            &td.body.stmts,
+            manual,
+            false,
+            false,
+            &mut eff,
+            &mut spawns,
+            &mut edges,
+        );
+    }
+
+    let mut cur_eff = direct_eff;
+    let mut spawns_in_boot = direct_spawns;
+    loop {
+        let mut changed = false;
+        for edge in &edges {
+            if !fn_names.contains(&edge.caller) || !fn_names.contains(&edge.callee) {
+                continue;
+            }
+            let callee_eff = cur_eff
+                .get(&edge.callee)
+                .copied()
+                .unwrap_or(MirFnEffect::NonYielding);
+            let edge_eff = match callee_eff {
+                MirFnEffect::HardBlocking => MirFnEffect::HardBlocking,
+                MirFnEffect::SoftYielding if !edge.in_noyield => MirFnEffect::SoftYielding,
+                _ => MirFnEffect::NonYielding,
+            };
+            let prev = cur_eff
+                .get(&edge.caller)
+                .copied()
+                .unwrap_or(MirFnEffect::NonYielding);
+            let next = prev.max(edge_eff);
+            if next != prev {
+                cur_eff.insert(edge.caller.clone(), next);
+                changed = true;
+            }
+            if spawns_in_boot.contains(&edge.callee) && spawns_in_boot.insert(edge.caller.clone()) {
                 changed = true;
             }
         }
+        if !changed {
+            break;
+        }
     }
 
-    for yname in yielding {
-        if let Some(sig) = syms.fns.get_mut(&yname) {
+    for fname in &fn_names {
+        let eff = cur_eff
+            .get(fname)
+            .copied()
+            .unwrap_or(MirFnEffect::NonYielding);
+        let sp = spawns_in_boot.contains(fname);
+        if let Some(sig) = syms.fns.get_mut(fname) {
             if !sig.is_extern_c {
-                sig.is_yielding = true;
+                sig.effect = eff;
+                sig.is_yielding = eff.can_yield();
+                sig.spawns_in_boot = sp;
             }
         }
     }
+
+    // Compute 2-state `(Coro | NoYield)` reachability for `SoftYielding` functions.
+    #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    enum ExecMode {
+        Coro,
+        NoYield,
+    }
+
+    let mut has_incoming: BTreeSet<&str> = BTreeSet::new();
+    let mut adj: BTreeMap<&str, Vec<&RawCallEdge>> = BTreeMap::new();
+    for e in &edges {
+        if fn_names.contains(&e.callee) {
+            has_incoming.insert(e.callee.as_str());
+            adj.entry(e.caller.as_str()).or_default().push(e);
+        }
+    }
+
+    let mut queue: VecDeque<(String, ExecMode)> = VecDeque::new();
+    let mut visited: BTreeSet<(String, ExecMode)> = BTreeSet::new();
+
+    if main_decl.is_some() {
+        visited.insert(("main".to_string(), ExecMode::Coro));
+        queue.push_back(("main".to_string(), ExecMode::Coro));
+    }
+    for td in task_decls {
+        let tkey = format!("task::{}", td.name.name);
+        if visited.insert((tkey.clone(), ExecMode::Coro)) {
+            queue.push_back((tkey, ExecMode::Coro));
+        }
+    }
+    for fname in &fn_names {
+        if !has_incoming.contains(fname.as_str())
+            && visited.insert((fname.clone(), ExecMode::Coro))
+        {
+            queue.push_back((fname.clone(), ExecMode::Coro));
+        }
+    }
+
+    let mut soft_in_coro = BTreeSet::new();
+    let mut soft_in_noyield = BTreeSet::new();
+
+    while let Some((curr, mode)) = queue.pop_front() {
+        let Some(out_edges) = adj.get(curr.as_str()) else {
+            continue;
+        };
+        for edge in out_edges {
+            if edge.in_restricted {
+                continue;
+            }
+            let Some(callee_sig) = syms.fns.get(&edge.callee) else {
+                continue;
+            };
+            if callee_sig.is_extern_c {
+                continue;
+            }
+            let next_mode = if mode == ExecMode::NoYield || edge.in_noyield {
+                ExecMode::NoYield
+            } else {
+                ExecMode::Coro
+            };
+            if callee_sig.effect == MirFnEffect::SoftYielding {
+                match next_mode {
+                    ExecMode::Coro => {
+                        soft_in_coro.insert(edge.callee.clone());
+                    }
+                    ExecMode::NoYield => {
+                        soft_in_noyield.insert(edge.callee.clone());
+                    }
+                }
+            }
+            if visited.insert((edge.callee.clone(), next_mode)) {
+                queue.push_back((edge.callee.clone(), next_mode));
+            }
+        }
+    }
+
+    // Register `{f}__noyield` signatures in `syms.fns` for all `soft_in_noyield` functions.
+    for ny_fn in &soft_in_noyield {
+        if let Some(orig_sig) = syms.fns.get(ny_fn).cloned() {
+            syms.fns.insert(
+                format!("{ny_fn}__noyield"),
+                FnSig {
+                    params: orig_sig.params,
+                    ret_ty: orig_sig.ret_ty,
+                    error_spec: orig_sig.error_spec,
+                    is_extern_c: false,
+                    is_yielding: false,
+                    effect: MirFnEffect::NonYielding,
+                    spawns_in_boot: false,
+                },
+            );
+        }
+    }
+
+    syms.dual_specialized_fns = soft_in_coro
+        .intersection(&soft_in_noyield)
+        .cloned()
+        .collect();
+    syms.soft_yielding_in_coro = soft_in_coro;
+    syms.soft_yielding_in_noyield = soft_in_noyield;
 }
 
-fn scan_stmts_yield(
+fn ast_block_has_break(block: &Block) -> bool {
+    ast_stmts_have_break(&block.stmts)
+}
+
+fn ast_stmts_have_break(stmts: &[Stmt]) -> bool {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::Break => return true,
+            StmtKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                if ast_block_has_break(then_block)
+                    || else_block.as_ref().is_some_and(ast_block_has_break)
+                {
+                    return true;
+                }
+            }
+            StmtKind::Switch { arms, .. } => {
+                if arms.iter().any(|a| ast_block_has_break(&a.body)) {
+                    return true;
+                }
+            }
+            StmtKind::NoYield { body } | StmtKind::Critical { body } | StmtKind::Block(body) => {
+                if ast_block_has_break(body) {
+                    return true;
+                }
+            }
+            StmtKind::Expr(e) | StmtKind::VarDecl { init: Some(e), .. } => {
+                if ast_expr_has_break(e) {
+                    return true;
+                }
+            }
+            StmtKind::Loop { .. }
+            | StmtKind::While { .. }
+            | StmtKind::LoopEvery { .. }
+            | StmtKind::ForRange { .. }
+            | StmtKind::ForEach { .. } => {}
+            _ => {}
+        }
+    }
+    false
+}
+
+fn ast_expr_has_break(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Catch { expr: inner, clause } => {
+            ast_expr_has_break(inner) || ast_block_has_break(&clause.body)
+        }
+        ExprKind::Or { expr: a, fallback: b } => ast_expr_has_break(a) || ast_expr_has_break(b),
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_stmts_effect(
+    caller: &str,
     stmts: &[Stmt],
     manual_yield: bool,
     in_noyield: bool,
-    syms: &ModuleSymbols,
-    direct: &mut bool,
-    callees: &mut BTreeSet<String>,
+    in_restricted: bool,
+    eff: &mut MirFnEffect,
+    spawns: &mut bool,
+    edges: &mut Vec<RawCallEdge>,
 ) {
     for stmt in stmts {
         let stmt_manual = manual_yield || has_attr_manual_yield(&stmt.attrs);
         match &stmt.kind {
-            StmtKind::Every { body, .. } => {
-                *direct = true;
-                scan_stmts_yield(&body.stmts, stmt_manual, in_noyield, syms, direct, callees);
+            StmtKind::LoopEvery { period, body } => {
+                if !in_noyield && !in_restricted {
+                    *eff = (*eff).max(MirFnEffect::HardBlocking);
+                }
+                scan_expr_effect(caller, period, in_noyield, in_restricted, eff, edges);
+                scan_stmts_effect(
+                    caller,
+                    &body.stmts,
+                    stmt_manual,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
-            StmtKind::Checkpoint => {
-                *direct = true;
+            StmtKind::Checkpoint | StmtKind::Restart => {
+                if !in_noyield && !in_restricted {
+                    *eff = (*eff).max(MirFnEffect::SoftYielding);
+                }
             }
             StmtKind::Loop { body } => {
-                if !stmt_manual && !in_noyield {
-                    *direct = true;
+                let has_break = ast_block_has_break(body);
+                if !in_noyield && !in_restricted {
+                    if !has_break {
+                        *eff = (*eff).max(MirFnEffect::HardBlocking);
+                    } else if !stmt_manual {
+                        *eff = (*eff).max(MirFnEffect::SoftYielding);
+                    }
                 }
-                scan_stmts_yield(&body.stmts, stmt_manual, in_noyield, syms, direct, callees);
+                scan_stmts_effect(
+                    caller,
+                    &body.stmts,
+                    stmt_manual,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
             StmtKind::While { cond, body } => {
-                scan_expr_yield(cond, syms, direct, callees);
-                scan_stmts_yield(&body.stmts, stmt_manual, in_noyield, syms, direct, callees);
+                scan_expr_effect(caller, cond, in_noyield, in_restricted, eff, edges);
+                let is_while_true = matches!(cond.kind, ExprKind::Literal(Literal::Bool(true)));
+                if is_while_true && !in_noyield && !in_restricted {
+                    let has_break = ast_block_has_break(body);
+                    if !has_break {
+                        *eff = (*eff).max(MirFnEffect::HardBlocking);
+                    } else if !stmt_manual {
+                        *eff = (*eff).max(MirFnEffect::SoftYielding);
+                    }
+                }
+                scan_stmts_effect(
+                    caller,
+                    &body.stmts,
+                    stmt_manual,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
-            StmtKind::NoYield { body } | StmtKind::Critical { body } => {
-                scan_stmts_yield(&body.stmts, stmt_manual, true, syms, direct, callees);
+            StmtKind::ForRange {
+                start, end, body, ..
+            } => {
+                scan_expr_effect(caller, start, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, end, in_noyield, in_restricted, eff, edges);
+                scan_stmts_effect(
+                    caller,
+                    &body.stmts,
+                    stmt_manual,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
+            }
+            StmtKind::ForEach { iter, body, .. } => {
+                scan_expr_effect(caller, iter, in_noyield, in_restricted, eff, edges);
+                scan_stmts_effect(
+                    caller,
+                    &body.stmts,
+                    stmt_manual,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
+            }
+            StmtKind::Defer(inner) => {
+                scan_stmts_effect(
+                    caller,
+                    std::slice::from_ref(inner.as_ref()),
+                    stmt_manual,
+                    true,
+                    true,
+                    eff,
+                    spawns,
+                    edges,
+                );
+            }
+            StmtKind::NoYield { body } => {
+                scan_stmts_effect(
+                    caller,
+                    &body.stmts,
+                    stmt_manual,
+                    true,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
+            }
+            StmtKind::Critical { body } => {
+                scan_stmts_effect(
+                    caller,
+                    &body.stmts,
+                    stmt_manual,
+                    true,
+                    true,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
             StmtKind::If {
                 cond,
                 then_block,
                 else_block,
             } => {
-                scan_expr_yield(cond, syms, direct, callees);
-                scan_stmts_yield(
+                scan_expr_effect(caller, cond, in_noyield, in_restricted, eff, edges);
+                scan_stmts_effect(
+                    caller,
                     &then_block.stmts,
                     stmt_manual,
                     in_noyield,
-                    syms,
-                    direct,
-                    callees,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
                 );
                 if let Some(eb) = else_block {
-                    scan_stmts_yield(&eb.stmts, stmt_manual, in_noyield, syms, direct, callees);
+                    scan_stmts_effect(
+                        caller,
+                        &eb.stmts,
+                        stmt_manual,
+                        in_noyield,
+                        in_restricted,
+                        eff,
+                        spawns,
+                        edges,
+                    );
                 }
             }
             StmtKind::Switch { scrutinee, arms } => {
-                scan_expr_yield(scrutinee, syms, direct, callees);
+                scan_expr_effect(caller, scrutinee, in_noyield, in_restricted, eff, edges);
                 for arm in arms {
-                    scan_stmts_yield(
+                    scan_stmts_effect(
+                        caller,
                         &arm.body.stmts,
                         stmt_manual,
                         in_noyield,
-                        syms,
-                        direct,
-                        callees,
+                        in_restricted,
+                        eff,
+                        spawns,
+                        edges,
                     );
                 }
             }
             StmtKind::Block(b) => {
-                scan_stmts_yield(&b.stmts, stmt_manual, in_noyield, syms, direct, callees);
+                scan_stmts_effect(
+                    caller,
+                    &b.stmts,
+                    stmt_manual,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
             StmtKind::VarDecl { init: Some(e), .. }
             | StmtKind::Return(Some(e))
             | StmtKind::Expr(e) => {
-                scan_expr_yield(e, syms, direct, callees);
+                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, edges);
             }
             StmtKind::Assign { target, value, .. } => {
-                scan_expr_yield(target, syms, direct, callees);
-                scan_expr_yield(value, syms, direct, callees);
+                scan_expr_effect(caller, target, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, value, in_noyield, in_restricted, eff, edges);
             }
             StmtKind::Error { reason, partial } => {
                 if let Some(r) = reason {
-                    scan_expr_yield(r, syms, direct, callees);
+                    scan_expr_effect(caller, r, in_noyield, in_restricted, eff, edges);
                 }
                 if let Some(p) = partial {
-                    scan_expr_yield(p, syms, direct, callees);
+                    scan_expr_effect(caller, p, in_noyield, in_restricted, eff, edges);
                 }
             }
             StmtKind::Spawn(sp) => {
+                *spawns = true;
                 for a in &sp.args {
-                    scan_expr_yield(&a.value, syms, direct, callees);
+                    scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, edges);
                 }
             }
             StmtKind::VarDecl { init: None, .. }
@@ -791,24 +1312,41 @@ fn scan_stmts_yield(
     }
 }
 
-fn scan_expr_yield(
+fn scan_expr_effect(
+    caller: &str,
     expr: &Expr,
-    syms: &ModuleSymbols,
-    direct: &mut bool,
-    callees: &mut BTreeSet<String>,
+    in_noyield: bool,
+    in_restricted: bool,
+    eff: &mut MirFnEffect,
+    edges: &mut Vec<RawCallEdge>,
 ) {
     match &expr.kind {
         ExprKind::Call { callee, args } => {
             if let ExprKind::Ident(id) = &callee.kind {
-                if matches!(id.name.as_str(), "delay" | "delay_ms" | "sleep" | "checkpoint") {
-                    *direct = true;
-                } else {
-                    callees.insert(id.name.clone());
+                match id.name.as_str() {
+                    "delay" | "delay_ms" | "sleep" => {
+                        if !in_noyield && !in_restricted {
+                            *eff = (*eff).max(MirFnEffect::HardBlocking);
+                        }
+                    }
+                    "checkpoint" => {
+                        if !in_noyield && !in_restricted {
+                            *eff = (*eff).max(MirFnEffect::SoftYielding);
+                        }
+                    }
+                    _ => {
+                        edges.push(RawCallEdge {
+                            caller: caller.to_string(),
+                            callee: id.name.clone(),
+                            in_noyield,
+                            in_restricted,
+                        });
+                    }
                 }
             }
-            scan_expr_yield(callee, syms, direct, callees);
+            scan_expr_effect(caller, callee, in_noyield, in_restricted, eff, edges);
             for a in args {
-                scan_expr_yield(&a.value, syms, direct, callees);
+                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, edges);
             }
         }
         ExprKind::MethodCall {
@@ -817,18 +1355,23 @@ fn scan_expr_yield(
             args,
         } => {
             let m = method.name.as_str();
-            if matches!(m, "wait_chunk" | "recv" | "wait" | "send" | "delay") {
-                *direct = true;
+            if matches!(
+                m,
+                "wait_chunk" | "recv" | "wait" | "send" | "delay" | "wait_change"
+            ) && !in_noyield
+                && !in_restricted
+            {
+                *eff = (*eff).max(MirFnEffect::HardBlocking);
             }
-            scan_expr_yield(receiver, syms, direct, callees);
+            scan_expr_effect(caller, receiver, in_noyield, in_restricted, eff, edges);
             for a in args {
-                scan_expr_yield(&a.value, syms, direct, callees);
+                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, edges);
             }
         }
         ExprKind::Unary { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. }
         | ExprKind::Field { target: inner, .. } => {
-            scan_expr_yield(inner, syms, direct, callees);
+            scan_expr_effect(caller, inner, in_noyield, in_restricted, eff, edges);
         }
         ExprKind::Binary { lhs, rhs, .. }
         | ExprKind::Index {
@@ -839,46 +1382,151 @@ fn scan_expr_yield(
             expr: lhs,
             fallback: rhs,
         } => {
-            scan_expr_yield(lhs, syms, direct, callees);
-            scan_expr_yield(rhs, syms, direct, callees);
+            scan_expr_effect(caller, lhs, in_noyield, in_restricted, eff, edges);
+            scan_expr_effect(caller, rhs, in_noyield, in_restricted, eff, edges);
         }
         ExprKind::Slice { target, start, end } => {
-            scan_expr_yield(target, syms, direct, callees);
+            scan_expr_effect(caller, target, in_noyield, in_restricted, eff, edges);
             if let Some(s) = start {
-                scan_expr_yield(s, syms, direct, callees);
+                scan_expr_effect(caller, s, in_noyield, in_restricted, eff, edges);
             }
             if let Some(e) = end {
-                scan_expr_yield(e, syms, direct, callees);
+                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, edges);
             }
         }
         ExprKind::StructLit { fields, .. } => {
             for f in fields {
-                scan_expr_yield(&f.value, syms, direct, callees);
+                scan_expr_effect(caller, &f.value, in_noyield, in_restricted, eff, edges);
             }
         }
         ExprKind::ArrayLit(elems) => {
             for e in elems {
-                scan_expr_yield(e, syms, direct, callees);
+                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, edges);
             }
         }
         ExprKind::Catch { expr: inner, clause } => {
-            scan_expr_yield(inner, syms, direct, callees);
-            scan_stmts_yield(&clause.body.stmts, false, false, syms, direct, callees);
+            scan_expr_effect(caller, inner, in_noyield, in_restricted, eff, edges);
+            let mut dummy_sp = false;
+            scan_stmts_effect(
+                caller,
+                &clause.body.stmts,
+                false,
+                in_noyield,
+                in_restricted,
+                eff,
+                &mut dummy_sp,
+                edges,
+            );
         }
         ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Priority(_) => {}
     }
 }
 
 fn stmt_slice_can_yield(stmts: &[Stmt], manual_yield: bool, syms: &ModuleSymbols) -> bool {
-    let mut direct = false;
-    let mut callees = BTreeSet::new();
-    scan_stmts_yield(stmts, manual_yield, false, syms, &mut direct, &mut callees);
-    if direct {
+    let mut eff = MirFnEffect::NonYielding;
+    let mut dummy_sp = false;
+    let mut edges = Vec::new();
+    scan_stmts_effect(
+        "__slice",
+        stmts,
+        manual_yield,
+        false,
+        false,
+        &mut eff,
+        &mut dummy_sp,
+        &mut edges,
+    );
+    if eff.can_yield() {
         return true;
     }
-    callees
-        .iter()
-        .any(|c| syms.fns.get(c).map_or(false, |f| f.is_yielding))
+    edges.iter().any(|e| {
+        syms.fns.get(&e.callee).map_or(false, |f| {
+            f.effect == MirFnEffect::HardBlocking
+                || (f.effect == MirFnEffect::SoftYielding && !e.in_noyield)
+        })
+    })
+}
+
+fn stmt_contains_boot_spawn(stmt: &Stmt, syms: &ModuleSymbols) -> bool {
+    match &stmt.kind {
+        StmtKind::Spawn(_) => true,
+        StmtKind::If {
+            cond,
+            then_block,
+            else_block,
+        } => {
+            expr_contains_boot_spawn(cond, syms)
+                || then_block
+                    .stmts
+                    .iter()
+                    .any(|s| stmt_contains_boot_spawn(s, syms))
+                || else_block.as_ref().is_some_and(|eb| {
+                    eb.stmts
+                        .iter()
+                        .any(|s| stmt_contains_boot_spawn(s, syms))
+                })
+        }
+        StmtKind::Switch { scrutinee, arms } => {
+            expr_contains_boot_spawn(scrutinee, syms)
+                || arms.iter().any(|a| {
+                    a.body
+                        .stmts
+                        .iter()
+                        .any(|s| stmt_contains_boot_spawn(s, syms))
+                })
+        }
+        StmtKind::Block(b) | StmtKind::NoYield { body: b } | StmtKind::Critical { body: b } => {
+            b.stmts.iter().any(|s| stmt_contains_boot_spawn(s, syms))
+        }
+        StmtKind::VarDecl { init: Some(e), .. }
+        | StmtKind::Assign { value: e, .. }
+        | StmtKind::Expr(e)
+        | StmtKind::Return(Some(e)) => expr_contains_boot_spawn(e, syms),
+        _ => false,
+    }
+}
+
+fn expr_contains_boot_spawn(expr: &Expr, syms: &ModuleSymbols) -> bool {
+    match &expr.kind {
+        ExprKind::Call { callee, args } => {
+            if let ExprKind::Ident(id) = &callee.kind {
+                if syms
+                    .fns
+                    .get(&id.name)
+                    .is_some_and(|sig| sig.spawns_in_boot)
+                {
+                    return true;
+                }
+            }
+            expr_contains_boot_spawn(callee, syms)
+                || args.iter().any(|a| expr_contains_boot_spawn(&a.value, syms))
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            expr_contains_boot_spawn(receiver, syms)
+                || args.iter().any(|a| expr_contains_boot_spawn(&a.value, syms))
+        }
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Field { target: inner, .. } => expr_contains_boot_spawn(inner, syms),
+        ExprKind::Binary { lhs, rhs, .. }
+        | ExprKind::Index {
+            target: lhs,
+            index: rhs,
+        }
+        | ExprKind::Or {
+            expr: lhs,
+            fallback: rhs,
+        } => expr_contains_boot_spawn(lhs, syms) || expr_contains_boot_spawn(rhs, syms),
+        ExprKind::Catch { expr: inner, clause } => {
+            expr_contains_boot_spawn(inner, syms)
+                || clause
+                    .body
+                    .stmts
+                    .iter()
+                    .any(|s| stmt_contains_boot_spawn(s, syms))
+        }
+        _ => false,
+    }
 }
 
 fn detect_static_set_priority(stmts: &[Stmt]) -> Option<MirPriority> {
@@ -902,9 +1550,18 @@ fn detect_static_set_priority(stmts: &[Stmt]) -> Option<MirPriority> {
     None
 }
 
-fn lower_main_entry(
+struct BootSpawnState<'a> {
+    fn_decls: &'a BTreeMap<String, &'a FnDecl>,
+    spawned_tasks: &'a mut Vec<MirSpawnInstance>,
+    bp_instance_counts: BTreeMap<String, usize>,
+    provenance_stack: Vec<String>,
+    branch_depth: usize,
+}
+
+fn lower_main_entry<'a>(
     md: &FnDecl,
-    syms: &ModuleSymbols,
+    syms: &'a ModuleSymbols,
+    fn_decls: &'a BTreeMap<String, &'a FnDecl>,
     blueprints: &mut Vec<MirTaskBlueprint>,
     spawned_tasks: &mut Vec<MirSpawnInstance>,
 ) -> Result<MirBootSequence, MirLowerError> {
@@ -912,17 +1569,15 @@ fn lower_main_entry(
     let stmts = &body.stmts;
     let manual_yield = has_attr_manual_yield(&md.attrs);
 
-    // Locate the last top-level `spawn` statement (if any).
+    // Locate the last top-level boot statement containing a `spawn` (directly, conditionally, or via boot helper).
     let last_spawn_idx = stmts
         .iter()
-        .rposition(|s| matches!(s.kind, StmtKind::Spawn(_)));
+        .rposition(|s| stmt_contains_boot_spawn(s, syms));
 
     let (boot_slice, tail_slice) = match last_spawn_idx {
         Some(idx) => (&stmts[..=idx], &stmts[idx + 1..]),
         None => {
             if stmt_slice_can_yield(stmts, manual_yield, syms) {
-                // No `spawn` statements, `main` itself is a yielding task; keep leading
-                // `sys.use_systick` in boot if it is the first statement, or run all in `main` task.
                 let split = stmts
                     .iter()
                     .take_while(|s| is_pure_boot_setup_stmt(s))
@@ -937,124 +1592,140 @@ fn lower_main_entry(
     let tail_becomes_task =
         !tail_slice.is_empty() && stmt_slice_can_yield(tail_slice, manual_yield, syms);
 
-    let mut dctx = DirectLowerCtx::new(syms, MirType::Void, MirErrorSpec::None);
     let mut boot_steps: Vec<MirBootStep> = Vec::new();
     let mut boot_yielding_callees: BTreeSet<String> = BTreeSet::new();
-    let mut bp_instance_counts: BTreeMap<String, usize> = BTreeMap::new();
 
-    let combined_boot_iter = if tail_becomes_task {
-        boot_slice.iter().chain([].iter())
+    let combined_boot_iter: Vec<&Stmt> = if tail_becomes_task {
+        boot_slice.iter().collect()
     } else {
-        boot_slice.iter().chain(tail_slice.iter())
+        boot_slice.iter().chain(tail_slice.iter()).collect()
     };
 
-    for stmt in combined_boot_iter {
-        match &stmt.kind {
-            StmtKind::Spawn(sp) => {
-                let bp_name = sp.task.name.clone();
-                let param_tys = syms.tasks.get(&bp_name).cloned().unwrap_or_default();
-                let mut lowered_args = Vec::new();
-                for (idx, arg) in sp.args.iter().enumerate() {
-                    let expected = param_tys.get(idx);
-                    lowered_args.push(dctx.lower_pure_expr(&arg.value, expected)?);
-                }
-                let count_entry = bp_instance_counts.entry(bp_name.clone()).or_insert(0);
-                let inst_num = *count_entry;
-                *count_entry += 1;
+    let boot_vars = {
+        let boot_state = BootSpawnState {
+            fn_decls,
+            spawned_tasks,
+            bp_instance_counts: BTreeMap::new(),
+            provenance_stack: vec!["main".to_string()],
+            branch_depth: 0,
+        };
+        let mut dctx = DirectLowerCtx::new_with_boot(
+            syms,
+            MirType::Void,
+            MirErrorSpec::None,
+            boot_state,
+        );
 
-                let slot_id = spawned_tasks.len();
-                let instance_name = format!("{bp_name}_{inst_num}");
-                let prio = sp.priority.map_or(MirPriority::Normal, convert_priority);
-                let core_pin = sp.core.map(|c| c as u8);
-
-                spawned_tasks.push(MirSpawnInstance {
-                    slot_id,
-                    instance_name,
-                    blueprint_name: bp_name,
-                    priority: prio,
-                    core_pin,
-                    init_args: lowered_args.clone(),
-                    is_main_supervisor: false,
-                });
-
-                boot_steps.push(MirBootStep::SpawnActivate {
-                    slot_id,
-                    args: lowered_args,
-                });
-            }
-            // Support sequential boot calls to yielding functions (e.g. `run_power_on_self_test();`)!
-            StmtKind::Expr(Expr {
-                kind: ExprKind::Call { callee, args },
-                ..
-            }) if is_yielding_fn_callee(callee, syms) => {
-                let cname = match &callee.kind {
-                    ExprKind::Ident(id) => id.name.clone(),
-                    _ => unreachable!(),
-                };
-                let fn_sig = syms.fns.get(&cname).unwrap().clone();
-                let mut largs = Vec::new();
-                for (i, a) in args.iter().enumerate() {
-                    largs.push(dctx.lower_pure_expr(&a.value, fn_sig.params.get(i))?);
+        for stmt in &combined_boot_iter {
+            match &stmt.kind {
+                // Support sequential boot calls to yielding functions (e.g. `run_power_on_self_test();`)!
+                StmtKind::Expr(Expr {
+                    kind: ExprKind::Call { callee, args },
+                    ..
+                }) if is_yielding_fn_callee(callee, syms) => {
+                    let cname = match &callee.kind {
+                        ExprKind::Ident(id) => id.name.clone(),
+                        _ => unreachable!(),
+                    };
+                    let fn_sig = syms.fns.get(&cname).unwrap().clone();
+                    let mut pre_stmts = Vec::new();
+                    let mut largs = Vec::new();
+                    for (i, a) in args.iter().enumerate() {
+                        largs.push(dctx.lower_expr_with_stmts(
+                            &a.value,
+                            fn_sig.params.get(i),
+                            &mut pre_stmts,
+                        )?);
+                    }
+                    for ps in pre_stmts {
+                        boot_steps.push(MirBootStep::Stmt(ps));
+                    }
+                    boot_yielding_callees.insert(cname.clone());
+                    boot_steps.push(MirBootStep::RunYieldingFn {
+                        callee: cname,
+                        args: largs,
+                        dst: None,
+                    });
                 }
-                boot_yielding_callees.insert(cname.clone());
-                boot_steps.push(MirBootStep::RunYieldingFn {
-                    callee: cname,
-                    args: largs,
-                    dst: None,
-                });
-            }
-            StmtKind::VarDecl {
-                ty,
-                name,
-                init:
-                    Some(Expr {
-                        kind: ExprKind::Call { callee, args },
-                        ..
-                    }),
-            } if is_yielding_fn_callee(callee, syms) => {
-                let cname = match &callee.kind {
-                    ExprKind::Ident(id) => id.name.clone(),
-                    _ => unreachable!(),
-                };
-                let fn_sig = syms.fns.get(&cname).unwrap().clone();
-                let vty = syms.resolve_type(ty);
-                let vid = dctx.declare_var(&name.name, vty, VarRole::UserLocal);
-                let mut largs = Vec::new();
-                for (i, a) in args.iter().enumerate() {
-                    largs.push(dctx.lower_pure_expr(&a.value, fn_sig.params.get(i))?);
+                StmtKind::VarDecl {
+                    ty,
+                    name,
+                    init:
+                        Some(Expr {
+                            kind: ExprKind::Call { callee, args },
+                            ..
+                        }),
+                } if is_yielding_fn_callee(callee, syms) => {
+                    let cname = match &callee.kind {
+                        ExprKind::Ident(id) => id.name.clone(),
+                        _ => unreachable!(),
+                    };
+                    let fn_sig = syms.fns.get(&cname).unwrap().clone();
+                    let vty = syms.resolve_type(ty);
+                    let vid = dctx.declare_var(&name.name, vty, VarRole::UserLocal);
+                    let mut pre_stmts = Vec::new();
+                    let mut largs = Vec::new();
+                    for (i, a) in args.iter().enumerate() {
+                        largs.push(dctx.lower_expr_with_stmts(
+                            &a.value,
+                            fn_sig.params.get(i),
+                            &mut pre_stmts,
+                        )?);
+                    }
+                    for ps in pre_stmts {
+                        boot_steps.push(MirBootStep::Stmt(ps));
+                    }
+                    boot_yielding_callees.insert(cname.clone());
+                    let dst = if fn_sig.error_spec.has_error() {
+                        Some(MirCallDst::Result(vid))
+                    } else {
+                        Some(MirCallDst::Value(vid))
+                    };
+                    boot_steps.push(MirBootStep::RunYieldingFn {
+                        callee: cname,
+                        args: largs,
+                        dst,
+                    });
                 }
-                boot_yielding_callees.insert(cname.clone());
-                let dst = if fn_sig.error_spec.has_error() {
-                    Some(MirCallDst::Result(vid))
-                } else {
-                    Some(MirCallDst::Value(vid))
-                };
-                boot_steps.push(MirBootStep::RunYieldingFn {
-                    callee: cname,
-                    args: largs,
-                    dst,
-                });
-            }
-            _ => {
-                let lowered = dctx.lower_stmt(stmt)?;
-                for ls in lowered {
-                    boot_steps.push(MirBootStep::Stmt(ls));
+                _ => {
+                    let lowered = dctx.lower_stmt(stmt)?;
+                    for ls in lowered {
+                        match ls {
+                            MirStmt::SpawnActivate { slot_id, args } => {
+                                boot_steps.push(MirBootStep::SpawnActivate { slot_id, args });
+                            }
+                            other => boot_steps.push(MirBootStep::Stmt(other)),
+                        }
+                    }
                 }
             }
         }
-    }
+
+        if !tail_becomes_task {
+            let root_defers = dctx.pop_and_lower_top_defer_scope()?;
+            for ls in root_defers {
+                boot_steps.push(MirBootStep::Stmt(ls));
+            }
+        }
+
+        // Capture `main`'s root lexical scope vars before dropping `dctx` so `tail_slice` can forward them.
+        let root_scope_map = dctx.scopes.frames.first().cloned().unwrap_or_default();
+        (dctx.vars, root_scope_map)
+    };
+
+    let (boot_vars_vec, root_scope_map) = boot_vars;
 
     if tail_becomes_task {
-        // Check if any boot variables are referenced inside `tail_slice`; if so, pass them
-        // into `main` supervisor task's static frame parameters so they persist cleanly!
+        // Forward any root `main` boot variables referenced inside `tail_slice` into `main` supervisor's frame!
         let mut tail_ident_refs = BTreeSet::new();
         collect_ast_idents_stmts(tail_slice, &mut tail_ident_refs);
 
         let mut forwarded_params: Vec<(String, MirType, MirExpr)> = Vec::new();
-        for bvar in &dctx.vars {
-            if bvar.role == VarRole::UserLocal && tail_ident_refs.contains(&bvar.name) {
+        for (vname, &vid) in &root_scope_map {
+            if tail_ident_refs.contains(vname) {
+                let bvar = &boot_vars_vec[vid.0];
                 forwarded_params.push((
-                    bvar.name.clone(),
+                    vname.clone(),
                     bvar.ty.clone(),
                     MirExpr::new(MirExprKind::Var(bvar.id), bvar.ty.clone()),
                 ));
@@ -1071,7 +1742,7 @@ fn lower_main_entry(
             init_args.push(init_expr);
         }
 
-        cctx.lower_stmts(tail_slice)?;
+        cctx.lower_top_level_stmts(tail_slice)?;
         cctx.finish_with_implicit_return();
 
         let mut main_bp = MirTaskBlueprint {
@@ -1096,6 +1767,8 @@ fn lower_main_entry(
             core_pin: None,
             init_args: init_args.clone(),
             is_main_supervisor: true,
+            provenance_path: vec!["main".to_string()],
+            conditional: false,
         });
         boot_steps.push(MirBootStep::SpawnActivate {
             slot_id,
@@ -1105,7 +1778,7 @@ fn lower_main_entry(
 
     Ok(MirBootSequence {
         present: true,
-        vars: dctx.vars,
+        vars: boot_vars_vec,
         steps: boot_steps,
         boot_yielding_callees: boot_yielding_callees.into_iter().collect(),
     })
@@ -1113,7 +1786,9 @@ fn lower_main_entry(
 
 fn is_yielding_fn_callee(callee: &Expr, syms: &ModuleSymbols) -> bool {
     if let ExprKind::Ident(id) = &callee.kind {
-        syms.fns.get(&id.name).map_or(false, |f| f.is_yielding)
+        syms.fns
+            .get(&id.name)
+            .map_or(false, |f| f.is_yielding && !f.spawns_in_boot)
     } else {
         false
     }
@@ -1171,8 +1846,25 @@ fn collect_ast_idents_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
                 collect_ast_idents_expr(cond, out);
                 collect_ast_idents_stmts(&body.stmts, out);
             }
+            StmtKind::LoopEvery { period, body } => {
+                collect_ast_idents_expr(period, out);
+                collect_ast_idents_stmts(&body.stmts, out);
+            }
+            StmtKind::ForRange {
+                start, end, body, ..
+            } => {
+                collect_ast_idents_expr(start, out);
+                collect_ast_idents_expr(end, out);
+                collect_ast_idents_stmts(&body.stmts, out);
+            }
+            StmtKind::ForEach { iter, body, .. } => {
+                collect_ast_idents_expr(iter, out);
+                collect_ast_idents_stmts(&body.stmts, out);
+            }
+            StmtKind::Defer(inner) => {
+                collect_ast_idents_stmts(std::slice::from_ref(inner.as_ref()), out);
+            }
             StmtKind::Loop { body }
-            | StmtKind::Every { body, .. }
             | StmtKind::NoYield { body }
             | StmtKind::Critical { body }
             | StmtKind::Block(body) => {
@@ -1475,12 +2167,23 @@ fn convert_switch_pat(
 // Direct (Non-Yielding) Function / ISR / Boot Statement Lowerer
 // ─────────────────────────────────────────────────────────────────────────────
 
+struct InlinedHelperFrame {
+    ret_ty: MirType,
+    ret_val_var: Option<VarId>,
+    ret_flag_var: Option<VarId>,
+    entry_defer_depth: usize,
+}
+
 struct DirectLowerCtx<'a> {
     syms: &'a ModuleSymbols,
     ret_ty: MirType,
     error_spec: MirErrorSpec,
     vars: Vec<MirVar>,
     scopes: VarScopes,
+    defer_stack: Vec<Vec<Stmt>>,
+    loop_defer_depths: Vec<usize>,
+    boot_state: Option<BootSpawnState<'a>>,
+    inlined_helper_stack: Vec<InlinedHelperFrame>,
     in_noyield: bool,
     pending_stmts: Vec<MirStmt>,
 }
@@ -1493,6 +2196,31 @@ impl<'a> DirectLowerCtx<'a> {
             error_spec,
             vars: Vec::new(),
             scopes: VarScopes::new(),
+            defer_stack: vec![Vec::new()],
+            loop_defer_depths: Vec::new(),
+            boot_state: None,
+            inlined_helper_stack: Vec::new(),
+            in_noyield: false,
+            pending_stmts: Vec::new(),
+        }
+    }
+
+    fn new_with_boot(
+        syms: &'a ModuleSymbols,
+        ret_ty: MirType,
+        error_spec: MirErrorSpec,
+        boot_state: BootSpawnState<'a>,
+    ) -> Self {
+        Self {
+            syms,
+            ret_ty,
+            error_spec,
+            vars: Vec::new(),
+            scopes: VarScopes::new(),
+            defer_stack: vec![Vec::new()],
+            loop_defer_depths: Vec::new(),
+            boot_state: Some(boot_state),
+            inlined_helper_stack: Vec::new(),
             in_noyield: false,
             pending_stmts: Vec::new(),
         }
@@ -1520,14 +2248,107 @@ impl<'a> DirectLowerCtx<'a> {
         self.declare_var(&name, ty, VarRole::CompilerTemp)
     }
 
+    fn has_active_defers_from(&self, min_depth: usize) -> bool {
+        self.defer_stack
+            .iter()
+            .skip(min_depth)
+            .any(|frame| !frame.is_empty())
+    }
+
+    fn lower_single_deferred_stmt(&mut self, deferred: &Stmt) -> Result<Vec<MirStmt>, MirLowerError> {
+        let prev_ny = self.in_noyield;
+        self.in_noyield = true;
+        self.scopes.push();
+        self.defer_stack.push(Vec::new());
+        let res = self.lower_stmt(deferred);
+        self.defer_stack.pop();
+        self.scopes.pop();
+        self.in_noyield = prev_ny;
+        res
+    }
+
+    fn pop_and_lower_top_defer_scope(&mut self) -> Result<Vec<MirStmt>, MirLowerError> {
+        let Some(defers) = self.defer_stack.pop() else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for d in defers.iter().rev() {
+            out.extend(self.lower_single_deferred_stmt(d)?);
+        }
+        Ok(out)
+    }
+
+    /// Emit active `defer` statements from innermost scope down to `min_depth` (inclusive) WITHOUT
+    /// popping `self.defer_stack` (used for `return`, `error`, `break`, `continue`, `sys.exit`).
+    fn emit_defers_down_to(&mut self, min_depth: usize) -> Result<Vec<MirStmt>, MirLowerError> {
+        let top = self.defer_stack.len();
+        if min_depth >= top {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        let mut popped_var_frames: Vec<BTreeMap<String, VarId>> = Vec::new();
+
+        for depth in (min_depth..top).rev() {
+            while self.scopes.frames.len() > depth + 1 {
+                if let Some(vf) = self.scopes.frames.pop() {
+                    popped_var_frames.push(vf);
+                } else {
+                    break;
+                }
+            }
+            let cloned_defers = self.defer_stack[depth].clone();
+            for d in cloned_defers.iter().rev() {
+                out.extend(self.lower_single_deferred_stmt(d)?);
+            }
+        }
+
+        while let Some(vf) = popped_var_frames.pop() {
+            self.scopes.frames.push(vf);
+        }
+        Ok(out)
+    }
+
+    fn lower_top_level_stmts(&mut self, stmts: &[Stmt]) -> Result<Vec<MirStmt>, MirLowerError> {
+        let mut out = self.lower_stmt_seq(stmts)?;
+        out.extend(self.pop_and_lower_top_defer_scope()?);
+        Ok(out)
+    }
+
     fn lower_block_stmts(&mut self, stmts: &[Stmt]) -> Result<Vec<MirStmt>, MirLowerError> {
         self.scopes.push();
+        self.defer_stack.push(Vec::new());
+        let mut out = self.lower_stmt_seq(stmts)?;
+        out.extend(self.pop_and_lower_top_defer_scope()?);
+        self.scopes.pop();
+        Ok(out)
+    }
+
+    fn lower_stmt_seq(&mut self, stmts: &[Stmt]) -> Result<Vec<MirStmt>, MirLowerError> {
+        let ret_flag_opt = self
+            .inlined_helper_stack
+            .last()
+            .and_then(|f| f.ret_flag_var);
         let mut out = Vec::new();
         for s in stmts {
             let chunk = self.lower_stmt(s)?;
-            out.extend(chunk);
+            if let Some(rf) = ret_flag_opt {
+                if !chunk.is_empty() {
+                    out.push(MirStmt::If {
+                        cond: MirExpr::new(
+                            MirExprKind::Unary {
+                                op: MirUnaryOp::Not,
+                                expr: Box::new(MirExpr::new(MirExprKind::Var(rf), MirType::Bool)),
+                            },
+                            MirType::Bool,
+                        ),
+                        then_body: chunk,
+                        else_body: Vec::new(),
+                    });
+                }
+            } else {
+                out.extend(chunk);
+            }
         }
-        self.scopes.pop();
         Ok(out)
     }
 
@@ -1536,7 +2357,15 @@ impl<'a> DirectLowerCtx<'a> {
         match &stmt.kind {
             StmtKind::VarDecl { ty, name, init } => {
                 let vty = self.syms.resolve_type(ty);
-                let vid = self.declare_var(&name.name, vty.clone(), VarRole::UserLocal);
+                let role = if self.inlined_helper_stack.is_empty() {
+                    VarRole::UserLocal
+                } else {
+                    VarRole::CompilerTemp
+                };
+                let vid = self.declare_var(&name.name, vty.clone(), role);
+                if role == VarRole::CompilerTemp {
+                    self.scopes.insert(name.name.clone(), vid);
+                }
                 if let Some(ie) = init {
                     let val = self.lower_expr_with_stmts(ie, Some(&vty), &mut out)?;
                     out.push(MirStmt::Assign {
@@ -1555,28 +2384,98 @@ impl<'a> DirectLowerCtx<'a> {
                     value: coerce_expr_if_needed(rhs, &pty.host_value_type()),
                 });
             }
+            StmtKind::Defer(inner) => {
+                if let Some(top) = self.defer_stack.last_mut() {
+                    top.push((**inner).clone());
+                }
+            }
             StmtKind::Return(expr_opt) => {
+                if let Some(hframe) = self.inlined_helper_stack.last() {
+                    let h_ret_ty = hframe.ret_ty.clone();
+                    let h_ret_val = hframe.ret_val_var;
+                    let h_ret_flag = hframe.ret_flag_var;
+                    let h_entry_depth = hframe.entry_defer_depth;
+                    if let Some(e) = expr_opt {
+                        let v = self.lower_expr_with_stmts(e, Some(&h_ret_ty), &mut out)?;
+                        if let Some(rv) = h_ret_val {
+                            out.push(MirStmt::Assign {
+                                target: MirPlace::Var(rv),
+                                op: MirAssignOp::Assign,
+                                value: coerce_expr_if_needed(v, &h_ret_ty),
+                            });
+                        }
+                    }
+                    out.extend(self.emit_defers_down_to(h_entry_depth)?);
+                    if let Some(rf) = h_ret_flag {
+                        out.push(MirStmt::Assign {
+                            target: MirPlace::Var(rf),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
+                        });
+                    }
+                    return Ok(out);
+                }
+
                 let ret_ty = self.ret_ty.clone();
+                let has_defers = self.has_active_defers_from(0);
                 let val = if let Some(e) = expr_opt {
-                    Some(self.lower_expr_with_stmts(e, Some(&ret_ty), &mut out)?)
+                    let raw = self.lower_expr_with_stmts(e, Some(&ret_ty), &mut out)?;
+                    let coerced = coerce_expr_if_needed(raw, &ret_ty);
+                    if has_defers && !ret_ty.is_void() {
+                        // Evaluate return expression into a temp BEFORE running `defer` statements!
+                        let tmp = self.alloc_temp("ret_val", ret_ty.clone());
+                        out.push(MirStmt::Assign {
+                            target: MirPlace::Var(tmp),
+                            op: MirAssignOp::Assign,
+                            value: coerced,
+                        });
+                        Some(MirExpr::new(MirExprKind::Var(tmp), ret_ty))
+                    } else {
+                        Some(coerced)
+                    }
                 } else {
                     None
                 };
+                out.extend(self.emit_defers_down_to(0)?);
                 out.push(MirStmt::Return(val));
             }
             StmtKind::Error { reason, partial } => {
                 let ret_ty = self.ret_ty.clone();
                 let err_ty = self.error_spec.err_type();
+                let has_defers = self.has_active_defers_from(0);
                 let r = if let Some(re) = reason {
-                    Some(self.lower_expr_with_stmts(re, err_ty.as_ref(), &mut out)?)
+                    let raw = self.lower_expr_with_stmts(re, err_ty.as_ref(), &mut out)?;
+                    if let (true, Some(ety)) = (has_defers, err_ty.clone()) {
+                        let tmp = self.alloc_temp("err_reason", ety.clone());
+                        out.push(MirStmt::Assign {
+                            target: MirPlace::Var(tmp),
+                            op: MirAssignOp::Assign,
+                            value: coerce_expr_if_needed(raw, &ety),
+                        });
+                        Some(MirExpr::new(MirExprKind::Var(tmp), ety))
+                    } else {
+                        Some(raw)
+                    }
                 } else {
                     None
                 };
                 let p = if let Some(pe) = partial {
-                    Some(self.lower_expr_with_stmts(pe, Some(&ret_ty), &mut out)?)
+                    let raw = self.lower_expr_with_stmts(pe, Some(&ret_ty), &mut out)?;
+                    if has_defers && !ret_ty.is_void() {
+                        let tmp = self.alloc_temp("err_partial", ret_ty.clone());
+                        out.push(MirStmt::Assign {
+                            target: MirPlace::Var(tmp),
+                            op: MirAssignOp::Assign,
+                            value: coerce_expr_if_needed(raw, &ret_ty),
+                        });
+                        Some(MirExpr::new(MirExprKind::Var(tmp), ret_ty))
+                    } else {
+                        Some(raw)
+                    }
                 } else {
                     None
                 };
+                out.extend(self.emit_defers_down_to(0)?);
                 out.push(MirStmt::Error {
                     reason: r,
                     partial: p,
@@ -1588,12 +2487,18 @@ impl<'a> DirectLowerCtx<'a> {
                 else_block,
             } => {
                 let c = self.lower_expr_with_stmts(cond, Some(&MirType::Bool), &mut out)?;
+                if let Some(bs) = &mut self.boot_state {
+                    bs.branch_depth += 1;
+                }
                 let tb = self.lower_block_stmts(&then_block.stmts)?;
                 let eb = if let Some(elb) = else_block {
                     self.lower_block_stmts(&elb.stmts)?
                 } else {
                     Vec::new()
                 };
+                if let Some(bs) = &mut self.boot_state {
+                    bs.branch_depth -= 1;
+                }
                 out.push(MirStmt::If {
                     cond: c,
                     then_body: tb,
@@ -1602,14 +2507,266 @@ impl<'a> DirectLowerCtx<'a> {
             }
             StmtKind::While { cond, body } => {
                 let c = self.lower_expr_with_stmts(cond, Some(&MirType::Bool), &mut out)?;
+                let loop_depth = self.defer_stack.len();
+                self.loop_defer_depths.push(loop_depth);
                 let b = self.lower_block_stmts(&body.stmts)?;
+                self.loop_defer_depths.pop();
                 out.push(MirStmt::While { cond: c, body: b });
             }
             StmtKind::Loop { body } => {
+                let loop_depth = self.defer_stack.len();
+                self.loop_defer_depths.push(loop_depth);
                 let b = self.lower_block_stmts(&body.stmts)?;
+                self.loop_defer_depths.pop();
                 out.push(MirStmt::While {
                     cond: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
                     body: b,
+                });
+            }
+            StmtKind::ForRange {
+                var_ty,
+                var_name,
+                start,
+                end,
+                inclusive,
+                body,
+            } => {
+                let vty = self.syms.resolve_type(var_ty);
+                let s_raw = self.lower_expr_with_stmts(start, Some(&vty), &mut out)?;
+                let e_raw = self.lower_expr_with_stmts(end, Some(&vty), &mut out)?;
+                let s_tmp = self.alloc_temp("for_start", vty.clone());
+                let e_tmp = self.alloc_temp("for_end", vty.clone());
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(s_tmp),
+                    op: MirAssignOp::Assign,
+                    value: coerce_expr_if_needed(s_raw, &vty),
+                });
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(e_tmp),
+                    op: MirAssignOp::Assign,
+                    value: coerce_expr_if_needed(e_raw, &vty),
+                });
+
+                self.scopes.push();
+                let ivar = self.declare_var(&var_name.name, vty.clone(), VarRole::UserLocal);
+                let first_tmp = self.alloc_temp("for_first", MirType::Bool);
+
+                let mut guarded = Vec::new();
+                guarded.push(MirStmt::Assign {
+                    target: MirPlace::Var(ivar),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(MirExprKind::Var(s_tmp), vty.clone()),
+                });
+                guarded.push(MirStmt::Assign {
+                    target: MirPlace::Var(first_tmp),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
+                });
+
+                let step_else = if *inclusive {
+                    // Check `i >= end` BEFORE incrementing so `end == T::MAX` never overflows!
+                    vec![
+                        MirStmt::If {
+                            cond: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Ge,
+                                    lhs: Box::new(MirExpr::new(MirExprKind::Var(ivar), vty.clone())),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(e_tmp),
+                                        vty.clone(),
+                                    )),
+                                },
+                                MirType::Bool,
+                            ),
+                            then_body: vec![MirStmt::Break],
+                            else_body: Vec::new(),
+                        },
+                        MirStmt::Assign {
+                            target: MirPlace::Var(ivar),
+                            op: MirAssignOp::AddAssign,
+                            value: MirExpr::new(MirExprKind::IntLit(1), vty.clone()),
+                        },
+                    ]
+                } else {
+                    vec![
+                        MirStmt::Assign {
+                            target: MirPlace::Var(ivar),
+                            op: MirAssignOp::AddAssign,
+                            value: MirExpr::new(MirExprKind::IntLit(1), vty.clone()),
+                        },
+                        MirStmt::If {
+                            cond: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Ge,
+                                    lhs: Box::new(MirExpr::new(MirExprKind::Var(ivar), vty.clone())),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(e_tmp),
+                                        vty.clone(),
+                                    )),
+                                },
+                                MirType::Bool,
+                            ),
+                            then_body: vec![MirStmt::Break],
+                            else_body: Vec::new(),
+                        },
+                    ]
+                };
+
+                let mut while_body = vec![MirStmt::If {
+                    cond: MirExpr::new(MirExprKind::Var(first_tmp), MirType::Bool),
+                    then_body: vec![MirStmt::Assign {
+                        target: MirPlace::Var(first_tmp),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(MirExprKind::BoolLit(false), MirType::Bool),
+                    }],
+                    else_body: step_else,
+                }];
+
+                let loop_depth = self.defer_stack.len();
+                self.loop_defer_depths.push(loop_depth);
+                let user_body = self.lower_block_stmts(&body.stmts)?;
+                self.loop_defer_depths.pop();
+                while_body.extend(user_body);
+
+                self.scopes.pop();
+
+                guarded.push(MirStmt::While {
+                    cond: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
+                    body: while_body,
+                });
+
+                let enter_op = if *inclusive {
+                    MirBinOp::Le
+                } else {
+                    MirBinOp::Lt
+                };
+                out.push(MirStmt::If {
+                    cond: MirExpr::new(
+                        MirExprKind::Binary {
+                            op: enter_op,
+                            lhs: Box::new(MirExpr::new(MirExprKind::Var(s_tmp), vty.clone())),
+                            rhs: Box::new(MirExpr::new(MirExprKind::Var(e_tmp), vty)),
+                        },
+                        MirType::Bool,
+                    ),
+                    then_body: guarded,
+                    else_body: Vec::new(),
+                });
+            }
+            StmtKind::ForEach {
+                elem_ty,
+                elem_name,
+                iter,
+                body,
+            } => {
+                let ety = self.syms.resolve_type(elem_ty);
+                let (slice_tmp, seq_elem_ty) = self.lower_iter_into_slice_temp(iter, &ety, &mut out)?;
+                let len_tmp = self.alloc_temp("for_len", MirType::Usize);
+                let slice_ty = MirType::Slice(Box::new(seq_elem_ty.clone()));
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(len_tmp),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(
+                        MirExprKind::SliceLen(Box::new(MirExpr::new(
+                            MirExprKind::Var(slice_tmp),
+                            slice_ty.clone(),
+                        ))),
+                        MirType::Usize,
+                    ),
+                });
+
+                self.scopes.push();
+                let elem_var = self.declare_var(&elem_name.name, ety.clone(), VarRole::UserLocal);
+                let idx_tmp = self.alloc_temp("for_idx", MirType::Usize);
+                let first_tmp = self.alloc_temp("for_first", MirType::Bool);
+
+                let mut guarded = vec![
+                    MirStmt::Assign {
+                        target: MirPlace::Var(idx_tmp),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
+                    },
+                    MirStmt::Assign {
+                        target: MirPlace::Var(first_tmp),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
+                    },
+                ];
+
+                let raw_elem_expr = MirExpr::new(
+                    MirExprKind::Index {
+                        base: Box::new(MirExpr::new(MirExprKind::Var(slice_tmp), slice_ty)),
+                        index: Box::new(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize)),
+                        is_slice: true,
+                    },
+                    seq_elem_ty.host_value_type(),
+                );
+
+                let mut while_body = vec![
+                    MirStmt::If {
+                        cond: MirExpr::new(MirExprKind::Var(first_tmp), MirType::Bool),
+                        then_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(first_tmp),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(MirExprKind::BoolLit(false), MirType::Bool),
+                        }],
+                        else_body: vec![
+                            MirStmt::Assign {
+                                target: MirPlace::Var(idx_tmp),
+                                op: MirAssignOp::AddAssign,
+                                value: MirExpr::new(MirExprKind::IntLit(1), MirType::Usize),
+                            },
+                            MirStmt::If {
+                                cond: MirExpr::new(
+                                    MirExprKind::Binary {
+                                        op: MirBinOp::Ge,
+                                        lhs: Box::new(MirExpr::new(
+                                            MirExprKind::Var(idx_tmp),
+                                            MirType::Usize,
+                                        )),
+                                        rhs: Box::new(MirExpr::new(
+                                            MirExprKind::Var(len_tmp),
+                                            MirType::Usize,
+                                        )),
+                                    },
+                                    MirType::Bool,
+                                ),
+                                then_body: vec![MirStmt::Break],
+                                else_body: Vec::new(),
+                            },
+                        ],
+                    },
+                    MirStmt::Assign {
+                        target: MirPlace::Var(elem_var),
+                        op: MirAssignOp::Assign,
+                        value: coerce_or_cast_int(raw_elem_expr, &ety),
+                    },
+                ];
+
+                let loop_depth = self.defer_stack.len();
+                self.loop_defer_depths.push(loop_depth);
+                let user_body = self.lower_block_stmts(&body.stmts)?;
+                self.loop_defer_depths.pop();
+                while_body.extend(user_body);
+
+                self.scopes.pop();
+
+                guarded.push(MirStmt::While {
+                    cond: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
+                    body: while_body,
+                });
+
+                out.push(MirStmt::If {
+                    cond: MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Gt,
+                            lhs: Box::new(MirExpr::new(MirExprKind::Var(len_tmp), MirType::Usize)),
+                            rhs: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                        },
+                        MirType::Bool,
+                    ),
+                    then_body: guarded,
+                    else_body: Vec::new(),
                 });
             }
             StmtKind::NoYield { body } => {
@@ -1630,6 +2787,9 @@ impl<'a> DirectLowerCtx<'a> {
             }
             StmtKind::Switch { scrutinee, arms } => {
                 let d = self.lower_expr_with_stmts(scrutinee, None, &mut out)?;
+                if let Some(bs) = &mut self.boot_state {
+                    bs.branch_depth += 1;
+                }
                 let mut mir_arms = Vec::new();
                 let mut default_body = Vec::new();
                 for arm in arms {
@@ -1640,34 +2800,410 @@ impl<'a> DirectLowerCtx<'a> {
                         default_body = body;
                     }
                 }
+                if let Some(bs) = &mut self.boot_state {
+                    bs.branch_depth -= 1;
+                }
                 out.push(MirStmt::Switch {
                     discr: d,
                     arms: mir_arms,
                     default: default_body,
                 });
             }
-            StmtKind::Continue => out.push(MirStmt::Continue),
-            StmtKind::Break => out.push(MirStmt::Break),
+            StmtKind::Continue => {
+                if let Some(&loop_depth) = self.loop_defer_depths.last() {
+                    out.extend(self.emit_defers_down_to(loop_depth)?);
+                }
+                out.push(MirStmt::Continue);
+            }
+            StmtKind::Break => {
+                if let Some(&loop_depth) = self.loop_defer_depths.last() {
+                    out.extend(self.emit_defers_down_to(loop_depth)?);
+                }
+                out.push(MirStmt::Break);
+            }
             StmtKind::Block(b) => {
                 out.extend(self.lower_block_stmts(&b.stmts)?);
             }
+            StmtKind::Checkpoint => {
+                if !self.in_noyield {
+                    return Err(MirLowerError {
+                        message: "`checkpoint()` encountered inside non-yielding context"
+                            .to_string(),
+                        span: stmt.span,
+                    });
+                }
+                // Inside a `__noyield` SoftYielding clone, `checkpoint()` strips to a zero-cost no-op!
+            }
+            StmtKind::Spawn(sp) => {
+                let activate = self.lower_boot_spawn_stmt(sp, &mut out, stmt.span)?;
+                out.push(activate);
+            }
             StmtKind::Expr(e) => {
+                if self.in_noyield && is_checkpoint_call_expr(e) {
+                    return Ok(out);
+                }
+                if let Some(code_arg_opt) = extract_sys_exit_arg(e) {
+                    let code_expr = self.lower_sys_exit_code_before_defers(code_arg_opt, &mut out)?;
+                    out.extend(self.emit_defers_down_to(0)?);
+                    out.push(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                        method: "exit".to_string(),
+                        args: vec![code_expr],
+                    }));
+                    return Ok(out);
+                }
                 if let Some(stmt_op) = self.try_lower_stmt_call(e, &mut out)? {
                     out.push(stmt_op);
                 } else {
                     let me = self.lower_expr_with_stmts(e, None, &mut out)?;
-                    out.push(MirStmt::Expr(me));
+                    if !me.ty.is_void() || matches!(me.kind, MirExprKind::CallDirect { .. }) {
+                        out.push(MirStmt::Expr(me));
+                    }
                 }
             }
-            StmtKind::Every { .. } | StmtKind::Checkpoint | StmtKind::Spawn(_) => {
+            StmtKind::LoopEvery { .. } | StmtKind::Restart => {
                 return Err(MirLowerError {
-                    message: "yielding or spawn statement encountered inside non-yielding context"
+                    message: "yielding `loop every` or `restart` encountered inside non-yielding context"
                         .to_string(),
                     span: stmt.span,
                 });
             }
         }
         Ok(out)
+    }
+
+    fn lower_sys_exit_code_before_defers(
+        &mut self,
+        code_arg_opt: Option<&Expr>,
+        out: &mut Vec<MirStmt>,
+    ) -> Result<MirExpr, MirLowerError> {
+        if let Some(ce) = code_arg_opt {
+            let raw = self.lower_expr_with_stmts(ce, Some(&MirType::I32), out)?;
+            let coerced = coerce_or_cast_int(raw, &MirType::I32);
+            if self.has_active_defers_from(0) {
+                let tmp = self.alloc_temp("exit_code", MirType::I32);
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(tmp),
+                    op: MirAssignOp::Assign,
+                    value: coerced,
+                });
+                Ok(MirExpr::new(MirExprKind::Var(tmp), MirType::I32))
+            } else {
+                Ok(coerced)
+            }
+        } else {
+            Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::I32))
+        }
+    }
+
+    fn lower_iter_into_slice_temp(
+        &mut self,
+        iter: &Expr,
+        fallback_elem_ty: &MirType,
+        out: &mut Vec<MirStmt>,
+    ) -> Result<(VarId, MirType), MirLowerError> {
+        if let Ok((place, MirType::Array { elem, len })) = self.lower_place(iter, out) {
+            let slice_ty = MirType::Slice(elem.clone());
+            let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+            out.push(MirStmt::Assign {
+                target: MirPlace::Var(slice_tmp),
+                op: MirAssignOp::Assign,
+                value: MirExpr::new(
+                    MirExprKind::ArrayToSlice {
+                        array_place: Box::new(place),
+                        len,
+                        elem_ty: *elem.clone(),
+                    },
+                    slice_ty,
+                ),
+            });
+            return Ok((slice_tmp, *elem));
+        }
+
+        let iv = self.lower_expr_with_stmts(iter, None, out)?;
+        match iv.ty.clone() {
+            MirType::Slice(elem) => {
+                let et = *elem.clone();
+                let slice_tmp = self.alloc_temp("for_slice", iv.ty.clone());
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(slice_tmp),
+                    op: MirAssignOp::Assign,
+                    value: iv,
+                });
+                Ok((slice_tmp, et))
+            }
+            MirType::Ptr(inner) => match inner.as_ref() {
+                MirType::Slice(elem) => {
+                    let et = *elem.clone();
+                    let slice_ty = MirType::Slice(elem.clone());
+                    let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+                    out.push(MirStmt::Assign {
+                        target: MirPlace::Var(slice_tmp),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::Unary {
+                                op: MirUnaryOp::Deref,
+                                expr: Box::new(iv),
+                            },
+                            slice_ty,
+                        ),
+                    });
+                    Ok((slice_tmp, et))
+                }
+                MirType::Array { elem, len } => {
+                    let et = *elem.clone();
+                    let len_val = *len;
+                    let ptr_tmp = self.alloc_temp("for_arr_ptr", iv.ty.clone());
+                    out.push(MirStmt::Assign {
+                        target: MirPlace::Var(ptr_tmp),
+                        op: MirAssignOp::Assign,
+                        value: iv.clone(),
+                    });
+                    let arr_ty = MirType::Array {
+                        elem: elem.clone(),
+                        len: len_val,
+                    };
+                    let slice_ty = MirType::Slice(elem.clone());
+                    let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+                    out.push(MirStmt::Assign {
+                        target: MirPlace::Var(slice_tmp),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::ArrayToSlice {
+                                array_place: Box::new(MirPlace::Deref(
+                                    Box::new(MirExpr::new(MirExprKind::Var(ptr_tmp), iv.ty)),
+                                    arr_ty,
+                                )),
+                                len: len_val,
+                                elem_ty: et.clone(),
+                            },
+                            slice_ty,
+                        ),
+                    });
+                    Ok((slice_tmp, et))
+                }
+                _ => {
+                    let slice_ty = MirType::Slice(Box::new(fallback_elem_ty.clone()));
+                    let slice_tmp = self.alloc_temp("for_slice", slice_ty);
+                    Ok((slice_tmp, fallback_elem_ty.clone()))
+                }
+            },
+            MirType::Array { elem, len } => {
+                let et = *elem.clone();
+                let len_val = len;
+                let arr_tmp = self.alloc_temp("for_arr", iv.ty.clone());
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(arr_tmp),
+                    op: MirAssignOp::Assign,
+                    value: iv,
+                });
+                let slice_ty = MirType::Slice(elem.clone());
+                let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(slice_tmp),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(
+                        MirExprKind::ArrayToSlice {
+                            array_place: Box::new(MirPlace::Var(arr_tmp)),
+                            len: len_val,
+                            elem_ty: et.clone(),
+                        },
+                        slice_ty,
+                    ),
+                });
+                Ok((slice_tmp, et))
+            }
+            _ => {
+                let slice_ty = MirType::Slice(Box::new(fallback_elem_ty.clone()));
+                let slice_tmp = self.alloc_temp("for_slice", slice_ty);
+                Ok((slice_tmp, fallback_elem_ty.clone()))
+            }
+        }
+    }
+
+    fn lower_boot_spawn_stmt(
+        &mut self,
+        sp: &SpawnStmt,
+        out: &mut Vec<MirStmt>,
+        span: Span,
+    ) -> Result<MirStmt, MirLowerError> {
+        if self.boot_state.is_none() {
+            return Err(MirLowerError {
+                message: "`spawn` encountered outside `fn main()` boot sequence".to_string(),
+                span,
+            });
+        }
+        let bp_name = sp.task.name.clone();
+        let param_tys = self.syms.tasks.get(&bp_name).cloned().unwrap_or_default();
+        let mut lowered_args = Vec::new();
+        for (idx, arg) in sp.args.iter().enumerate() {
+            let expected = param_tys.get(idx);
+            let val = self.lower_expr_with_stmts(&arg.value, expected, out)?;
+            let coerced = if let Some(ety) = expected {
+                coerce_expr_if_needed(val, ety)
+            } else {
+                val
+            };
+            lowered_args.push(coerced);
+        }
+
+        let bs = self.boot_state.as_mut().unwrap();
+        let count_entry = bs.bp_instance_counts.entry(bp_name.clone()).or_insert(0);
+        let inst_num = *count_entry;
+        *count_entry += 1;
+
+        let slot_id = bs.spawned_tasks.len();
+        let instance_name = format!("{bp_name}_{inst_num}");
+        let prio = sp.priority.map_or(MirPriority::Normal, convert_priority);
+        let core_pin = sp.core.map(|c| c as u8);
+        let mut provenance_path = bs.provenance_stack.clone();
+        provenance_path.push(bp_name.clone());
+        let conditional = bs.branch_depth > 0;
+
+        bs.spawned_tasks.push(MirSpawnInstance {
+            slot_id,
+            instance_name,
+            blueprint_name: bp_name,
+            priority: prio,
+            core_pin,
+            init_args: lowered_args.clone(),
+            is_main_supervisor: false,
+            provenance_path,
+            conditional,
+        });
+
+        Ok(MirStmt::SpawnActivate {
+            slot_id,
+            args: lowered_args,
+        })
+    }
+
+    fn try_unroll_boot_helper_call(
+        &mut self,
+        callee_name: &str,
+        args: &[CallArg],
+        out: &mut Vec<MirStmt>,
+    ) -> Result<Option<MirExpr>, MirLowerError> {
+        let Some(sig) = self.syms.fns.get(callee_name).cloned() else {
+            return Ok(None);
+        };
+        if !sig.spawns_in_boot {
+            return Ok(None);
+        }
+        let Some(fd) = self
+            .boot_state
+            .as_ref()
+            .and_then(|bs| bs.fn_decls.get(callee_name).copied())
+        else {
+            return Ok(None);
+        };
+        let Some(body_ast) = &fd.body else {
+            return Ok(None);
+        };
+
+        // 1. Evaluate call arguments in the CALLER's lexical scope first!
+        let mut lowered_args = Vec::new();
+        for (idx, a) in args.iter().enumerate() {
+            let expected = sig.params.get(idx);
+            let me = self.lower_expr_with_stmts(&a.value, expected, out)?;
+            let coerced = match (&me.ty, expected, &me.kind) {
+                (
+                    MirType::Array { elem, len },
+                    Some(MirType::Slice(_)),
+                    MirExprKind::Var(vid),
+                ) => MirExpr::new(
+                    MirExprKind::ArrayToSlice {
+                        array_place: Box::new(MirPlace::Var(*vid)),
+                        len: *len,
+                        elem_ty: *elem.clone(),
+                    },
+                    sig.params[idx].clone(),
+                ),
+                (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
+                _ => me,
+            };
+            lowered_args.push(coerced);
+        }
+
+        // 2. Prepare optional structured return flag & value slot if helper contains `return`.
+        let has_return = ast_stmts_have_return(&body_ast.stmts);
+        let ret_flag_var = if has_return {
+            let rf = self.alloc_temp("boot_ret_flag", MirType::Bool);
+            out.push(MirStmt::Assign {
+                target: MirPlace::Var(rf),
+                op: MirAssignOp::Assign,
+                value: MirExpr::new(MirExprKind::BoolLit(false), MirType::Bool),
+            });
+            Some(rf)
+        } else {
+            None
+        };
+        let ret_val_var = if !sig.ret_ty.is_void() {
+            Some(self.alloc_temp("boot_ret_val", sig.ret_ty.clone()))
+        } else {
+            None
+        };
+
+        // 3. Push helper scope, bind parameters, push provenance, and unroll helper body!
+        self.scopes.push();
+        self.defer_stack.push(Vec::new());
+        let entry_defer_depth = self.defer_stack.len() - 1;
+
+        for (idx, p) in fd.params.iter().enumerate() {
+            let pty = self.syms.resolve_type(&p.ty);
+            let pvid = self.declare_var(&p.name.name, pty.clone(), VarRole::CompilerTemp);
+            self.scopes.insert(p.name.name.clone(), pvid);
+            if let Some(arg_val) = lowered_args.get(idx).cloned() {
+                out.push(MirStmt::Assign {
+                    target: MirPlace::Var(pvid),
+                    op: MirAssignOp::Assign,
+                    value: arg_val,
+                });
+            }
+        }
+
+        if let Some(bs) = &mut self.boot_state {
+            bs.provenance_stack.push(callee_name.to_string());
+        }
+        self.inlined_helper_stack.push(InlinedHelperFrame {
+            ret_ty: sig.ret_ty.clone(),
+            ret_val_var,
+            ret_flag_var,
+            entry_defer_depth,
+        });
+
+        let helper_stmts = self.lower_stmt_seq(&body_ast.stmts)?;
+        out.extend(helper_stmts);
+
+        self.inlined_helper_stack.pop();
+        if let Some(bs) = &mut self.boot_state {
+            bs.provenance_stack.pop();
+        }
+
+        let exit_defers = self.pop_and_lower_top_defer_scope()?;
+        if !exit_defers.is_empty() {
+            if let Some(rf) = ret_flag_var {
+                out.push(MirStmt::If {
+                    cond: MirExpr::new(
+                        MirExprKind::Unary {
+                            op: MirUnaryOp::Not,
+                            expr: Box::new(MirExpr::new(MirExprKind::Var(rf), MirType::Bool)),
+                        },
+                        MirType::Bool,
+                    ),
+                    then_body: exit_defers,
+                    else_body: Vec::new(),
+                });
+            } else {
+                out.extend(exit_defers);
+            }
+        }
+        self.scopes.pop();
+
+        if let Some(rv) = ret_val_var {
+            Ok(Some(MirExpr::new(MirExprKind::Var(rv), sig.ret_ty)))
+        } else {
+            Ok(Some(MirExpr::new(MirExprKind::IntLit(0), MirType::Void)))
+        }
     }
 
     fn lower_pure_expr(
@@ -1742,6 +3278,7 @@ impl<'a> DirectLowerCtx<'a> {
                 };
 
                 self.scopes.push();
+                self.defer_stack.push(Vec::new());
                 let mut err_stmts = Vec::new();
                 if let Some(ep) = &clause.err_param {
                     let ety = err_ty_opt.unwrap_or_else(|| self.syms.resolve_type(&ep.ty));
@@ -1768,12 +3305,18 @@ impl<'a> DirectLowerCtx<'a> {
                         for s in prefix_stmts {
                             err_stmts.extend(self.lower_stmt(s)?);
                         }
-                        if let Some(stmt_op) = self.try_lower_stmt_call(tail_expr, &mut err_stmts)?
+                        if extract_sys_exit_arg(tail_expr).is_some() {
+                            err_stmts.extend(self.lower_stmt(last_stmt)?);
+                        } else if let Some(stmt_op) =
+                            self.try_lower_stmt_call(tail_expr, &mut err_stmts)?
                         {
                             err_stmts.push(stmt_op);
                         } else {
-                            let tail_val =
-                                self.lower_expr_with_stmts(tail_expr, Some(&ok_ty), &mut err_stmts)?;
+                            let tail_val = self.lower_expr_with_stmts(
+                                tail_expr,
+                                Some(&ok_ty),
+                                &mut err_stmts,
+                            )?;
                             if tail_val.ty.is_void() {
                                 err_stmts.push(MirStmt::Expr(tail_val));
                             } else {
@@ -1794,6 +3337,7 @@ impl<'a> DirectLowerCtx<'a> {
                         err_stmts.extend(self.lower_stmt(s)?);
                     }
                 }
+                err_stmts.extend(self.pop_and_lower_top_defer_scope()?);
                 self.scopes.pop();
 
                 if let Some(out_vid) = out_vid_opt {
@@ -1816,6 +3360,20 @@ impl<'a> DirectLowerCtx<'a> {
                     });
                     Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void))
                 }
+            }
+            ExprKind::Call { callee, args } if self.boot_state.is_some() => {
+                if let ExprKind::Ident(id) = &callee.kind {
+                    if let Some(unrolled) = self.try_unroll_boot_helper_call(&id.name, args, stmts)?
+                    {
+                        return Ok(unrolled);
+                    }
+                }
+                let _ = &self.pending_stmts;
+                let mut be = DirectBackend {
+                    ctx: self,
+                    stmts,
+                };
+                lower_common_expr(expr, expected, &mut be)
             }
             _ => {
                 let _ = &self.pending_stmts;
@@ -1871,6 +3429,7 @@ struct LoopContext {
     continue_bb: BlockId,
     break_bb: BlockId,
     has_inbox_recv: bool,
+    defer_depth: usize,
 }
 
 struct CoroutineLowerCtx<'a> {
@@ -1879,8 +3438,10 @@ struct CoroutineLowerCtx<'a> {
     error_spec: MirErrorSpec,
     manual_yield: bool,
     in_noyield: bool,
+    has_restart: bool,
     vars: Vec<MirVar>,
     scopes: VarScopes,
+    defer_stack: Vec<Vec<Stmt>>,
     blocks: Vec<MirBlock>,
     cur_bb: BlockId,
     cur_is_resume: bool,
@@ -1903,8 +3464,10 @@ impl<'a> CoroutineLowerCtx<'a> {
             error_spec,
             manual_yield,
             in_noyield: false,
+            has_restart: false,
             vars: Vec::new(),
             scopes: VarScopes::new(),
+            defer_stack: vec![Vec::new()],
             blocks: Vec::new(),
             cur_bb: BlockId(0),
             cur_is_resume: true,
@@ -1955,6 +3518,62 @@ impl<'a> CoroutineLowerCtx<'a> {
         self.declare_var(&name, ty, VarRole::CompilerTemp)
     }
 
+    fn has_active_defers_from(&self, min_depth: usize) -> bool {
+        self.defer_stack
+            .iter()
+            .skip(min_depth)
+            .any(|frame| !frame.is_empty())
+    }
+
+    fn lower_single_deferred_stmt(&mut self, deferred: &Stmt) -> Result<(), MirLowerError> {
+        let prev_ny = self.in_noyield;
+        self.in_noyield = true;
+        self.scopes.push();
+        self.defer_stack.push(Vec::new());
+        let res = self.lower_stmt(deferred);
+        self.defer_stack.pop();
+        self.scopes.pop();
+        self.in_noyield = prev_ny;
+        res
+    }
+
+    fn pop_and_lower_top_defer_scope(&mut self) -> Result<(), MirLowerError> {
+        let Some(defers) = self.defer_stack.pop() else {
+            return Ok(());
+        };
+        for d in defers.iter().rev() {
+            self.lower_single_deferred_stmt(d)?;
+        }
+        Ok(())
+    }
+
+    /// Emit active `defer` statements from innermost scope down to `min_depth` (inclusive) in LIFO order
+    /// without mutating `self.defer_stack`.
+    fn emit_defers_down_to(&mut self, min_depth: usize) -> Result<(), MirLowerError> {
+        let top = self.defer_stack.len();
+        if min_depth >= top {
+            return Ok(());
+        }
+        let mut popped_var_frames: Vec<BTreeMap<String, VarId>> = Vec::new();
+        for depth in (min_depth..top).rev() {
+            while self.scopes.frames.len() > depth + 1 {
+                if let Some(vf) = self.scopes.frames.pop() {
+                    popped_var_frames.push(vf);
+                } else {
+                    break;
+                }
+            }
+            let cloned_defers = self.defer_stack[depth].clone();
+            for d in cloned_defers.iter().rev() {
+                self.lower_single_deferred_stmt(d)?;
+            }
+        }
+        while let Some(vf) = popped_var_frames.pop() {
+            self.scopes.frames.push(vf);
+        }
+        Ok(())
+    }
+
     fn finish_with_implicit_return(&mut self) {
         let stmts = std::mem::take(&mut self.cur_stmts);
         let default_ret = if self.ret_ty.is_void() {
@@ -1968,11 +3587,24 @@ impl<'a> CoroutineLowerCtx<'a> {
             stmts,
             terminator: MirTerminator::Return(default_ret),
         });
+        if self.has_restart {
+            if let Some(b0) = self.blocks.first_mut() {
+                b0.is_resume_entry = true;
+            }
+        }
+    }
+
+    fn lower_top_level_stmts(&mut self, stmts: &[Stmt]) -> Result<(), MirLowerError> {
+        self.lower_stmts(stmts)?;
+        self.pop_and_lower_top_defer_scope()?;
+        Ok(())
     }
 
     fn lower_scoped_block(&mut self, block: &Block) -> Result<(), MirLowerError> {
         self.scopes.push();
+        self.defer_stack.push(Vec::new());
         self.lower_stmts(&block.stmts)?;
+        self.pop_and_lower_top_defer_scope()?;
         self.scopes.pop();
         Ok(())
     }
@@ -2023,31 +3655,94 @@ impl<'a> CoroutineLowerCtx<'a> {
                     value: coerce_expr_if_needed(rhs, &pty.host_value_type()),
                 });
             }
+            StmtKind::Defer(inner) => {
+                if let Some(top) = self.defer_stack.last_mut() {
+                    top.push((**inner).clone());
+                }
+            }
             StmtKind::Return(expr_opt) => {
                 let ret_ty = self.ret_ty.clone();
+                let has_defers = self.has_active_defers_from(0);
                 let val = if let Some(e) = expr_opt {
-                    Some(self.lower_expr(e, Some(&ret_ty))?)
+                    let raw = self.lower_expr(e, Some(&ret_ty))?;
+                    let coerced = coerce_expr_if_needed(raw, &ret_ty);
+                    if has_defers && !ret_ty.is_void() {
+                        let tmp = self.alloc_temp("ret_val", ret_ty.clone());
+                        self.cur_stmts.push(MirStmt::Assign {
+                            target: MirPlace::Var(tmp),
+                            op: MirAssignOp::Assign,
+                            value: coerced,
+                        });
+                        Some(MirExpr::new(MirExprKind::Var(tmp), ret_ty))
+                    } else {
+                        Some(coerced)
+                    }
                 } else {
                     None
                 };
+                self.emit_defers_down_to(0)?;
                 let dead_bb = self.alloc_bb();
                 self.seal_bb(MirTerminator::Return(val), dead_bb, false);
             }
             StmtKind::Error { reason, partial } => {
                 let ret_ty = self.ret_ty.clone();
                 let err_ty = self.error_spec.err_type();
+                let has_defers = self.has_active_defers_from(0);
                 let r = if let Some(re) = reason {
-                    Some(self.lower_expr(re, err_ty.as_ref())?)
+                    let raw = self.lower_expr(re, err_ty.as_ref())?;
+                    if let (true, Some(ety)) = (has_defers, err_ty.clone()) {
+                        let tmp = self.alloc_temp("err_reason", ety.clone());
+                        self.cur_stmts.push(MirStmt::Assign {
+                            target: MirPlace::Var(tmp),
+                            op: MirAssignOp::Assign,
+                            value: coerce_expr_if_needed(raw, &ety),
+                        });
+                        Some(MirExpr::new(MirExprKind::Var(tmp), ety))
+                    } else {
+                        Some(raw)
+                    }
                 } else {
                     None
                 };
                 let p = if let Some(pe) = partial {
-                    Some(self.lower_expr(pe, Some(&ret_ty))?)
+                    let raw = self.lower_expr(pe, Some(&ret_ty))?;
+                    if has_defers && !ret_ty.is_void() {
+                        let tmp = self.alloc_temp("err_partial", ret_ty.clone());
+                        self.cur_stmts.push(MirStmt::Assign {
+                            target: MirPlace::Var(tmp),
+                            op: MirAssignOp::Assign,
+                            value: coerce_expr_if_needed(raw, &ret_ty),
+                        });
+                        Some(MirExpr::new(MirExprKind::Var(tmp), ret_ty))
+                    } else {
+                        Some(raw)
+                    }
                 } else {
                     None
                 };
+                self.emit_defers_down_to(0)?;
                 let dead_bb = self.alloc_bb();
-                self.seal_bb(MirTerminator::Error { reason: r, partial: p }, dead_bb, false);
+                self.seal_bb(
+                    MirTerminator::Error {
+                        reason: r,
+                        partial: p,
+                    },
+                    dead_bb,
+                    false,
+                );
+            }
+            StmtKind::Restart => {
+                self.has_restart = true;
+                self.emit_defers_down_to(0)?;
+                self.cur_stmts.push(MirStmt::EndInboxTurn);
+                let dead_bb = self.alloc_bb();
+                self.seal_bb(
+                    MirTerminator::Yield(MirYieldKind::ShareCheckpoint {
+                        resume_bb: BlockId(0),
+                    }),
+                    dead_bb,
+                    false,
+                );
             }
             StmtKind::If {
                 cond,
@@ -2079,8 +3774,10 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let body_bb = self.alloc_bb();
                 let latch_bb = self.alloc_bb();
                 let exit_bb = self.alloc_bb();
+                let is_while_true = matches!(cond.kind, ExprKind::Literal(Literal::Bool(true)));
+                let auto_share = is_while_true && !stmt_manual && !self.in_noyield;
 
-                self.seal_bb(MirTerminator::Goto(cond_bb), cond_bb, false);
+                self.seal_bb(MirTerminator::Goto(cond_bb), cond_bb, auto_share);
                 let c = self.lower_expr(cond, Some(&MirType::Bool))?;
                 self.seal_bb(
                     MirTerminator::Branch {
@@ -2093,10 +3790,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                 );
 
                 let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
+                let defer_depth = self.defer_stack.len();
                 self.loop_stack.push(LoopContext {
                     continue_bb: latch_bb,
                     break_bb: exit_bb,
                     has_inbox_recv: has_inbox,
+                    defer_depth,
                 });
                 self.lower_scoped_block(body)?;
                 self.loop_stack.pop();
@@ -2105,7 +3804,15 @@ impl<'a> CoroutineLowerCtx<'a> {
                 if has_inbox {
                     self.cur_stmts.push(MirStmt::EndInboxTurn);
                 }
-                self.seal_bb(MirTerminator::Goto(cond_bb), exit_bb, false);
+                if auto_share {
+                    self.seal_bb(
+                        MirTerminator::Yield(MirYieldKind::ShareCheckpoint { resume_bb: cond_bb }),
+                        exit_bb,
+                        false,
+                    );
+                } else {
+                    self.seal_bb(MirTerminator::Goto(cond_bb), exit_bb, false);
+                }
             }
             StmtKind::Loop { body } => {
                 let top_bb = self.alloc_bb();
@@ -2115,10 +3822,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
 
                 self.seal_bb(MirTerminator::Goto(top_bb), top_bb, auto_share);
+                let defer_depth = self.defer_stack.len();
                 self.loop_stack.push(LoopContext {
                     continue_bb: latch_bb,
                     break_bb: exit_bb,
                     has_inbox_recv: has_inbox,
+                    defer_depth,
                 });
                 self.lower_scoped_block(body)?;
                 self.loop_stack.pop();
@@ -2137,9 +3846,56 @@ impl<'a> CoroutineLowerCtx<'a> {
                     self.seal_bb(MirTerminator::Goto(top_bb), exit_bb, false);
                 }
             }
-            StmtKind::Every { interval, body } => {
-                let period_ticks = self.syms.duration_to_ticks(interval)?;
+            StmtKind::LoopEvery { period, body } => {
+                let period_expr = if let ExprKind::Literal(Literal::Duration(dur)) = &period.kind {
+                    let ticks = self.syms.duration_to_ticks(dur)?;
+                    if ticks == 0 {
+                        return Err(MirLowerError {
+                            message: "periodic `loop every` interval must be greater than 0"
+                                .to_string(),
+                            span: period.span,
+                        });
+                    }
+                    MirExpr::new(MirExprKind::TicksLit(ticks), MirType::U32)
+                } else {
+                    let raw_p = self.lower_expr(period, Some(&MirType::U32))?;
+                    let p_u32 = coerce_or_cast_int(raw_p, &MirType::U32);
+                    if self.syms.tick_period_us != 1_000 && self.syms.tick_period_us > 0 {
+                        let p_u64 = coerce_or_cast_int(p_u32, &MirType::U64);
+                        let scaled = MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Div,
+                                lhs: Box::new(MirExpr::new(
+                                    MirExprKind::Binary {
+                                        op: MirBinOp::Mul,
+                                        lhs: Box::new(p_u64),
+                                        rhs: Box::new(MirExpr::new(
+                                            MirExprKind::IntLit(1_000),
+                                            MirType::U64,
+                                        )),
+                                    },
+                                    MirType::U64,
+                                )),
+                                rhs: Box::new(MirExpr::new(
+                                    MirExprKind::IntLit(self.syms.tick_period_us as i128),
+                                    MirType::U64,
+                                )),
+                            },
+                            MirType::U64,
+                        );
+                        coerce_or_cast_int(scaled, &MirType::U32)
+                    } else {
+                        p_u32
+                    }
+                };
+
+                let period_var = self.alloc_temp("every_period", MirType::U32);
                 let deadline_var = self.alloc_temp("every_next", MirType::U32);
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(period_var),
+                    op: MirAssignOp::Assign,
+                    value: period_expr,
+                });
                 self.cur_stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(deadline_var),
                     op: MirAssignOp::Assign,
@@ -2152,10 +3908,12 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 self.seal_bb(MirTerminator::Goto(body_bb), body_bb, true);
                 let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
+                let defer_depth = self.defer_stack.len();
                 self.loop_stack.push(LoopContext {
                     continue_bb: latch_bb,
                     break_bb: exit_bb,
                     has_inbox_recv: has_inbox,
+                    defer_depth,
                 });
                 self.lower_scoped_block(body)?;
                 self.loop_stack.pop();
@@ -2167,12 +3925,235 @@ impl<'a> CoroutineLowerCtx<'a> {
                 self.seal_bb(
                     MirTerminator::Yield(MirYieldKind::EveryLatch {
                         next_deadline_var: deadline_var,
-                        period_ticks,
+                        period_var,
                         resume_bb: body_bb,
                     }),
                     exit_bb,
                     false,
                 );
+            }
+            StmtKind::ForRange {
+                var_ty,
+                var_name,
+                start,
+                end,
+                inclusive,
+                body,
+            } => {
+                let vty = self.syms.resolve_type(var_ty);
+                let s_raw = self.lower_expr(start, Some(&vty))?;
+                let e_raw = self.lower_expr(end, Some(&vty))?;
+                let s_tmp = self.alloc_temp("for_start", vty.clone());
+                let e_tmp = self.alloc_temp("for_end", vty.clone());
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(s_tmp),
+                    op: MirAssignOp::Assign,
+                    value: coerce_expr_if_needed(s_raw, &vty),
+                });
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(e_tmp),
+                    op: MirAssignOp::Assign,
+                    value: coerce_expr_if_needed(e_raw, &vty),
+                });
+
+                self.scopes.push();
+                let ivar = self.declare_var(&var_name.name, vty.clone(), VarRole::UserLocal);
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(ivar),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(MirExprKind::Var(s_tmp), vty.clone()),
+                });
+
+                let done_tmp_opt = if *inclusive {
+                    let dt = self.alloc_temp("for_done", MirType::Bool);
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(dt),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Gt,
+                                lhs: Box::new(MirExpr::new(MirExprKind::Var(s_tmp), vty.clone())),
+                                rhs: Box::new(MirExpr::new(MirExprKind::Var(e_tmp), vty.clone())),
+                            },
+                            MirType::Bool,
+                        ),
+                    });
+                    Some(dt)
+                } else {
+                    None
+                };
+
+                let cond_bb = self.alloc_bb();
+                let body_bb = self.alloc_bb();
+                let step_bb = self.alloc_bb();
+                let exit_bb = self.alloc_bb();
+
+                self.seal_bb(MirTerminator::Goto(cond_bb), cond_bb, false);
+                let cond_expr = if let Some(dt) = done_tmp_opt {
+                    MirExpr::new(
+                        MirExprKind::Unary {
+                            op: MirUnaryOp::Not,
+                            expr: Box::new(MirExpr::new(MirExprKind::Var(dt), MirType::Bool)),
+                        },
+                        MirType::Bool,
+                    )
+                } else {
+                    MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Lt,
+                            lhs: Box::new(MirExpr::new(MirExprKind::Var(ivar), vty.clone())),
+                            rhs: Box::new(MirExpr::new(MirExprKind::Var(e_tmp), vty.clone())),
+                        },
+                        MirType::Bool,
+                    )
+                };
+                self.seal_bb(
+                    MirTerminator::Branch {
+                        cond: cond_expr,
+                        then_bb: body_bb,
+                        else_bb: exit_bb,
+                    },
+                    body_bb,
+                    false,
+                );
+
+                let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
+                let defer_depth = self.defer_stack.len();
+                self.loop_stack.push(LoopContext {
+                    continue_bb: step_bb,
+                    break_bb: exit_bb,
+                    has_inbox_recv: has_inbox,
+                    defer_depth,
+                });
+                self.lower_scoped_block(body)?;
+                self.loop_stack.pop();
+                self.scopes.pop();
+
+                self.seal_bb(MirTerminator::Goto(step_bb), step_bb, false);
+                if has_inbox {
+                    self.cur_stmts.push(MirStmt::EndInboxTurn);
+                }
+                if let Some(dt) = done_tmp_opt {
+                    // Inclusive `..=`: check `ivar >= e_tmp` BEFORE incrementing so `e_tmp == T::MAX` is overflow-free!
+                    self.cur_stmts.push(MirStmt::If {
+                        cond: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Ge,
+                                lhs: Box::new(MirExpr::new(MirExprKind::Var(ivar), vty.clone())),
+                                rhs: Box::new(MirExpr::new(MirExprKind::Var(e_tmp), vty.clone())),
+                            },
+                            MirType::Bool,
+                        ),
+                        then_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(dt),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
+                        }],
+                        else_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(ivar),
+                            op: MirAssignOp::AddAssign,
+                            value: MirExpr::new(MirExprKind::IntLit(1), vty),
+                        }],
+                    });
+                } else {
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(ivar),
+                        op: MirAssignOp::AddAssign,
+                        value: MirExpr::new(MirExprKind::IntLit(1), vty),
+                    });
+                }
+                self.seal_bb(MirTerminator::Goto(cond_bb), exit_bb, false);
+            }
+            StmtKind::ForEach {
+                elem_ty,
+                elem_name,
+                iter,
+                body,
+            } => {
+                let ety = self.syms.resolve_type(elem_ty);
+                let (slice_tmp, seq_elem_ty) = self.lower_iter_into_slice_temp(iter, &ety)?;
+                let slice_ty = MirType::Slice(Box::new(seq_elem_ty.clone()));
+                let len_tmp = self.alloc_temp("for_len", MirType::Usize);
+                let idx_tmp = self.alloc_temp("for_idx", MirType::Usize);
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(len_tmp),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(
+                        MirExprKind::SliceLen(Box::new(MirExpr::new(
+                            MirExprKind::Var(slice_tmp),
+                            slice_ty.clone(),
+                        ))),
+                        MirType::Usize,
+                    ),
+                });
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(idx_tmp),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
+                });
+
+                self.scopes.push();
+                let elem_var = self.declare_var(&elem_name.name, ety.clone(), VarRole::UserLocal);
+
+                let cond_bb = self.alloc_bb();
+                let body_bb = self.alloc_bb();
+                let step_bb = self.alloc_bb();
+                let exit_bb = self.alloc_bb();
+
+                self.seal_bb(MirTerminator::Goto(cond_bb), cond_bb, false);
+                self.seal_bb(
+                    MirTerminator::Branch {
+                        cond: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Lt,
+                                lhs: Box::new(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize)),
+                                rhs: Box::new(MirExpr::new(MirExprKind::Var(len_tmp), MirType::Usize)),
+                            },
+                            MirType::Bool,
+                        ),
+                        then_bb: body_bb,
+                        else_bb: exit_bb,
+                    },
+                    body_bb,
+                    false,
+                );
+
+                let raw_elem_expr = MirExpr::new(
+                    MirExprKind::Index {
+                        base: Box::new(MirExpr::new(MirExprKind::Var(slice_tmp), slice_ty)),
+                        index: Box::new(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize)),
+                        is_slice: true,
+                    },
+                    seq_elem_ty.host_value_type(),
+                );
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(elem_var),
+                    op: MirAssignOp::Assign,
+                    value: coerce_or_cast_int(raw_elem_expr, &ety),
+                });
+
+                let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
+                let defer_depth = self.defer_stack.len();
+                self.loop_stack.push(LoopContext {
+                    continue_bb: step_bb,
+                    break_bb: exit_bb,
+                    has_inbox_recv: has_inbox,
+                    defer_depth,
+                });
+                self.lower_scoped_block(body)?;
+                self.loop_stack.pop();
+                self.scopes.pop();
+
+                self.seal_bb(MirTerminator::Goto(step_bb), step_bb, false);
+                if has_inbox {
+                    self.cur_stmts.push(MirStmt::EndInboxTurn);
+                }
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(idx_tmp),
+                    op: MirAssignOp::AddAssign,
+                    value: MirExpr::new(MirExprKind::IntLit(1), MirType::Usize),
+                });
+                self.seal_bb(MirTerminator::Goto(cond_bb), exit_bb, false);
             }
             StmtKind::NoYield { body } => {
                 let prev = self.in_noyield;
@@ -2240,12 +4221,14 @@ impl<'a> CoroutineLowerCtx<'a> {
             }
             StmtKind::Continue => {
                 if let Some(&lc) = self.loop_stack.last() {
+                    self.emit_defers_down_to(lc.defer_depth)?;
                     let dead_bb = self.alloc_bb();
                     self.seal_bb(MirTerminator::Goto(lc.continue_bb), dead_bb, false);
                 }
             }
             StmtKind::Break => {
                 if let Some(&lc) = self.loop_stack.last() {
+                    self.emit_defers_down_to(lc.defer_depth)?;
                     if lc.has_inbox_recv {
                         self.cur_stmts.push(MirStmt::EndInboxTurn);
                     }
@@ -2254,17 +4237,23 @@ impl<'a> CoroutineLowerCtx<'a> {
                 }
             }
             StmtKind::Checkpoint => {
-                let resume_bb = self.alloc_bb();
-                self.seal_bb(
-                    MirTerminator::Yield(MirYieldKind::ShareCheckpoint { resume_bb }),
-                    resume_bb,
-                    true,
-                );
+                if !self.in_noyield {
+                    let resume_bb = self.alloc_bb();
+                    self.seal_bb(
+                        MirTerminator::Yield(MirYieldKind::ShareCheckpoint { resume_bb }),
+                        resume_bb,
+                        true,
+                    );
+                }
             }
             StmtKind::Block(b) => {
                 self.lower_scoped_block(b)?;
             }
             StmtKind::Expr(e) => {
+                if let Some(code_arg_opt) = extract_sys_exit_arg(e) {
+                    self.emit_coroutine_sys_exit(code_arg_opt)?;
+                    return Ok(());
+                }
                 if self.try_lower_yielding_stmt_expr(e)? {
                     return Ok(());
                 }
@@ -2279,12 +4268,165 @@ impl<'a> CoroutineLowerCtx<'a> {
             }
             StmtKind::Spawn(_) => {
                 return Err(MirLowerError {
-                    message: "`spawn` is only valid inside `fn main()`".to_string(),
+                    message: "`spawn` is only valid during `fn main()` boot".to_string(),
                     span: stmt.span,
                 });
             }
         }
         Ok(())
+    }
+
+    fn emit_coroutine_sys_exit(&mut self, code_arg_opt: Option<&Expr>) -> Result<(), MirLowerError> {
+        let code_expr = if let Some(ce) = code_arg_opt {
+            let raw = self.lower_expr(ce, Some(&MirType::I32))?;
+            let coerced = coerce_or_cast_int(raw, &MirType::I32);
+            if self.has_active_defers_from(0) {
+                let tmp = self.alloc_temp("exit_code", MirType::I32);
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(tmp),
+                    op: MirAssignOp::Assign,
+                    value: coerced,
+                });
+                MirExpr::new(MirExprKind::Var(tmp), MirType::I32)
+            } else {
+                coerced
+            }
+        } else {
+            MirExpr::new(MirExprKind::IntLit(0), MirType::I32)
+        };
+        self.emit_defers_down_to(0)?;
+        self.cur_stmts.push(MirStmt::EndInboxTurn);
+        self.cur_stmts.push(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+            method: "exit".to_string(),
+            args: vec![code_expr],
+        }));
+        let dead_bb = self.alloc_bb();
+        self.seal_bb(MirTerminator::Return(None), dead_bb, false);
+        Ok(())
+    }
+
+    fn lower_iter_into_slice_temp(
+        &mut self,
+        iter: &Expr,
+        fallback_elem_ty: &MirType,
+    ) -> Result<(VarId, MirType), MirLowerError> {
+        if let Ok((place, MirType::Array { elem, len })) = self.lower_place(iter) {
+            let slice_ty = MirType::Slice(elem.clone());
+            let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+            self.cur_stmts.push(MirStmt::Assign {
+                target: MirPlace::Var(slice_tmp),
+                op: MirAssignOp::Assign,
+                value: MirExpr::new(
+                    MirExprKind::ArrayToSlice {
+                        array_place: Box::new(place),
+                        len,
+                        elem_ty: *elem.clone(),
+                    },
+                    slice_ty,
+                ),
+            });
+            return Ok((slice_tmp, *elem));
+        }
+
+        let iv = self.lower_expr(iter, None)?;
+        match iv.ty.clone() {
+            MirType::Slice(elem) => {
+                let et = *elem.clone();
+                let slice_tmp = self.alloc_temp("for_slice", iv.ty.clone());
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(slice_tmp),
+                    op: MirAssignOp::Assign,
+                    value: iv,
+                });
+                Ok((slice_tmp, et))
+            }
+            MirType::Ptr(inner) => match inner.as_ref() {
+                MirType::Slice(elem) => {
+                    let et = *elem.clone();
+                    let slice_ty = MirType::Slice(elem.clone());
+                    let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(slice_tmp),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::Unary {
+                                op: MirUnaryOp::Deref,
+                                expr: Box::new(iv),
+                            },
+                            slice_ty,
+                        ),
+                    });
+                    Ok((slice_tmp, et))
+                }
+                MirType::Array { elem, len } => {
+                    let et = *elem.clone();
+                    let len_val = *len;
+                    let ptr_tmp = self.alloc_temp("for_arr_ptr", iv.ty.clone());
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(ptr_tmp),
+                        op: MirAssignOp::Assign,
+                        value: iv.clone(),
+                    });
+                    let arr_ty = MirType::Array {
+                        elem: elem.clone(),
+                        len: len_val,
+                    };
+                    let slice_ty = MirType::Slice(elem.clone());
+                    let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(slice_tmp),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::ArrayToSlice {
+                                array_place: Box::new(MirPlace::Deref(
+                                    Box::new(MirExpr::new(MirExprKind::Var(ptr_tmp), iv.ty)),
+                                    arr_ty,
+                                )),
+                                len: len_val,
+                                elem_ty: et.clone(),
+                            },
+                            slice_ty,
+                        ),
+                    });
+                    Ok((slice_tmp, et))
+                }
+                _ => {
+                    let slice_ty = MirType::Slice(Box::new(fallback_elem_ty.clone()));
+                    let slice_tmp = self.alloc_temp("for_slice", slice_ty);
+                    Ok((slice_tmp, fallback_elem_ty.clone()))
+                }
+            },
+            MirType::Array { elem, len } => {
+                let et = *elem.clone();
+                let len_val = len;
+                let arr_tmp = self.alloc_temp("for_arr", iv.ty.clone());
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(arr_tmp),
+                    op: MirAssignOp::Assign,
+                    value: iv,
+                });
+                let slice_ty = MirType::Slice(elem.clone());
+                let slice_tmp = self.alloc_temp("for_slice", slice_ty.clone());
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(slice_tmp),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(
+                        MirExprKind::ArrayToSlice {
+                            array_place: Box::new(MirPlace::Var(arr_tmp)),
+                            len: len_val,
+                            elem_ty: et.clone(),
+                        },
+                        slice_ty,
+                    ),
+                });
+                Ok((slice_tmp, et))
+            }
+            _ => {
+                let slice_ty = MirType::Slice(Box::new(fallback_elem_ty.clone()));
+                let slice_tmp = self.alloc_temp("for_slice", slice_ty);
+                Ok((slice_tmp, fallback_elem_ty.clone()))
+            }
+        }
     }
 
     /// Directly lower `VarType dst = <yielding_op>;` without allocating an extra copy temp!
@@ -2298,7 +4440,9 @@ impl<'a> CoroutineLowerCtx<'a> {
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(id) = &callee.kind {
                     if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
-                        if sig.is_yielding && !sig.error_spec.has_error() {
+                        let yields_here = sig.is_yielding
+                            && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
+                        if yields_here && !sig.error_spec.has_error() {
                             self.emit_yielding_fn_call(
                                 &id.name,
                                 &sig,
@@ -2377,28 +4521,6 @@ impl<'a> CoroutineLowerCtx<'a> {
                             );
                             return Ok(true);
                         }
-                        ("recv", MirPrimKind::Chan { elem, cap })
-                            if find_named_arg(args, "timeout").is_none() =>
-                        {
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::ChanRecv {
-                                    target,
-                                    elem_ty: *elem,
-                                    cap,
-                                    timeout_deadline_var: None,
-                                    dst_val: Some(dst_vid),
-                                    dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            return Ok(true);
-                        }
                         _ => {}
                     }
                 }
@@ -2417,7 +4539,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                         return true;
                     }
                     if let Some(sig) = self.syms.fns.get(&id.name) {
-                        return sig.is_yielding && sig.ret_ty.is_void() && !sig.error_spec.has_error();
+                        let yields_here = sig.is_yielding
+                            && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
+                        return yields_here && sig.ret_ty.is_void() && !sig.error_spec.has_error();
                     }
                 }
                 false
@@ -2433,7 +4557,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                     }
                 }
                 let m = method.name.as_str();
-                m == "send" || (m == "wait" && find_named_arg(args, "timeout").is_none())
+                (m == "send" || m == "wait") && find_named_arg(args, "timeout").is_none()
             }
             _ => false,
         }
@@ -2450,16 +4574,20 @@ impl<'a> CoroutineLowerCtx<'a> {
                         }
                     }
                     if id.name == "checkpoint" {
-                        let resume_bb = self.alloc_bb();
-                        self.seal_bb(
-                            MirTerminator::Yield(MirYieldKind::ShareCheckpoint { resume_bb }),
-                            resume_bb,
-                            true,
-                        );
+                        if !self.in_noyield {
+                            let resume_bb = self.alloc_bb();
+                            self.seal_bb(
+                                MirTerminator::Yield(MirYieldKind::ShareCheckpoint { resume_bb }),
+                                resume_bb,
+                                true,
+                            );
+                        }
                         return Ok(true);
                     }
                     if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
-                        if sig.is_yielding {
+                        let yields_here = sig.is_yielding
+                            && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
+                        if yields_here {
                             self.emit_yielding_fn_call(&id.name, &sig, args, None)?;
                             return Ok(true);
                         }
@@ -2482,13 +4610,16 @@ impl<'a> CoroutineLowerCtx<'a> {
                 if let Some((target, pkind)) = self.resolve_prim_receiver(receiver)? {
                     let m = method.name.as_str();
                     match (m, pkind) {
-                        ("send", MirPrimKind::Chan { elem, cap }) => {
+                        ("send", MirPrimKind::Inbox { elem, cap })
+                            if find_named_arg(args, "timeout").is_none() =>
+                        {
                             let vexpr = if let Some(first) = first_positional_arg(args) {
-                                self.lower_expr(first, Some(&elem))?
+                                let raw = self.lower_expr(first, Some(&elem))?;
+                                coerce_expr_if_needed(raw, &elem)
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                             };
-                            let val_var = self.alloc_temp("chan_tx", *elem.clone());
+                            let val_var = self.alloc_temp("inbox_tx", *elem.clone());
                             self.cur_stmts.push(MirStmt::Assign {
                                 target: MirPlace::Var(val_var),
                                 op: MirAssignOp::Assign,
@@ -2498,11 +4629,13 @@ impl<'a> CoroutineLowerCtx<'a> {
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
                             self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::ChanSend {
+                                MirTerminator::Yield(MirYieldKind::InboxSend {
                                     target,
                                     elem_ty: *elem,
                                     cap,
                                     val_var,
+                                    timeout_deadline_var: None,
+                                    dst_res: None,
                                     poll_bb,
                                     resume_bb,
                                 }),
@@ -2578,7 +4711,13 @@ impl<'a> CoroutineLowerCtx<'a> {
     ) -> Result<(), MirLowerError> {
         let mut largs = Vec::new();
         for (idx, a) in args.iter().enumerate() {
-            largs.push(self.lower_expr(&a.value, sig.params.get(idx))?);
+            let me = self.lower_expr(&a.value, sig.params.get(idx))?;
+            let coerced = if let Some(pty) = sig.params.get(idx) {
+                self.coerce_arg_for_param(me, pty)
+            } else {
+                me
+            };
+            largs.push(coerced);
         }
         let slot_idx = self.child_slots.len();
         let slot_name = format!("c{slot_idx}_{callee}");
@@ -2620,26 +4759,7 @@ impl<'a> CoroutineLowerCtx<'a> {
         &mut self,
         receiver: &Expr,
     ) -> Result<Option<(MirPrimTarget, MirPrimKind)>, MirLowerError> {
-        if let ExprKind::Ident(id) = &receiver.kind {
-            if let Some(pinfo) = self.syms.primitives.get(&id.name) {
-                return Ok(Some((
-                    MirPrimTarget::Global(id.name.clone()),
-                    pinfo.kind.clone(),
-                )));
-            }
-            if let Some(vid) = self.scopes.lookup(&id.name) {
-                let vty = self.vars[vid.0].ty.clone();
-                if let MirType::Ptr(inner) = &vty {
-                    if let MirType::Primitive(pk) = inner.as_ref() {
-                        return Ok(Some((
-                            MirPrimTarget::PtrExpr(MirExpr::new(MirExprKind::Var(vid), vty.clone())),
-                            pk.clone(),
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(None)
+        resolve_prim_receiver_be(receiver, self)
     }
 
     fn lower_expr(
@@ -2707,6 +4827,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 );
 
                 self.scopes.push();
+                self.defer_stack.push(Vec::new());
                 if let Some(ep) = &clause.err_param {
                     let ety = err_ty_opt.unwrap_or_else(|| self.syms.resolve_type(&ep.ty));
                     let evid = self.declare_var(&ep.name.name, ety.clone(), VarRole::UserLocal);
@@ -2730,7 +4851,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                 {
                     if let StmtKind::Expr(tail_expr) = &last_stmt.kind {
                         self.lower_stmts(prefix_stmts)?;
-                        if self.is_void_yielding_stmt_expr(tail_expr)
+                        if let Some(code_arg_opt) = extract_sys_exit_arg(tail_expr) {
+                            self.emit_coroutine_sys_exit(code_arg_opt)?;
+                        } else if self.is_void_yielding_stmt_expr(tail_expr)
                             && self.try_lower_yielding_stmt_expr(tail_expr)?
                         {
                             // void yielding statement executed in err_bb
@@ -2758,6 +4881,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 } else {
                     self.lower_stmts(&clause.body.stmts)?;
                 }
+                self.pop_and_lower_top_defer_scope()?;
                 self.scopes.pop();
                 self.seal_bb(MirTerminator::Goto(join_bb), ok_bb, false);
 
@@ -2777,7 +4901,9 @@ impl<'a> CoroutineLowerCtx<'a> {
             ExprKind::Call { callee, args } => {
                 if let ExprKind::Ident(id) = &callee.kind {
                     if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
-                        if sig.is_yielding {
+                        let yields_here = sig.is_yielding
+                            && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
+                        if yields_here {
                             let env_ty = if sig.error_spec.has_error() {
                                 MirType::Result {
                                     ok: Box::new(sig.ret_ty.clone()),
@@ -2847,6 +4973,81 @@ impl<'a> CoroutineLowerCtx<'a> {
                             );
                             return Ok(MirExpr::new(MirExprKind::Var(dst_vid), sty));
                         }
+                        ("send", MirPrimKind::Inbox { elem, cap }) => {
+                            let vexpr = if let Some(first) = first_positional_arg(args) {
+                                let raw = self.lower_expr(first, Some(&elem))?;
+                                coerce_expr_if_needed(raw, &elem)
+                            } else {
+                                MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
+                            };
+                            let val_var = self.alloc_temp("inbox_tx", *elem.clone());
+                            self.cur_stmts.push(MirStmt::Assign {
+                                target: MirPlace::Var(val_var),
+                                op: MirAssignOp::Assign,
+                                value: vexpr,
+                            });
+                            if let Some(texpr) = find_named_arg(args, "timeout") {
+                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
+                                let dl_var = self.alloc_temp("inbox_tx_deadline", MirType::U32);
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(dl_var),
+                                    op: MirAssignOp::Assign,
+                                    value: MirExpr::new(
+                                        MirExprKind::Binary {
+                                            op: MirBinOp::Add,
+                                            lhs: Box::new(MirExpr::new(
+                                                MirExprKind::NowTicks,
+                                                MirType::U32,
+                                            )),
+                                            rhs: Box::new(ticks),
+                                        },
+                                        MirType::U32,
+                                    ),
+                                });
+                                let rty = MirType::Result {
+                                    ok: Box::new(MirType::Void),
+                                    err: None,
+                                };
+                                let dst_res = self.alloc_temp("inbox_tx_res", rty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::InboxSend {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        val_var,
+                                        timeout_deadline_var: Some(dl_var),
+                                        dst_res: Some(dst_res),
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
+                                    resume_bb,
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                            } else {
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::InboxSend {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        val_var,
+                                        timeout_deadline_var: None,
+                                        dst_res: None,
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
+                                    resume_bb,
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void));
+                            }
+                        }
                         ("recv", MirPrimKind::Inbox { elem, cap }) => {
                             self.cur_stmts.push(MirStmt::EndInboxTurn);
                             if let Some(texpr) = find_named_arg(args, "timeout") {
@@ -2897,70 +5098,6 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
                                 self.seal_bb(
                                     MirTerminator::Yield(MirYieldKind::InboxRecv {
-                                        target,
-                                        elem_ty: *elem.clone(),
-                                        cap,
-                                        timeout_deadline_var: None,
-                                        dst_val: Some(dst_val),
-                                        dst_res: None,
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), *elem));
-                            }
-                        }
-                        ("recv", MirPrimKind::Chan { elem, cap }) => {
-                            if let Some(texpr) = find_named_arg(args, "timeout") {
-                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                let dl_var = self.alloc_temp("chan_deadline", MirType::U32);
-                                self.cur_stmts.push(MirStmt::Assign {
-                                    target: MirPlace::Var(dl_var),
-                                    op: MirAssignOp::Assign,
-                                    value: MirExpr::new(
-                                        MirExprKind::Binary {
-                                            op: MirBinOp::Add,
-                                            lhs: Box::new(MirExpr::new(
-                                                MirExprKind::NowTicks,
-                                                MirType::U32,
-                                            )),
-                                            rhs: Box::new(ticks),
-                                        },
-                                        MirType::U32,
-                                    ),
-                                });
-                                let rty = MirType::Result {
-                                    ok: elem.clone(),
-                                    err: None,
-                                };
-                                let dst_res = self.alloc_temp("chan_res", rty.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::ChanRecv {
-                                        target,
-                                        elem_ty: *elem,
-                                        cap,
-                                        timeout_deadline_var: Some(dl_var),
-                                        dst_val: None,
-                                        dst_res: Some(dst_res),
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
-                            } else {
-                                let dst_val = self.alloc_temp("chan_val", *elem.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::ChanRecv {
                                         target,
                                         elem_ty: *elem.clone(),
                                         cap,
@@ -3058,290 +5195,7 @@ impl<'a> CoroutineLowerCtx<'a> {
         expr: &Expr,
         expected: Option<&MirType>,
     ) -> Result<MirExpr, MirLowerError> {
-        // Split borrows cleanly by using temporary helper closures via raw self calls:
-        match &expr.kind {
-            ExprKind::Unary {
-                op: UnaryOp::AddrOf,
-                expr: inner,
-            } => {
-                if let ExprKind::Ident(id) = &inner.kind {
-                    if let Some(pinfo) = self.syms.primitives.get(&id.name) {
-                        return Ok(MirExpr::new(
-                            MirExprKind::GlobalPrimAddr(id.name.clone()),
-                            MirType::Ptr(Box::new(MirType::Primitive(pinfo.kind.clone()))),
-                        ));
-                    }
-                    if self.syms.fns.contains_key(&id.name) {
-                        return Ok(MirExpr::new(
-                            MirExprKind::FnAddr(id.name.clone()),
-                            expected.cloned().unwrap_or(MirType::Usize),
-                        ));
-                    }
-                }
-                let (place, pty) = self.lower_place(inner)?;
-                Ok(MirExpr::new(
-                    MirExprKind::AddrOfPlace(Box::new(place)),
-                    MirType::Ptr(Box::new(pty)),
-                ))
-            }
-            ExprKind::Unary { op, expr: inner } => {
-                let sub = self.lower_expr(inner, expected)?;
-                finish_unary(*op, sub)
-            }
-            ExprKind::Binary { op, lhs, rhs } => {
-                let is_cmp_or_logic = matches!(
-                    op,
-                    BinaryOp::Eq
-                        | BinaryOp::Ne
-                        | BinaryOp::Lt
-                        | BinaryOp::Le
-                        | BinaryOp::Gt
-                        | BinaryOp::Ge
-                        | BinaryOp::And
-                        | BinaryOp::Or
-                );
-                let op_expected = if is_cmp_or_logic { None } else { expected };
-                let (l, r) = if ast_is_untyped_int_lit(lhs) && !ast_is_untyped_int_lit(rhs) {
-                    let r = self.lower_expr(rhs, op_expected)?;
-                    let l = self.lower_expr(lhs, Some(&r.ty.host_value_type()))?;
-                    (l, r)
-                } else {
-                    let l = self.lower_expr(lhs, op_expected)?;
-                    let r = self.lower_expr(rhs, Some(&l.ty.host_value_type()))?;
-                    (l, r)
-                };
-                Ok(finish_binary(*op, l, r))
-            }
-            ExprKind::Cast { expr: inner, ty } => {
-                let target_ty = self.syms.resolve_type(ty);
-                let sub = self.lower_expr(inner, None)?;
-                Ok(MirExpr::new(
-                    MirExprKind::Cast {
-                        expr: Box::new(sub),
-                        target_ty: target_ty.clone(),
-                    },
-                    target_ty,
-                ))
-            }
-            ExprKind::Field { target, field } => {
-                if let Some(hw_path) = try_extract_hw_path(expr, self.syms) {
-                    return Ok(MirExpr::new(
-                        MirExprKind::HwPeriphVal(hw_path.clone()),
-                        MirType::HwPeripheral(hw_path.join(".")),
-                    ));
-                }
-                if let ExprKind::Ident(id) = &target.kind {
-                    if self.syms.enums.contains_key(&id.name) {
-                        return Ok(MirExpr::new(
-                            MirExprKind::EnumVariant {
-                                enum_name: id.name.clone(),
-                                variant: field.name.clone(),
-                            },
-                            MirType::Enum(id.name.clone()),
-                        ));
-                    }
-                }
-                let base = self.lower_expr(target, None)?;
-                finish_field_access(base, &field.name, self.syms, expr.span)
-            }
-            ExprKind::Index { target, index } => {
-                let base = self.lower_expr(target, None)?;
-                let idx = self.lower_expr(index, Some(&MirType::Usize))?;
-                finish_index(base, idx, expr.span)
-            }
-            ExprKind::Slice { target, start, end } => {
-                let s = if let Some(se) = start {
-                    self.lower_expr(se, Some(&MirType::Usize))?
-                } else {
-                    MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
-                };
-                if let Ok((place, MirType::Array { elem, len })) = self.lower_place(target) {
-                    let e = if let Some(ee) = end {
-                        self.lower_expr(ee, Some(&MirType::Usize))?
-                    } else {
-                        MirExpr::new(MirExprKind::IntLit(len as i128), MirType::Usize)
-                    };
-                    let slice_expr = MirExpr::new(
-                        MirExprKind::ArrayToSlice {
-                            array_place: Box::new(place),
-                            len,
-                            elem_ty: *elem.clone(),
-                        },
-                        MirType::Slice(elem.clone()),
-                    );
-                    return Ok(MirExpr::new(
-                        MirExprKind::SubSlice {
-                            base: Box::new(slice_expr),
-                            start: Box::new(s),
-                            end: Box::new(e),
-                            elem_ty: *elem.clone(),
-                            base_is_array: false,
-                        },
-                        MirType::Slice(elem),
-                    ));
-                }
-                let base = self.lower_expr(target, None)?;
-                let elem_ty = match &base.ty {
-                    MirType::Slice(inner) => *inner.clone(),
-                    MirType::Array { elem, .. } => *elem.clone(),
-                    _ => MirType::U8,
-                };
-                let e = if let Some(ee) = end {
-                    self.lower_expr(ee, Some(&MirType::Usize))?
-                } else {
-                    MirExpr::new(MirExprKind::SliceLen(Box::new(base.clone())), MirType::Usize)
-                };
-                Ok(MirExpr::new(
-                    MirExprKind::SubSlice {
-                        base: Box::new(base),
-                        start: Box::new(s),
-                        end: Box::new(e),
-                        elem_ty: elem_ty.clone(),
-                        base_is_array: false,
-                    },
-                    MirType::Slice(Box::new(elem_ty)),
-                ))
-            }
-            ExprKind::StructLit { name, fields } => {
-                let st = self.syms.structs.get(&name.name).cloned();
-                let packed = st.as_ref().map_or(false, |s| s.packed);
-                let mut mfields = Vec::new();
-                for fi in fields {
-                    let fty = st
-                        .as_ref()
-                        .and_then(|s| s.fields.iter().find(|f| f.name == fi.name.name))
-                        .map(|f| f.ty.clone())
-                        .unwrap_or(MirType::U32);
-                    let fv = self.lower_expr(&fi.value, Some(&fty.host_value_type()))?;
-                    mfields.push((
-                        fi.name.name.clone(),
-                        coerce_expr_if_needed(fv, &fty.host_value_type()),
-                        fty,
-                    ));
-                }
-                Ok(MirExpr::new(
-                    MirExprKind::StructLit {
-                        struct_name: name.name.clone(),
-                        packed,
-                        fields: mfields,
-                    },
-                    MirType::Struct(name.name.clone()),
-                ))
-            }
-            ExprKind::ArrayLit(elems) => {
-                let elem_ty = match expected {
-                    Some(MirType::Array { elem, .. }) | Some(MirType::Slice(elem)) => {
-                        *elem.clone()
-                    }
-                    _ => MirType::U8,
-                };
-                let mut melems = Vec::new();
-                for el in elems {
-                    let me = self.lower_expr(el, Some(&elem_ty))?;
-                    melems.push(coerce_expr_if_needed(me, &elem_ty));
-                }
-                let len = melems.len();
-                Ok(MirExpr::new(
-                    MirExprKind::ArrayLit {
-                        elems: melems,
-                        elem_ty: elem_ty.clone(),
-                    },
-                    MirType::Array {
-                        elem: Box::new(elem_ty),
-                        len,
-                    },
-                ))
-            }
-            ExprKind::Call { callee, args } => {
-                let mut largs = Vec::new();
-                if let ExprKind::Ident(id) = &callee.kind {
-                    if matches!(id.name.as_str(), "now_ticks" | "now_ms") {
-                        return Ok(MirExpr::new(MirExprKind::NowTicks, MirType::U32));
-                    }
-                    if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
-                        for (idx, a) in args.iter().enumerate() {
-                            let me = self.lower_expr(&a.value, sig.params.get(idx))?;
-                            let coerced = if let Some(pty) = sig.params.get(idx) {
-                                self.coerce_arg_for_param(me, pty)
-                            } else {
-                                me
-                            };
-                            largs.push(coerced);
-                        }
-                        let ret = if sig.error_spec.has_error() {
-                            MirType::Result {
-                                ok: Box::new(sig.ret_ty),
-                                err: sig.error_spec.err_type().map(Box::new),
-                            }
-                        } else {
-                            sig.ret_ty
-                        };
-                        return Ok(MirExpr::new(
-                            MirExprKind::CallDirect {
-                                callee: id.name.clone(),
-                                is_extern_c: sig.is_extern_c,
-                                args: largs,
-                            },
-                            ret,
-                        ));
-                    }
-                    for a in args {
-                        largs.push(self.lower_expr(&a.value, None)?);
-                    }
-                    return Ok(MirExpr::new(
-                        MirExprKind::CallDirect {
-                            callee: id.name.clone(),
-                            is_extern_c: true,
-                            args: largs,
-                        },
-                        expected.cloned().unwrap_or(MirType::Void),
-                    ));
-                }
-                Err(MirLowerError {
-                    message: "unsupported indirect function call target".to_string(),
-                    span: expr.span,
-                })
-            }
-            ExprKind::MethodCall {
-                receiver,
-                method,
-                args,
-            } => {
-                // `Type.from_bytes(slice)`
-                if let ExprKind::Ident(id) = &receiver.kind {
-                    if self.syms.structs.contains_key(&id.name) && method.name == "from_bytes" {
-                        let sarg = first_positional_arg(args).ok_or_else(|| MirLowerError {
-                            message: "from_bytes expects a slice argument".to_string(),
-                            span: expr.span,
-                        })?;
-                        let slice_ty = MirType::Slice(Box::new(MirType::U8));
-                        let s = self.lower_expr(sarg, Some(&slice_ty))?;
-                        let s = self.coerce_arg_for_param(s, &slice_ty);
-                        return Ok(MirExpr::new(
-                            MirExprKind::FromBytes {
-                                struct_name: id.name.clone(),
-                                slice: Box::new(s),
-                            },
-                            MirType::Result {
-                                ok: Box::new(MirType::Struct(id.name.clone())),
-                                err: None,
-                            },
-                        ));
-                    }
-                    if id.name == "sys" && matches!(method.name.as_str(), "now_ms" | "now_ticks") {
-                        return Ok(MirExpr::new(MirExprKind::NowTicks, MirType::U32));
-                    }
-                }
-                if let Some((target, pkind)) = self.resolve_prim_receiver(receiver)? {
-                    return finish_prim_read_method(target, pkind, &method.name, expr.span);
-                }
-                Err(MirLowerError {
-                    message: format!("unsupported method expression `.{}()`", method.name),
-                    span: expr.span,
-                })
-            }
-            _ => lower_leaf_expr(expr, expected, self.syms, &self.vars, &self.scopes),
-        }
+        lower_common_expr(expr, expected, self)
     }
 
     fn coerce_arg_for_param(&mut self, arg: MirExpr, param_ty: &MirType) -> MirExpr {
@@ -3372,6 +5226,7 @@ trait LowerBackend {
     fn syms(&self) -> &ModuleSymbols;
     fn vars(&self) -> &[MirVar];
     fn scopes(&self) -> &VarScopes;
+    fn in_noyield(&self) -> bool;
     fn lower_sub(
         &mut self,
         expr: &Expr,
@@ -3395,6 +5250,9 @@ impl<'b, 'a> LowerBackend for DirectBackend<'b, 'a> {
     fn scopes(&self) -> &VarScopes {
         &self.ctx.scopes
     }
+    fn in_noyield(&self) -> bool {
+        self.ctx.in_noyield
+    }
     fn lower_sub(
         &mut self,
         expr: &Expr,
@@ -3416,6 +5274,9 @@ impl<'a> LowerBackend for CoroutineLowerCtx<'a> {
     }
     fn scopes(&self) -> &VarScopes {
         &self.scopes
+    }
+    fn in_noyield(&self) -> bool {
+        self.in_noyield
     }
     fn lower_sub(
         &mut self,
@@ -3816,6 +5677,9 @@ fn lower_common_expr<B: LowerBackend>(
                 if matches!(id.name.as_str(), "now_ticks" | "now_ms") {
                     return Ok(MirExpr::new(MirExprKind::NowTicks, MirType::U32));
                 }
+                if id.name == "checkpoint" && be.in_noyield() {
+                    return Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void));
+                }
                 if let Some(sig) = be.syms().fns.get(&id.name).cloned() {
                     for (idx, a) in args.iter().enumerate() {
                         let me = be.lower_sub(&a.value, sig.params.get(idx))?;
@@ -3845,9 +5709,15 @@ fn lower_common_expr<B: LowerBackend>(
                     } else {
                         sig.ret_ty
                     };
+                    let target_callee =
+                        if be.in_noyield() && sig.effect == MirFnEffect::SoftYielding {
+                            format!("{}__noyield", id.name)
+                        } else {
+                            id.name.clone()
+                        };
                     return Ok(MirExpr::new(
                         MirExprKind::CallDirect {
-                            callee: id.name.clone(),
+                            callee: target_callee,
                             is_extern_c: sig.is_extern_c,
                             args: largs,
                         },
@@ -3909,32 +5779,9 @@ fn lower_common_expr<B: LowerBackend>(
                 if id.name == "sys" && matches!(method.name.as_str(), "now_ms" | "now_ticks") {
                     return Ok(MirExpr::new(MirExprKind::NowTicks, MirType::U32));
                 }
-                if let Some(pinfo) = be.syms().primitives.get(&id.name) {
-                    return finish_prim_read_method(
-                        MirPrimTarget::Global(id.name.clone()),
-                        pinfo.kind.clone(),
-                        &method.name,
-                        expr.span,
-                    );
-                }
-                if let Some(vid) = be.scopes().lookup(&id.name) {
-                    let vty = be.vars()[vid.0].ty.clone();
-                    let pk_opt = match &vty {
-                        MirType::Ptr(inner) => match inner.as_ref() {
-                            MirType::Primitive(pk) => Some(pk.clone()),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    if let Some(pk) = pk_opt {
-                        return finish_prim_read_method(
-                            MirPrimTarget::PtrExpr(MirExpr::new(MirExprKind::Var(vid), vty)),
-                            pk,
-                            &method.name,
-                            expr.span,
-                        );
-                    }
-                }
+            }
+            if let Some((target, pkind)) = resolve_prim_receiver_be(receiver, be)? {
+                return finish_prim_read_method(target, pkind, &method.name, args, expr.span, be);
             }
             Err(MirLowerError {
                 message: format!("unsupported method call `.{}()`", method.name),
@@ -4180,11 +6027,138 @@ fn finish_index(base: MirExpr, idx: MirExpr, span: Span) -> Result<MirExpr, MirL
     }
 }
 
-fn finish_prim_read_method(
+fn resolve_prim_receiver_be<B: LowerBackend>(
+    receiver: &Expr,
+    be: &mut B,
+) -> Result<Option<(MirPrimTarget, MirPrimKind)>, MirLowerError> {
+    if let ExprKind::Ident(id) = &receiver.kind {
+        if let Some(pinfo) = be.syms().primitives.get(&id.name) {
+            return Ok(Some((
+                MirPrimTarget::Global(id.name.clone()),
+                pinfo.kind.clone(),
+            )));
+        }
+        if let Some(vid) = be.scopes().lookup(&id.name) {
+            let vty = be.vars()[vid.0].ty.clone();
+            if let MirType::Ptr(inner) = vty.clone() {
+                if let MirType::Primitive(pk) = *inner {
+                    return Ok(Some((
+                        MirPrimTarget::PtrExpr(MirExpr::new(MirExprKind::Var(vid), vty)),
+                        pk,
+                    )));
+                }
+            }
+        }
+        return Ok(None);
+    }
+    if try_extract_hw_path(receiver, be.syms()).is_some() {
+        return Ok(None);
+    }
+    if let ExprKind::Field { .. } | ExprKind::Unary { op: UnaryOp::Deref, .. } = &receiver.kind {
+        if let Ok(rv) = be.lower_sub(receiver, None) {
+            match &rv.ty {
+                MirType::Ptr(inner) => {
+                    if let MirType::Primitive(pk) = inner.as_ref() {
+                        let pk_c = pk.clone();
+                        return Ok(Some((MirPrimTarget::PtrExpr(rv), pk_c)));
+                    }
+                }
+                MirType::Primitive(pk) => {
+                    let pk_c = pk.clone();
+                    if let Ok((place, pty)) = be.lower_place_be(receiver) {
+                        let ptr = MirExpr::new(
+                            MirExprKind::AddrOfPlace(Box::new(place)),
+                            MirType::Ptr(Box::new(pty)),
+                        );
+                        return Ok(Some((MirPrimTarget::PtrExpr(ptr), pk_c)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn is_checkpoint_call_expr(expr: &Expr) -> bool {
+    matches!(
+        &expr.kind,
+        ExprKind::Call { callee, args }
+            if args.is_empty() && matches!(&callee.kind, ExprKind::Ident(id) if id.name == "checkpoint")
+    )
+}
+
+fn extract_sys_exit_arg(expr: &Expr) -> Option<Option<&Expr>> {
+    match &expr.kind {
+        ExprKind::MethodCall {
+            receiver,
+            method,
+            args,
+        } if matches!(&receiver.kind, ExprKind::Ident(id) if id.name == "sys")
+            && method.name == "exit" =>
+        {
+            Some(first_positional_arg(args))
+        }
+        ExprKind::Call { callee, args } => match &callee.kind {
+            ExprKind::Field { target, field }
+                if matches!(&target.kind, ExprKind::Ident(id) if id.name == "sys")
+                    && field.name == "exit" =>
+            {
+                Some(first_positional_arg(args))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn ast_stmts_have_return(stmts: &[Stmt]) -> bool {
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Return(_) => return true,
+            StmtKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                if ast_stmts_have_return(&then_block.stmts)
+                    || else_block
+                        .as_ref()
+                        .is_some_and(|eb| ast_stmts_have_return(&eb.stmts))
+                {
+                    return true;
+                }
+            }
+            StmtKind::Switch { arms, .. } => {
+                if arms.iter().any(|a| ast_stmts_have_return(&a.body.stmts)) {
+                    return true;
+                }
+            }
+            StmtKind::While { body, .. }
+            | StmtKind::Loop { body }
+            | StmtKind::LoopEvery { body, .. }
+            | StmtKind::ForRange { body, .. }
+            | StmtKind::ForEach { body, .. }
+            | StmtKind::NoYield { body }
+            | StmtKind::Critical { body }
+            | StmtKind::Block(body) => {
+                if ast_stmts_have_return(&body.stmts) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn finish_prim_read_method<B: LowerBackend>(
     target: MirPrimTarget,
     pkind: MirPrimKind,
     method: &str,
+    args: &[CallArg],
     span: Span,
+    be: &mut B,
 ) -> Result<MirExpr, MirLowerError> {
     match (method, pkind) {
         ("read" | "get", MirPrimKind::Watch { elem }) => Ok(MirExpr::new(
@@ -4205,21 +6179,60 @@ fn finish_prim_read_method(
                 err: None,
             },
         )),
-        ("try_recv", MirPrimKind::Chan { elem, cap }) => Ok(MirExpr::new(
-            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ChanTryRecv {
+        ("try_send", MirPrimKind::Inbox { elem, cap }) => {
+            let v = if let Some(first) = first_positional_arg(args) {
+                let raw = be.lower_sub(first, Some(&elem))?;
+                coerce_expr_if_needed(raw, &elem)
+            } else {
+                MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
+            };
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxTrySend {
+                    target,
+                    elem_ty: *elem,
+                    cap,
+                    value: Box::new(v),
+                    boost,
+                })),
+                MirType::Bool,
+            ))
+        }
+        ("len", MirPrimKind::Inbox { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxLen {
                 target,
-                elem_ty: *elem.clone(),
+                elem_ty: *elem,
                 cap,
             })),
-            MirType::Result {
-                ok: elem,
-                err: None,
-            },
+            MirType::Usize,
+        )),
+        ("is_empty", MirPrimKind::Inbox { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxIsEmpty {
+                target,
+                elem_ty: *elem,
+                cap,
+            })),
+            MirType::Bool,
+        )),
+        ("is_full", MirPrimKind::Inbox { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxIsFull {
+                target,
+                elem_ty: *elem,
+                cap,
+            })),
+            MirType::Bool,
         )),
         ("is_set", MirPrimKind::Signal) => Ok(MirExpr::new(
             MirExprKind::PrimRead(Box::new(MirPrimReadOp::SignalIsSet { target })),
             MirType::Bool,
         )),
+        ("try_wait", MirPrimKind::Signal) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::SignalTryWait { target })),
+            MirType::Bool,
+        )),
+        ("half_len" | "cap", MirPrimKind::PingPong { cap, .. }) => {
+            Ok(MirExpr::new(MirExprKind::IntLit(cap as i128), MirType::Usize))
+        }
         _ => Err(MirLowerError {
             message: format!("unknown primitive read method `.{method}()`"),
             span,
@@ -4408,36 +6421,7 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
             }
 
             // 3. Non-blocking OS & DMA primitive operations
-            let prim_target_opt: Option<(MirPrimTarget, MirPrimKind)> =
-                if let ExprKind::Ident(id) = &receiver.kind {
-                    if let Some(pinfo) = be.syms().primitives.get(&id.name) {
-                        Some((
-                            MirPrimTarget::Global(id.name.clone()),
-                            pinfo.kind.clone(),
-                        ))
-                    } else if let Some(vid) = be.scopes().lookup(&id.name) {
-                        let vty = be.vars()[vid.0].ty.clone();
-                        let pk_opt = match &vty {
-                            MirType::Ptr(inner) => match inner.as_ref() {
-                                MirType::Primitive(pk) => Some(pk.clone()),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        pk_opt.map(|pk| {
-                            (
-                                MirPrimTarget::PtrExpr(MirExpr::new(MirExprKind::Var(vid), vty)),
-                                pk,
-                            )
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-            if let Some((target, pkind)) = prim_target_opt {
+            if let Some((target, pkind)) = resolve_prim_receiver_be(receiver, be)? {
                 let m = method.name.as_str();
                 match (m, pkind) {
                     ("publish" | "write" | "set", MirPrimKind::Watch { elem }) => {
@@ -4465,19 +6449,6 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             cap,
                             value: coerce_expr_if_needed(v, &elem),
                             boost,
-                        })));
-                    }
-                    ("try_send" | "post", MirPrimKind::Chan { elem, cap }) => {
-                        let v = if let Some(first) = first_positional_arg(args) {
-                            be.lower_sub(first, Some(&elem))?
-                        } else {
-                            MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
-                        };
-                        return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::ChanTrySend {
-                            target,
-                            elem_ty: *elem.clone(),
-                            cap,
-                            value: coerce_expr_if_needed(v, &elem),
                         })));
                     }
                     ("notify" | "set" | "post" | "trigger", MirPrimKind::Signal) => {

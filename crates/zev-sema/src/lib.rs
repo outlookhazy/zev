@@ -21,7 +21,7 @@ pub use call_graph::{CallContext, CallEdge, CallGraph, CallableKind, ExternCallb
 pub use checker::{AnalysisOutput, AnalyzeOptions};
 pub use diag::{Diagnostic, DiagnosticKind};
 pub use model::{
-    ConstInfo, DEFAULT_TICK_PERIOD_US, FunctionInfo, IsrInfo, ParamInfo, PrimitiveInfo,
+    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IsrInfo, ParamInfo, PrimitiveInfo,
     PriorityBoostSite, SemanticModel, SpawnedTaskInstance, TaskInfo,
 };
 pub use provenance::{LeaseEnv, LeaseToken, Provenance};

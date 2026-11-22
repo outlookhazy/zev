@@ -182,7 +182,10 @@ impl<'a> Lexer<'a> {
                 '.' => {
                     if self.peek() == Some('.') {
                         self.bump();
-                        if self.peek() == Some('.') {
+                        if self.peek() == Some('=') {
+                            self.bump();
+                            TokenKind::DotDotEq
+                        } else if self.peek() == Some('.') {
                             self.bump();
                             TokenKind::DotDotDot
                         } else {

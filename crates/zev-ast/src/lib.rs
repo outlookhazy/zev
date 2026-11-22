@@ -4,10 +4,10 @@
 //! - Module imports (`import chip.stm32g4 as hw;`)
 //! - Attributes & priorities (`@dma_safe`, `@manual_yield`, `@critical`, `@high`, `@normal`, `@low`, `@core(N)`)
 //! - Wire-exact `packed struct`, `struct`, and `enum` declarations with endian primitives (`u16be`, `u32le`, etc.)
-//! - Static OS & DMA primitives (`signal`, `chan<T, N>`, `watch<T>`, `inbox<T, N>`, `ping_pong<T, N>`, `lease<T, N>`)
+//! - Static OS & DMA primitives (`signal`, `watch<T>`, `inbox<T, N>`, `ping_pong<T, N>`, `lease<T, N>`)
 //! - Constants (`const`) and raw globals (parsed so `zev-sema` can reject illegal mutable globals cleanly)
 //! - Execution items: `fn` (with dual-exit `error` / `error ErrType` and `extern "C"`), `task` blueprints, and `isr` handlers
-//! - Cooperative & atomic control flow: `every <dur>`, `loop`, `while`, `noyield`, `critical`, `checkpoint()`, `spawn`, `switch`
+//! - Cooperative & atomic control flow: `loop every <period>`, `loop`, `while`, `for (T x in ...)`, `defer`, `restart;`, `noyield`, `critical`, `checkpoint()`, `spawn`, `switch`
 //! - Dual-exit error handling: `error;`, `error E;`, `error E, partial;`, postfix `or`, and postfix `catch`
 
 use std::fmt;
@@ -290,9 +290,7 @@ impl fmt::Display for PrimType {
 pub enum OsPrimitiveType {
     /// `signal` — lightweight event wakeup.
     Signal,
-    /// `chan<T, N>` — bounded static MPSC/SPSC queue of capacity `cap`.
-    Chan { elem: Box<TypeExpr>, cap: usize },
-    /// `inbox<T, N>` — bounded static Active-Object event queue of capacity `cap`.
+    /// `inbox<T, N>` — unified bounded static queue of capacity `cap` (supports `.post()`, `.send()`, `.recv()`, `.try_recv()`).
     Inbox { elem: Box<TypeExpr>, cap: usize },
     /// `watch<T>` — single-writer, zero-lock latest-value cell.
     Watch { elem: Box<TypeExpr> },
@@ -306,7 +304,6 @@ impl OsPrimitiveType {
     pub const fn kind_name(&self) -> &'static str {
         match self {
             Self::Signal => "signal",
-            Self::Chan { .. } => "chan",
             Self::Inbox { .. } => "inbox",
             Self::Watch { .. } => "watch",
             Self::PingPong { .. } => "ping_pong",
@@ -619,15 +616,33 @@ pub enum StmtKind {
         cond: Expr,
         body: Block,
     },
+    /// Bounded integer range loop (`for (usize i in 0..8) { ... }` or `for (u32 i in 0..=n) { ... }`).
+    ForRange {
+        var_ty: TypeExpr,
+        var_name: Ident,
+        start: Box<Expr>,
+        end: Box<Expr>,
+        inclusive: bool,
+        body: Block,
+    },
+    /// Bounded slice/array element loop (`for (u8 b in slice_or_array) { ... }`).
+    ForEach {
+        elem_ty: TypeExpr,
+        elem_name: Ident,
+        iter: Box<Expr>,
+        body: Block,
+    },
     /// Unbounded loop (`loop { ... }`).
     Loop {
         body: Block,
     },
-    /// Drift-free periodic loop (`every 1ms { ... }`).
-    Every {
-        interval: DurationLit,
+    /// Drift-free periodic loop (`loop every 20ms { ... }` or `loop every period_expr { ... }`).
+    LoopEvery {
+        period: Box<Expr>,
         body: Block,
     },
+    /// Deterministic scope-exit cleanup (`defer expr;` or `defer { ... }`).
+    Defer(Box<Stmt>),
     /// Task-atomic non-yielding scope (`noyield { ... }`).
     NoYield {
         body: Block,
@@ -647,6 +662,8 @@ pub enum StmtKind {
     Continue,
     /// `break;`
     Break,
+    /// Explicit task self-reset statement (`restart;`).
+    Restart,
     /// Explicit cooperative yield point (`checkpoint();`).
     Checkpoint,
     /// Standalone nested lexical scope `{ ... }`.
@@ -1069,5 +1086,57 @@ mod tests {
         let p2 = Program::new(vec![], Span::new(0, 10, 1, 1));
         let merged = Program::merge_all([p1, p2]);
         assert_eq!(merged.items.len(), 1);
+    }
+
+    #[test]
+    fn wave1_ast_variants_and_unified_os_primitives() {
+        let sp = Span::dummy();
+        let u8_ty = TypeExpr::new(TypeKind::Prim(PrimType::U8), sp);
+        let inbox = OsPrimitiveType::Inbox {
+            elem: Box::new(u8_ty.clone()),
+            cap: 16,
+        };
+        assert_eq!(inbox.kind_name(), "inbox");
+        assert_eq!(OsPrimitiveType::Signal.kind_name(), "signal");
+
+        let restart_stmt = Stmt::new(StmtKind::Restart, sp);
+        let defer_stmt = Stmt::new(StmtKind::Defer(Box::new(restart_stmt.clone())), sp);
+        let loop_every = Stmt::new(
+            StmtKind::LoopEvery {
+                period: Box::new(Expr::new(
+                    ExprKind::Literal(Literal::Duration(DurationLit {
+                        value: 20,
+                        unit: DurationUnit::Ms,
+                        span: sp,
+                    })),
+                    sp,
+                )),
+                body: Block::new(vec![defer_stmt], sp),
+            },
+            sp,
+        );
+        let for_range = Stmt::new(
+            StmtKind::ForRange {
+                var_ty: TypeExpr::new(TypeKind::Prim(PrimType::Usize), sp),
+                var_name: Ident::dummy("i"),
+                start: Box::new(Expr::new(ExprKind::Literal(Literal::Int(0)), sp)),
+                end: Box::new(Expr::new(ExprKind::Literal(Literal::Int(8)), sp)),
+                inclusive: true,
+                body: Block::new(vec![], sp),
+            },
+            sp,
+        );
+        let for_each = Stmt::new(
+            StmtKind::ForEach {
+                elem_ty: u8_ty,
+                elem_name: Ident::dummy("b"),
+                iter: Box::new(Expr::new(ExprKind::Ident(Ident::dummy("buf")), sp)),
+                body: Block::new(vec![], sp),
+            },
+            sp,
+        );
+        assert!(matches!(loop_every.kind, StmtKind::LoopEvery { .. }));
+        assert!(matches!(for_range.kind, StmtKind::ForRange { inclusive: true, .. }));
+        assert!(matches!(for_each.kind, StmtKind::ForEach { .. }));
     }
 }

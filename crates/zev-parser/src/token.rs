@@ -43,8 +43,10 @@ pub enum TokenKind {
     KwIf,
     KwElse,
     KwWhile,
+    KwFor,
     KwLoop,
     KwEvery,
+    KwDefer,
     KwNoYield,
     KwCritical,
     KwSwitch,
@@ -52,6 +54,7 @@ pub enum TokenKind {
     KwSpawn,
     KwContinue,
     KwBreak,
+    KwRestart,
     KwTrue,
     KwFalse,
 
@@ -64,7 +67,6 @@ pub enum TokenKind {
     KwSelect,
     KwMatch,
     KwTry,
-    KwFor,
     KwStatic,
     KwPub,
 
@@ -81,6 +83,7 @@ pub enum TokenKind {
     ColonColon, // ::
     Dot,        // .
     DotDot,     // ..
+    DotDotEq,   // ..=
     DotDotDot,  // ...
     At,         // @
     Question,   // ?
@@ -146,8 +149,10 @@ impl TokenKind {
             "if" => Some(Self::KwIf),
             "else" => Some(Self::KwElse),
             "while" => Some(Self::KwWhile),
+            "for" => Some(Self::KwFor),
             "loop" => Some(Self::KwLoop),
             "every" => Some(Self::KwEvery),
+            "defer" => Some(Self::KwDefer),
             "noyield" => Some(Self::KwNoYield),
             "critical" => Some(Self::KwCritical),
             "switch" => Some(Self::KwSwitch),
@@ -155,6 +160,7 @@ impl TokenKind {
             "spawn" => Some(Self::KwSpawn),
             "continue" => Some(Self::KwContinue),
             "break" => Some(Self::KwBreak),
+            "restart" => Some(Self::KwRestart),
             "true" => Some(Self::KwTrue),
             "false" => Some(Self::KwFalse),
             // Foreign-idiom trap keywords
@@ -166,7 +172,6 @@ impl TokenKind {
             "select" => Some(Self::KwSelect),
             "match" => Some(Self::KwMatch),
             "try" => Some(Self::KwTry),
-            "for" => Some(Self::KwFor),
             "static" => Some(Self::KwStatic),
             "pub" => Some(Self::KwPub),
             _ => None,
@@ -195,8 +200,10 @@ impl TokenKind {
             Self::KwIf => Some("if"),
             Self::KwElse => Some("else"),
             Self::KwWhile => Some("while"),
+            Self::KwFor => Some("for"),
             Self::KwLoop => Some("loop"),
             Self::KwEvery => Some("every"),
+            Self::KwDefer => Some("defer"),
             Self::KwNoYield => Some("noyield"),
             Self::KwCritical => Some("critical"),
             Self::KwSwitch => Some("switch"),
@@ -204,6 +211,7 @@ impl TokenKind {
             Self::KwSpawn => Some("spawn"),
             Self::KwContinue => Some("continue"),
             Self::KwBreak => Some("break"),
+            Self::KwRestart => Some("restart"),
             Self::KwTrue => Some("true"),
             Self::KwFalse => Some("false"),
             Self::KwLet => Some("let"),
@@ -214,7 +222,6 @@ impl TokenKind {
             Self::KwSelect => Some("select"),
             Self::KwMatch => Some("match"),
             Self::KwTry => Some("try"),
-            Self::KwFor => Some("for"),
             Self::KwStatic => Some("static"),
             Self::KwPub => Some("pub"),
             _ => None,
@@ -242,6 +249,7 @@ impl fmt::Display for TokenKind {
             Self::ColonColon => f.write_str("`::`"),
             Self::Dot => f.write_str("`.`"),
             Self::DotDot => f.write_str("`..`"),
+            Self::DotDotEq => f.write_str("`..=`"),
             Self::DotDotDot => f.write_str("`...`"),
             Self::At => f.write_str("`@`"),
             Self::Question => f.write_str("`?`"),

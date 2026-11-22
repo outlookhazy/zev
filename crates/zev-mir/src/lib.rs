@@ -16,7 +16,8 @@ pub use ir::*;
 pub use lower::{lower_program, lower_programs, MirLowerError};
 pub use ram::{
     compute_ram_report, populate_module_ram_report, ArchRamTotals, ChildSlotRamInfo,
-    FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign, SpawnedTaskRam, TargetAbi, VarRamInfo,
+    DualSpecializedFnRam, FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign, SpawnedTaskRam,
+    TargetAbi, VarRamInfo,
 };
 
 #[cfg(test)]
@@ -413,8 +414,11 @@ mod tests {
                             sp,
                         ),
                         Stmt::new(
-                            StmtKind::Every {
-                                interval: dur_ms(1),
+                            StmtKind::LoopEvery {
+                                period: Box::new(Expr::new(
+                                    ExprKind::Literal(Literal::Duration(dur_ms(1))),
+                                    sp,
+                                )),
                                 body: Block::new(
                                     vec![
                                         Stmt::new(
@@ -901,12 +905,15 @@ mod tests {
                     params: vec![],
                     body: Block::new(
                         vec![Stmt::new(
-                            StmtKind::Every {
-                                interval: DurationLit {
-                                    value: 500,
-                                    unit: DurationUnit::Us,
-                                    span: sp,
-                                },
+                            StmtKind::LoopEvery {
+                                period: Box::new(Expr::new(
+                                    ExprKind::Literal(Literal::Duration(DurationLit {
+                                        value: 500,
+                                        unit: DurationUnit::Us,
+                                        span: sp,
+                                    })),
+                                    sp,
+                                )),
                                 body: Block::new(vec![], sp),
                             },
                             sp,
@@ -1166,5 +1173,777 @@ mod tests {
         } else {
             panic!("expected Direct fn");
         }
+    }
+
+    #[test]
+    fn wave1_boot_tree_unrolling_provenance_and_conditional_spawn_in_mir() {
+        let sp = Span::dummy();
+        let watch_u32_ty = TypeExpr::new(
+            TypeKind::OsPrimitive(OsPrimitiveType::Watch {
+                elem: Box::new(ty_prim(PrimType::U32)),
+            }),
+            sp,
+        );
+        let watch_u32_ptr = TypeExpr::new(TypeKind::Ptr(Box::new(watch_u32_ty)), sp);
+        let addr_of = |n: &str| {
+            Expr::new(
+                ExprKind::Unary {
+                    op: UnaryOp::AddrOf,
+                    expr: Box::new(expr_id(n)),
+                },
+                sp,
+            )
+        };
+        let dur5 = Box::new(Expr::new(ExprKind::Literal(Literal::Duration(dur_ms(5))), sp));
+
+        let items = vec![
+            Item {
+                attrs: vec![],
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Watch {
+                        elem: Box::new(ty_prim(PrimType::U32)),
+                    },
+                    name: id("w0"),
+                    init: Some(expr_int(0)),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Watch {
+                        elem: Box::new(ty_prim(PrimType::U32)),
+                    },
+                    name: id("w1"),
+                    init: Some(expr_int(0)),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Task(TaskDecl {
+                    attrs: vec![],
+                    name: id("worker"),
+                    params: vec![
+                        Param {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("id"),
+                            span: sp,
+                        },
+                        Param {
+                            ty: watch_u32_ptr.clone(),
+                            name: id("out"),
+                            span: sp,
+                        },
+                    ],
+                    body: Block::new(
+                        vec![Stmt::new(
+                            StmtKind::LoopEvery {
+                                period: dur5.clone(),
+                                body: Block::new(
+                                    vec![Stmt::new(
+                                        StmtKind::Expr(Expr::new(
+                                            ExprKind::MethodCall {
+                                                receiver: Box::new(expr_id("out")),
+                                                method: id("publish"),
+                                                args: vec![CallArg::positional(expr_id("id"))],
+                                            },
+                                            sp,
+                                        )),
+                                        sp,
+                                    )],
+                                    sp,
+                                ),
+                            },
+                            sp,
+                        )],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Task(TaskDecl {
+                    attrs: vec![],
+                    name: id("diag_task"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("tag"),
+                        span: sp,
+                    }],
+                    body: Block::new(
+                        vec![Stmt::new(
+                            StmtKind::LoopEvery {
+                                period: dur5,
+                                body: Block::new(vec![], sp),
+                            },
+                            sp,
+                        )],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("init_pair"),
+                    params: vec![
+                        Param {
+                            ty: watch_u32_ptr.clone(),
+                            name: id("a"),
+                            span: sp,
+                        },
+                        Param {
+                            ty: watch_u32_ptr,
+                            name: id("b"),
+                            span: sp,
+                        },
+                    ],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::Spawn(SpawnStmt {
+                                    task: id("worker"),
+                                    args: vec![
+                                        CallArg::positional(expr_int(10)),
+                                        CallArg::positional(expr_id("a")),
+                                    ],
+                                    priority: Some(Priority::High),
+                                    core: None,
+                                    span: sp,
+                                }),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Spawn(SpawnStmt {
+                                    task: id("worker"),
+                                    args: vec![
+                                        CallArg::positional(expr_int(20)),
+                                        CallArg::positional(expr_id("b")),
+                                    ],
+                                    priority: Some(Priority::High),
+                                    core: None,
+                                    span: sp,
+                                }),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("setup_bus"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::Bool),
+                        name: id("enable_diag"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::Expr(Expr::new(
+                                    ExprKind::Call {
+                                        callee: Box::new(expr_id("init_pair")),
+                                        args: vec![
+                                            CallArg::positional(addr_of("w0")),
+                                            CallArg::positional(addr_of("w1")),
+                                        ],
+                                    },
+                                    sp,
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::If {
+                                    cond: expr_id("enable_diag"),
+                                    then_block: Block::new(
+                                        vec![Stmt::new(
+                                            StmtKind::Spawn(SpawnStmt {
+                                                task: id("diag_task"),
+                                                args: vec![CallArg::positional(expr_int(99))],
+                                                priority: Some(Priority::Low),
+                                                core: None,
+                                                span: sp,
+                                            }),
+                                            sp,
+                                        )],
+                                        sp,
+                                    ),
+                                    else_block: None,
+                                },
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("main"),
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Expr(Expr::new(
+                                ExprKind::Call {
+                                    callee: Box::new(expr_id("setup_bus")),
+                                    args: vec![CallArg::positional(Expr::new(
+                                        ExprKind::Literal(Literal::Bool(true)),
+                                        sp,
+                                    ))],
+                                },
+                                sp,
+                            )),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let prog = Program::new(items, sp);
+        let mir = lower_program(&prog).expect("lower boot-tree test");
+
+        assert_eq!(mir.spawned_tasks.len(), 3);
+        assert_eq!(
+            mir.spawned_tasks[0].provenance_path,
+            vec!["main", "setup_bus", "init_pair", "worker"]
+        );
+        assert!(!mir.spawned_tasks[0].conditional);
+        assert_eq!(
+            mir.spawned_tasks[1].provenance_path,
+            vec!["main", "setup_bus", "init_pair", "worker"]
+        );
+        assert!(!mir.spawned_tasks[1].conditional);
+        assert_eq!(
+            mir.spawned_tasks[2].provenance_path,
+            vec!["main", "setup_bus", "diag_task"]
+        );
+        assert!(mir.spawned_tasks[2].conditional);
+
+        let has_nested_cond_spawn = mir.boot.steps.iter().any(|step| match step {
+            MirBootStep::Stmt(MirStmt::If { then_body, .. }) => then_body
+                .iter()
+                .any(|s| matches!(s, MirStmt::SpawnActivate { slot_id: 2, .. })),
+            _ => false,
+        });
+        assert!(
+            has_nested_cond_spawn,
+            "expected conditional MirStmt::SpawnActivate inside boot If"
+        );
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("boot provenance  : main -> setup_bus -> init_pair -> worker"),
+            "missing provenance in table:\n{table}"
+        );
+        assert!(
+            table.contains("[conditional]"),
+            "missing [conditional] marker in table:\n{table}"
+        );
+    }
+
+    #[test]
+    fn wave1_soft_yielding_dual_specialization_and_ram_report_in_mir() {
+        let sp = Span::dummy();
+        let dur5 = Box::new(Expr::new(ExprKind::Literal(Literal::Duration(dur_ms(5))), sp));
+        let items = vec![
+            // u32 leaf_soft(u32 x) { checkpoint(); return x + 1; }
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("leaf_soft"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("x"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::U32),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(StmtKind::Checkpoint, sp),
+                            Stmt::new(
+                                StmtKind::Return(Some(Expr::new(
+                                    ExprKind::Binary {
+                                        op: BinaryOp::Add,
+                                        lhs: Box::new(expr_id("x")),
+                                        rhs: Box::new(expr_int(1)),
+                                    },
+                                    sp,
+                                ))),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // u32 shared_soft(u32 n) { u32 acc = 0; for (u32 i in 0..=n) { acc += leaf_soft(i); } return acc; }
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("shared_soft"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("n"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::U32),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("acc"),
+                                    init: Some(expr_int(0)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::ForRange {
+                                    var_ty: ty_prim(PrimType::U32),
+                                    var_name: id("i"),
+                                    start: Box::new(expr_int(0)),
+                                    end: Box::new(expr_id("n")),
+                                    inclusive: true,
+                                    body: Block::new(
+                                        vec![Stmt::new(
+                                            StmtKind::Assign {
+                                                target: expr_id("acc"),
+                                                op: AssignOp::AddAssign,
+                                                value: Expr::new(
+                                                    ExprKind::Call {
+                                                        callee: Box::new(expr_id("leaf_soft")),
+                                                        args: vec![CallArg::positional(expr_id(
+                                                            "i",
+                                                        ))],
+                                                    },
+                                                    sp,
+                                                ),
+                                            },
+                                            sp,
+                                        )],
+                                        sp,
+                                    ),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(StmtKind::Return(Some(expr_id("acc"))), sp),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // u32 noyield_only_soft(u32 n) { checkpoint(); return n; }
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("noyield_only_soft"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("n"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::U32),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(StmtKind::Checkpoint, sp),
+                            Stmt::new(StmtKind::Return(Some(expr_id("n"))), sp),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // task runner()
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Task(TaskDecl {
+                    attrs: vec![],
+                    name: id("runner"),
+                    params: vec![],
+                    body: Block::new(
+                        vec![Stmt::new(
+                            StmtKind::LoopEvery {
+                                period: dur5,
+                                body: Block::new(
+                                    vec![
+                                        Stmt::new(
+                                            StmtKind::VarDecl {
+                                                ty: ty_prim(PrimType::U32),
+                                                name: id("a"),
+                                                init: Some(Expr::new(
+                                                    ExprKind::Call {
+                                                        callee: Box::new(expr_id("shared_soft")),
+                                                        args: vec![CallArg::positional(expr_int(
+                                                            3,
+                                                        ))],
+                                                    },
+                                                    sp,
+                                                )),
+                                            },
+                                            sp,
+                                        ),
+                                        Stmt::new(
+                                            StmtKind::NoYield {
+                                                body: Block::new(
+                                                    vec![Stmt::new(
+                                                        StmtKind::VarDecl {
+                                                            ty: ty_prim(PrimType::U32),
+                                                            name: id("b"),
+                                                            init: Some(Expr::new(
+                                                                ExprKind::Binary {
+                                                                    op: BinaryOp::Add,
+                                                                    lhs: Box::new(Expr::new(
+                                                                        ExprKind::Call {
+                                                                            callee: Box::new(
+                                                                                expr_id(
+                                                                                    "shared_soft",
+                                                                                ),
+                                                                            ),
+                                                                            args: vec![
+                                                                                CallArg::positional(
+                                                                                    expr_id("a"),
+                                                                                ),
+                                                                            ],
+                                                                        },
+                                                                        sp,
+                                                                    )),
+                                                                    rhs: Box::new(Expr::new(
+                                                                        ExprKind::Call {
+                                                                            callee: Box::new(
+                                                                                expr_id(
+                                                                                    "noyield_only_soft",
+                                                                                ),
+                                                                            ),
+                                                                            args: vec![
+                                                                                CallArg::positional(
+                                                                                    expr_int(2),
+                                                                                ),
+                                                                            ],
+                                                                        },
+                                                                        sp,
+                                                                    )),
+                                                                },
+                                                                sp,
+                                                            )),
+                                                        },
+                                                        sp,
+                                                    )],
+                                                    sp,
+                                                ),
+                                            },
+                                            sp,
+                                        ),
+                                    ],
+                                    sp,
+                                ),
+                            },
+                            sp,
+                        )],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("main"),
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Spawn(SpawnStmt {
+                                task: id("runner"),
+                                args: vec![],
+                                priority: Some(Priority::Normal),
+                                core: None,
+                                span: sp,
+                            }),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let prog = Program::new(items, sp);
+        let mir = lower_program(&prog).expect("lower soft-yielding specialization test");
+
+        assert!(mir.dual_specialized_fns.contains(&"shared_soft".to_string()));
+        assert!(mir.dual_specialized_fns.contains(&"leaf_soft".to_string()));
+        assert!(!mir.dual_specialized_fns.contains(&"noyield_only_soft".to_string()));
+
+        let shared_coro = mir.functions.iter().find(|f| f.name == "shared_soft").unwrap();
+        assert!(shared_coro.is_yielding);
+        let shared_ny = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "shared_soft__noyield")
+            .unwrap();
+        assert!(!shared_ny.is_yielding);
+
+        assert!(mir.functions.iter().all(|f| f.name != "noyield_only_soft"));
+        let ny_only = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "noyield_only_soft__noyield")
+            .unwrap();
+        assert!(!ny_only.is_yielding);
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("Dual-Specialized Functions"),
+            "expected Dual-Specialized Functions section in RamReport:\n{table}"
+        );
+        assert!(table.contains("shared_soft__noyield"));
+        assert!(table.contains("leaf_soft__noyield"));
+    }
+
+    #[test]
+    fn wave1_unified_inbox_restart_defer_and_for_loops_in_mir() {
+        let sp = Span::dummy();
+        let items = vec![
+            Item {
+                attrs: vec![],
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Signal,
+                    name: id("gate"),
+                    init: None,
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Inbox {
+                        elem: Box::new(ty_prim(PrimType::U32)),
+                        cap: 4,
+                    },
+                    name: id("q"),
+                    init: None,
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Task(TaskDecl {
+                    attrs: vec![],
+                    name: id("actor"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("seed"),
+                        span: sp,
+                    }],
+                    body: Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("local_cnt"),
+                                    init: Some(expr_id("seed")),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Defer(Box::new(Stmt::new(
+                                    StmtKind::Assign {
+                                        target: expr_id("local_cnt"),
+                                        op: AssignOp::AddAssign,
+                                        value: expr_int(1),
+                                    },
+                                    sp,
+                                ))),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::LoopEvery {
+                                    period: Box::new(Expr::new(
+                                        ExprKind::Binary {
+                                            op: BinaryOp::Add,
+                                            lhs: Box::new(expr_id("seed")),
+                                            rhs: Box::new(expr_int(5)),
+                                        },
+                                        sp,
+                                    )),
+                                    body: Block::new(
+                                        vec![
+                                            Stmt::new(
+                                                StmtKind::Expr(Expr::new(
+                                                    ExprKind::MethodCall {
+                                                        receiver: Box::new(expr_id("q")),
+                                                        method: id("send"),
+                                                        args: vec![CallArg::positional(expr_id(
+                                                            "local_cnt",
+                                                        ))],
+                                                    },
+                                                    sp,
+                                                )),
+                                                sp,
+                                            ),
+                                            Stmt::new(
+                                                StmtKind::If {
+                                                    cond: Expr::new(
+                                                        ExprKind::MethodCall {
+                                                            receiver: Box::new(expr_id("gate")),
+                                                            method: id("try_wait"),
+                                                            args: vec![],
+                                                        },
+                                                        sp,
+                                                    ),
+                                                    then_block: Block::new(
+                                                        vec![Stmt::new(StmtKind::Restart, sp)],
+                                                        sp,
+                                                    ),
+                                                    else_block: None,
+                                                },
+                                                sp,
+                                            ),
+                                        ],
+                                        sp,
+                                    ),
+                                },
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("main"),
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Spawn(SpawnStmt {
+                                task: id("actor"),
+                                args: vec![CallArg::positional(expr_int(10))],
+                                priority: Some(Priority::Normal),
+                                core: None,
+                                span: sp,
+                            }),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let prog = Program::new(items, sp);
+        let mir = lower_program(&prog).expect("lower unified inbox + restart test");
+
+        let bp = mir.task_blueprints.iter().find(|b| b.name == "actor").unwrap();
+        assert!(
+            bp.blocks[0].is_resume_entry,
+            "restart target BlockId(0) must have is_resume_entry = true"
+        );
+
+        let has_restart_checkpoint = bp.blocks.iter().any(|b| {
+            matches!(
+                b.terminator,
+                MirTerminator::Yield(MirYieldKind::ShareCheckpoint {
+                    resume_bb: BlockId(0)
+                })
+            ) && b.stmts.iter().any(|s| matches!(s, MirStmt::EndInboxTurn))
+        });
+        assert!(
+            has_restart_checkpoint,
+            "restart must emit EndInboxTurn + ShareCheckpoint(BlockId(0))"
+        );
+
+        let has_inbox_send = bp
+            .blocks
+            .iter()
+            .any(|b| matches!(b.terminator, MirTerminator::Yield(MirYieldKind::InboxSend { .. })));
+        assert!(has_inbox_send, "expected MirYieldKind::InboxSend");
+
+        let has_every_latch_vars_hoisted = bp.blocks.iter().any(|b| match &b.terminator {
+            MirTerminator::Yield(MirYieldKind::EveryLatch {
+                next_deadline_var,
+                period_var,
+                ..
+            }) => bp.vars[next_deadline_var.0].hoisted && bp.vars[period_var.0].hoisted,
+            _ => false,
+        });
+        assert!(
+            has_every_latch_vars_hoisted,
+            "EveryLatch next_deadline_var and period_var must both be hoisted"
+        );
     }
 }

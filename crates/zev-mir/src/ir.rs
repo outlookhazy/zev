@@ -209,7 +209,6 @@ pub enum MirPrimKind {
     Signal,
     Watch { elem: Box<MirType> },
     Inbox { elem: Box<MirType>, cap: usize },
-    Chan { elem: Box<MirType>, cap: usize },
     PingPong { elem: Box<MirType>, cap: usize },
     Lease { elem: Box<MirType>, cap: usize },
 }
@@ -220,7 +219,6 @@ impl MirPrimKind {
             MirPrimKind::Signal => "signal".to_string(),
             MirPrimKind::Watch { elem } => format!("watch_{}", elem.mangle_name()),
             MirPrimKind::Inbox { elem, cap } => format!("inbox_{}_{}", elem.mangle_name(), cap),
-            MirPrimKind::Chan { elem, cap } => format!("chan_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::PingPong { elem, cap } => format!("pp_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::Lease { elem, cap } => format!("lease_{}_{}", elem.mangle_name(), cap),
         }
@@ -231,7 +229,6 @@ impl MirPrimKind {
             MirPrimKind::Signal => "signal".to_string(),
             MirPrimKind::Watch { elem } => format!("watch<{}>", elem.display_name()),
             MirPrimKind::Inbox { elem, cap } => format!("inbox<{}, {cap}>", elem.display_name()),
-            MirPrimKind::Chan { elem, cap } => format!("chan<{}, {cap}>", elem.display_name()),
             MirPrimKind::PingPong { elem, cap } => {
                 format!("ping_pong<{}, {cap}>", elem.display_name())
             }
@@ -433,6 +430,11 @@ pub enum MirStmt {
     /// Break/continue inside structured non-yielding loop.
     Break,
     Continue,
+    /// Activate static task slot `slot_id` with its spawn arguments (supports conditional boot `if`/`switch`).
+    SpawnActivate {
+        slot_id: usize,
+        args: Vec<MirExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -491,12 +493,6 @@ pub enum MirPrimNonBlockingOp {
         cap: usize,
         value: MirExpr,
         boost: Option<MirPriority>,
-    },
-    ChanTrySend {
-        target: MirPrimTarget,
-        elem_ty: MirType,
-        cap: usize,
-        value: MirExpr,
     },
     SignalNotify {
         target: MirPrimTarget,
@@ -572,10 +568,10 @@ pub enum MirCallDst {
 /// Yielding operations that suspend a coroutine and return control to the scheduler.
 #[derive(Debug, Clone)]
 pub enum MirYieldKind {
-    /// Drift-free periodic timer latch at the end of `every <period> { ... }`.
+    /// Drift-free periodic timer latch at the end of `loop every <period> { ... }` (with overrun skip/resync).
     EveryLatch {
         next_deadline_var: VarId,
-        period_ticks: u64,
+        period_var: VarId,
         resume_bb: BlockId,
     },
     /// Relative delay (`delay(dur)` / `sys.delay(dur)`): sets `deadline_var` before polling in `poll_bb`.
@@ -584,11 +580,11 @@ pub enum MirYieldKind {
         poll_bb: BlockId,
         resume_bb: BlockId,
     },
-    /// Demand-driven cooperative CPU share (`should_share()`) at unbounded loop back-edges or `checkpoint()`.
+    /// Demand-driven cooperative CPU share (`should_share()`) at unbounded loop back-edges, `checkpoint()`, or `restart;`.
     ShareCheckpoint {
         resume_bb: BlockId,
     },
-    /// Blocking receive on `inbox<T, N>`, optionally bounded by `timeout_deadline_var`.
+    /// Blocking receive on unified `inbox<T, N>`, optionally bounded by `timeout_deadline_var`.
     InboxRecv {
         target: MirPrimTarget,
         elem_ty: MirType,
@@ -599,22 +595,13 @@ pub enum MirYieldKind {
         poll_bb: BlockId,
         resume_bb: BlockId,
     },
-    /// Blocking send on `chan<T, N>` when queue is full.
-    ChanSend {
+    /// Blocking backpressure send on unified `inbox<T, N>` when queue is full, optionally bounded by `timeout_deadline_var`.
+    InboxSend {
         target: MirPrimTarget,
         elem_ty: MirType,
         cap: usize,
         val_var: VarId,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Blocking receive on `chan<T, N>`, optionally bounded by `timeout_deadline_var`.
-    ChanRecv {
-        target: MirPrimTarget,
-        elem_ty: MirType,
-        cap: usize,
         timeout_deadline_var: Option<VarId>,
-        dst_val: Option<VarId>,
         dst_res: Option<VarId>,
         poll_bb: BlockId,
         resume_bb: BlockId,
@@ -711,10 +698,7 @@ impl MirTerminator {
                 | MirYieldKind::InboxRecv {
                     poll_bb, resume_bb, ..
                 }
-                | MirYieldKind::ChanSend {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::ChanRecv {
+                | MirYieldKind::InboxSend {
                     poll_bb, resume_bb, ..
                 }
                 | MirYieldKind::SignalWait {
@@ -742,8 +726,7 @@ impl MirTerminator {
                 | MirYieldKind::ShareCheckpoint { resume_bb } => vec![*resume_bb],
                 MirYieldKind::DelayPoll { poll_bb, .. }
                 | MirYieldKind::InboxRecv { poll_bb, .. }
-                | MirYieldKind::ChanSend { poll_bb, .. }
-                | MirYieldKind::ChanRecv { poll_bb, .. }
+                | MirYieldKind::InboxSend { poll_bb, .. }
                 | MirYieldKind::SignalWait { poll_bb, .. }
                 | MirYieldKind::PingPongWaitChunk { poll_bb, .. }
                 | MirYieldKind::LeaseWaitChunk { poll_bb, .. }
@@ -866,12 +849,32 @@ pub enum MirPrimReadOp {
         elem_ty: MirType,
         cap: usize,
     },
-    ChanTryRecv {
+    InboxTrySend {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+        value: Box<MirExpr>,
+        boost: Option<MirPriority>,
+    },
+    InboxLen {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    InboxIsEmpty {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    InboxIsFull {
         target: MirPrimTarget,
         elem_ty: MirType,
         cap: usize,
     },
     SignalIsSet {
+        target: MirPrimTarget,
+    },
+    SignalTryWait {
         target: MirPrimTarget,
     },
 }
@@ -975,6 +978,10 @@ pub struct MirSpawnInstance {
     pub core_pin: Option<u8>,
     pub init_args: Vec<MirExpr>,
     pub is_main_supervisor: bool,
+    /// Full static boot-tree call path ending in `blueprint_name` (e.g. `["main", "setup_bus", "worker"]`).
+    pub provenance_path: Vec<String>,
+    /// True when spawned inside a conditional `if`/`else`/`switch` boot branch.
+    pub conditional: bool,
 }
 
 /// Sequential boot step in `fn main()` before the cooperative scheduler starts.
@@ -1021,6 +1028,7 @@ pub struct MirModule {
     pub functions: Vec<MirFunction>,
     pub task_blueprints: Vec<MirTaskBlueprint>,
     pub spawned_tasks: Vec<MirSpawnInstance>,
+    pub dual_specialized_fns: Vec<String>,
     pub boot: MirBootSequence,
     pub ram_report: RamReport,
 }

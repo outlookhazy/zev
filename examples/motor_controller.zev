@@ -55,7 +55,7 @@ u16 parse_setpoint([]u8 buf) error ParseErr {
 task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
     i32 integral = 0;                                  // Persists across yields in static frame
 
-    every 1ms {                                        // Drift-free periodic deadline
+    loop every 1ms {                                   // Drift-free periodic deadline
         u16 target = target_rpm.read();
         u16 actual = adc_read_rpm(pwm_ch);             // Yields automatically until conversion done
 

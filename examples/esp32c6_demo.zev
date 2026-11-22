@@ -3,7 +3,7 @@
 // Targets physical ESP32-C6 silicon directly from LLVM 23 `riscv32-unknown-none-elf`:
 //   - ROM Direct-Boot (`0xAEDB041D` x2 at `0x42000000` -> `@_start` at `0x42000008`)
 //   - Disarms `TIMG0`, `TIMG1`, `LP_WDT`, and `SWD` watchdogs at reset
-//   - 16 MHz hardware `SYSTIMER` (`0x6000A000`) driving drift-free `every 20ms` / `every 500ms` / `1s` deadlines
+//   - 16 MHz hardware `SYSTIMER` (`0x6000A000`) driving drift-free `loop every 20ms` / `loop every 500ms` / `1s` deadlines
 //   - 0-wait-state HP-SRAM (`.iram1`) WS2812B 800kHz addressable RGB LED driver on `GPIO8`
 //   - Debounced `BOOT` button (`GPIO9`) posting `ButtonPressed` with `boost: @critical`
 //   - Built-in `USB_DEVICE` Serial/JTAG console (`0x6000F000` -> `/dev/ttyACM0`)
@@ -39,29 +39,33 @@ inbox<SupEvent, 8>    sup_inbox;
 // ── Pure Saturated Color Wheel: Red -> Green -> Blue -> Cyan -> Magenta (0% White!) ──
 u32 drive_palette_slot(u32 slot) {
     u32 idx = slot % PALETTE_LEN;
-    if (idx == 0) {
-        // Pure Red
-        zev_ws2812_rgb(64, 0, 0);
-        return 0x400000;
+    switch (idx) {
+        0 => {
+            // Pure Red
+            zev_ws2812_rgb(64, 0, 0);
+            return 0x400000;
+        }
+        1 => {
+            // Pure Green
+            zev_ws2812_rgb(0, 64, 0);
+            return 0x004000;
+        }
+        2 => {
+            // Pure Blue
+            zev_ws2812_rgb(0, 0, 64);
+            return 0x000040;
+        }
+        3 => {
+            // Pure Cyan
+            zev_ws2812_rgb(0, 56, 56);
+            return 0x003838;
+        }
+        _ => {
+            // Pure Magenta
+            zev_ws2812_rgb(56, 0, 56);
+            return 0x380038;
+        }
     }
-    if (idx == 1) {
-        // Pure Green
-        zev_ws2812_rgb(0, 64, 0);
-        return 0x004000;
-    }
-    if (idx == 2) {
-        // Pure Blue
-        zev_ws2812_rgb(0, 0, 64);
-        return 0x000040;
-    }
-    if (idx == 3) {
-        // Pure Cyan
-        zev_ws2812_rgb(0, 56, 56);
-        return 0x003838;
-    }
-    // Pure Magenta
-    zev_ws2812_rgb(56, 0, 56);
-    return 0x380038;
 }
 
 fn print_telemetry_line(u32 uptime_ms, u32 color_rgb, u32 presses, u32 prio) {
@@ -99,13 +103,8 @@ fn record_button_event(u32 press_count) {
 
 fn scrub_sram_canary(u32 beat_count) {
     u32 acc = 0x5A5A;
-    u32 step = 0;
-    loop {
-        if (step >= 4) {
-            break;
-        }
+    for (u32 step in 0..4) {
         acc = (acc + beat_count + step) & 0xFFFF;
-        step += 1;
         checkpoint();
     }
     diag_signature.publish(acc);
@@ -117,7 +116,7 @@ fn scrub_sram_canary(u32 beat_count) {
 task led_animator(watch<u32> *mode_off, watch<u32> *out_color) {
     u32 tick_phase = 0;
 
-    every 500ms {
+    loop every 500ms {
         u32 user_off = mode_off.read();
         u32 slot = (tick_phase + user_off) % PALETTE_LEN;
 
@@ -135,7 +134,7 @@ task button_monitor() {
     u32 low_streak = 0;
     bool latched = false;
 
-    every 20ms {
+    loop every 20ms {
         u32 level = zev_gpio_read(PIN_BOOT_BTN);
         if (level == 0) {
             if (low_streak < 10) {

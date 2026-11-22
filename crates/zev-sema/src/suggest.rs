@@ -141,13 +141,17 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
         }
 
         ResolvedOsPrimitive::Inbox { elem, .. } => {
-            let valid = ["post", "recv", "try_recv", "len", "is_empty", "is_full"];
+            let valid = [
+                "post", "try_post", "send", "try_send", "recv", "try_recv", "len", "is_empty",
+                "is_full",
+            ];
             let direct = match method {
-                "send" | "push" | "put" | "enqueue" | "write" | "publish" | "emit"
-                | "try_send" | "notify" => Some(format!(
-                    "`.post({} val)` (or `.post(val, boost: @critical)` from an ISR)",
-                    elem
-                )),
+                "push" | "put" | "enqueue" | "write" | "publish" | "emit" | "notify" => {
+                    Some(format!(
+                        "`.post({} val)` (non-blocking, ISR-safe) or `.send({} val)` (task-only backpressured)",
+                        elem, elem
+                    ))
+                }
                 "pop" | "get" | "read" | "wait" | "dequeue" | "next" | "pull" => Some(format!(
                     "`.recv() -> {}` (or `.recv(timeout: 5s) or Fallback`)",
                     elem
@@ -155,30 +159,8 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
                 _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
             };
             let table = format!(
-                "valid methods on `{}`: `.post({} val [, boost: @prio])`, `.recv([timeout: <dur>]) -> {}`, `.try_recv() -> {} error`, `.len()`, `.is_empty()`, `.is_full()`",
-                prim, elem, elem, elem
-            );
-            (direct, table)
-        }
-
-        ResolvedOsPrimitive::Chan { elem, .. } => {
-            let valid = [
-                "send", "try_send", "post", "recv", "try_recv", "len", "is_empty", "is_full",
-            ];
-            let direct = match method {
-                "push" | "put" | "write" | "enqueue" | "publish" => Some(format!(
-                    "`.send({} val)` (yielding) or `.try_send({} val) -> bool` (non-blocking/ISR-safe)",
-                    elem, elem
-                )),
-                "pop" | "get" | "read" | "wait" | "dequeue" | "pull" => Some(format!(
-                    "`.recv() -> {}` (yielding) or `.try_recv() -> {} error` (non-blocking)",
-                    elem, elem
-                )),
-                _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
-            };
-            let table = format!(
-                "valid methods on `{}`: `.send({} val [, timeout: <dur>])`, `.try_send({} val) -> bool`, `.recv([timeout: <dur>]) -> {}`, `.try_recv() -> {} error`, `.len()`, `.is_empty()`, `.is_full()`",
-                prim, elem, elem, elem, elem
+                "valid methods on `{}`: `.post({} val [, boost: @prio])`, `.send({} val [, timeout: <dur>])`, `.try_send({} val) -> bool`, `.recv([timeout: <dur>]) -> {}`, `.try_recv() -> {} error`, `.len()`, `.is_empty()`, `.is_full()`",
+                prim, elem, elem, elem, elem, elem
             );
             (direct, table)
         }

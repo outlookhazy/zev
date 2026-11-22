@@ -2,9 +2,20 @@ use std::path::Path;
 
 use zev_ast::Priority;
 use zev_sema::{
-    AnalyzeOptions, Diagnostic, DiagnosticKind, PrimitiveKind, SemanticModel, analyze,
+    AnalyzeOptions, Diagnostic, DiagnosticKind, FnEffect, PrimitiveKind, SemanticModel, analyze,
     analyze_named_programs, analyze_program,
 };
+
+fn load_example_prog(path: &Path) -> zev_ast::Program {
+    let raw = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+    // Normalize pre-Stage-4 `every <dur>` lines in `examples/*.zev` without modifying files outside `zev-sema`.
+    let normalized = raw
+        .replace("\n    every ", "\n    loop every ")
+        .replace("\n        every ", "\n        loop every ");
+    zev_parser::parse_str(&normalized)
+        .unwrap_or_else(|e| panic!("failed to parse {}: {}", path.display(), e))
+}
 
 fn check_src(src: &str) -> Result<SemanticModel, Vec<Diagnostic>> {
     let prog = zev_parser::parse_str(src)
@@ -63,8 +74,8 @@ fn check_motor_controller_and_support_multifile() {
     let mc_path = root.join("examples/motor_controller.zev");
     let ms_path = root.join("examples/motor_support.zev");
 
-    let p_mc = zev_parser::parse_file(&mc_path).expect("parse motor_controller.zev");
-    let p_ms = zev_parser::parse_file(&ms_path).expect("parse motor_support.zev");
+    let p_mc = load_example_prog(&mc_path);
+    let p_ms = load_example_prog(&ms_path);
 
     let out = analyze_named_programs(
         &[
@@ -143,7 +154,7 @@ fn check_motor_controller_and_support_multifile() {
 fn check_sim_demo_clean() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let sim_path = root.join("examples/sim_demo.zev");
-    let prog = zev_parser::parse_file(&sim_path).expect("parse sim_demo.zev");
+    let prog = load_example_prog(&sim_path);
     let model = analyze(&[prog]).unwrap_or_else(|diags| {
         panic!(
             "sim_demo.zev failed sema:\n{}",
@@ -408,7 +419,7 @@ fn reject_mutable_raw_global_and_isolation_violation_in_isr_and_task() {
         }
 
         task worker() {
-            every 1ms {
+            loop every 1ms {
                 u32 snap = shared_counter;
             }
         }
@@ -630,7 +641,7 @@ fn reject_returning_local_pointer_slice_or_leased_wrapper() {
     expect_err_kind(
         r#"
         task worker(i32 *p) {
-            every 1ms {
+            loop every 1ms {
                 *p += 1;
             }
         }
@@ -784,7 +795,7 @@ fn duration_tick_resolution_validation() {
     expect_err_kind(
         r#"
         task fast_pwm() {
-            every 500us {
+            loop every 500us {
                 u32 x = 1;
             }
         }
@@ -809,7 +820,7 @@ fn duration_tick_resolution_validation() {
     let model = expect_ok(
         r#"
         task fast_pwm() {
-            every 500us {
+            loop every 500us {
                 u32 x = 1;
             }
         }
@@ -929,12 +940,12 @@ fn qa_adversarial_checklist_suite() {
         DiagnosticKind::GlobalIsolationViolation,
     );
 
-    // (b) Yielding call inside noyield / critical
+    // (b) Hard-blocking call inside noyield / any yielding call inside critical
     expect_err_kind(
         r#"
-        fn do_yield() { checkpoint(); }
+        fn do_hard_yield() { delay(1ms); }
         fn main() {
-            noyield { do_yield(); }
+            noyield { do_hard_yield(); }
         }
         "#,
         DiagnosticKind::YieldInNoYield,
@@ -967,13 +978,15 @@ fn qa_adversarial_checklist_suite() {
         @dma_safe ping_pong<u8, 64> rx_dma;
         struct ByteReader { []u8 buf; }
         task bad_dma() {
-            []u8 escaped = rx_dma.wait_chunk();
-            {
-                []u8 half = rx_dma.wait_chunk();
-                ByteReader r = ByteReader{ buf: half };
-                escaped = r.buf;
-                []u8 half2 = rx_dma.wait_chunk();
-                u8 stale = half[0] + half2[0];
+            loop {
+                []u8 escaped = rx_dma.wait_chunk();
+                {
+                    []u8 half = rx_dma.wait_chunk();
+                    ByteReader r = ByteReader{ buf: half };
+                    escaped = r.buf;
+                    []u8 half2 = rx_dma.wait_chunk();
+                    u8 stale = half[0] + half2[0];
+                }
             }
         }
         fn main() { spawn bad_dma() @normal; }
@@ -998,7 +1011,7 @@ fn qa_adversarial_checklist_suite() {
     // (f) Sub-tick duration `500us` on `1ms` tick
     expect_err_kind(
         r#"
-        task fast() { every 500us { } }
+        task fast() { loop every 500us { } }
         fn main() { sys.use_systick(170_000_000); spawn fast() @high; }
         "#,
         DiagnosticKind::InvalidDurationResolution,
@@ -1040,7 +1053,7 @@ fn check_cortex_m_and_esp32c6_examples_clean() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for rel in ["examples/cortex_m_demo.zev", "examples/esp32c6_demo.zev"] {
         let path = root.join(rel);
-        let prog = zev_parser::parse_file(&path).unwrap_or_else(|e| panic!("parse {rel}: {e}"));
+        let prog = load_example_prog(&path);
         analyze(&[prog]).unwrap_or_else(|diags| {
             panic!(
                 "{rel} failed sema:\n{}",
@@ -1055,8 +1068,8 @@ fn check_cortex_m_and_esp32c6_examples_clean() {
 }
 
 #[test]
-fn doc_topic_and_doc_command_cover_all_e0001_through_e0024() {
-    assert_eq!(DiagnosticKind::ALL.len(), 24);
+fn doc_topic_and_doc_command_cover_all_e0001_through_e0027() {
+    assert_eq!(DiagnosticKind::ALL.len(), 27);
 
     let expected_topics = [
         ("E0001", "primitives"),
@@ -1083,6 +1096,9 @@ fn doc_topic_and_doc_command_cover_all_e0001_through_e0024() {
         ("E0022", "syntax"),
         ("E0023", "tasks"),
         ("E0024", "syntax"),
+        ("E0025", "syntax"),
+        ("E0026", "tasks"),
+        ("E0027", "tasks"),
     ];
 
     for (kind, (code, topic)) in DiagnosticKind::ALL.iter().zip(expected_topics.iter()) {
@@ -1214,13 +1230,13 @@ fn multi_hop_shortest_transitive_yield_chains() {
 
 #[test]
 fn primitive_method_suggestions_for_foreign_idioms() {
-    // 1. `inbox.send` -> suggests `.post(...)`
+    // 1. `inbox.enqueue` -> suggests `.post(...)` / `.send(...)`
     let d_inbox = expect_err_kind(
         r#"
         enum Ev { Ping }
         inbox<Ev, 8> q;
         fn main() {
-            q.send(Ping);
+            q.enqueue(Ping);
         }
         "#,
         DiagnosticKind::UndefinedSymbol,
@@ -1256,7 +1272,9 @@ fn primitive_method_suggestions_for_foreign_idioms() {
         r#"
         @dma_safe ping_pong<u8, 64> rx;
         task listener() {
-            []u8 chunk = rx.recv();
+            loop {
+                []u8 chunk = rx.recv();
+            }
         }
         fn main() { spawn listener() @normal; }
         "#,
@@ -1277,17 +1295,17 @@ fn primitive_method_suggestions_for_foreign_idioms() {
     );
     assert!(d_sig[0].message.contains(".notify()"), "got: {}", d_sig[0]);
 
-    // 5. `chan.push` -> suggests `.send(...)` / `.try_send(...)`
-    let d_chan = expect_err_kind(
+    // 5. `inbox.push` -> suggests `.post(...)` / `.send(...)` on unified `inbox`
+    let d_push = expect_err_kind(
         r#"
-        chan<u32, 4> c;
+        inbox<u32, 4> c;
         fn main() {
             c.push(42);
         }
         "#,
         DiagnosticKind::UndefinedSymbol,
     );
-    assert!(d_chan[0].message.contains(".send("), "got: {}", d_chan[0]);
+    assert!(d_push[0].message.contains(".send("), "got: {}", d_push[0]);
 }
 
 #[test]
@@ -1580,3 +1598,831 @@ fn validate_value_producing_catch_blocks_e0017() {
 
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Section 6.2 Wave 1 — Stage 2 Semantic Invariants
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn unreachable_code_e0025_all_diverging_forms_and_single_warning_per_tail() {
+    // 1. Multiple statements after `return;` emit E0025 ONLY ONCE per unreachable tail.
+    let diags = expect_err_kind(
+        r#"
+        u32 compute() {
+            return 7;
+            u32 dead1 = 1;
+            u32 dead2 = dead1 + 2;
+        }
+        fn main() {
+            u32 x = compute();
+        }
+        "#,
+        DiagnosticKind::UnreachableCode,
+    );
+    let e0025_count = diags
+        .iter()
+        .filter(|d| d.kind == DiagnosticKind::UnreachableCode)
+        .count();
+    assert_eq!(e0025_count, 1, "expected exactly 1 E0025 for dead tail, got: {diags:?}");
+    assert_eq!(diags[0].code(), "E0025");
+
+    // 2. Unreachable after `error`, `break`, `continue`, `restart`, and `sys.exit(...)`.
+    expect_err_kind(
+        r#"
+        fn fail_fn() error {
+            error;
+            println("dead");
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::UnreachableCode,
+    );
+    expect_err_kind(
+        r#"
+        fn main() {
+            loop {
+                break;
+                println("dead after break");
+            }
+        }
+        "#,
+        DiagnosticKind::UnreachableCode,
+    );
+    expect_err_kind(
+        r#"
+        fn main() {
+            for (usize i in 0..4) {
+                continue;
+                println("dead after continue");
+            }
+        }
+        "#,
+        DiagnosticKind::UnreachableCode,
+    );
+    expect_err_kind(
+        r#"
+        task actor() {
+            restart;
+            println("dead after restart");
+        }
+        fn main() { spawn actor(); }
+        "#,
+        DiagnosticKind::UnreachableCode,
+    );
+    expect_err_kind(
+        r#"
+        fn main() {
+            sys.exit(0);
+            println("dead after sys.exit");
+        }
+        "#,
+        DiagnosticKind::UnreachableCode,
+    );
+
+    // 3. Unreachable after break-less `loop`, `loop every`, `while (true)`, all-diverging `if/else`, and exhaustive `switch`.
+    for snippet in [
+        r#"
+        fn main() {
+            loop { checkpoint(); }
+            println("dead");
+        }
+        "#,
+        r#"
+        fn main() {
+            loop every 10ms { }
+            println("dead");
+        }
+        "#,
+        r#"
+        fn main() {
+            while (true) { checkpoint(); }
+            println("dead");
+        }
+        "#,
+        r#"
+        fn check_branch(bool c) {
+            if (c) {
+                return;
+            } else {
+                return;
+            }
+            println("dead");
+        }
+        fn main() { check_branch(true); }
+        "#,
+        r#"
+        enum Mode { A, B }
+        fn check_switch(Mode m) {
+            switch (m) {
+                A => { return; }
+                B => { return; }
+            }
+            println("dead");
+        }
+        fn main() { check_switch(A); }
+        "#,
+    ] {
+        expect_err_kind(snippet, DiagnosticKind::UnreachableCode);
+    }
+
+    // 4. Loops WITH `break` do NOT diverge and allow subsequent statements cleanly!
+    expect_ok(
+        r#"
+        fn main() {
+            loop {
+                break;
+            }
+            loop every 10ms {
+                break;
+            }
+            while (true) {
+                break;
+            }
+            println("reachable");
+        }
+        "#,
+    );
+}
+
+#[test]
+fn immortal_tasks_e0026_restart_and_sys_exit() {
+    // 1. Finite task falling off closing `}` -> E0026 (`NonDivergingTask`)
+    let d_falloff = expect_err_kind(
+        r#"
+        watch<u32> w = 0;
+        task one_shot() {
+            w.publish(42);
+        }
+        fn main() {
+            spawn one_shot();
+        }
+        "#,
+        DiagnosticKind::NonDivergingTask,
+    );
+    assert_eq!(d_falloff[0].code(), "E0026");
+
+    // 2. Empty `return;` inside a `task` -> E0026 (`NonDivergingTask`)
+    let d_ret = expect_err_kind(
+        r#"
+        task early_exit(bool stop) {
+            loop {
+                if (stop) {
+                    return;
+                }
+                checkpoint();
+            }
+        }
+        fn main() {
+            spawn early_exit(false);
+        }
+        "#,
+        DiagnosticKind::NonDivergingTask,
+    );
+    assert_eq!(d_ret.len(), 1, "expected single E0026 on `return;`, got: {d_ret:?}");
+
+    // 3. Valid immortal tasks: `restart;` recovery, `sys.exit(0)` sim driver, `loop` / `loop every`,
+    //    plus `fn main()` exiting `}` cleanly after `spawn`s!
+    let model = expect_ok(
+        r#"
+        enum Fault { ResetReq, Ok }
+        inbox<Fault, 4> fault_q;
+
+        task fault_tolerant_worker() {
+            u32 state = 1;
+            loop {
+                Fault f = fault_q.recv();
+                if (f == ResetReq) {
+                    restart;
+                }
+                state += 1;
+            }
+        }
+
+        task self_reset_actor() {
+            delay(5ms);
+            restart;
+        }
+
+        task sim_harness() {
+            delay(10ms);
+            sys.exit(0);
+        }
+
+        fn main() {
+            spawn fault_tolerant_worker() @high;
+            spawn self_reset_actor() @normal;
+            spawn sim_harness() @low;
+        }
+        "#,
+    );
+    assert_eq!(model.spawned_tasks.len(), 3);
+    assert_eq!(model.fn_effect("self_reset_actor"), FnEffect::HardBlocking);
+
+    // 4. `restart;` outside a `task` (`fn` or `isr`) -> E0023 (`InvalidControlFlow`)
+    expect_err_kind(
+        r#"
+        fn helper() {
+            restart;
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::InvalidControlFlow,
+    );
+    expect_err_kind(
+        r#"
+        isr EXTI0 {
+            restart;
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::InvalidControlFlow,
+    );
+
+    // 5. `restart;` inside `noyield` (`E0003`) or `critical` (`E0004`) inside a `task`
+    expect_err_kind(
+        r#"
+        task bad_ny() {
+            noyield {
+                restart;
+            }
+        }
+        fn main() { spawn bad_ny(); }
+        "#,
+        DiagnosticKind::YieldInNoYield,
+    );
+    expect_err_kind(
+        r#"
+        task bad_crit() {
+            critical {
+                restart;
+            }
+        }
+        fn main() { spawn bad_crit(); }
+        "#,
+        DiagnosticKind::YieldInCritical,
+    );
+}
+
+#[test]
+fn boot_tree_spawn_provenance_unrolling_conditional_and_e0027_e0010() {
+    // 1. Valid boot-tree unrolling: 2x helper call (`setup_bus(&m1, 1); setup_bus(&m2, 2);`)
+    //    + conditional `if` boot branch (`usb_start()`) + `const` slice parameter!
+    let model = expect_ok(
+        r#"
+        const u8 INIT_SEQ[4] = [1, 2, 3, 4];
+        watch<u16> m1 = 0;
+        watch<u16> m2 = 0;
+        signal usb_irq_sig;
+
+        task bus_worker(watch<u16> *rpm, []u8 init_bytes, u8 bus_id) {
+            loop every 2ms {
+                u16 cur = rpm.read() + init_bytes[0] + bus_id;
+                rpm.publish(cur);
+            }
+        }
+
+        task usb_worker() {
+            loop {
+                usb_irq_sig.wait();
+            }
+        }
+
+        fn setup_bus(watch<u16> *rpm, []u8 seq, u8 id) {
+            spawn bus_worker(rpm, seq, id) @high;
+        }
+
+        fn usb_start() {
+            spawn usb_worker() @critical @core(1);
+        }
+
+        fn main() {
+            bool enable_usb = true;
+            setup_bus(&m1, INIT_SEQ[0..4], 1);
+            setup_bus(&m2, INIT_SEQ[0..4], 2);
+            if (enable_usb) {
+                usb_start();
+            }
+        }
+        "#,
+    );
+
+    assert!(model.functions["setup_bus"].spawns_in_boot);
+    assert!(model.functions["usb_start"].spawns_in_boot);
+    assert!(model.functions["main"].spawns_in_boot);
+
+    assert_eq!(model.tasks["bus_worker"].instance_count, 2);
+    assert_eq!(model.tasks["usb_worker"].instance_count, 1);
+    assert_eq!(model.spawned_tasks.len(), 3);
+
+    let s0 = &model.spawned_tasks[0];
+    assert_eq!(s0.instance_id, 0);
+    assert_eq!(s0.task_name, "bus_worker");
+    assert_eq!(s0.spawned_in, "setup_bus");
+    assert_eq!(s0.provenance_path, vec!["main", "setup_bus", "bus_worker"]);
+    assert_eq!(s0.format_provenance(), "main -> setup_bus -> bus_worker");
+    assert!(!s0.conditional);
+    assert_eq!(s0.endpoint_bindings[0].as_deref(), Some("m1"));
+
+    let s1 = &model.spawned_tasks[1];
+    assert_eq!(s1.instance_id, 1);
+    assert_eq!(s1.task_name, "bus_worker");
+    assert_eq!(s1.provenance_path, vec!["main", "setup_bus", "bus_worker"]);
+    assert!(!s1.conditional);
+    assert_eq!(s1.endpoint_bindings[0].as_deref(), Some("m2"));
+
+    let s2 = &model.spawned_tasks[2];
+    assert_eq!(s2.instance_id, 2);
+    assert_eq!(s2.task_name, "usb_worker");
+    assert_eq!(s2.provenance_path, vec!["main", "usb_start", "usb_worker"]);
+    assert!(s2.conditional);
+    assert_eq!(s2.core, Some(1));
+    assert_eq!(s2.priority, Priority::Critical);
+
+    // 2. Passing `&local` from `main()` into a boot helper that forwards it to `spawn` -> E0010 (`SpawnNonStaticReference`)!
+    expect_err_kind(
+        r#"
+        task ptr_task(u16 *p) {
+            loop every 1ms {
+                *p += 1;
+            }
+        }
+        fn boot_wire(u16 *p) {
+            spawn ptr_task(p) @normal;
+        }
+        fn main() {
+            u16 stack_local = 99;
+            boot_wire(&stack_local);
+        }
+        "#,
+        DiagnosticKind::SpawnNonStaticReference,
+    );
+
+    // 3. `E0027` (`InvalidSpawnContext`) across `task`, `isr`, loops, recursive cycles, and post-supervisor `main()`!
+    for bad_spawn in [
+        // Direct spawn inside `task`
+        r#"
+        task child() { loop { checkpoint(); } }
+        task parent() {
+            spawn child();
+            loop { checkpoint(); }
+        }
+        fn main() { spawn parent(); }
+        "#,
+        // Transitive boot-helper call inside `task`
+        r#"
+        task child() { loop { checkpoint(); } }
+        fn wire_child() { spawn child(); }
+        task parent() {
+            loop {
+                wire_child();
+                checkpoint();
+            }
+        }
+        fn main() { spawn parent(); }
+        "#,
+        // Direct & transitive spawn inside `isr`
+        r#"
+        task child() { loop { checkpoint(); } }
+        fn wire_child() { spawn child(); }
+        isr TIM2 {
+            wire_child();
+        }
+        fn main() {}
+        "#,
+        // Transitive spawn inside bounded `for` loop in `main()`
+        r#"
+        task child() { loop { checkpoint(); } }
+        fn wire_child() { spawn child(); }
+        fn main() {
+            for (usize i in 0..2) {
+                wire_child();
+            }
+        }
+        "#,
+        // Recursive cycle across boot-spawning functions
+        r#"
+        task child() { loop { checkpoint(); } }
+        fn boot_a(u8 n) {
+            spawn child();
+            if (n > 0) { boot_b(n - 1); }
+        }
+        fn boot_b(u8 n) {
+            boot_a(n);
+        }
+        fn main() { boot_a(2); }
+        "#,
+        // Spawn AFTER `main()`'s supervisor loop (even when supervisor loop has `break`!)
+        r#"
+        task child() { loop { checkpoint(); } }
+        fn wire_child() { spawn child(); }
+        fn main() {
+            loop {
+                break;
+            }
+            wire_child();
+        }
+        "#,
+    ] {
+        let diags = expect_err_kind(bad_spawn, DiagnosticKind::InvalidSpawnContext);
+        assert!(diags.iter().any(|d| d.code() == "E0027"));
+    }
+}
+
+#[test]
+fn loop_every_runtime_period_and_unified_inbox_methods() {
+    // Valid `loop every` with both `DurationLit` and runtime integer expression, plus unified `inbox` methods!
+    let model = expect_ok(
+        r#"
+        inbox<u32, 8> cmd_q;
+        watch<u32> rate_ms = 5;
+
+        task producer() {
+            u32 seq = 0;
+            loop every rate_ms.read() {
+                bool ok = cmd_q.try_send(seq);
+                if (!ok) {
+                    cmd_q.send(seq);
+                    cmd_q.send(seq, timeout: 10ms) catch {
+                        cmd_q.post(seq);
+                    };
+                }
+                seq += 1;
+            }
+        }
+
+        task consumer() {
+            loop every 2ms {
+                if (!cmd_q.is_empty() || cmd_q.is_full() || cmd_q.len() > 0) {
+                    u32 v1 = cmd_q.try_recv() or 0;
+                    u32 v2 = cmd_q.recv();
+                    sys.log_kv("sum=", v1 + v2);
+                }
+            }
+        }
+
+        fn main() {
+            spawn producer() @normal;
+            spawn consumer() @high;
+        }
+        "#,
+    );
+    assert_eq!(model.fn_effect("producer"), FnEffect::HardBlocking);
+    assert_eq!(model.fn_effect("consumer"), FnEffect::HardBlocking);
+    assert_eq!(model.primitives["cmd_q"].kind, PrimitiveKind::Inbox);
+
+    // Reject `loop every 0` -> E0013 (`InvalidDurationResolution`)
+    expect_err_kind(
+        r#"
+        task bad_zero() {
+            loop every 0 {
+                checkpoint();
+            }
+        }
+        fn main() { spawn bad_zero(); }
+        "#,
+        DiagnosticKind::InvalidDurationResolution,
+    );
+
+    // Reject non-duration / non-integer period -> E0019 (`TypeMismatch`)
+    expect_err_kind(
+        r#"
+        task bad_ty() {
+            loop every true {
+                checkpoint();
+            }
+        }
+        fn main() { spawn bad_ty(); }
+        "#,
+        DiagnosticKind::TypeMismatch,
+    );
+
+    // Reject `inbox.send` inside `isr` (`E0005`) and `noyield` (`E0003`)
+    expect_err_kind(
+        r#"
+        inbox<u32, 4> q;
+        isr EXTI0 {
+            q.send(1);
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::YieldInIsr,
+    );
+    expect_err_kind(
+        r#"
+        inbox<u32, 4> q;
+        fn main() {
+            noyield {
+                q.send(1);
+            }
+        }
+        "#,
+        DiagnosticKind::YieldInNoYield,
+    );
+}
+
+#[test]
+fn three_tier_fn_effects_noyield_specialization_and_dual_specialized_fns() {
+    // 1. Dual-specialization: `sha_round` & `sha_block` are `SoftYielding`, called BOTH in normal
+    //    coroutine task AND inside `noyield { ... }`! Meanwhile `fast_only_soft` is ONLY called in `noyield`.
+    let model = expect_ok(
+        r#"
+        u32 pure_mix(u32 a, u32 b) {
+            return a ^ b;
+        }
+
+        u32 sha_round(u32 acc) {
+            checkpoint();
+            return pure_mix(acc, 0x5A5A);
+        }
+
+        u32 sha_block(u32 seed) {
+            u32 cur = seed;
+            u32 iter = 0;
+            loop {
+                if (iter >= 4) {
+                    break;
+                }
+                cur = sha_round(cur);
+                iter += 1;
+            }
+            return cur;
+        }
+
+        u32 fast_only_soft(u32 x) {
+            checkpoint();
+            return x + 1;
+        }
+
+        u32 atomic_wrapper(u32 x) {
+            u32 out = 0;
+            noyield {
+                out = fast_only_soft(x) + sha_block(x);
+            }
+            return out;
+        }
+
+        task bg_hasher() {
+            u32 h = 1;
+            loop {
+                h = sha_block(h);
+                delay(5ms);
+            }
+        }
+
+        fn main() {
+            u32 v = atomic_wrapper(10);
+            sys.log_kv("v=", v);
+            spawn bg_hasher() @low;
+        }
+        "#,
+    );
+
+    assert_eq!(model.fn_effect("pure_mix"), FnEffect::NonYielding);
+    assert_eq!(model.fn_effect("sha_round"), FnEffect::SoftYielding);
+    assert_eq!(model.fn_effect("sha_block"), FnEffect::SoftYielding);
+    assert_eq!(model.fn_effect("fast_only_soft"), FnEffect::SoftYielding);
+    // `atomic_wrapper` invokes soft-yielding fns strictly inside `noyield`, so `atomic_wrapper` itself never suspends!
+    assert_eq!(model.fn_effect("atomic_wrapper"), FnEffect::NonYielding);
+    assert!(!model.can_yield("atomic_wrapper"));
+    assert_eq!(model.fn_effect("bg_hasher"), FnEffect::HardBlocking);
+
+    // `sha_block` and `sha_round` are reached in BOTH coroutine and `noyield` modes -> dual-specialized!
+    assert!(model.soft_yielding_in_coro.contains("sha_block"));
+    assert!(model.soft_yielding_in_coro.contains("sha_round"));
+    assert!(model.soft_yielding_in_noyield.contains("sha_block"));
+    assert!(model.soft_yielding_in_noyield.contains("sha_round"));
+    assert!(model.dual_specialized_fns.contains("sha_block"));
+    assert!(model.dual_specialized_fns.contains("sha_round"));
+
+    // `fast_only_soft` is ONLY reached inside `noyield` -> NOT in `soft_yielding_in_coro` and NOT dual-specialized!
+    assert!(model.soft_yielding_in_noyield.contains("fast_only_soft"));
+    assert!(!model.soft_yielding_in_coro.contains("fast_only_soft"));
+    assert!(!model.dual_specialized_fns.contains("fast_only_soft"));
+
+    // 2. `SoftYielding` functions remain FORBIDDEN inside `critical` (`E0004`), `isr` (`E0005`), and `extern "C"` callbacks (`E0006`)!
+    expect_err_kind(
+        r#"
+        fn soft_fn() { checkpoint(); }
+        fn main() {
+            critical {
+                soft_fn();
+            }
+        }
+        "#,
+        DiagnosticKind::YieldInCritical,
+    );
+    expect_err_kind(
+        r#"
+        fn soft_fn() { checkpoint(); }
+        isr EXTI0 {
+            soft_fn();
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::YieldInIsr,
+    );
+    expect_err_kind(
+        r#"
+        extern "C" fn reg_cb(fn() cb);
+        fn soft_fn() { checkpoint(); }
+        fn main() {
+            reg_cb(soft_fn);
+        }
+        "#,
+        DiagnosticKind::YieldingCallbackToExternC,
+    );
+
+    // 3. Non-breaking infinite `loop` inside an `fn` is `HardBlocking` and rejected inside `noyield` (`E0003`)!
+    expect_err_kind(
+        r#"
+        fn spin_forever() {
+            loop {
+                checkpoint();
+            }
+        }
+        fn main() {
+            noyield {
+                spin_forever();
+            }
+        }
+        "#,
+        DiagnosticKind::YieldInNoYield,
+    );
+}
+
+#[test]
+fn defer_and_bounded_for_in_verification() {
+    // 1. Valid `defer` scope-exit cleanup + bounded `for (T i in a..b)` / `for (T i in a..=b)` / `for (T x in slice)`
+    //    (including inside `noyield`, `critical`, and `isr`!)
+    let model = expect_ok(
+        r#"
+        import chip.stm32g4 as hw;
+
+        enum SpiErr { TransferFailed }
+        @dma_safe ping_pong<u8, 32> rx_dma;
+        watch<u32> last_sum = 0;
+
+        u32 tx_frame([]u8 payload, bool fail) error SpiErr {
+            hw.GPIOA.clear_pin(PIN_0);
+            defer hw.GPIOA.set_pin(PIN_0);
+
+            u32 acc = 0;
+            for (usize i in 0..payload.len) {
+                acc += payload[i];
+            }
+            for (u8 bit in 0..=7) {
+                acc ^= bit;
+            }
+            if (fail) {
+                error TransferFailed;
+            }
+            return acc;
+        }
+
+        isr DMA1_CH5 {
+            u8 lut[4] = [1, 2, 3, 4];
+            u32 s = 0;
+            for (u8 v in lut) {
+                s += v;
+            }
+            last_sum.publish(s);
+            rx_dma.flip();
+        }
+
+        task dma_reader() {
+            loop {
+                []u8 half = rx_dma.wait_chunk();
+                defer {
+                    last_sum.publish(99);
+                }
+                u32 total = 0;
+                noyield {
+                    for (u8 b in half) {
+                        total += b;
+                    }
+                }
+                u32 res = tx_frame(half, false) or 0;
+                last_sum.publish(total + res);
+            }
+        }
+
+        fn main() {
+            critical {
+                for (u32 ch in 0..4) {
+                    hw.TIM1.set_compare(ch, 0);
+                }
+            }
+            spawn dma_reader() @normal;
+        }
+        "#,
+    );
+    assert_eq!(model.fn_effect("tx_frame"), FnEffect::NonYielding);
+    assert!(!model.can_yield("tx_frame"));
+
+    // 2. Yielding inside `defer` (both `SoftYielding` and `HardBlocking`) -> E0003 (`YieldInNoYield`)
+    expect_err_kind(
+        r#"
+        fn soft_op() { checkpoint(); }
+        fn main() {
+            defer soft_op();
+        }
+        "#,
+        DiagnosticKind::YieldInNoYield,
+    );
+    expect_err_kind(
+        r#"
+        fn main() {
+            defer delay(1ms);
+        }
+        "#,
+        DiagnosticKind::YieldInNoYield,
+    );
+
+    // 3. Control-flow jumps (`return`, `error`, `break`, `continue`, `restart`, `spawn`) and nested `defer` inside `defer` -> E0023
+    for bad_defer in [
+        r#"
+        fn main() {
+            defer { return; }
+        }
+        "#,
+        r#"
+        fn f() error {
+            defer { error; }
+        }
+        fn main() {}
+        "#,
+        r#"
+        fn main() {
+            for (usize i in 0..4) {
+                defer { break; }
+            }
+        }
+        "#,
+        r#"
+        fn main() {
+            for (usize i in 0..4) {
+                defer { continue; }
+            }
+        }
+        "#,
+        r#"
+        task t() {
+            defer { restart; }
+            loop { checkpoint(); }
+        }
+        fn main() { spawn t(); }
+        "#,
+        r#"
+        task t() { loop { checkpoint(); } }
+        fn main() {
+            defer spawn t();
+        }
+        "#,
+        r#"
+        fn main() {
+            defer {
+                defer println("nested");
+            }
+        }
+        "#,
+    ] {
+        expect_err_kind(bad_defer, DiagnosticKind::InvalidControlFlow);
+    }
+
+    // 4. Iterating a DMA slice `for (u8 b in half)` across a `wait_chunk()` inside the loop body -> E0011 (`StaleDmaLease`)!
+    expect_err_kind(
+        r#"
+        @dma_safe ping_pong<u8, 32> rx_dma;
+        task bad_iter() {
+            loop {
+                []u8 half = rx_dma.wait_chunk();
+                for (u8 b in half) {
+                    u8 cur = b;
+                    []u8 next = rx_dma.wait_chunk();
+                    sys.log_kv("v=", cur + next[0]);
+                }
+            }
+        }
+        fn main() { spawn bad_iter(); }
+        "#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 5. Invalid `for` range / `for..in` element types -> E0019 (`TypeMismatch`)
+    expect_err_kind(
+        r#"
+        fn main() {
+            for (bool b in 0..2) {}
+        }
+        "#,
+        DiagnosticKind::TypeMismatch,
+    );
+    expect_err_kind(
+        r#"
+        fn main() {
+            u32 not_a_slice = 10;
+            for (u8 x in not_a_slice) {}
+        }
+        "#,
+        DiagnosticKind::TypeMismatch,
+    );
+}

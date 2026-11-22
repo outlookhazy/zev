@@ -193,11 +193,12 @@ fn compute_terminator_live_before(
         MirTerminator::Yield(yk) => match yk {
             MirYieldKind::EveryLatch {
                 next_deadline_var,
+                period_var,
                 resume_bb,
-                ..
             } => {
                 let mut out = block_live(*resume_bb);
                 out.insert(*next_deadline_var);
+                out.insert(*period_var);
                 out
             }
             MirYieldKind::ShareCheckpoint { resume_bb } => block_live(*resume_bb),
@@ -211,14 +212,6 @@ fn compute_terminator_live_before(
                 out
             }
             MirYieldKind::InboxRecv {
-                target,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                resume_bb,
-                ..
-            }
-            | MirYieldKind::ChanRecv {
                 target,
                 timeout_deadline_var,
                 dst_val,
@@ -240,15 +233,23 @@ fn compute_terminator_live_before(
                 }
                 out
             }
-            MirYieldKind::ChanSend {
+            MirYieldKind::InboxSend {
                 target,
                 val_var,
+                timeout_deadline_var,
+                dst_res,
                 resume_bb,
                 ..
             } => {
                 let mut out = block_live(*resume_bb);
+                if let Some(dr) = dst_res {
+                    out.remove(dr);
+                }
                 collect_prim_target_uses(target, &mut out);
                 out.insert(*val_var);
+                if let Some(tv) = timeout_deadline_var {
+                    out.insert(*tv);
+                }
                 out
             }
             MirYieldKind::SignalWait {
@@ -346,6 +347,11 @@ fn transfer_stmt(stmt: &MirStmt, live: &mut BTreeSet<VarId>) {
         | MirStmt::EndInboxTurn
         | MirStmt::Break
         | MirStmt::Continue => {}
+        MirStmt::SpawnActivate { args, .. } => {
+            for a in args {
+                collect_expr_uses(a, live);
+            }
+        }
         MirStmt::If {
             cond,
             then_body,
@@ -441,8 +447,7 @@ fn collect_prim_target_uses(target: &MirPrimTarget, uses: &mut BTreeSet<VarId>) 
 fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
     match op {
         MirPrimNonBlockingOp::WatchPublish { target, value, .. }
-        | MirPrimNonBlockingOp::InboxPost { target, value, .. }
-        | MirPrimNonBlockingOp::ChanTrySend { target, value, .. } => {
+        | MirPrimNonBlockingOp::InboxPost { target, value, .. } => {
             collect_prim_target_uses(target, uses);
             collect_expr_uses(value, uses);
         }
@@ -512,10 +517,17 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             collect_expr_uses(slice, uses);
         }
         MirExprKind::PrimRead(ro) => match ro.as_ref() {
+            MirPrimReadOp::InboxTrySend { target, value, .. } => {
+                collect_prim_target_uses(target, uses);
+                collect_expr_uses(value, uses);
+            }
             MirPrimReadOp::WatchRead { target, .. }
             | MirPrimReadOp::InboxTryRecv { target, .. }
-            | MirPrimReadOp::ChanTryRecv { target, .. }
-            | MirPrimReadOp::SignalIsSet { target } => {
+            | MirPrimReadOp::InboxLen { target, .. }
+            | MirPrimReadOp::InboxIsEmpty { target, .. }
+            | MirPrimReadOp::InboxIsFull { target, .. }
+            | MirPrimReadOp::SignalIsSet { target }
+            | MirPrimReadOp::SignalTryWait { target } => {
                 collect_prim_target_uses(target, uses);
             }
         },
@@ -567,6 +579,11 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
                 collect_addr_of_vars(e, out);
             }
         }
+        MirExprKind::PrimRead(ro) => {
+            if let MirPrimReadOp::InboxTrySend { value, .. } = ro.as_ref() {
+                collect_addr_of_vars(value, out);
+            }
+        }
         _ => {}
     }
 }
@@ -577,10 +594,14 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
         MirStmt::Assign { value, .. } | MirStmt::Expr(value) => {
             collect_addr_of_vars(value, &mut taken);
         }
+        MirStmt::SpawnActivate { args, .. } => {
+            for a in args {
+                collect_addr_of_vars(a, &mut taken);
+            }
+        }
         MirStmt::PrimOp(op) => match op {
             MirPrimNonBlockingOp::WatchPublish { value, .. }
-            | MirPrimNonBlockingOp::InboxPost { value, .. }
-            | MirPrimNonBlockingOp::ChanTrySend { value, .. } => {
+            | MirPrimNonBlockingOp::InboxPost { value, .. } => {
                 collect_addr_of_vars(value, &mut taken);
             }
             _ => {}
@@ -636,18 +657,17 @@ fn collect_terminator_forced_hoists(
     if let MirTerminator::Yield(yk) = term {
         match yk {
             MirYieldKind::EveryLatch {
-                next_deadline_var, ..
+                next_deadline_var,
+                period_var,
+                ..
             } => {
                 force_hoist.insert(*next_deadline_var);
+                force_hoist.insert(*period_var);
             }
             MirYieldKind::DelayPoll { deadline_var, .. } => {
                 force_hoist.insert(*deadline_var);
             }
             MirYieldKind::InboxRecv {
-                timeout_deadline_var: Some(tv),
-                ..
-            }
-            | MirYieldKind::ChanRecv {
                 timeout_deadline_var: Some(tv),
                 ..
             }
@@ -657,8 +677,15 @@ fn collect_terminator_forced_hoists(
             } => {
                 force_hoist.insert(*tv);
             }
-            MirYieldKind::ChanSend { val_var, .. } => {
+            MirYieldKind::InboxSend {
+                val_var,
+                timeout_deadline_var,
+                ..
+            } => {
                 force_hoist.insert(*val_var);
+                if let Some(tv) = timeout_deadline_var {
+                    force_hoist.insert(*tv);
+                }
             }
             MirYieldKind::CallYielding { args, .. } => {
                 // Any variable whose address `&v` is passed into a yielding function MUST

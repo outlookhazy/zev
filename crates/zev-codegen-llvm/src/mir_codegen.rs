@@ -303,6 +303,9 @@ impl<'a> ModuleCtx<'a> {
             }
             self.scan_mir_type_for_prims(&ext.ret_ty);
         }
+        for v in &self.module.boot.vars {
+            self.scan_mir_type_for_prims(&v.ty);
+        }
 
         // Function signatures
         for f in &self.module.functions {
@@ -586,7 +589,7 @@ impl<'a> ModuleCtx<'a> {
                     let al = eal.max(4);
                     (align_up(esz, 4) + 4, al)
                 }
-                MirPrimKind::Inbox { elem, cap } | MirPrimKind::Chan { elem, cap } => {
+                MirPrimKind::Inbox { elem, cap } => {
                     let (esz, eal) = self.size_align(elem, ptr_bytes);
                     let al = eal.max(4);
                     (align_up(13, eal) + esz * (*cap).max(1), al)
@@ -792,12 +795,12 @@ ok_bb:
                     let ety = self.llvm_ty(elem);
                     let _ = writeln!(out, "%prim.{id} = type {{ {ety}, i32 }}");
                 }
-                MirPrimKind::Inbox { elem, cap } | MirPrimKind::Chan { elem, cap } => {
+                MirPrimKind::Inbox { elem, cap } => {
                     let ety = self.llvm_ty(elem);
                     let c = (*cap).max(1);
                     let _ = writeln!(
                         out,
-                        "%prim.{id} = type {{ i32, i32, i32, i8, [{c} x {ety}] }}"
+                        "%prim.{id} = type {{ i32, i32, i32, [{c} x i8], [{c} x {ety}] }}"
                     );
                 }
                 MirPrimKind::PingPong { elem, cap } => {
@@ -857,13 +860,8 @@ ok_bb:
                             writeln!(out, "{gsym} = global {pty} zeroinitializer, align {align}");
                     }
                 }
-                MirPrimKind::Inbox { elem, cap } | MirPrimKind::Chan { elem, cap } => {
-                    let ety = self.llvm_ty(elem);
-                    let c = (*cap).max(1);
-                    let _ = writeln!(
-                        out,
-                        "{gsym} = global {pty} {{ i32 0, i32 0, i32 0, i8 127, [{c} x {ety}] zeroinitializer }}, align {align}"
-                    );
+                MirPrimKind::Inbox { .. } => {
+                    let _ = writeln!(out, "{gsym} = global {pty} zeroinitializer, align {align}");
                 }
                 MirPrimKind::PingPong { elem, cap } => {
                     let ety = self.llvm_ty(elem);
@@ -974,7 +972,7 @@ entry:
 "#
                     );
                 }
-                MirPrimKind::Inbox { elem, cap } | MirPrimKind::Chan { elem, cap } => {
+                MirPrimKind::Inbox { elem, cap } => {
                     let ety = self.llvm_ty(elem);
                     let c = (*cap).max(1) as i32;
                     let _ = writeln!(
@@ -991,22 +989,17 @@ do_push:
   %tail = load i32, ptr %tail_p, align 4
   %slot_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 4, i32 %tail
   store {ety} %val, ptr %slot_p, align 1
+  %bp = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3, i32 %tail
+  %has_b = icmp sge i32 %boost, 0
+  %b_p1 = add i32 %boost, 1
+  %b8 = trunc i32 %b_p1 to i8
+  %sb = select i1 %has_b, i8 %b8, i8 0
+  store i8 %sb, ptr %bp, align 1
   %t1 = add i32 %tail, 1
   %tnext = urem i32 %t1, {c}
   store i32 %tnext, ptr %tail_p, align 4
   %c1 = add i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
-  %has_b = icmp sge i32 %boost, 0
-  br i1 %has_b, label %upd_b, label %wake
-upd_b:
-  %pb_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3
-  %cur_pb = load i8, ptr %pb_p, align 1
-  %b8 = trunc i32 %boost to i8
-  %lt = icmp slt i8 %b8, %cur_pb
-  %min_b = select i1 %lt, i8 %b8, i8 %cur_pb
-  store i8 %min_b, ptr %pb_p, align 1
-  br label %wake
-wake:
   call void @__syn_wake_waiters(ptr %q, i32 %boost)
   call void @__syn_crit_exit(i32 %pm)
   ret i8 1
@@ -1028,23 +1021,25 @@ do_pop:
   %slot_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 4, i32 %head
   %val = load {ety}, ptr %slot_p, align 1
   store {ety} %val, ptr %out_val, align 1
+  %bp = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3, i32 %head
+  %sb = load i8, ptr %bp, align 1
+  store i8 0, ptr %bp, align 1
   %h1 = add i32 %head, 1
   %hnext = urem i32 %h1, {c}
   store i32 %hnext, ptr %head_p, align 4
   %c1 = sub i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
-  %pb_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3
-  %pb = load i8, ptr %pb_p, align 1
-  %has_pb = icmp slt i8 %pb, 127
+  %has_pb = icmp ne i8 %sb, 0
   br i1 %has_pb, label %apply_pb, label %wake_senders
 apply_pb:
-  store i8 127, ptr %pb_p, align 1
   %now = call i32 @__syn_now_ms()
-  %pb32 = zext i8 %pb to i32
+  %sb32 = zext i8 %sb to i32
+  %pb32 = sub i32 %sb32, 1
   call void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
   br label %wake_senders
 wake_senders:
-  call void @__syn_wake_waiters(ptr %q, i32 -1)
+  %q_tx = getelementptr inbounds {pty}, ptr %q, i32 0, i32 1
+  call void @__syn_wake_waiters(ptr %q_tx, i32 -1)
   call void @__syn_crit_exit(i32 %pm)
   ret i8 1
 empty:
@@ -2151,9 +2146,73 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             "switch i32 {pc_val}, label %coro_done [\n{switch_cases}  ]"
         ));
 
+        let mut every_resume_map: BTreeMap<BlockId, (VarId, VarId)> = BTreeMap::new();
+        for b in blocks {
+            if let MirTerminator::Yield(MirYieldKind::EveryLatch {
+                next_deadline_var,
+                period_var,
+                resume_bb,
+            }) = &b.terminator
+            {
+                every_resume_map.insert(*resume_bb, (*next_deadline_var, *period_var));
+            }
+        }
+
+        let entry_is_restart_target = blocks.first().is_some_and(|b| b.is_resume_entry);
+
         for b in blocks {
             let lbl = format!("bb_{}", b.id.0);
             self.start_block(&lbl);
+
+            // On `restart;` back into `bb_0`, zero hoisted non-Param locals while keeping `Param` fields intact!
+            if b.id.0 == entry_bb && entry_is_restart_target {
+                let vars_snapshot = self.vars.clone();
+                for v in &vars_snapshot {
+                    if v.hoisted && v.role != VarRole::Param {
+                        let vp = self.var_ptr(v.id);
+                        let lty = self.ctx.llvm_ty(&v.ty);
+                        self.emit_line(format!("store {lty} zeroinitializer, ptr {vp}, align 4"));
+                    }
+                }
+            }
+
+            // Resync while-sleeping overruns at `loop every` body entry (`wdiff >= eff_p`)
+            if let Some(&(dv_id, pv_id)) = every_resume_map.get(&b.id) {
+                let dl_ptr = self.var_ptr(dv_id);
+                let pv_ptr = self.var_ptr(pv_id);
+                let pv_lty = self.ctx.llvm_ty(&self.vars[pv_id.0].ty);
+                let pv_raw = self.next_tmp();
+                self.emit_line(format!("{pv_raw} = load {pv_lty}, ptr {pv_ptr}, align 4"));
+                let pv32 = self.coerce(SsaVal::new(pv_lty, pv_raw), "i32", false);
+                let p_zero = self.next_tmp();
+                let eff_p = self.next_tmp();
+                self.emit_line(format!("{p_zero} = icmp eq i32 {}, 0", pv32.repr));
+                self.emit_line(format!("{eff_p} = select i1 {p_zero}, i32 1, i32 {}", pv32.repr));
+                let dv = self.next_tmp();
+                let now = self.next_tmp();
+                let wdiff = self.next_tmp();
+                let is_over = self.next_tmp();
+                self.emit_line(format!("{dv} = load i32, ptr {dl_ptr}, align 4"));
+                self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                self.emit_line(format!("{wdiff} = sub i32 {now}, {dv}"));
+                self.emit_line(format!("{is_over} = icmp sge i32 {wdiff}, {eff_p}"));
+                let resync_lbl = self.next_label("every_wresync");
+                let cont_lbl = self.next_label("every_wcont");
+                self.emit_term(format!(
+                    "br i1 {is_over}, label %{resync_lbl}, label %{cont_lbl}"
+                ));
+                self.start_block(&resync_lbl);
+                let q = self.next_tmp();
+                let skip = self.next_tmp();
+                let dv_new = self.next_tmp();
+                self.emit_line(format!("{q} = udiv i32 {wdiff}, {eff_p}"));
+                self.emit_line(format!("{skip} = mul i32 {q}, {eff_p}"));
+                self.emit_line(format!("{dv_new} = add i32 {dv}, {skip}"));
+                self.emit_line(format!("store i32 {dv_new}, ptr {dl_ptr}, align 4"));
+                self.emit_term(format!("br label %{cont_lbl}"));
+                self.start_block(&cont_lbl);
+            }
+
             for stmt in &b.stmts {
                 self.emit_stmt(stmt)?;
             }
@@ -2298,29 +2357,46 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         match yk {
             MirYieldKind::EveryLatch {
                 next_deadline_var,
-                period_ticks,
+                period_var,
                 resume_bb,
             } => {
                 let dl_ptr = self.var_ptr(*next_deadline_var);
+                let pv_ptr = self.var_ptr(*period_var);
+                let pv_lty = self.ctx.llvm_ty(&self.vars[period_var.0].ty);
+                let pv_raw = self.next_tmp();
+                self.emit_line(format!("{pv_raw} = load {pv_lty}, ptr {pv_ptr}, align 4"));
+                let pv32 = self.coerce(SsaVal::new(pv_lty, pv_raw), "i32", false);
+                let p_zero = self.next_tmp();
+                let eff_p = self.next_tmp();
+                self.emit_line(format!("{p_zero} = icmp eq i32 {}, 0", pv32.repr));
+                self.emit_line(format!("{eff_p} = select i1 {p_zero}, i32 1, i32 {}", pv32.repr));
+
                 let cur_dl = self.next_tmp();
                 self.emit_line(format!("{cur_dl} = load i32, ptr {dl_ptr}, align 4"));
                 let next_dl = self.next_tmp();
-                let pt = *period_ticks as i32;
-                self.emit_line(format!("{next_dl} = add i32 {cur_dl}, {pt}"));
+                self.emit_line(format!("{next_dl} = add i32 {cur_dl}, {eff_p}"));
                 self.emit_line(format!("store i32 {next_dl}, ptr {dl_ptr}, align 4"));
 
                 let now = self.next_tmp();
                 self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
                 let diff = self.next_tmp();
                 self.emit_line(format!("{diff} = sub i32 {now}, {next_dl}"));
-                let already_due = self.next_tmp();
-                self.emit_line(format!("{already_due} = icmp sge i32 {diff}, 0"));
+                let is_early = self.next_tmp();
+                self.emit_line(format!("{is_early} = icmp slt i32 {diff}, 0"));
 
                 let due_lbl = self.next_label("every_due");
                 let sleep_lbl = self.next_label("every_wait");
-                self.emit_term(format!("br i1 {already_due}, label %{due_lbl}, label %{sleep_lbl}"));
+                self.emit_term(format!("br i1 {is_early}, label %{sleep_lbl}, label %{due_lbl}"));
 
                 self.start_block(&due_lbl);
+                let q = self.next_tmp();
+                let skip = self.next_tmp();
+                let resync_dl = self.next_tmp();
+                self.emit_line(format!("{q} = udiv i32 {diff}, {eff_p}"));
+                self.emit_line(format!("{skip} = mul i32 {q}, {eff_p}"));
+                self.emit_line(format!("{resync_dl} = add i32 {next_dl}, {skip}"));
+                self.emit_line(format!("store i32 {resync_dl}, ptr {dl_ptr}, align 4"));
+
                 let share = self.next_tmp();
                 self.emit_line(format!("{share} = call i1 @__syn_should_share(ptr %__task)"));
                 let yield_more = self.next_label("every_more");
@@ -2401,40 +2477,17 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     *resume_bb,
                 )?;
             }
-            MirYieldKind::ChanRecv {
-                target,
-                elem_ty,
-                cap,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let pk = MirPrimKind::Chan {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                self.emit_queue_recv_yield(
-                    target,
-                    &pk,
-                    elem_ty,
-                    *timeout_deadline_var,
-                    *dst_val,
-                    *dst_res,
-                    *poll_bb,
-                    *resume_bb,
-                )?;
-            }
-            MirYieldKind::ChanSend {
+            MirYieldKind::InboxSend {
                 target,
                 elem_ty,
                 cap,
                 val_var,
+                timeout_deadline_var,
+                dst_res,
                 poll_bb,
                 resume_bb,
             } => {
-                let pk = MirPrimKind::Chan {
+                let pk = MirPrimKind::Inbox {
                     elem: Box::new(elem_ty.clone()),
                     cap: *cap,
                 };
@@ -2450,15 +2503,65 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 let ok_b = self.next_tmp();
                 self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
-                let wait_lbl = self.next_label("ch_send_wait");
-                self.emit_term(format!(
-                    "br i1 {ok_b}, label %bb_{}, label %{wait_lbl}",
-                    resume_bb.0
-                ));
-                self.start_block(&wait_lbl);
-                self.park_task_prim(&qptr, None);
-                self.store_coro_pc(poll_bb.0 as i32);
-                self.emit_term("ret i32 1");
+                let ok_lbl = self.next_label("q_tx_ok");
+                let full_lbl = self.next_label("q_tx_full");
+                self.emit_term(format!("br i1 {ok_b}, label %{ok_lbl}, label %{full_lbl}"));
+
+                self.start_block(&ok_lbl);
+                if let Some(rvid) = dst_res {
+                    let rp = self.var_ptr(*rvid);
+                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                    self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 4"));
+                }
+                self.emit_term(format!("br label %bb_{}", resume_bb.0));
+
+                self.start_block(&full_lbl);
+                if let Some(dl_var) = timeout_deadline_var {
+                    let dl_ptr = self.var_ptr(*dl_var);
+                    let dl = self.next_tmp();
+                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
+                    let now = self.next_tmp();
+                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    let diff = self.next_tmp();
+                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
+                    let exp = self.next_tmp();
+                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
+                    let to_lbl = self.next_label("q_tx_to");
+                    let park_lbl = self.next_label("q_tx_park");
+                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
+
+                    self.start_block(&to_lbl);
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let e0 = self.next_tmp();
+                        self.emit_line(format!(
+                            "{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"
+                        ));
+                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
+                    }
+                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
+
+                    self.start_block(&park_lbl);
+                    let pty = format!("%prim.{id}");
+                    let q_tx = self.next_tmp();
+                    self.emit_line(format!(
+                        "{q_tx} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 1"
+                    ));
+                    let dl_ssa = SsaVal::new("i32", dl);
+                    self.park_task_prim(&q_tx, Some(&dl_ssa));
+                    self.store_coro_pc(poll_bb.0 as i32);
+                    self.emit_term("ret i32 1");
+                } else {
+                    let pty = format!("%prim.{id}");
+                    let q_tx = self.next_tmp();
+                    self.emit_line(format!(
+                        "{q_tx} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 1"
+                    ));
+                    self.park_task_prim(&q_tx, None);
+                    self.store_coro_pc(poll_bb.0 as i32);
+                    self.emit_term("ret i32 1");
+                }
             }
             MirYieldKind::SignalWait {
                 target,
@@ -2838,6 +2941,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         args: &[MirExpr],
         dst: Option<&MirCallDst>,
     ) -> Result<(), CodegenError> {
+        if self.terminated {
+            return Ok(());
+        }
         let child_layout = self.ctx.fn_frames[callee].clone();
         let child_sig = self.ctx.fn_sigs[callee].clone();
         let callee_fn = self
@@ -2938,6 +3044,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         slot_id: usize,
         args: &[MirExpr],
     ) -> Result<(), CodegenError> {
+        if self.terminated {
+            return Ok(());
+        }
         let sp = self
             .ctx
             .module
@@ -3253,6 +3362,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br label %{cnt}"));
                 }
             }
+            MirStmt::SpawnActivate { slot_id, args } => {
+                self.emit_boot_spawn_activate(*slot_id, args)?;
+            }
         }
         Ok(())
     }
@@ -3352,27 +3464,6 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let ign = self.next_tmp();
                 self.emit_line(format!(
                     "{ign} = call i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {}, i32 {b})",
-                    vc.repr
-                ));
-            }
-            MirPrimNonBlockingOp::ChanTrySend {
-                target,
-                elem_ty,
-                cap,
-                value,
-            } => {
-                let pk = MirPrimKind::Chan {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                let id = sanitize_ident(&pk.mangle_name());
-                let qptr = self.resolve_prim_ptr(target)?;
-                let ety = self.ctx.llvm_ty(elem_ty);
-                let vv = self.emit_expr(value)?;
-                let vc = self.coerce(vv, &ety, !value.ty.is_unsigned());
-                let ign = self.next_tmp();
-                self.emit_line(format!(
-                    "{ign} = call i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {}, i32 -1)",
                     vc.repr
                 ));
             }
@@ -3478,6 +3569,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             "0".to_string()
                         };
                         self.emit_line(format!("call void @__syn_platform_exit(i32 {code})"));
+                        self.emit_term("unreachable");
                     }
                     "pend_irq" => {
                         if let Some((irq, _)) = ev.first() {
@@ -4277,16 +4369,96 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 self.emit_try_recv_expr(target, &pk, elem_ty)
             }
-            MirPrimReadOp::ChanTryRecv {
+            MirPrimReadOp::InboxTrySend {
+                target,
+                elem_ty,
+                cap,
+                value,
+                boost,
+            } => {
+                let pk = MirPrimKind::Inbox {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let qptr = self.resolve_prim_ptr(target)?;
+                let ety = self.ctx.llvm_ty(elem_ty);
+                let vv = self.emit_expr(value)?;
+                let vc = self.coerce(vv, &ety, !value.ty.is_unsigned());
+                let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
+                let ok = self.next_tmp();
+                self.emit_line(format!(
+                    "{ok} = call i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {}, i32 {b})",
+                    vc.repr
+                ));
+                Ok(SsaVal::new("i8", ok))
+            }
+            MirPrimReadOp::InboxLen {
                 target,
                 elem_ty,
                 cap,
             } => {
-                let pk = MirPrimKind::Chan {
+                let pk = MirPrimKind::Inbox {
                     elem: Box::new(elem_ty.clone()),
                     cap: *cap,
                 };
-                self.emit_try_recv_expr(target, &pk, elem_ty)
+                let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
+                let qptr = self.resolve_prim_ptr(target)?;
+                let cnt_p = self.next_tmp();
+                let cnt = self.next_tmp();
+                self.emit_line(format!(
+                    "{cnt_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 2"
+                ));
+                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
+            }
+            MirPrimReadOp::InboxIsEmpty {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::Inbox {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
+                let qptr = self.resolve_prim_ptr(target)?;
+                let cnt_p = self.next_tmp();
+                let cnt = self.next_tmp();
+                let emp = self.next_tmp();
+                let b8 = self.next_tmp();
+                self.emit_line(format!(
+                    "{cnt_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 2"
+                ));
+                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                self.emit_line(format!("{emp} = icmp eq i32 {cnt}, 0"));
+                self.emit_line(format!("{b8} = zext i1 {emp} to i8"));
+                Ok(SsaVal::new("i8", b8))
+            }
+            MirPrimReadOp::InboxIsFull {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::Inbox {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
+                let qptr = self.resolve_prim_ptr(target)?;
+                let c = (*cap).max(1) as i32;
+                let cnt_p = self.next_tmp();
+                let cnt = self.next_tmp();
+                let fl = self.next_tmp();
+                let b8 = self.next_tmp();
+                self.emit_line(format!(
+                    "{cnt_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 2"
+                ));
+                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                self.emit_line(format!("{fl} = icmp sge i32 {cnt}, {c}"));
+                self.emit_line(format!("{b8} = zext i1 {fl} to i8"));
+                Ok(SsaVal::new("i8", b8))
             }
             MirPrimReadOp::SignalIsSet { target } => {
                 let sptr = self.resolve_prim_ptr(target)?;
@@ -4297,6 +4469,20 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 self.emit_line(format!("{f} = load volatile i8, ptr {fp}, align 1"));
                 Ok(SsaVal::new("i8", f))
+            }
+            MirPrimReadOp::SignalTryWait { target } => {
+                let id = sanitize_ident(&MirPrimKind::Signal.mangle_name());
+                let sptr = self.resolve_prim_ptr(target)?;
+                let task_arg = if self.coroutine.is_some() {
+                    "%__task"
+                } else {
+                    "null"
+                };
+                let ok = self.next_tmp();
+                self.emit_line(format!(
+                    "{ok} = call i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr {task_arg})"
+                ));
+                Ok(SsaVal::new("i8", ok))
             }
         }
     }

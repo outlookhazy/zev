@@ -649,6 +649,11 @@ do_restore:
   %base = load i8, ptr %bp_ptr, align 1
   store i8 %base, ptr %ep_ptr, align 1
   store i8 0, ptr %bf_ptr, align 1
+  %now_r = call i32 @__syn_now_ms()
+  %win_r = call i32 @__syn_starvation_window(i8 %base)
+  %due_r = add i32 %now_r, %win_r
+  %due_p = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 10
+  store i32 %due_r, ptr %due_p, align 4
   br label %unlock
 unlock:
   call void @__syn_crit_exit(i32 %pm)
@@ -713,6 +718,8 @@ wake:
   store ptr null, ptr %wo_ptr, align 4
   %ht_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 7
   store i8 0, ptr %ht_ptr, align 1
+  %mp_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 5
+  store i8 1, ptr %mp_ptr, align 1
   %pr_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 6
   store i8 0, ptr %pr_ptr, align 1
   %ep_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
@@ -765,6 +772,8 @@ do_wake:
   store ptr null, ptr %wo_ptr, align 4
   %ht2_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 7
   store i8 0, ptr %ht2_ptr, align 1
+  %mp_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 5
+  store i8 1, ptr %mp_ptr, align 1
   %pr_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 6
   store i8 0, ptr %pr_ptr, align 1
   %ep_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
@@ -1106,8 +1115,15 @@ dispatch:
   %is_more = icmp eq i32 %st, 0
   br i1 %is_more, label %on_more, label %chk_done
 on_more:
+  %pm_m = call i32 @__syn_crit_enter()
   store i8 1, ptr %st_ptr, align 1
   store i8 1, ptr %mp_ptr, align 1
+  %ep_m = load i8, ptr %ep_ptr, align 1
+  %win_m = call i32 @__syn_starvation_window(i8 %ep_m)
+  %now_m = call i32 @__syn_now_ms()
+  %due_m = add i32 %now_m, %win_m
+  store i32 %due_m, ptr %due_ptr, align 4
+  call void @__syn_crit_exit(i32 %pm_m)
   br label %tick_loop
 
 chk_done:
@@ -1119,7 +1135,15 @@ on_done:
   call void @__syn_end_inbox_turn(ptr %tp)
   br label %tick_loop
 on_wait:
+  %pm_w = call i32 @__syn_crit_enter()
+  %cur_st = load i8, ptr %st_ptr, align 1
+  %still_w = icmp ne i8 %cur_st, 1
+  br i1 %still_w, label %clr_mp, label %keep_mp
+clr_mp:
   store i8 0, ptr %mp_ptr, align 1
+  br label %keep_mp
+keep_mp:
+  call void @__syn_crit_exit(i32 %pm_w)
   br label %tick_loop
 
 idle_phase:

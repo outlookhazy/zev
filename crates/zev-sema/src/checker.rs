@@ -12,7 +12,7 @@ use zev_ast::{
 use crate::call_graph::{CallContext, CallEdge, CallGraph, CallableKind, ExternCallbackSite};
 use crate::diag::{Diagnostic, DiagnosticKind};
 use crate::model::{
-    ConstInfo, DEFAULT_TICK_PERIOD_US, FunctionInfo, IsrInfo, ParamInfo, PrimitiveInfo,
+    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IsrInfo, ParamInfo, PrimitiveInfo,
     PriorityBoostSite, SemanticModel, SpawnedTaskInstance, TaskInfo,
 };
 use crate::provenance::{LeaseEnv, Provenance};
@@ -139,6 +139,46 @@ enum ActiveBodyKind {
     Isr,
 }
 
+#[derive(Clone, Debug)]
+struct BootArgBinding {
+    static_endpoint: Option<String>,
+    endpoint_from_param: Option<usize>,
+    ref_param_origins: BTreeSet<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct BootCallArg {
+    static_endpoint: Option<String>,
+    endpoint_from_param: Option<usize>,
+    has_non_static_local_ref: bool,
+    ref_param_origins: BTreeSet<usize>,
+    span: Span,
+}
+
+#[derive(Clone, Debug)]
+enum BootStep {
+    DirectSpawn {
+        task_name: String,
+        priority: Priority,
+        core: Option<u32>,
+        conditional: bool,
+        arg_bindings: Vec<BootArgBinding>,
+        span: Span,
+    },
+    HelperCall {
+        callee: String,
+        conditional: bool,
+        args: Vec<BootCallArg>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct RecordedCallArgs {
+    caller: String,
+    callee: String,
+    args: Vec<BootCallArg>,
+}
+
 pub(crate) struct Analyzer {
     tick_period_us: u64,
     tick_configured_explicitly: bool,
@@ -154,9 +194,15 @@ pub(crate) struct Analyzer {
     primitives: BTreeMap<String, PrimitiveInfo>,
     illegal_globals: BTreeMap<String, IllegalGlobalInfo>,
     functions: BTreeMap<String, FunctionInfo>,
+    fn_decl_order: Vec<String>,
+    fn_boot_steps: BTreeMap<String, Vec<BootStep>>,
+    recorded_call_args: Vec<RecordedCallArgs>,
     tasks: BTreeMap<String, TaskInfo>,
     isrs: BTreeMap<String, IsrInfo>,
     spawned_tasks: Vec<SpawnedTaskInstance>,
+    soft_yielding_in_coro: BTreeSet<String>,
+    soft_yielding_in_noyield: BTreeSet<String>,
+    dual_specialized_fns: BTreeSet<String>,
     main_supervisor_priority: Option<Priority>,
     call_graph: CallGraph,
     current_file: Option<String>,
@@ -180,9 +226,15 @@ impl Analyzer {
             primitives: BTreeMap::new(),
             illegal_globals: BTreeMap::new(),
             functions: BTreeMap::new(),
+            fn_decl_order: Vec::new(),
+            fn_boot_steps: BTreeMap::new(),
+            recorded_call_args: Vec::new(),
             tasks: BTreeMap::new(),
             isrs: BTreeMap::new(),
             spawned_tasks: Vec::new(),
+            soft_yielding_in_coro: BTreeSet::new(),
+            soft_yielding_in_noyield: BTreeSet::new(),
+            dual_specialized_fns: BTreeSet::new(),
             main_supervisor_priority: None,
             call_graph: CallGraph::new(),
             current_file: None,
@@ -304,6 +356,9 @@ impl Analyzer {
             tasks: self.tasks,
             isrs: self.isrs,
             spawned_tasks: self.spawned_tasks,
+            soft_yielding_in_coro: self.soft_yielding_in_coro,
+            soft_yielding_in_noyield: self.soft_yielding_in_noyield,
+            dual_specialized_fns: self.dual_specialized_fns,
             main_supervisor_priority: self.main_supervisor_priority,
             main_can_yield,
             call_graph: self.call_graph,
@@ -493,23 +548,28 @@ impl Analyzer {
 
     fn prescan_tick_config(&mut self, block: &Block) {
         for stmt in &block.stmts {
-            match &stmt.kind {
-                StmtKind::Expr(expr) => self.prescan_tick_expr(expr),
-                StmtKind::Block(b) | StmtKind::NoYield { body: b } | StmtKind::Critical { body: b } => {
-                    self.prescan_tick_config(b);
-                }
-                StmtKind::If {
-                    then_block,
-                    else_block,
-                    ..
-                } => {
-                    self.prescan_tick_config(then_block);
-                    if let Some(eb) = else_block {
-                        self.prescan_tick_config(eb);
-                    }
-                }
-                _ => {}
+            self.prescan_tick_stmt(stmt);
+        }
+    }
+
+    fn prescan_tick_stmt(&mut self, stmt: &Stmt) {
+        match &stmt.kind {
+            StmtKind::Expr(expr) => self.prescan_tick_expr(expr),
+            StmtKind::Block(b) | StmtKind::NoYield { body: b } | StmtKind::Critical { body: b } => {
+                self.prescan_tick_config(b);
             }
+            StmtKind::Defer(inner) => self.prescan_tick_stmt(inner),
+            StmtKind::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                self.prescan_tick_config(then_block);
+                if let Some(eb) = else_block {
+                    self.prescan_tick_config(eb);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -713,7 +773,7 @@ impl Analyzer {
                 DiagnosticKind::IllegalMutableGlobal,
                 g.span,
                 format!(
-                    "mutable raw global variable '{}' is forbidden; top-level declarations must be 'const' or an OS primitive (signal, chan, watch, inbox, ping_pong, lease)",
+                    "mutable raw global variable '{}' is forbidden; top-level declarations must be 'const' or an OS primitive (signal, inbox, watch, ping_pong, lease)",
                     g.name.name
                 ),
             )
@@ -777,6 +837,7 @@ impl Analyzer {
             self.node_files.insert(f.name.name.clone(), cf.clone());
         }
 
+        self.fn_decl_order.push(f.name.name.clone());
         self.functions.insert(
             f.name.name.clone(),
             FunctionInfo {
@@ -788,6 +849,8 @@ impl Analyzer {
                 is_extern_c: f.is_extern_c,
                 direct_yield: false,
                 can_yield: false,
+                effect: FnEffect::NonYielding,
+                spawns_in_boot: false,
                 yield_chain: Vec::new(),
                 callees: Vec::new(),
                 yielding_callees: Vec::new(),
@@ -816,6 +879,7 @@ impl Analyzer {
                 params,
                 direct_yield: false,
                 can_yield: false,
+                effect: FnEffect::NonYielding,
                 callees: Vec::new(),
                 yielding_callees: Vec::new(),
                 instance_count: 0,
@@ -978,19 +1042,6 @@ impl Analyzer {
     fn resolve_os_primitive(&mut self, os: &OsPrimitiveType, span: Span) -> ResolvedOsPrimitive {
         match os {
             OsPrimitiveType::Signal => ResolvedOsPrimitive::Signal,
-            OsPrimitiveType::Chan { elem, cap } => {
-                if *cap == 0 {
-                    self.emit(Diagnostic::new(
-                        DiagnosticKind::InvalidOperation,
-                        span,
-                        "chan capacity must be greater than 0",
-                    ));
-                }
-                ResolvedOsPrimitive::Chan {
-                    elem: Box::new(self.resolve_non_void_elem(elem)),
-                    cap: *cap,
-                }
-            }
             OsPrimitiveType::Inbox { elem, cap } => {
                 if *cap == 0 {
                     self.emit(Diagnostic::new(
@@ -1126,6 +1177,7 @@ impl Analyzer {
         checker.bind_params(&fn_info.params);
         let diverges = checker.check_block_stmts(&body.stmts);
         let ret_origins: Vec<usize> = checker.return_param_origins.into_iter().collect();
+        let boot_steps = checker.boot_steps;
 
         if !fn_info.ret_ty.is_void() && !fn_info.ret_ty.is_error() && !diverges {
             let ret_ty = fn_info.ret_ty.clone();
@@ -1139,6 +1191,7 @@ impl Analyzer {
             ));
         }
 
+        self.fn_boot_steps.insert(f.name.name.clone(), boot_steps);
         if let Some(info) = self.functions.get_mut(&f.name.name) {
             info.return_param_origins = ret_origins;
         }
@@ -1156,7 +1209,17 @@ impl Analyzer {
             checker.noyield_depth += 1;
         }
         checker.bind_params(&task_info.params);
-        let _ = checker.check_block_stmts(&t.body.stmts);
+        let diverges = checker.check_block_stmts(&t.body.stmts);
+        if !diverges {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::NonDivergingTask,
+                t.name.span,
+                format!(
+                    "task '{}' may exit without diverging; tasks are permanent actors and must run inside 'loop' / 'loop every', park on 'inbox.recv()' / 'signal.wait()', reset via 'restart;', or move finite workflows into yielding 'fn's",
+                    t.name.name
+                ),
+            ));
+        }
     }
 
     fn check_isr_body(&mut self, _item_attrs: &[Attr], i: &IsrDecl) {
@@ -1174,69 +1237,110 @@ impl Analyzer {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Pass 3: Whole-Program Call-Graph Verification
+    // Pass 3: Whole-Program Call-Graph Verification & Boot-Tree Unrolling
     // ─────────────────────────────────────────────────────────────────────────
 
     fn run_whole_program_verification(&mut self) {
         self.call_graph.infer_yields();
 
-        // 1. Check all recorded call edges against `isr`, `critical`, and `noyield` contexts.
+        // 1. Check all recorded call edges against `isr`, `critical`, `defer`, `noyield`, and boot-spawn contexts.
         let edges = self.call_graph.edges.clone();
         for edge in &edges {
-            let Some(callee_node) = self.call_graph.nodes.get(&edge.callee) else {
+            let Some(callee_node) = self.call_graph.nodes.get(&edge.callee).cloned() else {
                 continue;
             };
-            if !callee_node.can_yield {
-                continue;
-            }
             let caller_file = self.node_files.get(&edge.caller).cloned();
-            let sub_chain = callee_node.yield_chain.join(" -> ");
+
+            // 1a. Yielding call checks (3-tier: `SoftYielding` allowed inside `noyield`, forbidden in `critical`/`isr`/`defer`).
             if edge.ctx.in_isr {
-                let isr_name = edge.caller.strip_prefix("isr::").unwrap_or(&edge.caller);
-                let note = format!(
-                    "yield chain: isr {} -> {}; ISRs cannot block or yield—signal a task via `inbox.post(Ev, boost: @critical);`, `signal.notify();`, or `dma.flip();`",
-                    isr_name, sub_chain
-                );
-                self.emit(
-                    Diagnostic::new(
-                        DiagnosticKind::YieldInIsr,
-                        edge.span,
-                        format!(
-                            "cannot call yielding function '{}' inside ISR '{}'",
-                            edge.callee, isr_name
-                        ),
-                    )
-                    .with_file(caller_file)
-                    .with_note(note),
-                );
+                if callee_node.any_yield_effect.can_yield() {
+                    let isr_name = edge.caller.strip_prefix("isr::").unwrap_or(&edge.caller);
+                    let sub_chain = self
+                        .call_graph
+                        .shortest_any_yield_chain(&edge.callee)
+                        .join(" -> ");
+                    let note = format!(
+                        "yield chain: isr {} -> {}; ISRs cannot block or yield—signal a task via `inbox.post(Ev, boost: @critical);`, `signal.notify();`, or `dma.flip();`",
+                        isr_name, sub_chain
+                    );
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInIsr,
+                            edge.span,
+                            format!(
+                                "cannot call yielding function '{}' inside ISR '{}'",
+                                edge.callee, isr_name
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note(note),
+                    );
+                }
             } else if edge.ctx.in_critical {
+                if callee_node.any_yield_effect.can_yield() {
+                    let caller_disp = edge
+                        .caller
+                        .strip_prefix("task::")
+                        .unwrap_or(&edge.caller);
+                    let sub_chain = self
+                        .call_graph
+                        .shortest_any_yield_chain(&edge.callee)
+                        .join(" -> ");
+                    let note = format!(
+                        "yield chain: critical block in {} -> {}; `critical {{ ... }}` masks hardware IRQs—move yielding calls outside `critical`",
+                        caller_disp, sub_chain
+                    );
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInCritical,
+                            edge.span,
+                            format!(
+                                "cannot call yielding function '{}' inside 'critical' block (IRQs are masked)",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note(note),
+                    );
+                }
+            } else if edge.ctx.in_defer {
+                if callee_node.any_yield_effect.can_yield() {
+                    let caller_disp = edge
+                        .caller
+                        .strip_prefix("task::")
+                        .unwrap_or(&edge.caller);
+                    let sub_chain = self
+                        .call_graph
+                        .shortest_any_yield_chain(&edge.callee)
+                        .join(" -> ");
+                    let note = format!(
+                        "yield chain: defer cleanup in {} -> {}; `defer` statements execute synchronously on scope exit and cannot yield",
+                        caller_disp, sub_chain
+                    );
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            edge.span,
+                            format!(
+                                "cannot call yielding function '{}' inside 'defer' cleanup statement",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note(note),
+                    );
+                }
+            } else if edge.ctx.in_noyield && callee_node.effect == FnEffect::HardBlocking {
                 let caller_disp = edge
                     .caller
                     .strip_prefix("task::")
                     .unwrap_or(&edge.caller);
+                let sub_chain = self
+                    .call_graph
+                    .shortest_hard_yield_chain(&edge.callee)
+                    .join(" -> ");
                 let note = format!(
-                    "yield chain: critical block in {} -> {}; `critical {{ ... }}` masks hardware IRQs—move yielding calls outside `critical`",
-                    caller_disp, sub_chain
-                );
-                self.emit(
-                    Diagnostic::new(
-                        DiagnosticKind::YieldInCritical,
-                        edge.span,
-                        format!(
-                            "cannot call yielding function '{}' inside 'critical' block (IRQs are masked)",
-                            edge.callee
-                        ),
-                    )
-                    .with_file(caller_file)
-                    .with_note(note),
-                );
-            } else if edge.ctx.in_noyield {
-                let caller_disp = edge
-                    .caller
-                    .strip_prefix("task::")
-                    .unwrap_or(&edge.caller);
-                let note = format!(
-                    "yield chain: noyield block in {} -> {}; move yielding calls outside `noyield {{ ... }}` (e.g. await/read inputs before entering `noyield`)",
+                    "yield chain: noyield block in {} -> {}; move hard-blocking calls outside `noyield {{ ... }}` (`SoftYielding` functions that only call `checkpoint()` ARE allowed inside `noyield`)",
                     caller_disp, sub_chain
                 );
                 self.emit(
@@ -1244,26 +1348,102 @@ impl Analyzer {
                         DiagnosticKind::YieldInNoYield,
                         edge.span,
                         format!(
-                            "cannot call yielding function '{}' inside 'noyield' scope",
+                            "cannot call hard-blocking function '{}' inside 'noyield' scope",
                             edge.callee
                         ),
                     )
-                    .with_file(caller_file)
+                    .with_file(caller_file.clone())
                     .with_note(note),
                 );
             }
+
+            // 1b. Boot-only `spawns_in_boot` call-site checks.
+            if callee_node.spawns_in_boot {
+                let spawn_chain = callee_node.spawn_chain.join(" -> ");
+                if edge.ctx.in_defer {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::InvalidControlFlow,
+                            edge.span,
+                            format!(
+                                "cannot call boot-spawning function '{}' inside 'defer' cleanup statement",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("spawn chain: {}", spawn_chain)),
+                    );
+                } else if edge.caller_kind == CallableKind::Task {
+                    let task_name = edge.caller.strip_prefix("task::").unwrap_or(&edge.caller);
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::InvalidSpawnContext,
+                            edge.span,
+                            format!(
+                                "cannot call boot-spawning function '{}' inside task '{}'; tasks must be statically spawned in 'main()' boot setup",
+                                edge.callee, task_name
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("spawn chain: {}", spawn_chain)),
+                    );
+                } else if edge.caller_kind == CallableKind::Isr || edge.ctx.in_isr {
+                    let isr_name = edge.caller.strip_prefix("isr::").unwrap_or(&edge.caller);
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::InvalidSpawnContext,
+                            edge.span,
+                            format!(
+                                "cannot call boot-spawning function '{}' inside ISR '{}'",
+                                edge.callee, isr_name
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("spawn chain: {}", spawn_chain)),
+                    );
+                } else if edge.ctx.in_loop {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::InvalidSpawnContext,
+                            edge.span,
+                            format!(
+                                "cannot call boot-spawning function '{}' inside a loop; every static boot-tree path must map 1:1 to a task slot",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("spawn chain: {}", spawn_chain)),
+                    );
+                } else if edge.ctx.after_diverge || edge.ctx.after_main_supervisor {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::InvalidSpawnContext,
+                            edge.span,
+                            format!(
+                                "cannot call boot-spawning function '{}' after 'main()' supervisor loop or diverging control flow",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("spawn chain: {}", spawn_chain)),
+                    );
+                }
+            }
         }
 
-        // 2. Check all `extern "C"` callback arguments for yielding functions.
+        // 2. Check all `extern "C"` callback arguments for yielding or boot-spawning functions.
         let cb_sites = self.call_graph.extern_callbacks.clone();
         for site in &cb_sites {
-            if let Some(cb_node) = self.call_graph.nodes.get(&site.callback_fn) {
-                if cb_node.can_yield {
+            if let Some(cb_node) = self.call_graph.nodes.get(&site.callback_fn).cloned() {
+                if cb_node.any_yield_effect.can_yield() {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
+                    let sub_chain = self
+                        .call_graph
+                        .shortest_any_yield_chain(&site.callback_fn)
+                        .join(" -> ");
                     let note = format!(
                         "yield chain: extern \"C\" {}(...) callback -> {}; stackless coroutines cannot suspend across C stack frames—pass a non-yielding `fn` callback",
-                        site.extern_fn,
-                        cb_node.yield_chain.join(" -> ")
+                        site.extern_fn, sub_chain
                     );
                     self.emit(
                         Diagnostic::new(
@@ -1278,10 +1458,47 @@ impl Analyzer {
                         .with_note(note),
                     );
                 }
+                if cb_node.spawns_in_boot {
+                    let cb_file = self.node_files.get(&site.callback_fn).cloned();
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::InvalidSpawnContext,
+                            site.span,
+                            format!(
+                                "cannot pass boot-spawning function '{}' as callback to extern \"C\" function '{}'",
+                                site.callback_fn, site.extern_fn
+                            ),
+                        )
+                        .with_file(cb_file),
+                    );
+                }
             }
         }
 
-        // 3. Detect recursive call cycles across yielding functions.
+        // 3. Detect recursive call cycles across boot-spawning functions (`E0027`) and yielding functions (`E0012`).
+        let spawning_cycles = self.call_graph.find_spawning_cycles();
+        for (cycle, span) in &spawning_cycles {
+            let cycle_file = cycle
+                .first()
+                .and_then(|f| self.node_files.get(f))
+                .cloned();
+            let cycle_str = cycle.join(" -> ");
+            self.emit(
+                Diagnostic::new(
+                    DiagnosticKind::InvalidSpawnContext,
+                    *span,
+                    format!(
+                        "recursive call cycle across boot-spawning function: {}",
+                        cycle_str
+                    ),
+                )
+                .with_file(cycle_file)
+                .with_note(
+                    "boot-tree `spawn` functions must form a static DAG so task slots are statically bounded at compile time",
+                ),
+            );
+        }
+
         for (cycle, span) in self.call_graph.find_yielding_cycles() {
             let cycle_file = cycle
                 .first()
@@ -1302,7 +1519,18 @@ impl Analyzer {
             );
         }
 
-        // 4. Synchronize resolved `can_yield` and callee lists into `FunctionInfo`, `TaskInfo`, and `IsrInfo`.
+        // 4. Verify interprocedural static-reference provenance for parameters forwarded into `spawn` (`E0010`),
+        //    then unroll `main()`'s static boot tree into `self.spawned_tasks`.
+        self.verify_boot_spawn_arg_provenance();
+        self.unroll_boot_spawn_tree();
+
+        // 5. Compute 3-tier `SoftYielding` coroutine vs `noyield` dual specializations.
+        let (soft_coro, soft_ny, dual_spec) = self.call_graph.compute_soft_specializations();
+        self.soft_yielding_in_coro = soft_coro;
+        self.soft_yielding_in_noyield = soft_ny;
+        self.dual_specialized_fns = dual_spec;
+
+        // 6. Synchronize resolved `effect`, `can_yield`, `spawns_in_boot`, and callee lists into `FunctionInfo`, `TaskInfo`, and `IsrInfo`.
         let fn_names: Vec<String> = self.functions.keys().cloned().collect();
         for name in fn_names {
             let callees = self.call_graph.callees_of(&name);
@@ -1313,6 +1541,8 @@ impl Analyzer {
             ) {
                 info.direct_yield = node.direct_yield;
                 info.can_yield = node.can_yield;
+                info.effect = node.effect;
+                info.spawns_in_boot = node.spawns_in_boot;
                 info.yield_chain = node.yield_chain.clone();
                 info.callees = callees;
                 info.yielding_callees = yielding_callees;
@@ -1329,6 +1559,7 @@ impl Analyzer {
             {
                 info.direct_yield = node.direct_yield;
                 info.can_yield = node.can_yield;
+                info.effect = node.effect;
                 info.callees = callees;
                 info.yielding_callees = yielding_callees;
             }
@@ -1340,6 +1571,195 @@ impl Analyzer {
             let callees = self.call_graph.callees_of(&key);
             if let Some(info) = self.isrs.get_mut(&name) {
                 info.callees = callees;
+            }
+        }
+    }
+
+    fn verify_boot_spawn_arg_provenance(&mut self) {
+        let mut spawning_ref_params: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        for (fn_name, steps) in &self.fn_boot_steps {
+            for step in steps {
+                if let BootStep::DirectSpawn { arg_bindings, .. } = step {
+                    for b in arg_bindings {
+                        if !b.ref_param_origins.is_empty() {
+                            spawning_ref_params
+                                .entry(fn_name.clone())
+                                .or_default()
+                                .extend(b.ref_param_origins.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for call in &self.recorded_call_args {
+                let Some(callee_params) = spawning_ref_params.get(&call.callee).cloned() else {
+                    continue;
+                };
+                for p_idx in callee_params {
+                    if let Some(arg) = call.args.get(p_idx) {
+                        for &caller_p in &arg.ref_param_origins {
+                            if spawning_ref_params
+                                .entry(call.caller.clone())
+                                .or_default()
+                                .insert(caller_p)
+                            {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let calls = self.recorded_call_args.clone();
+        for call in &calls {
+            let Some(callee_params) = spawning_ref_params.get(&call.callee) else {
+                continue;
+            };
+            let caller_file = self.node_files.get(&call.caller).cloned();
+            for &p_idx in callee_params {
+                if let Some(arg) = call.args.get(p_idx) {
+                    if arg.has_non_static_local_ref {
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::SpawnNonStaticReference,
+                                arg.span,
+                                format!(
+                                    "cannot pass non-static reference/slice into boot helper '{}' (argument {}): parameter is forwarded into 'spawn' and outlives local stack variables",
+                                    call.callee,
+                                    p_idx + 1
+                                ),
+                            )
+                            .with_file(caller_file.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn unroll_boot_spawn_tree(&mut self) {
+        self.spawned_tasks.clear();
+        for t in self.tasks.values_mut() {
+            t.instance_count = 0;
+        }
+
+        let roots: Vec<String> = if self.functions.contains_key("main") {
+            vec!["main".to_string()]
+        } else {
+            let mut called_by_fn = BTreeSet::new();
+            for e in &self.call_graph.edges {
+                if e.caller_kind == CallableKind::Fn {
+                    called_by_fn.insert(e.callee.clone());
+                }
+            }
+            self.fn_decl_order
+                .iter()
+                .filter(|name| {
+                    !called_by_fn.contains(*name)
+                        && self
+                            .call_graph
+                            .nodes
+                            .get(*name)
+                            .is_some_and(|n| n.spawns_in_boot)
+                })
+                .cloned()
+                .collect()
+        };
+
+        for root in roots {
+            let mut path = vec![root.clone()];
+            let mut visiting = BTreeSet::new();
+            visiting.insert(root.clone());
+            self.unroll_boot_fn(&root, &mut path, false, &[], &mut visiting);
+        }
+    }
+
+    fn unroll_boot_fn(
+        &mut self,
+        fn_name: &str,
+        path: &mut Vec<String>,
+        cond_active: bool,
+        param_endpoints: &[Option<String>],
+        visiting: &mut BTreeSet<String>,
+    ) {
+        let Some(steps) = self.fn_boot_steps.get(fn_name).cloned() else {
+            return;
+        };
+        for step in steps {
+            match step {
+                BootStep::DirectSpawn {
+                    task_name,
+                    priority,
+                    core,
+                    conditional,
+                    arg_bindings,
+                    span,
+                } => {
+                    let mut endpoint_bindings = Vec::with_capacity(arg_bindings.len());
+                    for b in &arg_bindings {
+                        let resolved = b.static_endpoint.clone().or_else(|| {
+                            b.endpoint_from_param
+                                .and_then(|idx| param_endpoints.get(idx).cloned().flatten())
+                        });
+                        endpoint_bindings.push(resolved);
+                    }
+                    let mut provenance_path = path.clone();
+                    provenance_path.push(task_name.clone());
+                    let instance_id = self.spawned_tasks.len();
+                    self.spawned_tasks.push(SpawnedTaskInstance {
+                        instance_id,
+                        task_name: task_name.clone(),
+                        priority,
+                        core,
+                        spawned_in: fn_name.to_string(),
+                        provenance_path,
+                        conditional: cond_active || conditional,
+                        endpoint_bindings,
+                        span,
+                    });
+                    if let Some(t) = self.tasks.get_mut(&task_name) {
+                        t.instance_count += 1;
+                    }
+                }
+                BootStep::HelperCall {
+                    callee,
+                    conditional,
+                    args,
+                } => {
+                    let spawns = self
+                        .call_graph
+                        .nodes
+                        .get(&callee)
+                        .is_some_and(|n| n.spawns_in_boot);
+                    if !spawns || !visiting.insert(callee.clone()) {
+                        continue;
+                    }
+                    let mut child_endpoints = Vec::with_capacity(args.len());
+                    for a in &args {
+                        let resolved = a.static_endpoint.clone().or_else(|| {
+                            a.endpoint_from_param
+                                .and_then(|idx| param_endpoints.get(idx).cloned().flatten())
+                        });
+                        child_endpoints.push(resolved);
+                    }
+                    path.push(callee.clone());
+                    self.unroll_boot_fn(
+                        &callee,
+                        path,
+                        cond_active || conditional,
+                        &child_endpoints,
+                        visiting,
+                    );
+                    path.pop();
+                    visiting.remove(&callee);
+                }
             }
         }
     }
@@ -1360,6 +1780,12 @@ struct BodyChecker<'a> {
     loop_depth: u32,
     noyield_depth: u32,
     critical_depth: u32,
+    defer_depth: u32,
+    branch_depth: u32,
+    after_diverge: bool,
+    main_supervisor_started: bool,
+    param_names: Vec<String>,
+    boot_steps: Vec<BootStep>,
     return_param_origins: BTreeSet<usize>,
     recorded_boosts: Vec<PriorityBoostSite>,
     last_struct_lit_fields: BTreeMap<(u32, u32), BTreeMap<String, Provenance>>,
@@ -1385,6 +1811,12 @@ impl<'a> BodyChecker<'a> {
             loop_depth: 0,
             noyield_depth: 0,
             critical_depth: 0,
+            defer_depth: 0,
+            branch_depth: 0,
+            after_diverge: false,
+            main_supervisor_started: false,
+            param_names: Vec::new(),
+            boot_steps: Vec::new(),
             return_param_origins: BTreeSet::new(),
             recorded_boosts: Vec::new(),
             last_struct_lit_fields: BTreeMap::new(),
@@ -1409,11 +1841,33 @@ impl<'a> BodyChecker<'a> {
         self.noyield_depth > 0
     }
 
+    fn in_defer(&self) -> bool {
+        self.defer_depth > 0
+    }
+
+    fn can_record_boot_step(&self) -> bool {
+        self.caller_kind == CallableKind::Fn
+            && self.loop_depth == 0
+            && self.defer_depth == 0
+            && !self.after_diverge
+            && !self.main_supervisor_started
+    }
+
+    fn resolve_param_endpoint_index(&self, endpoint_name: &Option<String>) -> Option<usize> {
+        let ep = endpoint_name.as_deref()?;
+        let pname = ep.strip_prefix("param:")?;
+        self.param_names.iter().position(|n| n == pname)
+    }
+
     fn call_context(&self) -> CallContext {
         CallContext {
             in_noyield: self.in_noyield(),
             in_critical: self.in_critical(),
             in_isr: self.in_isr(),
+            in_defer: self.in_defer(),
+            in_loop: self.loop_depth > 0,
+            after_diverge: self.after_diverge,
+            after_main_supervisor: self.main_supervisor_started,
         }
     }
 
@@ -1425,6 +1879,7 @@ impl<'a> BodyChecker<'a> {
     }
 
     fn bind_params(&mut self, params: &[ParamInfo]) {
+        self.param_names = params.iter().map(|p| p.name.clone()).collect();
         for (idx, p) in params.iter().enumerate() {
             let is_ptr = matches!(p.ty, Ty::Ptr(_));
             let endpoint_alias = match &p.ty {
@@ -1532,7 +1987,7 @@ impl<'a> BodyChecker<'a> {
         format!("check variant definitions on enum `{}`", enum_name)
     }
 
-    fn record_direct_yield(&mut self, span: Span, construct_desc: &str) {
+    fn record_direct_yield(&mut self, span: Span, tier: FnEffect, construct_desc: &str) {
         if self.in_isr() {
             let isr_name = self.display_caller_name().to_string();
             self.sema.emit(Diagnostic::new(
@@ -1549,6 +2004,15 @@ impl<'a> BodyChecker<'a> {
                     construct_desc
                 ),
             ));
+        } else if self.in_defer() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::YieldInNoYield,
+                span,
+                format!(
+                    "cannot yield via {} inside 'defer' cleanup statement",
+                    construct_desc
+                ),
+            ));
         } else if self.in_noyield() {
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::YieldInNoYield,
@@ -1558,7 +2022,7 @@ impl<'a> BodyChecker<'a> {
         } else {
             self.sema
                 .call_graph
-                .mark_direct_yield(&self.caller_key, construct_desc);
+                .mark_direct_yield(&self.caller_key, tier, construct_desc);
         }
     }
 
@@ -1599,16 +2063,34 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    /// Analyze a list of statements in the current scope. Returns `true` if control flow diverges
-    /// (`return`, `error`, `break`, `continue`, or infinite loop without `break`).
-    fn check_block_stmts(&mut self, stmts: &[Stmt]) -> bool {
+    /// Analyze a slice of statements, returning `(diverged, warned_unreachable)`.
+    fn check_stmt_slice(&mut self, stmts: &[Stmt]) -> (bool, bool) {
+        let prev_after_diverge = self.after_diverge;
         let mut diverged = false;
+        let mut warned_unreachable = false;
         for stmt in stmts {
+            if diverged {
+                if !warned_unreachable {
+                    warned_unreachable = true;
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::UnreachableCode,
+                        stmt.span,
+                        "unreachable statement following diverging control flow",
+                    ));
+                }
+                self.after_diverge = true;
+            }
             if self.check_stmt(stmt) {
                 diverged = true;
             }
         }
-        diverged
+        self.after_diverge = prev_after_diverge;
+        (diverged, warned_unreachable)
+    }
+
+    /// Analyze a list of statements in the current scope. Returns `true` if control flow diverges.
+    fn check_block_stmts(&mut self, stmts: &[Stmt]) -> bool {
+        self.check_stmt_slice(stmts).0
     }
 
     fn check_nested_block(&mut self, block: &Block) -> bool {
@@ -1698,6 +2180,17 @@ impl<'a> BodyChecker<'a> {
             }
 
             StmtKind::Return(opt_expr) => {
+                if self.in_defer() {
+                    if let Some(e) = opt_expr {
+                        let _ = self.check_expr_infallible(e);
+                    }
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        stmt.span,
+                        "'return' cannot be used inside a 'defer' cleanup statement",
+                    ));
+                    return true;
+                }
                 match &self.body_kind.clone() {
                     ActiveBodyKind::Isr => {
                         if let Some(e) = opt_expr {
@@ -1712,12 +2205,15 @@ impl<'a> BodyChecker<'a> {
                     ActiveBodyKind::Task => {
                         if let Some(e) = opt_expr {
                             let _ = self.check_expr_infallible(e);
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::ReturnMismatch,
-                                stmt.span,
-                                "tasks cannot return a value; use 'return;' for one-shot task completion",
-                            ));
                         }
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::NonDivergingTask,
+                            stmt.span,
+                            format!(
+                                "cannot 'return' from task '{}'; tasks are permanent actors (keep running inside 'loop' / 'loop every', park on 'inbox.recv()' / 'signal.wait()', reset via 'restart;', or move finite workflows into yielding 'fn's)",
+                                self.display_caller_name()
+                            ),
+                        ));
                     }
                     ActiveBodyKind::Fn { ret_ty, .. } => match (ret_ty.is_void(), opt_expr) {
                         (true, None) => {}
@@ -1785,6 +2281,15 @@ impl<'a> BodyChecker<'a> {
             StmtKind::Error { reason, partial } => {
                 let r_val = reason.as_ref().map(|r| self.check_expr_infallible(r));
                 let p_val = partial.as_ref().map(|p| self.check_expr_infallible(p));
+
+                if self.in_defer() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        stmt.span,
+                        "'error' exit cannot be used inside a 'defer' cleanup statement",
+                    ));
+                    return true;
+                }
 
                 match &self.body_kind.clone() {
                     ActiveBodyKind::Task | ActiveBodyKind::Isr => {
@@ -1943,7 +2448,9 @@ impl<'a> BodyChecker<'a> {
                 let base_vars = self.snapshot_outer_vars();
                 let base_leases = self.leases.clone();
 
+                self.branch_depth += 1;
                 let then_div = self.check_nested_block(then_block);
+                self.branch_depth -= 1;
                 let then_vars = self.snapshot_outer_vars();
                 let then_leases = self.leases.clone();
 
@@ -1951,7 +2458,9 @@ impl<'a> BodyChecker<'a> {
                 self.leases = base_leases.clone();
 
                 if let Some(eb) = else_block {
+                    self.branch_depth += 1;
                     let else_div = self.check_nested_block(eb);
+                    self.branch_depth -= 1;
                     let else_vars = self.snapshot_outer_vars();
                     let else_leases = self.leases.clone();
 
@@ -1986,13 +2495,10 @@ impl<'a> BodyChecker<'a> {
 
             StmtKind::While { cond, body } => {
                 let is_while_true = matches!(cond.kind, ExprKind::Literal(Literal::Bool(true)));
-                if is_while_true && self.in_critical() {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::UnboundedLoopInCritical,
-                        stmt.span,
-                        "unbounded loop ('while (true)') is forbidden inside 'critical' block while hardware IRQs are masked",
-                    ));
-                }
+                let manual_yield =
+                    has_attr_manual_yield(&stmt.attrs) || has_attr_noyield(&stmt.attrs);
+                let has_break = block_has_break(body);
+
                 let cv = self.check_expr_infallible(cond);
                 if !cv.ty.is_bool() && !cv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
@@ -2001,16 +2507,69 @@ impl<'a> BodyChecker<'a> {
                         format!("'while' condition must be 'bool', found '{}'", cv.ty),
                     ));
                 }
-                if is_while_true && !has_attr_manual_yield(&stmt.attrs) && !has_attr_noyield(&stmt.attrs) {
-                    self.record_direct_yield(stmt.span, "auto-yield unbounded loop");
+
+                if is_while_true {
+                    if self.in_critical() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::UnboundedLoopInCritical,
+                            stmt.span,
+                            "unbounded loop ('while (true)') is forbidden inside 'critical' block while hardware IRQs are masked",
+                        ));
+                    } else if self.in_isr() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::YieldInIsr,
+                            stmt.span,
+                            format!(
+                                "unbounded 'while (true)' loop is forbidden inside ISR '{}'",
+                                self.display_caller_name()
+                            ),
+                        ));
+                    } else if self.in_defer() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            stmt.span,
+                            "unbounded 'while (true)' loop is forbidden inside 'defer' cleanup statement",
+                        ));
+                    } else if self.in_noyield() {
+                        if !manual_yield {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::YieldInNoYield,
+                                stmt.span,
+                                "auto-yield 'while (true)' loop is forbidden inside 'noyield' block",
+                            ));
+                        } else if !has_break {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::YieldInNoYield,
+                                stmt.span,
+                                "infinite 'while (true)' without 'break' inside 'noyield' block would permanently starve the cooperative scheduler",
+                            ));
+                        }
+                    } else if !has_break {
+                        self.sema.call_graph.mark_direct_yield(
+                            &self.caller_key,
+                            FnEffect::HardBlocking,
+                            "while (true) (infinite loop)",
+                        );
+                    } else if !manual_yield {
+                        self.sema.call_graph.mark_direct_yield(
+                            &self.caller_key,
+                            FnEffect::SoftYielding,
+                            "while (true) (should_share)",
+                        );
+                    }
                 }
-                self.check_loop_body(body, false);
-                false
+
+                self.check_loop_body(body, is_while_true && !has_break);
+                if is_while_true && self.caller_key == "main" {
+                    self.main_supervisor_started = true;
+                }
+                is_while_true && !has_break
             }
 
             StmtKind::Loop { body } => {
                 let manual_yield =
                     has_attr_manual_yield(&stmt.attrs) || has_attr_noyield(&stmt.attrs);
+                let has_break = block_has_break(body);
 
                 if self.in_critical() {
                     self.sema.emit(
@@ -2019,7 +2578,7 @@ impl<'a> BodyChecker<'a> {
                             stmt.span,
                             "unbounded 'loop' is forbidden inside 'critical' block (IRQ-masked blocks must stay bounded)",
                         )
-                        .with_note("move the loop outside 'critical' or bound work per iteration"),
+                        .with_note("move the loop outside 'critical' or use a bounded 'for..in' / 'while' loop"),
                     );
                 } else if self.in_isr() {
                     self.sema.emit(Diagnostic::new(
@@ -2030,6 +2589,12 @@ impl<'a> BodyChecker<'a> {
                             self.display_caller_name()
                         ),
                     ));
+                } else if self.in_defer() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::YieldInNoYield,
+                        stmt.span,
+                        "'loop' is forbidden inside 'defer' cleanup statement",
+                    ));
                 } else if self.in_noyield() {
                     if !manual_yield {
                         self.sema.emit(
@@ -2039,33 +2604,233 @@ impl<'a> BodyChecker<'a> {
                                 "auto-yield 'loop' is forbidden inside 'noyield' block",
                             )
                             .with_note(
-                                "use a bounded 'while' loop or '@manual_yield' with an explicit exit condition",
+                                "use a bounded 'for..in' / 'while' loop or '@manual_yield' with an explicit 'break'",
                             ),
                         );
-                    } else if !block_has_break(body) {
+                    } else if !has_break {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::YieldInNoYield,
                             stmt.span,
                             "infinite 'loop' without 'break' inside 'noyield' block would permanently starve the cooperative scheduler",
                         ));
                     }
+                } else if !has_break {
+                    self.sema.call_graph.mark_direct_yield(
+                        &self.caller_key,
+                        FnEffect::HardBlocking,
+                        "loop (infinite)",
+                    );
                 } else if !manual_yield {
-                    self.sema
-                        .call_graph
-                        .mark_direct_yield(&self.caller_key, "loop (should_share)");
+                    self.sema.call_graph.mark_direct_yield(
+                        &self.caller_key,
+                        FnEffect::SoftYielding,
+                        "loop (should_share)",
+                    );
                 }
 
-                let has_break = block_has_break(body);
                 self.check_loop_body(body, !has_break);
+                if self.caller_key == "main" {
+                    self.main_supervisor_started = true;
+                }
                 !has_break
             }
 
-            StmtKind::Every { interval, body } => {
-                self.sema.validate_duration(interval);
-                self.record_direct_yield(stmt.span, "'every' periodic deadline");
+            StmtKind::LoopEvery { period, body } => {
+                let pv = self.check_expr_infallible(period);
+                if pv.ty.is_integer() {
+                    let is_zero = match &period.kind {
+                        ExprKind::Literal(Literal::Int(0)) => true,
+                        ExprKind::Ident(id) => self
+                            .sema
+                            .consts
+                            .get(&id.name)
+                            .is_some_and(|c| c.int_value == Some(0)),
+                        _ => false,
+                    };
+                    if is_zero {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidDurationResolution,
+                            period.span,
+                            "periodic 'loop every' interval must be greater than 0",
+                        ));
+                    }
+                } else if pv.ty != Ty::Duration && !pv.ty.is_error() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        period.span,
+                        format!(
+                            "'loop every' period must be a duration (e.g. 1ms) or integer expression, found '{}'",
+                            pv.ty
+                        ),
+                    ));
+                }
+
+                self.record_direct_yield(
+                    stmt.span,
+                    FnEffect::HardBlocking,
+                    "'loop every' periodic deadline",
+                );
                 let has_break = block_has_break(body);
                 self.check_loop_body(body, !has_break);
+                if self.caller_key == "main" {
+                    self.main_supervisor_started = true;
+                }
                 !has_break
+            }
+
+            StmtKind::ForRange {
+                var_ty,
+                var_name,
+                start,
+                end,
+                inclusive: _,
+                body,
+            } => {
+                let resolved_var_ty = self.sema.resolve_type(var_ty);
+                if !resolved_var_ty.is_integer() && !resolved_var_ty.is_error() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        var_ty.span,
+                        format!(
+                            "'for' range loop variable '{}' must have an integer type, found '{}'",
+                            var_name.name, resolved_var_ty
+                        ),
+                    ));
+                }
+                let sv = self.check_expr_infallible(start);
+                if !sv.ty.is_assignable_to(&resolved_var_ty)
+                    && !resolved_var_ty.is_error()
+                    && !sv.ty.is_error()
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        start.span,
+                        format!(
+                            "'for' range start has type '{}', expected '{}'",
+                            sv.ty, resolved_var_ty
+                        ),
+                    ));
+                }
+                let ev = self.check_expr_infallible(end);
+                if !ev.ty.is_assignable_to(&resolved_var_ty)
+                    && !resolved_var_ty.is_error()
+                    && !ev.ty.is_error()
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        end.span,
+                        format!(
+                            "'for' range end has type '{}', expected '{}'",
+                            ev.ty, resolved_var_ty
+                        ),
+                    ));
+                }
+
+                self.check_for_loop_with_binding(
+                    &var_name.name,
+                    resolved_var_ty,
+                    Provenance::pure_static(),
+                    iter_span_none(),
+                    body,
+                );
+                false
+            }
+
+            StmtKind::ForEach {
+                elem_ty,
+                elem_name,
+                iter,
+                body,
+            } => {
+                let resolved_elem_ty = self.sema.resolve_type(elem_ty);
+                let iv = self.check_expr_infallible(iter);
+                let deref_iter_ty = match &iv.ty {
+                    Ty::Ptr(inner) => (**inner).clone(),
+                    other => other.clone(),
+                };
+                match &deref_iter_ty {
+                    Ty::Slice(seq_elem) | Ty::Array { elem: seq_elem, .. } => {
+                        if !seq_elem.is_assignable_to(&resolved_elem_ty)
+                            && !resolved_elem_ty.is_error()
+                            && !seq_elem.is_error()
+                        {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::TypeMismatch,
+                                elem_ty.span,
+                                format!(
+                                    "'for..in' element '{}' declared as '{}', but iterable yields '{}'",
+                                    elem_name.name, resolved_elem_ty, seq_elem
+                                ),
+                            ));
+                        }
+                    }
+                    _ => {
+                        if !iv.ty.is_error() {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::TypeMismatch,
+                                iter.span,
+                                format!(
+                                    "cannot iterate over type '{}' in 'for..in' loop (expected slice '[]T' or array '[N]T')",
+                                    iv.ty
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                self.check_for_loop_with_binding(
+                    &elem_name.name,
+                    resolved_elem_ty,
+                    iv.prov,
+                    Some(iter.span),
+                    body,
+                );
+                false
+            }
+
+            StmtKind::Defer(inner) => {
+                if self.in_defer() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        stmt.span,
+                        "nested 'defer' inside a 'defer' statement is not allowed",
+                    ));
+                }
+                if matches!(inner.kind, StmtKind::VarDecl { .. }) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        inner.span,
+                        "cannot declare a standalone variable directly inside 'defer'; wrap cleanup statements in 'defer { ... }' if temporaries are needed",
+                    ));
+                }
+                self.defer_depth += 1;
+                self.noyield_depth += 1;
+                let _ = self.with_nested_scope(|this| this.check_stmt(inner));
+                self.noyield_depth -= 1;
+                self.defer_depth -= 1;
+                false
+            }
+
+            StmtKind::Restart => {
+                if self.in_defer() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        stmt.span,
+                        "'restart;' cannot be used inside a 'defer' cleanup statement",
+                    ));
+                } else if !matches!(self.body_kind, ActiveBodyKind::Task) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        stmt.span,
+                        format!(
+                            "'restart;' is only valid inside a 'task' body, not inside '{}'",
+                            self.display_caller_name()
+                        ),
+                    ));
+                } else {
+                    self.record_direct_yield(stmt.span, FnEffect::SoftYielding, "'restart;'");
+                }
+                true
             }
 
             StmtKind::NoYield { body } => {
@@ -2182,7 +2947,9 @@ impl<'a> BodyChecker<'a> {
 
                     self.scopes = base_vars.clone();
                     self.leases = base_leases.clone();
+                    self.branch_depth += 1;
                     let arm_div = self.check_nested_block(&arm.body);
+                    self.branch_depth -= 1;
                     if !arm_div {
                         all_arms_diverge = false;
                         live_var_branches.push(self.snapshot_outer_vars());
@@ -2212,29 +2979,41 @@ impl<'a> BodyChecker<'a> {
             }
 
             StmtKind::Continue => {
-                if self.loop_depth == 0 {
+                if self.in_defer() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidControlFlow,
                         stmt.span,
-                        "'continue' may only be used inside a 'loop', 'while', or 'every' body",
+                        "'continue' cannot be used inside a 'defer' cleanup statement",
+                    ));
+                } else if self.loop_depth == 0 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        stmt.span,
+                        "'continue' may only be used inside a 'loop', 'loop every', 'while', or 'for' body",
                     ));
                 }
                 true
             }
 
             StmtKind::Break => {
-                if self.loop_depth == 0 {
+                if self.in_defer() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidControlFlow,
                         stmt.span,
-                        "'break' may only be used inside a 'loop', 'while', or 'every' body",
+                        "'break' cannot be used inside a 'defer' cleanup statement",
+                    ));
+                } else if self.loop_depth == 0 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        stmt.span,
+                        "'break' may only be used inside a 'loop', 'loop every', 'while', or 'for' body",
                     ));
                 }
                 true
             }
 
             StmtKind::Checkpoint => {
-                self.record_direct_yield(stmt.span, "'checkpoint()'");
+                self.record_direct_yield(stmt.span, FnEffect::SoftYielding, "'checkpoint()'");
                 false
             }
 
@@ -2242,7 +3021,93 @@ impl<'a> BodyChecker<'a> {
 
             StmtKind::Expr(e) => {
                 let _ = self.check_expr_infallible(e);
-                false
+                self.lookup_local("sys").is_none() && is_sys_exit_expr(e)
+            }
+        }
+    }
+
+    fn check_for_loop_with_binding(
+        &mut self,
+        var_name: &str,
+        var_ty: Ty,
+        var_prov: Provenance,
+        iter_span: Option<Span>,
+        body: &Block,
+    ) {
+        let leases_before = self.leases.clone();
+        let entry_depth = self.current_depth();
+        self.loop_depth += 1;
+        self.loop_entry_depths.push(entry_depth);
+        self.loop_outer_reads.push(Vec::new());
+
+        self.with_nested_scope(|this| {
+            let bind_depth = this.current_depth();
+            this.scopes.last_mut().unwrap().insert(
+                var_name.to_string(),
+                LocalVar {
+                    name: var_name.to_string(),
+                    ty: var_ty,
+                    decl_depth: bind_depth,
+                    prov: var_prov.clone(),
+                    field_prov: BTreeMap::new(),
+                    endpoint_alias: None,
+                },
+            );
+            let _ = this.check_block_stmts(&body.stmts);
+        });
+
+        let outer_reads = self.loop_outer_reads.pop().unwrap_or_default();
+        self.loop_entry_depths.pop();
+        self.loop_depth -= 1;
+
+        let modified = self.leases.modified_sources_since(&leases_before);
+        if !modified.is_empty() {
+            if let Some(isp) = iter_span {
+                for tok in &var_prov.leases {
+                    if let Some(inv_span) = modified.get(&tok.source) {
+                        if leases_before.check_valid(tok).is_ok() {
+                            let mut diag = Diagnostic::new(
+                                DiagnosticKind::StaleDmaLease,
+                                isp,
+                                format!(
+                                    "cannot iterate over slice derived from '{}.wait_chunk()' across a loop body that calls 'wait_chunk()'",
+                                    tok.source
+                                ),
+                            );
+                            if let Some(sp) = inv_span {
+                                diag = diag.with_note(format!(
+                                    "DMA lease invalidated inside 'for..in' body via 'wait_chunk()' at {}",
+                                    sp
+                                ));
+                            }
+                            self.sema.emit(diag);
+                        }
+                    }
+                }
+            }
+
+            for (r_name, read_env, r_prov, read_span) in outer_reads {
+                for tok in &r_prov.leases {
+                    if let Some(inv_span) = modified.get(&tok.source) {
+                        if read_env.check_valid(tok).is_ok() {
+                            let mut diag = Diagnostic::new(
+                                DiagnosticKind::StaleDmaLease,
+                                read_span,
+                                format!(
+                                    "cannot read outer variable '{}' derived from '{}.wait_chunk()' across loop iterations that call 'wait_chunk()'",
+                                    r_name, tok.source
+                                ),
+                            );
+                            if let Some(sp) = inv_span {
+                                diag = diag.with_note(format!(
+                                    "subsequent loop iteration invalidates lease via 'wait_chunk()' at {}",
+                                    sp
+                                ));
+                            }
+                            self.sema.emit(diag);
+                        }
+                    }
+                }
             }
         }
     }
@@ -2293,24 +3158,56 @@ impl<'a> BodyChecker<'a> {
     }
 
     fn check_spawn(&mut self, sp: &SpawnStmt) {
-        if self.in_isr() {
+        let mut invalid_ctx = false;
+        if self.in_defer() {
+            invalid_ctx = true;
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::InvalidControlFlow,
                 sp.span,
                 format!(
-                    "cannot 'spawn' task '{}' inside ISR '{}'; tasks must be statically spawned in sequential setup",
+                    "cannot 'spawn' task '{}' inside a 'defer' cleanup statement",
+                    sp.task.name
+                ),
+            ));
+        } else if self.in_isr() {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::InvalidSpawnContext,
+                sp.span,
+                format!(
+                    "cannot 'spawn' task '{}' inside ISR '{}'; tasks must be statically spawned in 'main()' boot setup",
                     sp.task.name,
                     self.display_caller_name()
                 ),
             ));
-            return;
-        }
-        if self.loop_depth > 0 {
+        } else if matches!(self.body_kind, ActiveBodyKind::Task) {
+            invalid_ctx = true;
             self.sema.emit(Diagnostic::new(
-                DiagnosticKind::InvalidControlFlow,
+                DiagnosticKind::InvalidSpawnContext,
                 sp.span,
                 format!(
-                    "cannot 'spawn' task '{}' inside a loop; every 'spawn' site must map 1:1 to a static task slot",
+                    "cannot 'spawn' task '{}' inside task '{}'; dynamic runtime task spawning is forbidden—wire all tasks in 'main()' boot setup",
+                    sp.task.name,
+                    self.display_caller_name()
+                ),
+            ));
+        } else if self.loop_depth > 0 {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::InvalidSpawnContext,
+                sp.span,
+                format!(
+                    "cannot 'spawn' task '{}' inside a loop; every static boot-tree path must map 1:1 to a task slot",
+                    sp.task.name
+                ),
+            ));
+        } else if self.after_diverge || self.main_supervisor_started {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::InvalidSpawnContext,
+                sp.span,
+                format!(
+                    "cannot 'spawn' task '{}' after 'main()' supervisor loop or diverging control flow",
                     sp.task.name
                 ),
             ));
@@ -2357,9 +3254,10 @@ impl<'a> BodyChecker<'a> {
             ));
         }
 
-        let mut endpoint_bindings = Vec::new();
+        let mut arg_bindings = Vec::with_capacity(sp.args.len());
         for (i, arg) in sp.args.iter().enumerate() {
             let val = self.check_expr_infallible(&arg.value);
+            let mut ref_param_origins = BTreeSet::new();
             if let Some(param) = task_info.params.get(i) {
                 if !val.ty.is_assignable_to(&param.ty) {
                     self.sema.emit(Diagnostic::new(
@@ -2374,37 +3272,45 @@ impl<'a> BodyChecker<'a> {
                         ),
                     ));
                 }
-                if param.ty.contains_reference(&self.sema.structs)
-                    && (val.prov.origin_depth > 0
-                        || !val.prov.local_origins.is_empty()
-                        || !val.prov.leases.is_empty())
-                {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::SpawnNonStaticReference,
-                        arg.span,
-                        format!(
-                            "cannot pass non-static reference/slice into 'spawn {}' (argument {}): spawned tasks outlive local stack variables and DMA leases",
-                            sp.task.name,
-                            i + 1
-                        ),
-                    ));
+                if param.ty.contains_reference(&self.sema.structs) {
+                    if val.prov.has_non_returning_origin() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::SpawnNonStaticReference,
+                            arg.span,
+                            format!(
+                                "cannot pass non-static reference/slice into 'spawn {}' (argument {}): spawned tasks outlive local stack variables and DMA leases",
+                                sp.task.name,
+                                i + 1
+                            ),
+                        ));
+                    } else {
+                        ref_param_origins = val.prov.param_origins.clone();
+                    }
                 }
             }
-            endpoint_bindings.push(val.endpoint_name);
+            let endpoint_from_param = self.resolve_param_endpoint_index(&val.endpoint_name);
+            let static_endpoint = val
+                .endpoint_name
+                .filter(|ep| !ep.starts_with("param:"));
+            arg_bindings.push(BootArgBinding {
+                static_endpoint,
+                endpoint_from_param,
+                ref_param_origins,
+            });
         }
 
-        let instance_id = self.sema.spawned_tasks.len();
-        self.sema.spawned_tasks.push(SpawnedTaskInstance {
-            instance_id,
-            task_name: sp.task.name.clone(),
-            priority: sp.priority.unwrap_or(Priority::Normal),
-            core: sp.core,
-            spawned_in: self.display_caller_name().to_string(),
-            endpoint_bindings,
-            span: sp.span,
-        });
-        if let Some(t) = self.sema.tasks.get_mut(&sp.task.name) {
-            t.instance_count += 1;
+        if !invalid_ctx && self.can_record_boot_step() {
+            self.sema
+                .call_graph
+                .mark_direct_spawn(&self.caller_key, &sp.task.name);
+            self.boot_steps.push(BootStep::DirectSpawn {
+                task_name: sp.task.name.clone(),
+                priority: sp.priority.unwrap_or(Priority::Normal),
+                core: sp.core,
+                conditional: self.branch_depth > 0,
+                arg_bindings,
+                span: sp.span,
+            });
         }
     }
 
@@ -3833,6 +4739,7 @@ impl<'a> BodyChecker<'a> {
         }
 
         let mut arg_vals = Vec::with_capacity(args.len());
+        let mut boot_call_args = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let av = self.check_expr_infallible(&arg.value);
             if let Some(param) = fn_info.params.get(i) {
@@ -3862,7 +4769,36 @@ impl<'a> BodyChecker<'a> {
                     });
                 }
             }
+
+            let endpoint_from_param = self.resolve_param_endpoint_index(&av.endpoint_name);
+            let static_endpoint = av
+                .endpoint_name
+                .clone()
+                .filter(|ep| !ep.starts_with("param:"));
+            let has_non_static_local_ref = av.prov.has_non_returning_origin();
+            boot_call_args.push(BootCallArg {
+                static_endpoint,
+                endpoint_from_param,
+                has_non_static_local_ref,
+                ref_param_origins: av.prov.param_origins.clone(),
+                span: arg.span,
+            });
             arg_vals.push(av);
+        }
+
+        if !fn_info.is_extern_c {
+            self.sema.recorded_call_args.push(RecordedCallArgs {
+                caller: self.caller_key.clone(),
+                callee: fn_info.name.clone(),
+                args: boot_call_args.clone(),
+            });
+            if self.can_record_boot_step() {
+                self.boot_steps.push(BootStep::HelperCall {
+                    callee: fn_info.name.clone(),
+                    conditional: self.branch_depth > 0,
+                    args: boot_call_args,
+                });
+            }
         }
 
         // Compute return value provenance if `fn_info.ret_ty` carries references/slices.
@@ -3952,7 +4888,7 @@ impl<'a> BodyChecker<'a> {
                         let _ = self.check_expr_infallible(&a.value);
                     }
                 }
-                self.record_direct_yield(span, "'checkpoint()'");
+                self.record_direct_yield(span, FnEffect::SoftYielding, "'checkpoint()'");
                 Some(ExprVal::scalar(Ty::void(), span))
             }
 
@@ -3974,7 +4910,7 @@ impl<'a> BodyChecker<'a> {
                         ));
                     }
                 }
-                self.record_direct_yield(span, "'delay()'");
+                self.record_direct_yield(span, FnEffect::HardBlocking, "'delay()'");
                 Some(ExprVal::scalar(Ty::void(), span))
             }
 
@@ -4319,7 +5255,7 @@ impl<'a> BodyChecker<'a> {
                         ));
                     }
                 }
-                self.record_direct_yield(span, "sys.delay()");
+                self.record_direct_yield(span, FnEffect::HardBlocking, "sys.delay()");
                 ExprVal::scalar(Ty::void(), span)
             }
 
@@ -4559,7 +5495,11 @@ impl<'a> BodyChecker<'a> {
             ResolvedOsPrimitive::Signal => match m {
                 "wait" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
-                    self.record_direct_yield(span, &format!("{}.wait()", source_key));
+                    self.record_direct_yield(
+                        span,
+                        FnEffect::HardBlocking,
+                        &format!("{}.wait()", source_key),
+                    );
                     ExprVal {
                         ty: Ty::void(),
                         error_spec: if has_timeout {
@@ -4594,7 +5534,11 @@ impl<'a> BodyChecker<'a> {
                 }
                 "wait_change" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
-                    self.record_direct_yield(span, &format!("{}.wait_change()", source_key));
+                    self.record_direct_yield(
+                        span,
+                        FnEffect::HardBlocking,
+                        &format!("{}.wait_change()", source_key),
+                    );
                     ExprVal {
                         ty: (**elem).clone(),
                         error_spec: if has_timeout {
@@ -4615,54 +5559,17 @@ impl<'a> BodyChecker<'a> {
                     self.expect_single_elem(m, &pos_vals, elem, span);
                     ExprVal::scalar(Ty::void(), span)
                 }
-                "recv" => {
-                    self.expect_positional_arity(m, &pos_vals, 0, span);
-                    self.record_direct_yield(span, &format!("{}.recv()", source_key));
-                    ExprVal {
-                        ty: (**elem).clone(),
-                        error_spec: if has_timeout {
-                            ResolvedErrorSpec::Untyped
-                        } else {
-                            ResolvedErrorSpec::None
-                        },
-                        prov: Provenance::pure_static(),
-                        endpoint_name: None,
-                        span,
-                    }
-                }
-                "try_recv" => {
-                    self.expect_positional_arity(m, &pos_vals, 0, span);
-                    ExprVal {
-                        ty: (**elem).clone(),
-                        error_spec: ResolvedErrorSpec::Untyped,
-                        prov: Provenance::pure_static(),
-                        endpoint_name: None,
-                        span,
-                    }
-                }
-                "len" => {
-                    self.expect_positional_arity(m, &pos_vals, 0, span);
-                    ExprVal::scalar(Ty::usize(), span)
-                }
-                "is_empty" | "is_full" => {
-                    self.expect_positional_arity(m, &pos_vals, 0, span);
-                    ExprVal::scalar(Ty::bool(), span)
-                }
-                _ => self.unknown_prim_method(prim, method, span),
-            },
-
-            ResolvedOsPrimitive::Chan { elem, .. } => match m {
-                "post" => {
-                    self.expect_single_elem(m, &pos_vals, elem, span);
-                    ExprVal::scalar(Ty::void(), span)
-                }
                 "try_send" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
                     ExprVal::scalar(Ty::bool(), span)
                 }
                 "send" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
-                    self.record_direct_yield(span, &format!("{}.send()", source_key));
+                    self.record_direct_yield(
+                        span,
+                        FnEffect::HardBlocking,
+                        &format!("{}.send()", source_key),
+                    );
                     ExprVal {
                         ty: Ty::void(),
                         error_spec: if has_timeout {
@@ -4677,7 +5584,11 @@ impl<'a> BodyChecker<'a> {
                 }
                 "recv" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
-                    self.record_direct_yield(span, &format!("{}.recv()", source_key));
+                    self.record_direct_yield(
+                        span,
+                        FnEffect::HardBlocking,
+                        &format!("{}.recv()", source_key),
+                    );
                     ExprVal {
                         ty: (**elem).clone(),
                         error_spec: if has_timeout {
@@ -4718,7 +5629,11 @@ impl<'a> BodyChecker<'a> {
                 }
                 "wait_chunk" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
-                    self.record_direct_yield(span, &format!("{}.wait_chunk()", source_key));
+                    self.record_direct_yield(
+                        span,
+                        FnEffect::HardBlocking,
+                        &format!("{}.wait_chunk()", source_key),
+                    );
                     let gen = self.leases.acquire_next(source_key, span);
                     let prov =
                         Provenance::dma_lease(source_key.to_string(), gen, self.current_depth(), span);
@@ -4752,7 +5667,11 @@ impl<'a> BodyChecker<'a> {
                 }
                 "wait_chunk" | "acquire" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
-                    self.record_direct_yield(span, &format!("{}.{}()", source_key, m));
+                    self.record_direct_yield(
+                        span,
+                        FnEffect::HardBlocking,
+                        &format!("{}.{}()", source_key, m),
+                    );
                     let gen = self.leases.acquire_next(source_key, span);
                     let prov =
                         Provenance::dma_lease(source_key.to_string(), gen, self.current_depth(), span);
@@ -4989,14 +5908,31 @@ impl<'a> BodyChecker<'a> {
 
             if !iv.ty.is_void() && !clause.body.stmts.is_empty() {
                 let (prefix, last) = clause.body.stmts.split_at(clause.body.stmts.len() - 1);
-                let mut div = this.check_block_stmts(prefix);
+                let (mut div, warned) = this.check_stmt_slice(prefix);
+                let prev_after = this.after_diverge;
+                if div {
+                    if !warned {
+                        this.sema.emit(Diagnostic::new(
+                            DiagnosticKind::UnreachableCode,
+                            last[0].span,
+                            "unreachable statement following diverging control flow",
+                        ));
+                    }
+                    this.after_diverge = true;
+                }
                 if let StmtKind::Expr(last_expr) = &last[0].kind {
                     let lv = this.check_expr_infallible(last_expr);
+                    if this.lookup_local("sys").is_none() && is_sys_exit_expr(last_expr) {
+                        this.after_diverge = prev_after;
+                        return (true, None);
+                    }
+                    this.after_diverge = prev_after;
                     return (div, Some(lv));
                 }
                 if this.check_stmt(&last[0]) {
                     div = true;
                 }
+                this.after_diverge = prev_after;
                 (div, None)
             } else {
                 (this.check_block_stmts(&clause.body.stmts), None)
@@ -5124,6 +6060,26 @@ fn unify_integer_arith(lhs: &Ty, rhs: &Ty) -> Ty {
     }
 }
 
+const fn iter_span_none() -> Option<Span> {
+    None
+}
+
+fn is_sys_exit_expr(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::MethodCall {
+            receiver, method, ..
+        } => matches!(&receiver.kind, ExprKind::Ident(id) if id.name == "sys") && method.name == "exit",
+        ExprKind::Call { callee, .. } => match &callee.kind {
+            ExprKind::Field { target, field } => {
+                matches!(&target.kind, ExprKind::Ident(id) if id.name == "sys")
+                    && field.name == "exit"
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// Returns `true` if `block` contains a `break` targeting the enclosing loop (not nested inside an inner loop).
 fn block_has_break(block: &Block) -> bool {
     stmts_have_break(&block.stmts)
@@ -5160,7 +6116,11 @@ fn stmts_have_break(stmts: &[Stmt]) -> bool {
                 }
             }
             // Inner loops consume their own `break`.
-            StmtKind::Loop { .. } | StmtKind::While { .. } | StmtKind::Every { .. } => {}
+            StmtKind::Loop { .. }
+            | StmtKind::While { .. }
+            | StmtKind::LoopEvery { .. }
+            | StmtKind::ForRange { .. }
+            | StmtKind::ForEach { .. } => {}
             _ => {}
         }
     }

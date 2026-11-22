@@ -179,14 +179,48 @@ fn json_escape(s: &str) -> String {
     out
 }
 
+pub fn format_check_human_ok(
+    files: usize,
+    spawned_tasks: usize,
+    primitives: usize,
+    tick_period_us: u64,
+    dual_specialized: &[String],
+) -> String {
+    let mut sorted: Vec<&str> = dual_specialized.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    if sorted.is_empty() {
+        format!(
+            "OK ({files} file(s) verified, {spawned_tasks} task instance(s), {primitives} primitive(s), tick={tick_period_us}us)"
+        )
+    } else {
+        format!(
+            "OK ({files} file(s) verified, {spawned_tasks} task instance(s), {primitives} primitive(s), tick={tick_period_us}us, dual_specialized=[{}])",
+            sorted.join(", ")
+        )
+    }
+}
+
 pub fn render_check_json_ok(
     files: usize,
     spawned_tasks: usize,
     primitives: usize,
     tick_period_us: u64,
+    dual_specialized: &[String],
 ) -> String {
+    let mut sorted: Vec<&str> = dual_specialized.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut dual_json = String::from("[");
+    for (idx, name) in sorted.iter().enumerate() {
+        if idx > 0 {
+            dual_json.push_str(", ");
+        }
+        let _ = write!(dual_json, "\"{}\"", json_escape(name));
+    }
+    dual_json.push(']');
     format!(
-        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"diagnostics\": []}}"
+        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"dual_specialized_functions\": {dual_json}, \"diagnostics\": []}}"
     )
 }
 
@@ -261,5 +295,29 @@ mod tests {
         let json = render_check_json_err(&diags);
         assert!(json.starts_with("{\"ok\": false, \"diagnostics\": [{\"code\": \"P0001\""));
         assert!(json.contains("\"doc_cmd\": \"zevc doc P0001\""));
+    }
+
+    #[test]
+    fn renders_dual_specialized_functions_in_json_and_human_ok_outputs() {
+        let empty_json = render_check_json_ok(1, 2, 3, 1000, &[]);
+        assert_eq!(
+            empty_json,
+            "{\"ok\": true, \"files\": 1, \"spawned_tasks\": 2, \"primitives\": 3, \"tick_period_us\": 1000, \"dual_specialized_functions\": [], \"diagnostics\": []}"
+        );
+        assert_eq!(
+            format_check_human_ok(1, 2, 3, 1000, &[]),
+            "OK (1 file(s) verified, 2 task instance(s), 3 primitive(s), tick=1000us)"
+        );
+
+        let fns = vec!["sha256_block".to_string(), "crc_chunk".to_string()];
+        let dual_json = render_check_json_ok(2, 4, 5, 1000, &fns);
+        assert!(
+            dual_json.contains("\"dual_specialized_functions\": [\"crc_chunk\", \"sha256_block\"]"),
+            "json={dual_json}"
+        );
+        assert_eq!(
+            format_check_human_ok(2, 4, 5, 1000, &fns),
+            "OK (2 file(s) verified, 4 task instance(s), 5 primitive(s), tick=1000us, dual_specialized=[crc_chunk, sha256_block])"
+        );
     }
 }
