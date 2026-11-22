@@ -565,7 +565,11 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                     span: gv.span,
                 });
             }
-            ItemKind::Import(_) | ItemKind::Enum(_) | ItemKind::Struct(_) => {}
+            ItemKind::Import(_)
+            | ItemKind::Enum(_)
+            | ItemKind::Struct(_)
+            | ItemKind::Mmio(_)
+            | ItemKind::Irq(_) => {}
         }
     }
 
@@ -633,6 +637,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         let body = dctx.lower_top_level_stmts(&id.body.stmts)?;
         mir_isrs.push(MirIsr {
             name: id.vector.name.clone(),
+            params: Vec::new(),
+            state_vars: Vec::new(),
             vars: dctx.vars,
             body,
         });
@@ -776,9 +782,12 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         consts: mir_consts,
         enums: mir_enums,
         structs: mir_structs,
+        mmio_layouts: Vec::new(),
+        mmio_instances: Vec::new(),
         primitives: mir_primitives,
         extern_fns: mir_extern_fns,
         isrs: mir_isrs,
+        irq_vectors: Vec::new(),
         functions: mir_functions,
         task_blueprints: mir_blueprints,
         spawned_tasks,
@@ -1218,6 +1227,7 @@ fn scan_stmts_effect(
     for stmt in stmts {
         let stmt_manual = manual_yield || has_attr_manual_yield(&stmt.attrs);
         match &stmt.kind {
+            StmtKind::StateVar { .. } => {}
             StmtKind::LoopEvery { period, body } => {
                 if !in_noyield && !in_restricted {
                     *eff = (*eff).max(MirFnEffect::HardBlocking);
@@ -2514,6 +2524,7 @@ impl<'a> DirectLowerCtx<'a> {
                     });
                 }
             }
+            StmtKind::StateVar { .. } => {}
             StmtKind::Assign { target, op, value } => {
                 let (place, pty) = self.lower_place(target, &mut out)?;
                 let rhs = self.lower_expr_with_stmts(value, Some(&pty.host_value_type()), &mut out)?;
@@ -3885,6 +3896,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                     }
                 }
             }
+            StmtKind::StateVar { .. } => {}
             StmtKind::Assign { target, op, value } => {
                 if *op == MirAssignOp::Assign.into_ast_check() {
                     // handled uniformly below

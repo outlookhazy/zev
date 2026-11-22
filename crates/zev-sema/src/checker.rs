@@ -2522,6 +2522,7 @@ impl<'a> BodyChecker<'a> {
                 false
             }
 
+            StmtKind::StateVar { .. } => false,
             StmtKind::Assign { target, op, value } => {
                 let rhs = self.check_expr_infallible(value);
                 self.check_assignment(target, *op, value, rhs, stmt.span);
@@ -4291,6 +4292,7 @@ impl<'a> BodyChecker<'a> {
             }
 
             ExprKind::StructLit {
+                module: _,
                 name,
                 generic_args,
                 fields,

@@ -143,6 +143,7 @@ pub struct ArchRamTotals {
     pub boot_frames_bytes: usize,
     pub tcb_table_bytes: usize,
     pub primitives_bytes: usize,
+    pub isr_state_bytes: usize,
     pub scheduler_bytes: usize,
     pub total_sram_bytes: usize,
     pub naive_total_sram_bytes: usize,
@@ -157,6 +158,7 @@ pub struct RamReport {
     pub spawned_tasks: Vec<SpawnedTaskRam>,
     pub primitives: Vec<PrimitiveRam>,
     pub boot_frames: Vec<(String, usize, usize)>,
+    pub isr_states: Vec<(String, String, usize, usize)>,
     pub dual_specialized_fns: Vec<DualSpecializedFnRam>,
     pub monomorphized_instances: Vec<MonomorphizedMirItem>,
     pub mcu32: ArchRamTotals,
@@ -475,7 +477,12 @@ impl<'a> LayoutCtx<'a> {
                 SizeAlign::new(4, 4)
             }
             MirType::U64 | MirType::I64 | MirType::F64 => SizeAlign::new(8, 8),
-            MirType::Usize | MirType::Isize | MirType::Str | MirType::Ptr(_) | MirType::FnPtr { .. } => {
+            MirType::Usize
+            | MirType::Isize
+            | MirType::Str
+            | MirType::Ptr(_)
+            | MirType::MmioPtr(_)
+            | MirType::FnPtr { .. } => {
                 SizeAlign::new(ptr, ptr)
             }
             MirType::EndianInt { bits, .. } => {
@@ -781,6 +788,7 @@ pub fn compute_ram_report(
         spawned_tasks,
         primitives: prim_rams,
         boot_frames,
+        isr_states: Vec::new(),
         dual_specialized_fns,
         monomorphized_instances: Vec::new(),
         mcu32,
@@ -837,6 +845,7 @@ fn summarize_arch(
         boot_frames_bytes,
         tcb_table_bytes,
         primitives_bytes,
+        isr_state_bytes: 0,
         scheduler_bytes: sched,
         total_sram_bytes,
         naive_total_sram_bytes,

@@ -74,6 +74,7 @@ mod tests {
 
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Import(ImportDecl {
                 path: vec![id("chip"), id("stm32g4")],
                 alias: Some(id("hw")),
@@ -84,6 +85,7 @@ mod tests {
 
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Enum(EnumDecl {
                 name: id("SupEvent"),
                 variants: vec![
@@ -114,6 +116,7 @@ mod tests {
                     kind: AttrKind::DmaSafe,
                     span: sp,
                 }],
+                is_pub: false,
                 kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                     attrs: vec![],
                     ty: OsPrimitiveType::PingPong {
@@ -131,6 +134,7 @@ mod tests {
         for wname in ["motor1_rpm", "motor2_rpm"] {
             items.push(Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                     attrs: vec![],
                     ty: OsPrimitiveType::Watch {
@@ -146,6 +150,7 @@ mod tests {
 
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                 attrs: vec![],
                 ty: OsPrimitiveType::Inbox {
@@ -162,6 +167,7 @@ mod tests {
         // fn adc_read_rpm(u8 ch) -> u16
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false, generic_params: vec![],
@@ -201,6 +207,7 @@ mod tests {
         // fn pi_step(u16 target, u16 actual, *i32 integral) -> u16
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false, generic_params: vec![],
@@ -237,6 +244,7 @@ mod tests {
         // fn save_fault_record(u32 bad_cnt) — yielding with live locals across delay(2ms)
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false, generic_params: vec![],
@@ -299,6 +307,7 @@ mod tests {
         // fn scrub_flash_crc() — yielding via unbounded loop with live locals
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false, generic_params: vec![],
@@ -389,6 +398,7 @@ mod tests {
         );
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Task(TaskDecl {
                 attrs: vec![],
                 name: id("motor_control"),
@@ -548,6 +558,7 @@ mod tests {
         );
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Task(TaskDecl {
                 attrs: vec![],
                 name: id("fieldbus_listener"),
@@ -622,6 +633,7 @@ mod tests {
         };
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false, generic_params: vec![],
@@ -634,6 +646,7 @@ mod tests {
                     vec![
                         Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("motor_control"),
                                 args: vec![addr_of("motor1_rpm"), CallArg::positional(expr_int(1))],
                                 priority: Some(Priority::Critical),
@@ -644,6 +657,7 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("motor_control"),
                                 args: vec![addr_of("motor2_rpm"), CallArg::positional(expr_int(2))],
                                 priority: Some(Priority::Critical),
@@ -654,6 +668,7 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("fieldbus_listener"),
                                 args: vec![addr_of("uart1_dma"), addr_of("motor1_rpm")],
                                 priority: Some(Priority::Normal),
@@ -664,6 +679,7 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("fieldbus_listener"),
                                 args: vec![addr_of("uart2_dma"), addr_of("motor2_rpm")],
                                 priority: Some(Priority::Normal),
@@ -900,6 +916,7 @@ mod tests {
         let prog = Program::new(
             vec![Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Task(TaskDecl {
                     attrs: vec![],
                     name: id("fast"),
@@ -938,6 +955,7 @@ mod tests {
             vec![
                 Item {
                     attrs: vec![],
+                    is_pub: false,
                     kind: ItemKind::Const(ConstDecl {
                         ty: ty_prim(PrimType::U8),
                         name: id("CMD_A"),
@@ -948,6 +966,7 @@ mod tests {
                 },
                 Item {
                     attrs: vec![],
+                    is_pub: false,
                     kind: ItemKind::Const(ConstDecl {
                         ty: ty_prim(PrimType::U8),
                         name: id("CMD_B"),
@@ -965,6 +984,7 @@ mod tests {
                 },
                 Item {
                     attrs: vec![],
+                    is_pub: false,
                     kind: ItemKind::Enum(EnumDecl {
                         name: id("PktErr"),
                         variants: vec![EnumVariant {
@@ -978,6 +998,7 @@ mod tests {
                 },
                 Item {
                     attrs: vec![],
+                    is_pub: false,
                     kind: ItemKind::Fn(FnDecl {
                         attrs: vec![],
                         is_extern_c: false, generic_params: vec![],
@@ -1064,6 +1085,7 @@ mod tests {
                 },
                 Item {
                     attrs: vec![],
+                    is_pub: false,
                     kind: ItemKind::Fn(FnDecl {
                         attrs: vec![],
                         is_extern_c: false, generic_params: vec![],
@@ -1200,6 +1222,7 @@ mod tests {
         let items = vec![
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                     attrs: vec![],
                     ty: OsPrimitiveType::Watch {
@@ -1213,6 +1236,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                     attrs: vec![],
                     ty: OsPrimitiveType::Watch {
@@ -1226,6 +1250,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Task(TaskDecl {
                     attrs: vec![],
                     name: id("worker"),
@@ -1270,6 +1295,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Task(TaskDecl {
                     attrs: vec![],
                     name: id("diag_task"),
@@ -1294,6 +1320,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1317,6 +1344,7 @@ mod tests {
                         vec![
                             Stmt::new(
                                 StmtKind::Spawn(SpawnStmt {
+                                    module: None,
                                     task: id("worker"),
                                     args: vec![
                                         CallArg::positional(expr_int(10)),
@@ -1330,6 +1358,7 @@ mod tests {
                             ),
                             Stmt::new(
                                 StmtKind::Spawn(SpawnStmt {
+                                    module: None,
                                     task: id("worker"),
                                     args: vec![
                                         CallArg::positional(expr_int(20)),
@@ -1350,6 +1379,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1383,6 +1413,7 @@ mod tests {
                                     then_block: Block::new(
                                         vec![Stmt::new(
                                             StmtKind::Spawn(SpawnStmt {
+                                                module: None,
                                                 task: id("diag_task"),
                                                 args: vec![CallArg::positional(expr_int(99))],
                                                 priority: Some(Priority::Low),
@@ -1406,6 +1437,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1486,6 +1518,7 @@ mod tests {
             // u32 leaf_soft(u32 x) { checkpoint(); return x + 1; }
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1522,6 +1555,7 @@ mod tests {
             // u32 shared_soft(u32 n) { u32 acc = 0; for (u32 i in 0..=n) { acc += leaf_soft(i); } return acc; }
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1584,6 +1618,7 @@ mod tests {
             // u32 noyield_only_soft(u32 n) { checkpoint(); return n; }
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1610,6 +1645,7 @@ mod tests {
             // task runner()
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Task(TaskDecl {
                     attrs: vec![],
                     name: id("runner"),
@@ -1701,6 +1737,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1712,6 +1749,7 @@ mod tests {
                     body: Some(Block::new(
                         vec![Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("runner"),
                                 args: vec![],
                                 priority: Some(Priority::Normal),
@@ -1767,6 +1805,7 @@ mod tests {
         let items = vec![
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                     attrs: vec![],
                     ty: OsPrimitiveType::Signal,
@@ -1778,6 +1817,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                     attrs: vec![],
                     ty: OsPrimitiveType::Inbox {
@@ -1792,6 +1832,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Task(TaskDecl {
                     attrs: vec![],
                     name: id("actor"),
@@ -1879,6 +1920,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false, generic_params: vec![],
@@ -1890,6 +1932,7 @@ mod tests {
                     body: Some(Block::new(
                         vec![Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("actor"),
                                 args: vec![CallArg::positional(expr_int(10))],
                                 priority: Some(Priority::Normal),
@@ -1963,6 +2006,7 @@ mod tests {
             // Unmonomorphized template struct -> must be defensively skipped!
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Struct(StructDecl {
                     is_packed: false,
                     name: id("FixedVec"),
@@ -1979,6 +2023,7 @@ mod tests {
             // Monomorphized struct instance `@monomorphized("FixedVec<f32, 4>")`
             Item {
                 attrs: vec![mono_attr("FixedVec<f32, 4>")],
+                is_pub: false,
                 kind: ItemKind::Struct(StructDecl {
                     is_packed: false,
                     name: id("FixedVec__f32_4"),
@@ -2008,6 +2053,7 @@ mod tests {
             // Struct for `{pkt:?}` compile-time debug expansion
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Struct(StructDecl {
                     is_packed: false,
                     name: id("SensorPkt"),
@@ -2031,6 +2077,7 @@ mod tests {
             // Two enums: `BusErr` (formatted) and `UnusedEnum` (NOT formatted -> must NOT be in `formatted_enums`)
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Enum(EnumDecl {
                     name: id("BusErr"),
                     variants: vec![EnumVariant {
@@ -2044,6 +2091,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Enum(EnumDecl {
                     name: id("UnusedEnum"),
                     variants: vec![EnumVariant {
@@ -2058,6 +2106,7 @@ mod tests {
             // Monomorphized fn `@monomorphized("clamp<f32>")`
             Item {
                 attrs: vec![mono_attr("clamp<f32>")],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false,
@@ -2082,6 +2131,7 @@ mod tests {
             // Task holding hoisted `f32` + `f64` across `delay(1ms)` and formatting `{pkt:?}`, `{err}`, `fmt_buf`
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Task(TaskDecl {
                     attrs: vec![],
                     name: id("telem"),
@@ -2168,6 +2218,7 @@ mod tests {
                                                     name: id("pkt"),
                                                     init: Some(Expr::new(
                                                         ExprKind::StructLit {
+                                                            module: None,
                                                             name: id("SensorPkt"),
                                                             generic_args: vec![],
                                                             fields: vec![
@@ -2236,6 +2287,7 @@ mod tests {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false,
@@ -2248,6 +2300,7 @@ mod tests {
                     body: Some(Block::new(
                         vec![Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("telem"),
                                 args: vec![],
                                 priority: Some(Priority::Normal),
@@ -2320,6 +2373,7 @@ mod tests {
             // enum NavMode { Idle = 0, Cruise = 1 } (ONLY formatted via `[2]NavMode` `{modes:?}`!)
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Enum(EnumDecl {
                     name: id("NavMode"),
                     variants: vec![
@@ -2341,6 +2395,7 @@ mod tests {
             // Self-referential struct Node { u32 val; Node *next; }
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Struct(StructDecl {
                     is_packed: false,
                     name: id("Node"),
@@ -2370,6 +2425,7 @@ mod tests {
             // fn main() { Node n; [2]NavMode modes; println(f"{n:?} {modes:?}"); }
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false,

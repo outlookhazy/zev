@@ -86,6 +86,8 @@ pub enum MirType {
     Primitive(MirPrimKind),
     /// Hardware SVD peripheral handle (e.g., `hw.DMA1.CH5`, `hw.USART1`).
     HwPeripheral(String),
+    /// Typed pointer to an `mmio` register layout (`*UartRegs`).
+    MmioPtr(String),
     /// Function pointer type (for C interop callbacks).
     FnPtr {
         params: Vec<MirType>,
@@ -181,6 +183,7 @@ impl MirType {
             MirType::Ptr(inner) => format!("ptr_{}", inner.mangle_name()),
             MirType::Primitive(pk) => pk.mangle_name(),
             MirType::HwPeripheral(_) => "hw_periph".to_string(),
+            MirType::MmioPtr(n) => format!("mmio_ptr_{n}"),
             MirType::FnPtr { params, ret } => {
                 if params.is_empty() {
                     format!("fnptr_void_ret_{}", ret.mangle_name())
@@ -229,6 +232,7 @@ impl MirType {
             MirType::Ptr(inner) => format!("*{}", inner.display_name()),
             MirType::Primitive(pk) => pk.display_name(),
             MirType::HwPeripheral(p) => format!("hw.{p}"),
+            MirType::MmioPtr(n) => format!("*{n}"),
             MirType::FnPtr { .. } => "fn(...)".to_string(),
             MirType::Result { ok, err } => match err {
                 Some(e) => format!("{} error {}", ok.display_name(), e.display_name()),
@@ -373,6 +377,9 @@ pub enum VarRole {
     UserLocal,
     /// Compiler-synthesized state or temporary (e.g., `every` deadline, `wait` timeout, call temp).
     CompilerTemp,
+    /// ISR-private persistent static variable (`state Type name = init;`), passed as a pointer
+    /// to each per-attachment static storage slot.
+    IsrState,
 }
 
 /// Metadata and computed placement for a variable in a function or task.
@@ -484,6 +491,20 @@ pub enum MirStmt {
         dst_res: VarId,
         buf: MirExpr,
         chunks: Vec<MirFmtChunk>,
+    },
+    /// Volatile MMIO register write (`regs.cr1 = val;` or `regs.arr[i] = val;`).
+    MmioWrite {
+        base: Box<MirExpr>,
+        offset: u32,
+        elem_bits: u8,
+        index: Option<Box<MirExpr>>,
+        array_len: Option<usize>,
+        value: MirExpr,
+    },
+    /// Record runtime branch selection for conditional boot-branch `irq.attach(...)`.
+    SetIrqSelector {
+        symbol: String,
+        value: u8,
     },
 }
 
@@ -877,6 +898,16 @@ pub enum MirExprKind {
     ConstRef(String),
     GlobalPrimAddr(String),
     HwPeriphVal(Vec<String>),
+    /// Base address of a typed `mmio` peripheral instance (`MirType::MmioPtr(layout)`).
+    MmioAddr(String),
+    /// Volatile MMIO register read (`regs.isr` or `regs.arr[i]`).
+    MmioRead {
+        base: Box<MirExpr>,
+        offset: u32,
+        elem_bits: u8,
+        index: Option<Box<MirExpr>>,
+        array_len: Option<usize>,
+    },
     FnAddr(String),
     Var(VarId),
     Unary {
@@ -1021,12 +1052,100 @@ pub enum MirBinOp {
     LogicalOr,
 }
 
-/// Hardware Interrupt Service Routine (`isr NAME { ... }`). Always `noyield`.
+/// ISR-private `state` variable declared inside a [`MirIsr`] body.
+#[derive(Debug, Clone)]
+pub struct MirIsrStateDecl {
+    pub var_id: VarId,
+    pub name: String,
+    pub ty: MirType,
+    pub init: MirExpr,
+}
+
+/// Hardware Interrupt Service Routine (`isr NAME(...) { ... }`). Always `noyield`.
 #[derive(Debug, Clone)]
 pub struct MirIsr {
     pub name: String,
+    pub params: Vec<VarId>,
+    pub state_vars: Vec<MirIsrStateDecl>,
     pub vars: Vec<MirVar>,
     pub body: Vec<MirStmt>,
+}
+
+/// Access qualifier for a typed `mmio` register.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirMmioAccess {
+    Rw,
+    Ro,
+    Wo,
+    W1c,
+}
+
+/// A single register inside a [`MirMmioLayout`].
+#[derive(Debug, Clone)]
+pub struct MirMmioReg {
+    pub name: String,
+    pub access: MirMmioAccess,
+    pub elem_bits: u8,
+    pub array_len: Option<usize>,
+    pub offset: u32,
+}
+
+/// Reusable typed `mmio` register block layout.
+#[derive(Debug, Clone)]
+pub struct MirMmioLayout {
+    pub name: String,
+    pub byte_size: usize,
+    pub regs: Vec<MirMmioReg>,
+}
+
+/// Physical peripheral instance bound to a [`MirMmioLayout`] at `base_addr`.
+#[derive(Debug, Clone)]
+pub struct MirMmioInstance {
+    pub name: String,
+    pub layout: String,
+    pub base_addr: u64,
+    pub byte_size: usize,
+}
+
+/// Per-attachment static `.bss`/`.data` storage backing an ISR's `state` variable.
+#[derive(Debug, Clone)]
+pub struct MirIsrStateVar {
+    pub storage_symbol: String,
+    pub var_name: String,
+    pub ty: MirType,
+    pub init: MirExpr,
+}
+
+/// Compile-time baked argument passed to an attached ISR handler.
+#[derive(Debug, Clone)]
+pub enum MirBakedArg {
+    /// Address of a static OS/DMA primitive (`&sup_inbox`).
+    PrimAddr(String),
+    /// Base pointer of an `mmio` peripheral instance (`hw.USART1` / `&hw.USART1`).
+    MmioAddr(String),
+    /// Compile-time constant scalar (`u32`, `bool`, enum variant, etc.).
+    Const(MirExpr),
+}
+
+/// A single `.attach(...)` or `.attach_shared(...)` binding on a hardware IRQ vector.
+#[derive(Debug, Clone)]
+pub struct MirIrqBinding {
+    pub binding_id: usize,
+    pub isr_name: String,
+    pub baked_args: Vec<MirBakedArg>,
+    pub state_vars: Vec<MirIsrStateVar>,
+    /// Present only when mutually exclusive conditional boot branches bind the same IRQ.
+    pub cond_selector: Option<(String, u8)>,
+}
+
+/// Synthesized hardware IRQ vector entry for Flash `.isr_vector` / `INTMTX` dispatch.
+#[derive(Debug, Clone)]
+pub struct MirIrqVector {
+    pub irq_name: String,
+    pub irq_num: u32,
+    pub is_shared: bool,
+    pub selector_symbol: Option<String>,
+    pub bindings: Vec<MirIrqBinding>,
 }
 
 /// Body representation of a `MirFunction`.
@@ -1164,9 +1283,12 @@ pub struct MirModule {
     pub consts: Vec<MirConst>,
     pub enums: Vec<MirEnum>,
     pub structs: Vec<MirStruct>,
+    pub mmio_layouts: Vec<MirMmioLayout>,
+    pub mmio_instances: Vec<MirMmioInstance>,
     pub primitives: Vec<MirPrimitive>,
     pub extern_fns: Vec<MirExternFn>,
     pub isrs: Vec<MirIsr>,
+    pub irq_vectors: Vec<MirIrqVector>,
     pub functions: Vec<MirFunction>,
     pub task_blueprints: Vec<MirTaskBlueprint>,
     pub spawned_tasks: Vec<MirSpawnInstance>,

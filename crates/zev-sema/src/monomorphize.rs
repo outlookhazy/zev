@@ -384,7 +384,7 @@ impl<'a> Monomorphizer<'a> {
             let mut out_items = Vec::new();
             for (item_idx, item) in prog.items.iter().enumerate() {
                 match &item.kind {
-                    ItemKind::Import(_) | ItemKind::Enum(_) => {
+                    ItemKind::Import(_) | ItemKind::Enum(_) | ItemKind::Mmio(_) | ItemKind::Irq(_) => {
                         out_items.push(item.clone());
                     }
                     ItemKind::Struct(st) => {
@@ -397,6 +397,7 @@ impl<'a> Monomorphizer<'a> {
                             .unwrap_or_else(|| st.clone());
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
                             kind: ItemKind::Struct(rewritten),
                             span: item.span,
                         });
@@ -409,6 +410,7 @@ impl<'a> Monomorphizer<'a> {
                         let value = self.rewrite_expr(&c.value, &env, &mut scopes, Some(&ty)).0;
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
                             kind: ItemKind::Const(ConstDecl {
                                 ty,
                                 name: c.name.clone(),
@@ -429,6 +431,7 @@ impl<'a> Monomorphizer<'a> {
                             .map(|e| self.rewrite_expr(e, &env, &mut scopes, None).0);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
                             kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                                 attrs: p.attrs.clone(),
                                 ty,
@@ -448,6 +451,7 @@ impl<'a> Monomorphizer<'a> {
                             .map(|e| self.rewrite_expr(e, &env, &mut scopes, Some(&ty)).0);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
                             kind: ItemKind::GlobalVar(GlobalVarDecl {
                                 ty,
                                 name: g.name.clone(),
@@ -466,6 +470,7 @@ impl<'a> Monomorphizer<'a> {
                         let rewritten_fn = self.rewrite_fn_decl(f, pre_ret, &env);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
                             kind: ItemKind::Fn(rewritten_fn),
                             span: item.span,
                         });
@@ -487,6 +492,7 @@ impl<'a> Monomorphizer<'a> {
                         let body = self.rewrite_block(&t.body, &env, &mut scopes);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
                             kind: ItemKind::Task(TaskDecl {
                                 attrs: t.attrs.clone(),
                                 name: t.name.clone(),
@@ -502,9 +508,11 @@ impl<'a> Monomorphizer<'a> {
                         let body = self.rewrite_block(&i.body, &env, &mut scopes);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
                             kind: ItemKind::Isr(IsrDecl {
                                 attrs: i.attrs.clone(),
                                 vector: i.vector.clone(),
+                                params: i.params.clone(),
                                 body,
                                 span: i.span,
                             }),
@@ -556,6 +564,7 @@ impl<'a> Monomorphizer<'a> {
             });
             self.synth_fns_by_prog[job.prog_idx].push(Item {
                 attrs,
+                is_pub: false,
                 kind: ItemKind::Fn(synth_fn),
                 span: job.fn_span,
             });
@@ -1356,6 +1365,7 @@ impl<'a> Monomorphizer<'a> {
         });
         self.synth_structs_by_prog[tmpl.prog_idx].push(Item {
             attrs,
+            is_pub: false,
             kind: ItemKind::Struct(synth_decl),
             span: tmpl.decl.span,
         });
@@ -1545,6 +1555,20 @@ impl<'a> Monomorphizer<'a> {
                     init: r_init,
                 }
             }
+            StmtKind::StateVar { ty, name, init } => {
+                let r_ty = self.rewrite_type_expr(ty, env);
+                let r_init = init
+                    .as_ref()
+                    .map(|e| self.rewrite_expr(e, env, scopes, Some(&r_ty)).0);
+                if let Some(top) = scopes.last_mut() {
+                    top.insert(name.name.clone(), r_ty.clone());
+                }
+                StmtKind::StateVar {
+                    ty: r_ty,
+                    name: name.clone(),
+                    init: r_init,
+                }
+            }
             StmtKind::Assign { target, op, value } => {
                 let (rt, lhs_ty) = self.rewrite_expr(target, env, scopes, None);
                 let hint = match lhs_ty {
@@ -1699,6 +1723,7 @@ impl<'a> Monomorphizer<'a> {
                     })
                     .collect();
                 StmtKind::Spawn(SpawnStmt {
+                    module: sp.module.clone(),
                     task: sp.task.clone(),
                     args,
                     priority: sp.priority,
@@ -2006,6 +2031,7 @@ impl<'a> Monomorphizer<'a> {
             }
 
             ExprKind::StructLit {
+                module,
                 name,
                 generic_args,
                 fields,
@@ -2077,6 +2103,7 @@ impl<'a> Monomorphizer<'a> {
                     return (
                         Expr::new(
                             ExprKind::StructLit {
+                                module: module.clone(),
                                 name: out_ident,
                                 generic_args: Vec::new(),
                                 fields: rewritten_fields,
@@ -2122,6 +2149,7 @@ impl<'a> Monomorphizer<'a> {
                 (
                     Expr::new(
                         ExprKind::StructLit {
+                            module: module.clone(),
                             name: eff_name,
                             generic_args: Vec::new(),
                             fields: rewritten_fields,

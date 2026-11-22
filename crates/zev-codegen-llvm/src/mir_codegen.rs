@@ -983,6 +983,7 @@ impl<'a> ModuleCtx<'a> {
             MirType::Usize
             | MirType::Isize
             | MirType::Ptr(_)
+            | MirType::MmioPtr(_)
             | MirType::FnPtr { .. }
             | MirType::Str => (ptr_bytes, ptr_bytes),
             MirType::Slice(_) => (ptr_bytes * 2, ptr_bytes),
@@ -1045,7 +1046,9 @@ impl<'a> ModuleCtx<'a> {
             MirType::F64 => "double".to_string(),
             MirType::EndianInt { .. } => "i32".to_string(),
             MirType::Usize | MirType::Isize => self.opts.target.usize_llvm_ty().to_string(),
-            MirType::Ptr(_) | MirType::FnPtr { .. } | MirType::Str => "ptr".to_string(),
+            MirType::Ptr(_) | MirType::MmioPtr(_) | MirType::FnPtr { .. } | MirType::Str => {
+                "ptr".to_string()
+            }
             MirType::Slice(_) => format!("{{ ptr, {} }}", self.opts.target.usize_llvm_ty()),
             MirType::Array { elem, len } => {
                 let n = (*len).max(1);
@@ -3895,6 +3898,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirStmt::PrimOp(pop) => self.emit_prim_nonblocking(pop)?,
             MirStmt::Intrinsic(iop) => self.emit_intrinsic(iop)?,
+            MirStmt::MmioWrite { .. } | MirStmt::SetIrqSelector { .. } => {}
             MirStmt::EnterCritical => {
                 let pm = self.next_tmp();
                 self.emit_line(format!("{pm} = call i32 @__syn_crit_enter()"));
@@ -5115,6 +5119,15 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     |irq| irq as i32,
                 );
                 Ok(SsaVal::new("i32", format!("{id}")))
+            }
+            MirExprKind::MmioAddr(_) => Ok(SsaVal::new("ptr", "null")),
+            MirExprKind::MmioRead { elem_bits, .. } => {
+                let ity = match elem_bits {
+                    8 => "i8",
+                    16 => "i16",
+                    _ => "i32",
+                };
+                Ok(SsaVal::new(ity, "0"))
             }
             MirExprKind::FnAddr(fname) => {
                 if let Some(sig) = self.ctx.fn_sigs.get(fname) {

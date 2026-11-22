@@ -744,11 +744,7 @@ impl<'a> Parser<'a> {
                 }
                 let imp = self.parse_import()?;
                 let span = imp.span;
-                out.push(Item {
-                    attrs,
-                    kind: ItemKind::Import(imp),
-                    span,
-                });
+                out.push(Item::new(attrs, ItemKind::Import(imp), span));
             }
             TokenKind::KwPacked | TokenKind::KwStruct => {
                 let mut st = self.parse_struct()?;
@@ -760,47 +756,27 @@ impl<'a> Parser<'a> {
                 }
                 let span = first_span.merge(st.span);
                 st.span = span;
-                out.push(Item {
-                    attrs,
-                    kind: ItemKind::Struct(st),
-                    span,
-                });
+                out.push(Item::new(attrs, ItemKind::Struct(st), span));
             }
             TokenKind::KwEnum => {
                 let en = self.parse_enum()?;
                 let span = first_span.merge(en.span);
-                out.push(Item {
-                    attrs,
-                    kind: ItemKind::Enum(en),
-                    span,
-                });
+                out.push(Item::new(attrs, ItemKind::Enum(en), span));
             }
             TokenKind::KwIsr => {
                 let isr = self.parse_isr(attrs.clone(), first_span)?;
                 let span = isr.span;
-                out.push(Item {
-                    attrs,
-                    kind: ItemKind::Isr(isr),
-                    span,
-                });
+                out.push(Item::new(attrs, ItemKind::Isr(isr), span));
             }
             TokenKind::KwTask => {
                 let task = self.parse_task(attrs.clone(), first_span)?;
                 let span = task.span;
-                out.push(Item {
-                    attrs,
-                    kind: ItemKind::Task(task),
-                    span,
-                });
+                out.push(Item::new(attrs, ItemKind::Task(task), span));
             }
             TokenKind::KwConst => {
                 let c = self.parse_const(first_span)?;
                 let span = c.span;
-                out.push(Item {
-                    attrs,
-                    kind: ItemKind::Const(c),
-                    span,
-                });
+                out.push(Item::new(attrs, ItemKind::Const(c), span));
             }
             TokenKind::KwExtern => {
                 self.parse_extern_items(attrs, first_span, out)?;
@@ -808,11 +784,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwFn => {
                 let f = self.parse_kw_fn(attrs.clone(), false, first_span)?;
                 let span = f.span;
-                out.push(Item {
-                    attrs,
-                    kind: ItemKind::Fn(f),
-                    span,
-                });
+                out.push(Item::new(attrs, ItemKind::Fn(f), span));
             }
             _ => {
                 // Catch `ErrSet!RetType func(...)` at top-level (`P0007`)
@@ -831,11 +803,7 @@ impl<'a> Parser<'a> {
                 if self.at(&TokenKind::LParen) || self.at(&TokenKind::Lt) {
                     let f = self.finish_fn_after_name(attrs.clone(), false, ty, name, first_span)?;
                     let span = f.span;
-                    out.push(Item {
-                        attrs,
-                        kind: ItemKind::Fn(f),
-                        span,
-                    });
+                    out.push(Item::new(attrs, ItemKind::Fn(f), span));
                 } else {
                     let init = if self.eat(&TokenKind::Eq) {
                         Some(self.parse_expr()?)
@@ -846,9 +814,9 @@ impl<'a> Parser<'a> {
                     let span = first_span.merge(semi.span);
                     match ty.kind {
                         TypeKind::OsPrimitive(os_ty) => {
-                            out.push(Item {
-                                attrs: attrs.clone(),
-                                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                            out.push(Item::new(
+                                attrs.clone(),
+                                ItemKind::OsPrimitive(OsPrimitiveDecl {
                                     attrs,
                                     ty: os_ty,
                                     name,
@@ -856,19 +824,19 @@ impl<'a> Parser<'a> {
                                     span,
                                 }),
                                 span,
-                            });
+                            ));
                         }
                         _ => {
-                            out.push(Item {
+                            out.push(Item::new(
                                 attrs,
-                                kind: ItemKind::GlobalVar(GlobalVarDecl {
+                                ItemKind::GlobalVar(GlobalVarDecl {
                                     ty,
                                     name,
                                     init,
                                     span,
                                 }),
                                 span,
-                            });
+                            ));
                         }
                     }
                 }
@@ -1145,30 +1113,18 @@ impl<'a> Parser<'a> {
                     self.finish_fn_after_name(item_attrs.clone(), true, ty, name, item_start)?
                 };
                 let span = decl.span;
-                out.push(Item {
-                    attrs: item_attrs,
-                    kind: ItemKind::Fn(decl),
-                    span,
-                });
+                out.push(Item::new(item_attrs, ItemKind::Fn(decl), span));
             }
             self.expect(&TokenKind::RBrace)?;
         } else if self.at(&TokenKind::KwFn) {
             let decl = self.parse_kw_fn(attrs.clone(), true, first_span)?;
             let span = decl.span;
-            out.push(Item {
-                attrs,
-                kind: ItemKind::Fn(decl),
-                span,
-            });
+            out.push(Item::new(attrs, ItemKind::Fn(decl), span));
         } else {
             let (ty, name) = self.parse_typed_declarator("extern \"C\" function")?;
             let decl = self.finish_fn_after_name(attrs.clone(), true, ty, name, first_span)?;
             let span = decl.span;
-            out.push(Item {
-                attrs,
-                kind: ItemKind::Fn(decl),
-                span,
-            });
+            out.push(Item::new(attrs, ItemKind::Fn(decl), span));
         }
 
         Ok(())
@@ -1607,6 +1563,7 @@ impl<'a> Parser<'a> {
         Ok(IsrDecl {
             attrs,
             vector,
+            params: Vec::new(),
             body,
             span,
         })
@@ -2972,6 +2929,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::with_attrs(
             retained_stmt_attrs,
             StmtKind::Spawn(SpawnStmt {
+                module: None,
                 task,
                 args,
                 priority,
@@ -3910,6 +3868,7 @@ impl<'a> Parser<'a> {
         let rb = self.expect(&TokenKind::RBrace)?;
         Ok(Expr::new(
             ExprKind::StructLit {
+                module: None,
                 name,
                 generic_args,
                 fields,

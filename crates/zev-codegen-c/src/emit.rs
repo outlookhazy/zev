@@ -889,6 +889,7 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirType::Ptr(inner) => format!("{} *", self.c_type(inner)),
             MirType::Primitive(pk) => format!("syn_{}_t", pk.mangle_name()),
             MirType::HwPeripheral(_) => "syn_hw_periph_t".to_string(),
+            MirType::MmioPtr(_) => "volatile uint8_t *".to_string(),
             MirType::FnPtr { .. } => format!("syn_{}_t", ty.mangle_name()),
             MirType::Result { .. } => format!("syn_{}_t", ty.mangle_name()),
         }
@@ -913,7 +914,9 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             }
             MirType::F32 => "0.0f".to_string(),
             MirType::F64 => "0.0".to_string(),
-            MirType::Str | MirType::Ptr(_) | MirType::FnPtr { .. } => "NULL".to_string(),
+            MirType::Str | MirType::Ptr(_) | MirType::MmioPtr(_) | MirType::FnPtr { .. } => {
+                "NULL".to_string()
+            }
             MirType::Enum(name) => format!("((syn_enum_{name})0)"),
             MirType::EndianInt {
                 bits, big_endian, ..
@@ -2492,6 +2495,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     "{pad}    if (_sink.truncated) {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = true, .err = syn_FmtErr_Truncated, .val = _written }};\n{pad}    }} else {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = false, .val = _written }};\n{pad}    }}\n{pad}}}"
                 );
             }
+            MirStmt::MmioWrite { .. } | MirStmt::SetIrqSelector { .. } => {}
             MirStmt::EnterCritical => {
                 let _ = writeln!(self.out, "{pad}syn_enter_critical();");
             }
@@ -3010,6 +3014,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 }
                 format!("((syn_hw_periph_t)0x{hash:08X}U)")
             }
+            MirExprKind::MmioAddr(_) | MirExprKind::MmioRead { .. } => "0".to_string(),
             MirExprKind::FnAddr(fname) => {
                 if self.m.functions.iter().any(|f| f.name == *fname) {
                     format!("syn_fn_{fname}")

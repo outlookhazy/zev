@@ -150,6 +150,7 @@ mod tests {
         // packed struct CmdFrame { u8 op; u16be setpoint; u16be crc; }
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Struct(StructDecl {
                 is_packed: true,
                 name: id("CmdFrame"),
@@ -179,6 +180,7 @@ mod tests {
         // enum ParseErr { TooShort, BadCrc }
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Enum(EnumDecl {
                 name: id("ParseErr"),
                 variants: vec![
@@ -201,6 +203,7 @@ mod tests {
         // enum SupEvent { Overcurrent, BadPacket, IdleCheck }
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Enum(EnumDecl {
                 name: id("SupEvent"),
                 variants: vec![
@@ -231,6 +234,7 @@ mod tests {
                 kind: AttrKind::DmaSafe,
                 span: sp,
             }],
+            is_pub: false,
             kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                 attrs: vec![],
                 ty: OsPrimitiveType::PingPong {
@@ -247,6 +251,7 @@ mod tests {
         // watch<u16> motor1_rpm = 0; watch<u32> fault_saved = 0; watch<u32> scrub_runs = 0;
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                 attrs: vec![],
                 ty: OsPrimitiveType::Watch {
@@ -260,6 +265,7 @@ mod tests {
         });
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                 attrs: vec![],
                 ty: OsPrimitiveType::Watch {
@@ -273,6 +279,7 @@ mod tests {
         });
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                 attrs: vec![],
                 ty: OsPrimitiveType::Watch {
@@ -288,6 +295,7 @@ mod tests {
         // inbox<SupEvent, 8> sup_inbox;
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                 attrs: vec![],
                 ty: OsPrimitiveType::Inbox {
@@ -304,9 +312,11 @@ mod tests {
         // isr EXTI0 { hw.GPIOA.clear_pin(MOTOR_EN); sup_inbox.post(Overcurrent, boost: @critical); }
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Isr(IsrDecl {
                 attrs: vec![],
                 vector: id("EXTI0"),
+                params: vec![],
                 body: Block::new(
                     vec![
                         Stmt::new(
@@ -355,9 +365,11 @@ mod tests {
         // isr DMA1_CH5 { uart1_dma.flip(); }
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Isr(IsrDecl {
                 attrs: vec![],
                 vector: id("DMA1_CH5"),
+                params: vec![],
                 body: Block::new(
                     vec![Stmt::new(
                         StmtKind::Expr(Expr::new(
@@ -380,6 +392,7 @@ mod tests {
         // fn crc16([]u8 buf) -> u16: simple sum ((u16)buf[0] + (u16)buf[1] + (u16)buf[2])
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false,
@@ -458,6 +471,7 @@ mod tests {
         // u16 parse_setpoint([]u8 buf) error ParseErr
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false,
@@ -610,6 +624,7 @@ mod tests {
         // Yielding helper: save_fault_record(u32 bad_packets) — yields 1ms and records active priority!
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: true,
@@ -626,6 +641,7 @@ mod tests {
         });
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false,
@@ -709,6 +725,7 @@ mod tests {
         // Disjoint yielding sibling: scrub_flash_crc()
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false,
@@ -795,6 +812,7 @@ mod tests {
         );
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Task(TaskDecl {
                 attrs: vec![],
                 name: id("motor_control"),
@@ -922,6 +940,7 @@ mod tests {
         );
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Task(TaskDecl {
                 attrs: vec![],
                 name: id("fieldbus_listener"),
@@ -1056,6 +1075,7 @@ mod tests {
         };
         items.push(Item {
             attrs: vec![],
+            is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
                 is_extern_c: false,
@@ -1080,6 +1100,7 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("motor_control"),
                                 args: vec![addr_of("motor1_rpm"), CallArg::positional(expr_int(1))],
                                 priority: Some(Priority::Critical),
@@ -1090,6 +1111,7 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Spawn(SpawnStmt {
+                                module: None,
                                 task: id("fieldbus_listener"),
                                 args: vec![addr_of("uart1_dma"), addr_of("motor1_rpm")],
                                 priority: Some(Priority::Normal),
@@ -1377,6 +1399,7 @@ int main(void) {
         let items = vec![
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Enum(EnumDecl {
                     name: id("IoErr"),
                     variants: vec![EnumVariant {
@@ -1391,6 +1414,7 @@ int main(void) {
             // usize read_stream() error IoErr { error Timeout, 42; }
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false,
@@ -1416,6 +1440,7 @@ int main(void) {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
                     attrs: vec![],
                     ty: OsPrimitiveType::Watch {
@@ -1429,6 +1454,7 @@ int main(void) {
             },
             Item {
                 attrs: vec![],
+                is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
                     is_extern_c: false,
@@ -1549,8 +1575,8 @@ int main(void) {
     #[test]
     fn parse_lower_and_compile_motor_controller_plus_support() {
         let progs = parse_examples_compat(&[
-            "/home/cgalant/Projects/Prototype/examples/motor_controller.zev",
-            "/home/cgalant/Projects/Prototype/examples/motor_support.zev",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/motor_controller.zev"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/motor_support.zev"),
         ]);
         let mono_progs = zev_sema::monomorphize_programs(&progs)
             .expect("monomorphize motor_controller + motor_support");
@@ -1586,8 +1612,10 @@ int main(void) {
 
     #[test]
     fn parse_lower_compile_and_run_sim_demo() {
-        let progs =
-            parse_examples_compat(&["/home/cgalant/Projects/Prototype/examples/sim_demo.zev"]);
+        let progs = parse_examples_compat(&[concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/sim_demo.zev"
+        )]);
         let mono_progs =
             zev_sema::monomorphize_programs(&progs).expect("monomorphize sim_demo.zev");
         let mir = zev_mir::lower_programs(&mono_progs).expect("lower sim_demo.zev");

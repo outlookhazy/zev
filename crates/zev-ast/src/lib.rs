@@ -471,8 +471,32 @@ impl Program {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Item {
     pub attrs: Vec<Attr>,
+    /// Whether the top-level declaration is exported across module boundaries (`pub`).
+    pub is_pub: bool,
     pub kind: ItemKind,
     pub span: Span,
+}
+
+impl Item {
+    /// Construct a module-private top-level [`Item`].
+    pub fn new(attrs: Vec<Attr>, kind: ItemKind, span: Span) -> Self {
+        Self {
+            attrs,
+            is_pub: false,
+            kind,
+            span,
+        }
+    }
+
+    /// Construct a top-level [`Item`] with explicit visibility.
+    pub fn with_pub(attrs: Vec<Attr>, is_pub: bool, kind: ItemKind, span: Span) -> Self {
+        Self {
+            attrs,
+            is_pub,
+            kind,
+            span,
+        }
+    }
 }
 
 /// Top-level item kinds.
@@ -481,12 +505,78 @@ pub enum ItemKind {
     Import(ImportDecl),
     Struct(StructDecl),
     Enum(EnumDecl),
+    Mmio(MmioDecl),
+    Irq(IrqDecl),
     OsPrimitive(OsPrimitiveDecl),
     Const(ConstDecl),
     GlobalVar(GlobalVarDecl),
     Fn(FnDecl),
     Task(TaskDecl),
     Isr(IsrDecl),
+}
+
+/// Access qualifier for a typed `mmio` hardware register (`@rw`, `@ro`, `@wo`, `@w1c`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MmioAccess {
+    /// Read-write register (`@rw`); reads, writes, and compound RMW allowed.
+    Rw,
+    /// Read-only register (`@ro`); writes and compound RMW forbidden.
+    Ro,
+    /// Write-only register (`@wo`); reads and compound RMW forbidden.
+    Wo,
+    /// Write-1-to-clear status register (`@w1c`); reads and plain `=` allowed, compound RMW forbidden.
+    W1c,
+}
+
+impl MmioAccess {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rw => "@rw",
+            Self::Ro => "@ro",
+            Self::Wo => "@wo",
+            Self::W1c => "@w1c",
+        }
+    }
+}
+
+/// A single register entry inside an [`MmioDecl`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmioRegDecl {
+    pub access: MmioAccess,
+    pub ty: TypeExpr,
+    pub name: Ident,
+    pub offset: Expr,
+    pub span: Span,
+}
+
+/// Variants of a typed `mmio` declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MmioDeclKind {
+    /// Reusable register layout (`mmio UartRegs { @rw u32 cr1 @ 0x00; ... }`).
+    Layout { regs: Vec<MmioRegDecl> },
+    /// Peripheral instance bound to an existing layout (`mmio USART1 : UartRegs @ 0x4001_1000;`).
+    Instance { layout: TypeExpr, base_addr: Expr },
+    /// Single-instance inline block (`mmio Rcc @ 0x4002_1000 { ... }`).
+    Inline {
+        base_addr: Expr,
+        regs: Vec<MmioRegDecl>,
+    },
+}
+
+/// Typed volatile memory-mapped I/O register layout or peripheral instance (`mmio ...`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmioDecl {
+    pub name: Ident,
+    pub kind: MmioDeclKind,
+    pub span: Span,
+}
+
+/// Hardware interrupt token declaration (`irq IRQ_EXTI0 = 0;`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrqDecl {
+    pub name: Ident,
+    pub number: Expr,
+    pub span: Span,
 }
 
 /// `import a.b.c [as alias];`
@@ -610,11 +700,12 @@ pub struct TaskDecl {
     pub span: Span,
 }
 
-/// Hardware interrupt service routine (`isr EXTI0 { ... }`).
+/// Hardware interrupt service routine (`isr EXTI0 { ... }` or `isr uart_isr(*UartDriver d, *UartRegs r) { ... }`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IsrDecl {
     pub attrs: Vec<Attr>,
     pub vector: Ident,
+    pub params: Vec<Param>,
     pub body: Block,
     pub span: Span,
 }
@@ -663,6 +754,12 @@ impl Stmt {
 pub enum StmtKind {
     /// Explicit C-style local variable declaration (`u16 rpm = ...;`, `i32 integral = 0;`).
     VarDecl {
+        ty: TypeExpr,
+        name: Ident,
+        init: Option<Expr>,
+    },
+    /// ISR-private persistent static variable (`state u32 count = 0;`).
+    StateVar {
         ty: TypeExpr,
         name: Ident,
         init: Option<Expr>,
@@ -805,9 +902,10 @@ pub enum SwitchPat {
     Wildcard(Span),
 }
 
-/// Static task instantiation statement (`spawn task_fn(args...) [@prio] [@core(N)];`).
+/// Static task instantiation statement (`spawn [mod.]task_fn(args...) [@prio] [@core(N)];`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpawnStmt {
+    pub module: Option<Ident>,
     pub task: Ident,
     pub args: Vec<CallArg>,
     pub priority: Option<Priority>,
@@ -886,8 +984,9 @@ pub enum ExprKind {
         start: Option<Box<Expr>>,
         end: Option<Box<Expr>>,
     },
-    /// Struct literal (`ByteReader { buf: half, pos: 0 }`, `FixedVec<u32, 4> { ... }`).
+    /// Struct literal (`ByteReader { buf: half, pos: 0 }`, `mod.FixedVec<u32, 4> { ... }`).
     StructLit {
+        module: Option<Ident>,
         name: Ident,
         generic_args: Vec<GenericArg>,
         fields: Vec<FieldInit>,
@@ -1247,15 +1346,15 @@ mod tests {
     #[test]
     fn construct_program_and_merge() {
         let p1 = Program::new(
-            vec![Item {
-                attrs: vec![],
-                kind: ItemKind::Import(ImportDecl {
+            vec![Item::new(
+                vec![],
+                ItemKind::Import(ImportDecl {
                     path: vec![Ident::dummy("chip"), Ident::dummy("stm32g4")],
                     alias: Some(Ident::dummy("hw")),
                     span: Span::new(0, 26, 1, 1),
                 }),
-                span: Span::new(0, 26, 1, 1),
-            }],
+                Span::new(0, 26, 1, 1),
+            )],
             Span::new(0, 26, 1, 1),
         );
         let p2 = Program::new(vec![], Span::new(0, 10, 1, 1));

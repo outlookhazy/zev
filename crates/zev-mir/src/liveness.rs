@@ -123,7 +123,7 @@ fn compute_hoisting(
 
     for v in vars.iter_mut() {
         v.hoisted = match v.role {
-            VarRole::Param => true,
+            VarRole::Param | VarRole::IsrState => true,
             VarRole::UserLocal | VarRole::CompilerTemp => live_across_yield.contains(&v.id),
         };
     }
@@ -361,6 +361,16 @@ fn transfer_stmt(stmt: &MirStmt, live: &mut BTreeSet<VarId>) {
                 collect_fmt_chunk_uses(ch, live);
             }
         }
+        MirStmt::MmioWrite {
+            base, index, value, ..
+        } => {
+            collect_expr_uses(base, live);
+            if let Some(idx) = index {
+                collect_expr_uses(idx, live);
+            }
+            collect_expr_uses(value, live);
+        }
+        MirStmt::SetIrqSelector { .. } => {}
         MirStmt::If {
             cond,
             then_body,
@@ -497,6 +507,7 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
         | MirExprKind::ConstRef(_)
         | MirExprKind::GlobalPrimAddr(_)
         | MirExprKind::HwPeriphVal(_)
+        | MirExprKind::MmioAddr(_)
         | MirExprKind::FnAddr(_)
         | MirExprKind::ArrayLen(_)
         | MirExprKind::NowTicks => {}
@@ -510,6 +521,12 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
         | MirExprKind::Cast { expr: inner, .. }
         | MirExprKind::SliceLen(inner) => {
             collect_expr_uses(inner, uses);
+        }
+        MirExprKind::MmioRead { base, index, .. } => {
+            collect_expr_uses(base, uses);
+            if let Some(idx) = index {
+                collect_expr_uses(idx, uses);
+            }
         }
         MirExprKind::AddrOfPlace(place) | MirExprKind::ArrayToSlice { array_place: place, .. } => {
             collect_place_uses_for_partial_write(place, uses);
