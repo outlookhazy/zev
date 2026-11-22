@@ -13,3 +13,4 @@ zev-mir = { path = "../zev-mir" }
 [dev-dependencies]
 zev-ast = { path = "../zev-ast" }
 zev-parser = { path = "../zev-parser" }
+zev-sema = { path = "../zev-sema" }

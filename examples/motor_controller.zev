@@ -71,6 +71,7 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
         []u8 half = rx_dma.wait_chunk();               // Yields; compiler prevents DMA buffer clash
 
         u16 rpm = parse_setpoint(half) catch (ParseErr err) {
+            println(f"[WARN] fieldbus frame rejected: {err}");
             sup_inbox.post(BadPacket);
             continue;
         };

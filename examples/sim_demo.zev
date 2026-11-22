@@ -2,15 +2,15 @@
 //
 // Exercises all v0 Language-OS pillars on a scripted host timeline:
 //   1. Sequential phased boot (`main()`) + multi-instance static `spawn` (x2 motor_control, x2 fieldbus_listener)
-//   2. Drift-free `loop every 1ms` PI control loops with task-atomic `noyield` blocks
-//   3. Zero-copy `@dma_safe ping_pong` UART DMA + `packed struct` `u16be` decoding + `error`/`catch`
+//   2. Drift-free `loop every 1ms` PI control loops with task-atomic `noyield` blocks & generic `clamp<T>`
+//   3. Zero-copy `@dma_safe ping_pong` UART DMA + `packed struct` `u16be` decoding + `error`/`catch` + `{err}`
 //   4. `EXTI0` overcurrent ISR with `boost: @critical` waking `@low` supervisor at `@critical` & restoring `@low`
-//   5. Disjoint child coroutine frame `union` aliasing (`save_fault_record` vs `scrub_flash_crc`)
-//   6. Tickless idle + `@dma_safe` wake-lock sleep-depth clamping (`Deep` -> `Light` -> `Deep`)
+//   5. Disjoint child coroutine frame `union` aliasing (`save_fault_record` w/ `defer` vs `scrub_flash_crc`)
+//   6. Monomorphized `FixedVec<u16, 4>` RPM window, `f32` duty formatting, proven-fit `fmt_buf`, and `sys.exit(0)`
 
 import chip.stm32g4 as hw;
 
-// ── Host Deterministic Simulation Hooks (provided by synthesized C99 runtime) ─
+// ── Host Deterministic Simulation Hooks (provided by synthesized C99 / LLVM runtime) ─
 extern "C" fn syn_sim_enable_trace(bool en);
 extern "C" fn syn_sim_log(u32 tag, u32 a, u32 b);
 extern "C" fn syn_sim_push_uart1_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
@@ -18,14 +18,18 @@ extern "C" fn syn_sim_push_uart2_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
 extern "C" fn syn_sim_fire_isr_EXTI0();
 extern "C" u32 syn_sim_sleep_depth();
 extern "C" fn syn_sim_set_dma_active(u32 active);
-extern "C" fn syn_sim_exit(i32 code);
 
-// ── Wire Protocol & Event Types ─────────────────────────────────────────────
+// ── Wire Protocol, Bounded Containers & Event Types ─────────────────────────
 
 packed struct CmdFrame {
     u8    op;
     u16be setpoint;   // Big-endian wire encoding decoded natively
     u16be crc;
+}
+
+struct FixedVec<T, usize N> {
+    [N]T  data;
+    usize len;
 }
 
 enum ParseErr { TooShort, BadCrc }
@@ -60,7 +64,29 @@ isr DMA1_CH6 {
     uart2_dma.flip();                                  // Zero-copy buffer swap + wakes UART2 listener
 }
 
-// ── Pure & Yielding Firmware Helpers ────────────────────────────────────────
+// ── Monomorphized `<T>` / `<T, usize N>`, Pure & Yielding Helpers ───────────
+
+T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
+
+fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
+    if (v.len < N) {
+        v.data[v.len] = item;
+        v.len += 1;
+        return;
+    }
+    for (usize i in 1..N) {
+        v.data[i - 1] = v.data[i];
+    }
+    v.data[N - 1] = item;
+}
 
 fn setup_clocks() {
     critical {
@@ -112,26 +138,12 @@ u16 adc_read_rpm(u8 pwm_ch) {
 }
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
-    i32 tgt = target;
-    i32 act = actual;
-    i32 err = tgt - act;
-    i32 next_int = *integral + err;
-    if (next_int > 10000) {
-        next_int = 10000;
-    }
-    if (next_int < -10000) {
-        next_int = -10000;
-    }
+    i32 err = (target as i32) - (actual as i32);
+    i32 next_int = clamp(*integral + err, -10000, 10000);
     *integral = next_int;
 
     i32 out = (err / 2) + (next_int / 16);
-    if (out < 0) {
-        return 0;
-    }
-    if (out > 1000) {
-        return 1000;
-    }
-    u16 duty = out;
+    u16 duty = clamp(out, 0, 1000) as u16;
     return duty;
 }
 
@@ -140,13 +152,13 @@ fn save_fault_record(u32 bad_packets) {
     u32 magic = 0xFA01_0000;
     u32 pkt_cnt = bad_packets;
     u32 digest = magic + pkt_cnt + 0x5A5A;
+    u32 record_word = 0;
+    defer diag_telemetry.publish(record_word);
 
     checkpoint();
 
-    u32 record_word = flash_page + digest + pkt_cnt;
+    record_word = flash_page + digest + pkt_cnt;
     checkpoint();
-
-    diag_telemetry.publish(record_word);
 }
 
 fn scrub_flash_crc() {
@@ -162,6 +174,16 @@ fn scrub_flash_crc() {
     }
 
     diag_telemetry.publish(rolling_crc + words_checked);
+}
+
+fn log_sim_duty_snapshot(*FixedVec<u16, 4> hist, u16 r1, u16 r2, u16 d1, u16 d2) {
+    vec_push_ring(hist, r1);
+    vec_push_ring(hist, r2);
+    f32 d1_pct = (d1 as f32) * 0.1f32;
+    f32 d2_pct = (d2 as f32) * 0.1f32;
+    u8 summary_buf[64];
+    []u8 summary = fmt_buf(summary_buf, f"d1={d1_pct:.1}% d2={d2_pct:.1}% hist_n={hist.len}");
+    println(f"[SIM] rpm=({r1}, {r2}) {summary}");
 }
 
 // ── Reusable Parameterized Task Blueprints ──────────────────────────────────
@@ -186,6 +208,7 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
         []u8 half = rx_dma.wait_chunk();
 
         u16 rpm = parse_setpoint(half) catch (ParseErr err) {
+            println(f"[SIM] fieldbus frame rejected: {err}");
             sup_inbox.post(BadPacket);
             continue;
         };
@@ -198,6 +221,7 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
 
 task sim_stimulus() {
     u32 tick = 0;
+    FixedVec<u16, 4> rpm_hist = FixedVec<u16, 4> { data: [0, 0, 0, 0], len: 0 };
 
     loop every 1ms {
         tick += 1;
@@ -215,12 +239,13 @@ task sim_stimulus() {
 
         if (tick == 4) {
             // Milestone 2: Verify u16be decoded RPMs & 1ms PI duties
-            u32 r1 = motor1_rpm.read();
-            u32 r2 = motor2_rpm.read();
-            syn_sim_log(2, r1, r2);
-            u32 d1 = motor1_duty.read();
-            u32 d2 = motor2_duty.read();
-            syn_sim_log(3, d1, d2);
+            u16 r1 = motor1_rpm.read();
+            u16 r2 = motor2_rpm.read();
+            syn_sim_log(2, r1 as u32, r2 as u32);
+            u16 d1 = motor1_duty.read();
+            u16 d2 = motor2_duty.read();
+            syn_sim_log(3, d1 as u32, d2 as u32);
+            log_sim_duty_snapshot(&rpm_hist, r1, r2, d1, d2);
 
             // Milestone 3: Inject corrupted CRC frame on UART1 -> triggers error BadCrc -> catch -> BadPacket
             syn_sim_push_uart1_frame(1, 11, 184, 222, 173);
@@ -248,9 +273,11 @@ task sim_stimulus() {
         if (tick == 12) {
             // Milestone 7: Confirm tickless idle entered DEEP sleep after DMA release & exit cleanly
             u32 depth_unlocked = syn_sim_sleep_depth();
-            syn_sim_log(5, depth_unlocked, diag_telemetry.read());
+            u32 diag = diag_telemetry.read();
+            syn_sim_log(5, depth_unlocked, diag);
+            println(f"[SIM] complete: sleep_depth={depth_unlocked} fault_diag=0x{diag:08x}");
 
-            syn_sim_exit(0);
+            sys.exit(0);
         }
     }
 }

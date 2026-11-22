@@ -1,8 +1,8 @@
 // Companion support module for examples/motor_controller.zev
-// Implements clock/DMA setup, power-on self-test, yielding ADC readout,
-// task-atomic PI controller + wire checksum, and disjoint yielding flash
-// helpers (`save_fault_record` and `scrub_flash_crc`) whose coroutine frames
-// union-overlap inside `main`'s static supervisor frame.
+// Implements clock/DMA setup, power-on self-test, monomorphized `clamp<T>`,
+// yielding ADC readout, task-atomic PI controller + wire checksum, and disjoint
+// yielding flash helpers (`save_fault_record` w/ `defer` and `scrub_flash_crc`)
+// whose coroutine frames union-overlap inside `main`'s static supervisor frame.
 
 import chip.stm32g4 as hw;
 
@@ -30,7 +30,17 @@ fn run_power_on_self_test() {
     flash_diag_status.publish(boot_sig);
 }
 
-// ── Control-Loop & Fieldbus Helpers ─────────────────────────────────────────
+// ── Monomorphized `<T>` & Control-Loop / Fieldbus Helpers ───────────────────
+
+T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
 
 u16 crc16([]u8 buf) {
     u16 s1 = 85;
@@ -51,26 +61,12 @@ u16 adc_read_rpm(u8 pwm_ch) {
 }
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
-    i32 tgt = target;
-    i32 act = actual;
-    i32 err = tgt - act;
-    i32 next_int = *integral + err;
-    if (next_int > 10000) {
-        next_int = 10000;
-    }
-    if (next_int < -10000) {
-        next_int = -10000;
-    }
+    i32 err = (target as i32) - (actual as i32);
+    i32 next_int = clamp(*integral + err, -10000, 10000);
     *integral = next_int;
 
     i32 out = (err / 2) + (next_int / 16);
-    if (out < 0) {
-        return 0;
-    }
-    if (out > 1000) {
-        return 1000;
-    }
-    u16 duty = out;
+    u16 duty = clamp(out, 0, 1000) as u16;
     return duty;
 }
 
@@ -81,14 +77,14 @@ fn save_fault_record(u32 bad_packets) {
     u32 record_magic = 0xFA01_0000;
     u32 fault_count = bad_packets;
     u32 header_sum = record_magic + fault_count + 0x5A5A;
+    u32 commit_word = 0;
+    defer flash_diag_status.publish(commit_word);
 
     // Yield while flash page erase completes without stalling @critical loops
     checkpoint();
 
-    u32 commit_word = flash_page_addr + header_sum + fault_count;
+    commit_word = flash_page_addr + header_sum + fault_count;
     checkpoint();
-
-    flash_diag_status.publish(commit_word);
 }
 
 fn scrub_flash_crc() {

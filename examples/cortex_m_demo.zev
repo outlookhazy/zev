@@ -2,18 +2,16 @@
 //
 // End-to-end zero-C, zero-heap, zero-glue Language-OS demonstration running on real
 // emulated Cortex-M3 silicon in `qemu-system-arm`:
-//   1. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `loop every 1ms`, `noyield`)
-//   2. Zero-copy `@dma_safe ping_pong<u8, 64>` UART DMA + `packed struct` `u16be` + `error`/`catch`
+//   1. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `loop every 1ms`, `noyield`, `clamp<T>`)
+//   2. Zero-copy `@dma_safe ping_pong<u8, 64>` UART DMA + `packed struct` `u16be` + `error`/`catch` + `{err}`
 //   3. Real NVIC IRQ5 (`DMA1_CH5`) & IRQ0 (`EXTI0`) hardware preemption via `NVIC_ISPR0`
 //   4. ISR `boost: @critical` priority elevation into `sup_inbox` + automatic `@low` restore
-//   5. Union-aliased disjoint child coroutine frames (`save_fault_record` vs `scrub_flash_crc`)
-//   6. Tickless `wfi` idle sleep with automatic DMA wake-lock clamping (`LIGHT` vs `DEEP`)
+//   5. Union-aliased disjoint child coroutine frames (`save_fault_record` w/ `defer` vs `scrub_flash_crc`)
+//   6. Tickless `wfi` idle sleep with automatic DMA wake-lock clamping (`LIGHT` vs `DEEP`) + `sys.exit(0)`
 
 import chip.stm32g4 as hw;
 
 // Synthesized directly in LLVM 23 IR by `zev-codegen-llvm` (zero C / zero libc):
-extern "C" fn syn_uart_puts(*u8 msg);
-extern "C" fn syn_uart_kv(*u8 label, i32 val);
 extern "C" fn syn_nvic_pend_irq(u32 irq);
 extern "C" fn syn_dma_write_u8(ping_pong<u8, 64> *pp, u32 idx, u8 val);
 extern "C" fn syn_dma_set_active(ping_pong<u8, 64> *pp, bool active);
@@ -22,7 +20,6 @@ extern "C" u32 syn_wfi_count();
 extern "C" u32 syn_current_prio();
 extern "C" u32 syn_pwm_duty(u32 ch);
 extern "C" u32 syn_gpio_state();
-extern "C" fn syn_semihost_exit(i32 code);
 
 const u32 MOTOR_EN_PIN = 0;
 const u32 IRQ_EXTI0    = 0;
@@ -54,7 +51,17 @@ isr DMA1_CH5 {
     uart1_dma.flip();
 }
 
-// ── Pure Dual-Exit Wire Parser (`{ i16, i32 }` returned in ARM `r0, r1`) ────
+// ── Monomorphized `<T>` Helper & Dual-Exit Wire Parser ──────────────────────
+T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
+
 u16 crc16_cmd([]u8 buf) {
     u16 s1 = 85;
     u16 s2 = 170;
@@ -87,26 +94,12 @@ u16 adc_read_rpm(u8 pwm_ch) {
 }
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
-    i32 tgt = target;
-    i32 act = actual;
-    i32 err = tgt - act;
-    i32 next_i = *integral + err;
-    if (next_i > 8000) {
-        next_i = 8000;
-    }
-    if (next_i < -8000) {
-        next_i = -8000;
-    }
+    i32 err = (target as i32) - (actual as i32);
+    i32 next_i = clamp(*integral + err, -8000, 8000);
     *integral = next_i;
 
     i32 out = (err / 2) + (next_i / 8);
-    if (out < 0) {
-        return 0;
-    }
-    if (out > 1000) {
-        return 1000;
-    }
-    u16 duty = out;
+    u16 duty = clamp(out, 0, 1000) as u16;
     return duty;
 }
 
@@ -121,10 +114,12 @@ fn save_fault_record(u32 bad_packets) {
     u32 page_addr = 0x0802_0000;
     u32 magic = 0xFA17_0000;
     u32 sum = magic + bad_packets;
+    u32 commit = 0;
+    defer flash_diag.publish(commit);
+
     checkpoint();
-    u32 commit = page_addr + sum;
+    commit = page_addr + sum;
     checkpoint();
-    flash_diag.publish(commit);
 }
 
 fn scrub_flash_crc() {
@@ -158,6 +153,7 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
         []u8 half = rx_dma.wait_chunk();
 
         u16 rpm = parse_setpoint(half) catch (ParseErr err) {
+            println(f"[TELEM] fieldbus_err={err}");
             sup_inbox.post(BadPacket);
             continue;
         };
@@ -176,7 +172,7 @@ fn main() {
     syn_dma_set_active(&uart1_dma, true);
 
     run_power_on_self_test();
-    syn_uart_puts("[BOOT] Cortex-M3 Language-OS booted\n");
+    println("[BOOT] Cortex-M3 Language-OS booted");
 
     spawn motor_control(&motor1_rpm, 1) @critical;
     spawn fieldbus_listener(&uart1_dma, &motor1_rpm) @normal;
@@ -198,9 +194,9 @@ fn main() {
 
             // Yield across 3 real SysTick interrupts (WFI clamped to LIGHT=1 by active DMA lock)
             delay(3ms);
-            syn_uart_kv("[TELEM] motor1_rpm=", motor1_rpm.read());
-            syn_uart_kv("[TELEM] pwm_duty=", syn_pwm_duty(1));
-            syn_uart_kv("[TELEM] sleep_depth_dma_active=", syn_last_sleep_depth());
+            println(f"[TELEM] motor1_rpm={motor1_rpm.read()}");
+            println(f"[TELEM] pwm_duty={syn_pwm_duty(1)}");
+            println(f"[TELEM] sleep_depth_dma_active={syn_last_sleep_depth()}");
 
             // Stage corrupt-CRC frame -> triggers ParseErr::BadCrc -> sup_inbox.post(BadPacket)
             syn_dma_write_u8(&uart1_dma, 0, 1);
@@ -217,12 +213,12 @@ fn main() {
         switch (ev) {
             BadPacket => {
                 bad_packets += 1;
-                syn_uart_kv("[TELEM] bad_packets=", bad_packets);
+                println(f"[TELEM] bad_packets={bad_packets}");
                 // Release DMA wake-lock so next WFI enters DEEP (2) sleep and triggers IdleCheck
                 syn_dma_set_active(&uart1_dma, false);
             }
             IdleCheck => {
-                syn_uart_kv("[TELEM] sleep_depth_dma_idle=", syn_last_sleep_depth());
+                println(f"[TELEM] sleep_depth_dma_idle={syn_last_sleep_depth()}");
                 scrub_flash_crc();
                 if (stage == 1) {
                     stage = 2;
@@ -232,8 +228,8 @@ fn main() {
             }
             Overcurrent => {
                 u32 boosted_prio = syn_current_prio();
-                syn_uart_kv("[TELEM] sup_boosted_prio=", boosted_prio);
-                syn_uart_kv("[TELEM] gpio_safe_off=", syn_gpio_state());
+                println(f"[TELEM] sup_boosted_prio={boosted_prio}");
+                println(f"[TELEM] gpio_safe_off={syn_gpio_state()}");
                 motor1_rpm.publish(0);
                 save_fault_record(bad_packets);
                 stage = 3;
@@ -246,9 +242,9 @@ fn main() {
     }
 
     // EndInboxTurn runs automatically on break, restoring supervisor priority to @low (3)!
-    syn_uart_kv("[TELEM] sup_restored_prio=", syn_current_prio());
-    syn_uart_kv("[TELEM] wfi_sleeps=", syn_wfi_count());
-    syn_uart_kv("[TELEM] fault_diag=", flash_diag.read());
-    syn_uart_puts("[PASS] CORTEX-M3 BARE-METAL DEMO OK\n");
-    syn_semihost_exit(0);
+    println(f"[TELEM] sup_restored_prio={syn_current_prio()}");
+    println(f"[TELEM] wfi_sleeps={syn_wfi_count()}");
+    println(f"[TELEM] fault_diag=0x{flash_diag.read():08x}");
+    println("[PASS] CORTEX-M3 BARE-METAL DEMO OK");
+    sys.exit(0);
 }

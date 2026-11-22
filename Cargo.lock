@@ -25,6 +25,7 @@ dependencies = [
  "zev-ast",
  "zev-mir",
  "zev-parser",
+ "zev-sema",
 ]
 
 [[package]]

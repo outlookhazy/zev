@@ -6,11 +6,9 @@
 //   - 16 MHz hardware `SYSTIMER` (`0x6000A000`) driving drift-free `loop every 20ms` / `loop every 500ms` / `1s` deadlines
 //   - 0-wait-state HP-SRAM (`.iram1`) WS2812B 800kHz addressable RGB LED driver on `GPIO8`
 //   - Debounced `BOOT` button (`GPIO9`) posting `ButtonPressed` with `boost: @critical`
-//   - Built-in `USB_DEVICE` Serial/JTAG console (`0x6000F000` -> `/dev/ttyACM0`)
+//   - Zero-heap `println(f"...")` + proven-fit `fmt_buf` + `<T, usize N>` generics + `f32` power telemetry
 
 // Synthesized directly in RISC-V LLVM 23 IR by `zev-codegen-llvm` (zero C / zero ESP-IDF):
-extern "C" fn zev_uart_puts(*u8 msg);
-extern "C" fn zev_uart_kv(*u8 label, i32 val);
 extern "C" fn zev_ws2812_rgb(u8 r, u8 g, u8 b);
 extern "C" u32 zev_gpio_read(u32 pin);
 extern "C" u32 zev_now_ms();
@@ -25,11 +23,56 @@ const u32 PALETTE_LEN    = 5;
 
 enum SupEvent { ButtonPressed, Heartbeat }
 
+struct FixedVec<T, usize N> {
+    [N]T  data;
+    usize len;
+}
+
+struct LedSample {
+    u8  slot;
+    f32 mwatts;
+}
+
 // ── Static Zero-Heap Language-OS Endpoints (HP-SRAM `0x40800000`) ───────────
 watch<u32>            palette_offset = 0;
+watch<u32>            active_slot    = 0;
 watch<u32>            active_color   = 0;
 watch<u32>            diag_signature = 0;
 inbox<SupEvent, 8>    sup_inbox;
+
+// ── Monomorphized `<T>` & `<T, usize N>` Helpers (Zero Vtables, Zero Heap) ──
+T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
+
+fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
+    if (v.len < N) {
+        v.data[v.len] = item;
+        v.len += 1;
+        return;
+    }
+    for (usize i in 1..N) {
+        v.data[i - 1] = v.data[i];
+    }
+    v.data[N - 1] = item;
+}
+
+f32 vec_avg_f32<usize N>(*FixedVec<f32, N> v) {
+    if (v.len == 0) {
+        return 0.0f32;
+    }
+    f32 sum = 0.0f32;
+    for (usize i in 0..v.len) {
+        sum += v.data[i];
+    }
+    return sum / (v.len as f32);
+}
 
 // ── Pure Saturated Color Wheel: Red -> Green -> Blue -> Cyan -> Magenta (0% White!) ──
 u32 drive_palette_slot(u32 slot) {
@@ -63,10 +106,30 @@ u32 drive_palette_slot(u32 slot) {
     }
 }
 
-fn print_telemetry_line(u32 uptime_ms, u32 color_rgb, u32 presses, u32 prio) {
+LedSample sample_led_power(u32 slot, u32 color_rgb) {
+    u32 r = (color_rgb >> 16) & 0xFF;
+    u32 g = (color_rgb >> 8) & 0xFF;
+    u32 b = color_rgb & 0xFF;
+    f32 ch_sum = (r + g + b) as f32;
+    f32 mw = clamp<f32>(1.5f32 + (ch_sum * 0.24f32), 0.0f32, 180.0f32);
+    return LedSample{ slot: (slot % PALETTE_LEN) as u8, mwatts: mw };
+}
+
+fn print_telemetry_line(
+    u32 uptime_ms,
+    u32 color_rgb,
+    u32 presses,
+    u32 prio,
+    f32 avg_mw,
+    SupEvent ev,
+    LedSample sample
+) {
+    u8 status_buf[96];
+    // Statically proven worst-case fit (`37 B <= 96 B`) — zero `or` / `catch` boilerplate!
+    []u8 status = fmt_buf(status_buf, f"avg={avg_mw:.2}mW ev={ev}");
     u32 store_ns = zev_ws2812_store_ns();
     u32 pad8_ok = zev_pad8_ok();
-    println(f"[Zev on ESP32-C6 rv32imac] uptime={uptime_ms}ms color=0x{color_rgb:06x} presses={presses} prio={prio} store_ns={store_ns} pad8_ok={pad8_ok}");
+    println(f"[Zev on ESP32-C6 rv32imac] uptime={uptime_ms}ms color=0x{color_rgb:06x} presses={presses} prio={prio} {status} led={sample:?} store_ns={store_ns} pad8_ok={pad8_ok}");
 }
 
 // ── Disjoint Yielding Supervisor Helpers (Union-Aliased Static Frames) ──────
@@ -98,7 +161,7 @@ fn scrub_sram_canary(u32 beat_count) {
 // ── Cooperative Tasks ───────────────────────────────────────────────────────
 
 // Cycles onboard GPIO8 WS2812B RGB LED smoothly every 500ms
-task led_animator(watch<u32> *mode_off, watch<u32> *out_color) {
+task led_animator(watch<u32> *mode_off, watch<u32> *out_slot, watch<u32> *out_color) {
     u32 tick_phase = 0;
 
     loop every 500ms {
@@ -107,6 +170,7 @@ task led_animator(watch<u32> *mode_off, watch<u32> *out_color) {
 
         noyield {
             u32 rgb = drive_palette_slot(slot);
+            out_slot.publish(slot);
             out_color.publish(rgb);
         }
 
@@ -140,19 +204,26 @@ task button_monitor() {
 fn main() {
     // Immediate visual boot confirmation on GPIO8 WS2812B RGB LED
     u32 boot_rgb = drive_palette_slot(0);
+    active_slot.publish(0);
     active_color.publish(boot_rgb);
 
     run_soc_self_test();
 
-    zev_uart_puts("\n[BOOT] Zev Language-OS on ESP32-C6 (rv32imac Direct-Boot, zero C)\n");
-    zev_uart_kv("[BOOT] systimer_16mhz_calib_ticks=", zev_cpu_calib_ticks());
+    println("");
+    println("[BOOT] Zev Language-OS on ESP32-C6 (rv32imac Direct-Boot, zero C)");
+    u32 calib_ticks = zev_cpu_calib_ticks();
+    println(f"[BOOT] systimer_16mhz_calib_ticks={calib_ticks}");
 
-    spawn led_animator(&palette_offset, &active_color) @normal;
+    spawn led_animator(&palette_offset, &active_slot, &active_color) @normal;
     spawn button_monitor() @high;
 
     set_priority(@low);
     u32 presses = 0;
     u32 heartbeats = 0;
+    FixedVec<f32, 4> mw_window = FixedVec<f32, 4> {
+        data: [0.0f32, 0.0f32, 0.0f32, 0.0f32],
+        len: 0
+    };
 
     loop {
         SupEvent ev = sup_inbox.recv(timeout: 1s) or Heartbeat;
@@ -166,17 +237,38 @@ fn main() {
 
                 noyield {
                     u32 instant_rgb = drive_palette_slot(next_off);
+                    active_slot.publish(next_off);
                     active_color.publish(instant_rgb);
                 }
 
-                zev_uart_puts("[EVENT] BOOT Button (GPIO9) -> instant color shift! ");
-                print_telemetry_line(zev_now_ms(), active_color.read(), presses, boosted_prio);
+                u32 cur_rgb = active_color.read();
+                LedSample sample = sample_led_power(next_off, cur_rgb);
+                vec_push_ring(&mw_window, sample.mwatts);
+                f32 avg_mw = vec_avg_f32(&mw_window);
+
+                print("[EVENT] BOOT Button (GPIO9) -> instant color shift! ");
+                print_telemetry_line(zev_now_ms(), cur_rgb, presses, boosted_prio, avg_mw, ev, sample);
                 record_button_event(presses);
             }
             Heartbeat => {
                 heartbeats += 1;
                 scrub_sram_canary(heartbeats);
-                print_telemetry_line(zev_now_ms(), active_color.read(), presses, zev_current_prio());
+
+                u32 cur_slot = active_slot.read();
+                u32 cur_rgb = active_color.read();
+                LedSample sample = sample_led_power(cur_slot, cur_rgb);
+                vec_push_ring(&mw_window, sample.mwatts);
+                f32 avg_mw = vec_avg_f32(&mw_window);
+
+                print_telemetry_line(
+                    zev_now_ms(),
+                    cur_rgb,
+                    presses,
+                    zev_current_prio(),
+                    avg_mw,
+                    ev,
+                    sample
+                );
             }
         }
     }

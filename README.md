@@ -121,11 +121,11 @@ zevc flash-esp32c6 examples/esp32c6_demo.zev --port /dev/ttyACM0
 
 | File | Description |
 |---|---|
-| [`examples/motor_controller.zev`](examples/motor_controller.zev) | Reference dual-bus STM32G4 motor controller showcasing `main()` phased boot, multi-instance `spawn`, `loop every 1ms` `noyield` PI loops, zero-copy `ping_pong` UART DMA, `u16be` wire frames, and `EXTI0` ISR `boost: @critical`. |
-| [`examples/motor_support.zev`](examples/motor_support.zev) | Companion hardware setup, bounded `for..in` `crc16`, `pi_step`, yielding `adc_read_rpm`, and mutually exclusive yielding flash helpers (`save_fault_record` & `scrub_flash_crc`). |
-| [`examples/sim_demo.zev`](examples/sim_demo.zev) | Self-contained runnable host simulation exercising periodic `loop every 1ms` control, big-endian `u16be` DMA packets, `error BadCrc` / `catch` recovery, `EXTI0` priority boost & restoration, and `@dma_safe` sleep-depth clamping (`Deep` vs `Light`). |
-| [`examples/cortex_m_demo.zev`](examples/cortex_m_demo.zev) | Bare-metal ARM Cortex-M3 firmware slice compiled directly via LLVM 23 + `ld.lld` and executed in `qemu-system-arm` with real NVIC interrupts and `SysTick`. |
-| [`examples/esp32c6_demo.zev`](examples/esp32c6_demo.zev) | Bare-metal ESP32-C6-Pico (`rv32imac`) Direct-Boot firmware driving the `GPIO8` WS2812B RGB LED (`Red -> Green -> Blue -> Cyan -> Magenta`), `GPIO9` `BOOT` button (`boost: @critical`), and live zero-heap `println(f"...")` `USB_DEVICE` telemetry. |
+| [`examples/motor_controller.zev`](examples/motor_controller.zev) | Reference dual-bus STM32G4 motor controller showcasing `main()` phased boot, multi-instance `spawn`, `loop every 1ms` `noyield` PI loops, zero-copy `ping_pong` UART DMA, `u16be` wire frames, `{err}` enum formatting, and `EXTI0` ISR `boost: @critical`. |
+| [`examples/motor_support.zev`](examples/motor_support.zev) | Companion hardware setup, monomorphized `clamp<T>`, bounded `for..in` `crc16`, `pi_step`, yielding `adc_read_rpm`, and disjoint yielding flash helpers (`save_fault_record` w/ `defer` & `scrub_flash_crc`). |
+| [`examples/sim_demo.zev`](examples/sim_demo.zev) | Self-contained runnable host simulation exercising `loop every 1ms` control, `FixedVec<u16, 4>` & `clamp<T>` generics, `f32` `:.1` + proven-fit `fmt_buf`, `u16be` DMA packets, `error BadCrc` / `{err}` recovery, `EXTI0` boost & restore, and `@dma_safe` sleep-depth clamping. |
+| [`examples/cortex_m_demo.zev`](examples/cortex_m_demo.zev) | Zero-C bare-metal ARM Cortex-M3 firmware (`qemu-system-arm`) with `clamp<T>`, `defer`, zero-heap `println(f"...")` (`:08x` + `{err}`), real NVIC interrupts, `SysTick`, and `sys.exit(0)`. |
+| [`examples/esp32c6_demo.zev`](examples/esp32c6_demo.zev) | Bare-metal ESP32-C6-Pico (`rv32imac`) Direct-Boot firmware showcasing `FixedVec<f32, 4>` & `clamp<f32>`, proven-fit `fmt_buf`, `{sample:?}` debug + `{ev}` enum `println(f"...")` telemetry, `GPIO8` WS2812B RGB LED, and `GPIO9` `BOOT` button (`boost: @critical`). |
 
 ---
 

@@ -1520,25 +1520,42 @@ int main(void) {
         assert!(stdout.contains("PARTIAL_PROGRESS_OK"));
     }
 
-    fn parse_example_compat(path: &str) -> Program {
-        let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-        match zev_parser::parse_str(&raw) {
-            Ok(prog) => prog,
-            Err(_) => {
-                let migrated = raw.replace("    every ", "    loop every ");
-                zev_parser::parse_str(&migrated).unwrap_or_else(|e| panic!("parse {path}: {e:?}"))
-            }
+    fn parse_examples_compat(paths: &[&str]) -> Vec<Program> {
+        let mut raws = Vec::with_capacity(paths.len());
+        let mut all_generics = std::collections::BTreeSet::new();
+        for &path in paths {
+            let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+            all_generics.extend(zev_parser::collect_declared_generic_names(&raw));
+            raws.push((path, raw));
         }
+        raws.into_iter()
+            .map(|(path, raw)| {
+                match zev_parser::parse_str_named_with_generics(&raw, path, Some(&all_generics)) {
+                    Ok(prog) => prog,
+                    Err(_) => {
+                        let migrated = raw.replace("    every ", "    loop every ");
+                        zev_parser::parse_str_named_with_generics(
+                            &migrated,
+                            path,
+                            Some(&all_generics),
+                        )
+                        .unwrap_or_else(|e| panic!("parse {path}: {e:?}"))
+                    }
+                }
+            })
+            .collect()
     }
 
     #[test]
     fn parse_lower_and_compile_motor_controller_plus_support() {
-        let mc_prog =
-            parse_example_compat("/home/cgalant/Projects/Prototype/examples/motor_controller.zev");
-        let sup_prog =
-            parse_example_compat("/home/cgalant/Projects/Prototype/examples/motor_support.zev");
+        let progs = parse_examples_compat(&[
+            "/home/cgalant/Projects/Prototype/examples/motor_controller.zev",
+            "/home/cgalant/Projects/Prototype/examples/motor_support.zev",
+        ]);
+        let mono_progs = zev_sema::monomorphize_programs(&progs)
+            .expect("monomorphize motor_controller + motor_support");
 
-        let mir = zev_mir::lower_programs(&[mc_prog, sup_prog])
+        let mir = zev_mir::lower_programs(&mono_progs)
             .expect("lower motor_controller + motor_support");
 
         // Verify North Star static RAM invariants
@@ -1569,9 +1586,11 @@ int main(void) {
 
     #[test]
     fn parse_lower_compile_and_run_sim_demo() {
-        let demo_prog =
-            parse_example_compat("/home/cgalant/Projects/Prototype/examples/sim_demo.zev");
-        let mir = zev_mir::lower_program(&demo_prog).expect("lower sim_demo.zev");
+        let progs =
+            parse_examples_compat(&["/home/cgalant/Projects/Prototype/examples/sim_demo.zev"]);
+        let mono_progs =
+            zev_sema::monomorphize_programs(&progs).expect("monomorphize sim_demo.zev");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower sim_demo.zev");
         assert!(mir.ram_report.mcu32.union_bytes_saved > 0);
 
         let c_code = emit_c(&mir);

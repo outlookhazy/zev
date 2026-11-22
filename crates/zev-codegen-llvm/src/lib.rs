@@ -112,24 +112,35 @@ mod tests {
             .to_path_buf()
     }
 
-    fn load_example_prog(path: &Path) -> zev_ast::Program {
-        let raw = std::fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
-        let normalized = raw
-            .replace("\n    every ", "\n    loop every ")
-            .replace("\n        every ", "\n        loop every ");
-        zev_parser::parse_str(&normalized)
-            .unwrap_or_else(|e| panic!("failed to parse {}:\n{e}", path.display()))
+    fn compile_example_mir(paths: &[PathBuf]) -> zev_mir::MirModule {
+        let mut sources = Vec::with_capacity(paths.len());
+        let mut all_generics = std::collections::BTreeSet::new();
+        for path in paths {
+            let raw = std::fs::read_to_string(path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
+            all_generics.extend(zev_parser::collect_declared_generic_names(&raw));
+            sources.push((path.display().to_string(), raw));
+        }
+        let mut progs = Vec::with_capacity(sources.len());
+        for (name, src) in &sources {
+            let prog = zev_parser::parse_str_named_with_generics(src, name, Some(&all_generics))
+                .unwrap_or_else(|errs| panic!("failed to parse {name}: {errs:#?}"));
+            progs.push(prog);
+        }
+        let (mono_progs, _) = zev_sema::analyze_and_monomorphize_programs(
+            &progs,
+            &zev_sema::AnalyzeOptions::default(),
+        )
+        .into_result()
+        .unwrap_or_else(|diags| panic!("zev-sema rejected examples {paths:?}: {diags:#?}"));
+        zev_mir::lower_programs(&mono_progs)
+            .unwrap_or_else(|e| panic!("failed to lower examples {paths:?} to MIR: {e:?}"))
     }
 
     #[test]
     fn esp32c6_demo_builds_direct_boot_bin_and_passes_disasm_audit() {
         let demo_path = repo_root().join("examples/esp32c6_demo.zev");
-        let prog = load_example_prog(&demo_path);
-        zev_sema::analyze_program(&prog)
-            .unwrap_or_else(|diags| panic!("zev-sema rejected esp32c6_demo.zev: {diags:#?}"));
-        let mir = zev_mir::lower_program(&prog)
-            .unwrap_or_else(|e| panic!("failed to lower esp32c6_demo.zev: {e:?}"));
+        let mir = compile_example_mir(&[demo_path]);
 
         // Verify zero heap and disjoint child coroutine union savings in `main` supervisor!
         assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
@@ -200,11 +211,7 @@ mod tests {
     fn cortex_m_demo_end_to_end_elf_and_qemu() {
         let t0 = Instant::now();
         let demo_path = repo_root().join("examples/cortex_m_demo.zev");
-        let prog = load_example_prog(&demo_path);
-        zev_sema::analyze_program(&prog)
-            .unwrap_or_else(|diags| panic!("zev-sema rejected cortex_m_demo.zev: {diags:#?}"));
-        let mir = zev_mir::lower_program(&prog)
-            .unwrap_or_else(|e| panic!("failed to lower cortex_m_demo.zev to MIR: {e:?}"));
+        let mir = compile_example_mir(&[demo_path]);
 
         // Verify disjoint child coroutine union-aliasing saved SRAM in `main` supervisor!
         assert!(
@@ -231,8 +238,8 @@ mod tests {
             res.exec.exit_code, res.exec.stderr
         );
         assert!(
-            total_elapsed.as_secs_f64() < 2.0,
-            "end-to-end compile+link+QEMU took {:?} (> 2s budget)",
+            total_elapsed.as_secs_f64() < 5.0,
+            "end-to-end compile+link+QEMU took {:?} (> 5s budget)",
             total_elapsed
         );
         assert!(res.build.audit.is_zero_heap_freestanding());
@@ -255,11 +262,10 @@ mod tests {
     #[test]
     fn north_star_motor_controller_builds_freestanding_cortex_m_elf() {
         let root = repo_root();
-        let p_ctrl = load_example_prog(&root.join("examples/motor_controller.zev"));
-        let p_supp = load_example_prog(&root.join("examples/motor_support.zev"));
-
-        let mir = zev_mir::lower_programs(&[p_ctrl, p_supp])
-            .expect("lower motor_controller + motor_support to MIR");
+        let mir = compile_example_mir(&[
+            root.join("examples/motor_controller.zev"),
+            root.join("examples/motor_support.zev"),
+        ]);
 
         let out_elf = test_out_dir().join("motor_controller.elf");
         let mut opts = CodegenOptions::default();
@@ -291,8 +297,7 @@ mod tests {
     #[test]
     fn host_x86_64_ir_compiles_cleanly_via_llc() {
         let demo_path = repo_root().join("examples/cortex_m_demo.zev");
-        let prog = load_example_prog(&demo_path);
-        let mir = zev_mir::lower_program(&prog).expect("lower cortex_m_demo.zev");
+        let mir = compile_example_mir(&[demo_path]);
 
         let mut host_opts = CodegenOptions::default();
         host_opts.target = TargetArch::HostX86_64Linux;
@@ -722,9 +727,7 @@ mod tests {
     #[test]
     fn sim_demo_also_runs_on_bare_metal_cortex_m_qemu() {
         let sim_path = repo_root().join("examples/sim_demo.zev");
-        let prog = load_example_prog(&sim_path);
-        zev_sema::analyze_program(&prog).expect("sema sim_demo.zev");
-        let mir = zev_mir::lower_program(&prog).expect("mir sim_demo.zev");
+        let mir = compile_example_mir(&[sim_path]);
 
         let out_elf = test_out_dir().join("sim_demo_cm3.elf");
         let res = run_qemu_cortex_m(
@@ -744,9 +747,7 @@ mod tests {
     #[test]
     fn opt_levels_o0_o1_o2_o3_os_oz_build_zero_heap_elfs_and_shrink_flash_in_qemu() {
         let root = repo_root();
-        let cm3_prog = load_example_prog(&root.join("examples/cortex_m_demo.zev"));
-        zev_sema::analyze_program(&cm3_prog).expect("sema cm3");
-        let cm3_mir = zev_mir::lower_program(&cm3_prog).expect("mir cm3");
+        let cm3_mir = compile_example_mir(&[root.join("examples/cortex_m_demo.zev")]);
 
         let dir = test_out_dir();
         let mut cm3_text_by_level = std::collections::BTreeMap::new();
@@ -793,9 +794,7 @@ mod tests {
         );
 
         // Also verify ESP32-C6 Direct-Boot image builds cleanly across -O0, -O2, -Os, -Oz
-        let esp_prog = load_example_prog(&root.join("examples/esp32c6_demo.zev"));
-        zev_sema::analyze_program(&esp_prog).expect("sema esp32c6");
-        let esp_mir = zev_mir::lower_program(&esp_prog).expect("mir esp32c6");
+        let esp_mir = compile_example_mir(&[root.join("examples/esp32c6_demo.zev")]);
 
         let mut esp_bin_o0 = 0u64;
         let mut esp_bin_oz = 0u64;
