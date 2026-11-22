@@ -198,31 +198,52 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             (direct, table)
         }
 
-        ResolvedOsPrimitive::Lease { elem, .. } => {
+        ResolvedOsPrimitive::Pool { elem, .. } => {
             let valid = [
-                "wait_chunk",
-                "try_acquire",
-                "acquire",
-                "start",
-                "activate",
-                "complete",
-                "release",
-                "stop",
-                "deactivate",
-                "flip",
+                "try_alloc",
+                "alloc",
+                "avail",
+                "in_use",
+                "cap",
+                "is_exhausted",
             ];
             let direct = match method {
-                "recv" | "read" | "get" | "wait" | "borrow" => {
-                    Some(format!("`.wait_chunk() -> []{}`", elem))
+                "acquire" | "try_acquire" | "get" | "pop" | "take" | "wait_chunk" => {
+                    Some(format!("`.alloc()` or `.try_alloc() -> Lease<{}> error`", elem))
                 }
-                "send" | "post" | "notify" | "free" | "drop" => {
-                    Some("`.release()` or `.complete()`".to_string())
+                "release" | "free" | "drop" | "put" => {
+                    Some("`lease.release()` on the linear `Lease<T>` handle".to_string())
                 }
-                _ => closest_match(method, valid, 2).map(|m| format!("`.{}()`", m)),
+                "free_space" | "len" | "remaining" | "count" => Some("`.avail()`".to_string()),
+                "is_empty" | "is_full" => Some("`.is_exhausted()`".to_string()),
+                _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
             };
             let table = format!(
-                "valid methods on `{}`: `.wait_chunk([timeout: <dur>]) -> []{}`, `.try_acquire() -> []{} error`, `.complete()`, `.release()`",
-                prim, elem, elem
+                "valid methods on `{}`: `.try_alloc() -> Lease<{}> error`, `.alloc([timeout: <dur>])`, `.avail() -> usize`, `.in_use() -> usize`, `.cap() -> usize`, `.is_exhausted() -> bool`",
+                prim, elem
+            );
+            (direct, table)
+        }
+
+        ResolvedOsPrimitive::DmaSlot { elem } => {
+            let valid = ["park", "take", "release", "is_busy", "is_empty", "addr"];
+            let direct = match method {
+                "put" | "store" | "push" | "set" | "send" | "post" => {
+                    Some("`.park(lease) -> void error`".to_string())
+                }
+                "get" | "pop" | "recv" | "extract" | "acquire" => {
+                    Some(format!("`.take() -> Lease<{}> error`", elem))
+                }
+                "free" | "drop" | "clear" | "complete" => {
+                    Some("`.release([boost: @prio]) -> bool`".to_string())
+                }
+                "is_full" | "busy" => Some("`.is_busy() -> bool`".to_string()),
+                "ptr" | "data" => Some("`.addr() -> usize`".to_string()),
+                _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
+            };
+            let table = format!(
+                "valid methods on `{}`: `.park(lease) -> void error`, `.take() -> Lease<{}> error`, `.release([boost: @prio]) -> bool`, `.is_busy() -> bool`, `.is_empty() -> bool`, `.addr() -> usize`",
+                prim, elem
             );
             (direct, table)
         }

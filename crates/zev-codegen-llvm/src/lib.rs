@@ -4281,4 +4281,318 @@ fn main() {
             "ISR-contended watch<u16> must keep critical section"
         );
     }
+
+    #[test]
+    fn pool_lease_dma_slot_defer_recycle_sleep_clamp_and_isr_release_in_qemu() {
+        let src = r#"
+struct RadioSubsys {
+    signal sig;
+    @dma_safe pool<[17]u8, 2> sub_dma;
+    pool<u32, 3> ctrl_pool;
+}
+
+@dma_safe pool<[17]u8, 4> tx_pool;
+dma_slot<[17]u8> tx_slot;
+inbox<Lease<[17]u8>, 2> work_q;
+RadioSubsys radio;
+signal start_waiter;
+signal done_sig;
+irq IRQ_DMA = 2;
+
+isr on_dma_irq(*dma_slot<[17]u8> slot) {
+    slot.release(boost: @critical);
+}
+
+bool try_enqueue_view(*inbox<Lease<[17]u8>> q, Lease<[17]u8> item) {
+    return q.try_send(item);
+}
+
+u8 helper_with_defer(*pool<[17]u8, 4> p) {
+    Lease<[17]u8> b = p.try_alloc() catch {
+        return 0;
+    };
+    defer b.release();
+    *[17]u8 ptr_b = b.get();
+    (*ptr_b)[0] = 0x5Au8;
+    assert(b.addr() != 0);
+    assert(sys.sleep_depth() == 1);
+    return (*ptr_b)[0];
+}
+
+task waiter_task(*pool<[17]u8, 4> p, *signal start, *signal done) {
+    set_priority(@low);
+    start.wait();
+    Lease<[17]u8> got = p.alloc(timeout: 200ms) catch {
+        println("WAITER_TIMEOUT");
+        sys.exit(1);
+    };
+    assert(sys.current_prio() == 0);
+    assert(sys.sleep_depth() == 1);
+    *[17]u8 d = got.get();
+    assert((*d)[0] == 0x77u8);
+    got.release();
+    done.notify();
+    loop { sys.delay(10ms); }
+}
+
+task driver_task() {
+    // 1. Initial sleep depth is DEEP (2), non-@dma_safe pool keeps DEEP (2),
+    //    while @dma_safe pool clamps sleep depth DEEP -> LIGHT (1).
+    assert(sys.sleep_depth() == 2);
+    Lease<u32> c0 = radio.ctrl_pool.try_alloc() catch { sys.exit(1); };
+    assert(sys.sleep_depth() == 2);
+    assert(radio.ctrl_pool.cap() == 3);
+    assert(radio.ctrl_pool.avail() == 2);
+    assert(radio.ctrl_pool.in_use() == 1);
+    *u32 cp = c0.get();
+    *cp = 42u32;
+    c0.release();
+    assert(radio.ctrl_pool.avail() == 3);
+
+    // 2. Check @dma_safe 32-byte alignment & padded slot stride (>= 32B) on top-level & subsystem pools.
+    assert(tx_pool.cap() == 4);
+    assert(!tx_pool.is_exhausted());
+    Lease<[17]u8> a0 = tx_pool.try_alloc() catch { sys.exit(1); };
+    assert(sys.sleep_depth() == 1);
+    Lease<[17]u8> a1 = tx_pool.try_alloc() catch { sys.exit(1); };
+    usize addr0 = a0.addr();
+    usize addr1 = a1.addr();
+    assert((addr0 % 32) == 0);
+    assert((addr1 % 32) == 0);
+    usize stride_diff = 0;
+    if (addr1 > addr0) { stride_diff = addr1 - addr0; } else { stride_diff = addr0 - addr1; }
+    assert(stride_diff >= 32);
+    a0.release();
+    a1.release();
+    assert(sys.sleep_depth() == 2);
+
+    Lease<[17]u8> sb0 = radio.sub_dma.try_alloc() catch { sys.exit(1); };
+    Lease<[17]u8> sb1 = radio.sub_dma.try_alloc() catch { sys.exit(1); };
+    assert(radio.sub_dma.is_exhausted());
+    assert((sb0.addr() % 32) == 0);
+    assert((sb1.addr() % 32) == 0);
+    usize sub_diff = 0;
+    if (sb1.addr() > sb0.addr()) { sub_diff = sb1.addr() - sb0.addr(); } else { sub_diff = sb0.addr() - sb1.addr(); }
+    assert(sub_diff >= 32);
+    sb0.release();
+    sb1.release();
+    assert(sys.sleep_depth() == 2);
+
+    // 3. `defer b.release();` across helper return restores pool & DEEP sleep depth.
+    assert(helper_with_defer(&tx_pool) == 0x5Au8);
+    assert(tx_pool.avail() == 4);
+    assert(sys.sleep_depth() == 2);
+
+    // 4. Full inbox<Lease<T>, 2> + *inbox<Lease<T>> + timeout auto-recycle (0 leaks!).
+    Lease<[17]u8> q0 = tx_pool.try_alloc() catch { sys.exit(1); };
+    Lease<[17]u8> q1 = tx_pool.try_alloc() catch { sys.exit(1); };
+    Lease<[17]u8> q_ovf = tx_pool.try_alloc() catch { sys.exit(1); };
+    Lease<[17]u8> q_post = tx_pool.try_alloc() catch { sys.exit(1); };
+    assert(tx_pool.is_exhausted());
+    assert(work_q.try_send(q0));
+    assert(try_enqueue_view(&work_q, q1));
+    assert(work_q.is_full());
+    assert(!try_enqueue_view(&work_q, q_ovf));
+    assert(tx_pool.avail() == 1);
+    work_q.post(q_post);
+    assert(tx_pool.avail() == 2);
+    Lease<[17]u8> q_to = tx_pool.try_alloc() catch { sys.exit(1); };
+    assert(tx_pool.avail() == 1);
+    work_q.send(q_to, timeout: 4ms) catch {
+        println("Q_SEND_TIMEOUT_RECYCLED");
+    };
+    assert(tx_pool.avail() == 2);
+
+    // Drain work_q and release both leases.
+    Lease<[17]u8> dr0 = work_q.try_recv() catch { sys.exit(1); };
+    Lease<[17]u8> dr1 = work_q.try_recv() catch { sys.exit(1); };
+    assert(work_q.is_empty());
+    dr0.release();
+    dr1.release();
+    assert(tx_pool.avail() == 4);
+    assert(sys.sleep_depth() == 2);
+
+    // 5. `dma_slot<T>`: empty queries -> park -> busy auto-release -> take -> release.
+    assert(tx_slot.is_empty());
+    assert(!tx_slot.is_busy());
+    assert(tx_slot.addr() == 0);
+    Lease<[17]u8> s0 = tx_pool.try_alloc() catch { sys.exit(1); };
+    usize exp_slot_addr = s0.addr();
+    tx_slot.park(s0) catch { sys.exit(1); };
+    assert(tx_slot.is_busy());
+    assert(!tx_slot.is_empty());
+    assert(tx_slot.addr() == exp_slot_addr);
+    Lease<[17]u8> s_busy = tx_pool.try_alloc() catch { sys.exit(1); };
+    assert(tx_pool.avail() == 2);
+    tx_slot.park(s_busy) catch {
+        println("SLOT_BUSY_RECYCLED");
+    };
+    assert(tx_pool.avail() == 3);
+    Lease<[17]u8> taken = tx_slot.take() catch { sys.exit(1); };
+    assert(tx_slot.is_empty());
+    assert(taken.addr() == exp_slot_addr);
+    *[17]u8 tp = taken.get();
+    (*tp)[0] = 0x77u8;
+    tx_slot.park(taken) catch { sys.exit(1); };
+
+    // 6. Exhaust remaining 3 slots, spawn low-prio waiter on pool.alloc(),
+    //    keep h1..h3 held until waiter is woken strictly by the ISR releasing tx_slot with boost: @critical!
+    Lease<[17]u8> h1 = tx_pool.try_alloc() catch { sys.exit(1); };
+    Lease<[17]u8> h2 = tx_pool.try_alloc() catch { sys.exit(1); };
+    Lease<[17]u8> h3 = tx_pool.try_alloc() catch { sys.exit(1); };
+    assert(tx_pool.is_exhausted());
+    start_waiter.notify();
+    delay(2ms);
+    sys.pend_irq(2);
+    done_sig.wait();
+    h1.release();
+    h2.release();
+    h3.release();
+    assert(tx_pool.avail() == 4);
+    assert(tx_pool.in_use() == 0);
+    assert(tx_slot.is_empty());
+    assert(sys.sleep_depth() == 2);
+    println("[PASS] POOL_LEASE_QEMU OK");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    IRQ_DMA.attach(on_dma_irq(&tx_slot));
+    spawn waiter_task(&tx_pool, &start_waiter, &done_sig) @low;
+    spawn driver_task() @normal;
+}
+"#;
+        let (_mir, ll, res) = run_zev_cortex_m_qemu("pool_lease_qemu", src);
+        assert_all_allocas_in_entry(&ll);
+        assert!(
+            res.exec.stdout.contains("Q_SEND_TIMEOUT_RECYCLED")
+                && res.exec.stdout.contains("SLOT_BUSY_RECYCLED")
+                && res.exec.stdout.contains("[PASS] POOL_LEASE_QEMU OK"),
+            "stdout={}",
+            res.exec.stdout
+        );
+        // ISR touches dma_slot -> @__syn_pool_release must retain critical section
+        let rel_start = ll.find("define void @__syn_pool_release(").unwrap();
+        let rel_end = ll[rel_start..].find("\n}\n").unwrap() + rel_start;
+        assert!(
+            ll[rel_start..rel_end].contains("@__syn_crit_enter"),
+            "ISR-contended pool release must keep critical section"
+        );
+    }
+
+    #[test]
+    fn view_bundle_status_cell_duplex_elision_and_cross_target_builds() {
+        let src = r#"
+struct StatusCell<T> {
+    *watch<T> state;
+}
+
+struct DuplexStream {
+    *byte_ring rx;
+    *byte_ring tx;
+}
+
+watch<u32> link_watch = 1;
+byte_ring<16> uart_rx;
+byte_ring<16> uart_tx;
+@dma_safe pool<[64]u8, 4> pkt_pool;
+dma_slot<[64]u8> tx_slot;
+inbox<Lease<[64]u8>, 2> tx_q;
+
+void update_status(*StatusCell<u32> cell, u32 next_val) {
+    cell.state.publish(next_val);
+}
+
+void forward_stream(*DuplexStream io) {
+    assert(io.rx.push("PING") == 4);
+    u8 buf[4];
+    assert(io.rx.pop(buf) == 4);
+    assert(io.tx.push(buf) == 4);
+}
+
+fn main() {
+    StatusCell<u32> cell = StatusCell<u32> { state: &link_watch };
+    DuplexStream io = DuplexStream { rx: &uart_rx, tx: &uart_tx };
+    update_status(&cell, 99u32);
+    assert(cell.state.read() == 99u32);
+    forward_stream(&io);
+    assert(io.tx.len() == 4);
+    u8 out_b[4];
+    assert(uart_tx.pop(out_b) == 4);
+    assert(out_b[0] == 'P' && out_b[3] == 'G');
+
+    Lease<[64]u8> l = pkt_pool.try_alloc() catch { sys.exit(1); };
+    *[64]u8 p = l.get();
+    (*p)[0] = 0xABu8;
+    tx_q.post(l);
+    Lease<[64]u8> r = tx_q.try_recv() catch { sys.exit(1); };
+    tx_slot.park(r) catch { sys.exit(1); };
+    assert(tx_slot.release());
+    assert(pkt_pool.avail() == 4);
+    assert(sys.sleep_depth() == 2);
+    println("[PASS] VIEW_BUNDLE_CROSS_TARGET OK");
+    sys.exit(0);
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse view_bundle_cross_target");
+        let (mono_progs, _sema_model) = zev_sema::analyze_and_monomorphize_programs(
+            &[prog],
+            &zev_sema::AnalyzeOptions::default(),
+        )
+        .into_result()
+        .expect("sema + mono view_bundle_cross_target");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower view_bundle_cross_target");
+
+        // 1. Cortex-M3 QEMU execution + task-only @__syn_pool_release IRQ elision proof
+        let dir = test_out_dir();
+        let elf = dir.join("view_bundle_cm3.elf");
+        let cm_res = run_qemu_cortex_m(
+            &mir,
+            &elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run view_bundle Cortex-M3 QEMU");
+        assert_eq!(cm_res.exec.exit_code, 0, "stdout={}", cm_res.exec.stdout);
+        assert!(cm_res.exec.stdout.contains("[PASS] VIEW_BUNDLE_CROSS_TARGET OK"));
+        let ll_cm = std::fs::read_to_string(&cm_res.build.ll_path).unwrap();
+        assert_all_allocas_in_entry(&ll_cm);
+        let rel_start = ll_cm.find("define void @__syn_pool_release(").unwrap();
+        let rel_end = ll_cm[rel_start..].find("\n}\n").unwrap() + rel_start;
+        assert!(
+            ll_cm[rel_start..rel_end].contains("; irq-mask elided"),
+            "task-only pool release must elide IRQ mask:\n{}",
+            &ll_cm[rel_start..rel_end]
+        );
+        assert!(!ll_cm[rel_start..rel_end].contains("@__syn_crit_enter"));
+
+        // 2. ESP32-C6 ELF + firmware binary + disassembly audit
+        let esp_img = build_esp32c6_image(
+            &mir,
+            &dir.join("view_bundle_esp32c6.elf"),
+            &dir.join("view_bundle_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 pool/lease/view-bundle image");
+        assert!(esp_img.elf.audit.is_zero_heap_freestanding());
+
+        // 3. AVR ATmega328P ELF + flash binary build (@llvm.cttz.i32 / @llvm.ctpop.i32)
+        let avr_img = build_avr_uno_image(
+            &mir,
+            &dir.join("view_bundle_avr.elf"),
+            &dir.join("view_bundle_avr.hex"),
+        )
+        .expect("build AVR ATmega328P pool/lease/view-bundle image");
+        assert!(avr_img.elf.audit.is_zero_heap_freestanding());
+
+        // 4. Host x86_64 LLVM IR + llc object compilation
+        let mut host_opts = CodegenOptions::default();
+        host_opts.target = TargetArch::HostX86_64Linux;
+        let host_ll = emit_llvm_ir_with_options(&mir, &host_opts).expect("emit x86_64 IR");
+        let host_ll_path = dir.join("view_bundle_host.ll");
+        let host_obj_path = dir.join("view_bundle_host.o");
+        std::fs::write(&host_ll_path, &host_ll).unwrap();
+        compile_ll_to_obj(&host_ll_path, &host_obj_path, &host_opts)
+            .expect("llc x86_64 compile view_bundle + pool/lease");
+    }
 }

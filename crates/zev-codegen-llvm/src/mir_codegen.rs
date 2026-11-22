@@ -6,7 +6,7 @@
 //! - Stackless coroutine state machines (`switch i32 %pc, ...`) over static `%TaskFrame_*` /
 //!   `%FnFrame_*` structs with `[K x i64]` byte-aligned union storage for disjoint child frames
 //! - Scheduler-integrated `watch`, `inbox` (with `timeout` + `or` + ISR `boost`), `chan`,
-//!   `signal`, `ping_pong` (with DMA wake-lock sleep clamping), and `lease` primitives
+//!   `signal`, `ping_pong`, `@dma_safe pool`/`Lease`/`dma_slot` (with DMA wake-lock sleep clamping) primitives
 //! - Synthesized bare-metal Cortex-M3 `.isr_vector` + user hardware `isr` handlers.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -37,7 +37,10 @@ struct StructInfo {
     llvm_name: String,
     byte_size: usize,
     align: usize,
+    llvm_abi_size: usize,
+    llvm_nat_align: usize,
     field_indices: HashMap<String, (usize, MirType)>,
+    llvm_fields: Vec<(Option<usize>, String)>,
 }
 
 #[derive(Clone)]
@@ -94,6 +97,7 @@ struct ModuleCtx<'a> {
     distinct_prims: BTreeMap<String, MirPrimKind>,
     distinct_inbox_views: BTreeMap<String, MirType>,
     uses_byte_ring_view: bool,
+    uses_pool_lease: bool,
     rt_features: RuntimeIrFeatures,
     strings: Vec<String>,
     string_dedup: HashMap<String, usize>,
@@ -163,6 +167,7 @@ pub fn emit_llvm_ir_with_options(
         distinct_prims: BTreeMap::new(),
         distinct_inbox_views: BTreeMap::new(),
         uses_byte_ring_view: false,
+        uses_pool_lease: false,
         rt_features,
         strings: Vec::new(),
         string_dedup: HashMap::new(),
@@ -350,8 +355,10 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                 MirPrimKind::Watch { elem }
                 | MirPrimKind::Inbox { elem, .. }
                 | MirPrimKind::PingPong { elem, .. }
-                | MirPrimKind::Lease { elem, .. } => scan_ty(elem, feat),
+                | MirPrimKind::Pool { elem, .. }
+                | MirPrimKind::DmaSlot { elem } => scan_ty(elem, feat),
             },
+            MirType::Lease(elem) => scan_ty(elem, feat),
             MirType::PrimView(MirPrimViewKind::Inbox { elem }) => scan_ty(elem, feat),
             MirType::PrimView(MirPrimViewKind::ByteRing) => {}
             _ => {}
@@ -487,6 +494,40 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                     scan_ty(elem_ty, feat);
                     let _ = cap;
                 }
+                MirPrimReadOp::PoolTryAlloc {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::PoolAvail {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::PoolInUse {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::PoolIsExhausted {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::PoolCap {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::DmaSlotTake { target, elem_ty }
+                | MirPrimReadOp::DmaSlotRelease {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::DmaSlotIsBusy { target, elem_ty }
+                | MirPrimReadOp::DmaSlotIsEmpty { target, elem_ty }
+                | MirPrimReadOp::DmaSlotAddr { target, elem_ty } => {
+                    scan_prim_target(target, feat);
+                    scan_ty(elem_ty, feat);
+                }
+                MirPrimReadOp::DmaSlotPark {
+                    target,
+                    elem_ty,
+                    lease,
+                } => {
+                    scan_prim_target(target, feat);
+                    scan_ty(elem_ty, feat);
+                    scan_expr(lease, feat);
+                }
                 MirPrimReadOp::ByteRingPush {
                     target, src: val, ..
                 }
@@ -556,6 +597,10 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                 if let Some(idx) = index {
                     scan_expr(idx, feat);
                 }
+            }
+            MirExprKind::LeaseGet { lease, elem_ty } | MirExprKind::LeaseAddr { lease, elem_ty } => {
+                scan_ty(elem_ty, feat);
+                scan_expr(lease, feat);
             }
             _ => {}
         }
@@ -630,15 +675,19 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                     }
                     | MirPrimNonBlockingOp::PingPongSetActive {
                         target, elem_ty, ..
-                    }
-                    | MirPrimNonBlockingOp::LeaseComplete {
-                        target, elem_ty, ..
-                    }
-                    | MirPrimNonBlockingOp::LeaseSetActive {
-                        target, elem_ty, ..
                     } => {
                         scan_prim_target(target, feat);
                         scan_ty(elem_ty, feat);
+                    }
+                    MirPrimNonBlockingOp::LeaseRelease {
+                        value, elem_ty, ..
+                    } => {
+                        scan_ty(elem_ty, feat);
+                        scan_expr(value, feat);
+                    }
+                    MirPrimNonBlockingOp::LeaseNullify { target, elem_ty } => {
+                        scan_ty(elem_ty, feat);
+                        scan_place(target, feat);
                     }
                     MirPrimNonBlockingOp::InboxViewPost {
                         view,
@@ -759,7 +808,7 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                     | MirYieldKind::PingPongWaitChunk {
                         target, elem_ty, ..
                     }
-                    | MirYieldKind::LeaseWaitChunk {
+                    | MirYieldKind::PoolAlloc {
                         target, elem_ty, ..
                     } => {
                         scan_prim_target(target, feat);
@@ -1075,18 +1124,61 @@ impl<'a> ModuleCtx<'a> {
         let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
         let mut offset = 0usize;
         let mut max_align = 1usize;
+        let mut llvm_off = 0usize;
+        let mut llvm_max_nat_al = 1usize;
         let mut field_indices = HashMap::new();
+        let mut llvm_fields = Vec::new();
         for (idx, fld) in decl.fields.iter().enumerate() {
-            let (fsize, falign) = self.size_align(&fld.ty, ptr_bytes);
+            let is_dma_pool = fld.dma_safe
+                && matches!(fld.ty, MirType::Primitive(MirPrimKind::Pool { .. }));
+            let (fsize, mut falign) = self.size_align(&fld.ty, ptr_bytes);
+            let fsize = if is_dma_pool {
+                if let MirType::Primitive(MirPrimKind::Pool { elem, cap }) = &fld.ty {
+                    let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                    let stride = align_up(esz.max(1), eal.max(32));
+                    32 + (*cap).max(1) * stride
+                } else {
+                    fsize
+                }
+            } else {
+                fsize
+            };
+            if is_dma_pool {
+                falign = falign.max(32);
+            }
             if !decl.packed {
                 offset = align_up(offset, falign);
                 max_align = max_align.max(falign);
             }
             offset += fsize;
-            field_indices.insert(fld.name.clone(), (idx, fld.ty.clone()));
+
+            let (nat_sz, nat_al) = self.llvm_abi_size_align(&fld.ty, fld.dma_safe);
+            let req_al = if decl.is_subsystem {
+                falign
+            } else if decl.packed {
+                1
+            } else {
+                nat_al
+            };
+            if decl.is_subsystem && req_al > nat_al {
+                let aligned = align_up(llvm_off, req_al);
+                if aligned > llvm_off {
+                    llvm_fields.push((None, format!("[{} x i8]", aligned - llvm_off)));
+                    llvm_off = aligned;
+                }
+            }
+            if !decl.packed {
+                llvm_off = align_up(llvm_off, nat_al);
+                llvm_max_nat_al = llvm_max_nat_al.max(nat_al);
+            }
+            let llvm_idx = llvm_fields.len();
+            llvm_fields.push((Some(idx), self.llvm_field_ty(fld)));
+            llvm_off += nat_sz;
+            field_indices.insert(fld.name.clone(), (llvm_idx, fld.ty.clone()));
         }
         if !decl.packed {
             offset = align_up(offset, max_align);
+            llvm_off = align_up(llvm_off, llvm_max_nat_al);
         }
         let llvm_name = format!("%struct.{}", sanitize_ident(&decl.name));
         self.structs.insert(
@@ -1096,7 +1188,14 @@ impl<'a> ModuleCtx<'a> {
                 llvm_name,
                 byte_size: offset.max(1),
                 align: if decl.packed { 1 } else { max_align.max(1) },
+                llvm_abi_size: llvm_off.max(1),
+                llvm_nat_align: if decl.packed {
+                    1
+                } else {
+                    llvm_max_nat_al.max(1)
+                },
                 field_indices,
+                llvm_fields,
             },
         );
         self.struct_order.push(decl.name.clone());
@@ -1105,6 +1204,10 @@ impl<'a> ModuleCtx<'a> {
     fn scan_mir_type_for_prims(&mut self, ty: &MirType) {
         match ty {
             MirType::Primitive(pk) => self.register_prim_kind(pk),
+            MirType::Lease(elem) => {
+                self.uses_pool_lease = true;
+                self.scan_mir_type_for_prims(elem);
+            }
             MirType::PrimView(MirPrimViewKind::ByteRing) => self.uses_byte_ring_view = true,
             MirType::PrimView(MirPrimViewKind::Inbox { elem }) => self.register_inbox_view(elem),
             MirType::Ptr(inner) | MirType::Slice(inner) => self.scan_mir_type_for_prims(inner),
@@ -1128,9 +1231,26 @@ impl<'a> ModuleCtx<'a> {
     }
 
     fn register_prim_kind(&mut self, pk: &MirPrimKind) {
+        if matches!(pk, MirPrimKind::Pool { .. } | MirPrimKind::DmaSlot { .. }) {
+            self.uses_pool_lease = true;
+        }
+        match pk {
+            MirPrimKind::Watch { elem }
+            | MirPrimKind::Inbox { elem, .. }
+            | MirPrimKind::PingPong { elem, .. }
+            | MirPrimKind::Pool { elem, .. }
+            | MirPrimKind::DmaSlot { elem } => self.scan_mir_type_for_prims(elem),
+            MirPrimKind::Signal | MirPrimKind::ByteRing { .. } => {}
+        }
         let key = pk.mangle_name();
         if !self.distinct_prims.contains_key(&key) {
             self.distinct_prims.insert(key, pk.clone());
+        }
+    }
+
+    fn scan_prim_target_for_prims(&mut self, target: &MirPrimTarget) {
+        if let MirPrimTarget::PtrExpr(e) = target {
+            self.scan_expr_for_prims(e);
         }
     }
 
@@ -1166,6 +1286,36 @@ impl<'a> ModuleCtx<'a> {
                     MirYieldKind::ByteRingViewWaitRead { view, .. } => {
                         self.scan_expr_for_prims(view);
                         self.uses_byte_ring_view = true;
+                    }
+                    MirYieldKind::PoolAlloc {
+                        target,
+                        elem_ty,
+                        cap,
+                        ..
+                    } => {
+                        self.scan_prim_target_for_prims(target);
+                        self.register_prim_kind(&MirPrimKind::Pool {
+                            elem: Box::new(elem_ty.clone()),
+                            cap: *cap,
+                        });
+                    }
+                    MirYieldKind::InboxRecv {
+                        target,
+                        elem_ty,
+                        cap,
+                        ..
+                    }
+                    | MirYieldKind::InboxSend {
+                        target,
+                        elem_ty,
+                        cap,
+                        ..
+                    } => {
+                        self.scan_prim_target_for_prims(target);
+                        self.register_prim_kind(&MirPrimKind::Inbox {
+                            elem: Box::new(elem_ty.clone()),
+                            cap: *cap,
+                        });
                     }
                     _ => {}
                 },
@@ -1249,9 +1399,19 @@ impl<'a> ModuleCtx<'a> {
                     self.scan_expr_for_prims(view);
                     self.uses_byte_ring_view = true;
                 }
-                MirPrimNonBlockingOp::WatchPublish { value, .. }
-                | MirPrimNonBlockingOp::InboxPost { value, .. } => {
+                MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+                | MirPrimNonBlockingOp::InboxPost { target, value, .. } => {
+                    self.scan_prim_target_for_prims(target);
                     self.scan_expr_for_prims(value);
+                }
+                MirPrimNonBlockingOp::LeaseRelease { value, elem_ty, .. } => {
+                    self.uses_pool_lease = true;
+                    self.scan_mir_type_for_prims(elem_ty);
+                    self.scan_expr_for_prims(value);
+                }
+                MirPrimNonBlockingOp::LeaseNullify { elem_ty, .. } => {
+                    self.uses_pool_lease = true;
+                    self.scan_mir_type_for_prims(elem_ty);
                 }
                 MirPrimNonBlockingOp::ByteRingConsume { len, .. }
                 | MirPrimNonBlockingOp::ByteRingCommitWrite { len, .. } => {
@@ -1397,15 +1557,97 @@ impl<'a> ModuleCtx<'a> {
                     self.scan_expr_for_prims(view);
                     self.uses_byte_ring_view = true;
                 }
-                MirPrimReadOp::ByteRingPush { src: val, .. }
-                | MirPrimReadOp::ByteRingPop { dst: val, .. }
-                | MirPrimReadOp::ByteRingPushByte { byte: val, .. }
-                | MirPrimReadOp::ByteRingGrantWrite { len: val, .. }
-                | MirPrimReadOp::InboxTrySend { value: val, .. } => {
+                MirPrimReadOp::ByteRingPush {
+                    target, src: val, ..
+                }
+                | MirPrimReadOp::ByteRingPop {
+                    target, dst: val, ..
+                }
+                | MirPrimReadOp::ByteRingPushByte {
+                    target, byte: val, ..
+                }
+                | MirPrimReadOp::ByteRingGrantWrite {
+                    target, len: val, ..
+                } => {
+                    self.scan_prim_target_for_prims(target);
                     self.scan_expr_for_prims(val);
+                }
+                MirPrimReadOp::InboxTrySend {
+                    target,
+                    elem_ty,
+                    cap,
+                    value: val,
+                    ..
+                } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::Inbox {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    });
+                    self.scan_expr_for_prims(val);
+                }
+                MirPrimReadOp::PoolTryAlloc {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolAvail {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolInUse {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolIsExhausted {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolCap {
+                    target,
+                    elem_ty,
+                    cap,
+                } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::Pool {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    });
+                }
+                MirPrimReadOp::DmaSlotPark {
+                    target,
+                    elem_ty,
+                    lease,
+                } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::DmaSlot {
+                        elem: Box::new(elem_ty.clone()),
+                    });
+                    self.scan_expr_for_prims(lease);
+                }
+                MirPrimReadOp::DmaSlotTake { target, elem_ty }
+                | MirPrimReadOp::DmaSlotRelease {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::DmaSlotIsBusy { target, elem_ty }
+                | MirPrimReadOp::DmaSlotIsEmpty { target, elem_ty }
+                | MirPrimReadOp::DmaSlotAddr { target, elem_ty } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::DmaSlot {
+                        elem: Box::new(elem_ty.clone()),
+                    });
                 }
                 _ => {}
             },
+            MirExprKind::LeaseGet { lease, elem_ty }
+            | MirExprKind::LeaseAddr { lease, elem_ty } => {
+                self.uses_pool_lease = true;
+                self.scan_mir_type_for_prims(elem_ty);
+                self.scan_expr_for_prims(lease);
+            }
             MirExprKind::MmioRead { base, index, .. } => {
                 self.scan_expr_for_prims(base);
                 if let Some(i) = index {
@@ -1571,12 +1813,22 @@ impl<'a> ModuleCtx<'a> {
                     let (esz, eal) = self.size_align(elem, ptr_bytes);
                     (align_up(4, eal) + 2 * esz * (*cap).max(1), eal.max(4))
                 }
-                MirPrimKind::Lease { elem, cap } => {
+                MirPrimKind::Pool { elem, cap } => {
+                    let (hdr_sz, hdr_al) = self.pool_hdr_llvm_size();
                     let (esz, eal) = self.size_align(elem, ptr_bytes);
-                    (align_up(2, eal) + esz * (*cap).max(1), eal.max(4))
+                    let al = eal.max(hdr_al);
+                    (align_up(hdr_sz, eal) + esz * (*cap).max(1), al)
+                }
+                MirPrimKind::DmaSlot { .. } => {
+                    let al = self.ptr_align();
+                    (align_up(2 * ptr_bytes + 2, al.max(1)), al.max(1))
                 }
                 MirPrimKind::ByteRing { cap } => (28 + (*cap).max(1), 4),
             },
+            MirType::Lease(_) => {
+                let al = self.ptr_align();
+                (align_up(2 * ptr_bytes + 1, al.max(1)), al.max(1))
+            }
             MirType::PrimView(MirPrimViewKind::ByteRing) => (2 * ptr_bytes, ptr_bytes),
             MirType::PrimView(MirPrimViewKind::Inbox { .. }) => (3 * ptr_bytes, ptr_bytes),
             MirType::Result { ok, .. } => {
@@ -1589,6 +1841,131 @@ impl<'a> ModuleCtx<'a> {
                 (align_up(osz, 4) + 4, al)
             }
         }
+    }
+
+    fn ptr_align(&self) -> usize {
+        if self.opts.target == TargetArch::AvrAtmega328p {
+            1
+        } else {
+            (self.opts.target.ptr_bits() / 8) as usize
+        }
+    }
+
+    fn llvm_scalar_abi_align(&self, natural_align: usize) -> usize {
+        if self.opts.target == TargetArch::AvrAtmega328p {
+            1
+        } else {
+            natural_align
+        }
+    }
+
+    fn pool_hdr_llvm_size(&self) -> (usize, usize) {
+        match self.opts.target {
+            TargetArch::HostX86_64Linux => (24, 8),
+            TargetArch::Thumbv7mNoneEabi | TargetArch::Riscv32Esp32C6 => (16, 4),
+            TargetArch::AvrAtmega328p => (12, 1),
+        }
+    }
+
+    fn llvm_abi_size_align(&self, ty: &MirType, dma_safe: bool) -> (usize, usize) {
+        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let ptr_al = self.ptr_align();
+        match ty {
+            MirType::Void => (0, 1),
+            MirType::Bool | MirType::U8 | MirType::I8 => (1, 1),
+            MirType::U16 | MirType::I16 | MirType::EndianInt { bits: 16, .. } => {
+                (2, self.llvm_scalar_abi_align(2))
+            }
+            MirType::U32
+            | MirType::I32
+            | MirType::F32
+            | MirType::EndianInt { bits: 32, .. }
+            | MirType::Enum(_) => (4, self.llvm_scalar_abi_align(4)),
+            MirType::U64 | MirType::I64 | MirType::F64 | MirType::EndianInt { bits: 64, .. } => {
+                (8, self.llvm_scalar_abi_align(8))
+            }
+            MirType::EndianInt { .. } => (4, self.llvm_scalar_abi_align(4)),
+            MirType::Usize
+            | MirType::Isize
+            | MirType::Ptr(_)
+            | MirType::MmioPtr(_)
+            | MirType::FnPtr { .. }
+            | MirType::Str => (ptr_bytes, ptr_al),
+            MirType::Slice(_) | MirType::PrimView(MirPrimViewKind::ByteRing) => {
+                (2 * ptr_bytes, ptr_al)
+            }
+            MirType::PrimView(MirPrimViewKind::Inbox { .. }) => (3 * ptr_bytes, ptr_al),
+            MirType::Lease(_) => (align_up(2 * ptr_bytes + 1, ptr_al), ptr_al),
+            MirType::Array { elem, len } => {
+                let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                (esz * (*len).max(1), eal)
+            }
+            MirType::Struct(name) => {
+                if let Some(si) = self.structs.get(name) {
+                    (si.llvm_abi_size, si.llvm_nat_align)
+                } else {
+                    (4, self.llvm_scalar_abi_align(4))
+                }
+            }
+            MirType::Primitive(pk) => match pk {
+                MirPrimKind::Signal => (2, 1),
+                MirPrimKind::Watch { elem } => {
+                    let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                    let i32_al = self.llvm_scalar_abi_align(4);
+                    let al = eal.max(i32_al);
+                    (align_up(align_up(esz, i32_al) + 4, al), al)
+                }
+                MirPrimKind::Inbox { elem, cap } => {
+                    let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                    let i32_al = self.llvm_scalar_abi_align(4);
+                    let c = (*cap).max(1);
+                    let al = eal.max(i32_al);
+                    (align_up(align_up(12 + c, eal) + c * esz, al), al)
+                }
+                MirPrimKind::PingPong { elem, cap } => {
+                    let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                    let c = (*cap).max(1);
+                    (align_up(4, eal) + 2 * c * esz, eal.max(1))
+                }
+                MirPrimKind::Pool { elem, cap } => {
+                    let (hdr_sz, hdr_al) = self.pool_hdr_llvm_size();
+                    let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                    let c = (*cap).max(1);
+                    if dma_safe {
+                        let slot_stride = align_up(esz.max(1), eal.max(32));
+                        let al = hdr_al.max(eal);
+                        (align_up(32 + c * slot_stride, al), al)
+                    } else {
+                        let al = hdr_al.max(eal);
+                        (align_up(align_up(hdr_sz, eal) + c * esz, al), al)
+                    }
+                }
+                MirPrimKind::DmaSlot { .. } => (align_up(2 * ptr_bytes + 2, ptr_al), ptr_al),
+                MirPrimKind::ByteRing { cap } => {
+                    let i32_al = self.llvm_scalar_abi_align(4);
+                    (align_up(25 + (*cap).max(1), i32_al), i32_al)
+                }
+            },
+            MirType::Result { ok, .. } => {
+                let i32_al = self.llvm_scalar_abi_align(4);
+                let (osz, oal) = if ok.is_void() {
+                    (4, i32_al)
+                } else {
+                    self.llvm_abi_size_align(ok, false)
+                };
+                let al = oal.max(i32_al);
+                (align_up(align_up(osz, i32_al) + 4, al), al)
+            }
+        }
+    }
+
+    fn llvm_field_ty(&self, fld: &zev_mir::MirField) -> String {
+        if fld.dma_safe {
+            if let MirType::Primitive(pk @ MirPrimKind::Pool { .. }) = &fld.ty {
+                return format!("%prim.{}_dma", sanitize_ident(&pk.mangle_name()));
+            }
+        }
+        self.llvm_ty(&fld.ty)
     }
 
     fn llvm_ty(&self, ty: &MirType) -> String {
@@ -1614,6 +1991,7 @@ impl<'a> ModuleCtx<'a> {
             }
             MirType::Struct(name) => format!("%struct.{}", sanitize_ident(name)),
             MirType::Primitive(pk) => format!("%prim.{}", sanitize_ident(&pk.mangle_name())),
+            MirType::Lease(_) => "{ ptr, ptr, i8 }".to_string(),
             MirType::PrimView(MirPrimViewKind::ByteRing) => {
                 format!("{{ ptr, {} }}", self.opts.target.usize_llvm_ty())
             }
@@ -2271,24 +2649,26 @@ impl<'a> ModuleCtx<'a> {
         let Some(si) = self.structs.get(struct_name) else {
             return "zeroinitializer".to_string();
         };
-        if si.decl.fields.is_empty() {
+        if si.llvm_fields.is_empty() {
             return "zeroinitializer".to_string();
         }
         let parts: Vec<String> = si
-            .decl
-            .fields
+            .llvm_fields
             .iter()
-            .map(|f| {
-                let fty = self.llvm_ty(&f.ty);
-                match &f.ty {
-                    MirType::Primitive(MirPrimKind::Signal) => {
-                        format!("{fty} {{ i8 0, i8 127 }}")
+            .map(|(decl_idx, lty)| match decl_idx {
+                Some(idx) => {
+                    let f = &si.decl.fields[*idx];
+                    match &f.ty {
+                        MirType::Primitive(MirPrimKind::Signal) => {
+                            format!("{lty} {{ i8 0, i8 127 }}")
+                        }
+                        MirType::Struct(sub) => {
+                            format!("{lty} {}", self.subsystem_zero_init_const(sub))
+                        }
+                        _ => format!("{lty} zeroinitializer"),
                     }
-                    MirType::Struct(sub) => {
-                        format!("{fty} {}", self.subsystem_zero_init_const(sub))
-                    }
-                    _ => format!("{fty} zeroinitializer"),
                 }
+                None => format!("{lty} zeroinitializer"),
             })
             .collect();
         format!("{{ {} }}", parts.join(", "))
@@ -2405,10 +2785,18 @@ ok_bb:
     }
 
     fn emit_primitives_ir(&self, out: &mut String) {
-        if self.distinct_prims.is_empty() && self.module.primitives.is_empty() {
+        if self.distinct_prims.is_empty()
+            && self.module.primitives.is_empty()
+            && !self.uses_pool_lease
+            && self.module.subsystems.is_empty()
+            && self.distinct_inbox_views.is_empty()
+        {
             return;
         }
         let _ = writeln!(out, "; ── Static OS & Zero-Copy DMA Primitive Endpoints ──");
+        if self.uses_pool_lease {
+            let _ = writeln!(out, "%prim.pool_hdr = type {{ i32, i32, ptr, i8, i8 }}");
+        }
         for (mangled, pk) in &self.distinct_prims {
             let id = sanitize_ident(mangled);
             match pk {
@@ -2435,10 +2823,37 @@ ok_bb:
                         "%prim.{id} = type {{ i8, i8, i8, i8, [{c} x {ety}], [{c} x {ety}] }}"
                     );
                 }
-                MirPrimKind::Lease { elem, cap } => {
+                MirPrimKind::Pool { elem, cap } => {
                     let ety = self.llvm_ty(elem);
                     let c = (*cap).max(1);
-                    let _ = writeln!(out, "%prim.{id} = type {{ i8, i8, [{c} x {ety}] }}");
+                    let _ = writeln!(out, "%prim.{id} = type {{ %prim.pool_hdr, [{c} x {ety}] }}");
+                    let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                    let (hdr_sz, _) = self.pool_hdr_llvm_size();
+                    let stride = align_up(esz.max(1), eal.max(32));
+                    let pad = stride.saturating_sub(esz);
+                    if pad > 0 {
+                        let _ = writeln!(
+                            out,
+                            "%prim.{id}_dma_slot = type {{ {ety}, [{pad} x i8] }}"
+                        );
+                    } else {
+                        let _ = writeln!(out, "%prim.{id}_dma_slot = type {{ {ety} }}");
+                    }
+                    let hdr_pad = 32usize.saturating_sub(hdr_sz);
+                    if hdr_pad > 0 {
+                        let _ = writeln!(
+                            out,
+                            "%prim.{id}_dma = type {{ %prim.pool_hdr, [{hdr_pad} x i8], [{c} x %prim.{id}_dma_slot] }}"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            out,
+                            "%prim.{id}_dma = type {{ %prim.pool_hdr, [{c} x %prim.{id}_dma_slot] }}"
+                        );
+                    }
+                }
+                MirPrimKind::DmaSlot { .. } => {
+                    let _ = writeln!(out, "%prim.{id} = type {{ ptr, ptr, i8, i8 }}");
                 }
                 MirPrimKind::ByteRing { cap } => {
                     let c = (*cap).max(1);
@@ -2463,10 +2878,10 @@ ok_bb:
             if !si.decl.is_subsystem {
                 continue;
             }
-            let fields_str: Vec<String> = if si.decl.fields.is_empty() {
+            let fields_str: Vec<String> = if si.llvm_fields.is_empty() {
                 vec!["i8".to_string()]
             } else {
-                si.decl.fields.iter().map(|f| self.llvm_ty(&f.ty)).collect()
+                si.llvm_fields.iter().map(|(_, lty)| lty.clone()).collect()
             };
             let joined = fields_str.join(", ");
             let _ = writeln!(out, "{} = type {{ {joined} }}", si.llvm_name);
@@ -2494,7 +2909,15 @@ ok_bb:
             }
             let gsym = format!("@__syn_prim_{}", sanitize_ident(&p.name));
             let pty = format!("%prim.{}", sanitize_ident(&p.kind.mangle_name()));
-            let align = if p.dma_safe { 16 } else { 4 };
+            let align = if p.dma_safe {
+                if matches!(p.kind, MirPrimKind::Pool { .. }) {
+                    32
+                } else {
+                    16
+                }
+            } else {
+                4
+            };
             match &p.kind {
                 MirPrimKind::Signal => {
                     let _ = writeln!(out, "{gsym} = global {pty} {{ i8 0, i8 127 }}, align {align}");
@@ -2560,22 +2983,76 @@ ok_bb:
                         "{gsym} = global {pty} {{ i8 0, i8 0, i8 0, i8 {lbit}, [{c} x {ety}] zeroinitializer, [{c} x {ety}] zeroinitializer }}, align {align}"
                     );
                 }
-                MirPrimKind::Lease { elem, cap } => {
-                    let ety = self.llvm_ty(elem);
-                    let c = (*cap).max(1);
-                    let lbit = p.sleep_lock_bit.unwrap_or(0);
-                    let _ = writeln!(
-                        out,
-                        "{gsym} = global {pty} {{ i8 0, i8 {lbit}, [{c} x {ety}] zeroinitializer }}, align {align}"
-                    );
+                MirPrimKind::Pool { .. } => {
+                    let gty = if p.dma_safe { format!("{pty}_dma") } else { pty };
+                    let _ = writeln!(out, "{gsym} = global {gty} zeroinitializer, align {align}");
+                }
+                MirPrimKind::DmaSlot { .. } => {
+                    let _ = writeln!(out, "{gsym} = global {pty} zeroinitializer, align {align}");
                 }
             }
         }
         let _ = writeln!(out);
 
         let vis = zev_mir::opt::VisibilityReport::effective_for(self.module);
-        // Emit typed primitive runtime helpers for each distinct primitive kind
+        // Emit shared pool lease release helper if pools, dma_slots, or Lease<T> values exist.
         let fn_sz = self.opts.fn_size_attrs();
+        if self.uses_pool_lease {
+            let ptr_al = self.ptr_align();
+            let mut rel_sec = format!(
+                r#"define void @__syn_pool_release(ptr %pool_hdr, i8 %slot_idx, i8 %boost) nounwind{fn_sz} {{
+entry:
+  %is_null = icmp eq ptr %pool_hdr, null
+  br i1 %is_null, label %done_null, label %chk_bounds
+done_null:
+  ret void
+chk_bounds:
+  %pm = call i32 @__syn_crit_enter()
+  %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %pool_hdr, i32 0, i32 4
+  %cap = load i8, ptr %cap_p, align 1
+  %valid = icmp ult i8 %slot_idx, %cap
+  br i1 %valid, label %chk_bit, label %unlock_exit
+chk_bit:
+  %idx32 = zext i8 %slot_idx to i32
+  %bit = shl i32 1, %idx32
+  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %pool_hdr, i32 0, i32 0
+  %fm = load i32, ptr %fm_p, align 4
+  %was = and i32 %fm, %bit
+  %is_used = icmp eq i32 %was, 0
+  br i1 %is_used, label %free_slot, label %unlock_exit
+free_slot:
+  %new_fm = or i32 %fm, %bit
+  store i32 %new_fm, ptr %fm_p, align 4
+  %dma_p = getelementptr inbounds %prim.pool_hdr, ptr %pool_hdr, i32 0, i32 3
+  %dma = load i8, ptr %dma_p, align 1
+  %is_dma = icmp ne i8 %dma, 0
+  br i1 %is_dma, label %dec_dma, label %wake
+dec_dma:
+  %dl = load volatile i32, ptr @__syn_dma_locks, align 4
+  %has_dl = icmp ugt i32 %dl, 0
+  br i1 %has_dl, label %do_dec, label %wake
+do_dec:
+  %dl1 = sub i32 %dl, 1
+  store volatile i32 %dl1, ptr @__syn_dma_locks, align 4
+  br label %wake
+wake:
+  %b32 = sext i8 %boost to i32
+  call void @__syn_wake_waiters(ptr %pool_hdr, i32 %b32)
+  br label %unlock_exit
+unlock_exit:
+  call void @__syn_crit_exit(i32 %pm)
+  ret void
+}}
+"#
+            );
+            let _ = ptr_al;
+            if !vis.any_pool_or_lease_contended() {
+                elide_llvm_crit(&mut rel_sec);
+            }
+            out.push_str(&rel_sec);
+            out.push('\n');
+        }
+        // Emit typed primitive runtime helpers for each distinct primitive kind
         for (mangled, pk) in &self.distinct_prims {
             let id = sanitize_ident(mangled);
             let pty = format!("%prim.{id}");
@@ -2665,9 +3142,20 @@ entry:
                 MirPrimKind::Inbox { elem, cap } => {
                     let ety = self.llvm_ty(elem);
                     let c = (*cap).max(1) as i32;
+                    let is_lease = matches!(elem.as_ref(), MirType::Lease(_));
+                    let push_fn = if is_lease {
+                        format!("@__syn_q_push_keep_{id}")
+                    } else {
+                        format!("@__syn_q_push_{id}")
+                    };
+                    let clear_slot = if is_lease {
+                        format!("\n  store {ety} zeroinitializer, ptr %slot_p, align 1")
+                    } else {
+                        String::new()
+                    };
                     let _ = writeln!(
                         sec,
-                        r#"define i8 @__syn_q_push_{id}(ptr %q, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+                        r#"define i8 {push_fn}(ptr %q, {ety} %val, i32 %boost) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
   %cnt_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 2
@@ -2710,7 +3198,7 @@ do_pop:
   %head = load i32, ptr %head_p, align 4
   %slot_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 4, i32 %head
   %val = load {ety}, ptr %slot_p, align 1
-  store {ety} %val, ptr %out_val, align 1
+  store {ety} %val, ptr %out_val, align 1{clear_slot}
   %bp = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3, i32 %head
   %sb = load i8, ptr %bp, align 1
   store i8 0, ptr %bp, align 1
@@ -2738,6 +3226,25 @@ empty:
 }}
 "#
                     );
+                    if is_lease {
+                        let _ = writeln!(
+                            sec,
+                            r#"define i8 @__syn_q_push_{id}(ptr %q, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+entry:
+  %ok = call i8 @__syn_q_push_keep_{id}(ptr %q, {ety} %val, i32 %boost)
+  %ok_b = icmp ne i8 %ok, 0
+  br i1 %ok_b, label %done, label %drop_lease
+drop_lease:
+  %ph = extractvalue {ety} %val, 1
+  %idx = extractvalue {ety} %val, 2
+  call void @__syn_pool_release(ptr %ph, i8 %idx, i8 -1)
+  ret i8 0
+done:
+  ret i8 1
+}}
+"#
+                        );
+                    }
                 }
                 MirPrimKind::PingPong { .. } => {
                     let _ = writeln!(
@@ -2801,53 +3308,259 @@ none:
 "#
                     );
                 }
-                MirPrimKind::Lease { .. } => {
+                MirPrimKind::Pool { .. } => {
+                    let ptr_al = self.ptr_align();
+                    let usize_ty = self.opts.target.usize_llvm_ty();
+                    let (hdr_sz, _) = self.pool_hdr_llvm_size();
+                    let slots_fidx = if 32usize.saturating_sub(hdr_sz) > 0 {
+                        2
+                    } else {
+                        1
+                    };
+                    let conv_usize = |src: &str, dst: &str| -> String {
+                        match usize_ty {
+                            "i16" => format!("  {dst} = trunc i32 {src} to i16"),
+                            "i64" => format!("  {dst} = zext i32 {src} to i64"),
+                            _ => format!("  {dst} = add i32 {src}, 0"),
+                        }
+                    };
+                    let conv_av = conv_usize("%cnt", "%cnt_u");
+                    let conv_used = conv_usize("%used", "%used_u");
+                    let conv_cap = conv_usize("%cap32", "%cap_u");
                     let _ = writeln!(
                         sec,
-                        r#"define void @__syn_lease_set_active_{id}(ptr %ls, i8 %active) nounwind{fn_sz} {{
+                        r#"define ptr @__syn_pool_slot_ptr_{id}(ptr %p, i8 %idx) nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %lb_p = getelementptr inbounds {pty}, ptr %ls, i32 0, i32 1
-  %lb = load i8, ptr %lb_p, align 1
-  %lb32 = zext i8 %lb to i32
-  %sh = and i32 %lb32, 31
-  %bit = shl i32 1, %sh
-  %old = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
-  %is_on = icmp ne i8 %active, 0
-  %inv = xor i32 %bit, -1
-  %cleared = and i32 %old, %inv
-  %setv = or i32 %old, %bit
-  %newv = select i1 %is_on, i32 %setv, i32 %cleared
-  store volatile i32 %newv, ptr @__syn_sleep_lock_mask, align 4
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+  %dma_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 3
+  %dma = load i8, ptr %dma_p, align 1
+  %is_dma = icmp ne i8 %dma, 0
+  %idx32 = zext i8 %idx to i32
+  %p_dma = getelementptr inbounds {pty}_dma, ptr %p, i32 0, i32 {slots_fidx}, i32 %idx32, i32 0
+  %p_plain = getelementptr inbounds {pty}, ptr %p, i32 0, i32 1, i32 %idx32
+  %res = select i1 %is_dma, ptr %p_dma, ptr %p_plain
+  ret ptr %res
 }}
 
-define void @__syn_lease_complete_{id}(ptr %ls) nounwind{fn_sz} {{
+define i8 @__syn_pool_try_alloc_raw_{id}(ptr %p, ptr %out_lease) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
-  %cr_p = getelementptr inbounds {pty}, ptr %ls, i32 0, i32 0
-  store i8 1, ptr %cr_p, align 1
-  call void @__syn_wake_waiters(ptr %ls, i32 -1)
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
-}}
-
-define ptr @__syn_lease_poll_{id}(ptr %ls) nounwind{fn_sz} {{
-entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cr_p = getelementptr inbounds {pty}, ptr %ls, i32 0, i32 0
-  %cr = load i8, ptr %cr_p, align 1
-  %rdy = icmp ne i8 %cr, 0
-  br i1 %rdy, label %take, label %none
+  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
+  %fm = load i32, ptr %fm_p, align 4
+  %has = icmp ne i32 %fm, 0
+  br i1 %has, label %take, label %empty
 take:
-  store i8 0, ptr %cr_p, align 1
-  %buf = getelementptr inbounds {pty}, ptr %ls, i32 0, i32 2, i32 0
+  %idx32 = call i32 @llvm.cttz.i32(i32 %fm, i1 true)
+  %bit = shl i32 1, %idx32
+  %inv = xor i32 %bit, -1
+  %new_fm = and i32 %fm, %inv
+  store i32 %new_fm, ptr %fm_p, align 4
+  %dma_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 3
+  %dma = load i8, ptr %dma_p, align 1
+  %is_dma = icmp ne i8 %dma, 0
+  br i1 %is_dma, label %inc_dma, label %finish
+inc_dma:
+  %dl = load volatile i32, ptr @__syn_dma_locks, align 4
+  %dl1 = add i32 %dl, 1
+  store volatile i32 %dl1, ptr @__syn_dma_locks, align 4
+  br label %finish
+finish:
+  %idx8 = trunc i32 %idx32 to i8
   call void @__syn_crit_exit(i32 %pm)
-  ret ptr %buf
-none:
+  %dp = call ptr @__syn_pool_slot_ptr_{id}(ptr %p, i8 %idx8)
+  %f0 = getelementptr inbounds {{ ptr, ptr, i8 }}, ptr %out_lease, i32 0, i32 0
+  store ptr %dp, ptr %f0, align {ptr_al}
+  %f1 = getelementptr inbounds {{ ptr, ptr, i8 }}, ptr %out_lease, i32 0, i32 1
+  store ptr %p, ptr %f1, align {ptr_al}
+  %f2 = getelementptr inbounds {{ ptr, ptr, i8 }}, ptr %out_lease, i32 0, i32 2
+  store i8 %idx8, ptr %f2, align 1
+  ret i8 1
+empty:
   call void @__syn_crit_exit(i32 %pm)
-  ret ptr null
+  ret i8 0
+}}
+
+define {{ {{ ptr, ptr, i8 }}, i32 }} @__syn_pool_try_alloc_{id}(ptr %p) nounwind{fn_sz} {{
+entry:
+  %tmp = alloca {{ ptr, ptr, i8 }}, align {ptr_al}
+  store {{ ptr, ptr, i8 }} zeroinitializer, ptr %tmp, align {ptr_al}
+  %ok = call i8 @__syn_pool_try_alloc_raw_{id}(ptr %p, ptr %tmp)
+  %got = icmp ne i8 %ok, 0
+  %ls = load {{ ptr, ptr, i8 }}, ptr %tmp, align {ptr_al}
+  %tag = select i1 %got, i32 0, i32 1
+  %r0 = insertvalue {{ {{ ptr, ptr, i8 }}, i32 }} poison, {{ ptr, ptr, i8 }} %ls, 0
+  %r1 = insertvalue {{ {{ ptr, ptr, i8 }}, i32 }} %r0, i32 %tag, 1
+  ret {{ {{ ptr, ptr, i8 }}, i32 }} %r1
+}}
+
+define {usize_ty} @__syn_pool_avail_{id}(ptr %p) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
+  %fm = load i32, ptr %fm_p, align 4
+  call void @__syn_crit_exit(i32 %pm)
+  %cnt = call i32 @llvm.ctpop.i32(i32 %fm)
+{conv_av}
+  ret {usize_ty} %cnt_u
+}}
+
+define {usize_ty} @__syn_pool_in_use_{id}(ptr %p) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 4
+  %cap = load i8, ptr %cap_p, align 1
+  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
+  %fm = load i32, ptr %fm_p, align 4
+  call void @__syn_crit_exit(i32 %pm)
+  %avail = call i32 @llvm.ctpop.i32(i32 %fm)
+  %cap32 = zext i8 %cap to i32
+  %used = sub i32 %cap32, %avail
+{conv_used}
+  ret {usize_ty} %used_u
+}}
+
+define {usize_ty} @__syn_pool_cap_{id}(ptr %p) nounwind{fn_sz} {{
+entry:
+  %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 4
+  %cap = load i8, ptr %cap_p, align 1
+  %cap32 = zext i8 %cap to i32
+{conv_cap}
+  ret {usize_ty} %cap_u
+}}
+
+define i8 @__syn_pool_is_exhausted_{id}(ptr %p) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
+  %fm = load i32, ptr %fm_p, align 4
+  call void @__syn_crit_exit(i32 %pm)
+  %empty = icmp eq i32 %fm, 0
+  %b8 = zext i1 %empty to i8
+  ret i8 %b8
+}}
+"#
+                    );
+                }
+                MirPrimKind::DmaSlot { .. } => {
+                    let usize_ty = self.opts.target.usize_llvm_ty();
+                    let _ = writeln!(
+                        sec,
+                        r#"define {{ i32, i32 }} @__syn_slot_park_{id}(ptr %s, {{ ptr, ptr, i8 }} %lease) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+  %occ = load i8, ptr %occ_p, align 1
+  %busy = icmp ne i8 %occ, 0
+  br i1 %busy, label %is_busy, label %do_park
+is_busy:
+  call void @__syn_crit_exit(i32 %pm)
+  %ph_b = extractvalue {{ ptr, ptr, i8 }} %lease, 1
+  %idx_b = extractvalue {{ ptr, ptr, i8 }} %lease, 2
+  call void @__syn_pool_release(ptr %ph_b, i8 %idx_b, i8 -1)
+  ret {{ i32, i32 }} {{ i32 0, i32 1 }}
+do_park:
+  %dp = extractvalue {{ ptr, ptr, i8 }} %lease, 0
+  %ph = extractvalue {{ ptr, ptr, i8 }} %lease, 1
+  %idx = extractvalue {{ ptr, ptr, i8 }} %lease, 2
+  %f0 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
+  %f1 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 1
+  %f2 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 2
+  store ptr %dp, ptr %f0, align 1
+  store ptr %ph, ptr %f1, align 1
+  store i8 %idx, ptr %f2, align 1
+  store i8 1, ptr %occ_p, align 1
+  call void @__syn_crit_exit(i32 %pm)
+  ret {{ i32, i32 }} zeroinitializer
+}}
+
+define {{ {{ ptr, ptr, i8 }}, i32 }} @__syn_slot_take_{id}(ptr %s) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+  %occ = load i8, ptr %occ_p, align 1
+  %empty = icmp eq i8 %occ, 0
+  br i1 %empty, label %is_empty, label %do_take
+is_empty:
+  call void @__syn_crit_exit(i32 %pm)
+  ret {{ {{ ptr, ptr, i8 }}, i32 }} {{ {{ ptr, ptr, i8 }} zeroinitializer, i32 1 }}
+do_take:
+  %f0 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
+  %f1 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 1
+  %f2 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 2
+  %dp = load ptr, ptr %f0, align 1
+  %ph = load ptr, ptr %f1, align 1
+  %idx = load i8, ptr %f2, align 1
+  store ptr null, ptr %f0, align 1
+  store ptr null, ptr %f1, align 1
+  store i8 0, ptr %f2, align 1
+  store i8 0, ptr %occ_p, align 1
+  call void @__syn_crit_exit(i32 %pm)
+  %l0 = insertvalue {{ ptr, ptr, i8 }} poison, ptr %dp, 0
+  %l1 = insertvalue {{ ptr, ptr, i8 }} %l0, ptr %ph, 1
+  %l2 = insertvalue {{ ptr, ptr, i8 }} %l1, i8 %idx, 2
+  %r0 = insertvalue {{ {{ ptr, ptr, i8 }}, i32 }} poison, {{ ptr, ptr, i8 }} %l2, 0
+  %r1 = insertvalue {{ {{ ptr, ptr, i8 }}, i32 }} %r0, i32 0, 1
+  ret {{ {{ ptr, ptr, i8 }}, i32 }} %r1
+}}
+
+define i8 @__syn_slot_release_{id}(ptr %s, i8 %boost) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+  %occ = load i8, ptr %occ_p, align 1
+  %empty = icmp eq i8 %occ, 0
+  br i1 %empty, label %is_empty, label %do_rel
+is_empty:
+  call void @__syn_crit_exit(i32 %pm)
+  ret i8 0
+do_rel:
+  %f0 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
+  %f1 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 1
+  %f2 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 2
+  %ph = load ptr, ptr %f1, align 1
+  %idx = load i8, ptr %f2, align 1
+  store ptr null, ptr %f0, align 1
+  store ptr null, ptr %f1, align 1
+  store i8 0, ptr %f2, align 1
+  store i8 0, ptr %occ_p, align 1
+  call void @__syn_crit_exit(i32 %pm)
+  call void @__syn_pool_release(ptr %ph, i8 %idx, i8 %boost)
+  ret i8 1
+}}
+
+define i8 @__syn_slot_is_busy_{id}(ptr %s) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+  %occ = load i8, ptr %occ_p, align 1
+  call void @__syn_crit_exit(i32 %pm)
+  %b = icmp ne i8 %occ, 0
+  %b8 = zext i1 %b to i8
+  ret i8 %b8
+}}
+
+define i8 @__syn_slot_is_empty_{id}(ptr %s) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+  %occ = load i8, ptr %occ_p, align 1
+  call void @__syn_crit_exit(i32 %pm)
+  %e = icmp eq i8 %occ, 0
+  %b8 = zext i1 %e to i8
+  ret i8 %b8
+}}
+
+define {usize_ty} @__syn_slot_addr_{id}(ptr %s) nounwind{fn_sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+  %occ = load i8, ptr %occ_p, align 1
+  %f0 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
+  %dp = load ptr, ptr %f0, align 1
+  call void @__syn_crit_exit(i32 %pm)
+  %busy = icmp ne i8 %occ, 0
+  %p_sel = select i1 %busy, ptr %dp, ptr null
+  %addr = ptrtoint ptr %p_sel to {usize_ty}
+  ret {usize_ty} %addr
 }}
 "#
                     );
@@ -3418,10 +4131,21 @@ entry:
         // Emit capacity-erased unsized `*inbox<T>` view helpers
         for (key, elem) in &self.distinct_inbox_views {
             let ety = self.llvm_ty(elem);
+            let is_lease = matches!(elem, MirType::Lease(_));
+            let push_fn = if is_lease {
+                format!("@__syn_q_view_push_keep_{key}")
+            } else {
+                format!("@__syn_q_view_push_{key}")
+            };
+            let clear_slot = if is_lease {
+                format!("\n  store {ety} zeroinitializer, ptr %slot_p, align 1")
+            } else {
+                String::new()
+            };
             let mut sec = String::new();
             let _ = writeln!(
                 sec,
-                r#"define i8 @__syn_q_view_push_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+                r#"define i8 {push_fn}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
   %cnt_p = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 2
@@ -3468,7 +4192,7 @@ do_pop:
   %head = load i32, ptr %head_p, align 4
   %slot_p = getelementptr inbounds {ety}, ptr %items_base, i32 %head
   %val = load {ety}, ptr %slot_p, align 1
-  store {ety} %val, ptr %out_val, align 1
+  store {ety} %val, ptr %out_val, align 1{clear_slot}
   %bp = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 3, i32 %head
   %sb = load i8, ptr %bp, align 1
   store i8 0, ptr %bp, align 1
@@ -3496,6 +4220,25 @@ empty:
 }}
 "#
             );
+            if is_lease {
+                let _ = writeln!(
+                    sec,
+                    r#"define i8 @__syn_q_view_push_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+entry:
+  %ok = call i8 @__syn_q_view_push_keep_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost)
+  %ok_b = icmp ne i8 %ok, 0
+  br i1 %ok_b, label %done, label %drop_lease
+drop_lease:
+  %ph = extractvalue {ety} %val, 1
+  %idx = extractvalue {ety} %val, 2
+  call void @__syn_pool_release(ptr %ph, i8 %idx, i8 -1)
+  ret i8 0
+done:
+  ret i8 1
+}}
+"#
+                );
+            }
             if !vis.is_inbox_view_contended(elem) {
                 elide_llvm_crit(&mut sec);
             }
@@ -4425,6 +5168,7 @@ entry:
             &MirErrorSpec::None,
         );
         fb.emit_entry_allocas(&[]);
+        fb.emit_pool_boot_inits();
 
         if boot_present {
             for step in &steps {
@@ -5160,11 +5904,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let qptr = self.resolve_prim_ptr(target)?;
                 let vp = self.var_ptr(*val_var);
                 let ety = self.ctx.llvm_ty(elem_ty);
+                let is_lease = matches!(elem_ty, MirType::Lease(_));
+                let push_fn = if is_lease {
+                    format!("@__syn_q_push_keep_{id}")
+                } else {
+                    format!("@__syn_q_push_{id}")
+                };
+                let ptr_al = self.ctx.ptr_align();
                 let v = self.next_tmp();
                 self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {v}, i32 -1)"
+                    "{ok} = call i8 {push_fn}(ptr {qptr}, {ety} {v}, i32 -1)"
                 ));
                 let ok_b = self.next_tmp();
                 self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
@@ -5173,6 +5924,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_term(format!("br i1 {ok_b}, label %{ok_lbl}, label %{full_lbl}"));
 
                 self.start_block(&ok_lbl);
+                if is_lease {
+                    let vp_ph = self.next_tmp();
+                    self.emit_line(format!(
+                        "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
+                    ));
+                    self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
+                }
                 if let Some(rvid) = dst_res {
                     let rp = self.var_ptr(*rvid);
                     let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -5196,6 +5954,20 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
                     self.start_block(&to_lbl);
+                    if is_lease {
+                        let ph = self.next_tmp();
+                        let sidx = self.next_tmp();
+                        let vp_ph = self.next_tmp();
+                        self.emit_line(format!("{ph} = extractvalue {ety} {v}, 1"));
+                        self.emit_line(format!("{sidx} = extractvalue {ety} {v}, 2"));
+                        self.emit_line(format!(
+                            "call void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
+                        ));
+                        self.emit_line(format!(
+                            "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
+                        ));
+                        self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
+                    }
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
                         let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -5461,11 +6233,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let key = sanitize_ident(&elem_ty.mangle_name());
                 let vp = self.var_ptr(*val_var);
                 let ety = self.ctx.llvm_ty(elem_ty);
+                let is_lease = matches!(elem_ty, MirType::Lease(_));
+                let push_fn = if is_lease {
+                    format!("@__syn_q_view_push_keep_{key}")
+                } else {
+                    format!("@__syn_q_view_push_{key}")
+                };
+                let ptr_al = self.ctx.ptr_align();
                 let v = self.next_tmp();
                 self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_q_view_push_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {v}, i32 -1)"
+                    "{ok} = call i8 {push_fn}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {v}, i32 -1)"
                 ));
                 let ok_b = self.next_tmp();
                 self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
@@ -5474,6 +6253,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_term(format!("br i1 {ok_b}, label %{ok_lbl}, label %{full_lbl}"));
 
                 self.start_block(&ok_lbl);
+                if is_lease {
+                    let vp_ph = self.next_tmp();
+                    self.emit_line(format!(
+                        "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
+                    ));
+                    self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
+                }
                 if let Some(rvid) = dst_res {
                     let rp = self.var_ptr(*rvid);
                     let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -5497,6 +6283,20 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
                     self.start_block(&to_lbl);
+                    if is_lease {
+                        let ph = self.next_tmp();
+                        let sidx = self.next_tmp();
+                        let vp_ph = self.next_tmp();
+                        self.emit_line(format!("{ph} = extractvalue {ety} {v}, 1"));
+                        self.emit_line(format!("{sidx} = extractvalue {ety} {v}, 2"));
+                        self.emit_line(format!(
+                            "call void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
+                        ));
+                        self.emit_line(format!(
+                            "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
+                        ));
+                        self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
+                    }
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
                         let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -5638,45 +6438,96 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.store_coro_pc(poll_bb.0 as i32);
                 self.emit_term("ret i32 1");
             }
-            MirYieldKind::LeaseWaitChunk {
+            MirYieldKind::PoolAlloc {
                 target,
                 elem_ty,
                 cap,
-                dst_slice,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
                 poll_bb,
                 resume_bb,
             } => {
-                let pk = MirPrimKind::Lease {
+                let pk = MirPrimKind::Pool {
                     elem: Box::new(elem_ty.clone()),
                     cap: *cap,
                 };
                 let id = sanitize_ident(&pk.mangle_name());
-                let lptr = self.resolve_prim_ptr(target)?;
-                let chunk_ptr = self.next_tmp();
+                let pptr = self.resolve_prim_ptr(target)?;
+                let (tmp, al) = self.emit_temp_alloca("{ ptr, ptr, i8 }");
                 self.emit_line(format!(
-                    "{chunk_ptr} = call ptr @__syn_lease_poll_{id}(ptr {lptr})"
+                    "store {{ ptr, ptr, i8 }} zeroinitializer, ptr {tmp}, align {al}"
+                ));
+                let ok = self.next_tmp();
+                self.emit_line(format!(
+                    "{ok} = call i8 @__syn_pool_try_alloc_raw_{id}(ptr {pptr}, ptr {tmp})"
                 ));
                 let got = self.next_tmp();
-                self.emit_line(format!("{got} = icmp ne ptr {chunk_ptr}, null"));
-                let ok_lbl = self.next_label("ls_ok");
-                let wait_lbl = self.next_label("ls_wait");
-                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{wait_lbl}"));
+                self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
+                let ok_lbl = self.next_label("pool_ok");
+                let empty_lbl = self.next_label("pool_empty");
+                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{empty_lbl}"));
 
                 self.start_block(&ok_lbl);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty();
-                let slice_ty = format!("{{ ptr, {usize_ty} }}");
-                let s0 = self.next_tmp();
-                let s1 = self.next_tmp();
-                self.emit_line(format!("{s0} = insertvalue {slice_ty} poison, ptr {chunk_ptr}, 0"));
-                self.emit_line(format!("{s1} = insertvalue {slice_ty} {s0}, {usize_ty} {cap}, 1"));
-                let dp = self.var_ptr(*dst_slice);
-                self.emit_line(format!("store {slice_ty} {s1}, ptr {dp}, align 4"));
+                let ls = self.next_tmp();
+                self.emit_line(format!("{ls} = load {{ ptr, ptr, i8 }}, ptr {tmp}, align {al}"));
+                let ptr_al = self.ctx.ptr_align();
+                if let Some(vid) = dst_val {
+                    let vp = self.var_ptr(*vid);
+                    self.emit_line(format!(
+                        "store {{ ptr, ptr, i8 }} {ls}, ptr {vp}, align {ptr_al}"
+                    ));
+                }
+                if let Some(rvid) = dst_res {
+                    let rp = self.var_ptr(*rvid);
+                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                    let r0 = self.next_tmp();
+                    let r1 = self.next_tmp();
+                    self.emit_line(format!(
+                        "{r0} = insertvalue {rty} poison, {{ ptr, ptr, i8 }} {ls}, 0"
+                    ));
+                    self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
+                    self.emit_line(format!("store {rty} {r1}, ptr {rp}, align {ptr_al}"));
+                }
                 self.emit_term(format!("br label %bb_{}", resume_bb.0));
 
-                self.start_block(&wait_lbl);
-                self.park_task_prim(&lptr, None);
-                self.store_coro_pc(poll_bb.0 as i32);
-                self.emit_term("ret i32 1");
+                self.start_block(&empty_lbl);
+                if let Some(dl_var) = timeout_deadline_var {
+                    let dl_ptr = self.var_ptr(*dl_var);
+                    let dl = self.next_tmp();
+                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
+                    let now = self.next_tmp();
+                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    let diff = self.next_tmp();
+                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
+                    let exp = self.next_tmp();
+                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
+                    let to_lbl = self.next_label("pool_to");
+                    let park_lbl = self.next_label("pool_park");
+                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
+
+                    self.start_block(&to_lbl);
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let e0 = self.next_tmp();
+                        self.emit_line(format!(
+                            "{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"
+                        ));
+                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align {ptr_al}"));
+                    }
+                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
+
+                    self.start_block(&park_lbl);
+                    let dl_ssa = SsaVal::new("i32", dl);
+                    self.park_task_prim(&pptr, Some(&dl_ssa));
+                    self.store_coro_pc(poll_bb.0 as i32);
+                    self.emit_term("ret i32 1");
+                } else {
+                    self.park_task_prim(&pptr, None);
+                    self.store_coro_pc(poll_bb.0 as i32);
+                    self.emit_term("ret i32 1");
+                }
             }
             MirYieldKind::CallYielding {
                 callee,
@@ -6010,6 +6861,105 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
         }
         Ok(())
+    }
+
+    fn emit_store_pool_hdr(&mut self, hdr_ptr: &str, cap: usize, dma_safe: bool) {
+        let c = cap.max(1);
+        let mask: u32 = if c >= 32 {
+            u32::MAX
+        } else {
+            (1u32 << c) - 1
+        };
+        let mask_i32 = mask as i32;
+        let dma8 = i8::from(dma_safe);
+        let cap8 = c as u8;
+        let ptr_al = self.ctx.ptr_align();
+        let f0 = self.next_tmp();
+        let f1 = self.next_tmp();
+        let f2 = self.next_tmp();
+        let f3 = self.next_tmp();
+        let f4 = self.next_tmp();
+        self.emit_line(format!(
+            "{f0} = getelementptr inbounds %prim.pool_hdr, ptr {hdr_ptr}, i32 0, i32 0"
+        ));
+        self.emit_line(format!("store i32 {mask_i32}, ptr {f0}, align 4"));
+        self.emit_line(format!(
+            "{f1} = getelementptr inbounds %prim.pool_hdr, ptr {hdr_ptr}, i32 0, i32 1"
+        ));
+        self.emit_line(format!("store i32 {mask_i32}, ptr {f1}, align 4"));
+        self.emit_line(format!(
+            "{f2} = getelementptr inbounds %prim.pool_hdr, ptr {hdr_ptr}, i32 0, i32 2"
+        ));
+        self.emit_line(format!("store ptr null, ptr {f2}, align {ptr_al}"));
+        self.emit_line(format!(
+            "{f3} = getelementptr inbounds %prim.pool_hdr, ptr {hdr_ptr}, i32 0, i32 3"
+        ));
+        self.emit_line(format!("store i8 {dma8}, ptr {f3}, align 1"));
+        self.emit_line(format!(
+            "{f4} = getelementptr inbounds %prim.pool_hdr, ptr {hdr_ptr}, i32 0, i32 4"
+        ));
+        self.emit_line(format!("store i8 {cap8}, ptr {f4}, align 1"));
+    }
+
+    fn emit_subsys_pool_inits(&mut self, struct_name: &str, base_ptr: &str) {
+        let Some(si) = self.ctx.structs.get(struct_name).cloned() else {
+            return;
+        };
+        for f in &si.decl.fields {
+            let Some(&(fidx, _)) = si.field_indices.get(&f.name) else {
+                continue;
+            };
+            match &f.ty {
+                MirType::Primitive(MirPrimKind::Pool { cap, .. }) => {
+                    let fp = self.next_tmp();
+                    self.emit_line(format!(
+                        "{fp} = getelementptr inbounds {}, ptr {base_ptr}, i32 0, i32 {fidx}",
+                        si.llvm_name
+                    ));
+                    self.emit_store_pool_hdr(&fp, *cap, f.dma_safe);
+                }
+                MirType::Struct(sub_name) => {
+                    let fp = self.next_tmp();
+                    self.emit_line(format!(
+                        "{fp} = getelementptr inbounds {}, ptr {base_ptr}, i32 0, i32 {fidx}",
+                        si.llvm_name
+                    ));
+                    self.emit_subsys_pool_inits(sub_name, &fp);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn emit_pool_boot_inits(&mut self) {
+        let prims: Vec<(String, usize, bool)> = self
+            .ctx
+            .module
+            .primitives
+            .iter()
+            .filter_map(|p| {
+                if !p.dead_stripped {
+                    if let MirPrimKind::Pool { cap, .. } = &p.kind {
+                        return Some((p.name.clone(), *cap, p.dma_safe));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (name, cap, dma_safe) in prims {
+            let gsym = format!("@__syn_prim_{}", sanitize_ident(&name));
+            self.emit_store_pool_hdr(&gsym, cap, dma_safe);
+        }
+        let subs: Vec<(String, String)> = self
+            .ctx
+            .module
+            .subsystems
+            .iter()
+            .map(|s| (s.struct_name.clone(), format!("@__zev_subsys_{}", sanitize_ident(&s.name))))
+            .collect();
+        for (sname, gsym) in subs {
+            self.emit_subsys_pool_inits(&sname, &gsym);
+        }
     }
 
     fn emit_boot_spawn_activate(
@@ -7047,35 +7997,25 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "call void @__syn_pp_set_active_{id}(ptr {pptr}, i8 {act})"
                 ));
             }
-            MirPrimNonBlockingOp::LeaseComplete {
-                target,
-                elem_ty,
-                cap,
-            } => {
-                let pk = MirPrimKind::Lease {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                let id = sanitize_ident(&pk.mangle_name());
-                let lptr = self.resolve_prim_ptr(target)?;
-                self.emit_line(format!("call void @__syn_lease_complete_{id}(ptr {lptr})"));
-            }
-            MirPrimNonBlockingOp::LeaseSetActive {
-                target,
-                elem_ty,
-                cap,
-                active,
-            } => {
-                let pk = MirPrimKind::Lease {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                let id = sanitize_ident(&pk.mangle_name());
-                let lptr = self.resolve_prim_ptr(target)?;
-                let act = i8::from(*active);
+            MirPrimNonBlockingOp::LeaseRelease { value, boost, .. } => {
+                let lv = self.emit_expr(value)?;
+                let ph = self.next_tmp();
+                let idx = self.next_tmp();
+                self.emit_line(format!("{ph} = extractvalue {{ ptr, ptr, i8 }} {}, 1", lv.repr));
+                self.emit_line(format!("{idx} = extractvalue {{ ptr, ptr, i8 }} {}, 2", lv.repr));
+                let b = boost.map_or(-1i8, |p| p.as_u8() as i8);
                 self.emit_line(format!(
-                    "call void @__syn_lease_set_active_{id}(ptr {lptr}, i8 {act})"
+                    "call void @__syn_pool_release(ptr {ph}, i8 {idx}, i8 {b})"
                 ));
+            }
+            MirPrimNonBlockingOp::LeaseNullify { target, .. } => {
+                let (lp, _, _) = self.emit_place_ptr(target)?;
+                let php = self.next_tmp();
+                let ptr_al = self.ctx.ptr_align();
+                self.emit_line(format!(
+                    "{php} = getelementptr inbounds {{ ptr, ptr, i8 }}, ptr {lp}, i32 0, i32 1"
+                ));
+                self.emit_line(format!("store ptr null, ptr {php}, align {ptr_al}"));
             }
             MirPrimNonBlockingOp::ByteRingConsume { target, cap, len } => {
                 let pk = MirPrimKind::ByteRing { cap: *cap };
@@ -8065,11 +9005,17 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     }
                     MirSysQuery::SleepDepth => {
                         let m = self.next_tmp();
+                        let dl = self.next_tmp();
+                        let any = self.next_tmp();
                         let locked = self.next_tmp();
                         self.emit_line(format!(
                             "{m} = load volatile i32, ptr @__syn_sleep_lock_mask, align 4"
                         ));
-                        self.emit_line(format!("{locked} = icmp ne i32 {m}, 0"));
+                        self.emit_line(format!(
+                            "{dl} = load volatile i32, ptr @__syn_dma_locks, align 4"
+                        ));
+                        self.emit_line(format!("{any} = or i32 {m}, {dl}"));
+                        self.emit_line(format!("{locked} = icmp ne i32 {any}, 0"));
                         self.emit_line(format!("{v} = select i1 {locked}, i32 1, i32 2"));
                     }
                     MirSysQuery::WfiCount => {
@@ -8079,6 +9025,21 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     }
                 }
                 Ok(self.coerce(SsaVal::new("i32", v), &dst_lty, false))
+            }
+            MirExprKind::LeaseGet { lease, .. } => {
+                let lv = self.emit_expr(lease)?;
+                let p = self.next_tmp();
+                self.emit_line(format!("{p} = extractvalue {{ ptr, ptr, i8 }} {}, 0", lv.repr));
+                Ok(SsaVal::new("ptr", p))
+            }
+            MirExprKind::LeaseAddr { lease, .. } => {
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let lv = self.emit_expr(lease)?;
+                let p = self.next_tmp();
+                let a = self.next_tmp();
+                self.emit_line(format!("{p} = extractvalue {{ ptr, ptr, i8 }} {}, 0", lv.repr));
+                self.emit_line(format!("{a} = ptrtoint ptr {p} to {usize_ty}"));
+                Ok(SsaVal::new(usize_ty, a))
             }
         }
     }
@@ -8259,6 +9220,180 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{s0} = insertvalue {sl_ty} poison, ptr {buf_p}, 0"));
                 self.emit_line(format!("{s1} = insertvalue {sl_ty} {s0}, {usize_ty} {n}, 1"));
                 Ok(SsaVal::new(sl_ty, s1))
+            }
+            MirPrimReadOp::PoolTryAlloc {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::Pool {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let pptr = self.resolve_prim_ptr(target)?;
+                let rty = "{ { ptr, ptr, i8 }, i32 }".to_string();
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call {rty} @__syn_pool_try_alloc_{id}(ptr {pptr})"
+                ));
+                Ok(SsaVal::new(rty, res))
+            }
+            MirPrimReadOp::PoolAvail {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::Pool {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let pptr = self.resolve_prim_ptr(target)?;
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call {usize_ty} @__syn_pool_avail_{id}(ptr {pptr})"
+                ));
+                Ok(SsaVal::new(usize_ty, res))
+            }
+            MirPrimReadOp::PoolInUse {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::Pool {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let pptr = self.resolve_prim_ptr(target)?;
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call {usize_ty} @__syn_pool_in_use_{id}(ptr {pptr})"
+                ));
+                Ok(SsaVal::new(usize_ty, res))
+            }
+            MirPrimReadOp::PoolIsExhausted {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::Pool {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let pptr = self.resolve_prim_ptr(target)?;
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call i8 @__syn_pool_is_exhausted_{id}(ptr {pptr})"
+                ));
+                Ok(SsaVal::new("i8", res))
+            }
+            MirPrimReadOp::PoolCap {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::Pool {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let pptr = self.resolve_prim_ptr(target)?;
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call {usize_ty} @__syn_pool_cap_{id}(ptr {pptr})"
+                ));
+                Ok(SsaVal::new(usize_ty, res))
+            }
+            MirPrimReadOp::DmaSlotPark {
+                target,
+                elem_ty,
+                lease,
+            } => {
+                let pk = MirPrimKind::DmaSlot {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let sptr = self.resolve_prim_ptr(target)?;
+                let lv = self.emit_expr(lease)?;
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call {{ i32, i32 }} @__syn_slot_park_{id}(ptr {sptr}, {{ ptr, ptr, i8 }} {})",
+                    lv.repr
+                ));
+                Ok(SsaVal::new("{ i32, i32 }", res))
+            }
+            MirPrimReadOp::DmaSlotTake { target, elem_ty } => {
+                let pk = MirPrimKind::DmaSlot {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let sptr = self.resolve_prim_ptr(target)?;
+                let rty = "{ { ptr, ptr, i8 }, i32 }".to_string();
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call {rty} @__syn_slot_take_{id}(ptr {sptr})"
+                ));
+                Ok(SsaVal::new(rty, res))
+            }
+            MirPrimReadOp::DmaSlotRelease {
+                target,
+                elem_ty,
+                boost,
+            } => {
+                let pk = MirPrimKind::DmaSlot {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let sptr = self.resolve_prim_ptr(target)?;
+                let b = boost.map_or(-1i8, |p| p.as_u8() as i8);
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call i8 @__syn_slot_release_{id}(ptr {sptr}, i8 {b})"
+                ));
+                Ok(SsaVal::new("i8", res))
+            }
+            MirPrimReadOp::DmaSlotIsBusy { target, elem_ty } => {
+                let pk = MirPrimKind::DmaSlot {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let sptr = self.resolve_prim_ptr(target)?;
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call i8 @__syn_slot_is_busy_{id}(ptr {sptr})"
+                ));
+                Ok(SsaVal::new("i8", res))
+            }
+            MirPrimReadOp::DmaSlotIsEmpty { target, elem_ty } => {
+                let pk = MirPrimKind::DmaSlot {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let sptr = self.resolve_prim_ptr(target)?;
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call i8 @__syn_slot_is_empty_{id}(ptr {sptr})"
+                ));
+                Ok(SsaVal::new("i8", res))
+            }
+            MirPrimReadOp::DmaSlotAddr { target, elem_ty } => {
+                let pk = MirPrimKind::DmaSlot {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let sptr = self.resolve_prim_ptr(target)?;
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let res = self.next_tmp();
+                self.emit_line(format!(
+                    "{res} = call {usize_ty} @__syn_slot_addr_{id}(ptr {sptr})"
+                ));
+                Ok(SsaVal::new(usize_ty, res))
             }
             MirPrimReadOp::ByteRingPush {
                 target,

@@ -336,16 +336,31 @@ fn compute_terminator_live_before(
                 dst_slice,
                 resume_bb,
                 ..
-            }
-            | MirYieldKind::LeaseWaitChunk {
-                target,
-                dst_slice,
-                resume_bb,
-                ..
             } => {
                 let mut out = block_live(*resume_bb);
                 out.remove(dst_slice);
                 collect_prim_target_uses(target, &mut out);
+                out
+            }
+            MirYieldKind::PoolAlloc {
+                target,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
+                resume_bb,
+                ..
+            } => {
+                let mut out = block_live(*resume_bb);
+                if let Some(dv) = dst_val {
+                    out.remove(dv);
+                }
+                if let Some(dr) = dst_res {
+                    out.remove(dr);
+                }
+                collect_prim_target_uses(target, &mut out);
+                if let Some(tv) = timeout_deadline_var {
+                    out.insert(*tv);
+                }
                 out
             }
             MirYieldKind::CallYielding { args, poll_bb, .. } => {
@@ -393,6 +408,12 @@ fn transfer_stmt(stmt: &MirStmt, live: &mut BTreeSet<VarId>) {
             }
         }
         MirStmt::Expr(e) => collect_expr_uses(e, live),
+        MirStmt::PrimOp(MirPrimNonBlockingOp::LeaseNullify { target, .. }) => match target {
+            MirPlace::Var(vid) => {
+                live.remove(vid);
+            }
+            other => collect_place_uses_for_partial_write(other, live),
+        },
         MirStmt::PrimOp(op) => collect_prim_op_uses(op, live),
         MirStmt::Intrinsic(intr) => match intr {
             crate::ir::MirIntrinsicOp::UseSystick { hz } => collect_expr_uses(hz, live),
@@ -553,10 +574,14 @@ fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
         | MirPrimNonBlockingOp::SignalClear { target }
         | MirPrimNonBlockingOp::PingPongFlip { target, .. }
         | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
-        | MirPrimNonBlockingOp::LeaseComplete { target, .. }
-        | MirPrimNonBlockingOp::LeaseSetActive { target, .. }
         | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
             collect_prim_target_uses(target, uses);
+        }
+        MirPrimNonBlockingOp::LeaseRelease { value, .. } => {
+            collect_expr_uses(value, uses);
+        }
+        MirPrimNonBlockingOp::LeaseNullify { target, .. } => {
+            collect_place_uses_for_partial_write(target, uses);
         }
         MirPrimNonBlockingOp::InboxViewPost { view, value, .. } => {
             collect_expr_uses(view, uses);
@@ -717,11 +742,30 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             | MirPrimReadOp::ByteRingViewIsFull { view } => {
                 collect_expr_uses(view, uses);
             }
+            MirPrimReadOp::PoolTryAlloc { target, .. }
+            | MirPrimReadOp::PoolAvail { target, .. }
+            | MirPrimReadOp::PoolInUse { target, .. }
+            | MirPrimReadOp::PoolIsExhausted { target, .. }
+            | MirPrimReadOp::PoolCap { target, .. }
+            | MirPrimReadOp::DmaSlotTake { target, .. }
+            | MirPrimReadOp::DmaSlotRelease { target, .. }
+            | MirPrimReadOp::DmaSlotIsBusy { target, .. }
+            | MirPrimReadOp::DmaSlotIsEmpty { target, .. }
+            | MirPrimReadOp::DmaSlotAddr { target, .. } => {
+                collect_prim_target_uses(target, uses);
+            }
+            MirPrimReadOp::DmaSlotPark { target, lease, .. } => {
+                collect_prim_target_uses(target, uses);
+                collect_expr_uses(lease, uses);
+            }
         },
         MirExprKind::CallDirect { args, .. } => {
             for a in args {
                 collect_expr_uses(a, uses);
             }
+        }
+        MirExprKind::LeaseGet { lease, .. } | MirExprKind::LeaseAddr { lease, .. } => {
+            collect_expr_uses(lease, uses);
         }
     }
 }
@@ -788,7 +832,8 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
             }
         }
         MirExprKind::PrimRead(ro) => match ro.as_ref() {
-            MirPrimReadOp::InboxTrySend { value, .. } => {
+            MirPrimReadOp::InboxTrySend { value, .. }
+            | MirPrimReadOp::DmaSlotPark { lease: value, .. } => {
                 collect_addr_of_vars(value, out);
             }
             MirPrimReadOp::ByteRingPush { src: value, .. }
@@ -830,6 +875,9 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
         },
         MirExprKind::MakePrimView { ptr, .. } => {
             collect_addr_of_vars(ptr, out);
+        }
+        MirExprKind::LeaseGet { lease, .. } | MirExprKind::LeaseAddr { lease, .. } => {
+            collect_addr_of_vars(lease, out);
         }
         _ => {}
     }
@@ -1043,8 +1091,12 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
         }
         MirStmt::PrimOp(op) => match op {
             MirPrimNonBlockingOp::WatchPublish { value, .. }
-            | MirPrimNonBlockingOp::InboxPost { value, .. } => {
+            | MirPrimNonBlockingOp::InboxPost { value, .. }
+            | MirPrimNonBlockingOp::LeaseRelease { value, .. } => {
                 collect_addr_of_vars(value, &mut taken);
+            }
+            MirPrimNonBlockingOp::LeaseNullify { target, .. } => {
+                collect_place_subexpr_addr_of_vars(target, &mut taken);
             }
             MirPrimNonBlockingOp::InboxViewPost { view, value, .. } => {
                 collect_addr_of_vars(view, &mut taken);
@@ -1142,6 +1194,10 @@ fn collect_terminator_forced_hoists(
                 ..
             }
             | MirYieldKind::SignalWait {
+                timeout_deadline_var: Some(tv),
+                ..
+            }
+            | MirYieldKind::PoolAlloc {
                 timeout_deadline_var: Some(tv),
                 ..
             } => {

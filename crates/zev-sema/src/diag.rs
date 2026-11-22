@@ -73,11 +73,13 @@ pub enum DiagnosticKind {
     IrqAttachmentError,
     /// Invalid ISR `state` variable outside `isr`, missing/non-const initializer, reference-bearing type, or escaping `&state` (`E0033`).
     InvalidIsrState,
+    /// Move-only `Lease<T>` linearity violation (use-after-move, unconsumed lease on exit, overwrite, branch mismatch, or illegal placement) (`E0034`).
+    LinearLeaseViolation,
 }
 
 impl DiagnosticKind {
-    /// All 33 semantic error kinds (`E0001`..`E0033`) in code order.
-    pub const ALL: [Self; 33] = [
+    /// All 34 semantic error kinds (`E0001`..`E0034`) in code order.
+    pub const ALL: [Self; 34] = [
         Self::IllegalMutableGlobal,
         Self::GlobalIsolationViolation,
         Self::YieldInNoYield,
@@ -111,9 +113,10 @@ impl DiagnosticKind {
         Self::MmioViolation,
         Self::IrqAttachmentError,
         Self::InvalidIsrState,
+        Self::LinearLeaseViolation,
     ];
 
-    /// Stable error code (`"E0001"`..`"E0033"`).
+    /// Stable error code (`"E0001"`..`"E0034"`).
     pub const fn code(self) -> &'static str {
         match self {
             Self::IllegalMutableGlobal => "E0001",
@@ -149,6 +152,7 @@ impl DiagnosticKind {
             Self::MmioViolation => "E0031",
             Self::IrqAttachmentError => "E0032",
             Self::InvalidIsrState => "E0033",
+            Self::LinearLeaseViolation => "E0034",
         }
     }
 
@@ -165,7 +169,8 @@ impl DiagnosticKind {
             Self::ScopeDepthEscape
             | Self::ReturnLocalReference
             | Self::SpawnNonStaticReference
-            | Self::StaleDmaLease => "dma",
+            | Self::StaleDmaLease
+            | Self::LinearLeaseViolation => "dma",
             Self::InvalidDurationResolution
             | Self::InvalidControlFlow
             | Self::NonDivergingTask
@@ -206,7 +211,7 @@ impl DiagnosticKind {
                 "replace mutable globals with `const Type NAME = val;` (immutable), `watch<Type> name = init;` (latest value), or `inbox<Event, 8> name;` (queued events)"
             }
             Self::GlobalIsolationViolation => {
-                "tasks and ISRs communicate exclusively through static OS primitives (`watch<T>`, `inbox<T, N>`, `signal`, `ping_pong<T, N>`, `lease<T, N>`)"
+                "tasks and ISRs communicate exclusively through static OS primitives (`watch<T>`, `inbox<T, N>`, `signal`, `ping_pong<T, N>`, `pool<T, K>`, `dma_slot<T>`, `byte_ring<N>`)"
             }
             Self::YieldInNoYield => {
                 "move hard-blocking calls/waits outside `noyield { ... }`, or use a bounded `for (usize i in 0..n)` / `while (cond)` loop inside `noyield`"
@@ -301,6 +306,9 @@ impl DiagnosticKind {
             Self::InvalidIsrState => {
                 "declare `state Type name = const_init;` only inside an `isr`, using non-reference-bearing types and without escaping `&name` outside the ISR"
             }
+            Self::LinearLeaseViolation => {
+                "a move-only `Lease<T>` must be consumed exactly once along every control-flow exit via `.release()`, `dma_slot.park(lease)`, `inbox.post(lease)` / `.send(lease)`, or `return lease;` (or register `defer lease.release();` immediately)"
+            }
         }
     }
 }
@@ -336,7 +344,7 @@ impl Diagnostic {
         self
     }
 
-    /// Stable error code (`"E0001"`..`"E0029"`).
+    /// Stable error code (`"E0001"`..`"E0034"`).
     pub const fn code(&self) -> &'static str {
         self.kind.code()
     }

@@ -26,7 +26,8 @@ use crate::suggest::{
     advise_primitive_method, closest_match, suggest_foreign_type_name,
 };
 use crate::types::{
-    EnumInfo, FieldInfo, NamespaceKind, ResolvedErrorSpec, ResolvedOsPrimitive, StructInfo, Ty,
+    EnumInfo, FieldInfo, NamespaceKind, PrimitiveKind, ResolvedErrorSpec, ResolvedOsPrimitive,
+    StructInfo, Ty,
 };
 
 /// Configuration options for semantic analysis.
@@ -74,6 +75,14 @@ struct IllegalGlobalInfo {
     decl_span: Span,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum LinearLeaseState {
+    Live,
+    DeferredRelease { span: Span, scope_depth: u32 },
+    Moved { moved_at: Span, reason: &'static str },
+    Uninit,
+}
+
 #[derive(Clone, Debug)]
 struct LocalVar {
     name: String,
@@ -83,6 +92,8 @@ struct LocalVar {
     field_prov: BTreeMap<String, Provenance>,
     endpoint_alias: Option<String>,
     is_isr_state: bool,
+    lease_state: Option<LinearLeaseState>,
+    lease_gen_key: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -678,9 +689,49 @@ impl Analyzer {
                     ),
                 ));
             }
+            let dma_safe = has_attr_dma_safe(&f.attrs);
+            for attr in &f.attrs {
+                match &attr.kind {
+                    AttrKind::DmaSafe => {
+                        if !matches!(
+                            ty,
+                            Ty::OsPrimitive(
+                                ResolvedOsPrimitive::Pool { .. }
+                                    | ResolvedOsPrimitive::PingPong { .. }
+                            )
+                        ) {
+                            self.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                attr.span,
+                                format!(
+                                    "`@dma_safe` on field '{}' of struct '{}' is only allowed on `pool<T, K>` or `ping_pong<T, N>` fields",
+                                    f.name.name, st.name.name
+                                ),
+                            ));
+                        }
+                    }
+                    other => {
+                        self.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            attr.span,
+                            format!(
+                                "attribute `{:?}` is not valid on field '{}' of struct '{}'",
+                                other, f.name.name, st.name.name
+                            ),
+                        ));
+                    }
+                }
+            }
+            self.check_disallowed_lease_type(
+                &ty,
+                f.ty.span,
+                &format!("field '{}' of struct '{}'", f.name.name, st.name.name),
+                false,
+            );
             fields.push(FieldInfo {
                 name: f.name.name.clone(),
                 ty,
+                dma_safe,
                 span: f.span,
             });
         }
@@ -804,8 +855,25 @@ impl Analyzer {
                             ),
                         )
                         .with_file(file.clone())
-                        .with_note("move raw scalar/buffer fields into `watch<T>`, `inbox<T, N>`, or `byte_ring<N>` fields"),
+                        .with_note("move raw scalar/buffer fields into `watch<T>`, `inbox<T, N>`, `pool<T, K>`, `dma_slot<T>`, or `byte_ring<N>` fields"),
                     );
+                }
+                match &f.ty {
+                    Ty::OsPrimitive(ResolvedOsPrimitive::Pool { elem, .. }) => {
+                        self.validate_pool_slot_elem(
+                            elem,
+                            f.span,
+                            &format!("pool field '{}.{}'", st.name, f.name),
+                        );
+                    }
+                    Ty::OsPrimitive(ResolvedOsPrimitive::DmaSlot { elem }) => {
+                        self.validate_pool_slot_elem(
+                            elem,
+                            f.span,
+                            &format!("dma_slot field '{}.{}'", st.name, f.name),
+                        );
+                    }
+                    _ => {}
                 }
             }
             self.current_instantiation_note = None;
@@ -1472,8 +1540,45 @@ impl Analyzer {
                 p.span,
                 &format!("element type of OS primitive '{}'", p.name.name),
             );
+            match &resolved {
+                ResolvedOsPrimitive::Pool { .. } => {
+                    self.validate_pool_slot_elem(
+                        et,
+                        p.span,
+                        &format!("pool '{}'", p.name.name),
+                    );
+                }
+                ResolvedOsPrimitive::DmaSlot { .. } => {
+                    self.validate_pool_slot_elem(
+                        et,
+                        p.span,
+                        &format!("dma_slot '{}'", p.name.name),
+                    );
+                }
+                ResolvedOsPrimitive::Inbox { elem, .. }
+                    if matches!(&**elem, Ty::Lease(_)) =>
+                {
+                    if let Ty::Lease(inner) = &**elem {
+                        self.validate_pool_slot_elem(
+                            inner,
+                            p.span,
+                            &format!("Lease<T> in inbox '{}'", p.name.name),
+                        );
+                    }
+                }
+                _ => {
+                    self.check_disallowed_lease_type(
+                        et,
+                        p.span,
+                        &format!("OS primitive '{}'", p.name.name),
+                        false,
+                    );
+                }
+            }
         }
         let capacity = resolved.capacity();
+        let clamps_sleep_depth = matches!(kind, PrimitiveKind::PingPong)
+            || (dma_safe && matches!(kind, PrimitiveKind::Pool));
         self.primitives.insert(
             p.name.name.clone(),
             PrimitiveInfo {
@@ -1484,7 +1589,7 @@ impl Analyzer {
                 capacity,
                 dma_safe,
                 has_init: p.init.is_some(),
-                clamps_sleep_depth: kind.clamps_sleep_depth(),
+                clamps_sleep_depth,
                 span: p.span,
             },
         );
@@ -1542,7 +1647,7 @@ impl Analyzer {
                 DiagnosticKind::IllegalMutableGlobal,
                 g.span,
                 format!(
-                    "mutable raw global variable '{}' is forbidden; top-level declarations must be 'const' or an OS primitive (signal, inbox, watch, ping_pong, lease, byte_ring)",
+                    "mutable raw global variable '{}' is forbidden; top-level declarations must be 'const' or an OS primitive (signal, inbox, watch, ping_pong, pool, dma_slot, byte_ring)",
                     g.name.name
                 ),
             )
@@ -1551,6 +1656,12 @@ impl Analyzer {
                 ty = ty_str,
                 name = g.name.name
             )),
+        );
+        self.check_disallowed_lease_type(
+            &ty,
+            g.ty.span,
+            &format!("global declaration '{}'", g.name.name),
+            false,
         );
 
         self.illegal_globals.insert(
@@ -1572,6 +1683,21 @@ impl Analyzer {
             f.ret_type.span,
             &format!("return type of function '{}'", f.name.name),
         );
+        if f.is_extern_c {
+            self.check_disallowed_lease_type(
+                &ret_ty,
+                f.ret_type.span,
+                &format!("return type of extern \"C\" function '{}'", f.name.name),
+                false,
+            );
+        } else {
+            self.check_disallowed_lease_type(
+                &ret_ty,
+                f.ret_type.span,
+                &format!("return type of function '{}'", f.name.name),
+                true,
+            );
+        }
         let error_spec = match &f.error_spec {
             None => ResolvedErrorSpec::None,
             Some(ErrorSpec::Bare(_)) => ResolvedErrorSpec::Untyped,
@@ -1581,6 +1707,12 @@ impl Analyzer {
                     &err_ty,
                     err_ty_expr.span,
                     &format!("error specification of function '{}'", f.name.name),
+                );
+                self.check_disallowed_lease_type(
+                    &err_ty,
+                    err_ty_expr.span,
+                    &format!("error specification of function '{}'", f.name.name),
+                    false,
                 );
                 if err_ty.is_void() {
                     self.emit(Diagnostic::new(
@@ -1604,7 +1736,7 @@ impl Analyzer {
             ));
         }
 
-        let params = self.resolve_params(&f.params, &f.name.name);
+        let params = self.resolve_params(&f.params, &f.name.name, !f.is_extern_c);
         let callable_kind = if f.is_extern_c {
             CallableKind::ExternCFn
         } else {
@@ -1643,7 +1775,7 @@ impl Analyzer {
         if !self.check_top_level_name_unique(&t.name) {
             return;
         }
-        let params = self.resolve_params(&t.params, &t.name.name);
+        let params = self.resolve_params(&t.params, &t.name.name, false);
         let node_key = format!("task::{}", t.name.name);
         if let Some(cf) = &self.current_file {
             self.node_files.insert(node_key.clone(), cf.clone());
@@ -1676,7 +1808,7 @@ impl Analyzer {
             ));
             return;
         }
-        let params = self.resolve_params(&i.params, &format!("isr {}", i.vector.name));
+        let params = self.resolve_params(&i.params, &format!("isr {}", i.vector.name), false);
         let node_key = format!("isr::{}", i.vector.name);
         if let Some(cf) = &self.current_file {
             self.node_files.insert(node_key.clone(), cf.clone());
@@ -1696,7 +1828,12 @@ impl Analyzer {
         );
     }
 
-    fn resolve_params(&mut self, params: &[Param], owner: &str) -> Vec<ParamInfo> {
+    fn resolve_params(
+        &mut self,
+        params: &[Param],
+        owner: &str,
+        allow_top_level_lease: bool,
+    ) -> Vec<ParamInfo> {
         let mut seen = BTreeSet::new();
         let mut out = Vec::new();
         for p in params {
@@ -1720,6 +1857,27 @@ impl Analyzer {
                 p.ty.span,
                 &format!("parameter '{}' of '{}'", p.name.name, owner),
             );
+            self.check_disallowed_lease_type(
+                &ty,
+                p.ty.span,
+                &format!("parameter '{}' of '{}'", p.name.name, owner),
+                allow_top_level_lease,
+            );
+            if matches!(
+                &ty,
+                Ty::OsPrimitive(
+                    ResolvedOsPrimitive::Pool { .. } | ResolvedOsPrimitive::DmaSlot { .. }
+                )
+            ) {
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::InvalidOperation,
+                    p.ty.span,
+                    format!(
+                        "cannot pass static OS primitive '{}' by value in parameter '{}' of '{}' (pass a pointer `*{}`)",
+                        ty, p.name.name, owner, ty
+                    ),
+                ));
+            }
             out.push(ParamInfo {
                 name: p.name.name.clone(),
                 ty,
@@ -1888,6 +2046,10 @@ impl Analyzer {
             }
             TypeKind::Ptr(inner) => Ty::Ptr(Box::new(self.resolve_type(inner))),
             TypeKind::OsPrimitive(os) => Ty::OsPrimitive(self.resolve_os_primitive(os, te.span)),
+            TypeKind::Lease(inner) => {
+                let elem = self.resolve_non_void_elem(inner);
+                Ty::Lease(Box::new(elem))
+            }
             TypeKind::FnPtr { params, ret } => {
                 let ps = params.iter().map(|p| self.resolve_type(p)).collect();
                 let r = self.resolve_type(ret);
@@ -1934,19 +2096,25 @@ impl Analyzer {
                     cap: *cap,
                 }
             }
-            OsPrimitiveType::Lease { elem, cap } => {
-                if *cap == 0 {
+            OsPrimitiveType::Pool { elem, cap } => {
+                if *cap == 0 || *cap > 32 {
                     self.emit(Diagnostic::new(
-                        DiagnosticKind::InvalidOperation,
+                        DiagnosticKind::LinearLeaseViolation,
                         span,
-                        "lease buffer capacity must be greater than 0",
+                        format!(
+                            "pool capacity must be between 1 and 32 slots (32-bit bitmask), found {}",
+                            cap
+                        ),
                     ));
                 }
-                ResolvedOsPrimitive::Lease {
+                ResolvedOsPrimitive::Pool {
                     elem: Box::new(self.resolve_non_void_elem(elem)),
                     cap: *cap,
                 }
             }
+            OsPrimitiveType::DmaSlot { elem } => ResolvedOsPrimitive::DmaSlot {
+                elem: Box::new(self.resolve_non_void_elem(elem)),
+            },
             OsPrimitiveType::ByteRing { cap } => {
                 if *cap == 0 {
                     self.emit(Diagnostic::new(
@@ -2049,6 +2217,9 @@ impl Analyzer {
         }
         checker.bind_params(&fn_info.params);
         let diverges = checker.check_block_stmts(&body.stmts);
+        if !diverges {
+            checker.finish_lexical_block(false, f.name.span);
+        }
         let ret_origins: Vec<usize> = checker.return_param_origins.into_iter().collect();
         let boot_steps = checker.boot_steps;
         let irq_nodes = checker
@@ -2111,7 +2282,10 @@ impl Analyzer {
         let mut checker =
             BodyChecker::new(self, &node_key, CallableKind::Isr, ActiveBodyKind::Isr);
         checker.bind_params(&isr_info.params);
-        let _ = checker.check_block_stmts(&i.body.stmts);
+        let diverges = checker.check_block_stmts(&i.body.stmts);
+        if !diverges {
+            checker.finish_lexical_block(false, i.vector.span);
+        }
         let boosts = checker.recorded_boosts;
         if let Some(info) = self.isrs.get_mut(&i.vector.name) {
             info.priority_boosts = boosts;
@@ -3205,6 +3379,11 @@ struct BodyChecker<'a> {
     /// Tracks lexical scope depths at loop entry and outer variables carrying DMA leases read inside the loop.
     loop_entry_depths: Vec<u32>,
     loop_outer_reads: Vec<Vec<(String, LeaseEnv, Provenance, Span)>>,
+    /// Tracks loop-entry snapshots for outer `Lease<T>` move checking inside loops.
+    loop_lease_frames: Vec<(u32, Vec<BTreeMap<String, LocalVar>>)>,
+    /// When inside a `defer` statement, records the lexical scope depth owning that `defer`.
+    active_defer_owner_depth: Option<u32>,
+    next_lease_var_id: u64,
 }
 
 impl<'a> BodyChecker<'a> {
@@ -3241,6 +3420,9 @@ impl<'a> BodyChecker<'a> {
             mmio_array_expr_spans: BTreeMap::new(),
             loop_entry_depths: Vec::new(),
             loop_outer_reads: Vec::new(),
+            loop_lease_frames: Vec::new(),
+            active_defer_owner_depth: None,
+            next_lease_var_id: 0,
         }
     }
 
@@ -3346,6 +3528,22 @@ impl<'a> BodyChecker<'a> {
             } else {
                 Provenance::pure_static()
             };
+            let (lease_state, lease_gen_key) = if p.ty.is_linear_lease() {
+                if self.caller_kind == CallableKind::Fn {
+                    let key = self.fresh_lease_gen_key(&p.name);
+                    (Some(LinearLeaseState::Live), Some(key))
+                } else {
+                    (
+                        Some(LinearLeaseState::Moved {
+                            moved_at: p.span,
+                            reason: "invalid param",
+                        }),
+                        None,
+                    )
+                }
+            } else {
+                (None, None)
+            };
             self.scopes[0].insert(
                 p.name.clone(),
                 LocalVar {
@@ -3356,6 +3554,8 @@ impl<'a> BodyChecker<'a> {
                     field_prov: BTreeMap::new(),
                     endpoint_alias,
                     is_isr_state: false,
+                    lease_state,
+                    lease_gen_key,
                 },
             );
         }
@@ -3476,6 +3676,179 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
+    fn fresh_lease_gen_key(&mut self, var_name: &str) -> String {
+        self.next_lease_var_id += 1;
+        format!("{}#{}", var_name, self.next_lease_var_id)
+    }
+
+    fn display_lease_source(source: &str) -> &str {
+        source.split('#').next().unwrap_or(source)
+    }
+
+    fn finish_lexical_block(&mut self, diverged: bool, block_span: Span) {
+        let closing_depth = self.current_depth();
+        if diverged {
+            return;
+        }
+        if let Some(closing_scope) = self.scopes.last() {
+            let unconsumed: Vec<String> = closing_scope
+                .values()
+                .filter(|v| matches!(v.lease_state, Some(LinearLeaseState::Live)))
+                .map(|v| v.name.clone())
+                .collect();
+            for vname in unconsumed {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::LinearLeaseViolation,
+                    block_span,
+                    format!(
+                        "linear Lease<T> variable '{}' was not consumed before end of scope",
+                        vname
+                    ),
+                ));
+            }
+        }
+        // Any outer variable whose `defer` was registered at `closing_depth` is released right here!
+        let mut to_invalidate = Vec::new();
+        for scope in &mut self.scopes {
+            for var in scope.values_mut() {
+                if let Some(LinearLeaseState::DeferredRelease { span, scope_depth }) =
+                    var.lease_state
+                {
+                    if scope_depth == closing_depth {
+                        var.lease_state = Some(LinearLeaseState::Moved {
+                            moved_at: span,
+                            reason: "defer release",
+                        });
+                        if let Some(ref key) = var.lease_gen_key {
+                            to_invalidate.push((key.clone(), span));
+                        }
+                    }
+                }
+            }
+        }
+        for (key, sp) in to_invalidate {
+            let _ = self.leases.invalidate(&key, sp, "defer release");
+        }
+    }
+
+    fn check_unconsumed_leases_on_exit(&mut self, exit_span: Span, exit_kind: &str, min_depth_exclusive: u32) {
+        let mut offenders = Vec::new();
+        for scope in &self.scopes {
+            for var in scope.values() {
+                if var.decl_depth > min_depth_exclusive
+                    && matches!(var.lease_state, Some(LinearLeaseState::Live))
+                {
+                    offenders.push(var.name.clone());
+                }
+            }
+        }
+        for name in offenders {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::LinearLeaseViolation,
+                exit_span,
+                format!(
+                    "cannot '{}' while linear Lease<T> variable '{}' is still live and unconsumed",
+                    exit_kind, name
+                ),
+            ));
+        }
+    }
+
+    fn consume_lease_value(
+        &mut self,
+        expr: &Expr,
+        val: &ExprVal,
+        reason: &'static str,
+        use_span: Span,
+    ) {
+        if !val.ty.is_linear_lease() {
+            return;
+        }
+        let ExprKind::Ident(ident) = &expr.kind else {
+            return;
+        };
+        let Some(var) = self.lookup_local(&ident.name).cloned() else {
+            return;
+        };
+        if !var.ty.is_linear_lease() {
+            return;
+        }
+        match var.lease_state {
+            Some(LinearLeaseState::Live) => {
+                // Reject moving/releasing an outer variable that was already Live/Deferred at loop entry.
+                for (entry_depth, entry_vars) in &self.loop_lease_frames {
+                    if var.decl_depth <= *entry_depth {
+                        let was_outer_live = entry_vars
+                            .iter()
+                            .rev()
+                            .find_map(|s| s.get(&var.name))
+                            .is_some_and(|ev| {
+                                matches!(
+                                    ev.lease_state,
+                                    Some(
+                                        LinearLeaseState::Live
+                                            | LinearLeaseState::DeferredRelease { .. }
+                                    )
+                                )
+                            });
+                        if was_outer_live {
+                            self.sema.emit(
+                                Diagnostic::new(
+                                    DiagnosticKind::LinearLeaseViolation,
+                                    use_span,
+                                    format!(
+                                        "cannot move/consume outer live Lease<T> variable '{}' inside a loop",
+                                        var.name
+                                    ),
+                                )
+                                .with_note("release the outer Lease<T> after the loop exits (or allocate/release inside each loop iteration)"),
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                if let Some(defer_owner) = self.active_defer_owner_depth {
+                    if var.decl_depth <= defer_owner {
+                        if let Some(v) = self.lookup_local_mut(&ident.name) {
+                            v.lease_state = Some(LinearLeaseState::DeferredRelease {
+                                span: use_span,
+                                scope_depth: defer_owner,
+                            });
+                        }
+                        return;
+                    }
+                }
+
+                if let Some(v) = self.lookup_local_mut(&ident.name) {
+                    v.lease_state = Some(LinearLeaseState::Moved {
+                        moved_at: use_span,
+                        reason,
+                    });
+                }
+                if let Some(key) = var.lease_gen_key {
+                    let _ = self.leases.invalidate(&key, use_span, reason);
+                }
+            }
+            Some(LinearLeaseState::DeferredRelease { span, .. }) => {
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::LinearLeaseViolation,
+                        use_span,
+                        format!(
+                            "cannot move/consume Lease<T> variable '{}' via {}: `defer` release was already scheduled at {}",
+                            var.name, reason, span
+                        ),
+                    )
+                    .with_note("remove either the manual consume or `defer lease.release();` so it is released once"),
+                );
+            }
+            Some(LinearLeaseState::Moved { .. }) | Some(LinearLeaseState::Uninit) | None => {
+                // `check_ident_expr` already reported use-after-move / uninit if accessed as rvalue.
+            }
+        }
+    }
+
     /// Push a nested lexical block (`depth + 1`), execute `f`, and pop the nested block.
     fn with_nested_scope<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         self.scopes.push(BTreeMap::new());
@@ -3488,7 +3861,12 @@ impl<'a> BodyChecker<'a> {
         self.scopes.clone()
     }
 
-    fn merge_branch_vars(&mut self, base: &[BTreeMap<String, LocalVar>], branches: &[Vec<BTreeMap<String, LocalVar>>]) {
+    fn merge_branch_vars(
+        &mut self,
+        base: &[BTreeMap<String, LocalVar>],
+        branches: &[Vec<BTreeMap<String, LocalVar>>],
+        join_span: Span,
+    ) {
         if branches.is_empty() {
             return;
         }
@@ -3498,16 +3876,66 @@ impl<'a> BodyChecker<'a> {
             }
             for (name, var) in scope.iter_mut() {
                 let mut merged_prov: Option<Provenance> = None;
+                let mut merged_lease: Option<LinearLeaseState> = None;
+                let mut lease_mismatch = false;
                 for b in branches {
                     if let Some(b_var) = b.get(depth_idx).and_then(|s| s.get(name)) {
                         merged_prov = Some(match merged_prov {
                             None => b_var.prov.clone(),
                             Some(acc) => acc.merge(&b_var.prov),
                         });
+                        if let Some(bs) = b_var.lease_state {
+                            match merged_lease {
+                                None => merged_lease = Some(bs),
+                                Some(prev) => {
+                                    let same = match (prev, bs) {
+                                        (LinearLeaseState::Live, LinearLeaseState::Live)
+                                        | (LinearLeaseState::Uninit, LinearLeaseState::Uninit)
+                                        | (
+                                            LinearLeaseState::Moved { .. },
+                                            LinearLeaseState::Moved { .. },
+                                        ) => true,
+                                        (
+                                            LinearLeaseState::DeferredRelease {
+                                                scope_depth: d1,
+                                                ..
+                                            },
+                                            LinearLeaseState::DeferredRelease {
+                                                scope_depth: d2,
+                                                ..
+                                            },
+                                        ) => d1 == d2,
+                                        _ => false,
+                                    };
+                                    if !same {
+                                        lease_mismatch = true;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 if let Some(mp) = merged_prov {
                     var.prov = mp;
+                }
+                if lease_mismatch {
+                    self.sema.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::LinearLeaseViolation,
+                            join_span,
+                            format!(
+                                "conditional branches disagree on linear ownership state of Lease<T> variable '{}'",
+                                name
+                            ),
+                        )
+                        .with_note("every control-flow path reaching the branch merge must either leave the Lease<T> unconsumed or consume it along all branches"),
+                    );
+                    var.lease_state = Some(LinearLeaseState::Moved {
+                        moved_at: join_span,
+                        reason: "branch mismatch",
+                    });
+                } else if let Some(ml) = merged_lease {
+                    var.lease_state = Some(ml);
                 }
             }
         }
@@ -3544,7 +3972,11 @@ impl<'a> BodyChecker<'a> {
     }
 
     fn check_nested_block(&mut self, block: &Block) -> bool {
-        self.with_nested_scope(|this| this.check_block_stmts(&block.stmts))
+        self.with_nested_scope(|this| {
+            let div = this.check_block_stmts(&block.stmts);
+            this.finish_lexical_block(div, block.span);
+            div
+        })
     }
 
     fn check_stmt(&mut self, stmt: &Stmt) -> bool {
@@ -3563,6 +3995,27 @@ impl<'a> BodyChecker<'a> {
                     ty.span,
                     &format!("local variable '{}'", name.name),
                 );
+                self.sema.check_disallowed_lease_type(
+                    &resolved_ty,
+                    ty.span,
+                    &format!("local variable '{}'", name.name),
+                    true,
+                );
+                if matches!(
+                    &resolved_ty,
+                    Ty::OsPrimitive(
+                        ResolvedOsPrimitive::Pool { .. } | ResolvedOsPrimitive::DmaSlot { .. }
+                    )
+                ) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        ty.span,
+                        format!(
+                            "static OS primitive '{}' cannot be declared as local variable '{}' (declare at module scope or in a subsystem struct)",
+                            resolved_ty, name.name
+                        ),
+                    ));
+                }
                 if self.scopes.last().unwrap().contains_key(&name.name) {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::DuplicateDefinition,
@@ -3575,9 +4028,23 @@ impl<'a> BodyChecker<'a> {
                 let mut prov = Provenance::pure_static();
                 let mut field_prov = BTreeMap::new();
                 let mut endpoint_alias = None;
+                let mut lease_state = if resolved_ty.is_linear_lease() {
+                    Some(LinearLeaseState::Uninit)
+                } else {
+                    None
+                };
+                let mut lease_gen_key = None;
 
                 if let Some(init_expr) = init {
                     let val = self.check_expr_infallible(init_expr);
+                    if val.ty.is_linear_lease() {
+                        self.consume_lease_value(
+                            init_expr,
+                            &val,
+                            "variable initialization",
+                            init_expr.span,
+                        );
+                    }
                     if matches!(init_expr.kind, ExprKind::StructLit { .. }) {
                         if let Some(fp) = self
                             .last_struct_lit_fields
@@ -3597,6 +4064,17 @@ impl<'a> BodyChecker<'a> {
                         ));
                     } else {
                         self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
+                    }
+                    if resolved_ty.is_linear_lease() {
+                        if val.ty.is_error() {
+                            lease_state = Some(LinearLeaseState::Moved {
+                                moved_at: init_expr.span,
+                                reason: "error init",
+                            });
+                        } else {
+                            lease_state = Some(LinearLeaseState::Live);
+                            lease_gen_key = Some(self.fresh_lease_gen_key(&name.name));
+                        }
                     }
                     if resolved_ty.contains_reference(&self.sema.structs)
                         || resolved_ty.contains_fn_ptr(&self.sema.structs)
@@ -3637,6 +4115,8 @@ impl<'a> BodyChecker<'a> {
                         field_prov,
                         endpoint_alias,
                         is_isr_state: false,
+                        lease_state,
+                        lease_gen_key,
                     },
                 );
                 false
@@ -3695,6 +4175,12 @@ impl<'a> BodyChecker<'a> {
                     &resolved_ty,
                     ty.span,
                     &format!("`state` variable '{}'", name.name),
+                );
+                self.sema.check_disallowed_lease_type(
+                    &resolved_ty,
+                    ty.span,
+                    &format!("ISR `state` variable '{}'", name.name),
+                    false,
                 );
                 if resolved_ty.contains_reference(&self.sema.structs)
                     || resolved_ty.contains_fn_ptr(&self.sema.structs)
@@ -3766,6 +4252,8 @@ impl<'a> BodyChecker<'a> {
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
                         is_isr_state: true,
+                        lease_state: None,
+                        lease_gen_key: None,
                     },
                 );
                 if matches!(self.body_kind, ActiveBodyKind::Isr) {
@@ -3806,6 +4294,7 @@ impl<'a> BodyChecker<'a> {
                                 "ISR handlers cannot return a value",
                             ));
                         }
+                        self.check_unconsumed_leases_on_exit(stmt.span, "return", 0);
                     }
                     ActiveBodyKind::Task => {
                         if let Some(e) = opt_expr {
@@ -3820,67 +4309,76 @@ impl<'a> BodyChecker<'a> {
                             ),
                         ));
                     }
-                    ActiveBodyKind::Fn { ret_ty, .. } => match (ret_ty.is_void(), opt_expr) {
-                        (true, None) => {}
-                        (true, Some(e)) => {
-                            let val = self.check_expr_infallible(e);
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::ReturnMismatch,
-                                stmt.span,
-                                format!(
-                                    "void function '{}' cannot return value of type '{}'",
-                                    self.caller_key, val.ty
-                                ),
-                            ));
-                        }
-                        (false, None) => {
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::ReturnMismatch,
-                                stmt.span,
-                                format!(
-                                    "function '{}' must return a value of type '{}'",
-                                    self.caller_key, ret_ty
-                                ),
-                            ));
-                        }
-                        (false, Some(e)) => {
-                            let val = self.check_expr_infallible(e);
-                            if !val.ty.is_assignable_to(ret_ty) {
+                    ActiveBodyKind::Fn { ret_ty, .. } => {
+                        match (ret_ty.is_void(), opt_expr) {
+                            (true, None) => {}
+                            (true, Some(e)) => {
+                                let val = self.check_expr_infallible(e);
+                                if val.ty.is_linear_lease() {
+                                    self.consume_lease_value(e, &val, "return", e.span);
+                                }
                                 self.sema.emit(Diagnostic::new(
                                     DiagnosticKind::ReturnMismatch,
-                                    e.span,
+                                    stmt.span,
                                     format!(
-                                        "return value has type '{}', expected '{}'",
-                                        val.ty, ret_ty
+                                        "void function '{}' cannot return value of type '{}'",
+                                        self.caller_key, val.ty
                                     ),
                                 ));
-                            } else {
-                                self.sema.check_f32_coercion_expr(e, ret_ty);
                             }
-                            if ret_ty.contains_reference(&self.sema.structs) {
-                                if val.prov.has_non_returning_origin() {
-                                    self.sema.emit(
-                                        Diagnostic::new(
-                                            DiagnosticKind::ReturnLocalReference,
-                                            e.span,
-                                            format!(
-                                                "cannot return pointer/slice/wrapper of type '{}' referencing local variable or temporary DMA lease from '{}'",
-                                                ret_ty, self.caller_key
-                                            ),
-                                        )
-                                        .with_note(format!(
-                                            "referenced origins: {:?}",
-                                            val.prov.local_origins
-                                        )),
-                                    );
+                            (false, None) => {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::ReturnMismatch,
+                                    stmt.span,
+                                    format!(
+                                        "function '{}' must return a value of type '{}'",
+                                        self.caller_key, ret_ty
+                                    ),
+                                ));
+                            }
+                            (false, Some(e)) => {
+                                let val = self.check_expr_infallible(e);
+                                if val.ty.is_linear_lease() {
+                                    self.consume_lease_value(e, &val, "return", e.span);
+                                }
+                                if !val.ty.is_assignable_to(ret_ty) {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::ReturnMismatch,
+                                        e.span,
+                                        format!(
+                                            "return value has type '{}', expected '{}'",
+                                            val.ty, ret_ty
+                                        ),
+                                    ));
                                 } else {
-                                    for &idx in &val.prov.param_origins {
-                                        self.return_param_origins.insert(idx);
+                                    self.sema.check_f32_coercion_expr(e, ret_ty);
+                                }
+                                if ret_ty.contains_reference(&self.sema.structs) {
+                                    if val.prov.has_non_returning_origin() {
+                                        self.sema.emit(
+                                            Diagnostic::new(
+                                                DiagnosticKind::ReturnLocalReference,
+                                                e.span,
+                                                format!(
+                                                    "cannot return pointer/slice/wrapper of type '{}' referencing local variable or temporary DMA lease from '{}'",
+                                                    ret_ty, self.caller_key
+                                                ),
+                                            )
+                                            .with_note(format!(
+                                                "referenced origins: {:?}",
+                                                val.prov.local_origins
+                                            )),
+                                        );
+                                    } else {
+                                        for &idx in &val.prov.param_origins {
+                                            self.return_param_origins.insert(idx);
+                                        }
                                     }
                                 }
                             }
                         }
-                    },
+                        self.check_unconsumed_leases_on_exit(stmt.span, "return", 0);
+                    }
                 }
                 true
             }
@@ -3985,6 +4483,13 @@ impl<'a> BodyChecker<'a> {
                         }
                         // 2-arg `error Reason, partial_val;`
                         (ResolvedErrorSpec::Typed(err_ty), Some(rv), Some(pv)) => {
+                            if pv.ty.is_linear_lease() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::LinearLeaseViolation,
+                                    pv.span,
+                                    "cannot return linear 'Lease<T>' as partial-progress payload on 'error' exit",
+                                ));
+                            }
                             if !rv.ty.is_assignable_to(err_ty) {
                                 self.sema.emit(Diagnostic::new(
                                     DiagnosticKind::ErrorSpecMismatch,
@@ -4040,6 +4545,7 @@ impl<'a> BodyChecker<'a> {
                         }
                     },
                 }
+                self.check_unconsumed_leases_on_exit(stmt.span, "error", 0);
                 true
             }
 
@@ -4104,7 +4610,7 @@ impl<'a> BodyChecker<'a> {
                         live_var_branches.push(else_vars);
                         live_lease_branches.push(else_leases);
                     }
-                    self.merge_branch_vars(&base_vars, &live_var_branches);
+                    self.merge_branch_vars(&base_vars, &live_var_branches, stmt.span);
                     self.leases = base_leases;
                     self.leases.join_branches(&live_lease_branches);
                     then_div && else_div
@@ -4122,7 +4628,7 @@ impl<'a> BodyChecker<'a> {
                         live_var_branches.push(then_vars);
                         live_lease_branches.push(then_leases);
                     }
-                    self.merge_branch_vars(&base_vars, &live_var_branches);
+                    self.merge_branch_vars(&base_vars, &live_var_branches, stmt.span);
                     self.leases = base_leases;
                     self.leases.join_branches(&live_lease_branches);
                     false
@@ -4195,6 +4701,9 @@ impl<'a> BodyChecker<'a> {
                     }
                 }
 
+                if is_while_true && !has_break {
+                    self.check_unconsumed_leases_on_exit(stmt.span, "enter infinite while loop", 0);
+                }
                 self.check_loop_body(body, is_while_true && !has_break);
                 if is_while_true && self.caller_key == "main" {
                     self.main_supervisor_started = true;
@@ -4264,6 +4773,9 @@ impl<'a> BodyChecker<'a> {
                     );
                 }
 
+                if !has_break {
+                    self.check_unconsumed_leases_on_exit(stmt.span, "enter infinite loop", 0);
+                }
                 self.check_loop_body(body, !has_break);
                 if self.caller_key == "main" {
                     self.main_supervisor_started = true;
@@ -4307,6 +4819,13 @@ impl<'a> BodyChecker<'a> {
                     "'loop every' periodic deadline",
                 );
                 let has_break = block_has_break(body);
+                if !has_break {
+                    self.check_unconsumed_leases_on_exit(
+                        stmt.span,
+                        "enter infinite loop every",
+                        0,
+                    );
+                }
                 self.check_loop_body(body, !has_break);
                 if self.caller_key == "main" {
                     self.main_supervisor_started = true;
@@ -4441,7 +4960,14 @@ impl<'a> BodyChecker<'a> {
                 }
                 self.defer_depth += 1;
                 self.noyield_depth += 1;
-                let _ = self.with_nested_scope(|this| this.check_stmt(inner));
+                let prev_defer_owner = self.active_defer_owner_depth;
+                self.active_defer_owner_depth = Some(self.current_depth());
+                let _ = self.with_nested_scope(|this| {
+                    let div = this.check_stmt(inner);
+                    this.finish_lexical_block(div, inner.span);
+                    div
+                });
+                self.active_defer_owner_depth = prev_defer_owner;
                 self.noyield_depth -= 1;
                 self.defer_depth -= 1;
                 false
@@ -4466,6 +4992,7 @@ impl<'a> BodyChecker<'a> {
                 } else {
                     self.record_direct_yield(stmt.span, FnEffect::SoftYielding, "'restart;'");
                 }
+                self.check_unconsumed_leases_on_exit(stmt.span, "restart", 0);
                 true
             }
 
@@ -4643,7 +5170,7 @@ impl<'a> BodyChecker<'a> {
                 }
 
                 self.scopes = base_vars.clone();
-                self.merge_branch_vars(&base_vars, &live_var_branches);
+                self.merge_branch_vars(&base_vars, &live_var_branches, stmt.span);
                 self.leases = base_leases;
                 self.leases.join_branches(&live_lease_branches);
                 all_arms_diverge
@@ -4667,6 +5194,17 @@ impl<'a> BodyChecker<'a> {
                         stmt.span,
                         "'continue' may only be used inside a 'loop', 'loop every', 'while', or 'for' body",
                     ));
+                } else {
+                    let loop_entry = self.loop_lease_frames.last().map(|(d, _)| *d).unwrap_or(0);
+                    self.check_unconsumed_leases_on_exit(stmt.span, "continue", loop_entry);
+                    if let Some((entry_d, entry_vars)) = self.loop_lease_frames.last().cloned() {
+                        self.check_loop_reassigned_outer_live(
+                            &entry_vars,
+                            entry_d,
+                            stmt.span,
+                            "continue",
+                        );
+                    }
                 }
                 true
             }
@@ -4684,6 +5222,17 @@ impl<'a> BodyChecker<'a> {
                         stmt.span,
                         "'break' may only be used inside a 'loop', 'loop every', 'while', or 'for' body",
                     ));
+                } else {
+                    let loop_entry = self.loop_lease_frames.last().map(|(d, _)| *d).unwrap_or(0);
+                    self.check_unconsumed_leases_on_exit(stmt.span, "break", loop_entry);
+                    if let Some((entry_d, entry_vars)) = self.loop_lease_frames.last().cloned() {
+                        self.check_loop_reassigned_outer_live(
+                            &entry_vars,
+                            entry_d,
+                            stmt.span,
+                            "break",
+                        );
+                    }
                 }
                 true
             }
@@ -4696,8 +5245,74 @@ impl<'a> BodyChecker<'a> {
             StmtKind::Block(b) => self.check_nested_block(b),
 
             StmtKind::Expr(e) => {
-                let _ = self.check_expr_infallible(e);
-                self.lookup_local("sys").is_none() && is_sys_exit_expr(e)
+                let ev = self.check_expr_infallible(e);
+                if ev.ty.is_linear_lease() {
+                    self.sema.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::LinearLeaseViolation,
+                            e.span,
+                            format!(
+                                "unused expression of linear type '{}' drops ownership and leaks pool slot",
+                                ev.ty
+                            ),
+                        )
+                        .with_note("bind the `Lease<T>` to a local variable (`Lease<T> l = ...;`) or consume it via `.release()`, `dma_slot.park(...)`, or `inbox.post(...)`"),
+                    );
+                }
+                let exits = self.lookup_local("sys").is_none() && is_sys_exit_expr(e);
+                if exits {
+                    self.check_unconsumed_leases_on_exit(e.span, "sys.exit", 0);
+                }
+                exits
+            }
+        }
+    }
+
+    fn check_loop_reassigned_outer_live(
+        &mut self,
+        entry_vars: &[BTreeMap<String, LocalVar>],
+        entry_depth: u32,
+        span: Span,
+        ctx: &str,
+    ) {
+        let mut offenders = Vec::new();
+        for (idx, scope) in self.scopes.iter().enumerate() {
+            for (name, var) in scope {
+                if var.decl_depth <= entry_depth
+                    && matches!(var.lease_state, Some(LinearLeaseState::Live))
+                {
+                    let was_live = entry_vars
+                        .get(idx)
+                        .and_then(|s| s.get(name))
+                        .is_some_and(|ev| {
+                            matches!(
+                                ev.lease_state,
+                                Some(
+                                    LinearLeaseState::Live
+                                        | LinearLeaseState::DeferredRelease { .. }
+                                )
+                            )
+                        });
+                    if !was_live {
+                        offenders.push(name.clone());
+                    }
+                }
+            }
+        }
+        for name in offenders {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::LinearLeaseViolation,
+                span,
+                format!(
+                    "Lease<T> variable '{}' acquired inside loop must be consumed before '{}'",
+                    name, ctx
+                ),
+            ));
+            if let Some(v) = self.lookup_local_mut(&name) {
+                v.lease_state = Some(LinearLeaseState::Moved {
+                    moved_at: span,
+                    reason: "loop leak",
+                });
             }
         }
     }
@@ -4712,11 +5327,13 @@ impl<'a> BodyChecker<'a> {
     ) {
         let leases_before = self.leases.clone();
         let entry_depth = self.current_depth();
+        let loop_entry_vars = self.snapshot_outer_vars();
         self.loop_depth += 1;
         self.loop_entry_depths.push(entry_depth);
         self.loop_outer_reads.push(Vec::new());
+        self.loop_lease_frames.push((entry_depth, loop_entry_vars.clone()));
 
-        self.with_nested_scope(|this| {
+        let body_div = self.with_nested_scope(|this| {
             let bind_depth = this.current_depth();
             this.scopes.last_mut().unwrap().insert(
                 var_name.to_string(),
@@ -4728,11 +5345,24 @@ impl<'a> BodyChecker<'a> {
                     field_prov: BTreeMap::new(),
                     endpoint_alias: None,
                     is_isr_state: false,
+                    lease_state: None,
+                    lease_gen_key: None,
                 },
             );
-            let _ = this.check_block_stmts(&body.stmts);
+            let div = this.check_block_stmts(&body.stmts);
+            this.finish_lexical_block(div, body.span);
+            div
         });
+        if !body_div {
+            self.check_loop_reassigned_outer_live(
+                &loop_entry_vars,
+                entry_depth,
+                body.span,
+                "end of loop iteration",
+            );
+        }
 
+        let _ = self.loop_lease_frames.pop();
         let outer_reads = self.loop_outer_reads.pop().unwrap_or_default();
         self.loop_entry_depths.pop();
         self.loop_depth -= 1;
@@ -4831,12 +5461,23 @@ impl<'a> BodyChecker<'a> {
     fn check_loop_body(&mut self, body: &Block, _infinite: bool) {
         let leases_before = self.leases.clone();
         let entry_depth = self.current_depth();
+        let loop_entry_vars = self.snapshot_outer_vars();
         self.loop_depth += 1;
         self.loop_entry_depths.push(entry_depth);
         self.loop_outer_reads.push(Vec::new());
+        self.loop_lease_frames.push((entry_depth, loop_entry_vars.clone()));
 
-        let _ = self.check_nested_block(body);
+        let body_div = self.check_nested_block(body);
+        if !body_div {
+            self.check_loop_reassigned_outer_live(
+                &loop_entry_vars,
+                entry_depth,
+                body.span,
+                "end of loop iteration",
+            );
+        }
 
+        let _ = self.loop_lease_frames.pop();
         let outer_reads = self.loop_outer_reads.pop().unwrap_or_default();
         self.loop_entry_depths.pop();
         self.loop_depth -= 1;
@@ -5162,6 +5803,54 @@ impl<'a> BodyChecker<'a> {
                     ));
                 } else {
                     self.sema.check_f32_coercion_expr(value_expr, &var_info.ty);
+                }
+
+                if var_info.ty.is_linear_lease() {
+                    match var_info.lease_state {
+                        Some(LinearLeaseState::Live) => {
+                            self.sema.emit(
+                                Diagnostic::new(
+                                    DiagnosticKind::LinearLeaseViolation,
+                                    stmt_span,
+                                    format!(
+                                        "cannot overwrite live Lease<T> variable '{}' before consuming its current handle",
+                                        ident.name
+                                    ),
+                                )
+                                .with_note("call `.release()`, `dma_slot.park(...)`, or `inbox.post(...)` on it before reassigning"),
+                            );
+                        }
+                        Some(LinearLeaseState::DeferredRelease { span, .. }) => {
+                            self.sema.emit(
+                                Diagnostic::new(
+                                    DiagnosticKind::LinearLeaseViolation,
+                                    stmt_span,
+                                    format!(
+                                        "cannot overwrite Lease<T> variable '{}' while `defer` release from {} is pending",
+                                        ident.name, span
+                                    ),
+                                ),
+                            );
+                        }
+                        Some(LinearLeaseState::Moved { .. })
+                        | Some(LinearLeaseState::Uninit)
+                        | None => {}
+                    }
+                    if rhs.ty.is_linear_lease() {
+                        self.consume_lease_value(value_expr, &rhs, "assignment", stmt_span);
+                    }
+                    let new_key = self.fresh_lease_gen_key(&ident.name);
+                    if let Some(v) = self.lookup_local_mut(&ident.name) {
+                        v.lease_state = Some(if rhs.ty.is_error() {
+                            LinearLeaseState::Moved {
+                                moved_at: stmt_span,
+                                reason: "error assign",
+                            }
+                        } else {
+                            LinearLeaseState::Live
+                        });
+                        v.lease_gen_key = Some(new_key);
+                    }
                 }
 
                 if var_info.ty.contains_reference(&self.sema.structs)
@@ -6024,6 +6713,13 @@ impl<'a> BodyChecker<'a> {
                 let mut combined_prov = Provenance::pure_static();
                 for e in elems {
                     let ev = self.check_expr_infallible(e);
+                    if ev.ty.is_linear_lease() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::LinearLeaseViolation,
+                            e.span,
+                            "linear 'Lease<T>' handles cannot be stored inside an array literal",
+                        ));
+                    }
                     if ev.ty.contains_reference(&self.sema.structs) {
                         combined_prov = combined_prov.merge(&ev.prov);
                     }
@@ -6098,8 +6794,19 @@ impl<'a> BodyChecker<'a> {
                         "cannot apply 'or' fallback to an infallible expression",
                     ));
                 }
+                let base_vars = self.snapshot_outer_vars();
+                let base_leases = self.leases.clone();
                 let fv = self.check_expr_raw(fallback);
                 let _ = self.reject_unindexed_mmio_array(fallback.span);
+                if fv.ty.is_linear_lease() {
+                    self.consume_lease_value(fallback, &fv, "`or` fallback", fallback.span);
+                }
+                let fallback_vars = self.snapshot_outer_vars();
+                let fallback_leases = self.leases.clone();
+                self.scopes = base_vars.clone();
+                self.merge_branch_vars(&base_vars, &[base_vars.clone(), fallback_vars], expr.span);
+                self.leases = base_leases.clone();
+                self.leases.join_branches(&[base_leases, fallback_leases]);
                 if !fv.ty.is_assignable_to(&iv.ty) && !iv.ty.is_assignable_to(&fv.ty) {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidOrFallback,
@@ -6171,6 +6878,28 @@ impl<'a> BodyChecker<'a> {
                         ));
                     }
                     d
+                } else if stale_tok.acq_method == "get" {
+                    let lease_name = Self::display_lease_source(&stale_tok.source);
+                    let mut d = Diagnostic::new(
+                        DiagnosticKind::StaleDmaLease,
+                        ident.span,
+                        format!(
+                            "cannot read '{}' derived from '{}.get()' after '{}' moved or released its Lease",
+                            ident.name, lease_name, lease_name
+                        ),
+                    );
+                    if let Some(sp) = inv_span {
+                        d = d.with_note(format!(
+                            "pointer borrowed from `{}.get()` at {} was invalidated by `{}` at {}; finish dereferencing `{}` before calling `.release()`, `.park()`, `.post()`, or moving `{}`",
+                            lease_name, stale_tok.acquired_at, inv_method, sp, ident.name, lease_name
+                        ));
+                    } else {
+                        d = d.with_note(format!(
+                            "finish reading `{}` before `{}` is moved or released",
+                            ident.name, lease_name
+                        ));
+                    }
+                    d
                 } else {
                     let mut d = Diagnostic::new(
                         DiagnosticKind::StaleDmaLease,
@@ -6208,6 +6937,37 @@ impl<'a> BodyChecker<'a> {
                             ident.span,
                         ));
                     }
+                }
+            }
+
+            if var.ty.is_linear_lease() {
+                match var.lease_state {
+                    Some(LinearLeaseState::Moved { moved_at, reason }) => {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::LinearLeaseViolation,
+                                ident.span,
+                                format!("use of moved linear Lease<T> variable '{}'", ident.name),
+                            )
+                            .with_note(format!(
+                                "`{}` was previously consumed via {} at {}",
+                                ident.name, reason, moved_at
+                            )),
+                        );
+                        return ExprVal::error(ident.span);
+                    }
+                    Some(LinearLeaseState::Uninit) => {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::LinearLeaseViolation,
+                            ident.span,
+                            format!(
+                                "use of uninitialized linear Lease<T> variable '{}'",
+                                ident.name
+                            ),
+                        ));
+                        return ExprVal::error(ident.span);
+                    }
+                    _ => {}
                 }
             }
 
@@ -6476,6 +7236,14 @@ impl<'a> BodyChecker<'a> {
                 if iv.ty.is_error() {
                     return ExprVal::error(span);
                 }
+                if iv.ty.is_linear_lease() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::LinearLeaseViolation,
+                        span,
+                        "cannot take address `&` of linear Lease<T> variable (use `.get()` to obtain a tracked `*T` buffer pointer)",
+                    ));
+                    return ExprVal::error(span);
+                }
 
                 let (prov, endpoint_name) =
                     self.resolve_addr_of_provenance(inner, iv.prov, iv.endpoint_name);
@@ -6585,6 +7353,14 @@ impl<'a> BodyChecker<'a> {
             }
 
             BinaryOp::Eq | BinaryOp::Ne => {
+                if lv.ty.is_linear_lease() || rv.ty.is_linear_lease() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::LinearLeaseViolation,
+                        span,
+                        "linear Lease<T> values cannot be compared directly with `==` / `!=` (compare `.addr()` instead)",
+                    ));
+                    return ExprVal::error(span);
+                }
                 let unified_float = unify_float_arith(&lv.ty, &rv.ty);
                 let compat = lv.ty.is_assignable_to(&rv.ty)
                     || rv.ty.is_assignable_to(&lv.ty)
@@ -6856,9 +7632,14 @@ impl<'a> BodyChecker<'a> {
                 };
 
                 let is_subsys_field = matches!(&f_info.ty, Ty::OsPrimitive(_))
+                    || matches!(&f_info.ty, Ty::Ptr(inner) if matches!(&**inner, Ty::OsPrimitive(_)))
                     || matches!(
                         &f_info.ty,
                         Ty::Struct(s) if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem)
+                    )
+                    || matches!(
+                        &f_info.ty,
+                        Ty::Ptr(inner) if matches!(&**inner, Ty::Struct(s) if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem))
                     );
                 let prov = if is_subsys_field
                     || f_info.ty.contains_reference(&self.sema.structs)
@@ -6883,6 +7664,8 @@ impl<'a> BodyChecker<'a> {
                 let endpoint_name = if is_subsys_field {
                     tv.endpoint_name
                         .as_ref()
+                        .cloned()
+                        .or_else(|| root_ident_of(target))
                         .map(|parent| format!("{parent}.{}", field.name))
                 } else {
                     None
@@ -7056,6 +7839,9 @@ impl<'a> BodyChecker<'a> {
                 }
                 for (i, arg) in args.iter().enumerate() {
                     let av = self.check_expr_infallible(&arg.value);
+                    if av.ty.is_linear_lease() {
+                        self.consume_lease_value(&arg.value, &av, "function pointer argument", arg.span);
+                    }
                     if let Some(expected) = params.get(i) {
                         if !av.ty.is_assignable_to(expected) {
                             self.sema.emit(Diagnostic::new(
@@ -7140,6 +7926,9 @@ impl<'a> BodyChecker<'a> {
         let mut boot_attach_args = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let av = self.check_expr_infallible(&arg.value);
+            if av.ty.is_linear_lease() {
+                self.consume_lease_value(&arg.value, &av, "function argument", arg.span);
+            }
             if let Some(param) = fn_info.params.get(i) {
                 if !av.ty.is_assignable_to(&param.ty) {
                     self.sema.emit(Diagnostic::new(
@@ -7559,6 +8348,132 @@ impl<'a> BodyChecker<'a> {
                 self.check_os_primitive_method(&os_prim, &source_key, method, args, span)
             }
 
+            Ty::Lease(elem) => {
+                let mut pos_vals = Vec::new();
+                let mut has_boost = false;
+                for a in args {
+                    let av = self.check_expr_infallible(&a.value);
+                    if let Some(arg_name) = &a.name {
+                        match arg_name.name.as_str() {
+                            "timeout" => {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::InvalidOperation,
+                                    a.span,
+                                    format!("`timeout:` is not valid on `Lease.{}`", method.name),
+                                ));
+                            }
+                            "boost" => {
+                                has_boost = true;
+                                if av.ty != Ty::Priority && !av.ty.is_error() {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::TypeMismatch,
+                                        a.span,
+                                        format!(
+                                            "'boost:' must be a priority (@critical..@low), found '{}'",
+                                            av.ty
+                                        ),
+                                    ));
+                                }
+                                if let ExprKind::Priority(prio) = a.value.kind {
+                                    self.recorded_boosts.push(PriorityBoostSite {
+                                        primitive_name: "<Lease>".to_string(),
+                                        boost_priority: prio,
+                                        span: a.span,
+                                    });
+                                }
+                            }
+                            other => {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    arg_name.span,
+                                    format!(
+                                        "unknown named argument '{}:' on `Lease.{}`",
+                                        other, method.name
+                                    ),
+                                ));
+                            }
+                        }
+                    } else {
+                        pos_vals.push((av, a.value.clone(), a.span));
+                    }
+                }
+                match method.name.as_str() {
+                    "get" => {
+                        self.expect_positional_arity("get", &pos_vals, 0, span);
+                        if has_boost {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                span,
+                                "`boost:` is only valid on `Lease.release(...)`",
+                            ));
+                        }
+                        if let ExprKind::Ident(id) = &receiver.kind {
+                            if let Some(var) = self.lookup_local(&id.name).cloned() {
+                                if let Some(key) = var.lease_gen_key {
+                                    let gen = self.leases.acquire_next(&key, span);
+                                    let prov = Provenance::dma_lease_get(
+                                        key,
+                                        gen,
+                                        var.decl_depth,
+                                        span,
+                                    );
+                                    return ExprVal {
+                                        ty: Ty::Ptr(elem),
+                                        error_spec: ResolvedErrorSpec::None,
+                                        prov,
+                                        endpoint_name: None,
+                                        span,
+                                    };
+                                }
+                            }
+                            ExprVal::scalar(Ty::Ptr(elem), span)
+                        } else {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::LinearLeaseViolation,
+                                span,
+                                "cannot borrow `.get()` from a temporary unnamed `Lease<T>` (bind it to a local variable and release it after use)",
+                            ));
+                            ExprVal::error(span)
+                        }
+                    }
+                    "addr" => {
+                        self.expect_positional_arity("addr", &pos_vals, 0, span);
+                        if has_boost {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                span,
+                                "`boost:` is only valid on `Lease.release(...)`",
+                            ));
+                        }
+                        if !matches!(receiver.kind, ExprKind::Ident(_)) {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::LinearLeaseViolation,
+                                span,
+                                "cannot call `.addr()` on a temporary unnamed `Lease<T>` (bind it to a local variable first)",
+                            ));
+                            return ExprVal::error(span);
+                        }
+                        ExprVal::scalar(Ty::usize(), span)
+                    }
+                    "release" => {
+                        self.expect_positional_arity("release", &pos_vals, 0, span);
+                        self.consume_lease_value(receiver, &rv, "release", span);
+                        ExprVal::scalar(Ty::void(), span)
+                    }
+                    _ => {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::UndefinedSymbol,
+                                method.span,
+                                format!("linear `Lease<{}>` has no method '{}'", elem, method.name),
+                            )
+                            .with_note("valid methods on `Lease<T>`: `.get() -> *T`, `.addr() -> usize`, `.release([boost: @prio])`"),
+                        );
+                        ExprVal::error(span)
+                    }
+                }
+            }
+
             Ty::Struct(struct_name) => {
                 if let Some(FieldInfo {
                     ty: Ty::FnPtr { params, ret },
@@ -7597,6 +8512,9 @@ impl<'a> BodyChecker<'a> {
                     }
                     for (i, arg) in args.iter().enumerate() {
                         let av = self.check_expr_infallible(&arg.value);
+                        if av.ty.is_linear_lease() {
+                            self.consume_lease_value(&arg.value, &av, "function pointer field argument", arg.span);
+                        }
                         if let Some(expected) = params.get(i) {
                             if !av.ty.is_assignable_to(expected) {
                                 self.sema.emit(Diagnostic::new(
@@ -7976,6 +8894,7 @@ impl<'a> BodyChecker<'a> {
         // Partition positional vs named arguments (`timeout: <dur>`, `boost: @prio`).
         let mut pos_vals = Vec::new();
         let mut has_timeout = false;
+        let mut has_boost = false;
 
         for a in args {
             let av = self.check_expr_infallible(&a.value);
@@ -7992,6 +8911,7 @@ impl<'a> BodyChecker<'a> {
                         }
                     }
                     "boost" => {
+                        has_boost = true;
                         if av.ty != Ty::Priority && !av.ty.is_error() {
                             self.sema.emit(Diagnostic::new(
                                 DiagnosticKind::TypeMismatch,
@@ -8090,14 +9010,29 @@ impl<'a> BodyChecker<'a> {
             ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => match m {
                 "post" | "try_post" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
+                    if elem.is_linear_lease() {
+                        if let Some((av, ae, asp)) = pos_vals.first() {
+                            self.consume_lease_value(ae, av, if m == "post" { "inbox.post" } else { "inbox.try_post" }, *asp);
+                        }
+                    }
                     ExprVal::scalar(Ty::void(), span)
                 }
                 "try_send" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
+                    if elem.is_linear_lease() {
+                        if let Some((av, ae, asp)) = pos_vals.first() {
+                            self.consume_lease_value(ae, av, "inbox.try_send", *asp);
+                        }
+                    }
                     ExprVal::scalar(Ty::bool(), span)
                 }
                 "send" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
+                    if elem.is_linear_lease() {
+                        if let Some((av, ae, asp)) = pos_vals.first() {
+                            self.consume_lease_value(ae, av, "inbox.send", *asp);
+                        }
+                    }
                     self.record_direct_yield(
                         span,
                         FnEffect::HardBlocking,
@@ -8193,45 +9128,138 @@ impl<'a> BodyChecker<'a> {
                 _ => self.unknown_prim_method(prim, method, span),
             },
 
-            ResolvedOsPrimitive::Lease { elem, .. } => match m {
-                "release" | "complete" | "flip" | "start" | "activate" | "stop" | "deactivate" => {
+            ResolvedOsPrimitive::Pool { elem, .. } => match m {
+                "try_alloc" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
-                    ExprVal::scalar(Ty::void(), span)
+                    if has_timeout {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "`pool.try_alloc()` is non-blocking and does not accept `timeout:` (use `pool.alloc(timeout: <dur>)`)",
+                        ));
+                    }
+                    if has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "`pool.try_alloc()` does not accept `boost:`",
+                        ));
+                    }
+                    ExprVal {
+                        ty: Ty::Lease(elem.clone()),
+                        error_spec: ResolvedErrorSpec::Untyped,
+                        prov: Provenance::pure_static(),
+                        endpoint_name: None,
+                        span,
+                    }
                 }
-                "wait_chunk" | "acquire" => {
+                "alloc" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "`pool.alloc()` does not accept `boost:`",
+                        ));
+                    }
                     self.record_direct_yield(
                         span,
                         FnEffect::HardBlocking,
-                        &format!("{}.{}()", source_key, m),
+                        &format!("{}.alloc()", source_key),
                     );
-                    let gen = self.leases.acquire_next(source_key, span);
-                    let prov =
-                        Provenance::dma_lease(source_key.to_string(), gen, self.current_depth(), span);
                     ExprVal {
-                        ty: Ty::Slice(elem.clone()),
+                        ty: Ty::Lease(elem.clone()),
                         error_spec: if has_timeout {
                             ResolvedErrorSpec::Untyped
                         } else {
                             ResolvedErrorSpec::None
                         },
-                        prov,
+                        prov: Provenance::pure_static(),
                         endpoint_name: None,
                         span,
                     }
                 }
-                "try_acquire" => {
+                "avail" | "in_use" | "cap" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
-                    let gen = self.leases.acquire_next(source_key, span);
-                    let prov =
-                        Provenance::dma_lease(source_key.to_string(), gen, self.current_depth(), span);
+                    if has_timeout || has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            format!("`pool.{}()` does not accept `timeout:` or `boost:`", m),
+                        ));
+                    }
+                    ExprVal::scalar(Ty::usize(), span)
+                }
+                "is_exhausted" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout || has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "`pool.is_exhausted()` does not accept `timeout:` or `boost:`",
+                        ));
+                    }
+                    ExprVal::scalar(Ty::bool(), span)
+                }
+                _ => self.unknown_prim_method(prim, method, span),
+            },
+
+            ResolvedOsPrimitive::DmaSlot { elem } => match m {
+                "park" => {
+                    self.expect_single_elem(m, &pos_vals, &Ty::Lease(elem.clone()), span);
+                    if has_timeout {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "`dma_slot.park()` does not accept `timeout:`",
+                        ));
+                    }
+                    if let Some((av, ae, asp)) = pos_vals.first() {
+                        self.consume_lease_value(ae, av, "dma_slot.park", *asp);
+                    }
                     ExprVal {
-                        ty: Ty::Slice(elem.clone()),
+                        ty: Ty::void(),
                         error_spec: ResolvedErrorSpec::Untyped,
-                        prov,
+                        prov: Provenance::pure_static(),
                         endpoint_name: None,
                         span,
                     }
+                }
+                "take" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout || has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "`dma_slot.take()` does not accept `timeout:` or `boost:`",
+                        ));
+                    }
+                    ExprVal {
+                        ty: Ty::Lease(elem.clone()),
+                        error_spec: ResolvedErrorSpec::Untyped,
+                        prov: Provenance::pure_static(),
+                        endpoint_name: None,
+                        span,
+                    }
+                }
+                "release" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "`dma_slot.release()` does not accept `timeout:`",
+                        ));
+                    }
+                    ExprVal::scalar(Ty::bool(), span)
+                }
+                "is_busy" | "is_empty" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    ExprVal::scalar(Ty::bool(), span)
+                }
+                "addr" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    ExprVal::scalar(Ty::usize(), span)
                 }
                 _ => self.unknown_prim_method(prim, method, span),
             },
@@ -8572,6 +9600,8 @@ impl<'a> BodyChecker<'a> {
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
                         is_isr_state: false,
+                        lease_state: None,
+                        lease_gen_key: None,
                     },
                 );
             }
@@ -8595,6 +9625,8 @@ impl<'a> BodyChecker<'a> {
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
                         is_isr_state: false,
+                        lease_state: None,
+                        lease_gen_key: None,
                     },
                 );
             }
@@ -8615,7 +9647,14 @@ impl<'a> BodyChecker<'a> {
                 }
                 if let StmtKind::Expr(last_expr) = &last[0].kind {
                     let lv = this.check_expr_infallible(last_expr);
-                    if this.lookup_local("sys").is_none() && is_sys_exit_expr(last_expr) {
+                    if lv.ty.is_linear_lease() {
+                        this.consume_lease_value(last_expr, &lv, "catch fallback", last_expr.span);
+                    }
+                    let sys_exit =
+                        this.lookup_local("sys").is_none() && is_sys_exit_expr(last_expr);
+                    let res_div = div || sys_exit;
+                    this.finish_lexical_block(res_div, clause.span);
+                    if sys_exit {
                         this.after_diverge = prev_after;
                         return (true, None);
                     }
@@ -8625,10 +9664,13 @@ impl<'a> BodyChecker<'a> {
                 if this.check_stmt(&last[0]) {
                     div = true;
                 }
+                this.finish_lexical_block(div, clause.span);
                 this.after_diverge = prev_after;
                 (div, None)
             } else {
-                (this.check_block_stmts(&clause.body.stmts), None)
+                let div = this.check_block_stmts(&clause.body.stmts);
+                this.finish_lexical_block(div, clause.span);
+                (div, None)
             }
         });
 
@@ -8638,7 +9680,7 @@ impl<'a> BodyChecker<'a> {
         let mut merged_prov = iv.prov.clone();
         if !catch_div {
             self.scopes = base_vars.clone();
-            self.merge_branch_vars(&base_vars, &[base_vars.clone(), catch_vars]);
+            self.merge_branch_vars(&base_vars, &[base_vars.clone(), catch_vars], clause.span);
             self.leases = base_leases.clone();
             self.leases.join_branches(&[base_leases, catch_leases]);
 
@@ -9843,10 +10885,22 @@ fn is_mmio_ty(ty: &Ty) -> bool {
         || matches!(ty, Ty::Ptr(inner) if matches!(&**inner, Ty::MmioLayout(_)))
 }
 
+fn ty_contains_linear_lease(ty: &Ty) -> bool {
+    match ty {
+        Ty::Lease(_) => true,
+        Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Ptr(elem) => ty_contains_linear_lease(elem),
+        Ty::OsPrimitive(os) => os.elem_ty().is_some_and(ty_contains_linear_lease),
+        Ty::FnPtr { params, ret } => {
+            params.iter().any(ty_contains_linear_lease) || ty_contains_linear_lease(ret)
+        }
+        _ => false,
+    }
+}
+
 fn ty_contains_byval_mmio(ty: &Ty) -> Option<&str> {
     match ty {
         Ty::MmioLayout(name) => Some(name.as_str()),
-        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_contains_byval_mmio(elem),
+        Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Lease(elem) => ty_contains_byval_mmio(elem),
         Ty::OsPrimitive(os) => os.elem_ty().and_then(ty_contains_byval_mmio),
         Ty::FnPtr { params, ret } => params
             .iter()
@@ -9860,7 +10914,9 @@ fn ty_contains_bare_unsized_prim(ty: &Ty) -> Option<String> {
     match ty {
         Ty::OsPrimitive(os) if os.is_unsized_view() => Some(os.to_string()),
         Ty::OsPrimitive(os) => os.elem_ty().and_then(ty_contains_bare_unsized_prim),
-        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_contains_bare_unsized_prim(elem),
+        Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Lease(elem) => {
+            ty_contains_bare_unsized_prim(elem)
+        }
         Ty::FnPtr { params, ret } => params
             .iter()
             .find_map(ty_contains_bare_unsized_prim)
@@ -9872,7 +10928,7 @@ fn ty_contains_bare_unsized_prim(ty: &Ty) -> Option<String> {
 fn ty_embeds_os_primitive(ty: &Ty) -> bool {
     match ty {
         Ty::OsPrimitive(os) => !os.is_unsized_view(),
-        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_embeds_os_primitive(elem),
+        Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Lease(elem) => ty_embeds_os_primitive(elem),
         _ => false,
     }
 }
@@ -9885,7 +10941,9 @@ fn ty_contains_byval_subsys<'a>(
         Ty::Struct(name) if structs.get(name).is_some_and(|s| s.is_subsystem) => {
             Some(name.as_str())
         }
-        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_contains_byval_subsys(elem, structs),
+        Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Lease(elem) => {
+            ty_contains_byval_subsys(elem, structs)
+        }
         Ty::OsPrimitive(os) => os
             .elem_ty()
             .and_then(|e| ty_contains_byval_subsys(e, structs)),
@@ -9898,6 +10956,103 @@ fn ty_contains_byval_subsys<'a>(
 }
 
 impl Analyzer {
+    fn validate_pool_slot_elem(&mut self, elem: &Ty, span: Span, owner_desc: &str) {
+        if elem.is_error() || elem.is_void() {
+            return;
+        }
+        if ty_contains_linear_lease(elem) {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::LinearLeaseViolation,
+                span,
+                format!("{} cannot wrap linear 'Lease<...>' inside its payload element type '{}'", owner_desc, elem),
+            ));
+            return;
+        }
+        if let Some(mmio) = ty_contains_byval_mmio(elem) {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::LinearLeaseViolation,
+                span,
+                format!("{} cannot store MMIO register layout '{}' by value", owner_desc, mmio),
+            ));
+            return;
+        }
+        if ty_embeds_os_primitive(elem) || ty_contains_byval_subsys(elem, &self.structs).is_some() {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::LinearLeaseViolation,
+                span,
+                format!("{} cannot embed OS primitives or subsystem structs inside element type '{}'", owner_desc, elem),
+            ));
+            return;
+        }
+        if elem.contains_reference(&self.structs) || elem.contains_fn_ptr(&self.structs) {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::LinearLeaseViolation,
+                span,
+                format!("{} requires a plain non-reference value type (no '*T', '[]T', or 'fn(...)' fields in '{}')", owner_desc, elem),
+            ));
+        }
+    }
+
+    fn check_disallowed_lease_type(
+        &mut self,
+        ty: &Ty,
+        span: Span,
+        ctx: &str,
+        allow_top_level_lease: bool,
+    ) {
+        match ty {
+            Ty::Lease(elem) => {
+                if !allow_top_level_lease {
+                    self.emit(Diagnostic::new(
+                        DiagnosticKind::LinearLeaseViolation,
+                        span,
+                        format!(
+                            "linear type '{}' is not allowed in {} (only permitted as locals, `fn` params/returns, `inbox<Lease<T>, N>`, `*inbox<Lease<T>>`, and managed via `dma_slot<T>`)",
+                            ty, ctx
+                        ),
+                    ));
+                } else {
+                    self.validate_pool_slot_elem(elem, span, "Lease<T>");
+                }
+            }
+            Ty::OsPrimitive(
+                ResolvedOsPrimitive::Inbox { elem, .. }
+                | ResolvedOsPrimitive::InboxUnsized { elem },
+            ) => {
+                if let Ty::Lease(inner) = &**elem {
+                    self.validate_pool_slot_elem(inner, span, "Lease<T>");
+                } else {
+                    self.check_disallowed_lease_type(elem, span, ctx, false);
+                }
+            }
+            Ty::OsPrimitive(os) => {
+                if let Some(elem) = os.elem_ty() {
+                    self.check_disallowed_lease_type(elem, span, ctx, false);
+                }
+            }
+            Ty::Ptr(inner) => match &**inner {
+                Ty::OsPrimitive(
+                    ResolvedOsPrimitive::Inbox { .. }
+                    | ResolvedOsPrimitive::InboxUnsized { .. }
+                    | ResolvedOsPrimitive::Pool { .. }
+                    | ResolvedOsPrimitive::DmaSlot { .. },
+                ) => {
+                    self.check_disallowed_lease_type(inner, span, ctx, false);
+                }
+                _ => self.check_disallowed_lease_type(inner, span, ctx, false),
+            },
+            Ty::Array { elem, .. } | Ty::Slice(elem) => {
+                self.check_disallowed_lease_type(elem, span, ctx, false);
+            }
+            Ty::FnPtr { params, ret } => {
+                for p in params {
+                    self.check_disallowed_lease_type(p, span, ctx, false);
+                }
+                self.check_disallowed_lease_type(ret, span, ctx, false);
+            }
+            _ => {}
+        }
+    }
     fn check_extern_c_access(&mut self, prog_idx: usize, ident: &Ident) {
         if self.program_extern_c_scopes.is_empty()
             || !self.non_root_extern_c_names.contains(&ident.name)

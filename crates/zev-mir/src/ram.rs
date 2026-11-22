@@ -511,6 +511,7 @@ impl<'a> LayoutCtx<'a> {
             | MirType::FnPtr { .. } => {
                 SizeAlign::new(ptr, ptr)
             }
+            MirType::Lease(_) => SizeAlign::new(ptr * 3, ptr),
             MirType::EndianInt { bits, .. } => {
                 let bytes = (*bits as usize) / 8;
                 // Wire-endian wrapper `struct { uint8_t b[N]; }` has byte alignment 1!
@@ -522,7 +523,10 @@ impl<'a> LayoutCtx<'a> {
                     let fl: Vec<SizeAlign> = st
                         .fields
                         .iter()
-                        .map(|f| self.type_layout(&f.ty, abi))
+                        .map(|f| match &f.ty {
+                            MirType::Primitive(pk) => self.prim_layout(pk, f.dma_safe, abi),
+                            other => self.type_layout(other, abi),
+                        })
                         .collect();
                     self.struct_layout(&fl, st.packed)
                 } else {
@@ -615,15 +619,35 @@ impl<'a> LayoutCtx<'a> {
                     false,
                 )
             }
-            MirPrimKind::Lease { elem, cap } => {
-                // `{ T buf[N]; syn_task_t *waiter; uint32_t sleep_lock_bit; uint16_t len; bool leased, ready; }`
+            MirPrimKind::Pool { elem, cap } => {
+                // Header `{ u32 free_mask; u32 full_mask; ptr waiters; u8 dma_safe; u8 cap; }`
+                let hdr = self.struct_layout(
+                    &[
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(ptr, ptr),
+                        SizeAlign::new(1, 1),
+                        SizeAlign::new(1, 1),
+                    ],
+                    false,
+                );
                 let el = self.type_layout(elem, abi);
+                let elem_sz = el.size.max(1);
+                let elem_al = el.align.max(1);
+                if dma_safe {
+                    let slot_al = elem_al.max(32);
+                    let slot_stride = align_up(elem_sz, slot_al);
+                    let hdr_aligned = align_up(hdr.size, slot_al);
+                    return SizeAlign::new(hdr_aligned + slot_stride * *cap, slot_al);
+                }
+                self.struct_layout(&[hdr, SizeAlign::new(elem_sz * *cap, elem_al)], false)
+            }
+            MirPrimKind::DmaSlot { .. } => {
+                // `{ ptr data; ptr pool_hdr; u8 slot_idx; u8 occupied; }`
                 self.struct_layout(
                     &[
-                        SizeAlign::new(el.size * cap, el.align),
                         SizeAlign::new(ptr, ptr),
-                        SizeAlign::new(4, 4),
-                        SizeAlign::new(2, 2),
+                        SizeAlign::new(ptr, ptr),
                         SizeAlign::new(1, 1),
                         SizeAlign::new(1, 1),
                     ],
@@ -682,14 +706,21 @@ fn scheduler_bytes(abi: TargetAbi) -> usize {
     }
 }
 
-fn struct_holds_dma_sleep_lock(name: &str, structs: &BTreeMap<&str, &MirStruct>) -> bool {
+fn struct_holds_dma_sleep_lock(
+    name: &str,
+    parent_dma_safe: bool,
+    structs: &BTreeMap<&str, &MirStruct>,
+) -> bool {
     let Some(st) = structs.get(name) else {
         return false;
     };
-    st.fields.iter().any(|f| match &f.ty {
-        MirType::Primitive(pk) => pk.holds_dma_sleep_lock(),
-        MirType::Struct(sub) => struct_holds_dma_sleep_lock(sub, structs),
-        _ => false,
+    st.fields.iter().any(|f| {
+        let field_dma_safe = parent_dma_safe || f.dma_safe;
+        match &f.ty {
+            MirType::Primitive(pk) => pk.holds_dma_sleep_lock(field_dma_safe),
+            MirType::Struct(sub) => struct_holds_dma_sleep_lock(sub, field_dma_safe, structs),
+            _ => false,
+        }
     })
 }
 
@@ -848,7 +879,7 @@ pub fn compute_ram_report_with_subsystems(
             name: p.name.clone(),
             kind_display: p.kind.display_name(),
             dma_safe: p.dma_safe,
-            holds_sleep_lock: p.kind.holds_dma_sleep_lock(),
+            holds_sleep_lock: p.kind.holds_dma_sleep_lock(p.dma_safe),
             dead_stripped: p.dead_stripped,
             irq_mask_elided: p.irq_mask_elided,
             bytes_32: s32,
@@ -873,7 +904,7 @@ pub fn compute_ram_report_with_subsystems(
             name: sub.name.clone(),
             kind_display: sub.struct_name.clone(),
             dma_safe: sub.dma_safe,
-            holds_sleep_lock: struct_holds_dma_sleep_lock(&sub.struct_name, &ctx.structs),
+            holds_sleep_lock: struct_holds_dma_sleep_lock(&sub.struct_name, sub.dma_safe, &ctx.structs),
             dead_stripped: false,
             irq_mask_elided: false,
             bytes_32: s32,

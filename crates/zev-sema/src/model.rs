@@ -378,8 +378,32 @@ impl SemanticModel {
         self.spawned_tasks.iter().any(|s| s.core.is_some())
     }
 
-    /// Returns `true` if any declared primitive requires DMA sleep-lock clamping (`ping_pong`, `lease`).
+    /// Returns `true` if any declared primitive or subsystem requires DMA sleep-lock clamping
+    /// (`ping_pong` or `@dma_safe pool`).
     pub fn has_dma_sleep_locks(&self) -> bool {
-        self.primitives.values().any(|p| p.clamps_sleep_depth)
+        if self.primitives.values().any(|p| p.clamps_sleep_depth) {
+            return true;
+        }
+        fn struct_has_dma_lock(
+            st_name: &str,
+            parent_dma: bool,
+            structs: &BTreeMap<String, StructInfo>,
+        ) -> bool {
+            let Some(st) = structs.get(st_name) else {
+                return false;
+            };
+            st.fields.iter().any(|f| {
+                let eff_dma = parent_dma || f.dma_safe;
+                match &f.ty {
+                    Ty::OsPrimitive(ResolvedOsPrimitive::PingPong { .. }) => true,
+                    Ty::OsPrimitive(ResolvedOsPrimitive::Pool { .. }) => eff_dma,
+                    Ty::Struct(inner) => struct_has_dma_lock(inner, eff_dma, structs),
+                    _ => false,
+                }
+            })
+        }
+        self.subsystems
+            .values()
+            .any(|sub| struct_has_dma_lock(&sub.struct_name, sub.dma_safe, &self.structs))
     }
 }

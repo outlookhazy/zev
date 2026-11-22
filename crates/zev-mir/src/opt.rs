@@ -76,8 +76,18 @@ impl VisibilityReport {
             MirPrimKind::Inbox { elem, .. } => self.isr_contended_prim_mangles.contains(
                 &MirPrimViewKind::Inbox { elem: elem.clone() }.mangle_name(),
             ),
+            MirPrimKind::Pool { elem, .. } => self
+                .isr_contended_prim_mangles
+                .contains(&format!("lease_release_{}", elem.mangle_name())),
             _ => false,
         }
+    }
+
+    /// True if any ISR can touch a `pool<T, K>` or `Lease<T>` (used for shared `__syn_pool_release` IRQ elision).
+    pub fn any_pool_or_lease_contended(&self) -> bool {
+        self.isr_contended_prim_mangles
+            .iter()
+            .any(|m| m.starts_with("pool_") || m.starts_with("lease_release_"))
     }
 
     /// True if `*inbox<elem>` views may alias an ISR-contended `inbox<elem, N>`.
@@ -154,7 +164,12 @@ fn type_size_align(
                 let fl: Vec<(usize, usize)> = st
                     .fields
                     .iter()
-                    .map(|f| type_size_align(&f.ty, ptr_bytes, structs, seen_structs))
+                    .map(|f| match &f.ty {
+                        MirType::Primitive(pk) => {
+                            watch_or_prim_size_align(pk, f.dma_safe, ptr_bytes, structs, seen_structs)
+                        }
+                        other => type_size_align(other, ptr_bytes, structs, seen_structs),
+                    })
                     .collect();
                 seen_structs.remove(name.as_str());
                 struct_size_align(&fl, st.packed)
@@ -163,6 +178,7 @@ fn type_size_align(
             }
         }
         MirType::Slice(_) => (ptr_bytes * 2, ptr_bytes),
+        MirType::Lease(_) => (ptr_bytes * 3, ptr_bytes),
         MirType::Array { elem, len } => {
             let (sz, al) = type_size_align(elem, ptr_bytes, structs, seen_structs);
             (sz * len, al)
@@ -229,20 +245,26 @@ fn watch_or_prim_size_align(
                 false,
             )
         }
-        MirPrimKind::Lease { elem, cap } => {
-            let el = type_size_align(elem, ptr_bytes, structs, seen_structs);
-            struct_size_align(
-                &[
-                    (el.0 * cap, el.1),
-                    (ptr_bytes, ptr_bytes),
-                    (4, 4),
-                    (2, 2),
-                    (1, 1),
-                    (1, 1),
-                ],
+        MirPrimKind::Pool { elem, cap } => {
+            let hdr = struct_size_align(
+                &[(4, 4), (4, 4), (ptr_bytes, ptr_bytes), (1, 1), (1, 1)],
                 false,
-            )
+            );
+            let el = type_size_align(elem, ptr_bytes, structs, seen_structs);
+            let elem_sz = el.0.max(1);
+            let elem_al = el.1.max(1);
+            if dma_safe {
+                let slot_al = elem_al.max(32);
+                let slot_stride = align_up(elem_sz, slot_al);
+                let hdr_aligned = align_up(hdr.0, slot_al);
+                return (hdr_aligned + slot_stride * *cap, slot_al);
+            }
+            struct_size_align(&[hdr, (elem_sz * *cap, elem_al)], false)
         }
+        MirPrimKind::DmaSlot { .. } => struct_size_align(
+            &[(ptr_bytes, ptr_bytes), (ptr_bytes, ptr_bytes), (1, 1), (1, 1)],
+            false,
+        ),
         MirPrimKind::ByteRing { cap } => struct_size_align(
             &[
                 (*cap, 1),
@@ -330,7 +352,15 @@ impl<'a> ScanCtx<'a> {
             MirType::PrimView(vk) => {
                 self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
             }
-            MirType::Ptr(inner) | MirType::Slice(inner) | MirType::Array { elem: inner, .. } => {
+            MirType::Ptr(inner)
+            | MirType::Slice(inner)
+            | MirType::Array { elem: inner, .. } => {
+                self.record_prim_types_in_ty(inner, seen_structs);
+            }
+            MirType::Lease(inner) => {
+                self.acc
+                    .isr_contended_prim_mangles
+                    .insert(format!("lease_release_{}", inner.mangle_name()));
                 self.record_prim_types_in_ty(inner, seen_structs);
             }
             MirType::FnPtr { params, ret } => {
@@ -383,6 +413,23 @@ impl<'a> ScanCtx<'a> {
         in_isr: bool,
         callees: &mut BTreeSet<String>,
     ) {
+        if in_isr {
+            match kind {
+                MirPrimKind::DmaSlot { elem } => {
+                    self.acc
+                        .isr_contended_prim_mangles
+                        .insert(format!("lease_release_{}", elem.mangle_name()));
+                }
+                MirPrimKind::Inbox { elem, .. } => {
+                    if let MirType::Lease(inner) = elem.as_ref() {
+                        self.acc
+                            .isr_contended_prim_mangles
+                            .insert(format!("lease_release_{}", inner.mangle_name()));
+                    }
+                }
+                _ => {}
+            }
+        }
         match target {
             MirPrimTarget::Global(name) => {
                 if in_isr {
@@ -481,7 +528,9 @@ impl<'a> ScanCtx<'a> {
             | MirExprKind::Cast { expr: inner, .. }
             | MirExprKind::FieldAccess { base: inner, .. }
             | MirExprKind::SliceLen(inner)
-            | MirExprKind::FromBytes { slice: inner, .. } => {
+            | MirExprKind::FromBytes { slice: inner, .. }
+            | MirExprKind::LeaseGet { lease: inner, .. }
+            | MirExprKind::LeaseAddr { lease: inner, .. } => {
                 self.visit_expr(inner, in_isr, callees);
             }
             MirExprKind::AddrOfPlace(place) | MirExprKind::ArrayToSlice { array_place: place, .. } => {
@@ -634,6 +683,11 @@ impl<'a> ScanCtx<'a> {
                             elem: Box::new(elem_ty.clone()),
                         };
                         self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                        if let MirType::Lease(inner) = elem_ty {
+                            self.acc
+                                .isr_contended_prim_mangles
+                                .insert(format!("lease_release_{}", inner.mangle_name()));
+                        }
                     }
                     self.visit_expr(view, in_isr, callees);
                 }
@@ -648,6 +702,11 @@ impl<'a> ScanCtx<'a> {
                             elem: Box::new(elem_ty.clone()),
                         };
                         self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                        if let MirType::Lease(inner) = elem_ty {
+                            self.acc
+                                .isr_contended_prim_mangles
+                                .insert(format!("lease_release_{}", inner.mangle_name()));
+                        }
                     }
                     self.visit_expr(view, in_isr, callees);
                     self.visit_expr(value, in_isr, callees);
@@ -693,6 +752,60 @@ impl<'a> ScanCtx<'a> {
                             .insert(MirPrimViewKind::ByteRing.mangle_name());
                     }
                     self.visit_expr(view, in_isr, callees);
+                }
+                MirPrimReadOp::PoolTryAlloc {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolAvail {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolInUse {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolIsExhausted {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PoolCap {
+                    target,
+                    elem_ty,
+                    cap,
+                } => {
+                    let kind = MirPrimKind::Pool {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    };
+                    self.visit_prim_target(target, &kind, in_isr, callees);
+                }
+                MirPrimReadOp::DmaSlotPark {
+                    target,
+                    elem_ty,
+                    lease,
+                } => {
+                    let kind = MirPrimKind::DmaSlot {
+                        elem: Box::new(elem_ty.clone()),
+                    };
+                    self.visit_prim_target(target, &kind, in_isr, callees);
+                    self.visit_expr(lease, in_isr, callees);
+                }
+                MirPrimReadOp::DmaSlotTake { target, elem_ty }
+                | MirPrimReadOp::DmaSlotRelease {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::DmaSlotIsBusy { target, elem_ty }
+                | MirPrimReadOp::DmaSlotIsEmpty { target, elem_ty }
+                | MirPrimReadOp::DmaSlotAddr { target, elem_ty } => {
+                    let kind = MirPrimKind::DmaSlot {
+                        elem: Box::new(elem_ty.clone()),
+                    };
+                    self.visit_prim_target(target, &kind, in_isr, callees);
                 }
             },
         }
@@ -751,23 +864,15 @@ impl<'a> ScanCtx<'a> {
                 };
                 self.visit_prim_target(target, &kind, in_isr, callees);
             }
-            MirPrimNonBlockingOp::LeaseComplete {
-                target,
-                elem_ty,
-                cap,
+            MirPrimNonBlockingOp::LeaseRelease { value, elem_ty, .. } => {
+                if in_isr {
+                    self.acc
+                        .isr_contended_prim_mangles
+                        .insert(format!("lease_release_{}", elem_ty.mangle_name()));
+                }
+                self.visit_expr(value, in_isr, callees);
             }
-            | MirPrimNonBlockingOp::LeaseSetActive {
-                target,
-                elem_ty,
-                cap,
-                ..
-            } => {
-                let kind = MirPrimKind::Lease {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                self.visit_prim_target(target, &kind, in_isr, callees);
-            }
+            MirPrimNonBlockingOp::LeaseNullify { .. } => {}
             MirPrimNonBlockingOp::ByteRingConsume { target, cap, len }
             | MirPrimNonBlockingOp::ByteRingCommitWrite {
                 target, cap, len, ..
@@ -791,6 +896,11 @@ impl<'a> ScanCtx<'a> {
                         elem: Box::new(elem_ty.clone()),
                     };
                     self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                    if let MirType::Lease(inner) = elem_ty {
+                        self.acc
+                            .isr_contended_prim_mangles
+                            .insert(format!("lease_release_{}", inner.mangle_name()));
+                    }
                 }
                 self.visit_expr(view, in_isr, callees);
                 self.visit_expr(value, in_isr, callees);
@@ -981,13 +1091,13 @@ impl<'a> ScanCtx<'a> {
                     };
                     self.visit_prim_target(target, &kind, in_isr, callees);
                 }
-                MirYieldKind::LeaseWaitChunk {
+                MirYieldKind::PoolAlloc {
                     target,
                     elem_ty,
                     cap,
                     ..
                 } => {
-                    let kind = MirPrimKind::Lease {
+                    let kind = MirPrimKind::Pool {
                         elem: Box::new(elem_ty.clone()),
                         cap: *cap,
                     };
@@ -2234,10 +2344,12 @@ mod tests {
                 MirField {
                     name: "a".to_string(),
                     ty: MirType::Usize,
+                    dma_safe: false,
                 },
                 MirField {
                     name: "b".to_string(),
                     ty: MirType::U8,
+                    dma_safe: false,
                 },
             ],
         });

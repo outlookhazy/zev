@@ -616,6 +616,18 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn trap_p0013(&self, span: Span) -> ParseError {
+        self.err_at(
+            "`lease<T, N>` has been retired; use `@dma_safe pool<T, K>` with move-only `Lease<T>` and `dma_slot<T>` (or `@dma_safe ping_pong<T, N>`)",
+            span,
+        )
+        .with_code("P0013")
+        .with_doc_topic("dma")
+        .with_hint(
+            "replace `lease<T, N> name;` with `@dma_safe pool<[N]T, K> name;` + `Lease<[N]T>` + `dma_slot<[N]T>`, or `@dma_safe ping_pong<T, N> name;`",
+        )
+    }
+
     fn trap_p0009_lifetime(&self, lt: &str, span: Span) -> ParseError {
         self.err_at(
             format!(
@@ -1050,16 +1062,17 @@ impl<'a> Parser<'a> {
         let mut fields = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
             let f_start = self.peek_span();
+            let f_attrs = self.parse_attrs()?;
             if self.at(&TokenKind::KwPub) {
                 return Err(self
                     .err_at(
                         "`pub` visibility modifier is not allowed on struct fields",
-                        f_start,
+                        self.peek_span(),
                     )
                     .with_doc_topic("syntax"));
             }
             if self.at(&TokenKind::KwStatic) {
-                return Err(self.trap_p0010(f_start));
+                return Err(self.trap_p0010(self.peek_span()));
             }
             let (ty, field_name) = self.parse_field_or_param("struct field")?;
             let f_end = if self.eat(&TokenKind::Semi) || self.eat(&TokenKind::Comma) {
@@ -1075,6 +1088,7 @@ impl<'a> Parser<'a> {
                     .with_doc_topic("syntax"));
             };
             fields.push(StructField {
+                attrs: f_attrs,
                 ty,
                 name: field_name,
                 span: f_start.merge(f_end),
@@ -2064,7 +2078,44 @@ impl<'a> Parser<'a> {
                             )
                         }
                     }
-                    "ping_pong" | "lease"
+                    "lease" if self.peek_n_kind(1) == TokenKind::Lt => {
+                        // Trap retired `lease<T, N>` with `P0013` -> `@dma_safe pool<T, K>` + `Lease<T>` + `dma_slot<T>`.
+                        self.bump(); // `lease`
+                        let lt_tok = self.expect(&TokenKind::Lt)?;
+                        let mut end_span = lt_tok.span;
+                        let mut depth = 1usize;
+                        while depth > 0 && !self.at(&TokenKind::Eof) && !self.at(&TokenKind::Semi) {
+                            let tok = self.bump();
+                            end_span = tok.span;
+                            match tok.kind {
+                                TokenKind::Lt => depth += 1,
+                                TokenKind::Gt => depth = depth.saturating_sub(1),
+                                TokenKind::Shr => depth = depth.saturating_sub(2),
+                                _ => {}
+                            }
+                        }
+                        return Err(self.trap_p0013(start.merge(end_span)));
+                    }
+                    "dma_slot" if self.peek_n_kind(1) == TokenKind::Lt => {
+                        self.bump();
+                        self.expect(&TokenKind::Lt)?;
+                        let elem = self.parse_type()?;
+                        let gt_span = self.expect_type_gt()?;
+                        TypeExpr::new(
+                            TypeKind::OsPrimitive(OsPrimitiveType::DmaSlot {
+                                elem: Box::new(elem),
+                            }),
+                            start.merge(gt_span),
+                        )
+                    }
+                    "Lease" if self.peek_n_kind(1) == TokenKind::Lt => {
+                        self.bump();
+                        self.expect(&TokenKind::Lt)?;
+                        let elem = self.parse_type()?;
+                        let gt_span = self.expect_type_gt()?;
+                        TypeExpr::new(TypeKind::Lease(Box::new(elem)), start.merge(gt_span))
+                    }
+                    "ping_pong" | "pool"
                         if self.peek_n_kind(1) == TokenKind::Lt =>
                     {
                         self.bump();
@@ -2078,7 +2129,7 @@ impl<'a> Parser<'a> {
                                 elem: Box::new(elem),
                                 cap,
                             },
-                            "lease" => OsPrimitiveType::Lease {
+                            "pool" => OsPrimitiveType::Pool {
                                 elem: Box::new(elem),
                                 cap,
                             },
@@ -2943,9 +2994,9 @@ impl<'a> Parser<'a> {
         let (ty, var_name) = match self.parse_typed_declarator("`for` loop binding") {
             Ok(pair) => pair,
             Err(e) => {
-                // Preserve specific type traps like `chan<...>` (`P0012`) or `&mut`/`'a` (`P0009`);
-                // map untyped / C-style `for (i = 0; ...)` or `for (let i ...)` to `P0008`.
-                if matches!(e.code, Some("P0009" | "P0012")) {
+                // Preserve specific type traps like `chan<...>` (`P0012`), `lease<...>` (`P0013`),
+                // or `&mut`/`'a` (`P0009`); map untyped / C-style `for (i = 0; ...)` or `for (let i ...)` to `P0008`.
+                if matches!(e.code, Some("P0009" | "P0012" | "P0013")) {
                     return Err(e);
                 }
                 return Err(self.trap_p0008(start.merge(self.peek_span())));

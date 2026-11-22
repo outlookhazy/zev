@@ -486,7 +486,7 @@ fn allow_local_struct_wrapping_and_downward_calls_for_dma_slices() {
         }
 
         @dma_safe ping_pong<u8, 64> rx_dma;
-        @dma_safe lease<u8, 32>      spi_lease;
+        @dma_safe pool<[32]u8, 4>   spi_pool;
 
         u8 peek_first(ByteReader *r) {
             if (r.buf.len == 0) {
@@ -514,8 +514,10 @@ fn allow_local_struct_wrapping_and_downward_calls_for_dma_slices() {
                 half = rx_dma.wait_chunk();
                 u8 b2 = half[0];
 
-                []u8 spi_buf = spi_lease.wait_chunk();
-                u8 s0 = spi_buf[0];
+                Lease<[32]u8> spi_l = spi_pool.alloc();
+                defer spi_l.release();
+                *[32]u8 spi_buf = spi_l.get();
+                u8 s0 = (*spi_buf)[0];
             }
         }
 
@@ -715,7 +717,7 @@ fn reject_reading_stale_dma_slice_or_wrapper_after_second_wait_chunk() {
     // Conditional branch `wait_chunk()` invalidating outer lease
     expect_err_kind(
         r#"
-        @dma_safe lease<u8, 32> dma_lease;
+        @dma_safe ping_pong<u8, 32> dma_lease;
 
         fn bad_branch_invalidation(bool flag) {
             []u8 buf = dma_lease.wait_chunk();
@@ -1075,8 +1077,8 @@ fn check_cortex_m_and_esp32c6_examples_clean() {
 }
 
 #[test]
-fn doc_topic_and_doc_command_cover_all_e0001_through_e0033() {
-    assert_eq!(DiagnosticKind::ALL.len(), 33);
+fn doc_topic_and_doc_command_cover_all_e0001_through_e0034() {
+    assert_eq!(DiagnosticKind::ALL.len(), 34);
 
     let expected_topics = [
         ("E0001", "primitives"),
@@ -1112,6 +1114,7 @@ fn doc_topic_and_doc_command_cover_all_e0001_through_e0033() {
         ("E0031", "runtime"),
         ("E0032", "runtime"),
         ("E0033", "yielding"),
+        ("E0034", "dma"),
     ];
 
     for (kind, (code, topic)) in DiagnosticKind::ALL.iter().zip(expected_topics.iter()) {
@@ -4843,6 +4846,288 @@ fn main() {
 "#;
     expect_err_kind(bad_unhandled, DiagnosticKind::UnhandledFallibleExpr);
 }
+
+#[test]
+fn verifies_pool_dma_slot_linear_lease_methods_and_view_bundle_generics() {
+    let good = r#"
+struct Frame {
+    [16]u8 data;
+    u16 len;
+}
+
+struct SpiBus {
+    @dma_safe pool<Frame, 8> tx_pool;
+    dma_slot<Frame> tx_slot;
+    inbox<Lease<Frame>, 4> done_q;
+}
+
+struct DuplexStream {
+    *byte_ring rx;
+    *byte_ring tx;
+}
+
+struct StatusCell<T> {
+    *watch<T> state;
+}
+
+fn publish_cell<T>(*StatusCell<T> cell, T val) {
+    cell.state.publish(val);
+}
+
+T read_cell<T>(*StatusCell<T> cell) {
+    return cell.state.read();
+}
+
+Lease<T> alloc_from<T>(*pool<T, 8> p) {
+    return p.alloc();
+}
+
+fn release_with_defer(*pool<Frame, 8> p, *dma_slot<Frame> slot, *inbox<Lease<Frame>> q) error {
+    Lease<Frame> l1 = p.try_alloc() catch {
+        error;
+    };
+    defer l1.release();
+    *Frame fp = l1.get();
+    fp.len = 4;
+    usize a = l1.addr();
+    let_noop(a);
+
+    Lease<Frame> l2 = p.alloc(timeout: 5ms) catch {
+        return;
+    };
+    slot.park(l2) catch {
+        return;
+    };
+    Lease<Frame> l3 = slot.take() catch {
+        return;
+    };
+    q.post(l3);
+    Lease<Frame> l4 = q.recv();
+    l4.release(boost: @high);
+    // Reassigning after move is permitted:
+    l4 = p.alloc();
+    if (l4.addr() != 0) {
+        l4.release();
+    } else {
+        slot.park(l4) catch {};
+    }
+}
+
+fn let_noop(usize x) {}
+
+irq IRQ_SPI = 12;
+SpiBus bus;
+@dma_safe pool<Frame, 4> aux_pool;
+watch<u32> g_state = 0;
+byte_ring<16> g_rx;
+byte_ring<16> g_tx;
+
+isr spi_isr(*SpiBus b, *pool<Frame, 4> aux) {
+    bool did = b.tx_slot.release(boost: @critical);
+    if (did) {
+        Lease<Frame> extra = aux.try_alloc() catch { return; };
+        extra.release(boost: @high);
+    }
+}
+
+task worker(*pool<Frame, 8> p, *dma_slot<Frame> slot, *inbox<Lease<Frame>> q) {
+    StatusCell<u32> cell = StatusCell { state: &g_state };
+    DuplexStream ds = DuplexStream { rx: &g_rx, tx: &g_tx };
+    loop {
+        publish_cell(&cell, 77);
+        u32 cur = read_cell(&cell);
+        []u8 rbuf = ds.rx.read_slice();
+        if (rbuf.len > 0) {
+            usize written = ds.tx.push(rbuf);
+            ds.rx.consume(rbuf.len);
+        }
+        Lease<Frame> f = alloc_from(p);
+        usize av = p.avail();
+        usize used = p.in_use();
+        usize cap = p.cap();
+        bool ex = p.is_exhausted();
+        bool busy = slot.is_busy();
+        bool emp = slot.is_empty();
+        usize saddr = slot.addr();
+        if (cur == 0 && av == 0 && used == 0 && cap == 0 && ex && busy && emp && saddr == 0) {
+            f.release();
+            continue;
+        }
+        release_with_defer(p, slot, q) catch {};
+        f.release();
+    }
+}
+
+fn main() {
+    IRQ_SPI.attach(spi_isr(&bus, &aux_pool));
+    spawn worker(&bus.tx_pool, &bus.tx_slot, &bus.done_q) @normal;
+}
+"#;
+    let model = expect_ok(good);
+    assert!(model.has_dma_sleep_locks());
+    assert!(model.primitives["aux_pool"].clamps_sleep_depth);
+    assert!(model.structs["SpiBus"].is_subsystem);
+    assert!(model.structs["SpiBus"].field("tx_pool").unwrap().dma_safe);
+}
+
+#[test]
+fn rejects_e0034_linear_lease_violations_and_e0011_stale_get() {
+    // 1. Unconsumed lease at scope / fn exit -> E0034
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn main() {
+            Lease<u8> l = p.alloc();
+        }
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+
+    // 2. Unused expression statement -> E0034
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn main() {
+            p.alloc();
+        }
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+
+    // 3. Use after move (.release / slot.park catch / inbox.post / double fn arg) -> E0034
+    for bad in [
+        "pool<u8, 4> p; fn main() { Lease<u8> l = p.alloc(); l.release(); usize a = l.addr(); }",
+        "pool<u8, 4> p; dma_slot<u8> s; fn main() { Lease<u8> l = p.alloc(); s.park(l) catch {}; l.release(); }",
+        "pool<u8, 4> p; inbox<Lease<u8>, 2> q; fn main() { Lease<u8> l = p.alloc(); q.post(l); *u8 ptr = l.get(); }",
+        "fn two(Lease<u8> a, Lease<u8> b) { a.release(); b.release(); } pool<u8, 4> p; fn main() { Lease<u8> l = p.alloc(); two(l, l); }",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::LinearLeaseViolation);
+    }
+
+    // 4. Overwriting Live or DeferredRelease variable -> E0034
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn main() {
+            Lease<u8> l = p.alloc();
+            l = p.alloc();
+            l.release();
+        }
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn main() {
+            Lease<u8> l = p.alloc();
+            defer l.release();
+            l = p.alloc();
+        }
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+
+    // 5. Double consume after defer -> E0034
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn main() {
+            Lease<u8> l = p.alloc();
+            defer l.release();
+            l.release();
+        }
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+
+    // 6. Branch mismatch across if/else and switch -> E0034
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn f(bool c) {
+            Lease<u8> l = p.alloc();
+            if (c) { l.release(); }
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn f(u8 k) {
+            Lease<u8> l = p.alloc();
+            switch (k) {
+                0 => { l.release(); }
+                _ => {}
+            }
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+
+    // 7. Moving outer live lease inside loop, or leaking on break/continue/return/error/sys.exit -> E0034
+    for bad in [
+        "pool<u8, 4> p; fn main() { Lease<u8> l = p.alloc(); for (usize i in 0..2) { l.release(); } }",
+        "pool<u8, 4> p; fn main() { for (usize i in 0..2) { Lease<u8> l = p.alloc(); if (i == 1) { break; } l.release(); } }",
+        "pool<u8, 4> p; fn f(bool b) error { Lease<u8> l = p.alloc(); if (b) { error; } l.release(); } fn main() {}",
+        "pool<u8, 4> p; fn main() { Lease<u8> l = p.alloc(); sys.exit(1); }",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::LinearLeaseViolation);
+    }
+
+    // 8. Disallowed pool bounds, element types, and Lease<T> placement -> E0034
+    for bad in [
+        "pool<u8, 0> p; fn main() {}",
+        "pool<u8, 33> p; fn main() {}",
+        "pool<*u8, 4> p; fn main() {}",
+        "pool<watch<u8>, 4> p; fn main() {}",
+        "dma_slot<[]u8> s; fn main() {}",
+        "struct Bad { Lease<u8> l; } fn main() {}",
+        "watch<Lease<u8>> w; fn main() {}",
+        "ping_pong<Lease<u8>, 4> pp; fn main() {}",
+        "pool<Lease<u8>, 4> p; fn main() {}",
+        "task bad_task(Lease<u8> l) { loop { l.release(); } } fn main() {}",
+        "irq IRQ0 = 1; isr bad_isr() { state u8 dummy = 0; } fn f(*Lease<u8> p) {} fn main() {}",
+        "fn main() { [2]Lease<u8> arr; }",
+        "fn main() { []Lease<u8> sl; }",
+        "pool<u8, 4> p; fn main() { Lease<u8> l = p.alloc(); *Lease<u8> ptr = &l; l.release(); }",
+        "enum E { Fail } pool<u8, 4> p; Lease<u8> f() error E { Lease<u8> l = p.alloc(); error E.Fail, l; } fn main() {}",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::LinearLeaseViolation);
+    }
+
+    // 9. E0011 (StaleDmaLease) when dereferencing/reading `*T` from `Lease.get()` after `.release()` or move
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        fn main() {
+            Lease<u8> l = p.alloc();
+            *u8 ptr = l.get();
+            l.release();
+            u8 v = *ptr;
+        }
+        "#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 10. E0009 (ReturnLocalReference) when returning `l.get()` pointer from a function
+    expect_err_kind(
+        r#"
+        pool<u8, 4> p;
+        *u8 bad_ret() {
+            Lease<u8> l = p.alloc();
+            defer l.release();
+            return l.get();
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::ReturnLocalReference,
+    );
+}
+
 
 
 

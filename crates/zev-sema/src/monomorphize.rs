@@ -375,6 +375,7 @@ impl<'a> Monomorphizer<'a> {
                             .fields
                             .iter()
                             .map(|f| StructField {
+                                attrs: f.attrs.clone(),
                                 ty: self.rewrite_type_expr(&f.ty, &env),
                                 name: f.name.clone(),
                                 span: f.span,
@@ -1185,6 +1186,7 @@ impl<'a> Monomorphizer<'a> {
             }
             TypeKind::Ptr(inner) => TypeKind::Ptr(Box::new(self.rewrite_type_expr(inner, env))),
             TypeKind::OsPrimitive(os) => TypeKind::OsPrimitive(self.rewrite_os_prim_type(os, env)),
+            TypeKind::Lease(inner) => TypeKind::Lease(Box::new(self.rewrite_type_expr(inner, env))),
             TypeKind::FnPtr { params, ret } => TypeKind::FnPtr {
                 params: params.iter().map(|p| self.rewrite_type_expr(p, env)).collect(),
                 ret: Box::new(self.rewrite_type_expr(ret, env)),
@@ -1210,9 +1212,12 @@ impl<'a> Monomorphizer<'a> {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
                 cap: *cap,
             },
-            OsPrimitiveType::Lease { elem, cap } => OsPrimitiveType::Lease {
+            OsPrimitiveType::Pool { elem, cap } => OsPrimitiveType::Pool {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
                 cap: *cap,
+            },
+            OsPrimitiveType::DmaSlot { elem } => OsPrimitiveType::DmaSlot {
+                elem: Box::new(self.rewrite_type_expr(elem, env)),
             },
             OsPrimitiveType::ByteRing { cap } => OsPrimitiveType::ByteRing { cap: *cap },
             OsPrimitiveType::ByteRingUnsized => OsPrimitiveType::ByteRingUnsized,
@@ -1246,6 +1251,9 @@ impl<'a> Monomorphizer<'a> {
                     .join("_D")
             }
             TypeKind::Ptr(inner) => format!("_P{}", self.format_mangled_type(inner)),
+            TypeKind::Lease(inner) => {
+                format!("_GLease_L_{}_R_", self.format_mangled_type(inner))
+            }
             TypeKind::Slice(inner) => format!("_S{}", self.format_mangled_type(inner)),
             TypeKind::Array { elem, len } => {
                 let n = len.as_fixed().unwrap_or(0);
@@ -1269,8 +1277,11 @@ impl<'a> Monomorphizer<'a> {
                         cap
                     )
                 }
-                OsPrimitiveType::Lease { elem, cap } => {
-                    format!("_Glease_L_{}__{}_R_", self.format_mangled_type(elem), cap)
+                OsPrimitiveType::Pool { elem, cap } => {
+                    format!("_Gpool_L_{}__{}_R_", self.format_mangled_type(elem), cap)
+                }
+                OsPrimitiveType::DmaSlot { elem } => {
+                    format!("_Gdma_0slot_L_{}_R_", self.format_mangled_type(elem))
                 }
                 OsPrimitiveType::ByteRing { cap } => {
                     format!("_Gbyte_0ring_L_{}_R_", cap)
@@ -1323,6 +1334,7 @@ impl<'a> Monomorphizer<'a> {
                 format!("[{}]{}", n, self.format_human_type(elem))
             }
             TypeKind::Ptr(inner) => format!("*{}", self.format_human_type(inner)),
+            TypeKind::Lease(inner) => format!("Lease<{}>", self.format_human_type(inner)),
             TypeKind::OsPrimitive(os) => match os {
                 OsPrimitiveType::Signal => "signal".to_string(),
                 OsPrimitiveType::Watch { elem } => {
@@ -1337,8 +1349,11 @@ impl<'a> Monomorphizer<'a> {
                 OsPrimitiveType::PingPong { elem, cap } => {
                     format!("ping_pong<{}, {}>", self.format_human_type(elem), cap)
                 }
-                OsPrimitiveType::Lease { elem, cap } => {
-                    format!("lease<{}, {}>", self.format_human_type(elem), cap)
+                OsPrimitiveType::Pool { elem, cap } => {
+                    format!("pool<{}, {}>", self.format_human_type(elem), cap)
+                }
+                OsPrimitiveType::DmaSlot { elem } => {
+                    format!("dma_slot<{}>", self.format_human_type(elem))
                 }
                 OsPrimitiveType::ByteRing { cap } => {
                     format!("byte_ring<{}>", cap)
@@ -1466,6 +1481,7 @@ impl<'a> Monomorphizer<'a> {
         let mut fields = Vec::with_capacity(tmpl.decl.fields.len());
         for f in &tmpl.decl.fields {
             fields.push(StructField {
+                attrs: f.attrs.clone(),
                 ty: self.rewrite_type_expr(&f.ty, &child_env),
                 name: f.name.clone(),
                 span: f.span,
@@ -2437,12 +2453,41 @@ impl<'a> Monomorphizer<'a> {
                                 ));
                             }
                             (
-                                OsPrimitiveType::PingPong { elem, .. }
-                                | OsPrimitiveType::Lease { elem, .. },
+                                OsPrimitiveType::PingPong { elem, .. },
                                 "wait_chunk" | "acquire" | "try_acquire" | "active_buf" | "dma_buf",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
                                     TypeKind::Slice(elem.clone()),
+                                    expr.span,
+                                ));
+                            }
+                            (
+                                OsPrimitiveType::Pool { elem, .. },
+                                "try_alloc" | "alloc",
+                            )
+                            | (OsPrimitiveType::DmaSlot { elem }, "take") => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Lease(elem.clone()),
+                                    expr.span,
+                                ));
+                            }
+                            (
+                                OsPrimitiveType::Pool { .. },
+                                "avail" | "in_use" | "cap",
+                            )
+                            | (OsPrimitiveType::DmaSlot { .. }, "addr") => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::Usize),
+                                    expr.span,
+                                ));
+                            }
+                            (OsPrimitiveType::Pool { .. }, "is_exhausted")
+                            | (
+                                OsPrimitiveType::DmaSlot { .. },
+                                "release" | "is_busy" | "is_empty",
+                            ) => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::Bool),
                                     expr.span,
                                 ));
                             }
@@ -2486,6 +2531,22 @@ impl<'a> Monomorphizer<'a> {
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
                                     TypeKind::Prim(PrimType::Bool),
+                                    expr.span,
+                                ));
+                            }
+                            _ => {}
+                        }
+                    } else if let TypeKind::Lease(elem) = &deref.kind {
+                        match method.name.as_str() {
+                            "get" => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Ptr(elem.clone()),
+                                    expr.span,
+                                ));
+                            }
+                            "addr" => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::Usize),
                                     expr.span,
                                 ));
                             }
@@ -3029,6 +3090,81 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
 
+            TypeKind::Lease(p_inner) => {
+                if let InferTy::Concrete(TypeExpr {
+                    kind: TypeKind::Lease(a_inner),
+                    ..
+                }) = actual
+                {
+                    self.unify_pattern(
+                        p_inner,
+                        &InferTy::Concrete((**a_inner).clone()),
+                        param_kinds,
+                        inferred_types,
+                        inferred_consts,
+                        conflict,
+                    );
+                }
+            }
+
+            TypeKind::OsPrimitive(p_os) => {
+                if let InferTy::Concrete(TypeExpr {
+                    kind: TypeKind::OsPrimitive(a_os),
+                    ..
+                }) = actual
+                {
+                    match (p_os, a_os) {
+                        (
+                            OsPrimitiveType::Watch { elem: pe },
+                            OsPrimitiveType::Watch { elem: ae },
+                        )
+                        | (
+                            OsPrimitiveType::DmaSlot { elem: pe },
+                            OsPrimitiveType::DmaSlot { elem: ae },
+                        )
+                        | (
+                            OsPrimitiveType::InboxUnsized { elem: pe },
+                            OsPrimitiveType::InboxUnsized { elem: ae },
+                        )
+                        | (
+                            OsPrimitiveType::InboxUnsized { elem: pe },
+                            OsPrimitiveType::Inbox { elem: ae, .. },
+                        ) => {
+                            self.unify_pattern(
+                                pe,
+                                &InferTy::Concrete((**ae).clone()),
+                                param_kinds,
+                                inferred_types,
+                                inferred_consts,
+                                conflict,
+                            );
+                        }
+                        (
+                            OsPrimitiveType::Inbox { elem: pe, cap: pc },
+                            OsPrimitiveType::Inbox { elem: ae, cap: ac },
+                        )
+                        | (
+                            OsPrimitiveType::PingPong { elem: pe, cap: pc },
+                            OsPrimitiveType::PingPong { elem: ae, cap: ac },
+                        )
+                        | (
+                            OsPrimitiveType::Pool { elem: pe, cap: pc },
+                            OsPrimitiveType::Pool { elem: ae, cap: ac },
+                        ) if pc == ac => {
+                            self.unify_pattern(
+                                pe,
+                                &InferTy::Concrete((**ae).clone()),
+                                param_kinds,
+                                inferred_types,
+                                inferred_consts,
+                                conflict,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
             TypeKind::Slice(p_elem) => {
                 if let InferTy::Concrete(TypeExpr { kind, .. }) = actual {
                     match kind {
@@ -3207,6 +3343,7 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             .collect::<Vec<_>>()
             .join("_D"),
         TypeKind::Ptr(inner) => format!("_P{}", mangle_type_expr(inner)),
+        TypeKind::Lease(inner) => format!("_GLease_L_{}_R_", mangle_type_expr(inner)),
         TypeKind::Slice(inner) => format!("_S{}", mangle_type_expr(inner)),
         TypeKind::Array { elem, len } => {
             let n = len.as_fixed().unwrap_or(0);
@@ -3224,8 +3361,11 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             OsPrimitiveType::PingPong { elem, cap } => {
                 format!("_Gping_0pong_L_{}__{}_R_", mangle_type_expr(elem), cap)
             }
-            OsPrimitiveType::Lease { elem, cap } => {
-                format!("_Glease_L_{}__{}_R_", mangle_type_expr(elem), cap)
+            OsPrimitiveType::Pool { elem, cap } => {
+                format!("_Gpool_L_{}__{}_R_", mangle_type_expr(elem), cap)
+            }
+            OsPrimitiveType::DmaSlot { elem } => {
+                format!("_Gdma_0slot_L_{}_R_", mangle_type_expr(elem))
             }
             OsPrimitiveType::ByteRing { cap } => {
                 format!("_Gbyte_0ring_L_{}_R_", cap)

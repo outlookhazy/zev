@@ -203,16 +203,19 @@ mod tests {
                 generic_params: vec![],
                 fields: vec![
                     StructField {
+                        attrs: vec![],
                         ty: ty_prim(PrimType::U8),
                         name: id("op"),
                         span: sp,
                     },
                     StructField {
+                        attrs: vec![],
                         ty: ty_prim(PrimType::U16Be),
                         name: id("setpoint"),
                         span: sp,
                     },
                     StructField {
+                        attrs: vec![],
                         ty: ty_prim(PrimType::U16Be),
                         name: id("crc"),
                         span: sp,
@@ -1735,8 +1738,10 @@ packed struct LeHeader {
 }
 
 signal ready_sig;
+signal slot_ready_sig;
 inbox<u32, 4> work_inbox;
-@dma_safe lease<u8, 16> spi_lease;
+@dma_safe pool<[16]u8, 2> spi_pool;
+dma_slot<[16]u8> spi_slot;
 watch<u32> result_watch = 0;
 
 task producer() {
@@ -1751,10 +1756,16 @@ task consumer() {
     loop {
         ready_sig.wait();
         u32 v = work_inbox.recv();
-        []u8 buf = spi_lease.wait_chunk();
-        LeHeader hdr = LeHeader.from_bytes(buf[0..7]) catch {
+        slot_ready_sig.wait();
+        Lease<[16]u8> l = spi_slot.take() catch {
             restart;
         };
+        [16]u8 frame = *l.get();
+        LeHeader hdr = LeHeader.from_bytes(frame[0..7]) catch {
+            l.release();
+            restart;
+        };
+        l.release();
         u32 total = v + (hdr.length as u32) + hdr.seq_num;
         result_watch.publish(total);
     }
@@ -1765,8 +1776,8 @@ fn main() {
     spawn consumer() @low;
 }
 "#;
-        let prog = zev_parser::parse_str(src).expect("parse signal/inbox/lease test");
-        let mir = zev_mir::lower_program(&prog).expect("lower signal/inbox/lease");
+        let prog = zev_parser::parse_str(src).expect("parse signal/inbox/pool test");
+        let mir = zev_mir::lower_program(&prog).expect("lower signal/inbox/pool");
         let c_code = emit_c(&mir);
 
         // Verify freestanding mode (-DSYN_FREESTANDING) compiles with zero warnings!
@@ -1795,34 +1806,40 @@ fn main() {
             String::from_utf8_lossy(&fs_out.stderr)
         );
 
-        let driver = r#"
-int main(void) {
+        let lease_res_ty = "syn_res_lease_arr_16_u8_err_bool_t";
+        let driver = format!(r#"
+int main(void) {{
     syn_boot_init();
     syn_sim_pump_ready();
 
-    /* Complete the SPI lease buffer with little-endian magic=0xA5, length=100 (0x0064 -> 64 00), seq_num=1000 (0x000003E8 -> E8 03 00 00) */
-    const uint8_t wire[7] = { 0xA5, 0x64, 0x00, 0xE8, 0x03, 0x00, 0x00 };
-    syn_lease_u8_16_set_active(&spi_lease, true);
-    if (syn_sim_allowed_sleep_depth() != (uint32_t)SYN_SLEEP_LIGHT) {
-        return 1;
-    }
-    memcpy(spi_lease.buf, wire, 7U);
-    spi_lease.len = 7U;
-    syn_lease_u8_16_complete(&spi_lease);
+    /* Complete an allocated DMA pool buffer with little-endian magic=0xA5, length=100 (0x0064 -> 64 00), seq_num=1000 (0x000003E8 -> E8 03 00 00) */
+    const uint8_t wire[7] = {{ 0xA5, 0x64, 0x00, 0xE8, 0x03, 0x00, 0x00 }};
+    {lease_res_ty} ar = syn_pool_arr_16_u8_2_try_alloc(&spi_pool);
+    if (ar.is_err) {{ return 1; }}
+    if (syn_sim_allowed_sleep_depth() != (uint32_t)SYN_SLEEP_LIGHT) {{
+        return 2;
+    }}
+    memcpy(ar.val.data->data, wire, 7U);
+    if (syn_dma_slot_arr_16_u8_park(&spi_slot, ar.val).is_err) {{
+        return 3;
+    }}
+    syn_signal_notify(&slot_ready_sig, SYN_NO_BOOST);
 
     syn_sim_pump_ready();
-    syn_lease_u8_16_set_active(&spi_lease, false);
 
-    /* 77 + 100 + 1000 = 1177 */
-    if (syn_watch_u32_read(&result_watch) != 1177U) {
+    /* 77 + 100 + 1000 = 1177, and releasing the lease restores DEEP sleep! */
+    if (syn_watch_u32_read(&result_watch) != 1177U) {{
         fprintf(stderr, "Expected 1177, got %u\n", syn_watch_u32_read(&result_watch));
-        return 2;
-    }
+        return 4;
+    }}
+    if (syn_sim_allowed_sleep_depth() != (uint32_t)SYN_SLEEP_DEEP) {{
+        return 5;
+    }}
     printf("PRIMS_AND_LE_OK\n");
     return 0;
-}
-"#;
-        let stdout = compile_and_run_clang_sanitized("prims_and_le", &c_code, Some(driver));
+}}
+"#);
+        let stdout = compile_and_run_clang_sanitized("prims_and_le", &c_code, Some(&driver));
         assert!(stdout.contains("PRIMS_AND_LE_OK"));
     }
 
@@ -4196,11 +4213,13 @@ int main(void) {
                     generic_params: vec![],
                     fields: vec![
                         StructField {
+                            attrs: vec![],
                             ty: ty_prim(PrimType::U32),
                             name: id("total"),
                             span: sp,
                         },
                         StructField {
+                            attrs: vec![],
                             ty: ty_prim(PrimType::U16),
                             name: id("hits"),
                             span: sp,
@@ -5159,9 +5178,17 @@ fn main() {
         src: &str,
     ) -> (zev_mir::MirModule, String, String) {
         let prog = zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {test_name}: {e:?}"));
-        zev_sema::analyze_program(&prog)
-            .unwrap_or_else(|e| panic!("sema {test_name}: {e:?}"));
-        let mir = lower_program(&prog).unwrap_or_else(|e| panic!("lower {test_name}: {e:?}"));
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, None)],
+            &zev_sema::AnalyzeOptions::default(),
+        );
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema {test_name}: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = zev_mir::lower_programs(&analyzed.programs)
+            .unwrap_or_else(|e| panic!("lower {test_name}: {e:?}"));
         let c_code = emit_c(&mir);
         assert_freestanding_compiles(test_name, &c_code);
         let stdout = compile_and_run_clang_sanitized(test_name, &c_code, None);
@@ -5471,6 +5498,273 @@ fn main() {
         assert!(
             stdout.contains("FMT_TRUNC partial=4 total_len=16"),
             "expected Truncated partial=4 filling remaining ring space:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn pool_lease_dma_slot_defer_recycle_sleep_clamp_and_isr_release_asan() {
+        let src = r#"
+struct Frame {
+    u32 id;
+    [20]u8 payload;
+}
+
+struct SubBus {
+    @dma_safe pool<u8, 2> dma_p;
+    pool<u8, 2> cpu_p;
+    dma_slot<u8> slot;
+}
+
+SubBus bus;
+@dma_safe pool<Frame, 2> dma_pool;
+dma_slot<Frame> tx_slot;
+inbox<Lease<Frame>, 1> pkt_q;
+signal done_sig;
+watch<u32> phase = 0;
+
+irq IRQ_TX = 3;
+
+isr tx_done_isr(*dma_slot<Frame> slot, *pool<Frame, 2> p, *watch<u32> out_avail) {
+    bool released = slot.release(boost: @high);
+    assert(released);
+    out_avail.publish(p.avail() as u32);
+}
+
+fn fill_and_send(*pool<Frame, 2> p, *inbox<Lease<Frame>> q, u32 id_val) {
+    Lease<Frame> l = p.try_alloc() catch { return; };
+    *Frame fp = l.get();
+    fp.id = id_val;
+    bool ok = q.try_send(l);
+    assert(!ok);
+}
+
+u32 defer_early(bool early) {
+    Lease<Frame> l = dma_pool.try_alloc() catch { return 0; };
+    defer l.release();
+    *Frame fp = l.get();
+    fp.id = 42;
+    if early {
+        return fp.id + 1;
+    }
+    return fp.id;
+}
+
+u32 alloc_timeout_exhausted() {
+    Lease<Frame> l = dma_pool.alloc(timeout: 1ms) catch {
+        return 99;
+    };
+    l.release();
+    return 0;
+}
+
+task waiter_task() {
+    phase.publish(1);
+    // All 2 slots are occupied -> this blocks until ISR releases tx_slot!
+    Lease<Frame> l = dma_pool.alloc();
+    assert(sys.current_prio() == 1);
+    *Frame fp = l.get();
+    u32 got = fp.id;
+    l.release();
+    println(f"ALLOC_WOKE id={got} depth={sys.sleep_depth()}");
+    done_sig.notify();
+
+    // Wait then drain two queued leases sent via blocking `pkt_q.send(...)`
+    sys.delay(2ms);
+    Lease<Frame> r1 = pkt_q.recv();
+    assert(r1.get().id == 111);
+    r1.release();
+    Lease<Frame> r2 = pkt_q.recv();
+    assert(r2.get().id == 222);
+    r2.release();
+    done_sig.notify();
+    loop { sys.delay(50ms); }
+}
+
+task orchestrator() {
+    // 1. Check initial Deep sleep & pool queries
+    assert(dma_pool.cap() == 2);
+    assert(dma_pool.avail() == 2);
+    assert(dma_pool.in_use() == 0);
+    assert(!dma_pool.is_exhausted());
+    assert(sys.sleep_depth() == 2);
+
+    // 2. @dma_safe cache-line 32B alignment & separation
+    Lease<Frame> a0 = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    Lease<Frame> a1 = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    usize addr0 = a0.addr();
+    usize addr1 = a1.addr();
+    usize diff = 0;
+    if (addr1 > addr0) { diff = addr1 - addr0; } else { diff = addr0 - addr1; }
+    assert(addr0 % 32 == 0);
+    assert(addr1 % 32 == 0);
+    assert(diff >= 32);
+    assert(dma_pool.is_exhausted());
+    assert(dma_pool.in_use() == 2);
+    assert(sys.sleep_depth() == 1);
+    a0.release();
+    a1.release();
+    assert(dma_pool.avail() == 2);
+    assert(sys.sleep_depth() == 2);
+
+    // 3. Subsystem pools: non-@dma_safe stays DEEP (2), @dma_safe clamps LIGHT (1)
+    Lease<u8> cu = bus.cpu_p.try_alloc() catch { assert(false); sys.exit(1); };
+    assert(sys.sleep_depth() == 2);
+    cu.release();
+    Lease<u8> du = bus.dma_p.try_alloc() catch { assert(false); sys.exit(1); };
+    assert(sys.sleep_depth() == 1);
+    bus.slot.park(du) catch { assert(false); sys.exit(1); };
+    assert(bus.slot.addr() != 0);
+    assert(bus.slot.release());
+    assert(bus.dma_p.avail() == 2);
+    assert(sys.sleep_depth() == 2);
+
+    // 4. defer cleanup + returning before release
+    u32 dval = defer_early(true);
+    assert(dval == 43);
+    assert(dma_pool.avail() == 2);
+    assert(sys.sleep_depth() == 2);
+
+    // 5. Full inbox & busy dma_slot auto-recycle (0 leaks!)
+    Lease<Frame> q0 = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    q0.get().id = 100;
+    pkt_q.post(q0);
+    // Fill remaining slot and try sending into full *inbox<Lease<Frame>> via try_send/post/timeout send
+    fill_and_send(&dma_pool, &pkt_q, 999);
+    assert(dma_pool.avail() == 1);
+    Lease<Frame> q_drop = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    pkt_q.post(q_drop);
+    assert(dma_pool.avail() == 1);
+    Lease<Frame> q_to = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    bool timed_out = false;
+    pkt_q.send(q_to, timeout: 1ms) catch {
+        timed_out = true;
+    };
+    assert(timed_out);
+    assert(dma_pool.avail() == 1);
+
+    // Busy dma_slot.park auto-releases incoming lease and preserves first parked lease!
+    Lease<Frame> p0 = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    p0.get().id = 77;
+    tx_slot.park(p0) catch { assert(false); };
+    assert(tx_slot.is_busy());
+    assert(!tx_slot.is_empty());
+    assert(dma_pool.is_exhausted());
+
+    // Drain queued pkt_q item, allocate p1 to verify dma_slot.park fail auto-recycled without leak
+    Lease<Frame> rx_q = pkt_q.try_recv() catch { assert(false); sys.exit(1); };
+    assert(rx_q.get().id == 100);
+    rx_q.release();
+    assert(dma_pool.avail() == 1);
+    Lease<Frame> p_dup = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    bool slot_busy_err = false;
+    tx_slot.park(p_dup) catch {
+        slot_busy_err = true;
+    };
+    assert(slot_busy_err);
+    assert(dma_pool.avail() == 1);
+
+    // Re-occupy slot 1 and let waiter_task block on exhausted dma_pool.alloc(), then trigger IRQ!
+    Lease<Frame> hold1 = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    assert(dma_pool.is_exhausted());
+    assert(alloc_timeout_exhausted() == 99);
+    // Wait until waiter_task enters Poll on dma_pool.alloc()
+    while phase.read() == 0 {
+        sys.delay(1ms);
+    }
+    sys.delay(1ms);
+    sys.pend_irq(IRQ_TX);
+    done_sig.wait();
+    // Note hold1 is still held until now -> depth 1, then release -> depth 2!
+    assert(sys.sleep_depth() == 1);
+    hold1.release();
+    assert(dma_pool.avail() == 2);
+    assert(sys.sleep_depth() == 2);
+
+    // Blocking inbox<Lease<Frame>, 1>.send(lease) when full must NOT leak or double-release on poll retry!
+    Lease<Frame> q1 = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    Lease<Frame> q2 = dma_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    q1.get().id = 111;
+    q2.get().id = 222;
+    pkt_q.send(q1);
+    pkt_q.send(q2);
+    done_sig.wait();
+    assert(dma_pool.avail() == 2);
+    assert(sys.sleep_depth() == 2);
+    println("POOL_LEASE_E2E_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    IRQ_TX.attach(tx_done_isr(&tx_slot, &dma_pool, &phase));
+    spawn waiter_task() @normal;
+    spawn orchestrator() @high;
+}
+"#;
+        let (_mir, c_code, stdout) =
+            run_zev_c_sim_and_freestanding("pool_lease_dma_slot_e2e_asan", src);
+        assert!(stdout.contains("ALLOC_WOKE"), "stdout:\n{stdout}");
+        assert!(stdout.contains("POOL_LEASE_E2E_OK"), "stdout:\n{stdout}");
+        assert!(c_code.contains("__syn_pool_release"));
+    }
+
+    #[test]
+    fn view_bundle_structs_status_cell_and_duplex_stream_asan() {
+        let src = r#"
+struct StatusCell<T> {
+    *watch<T> state;
+}
+
+struct DuplexStream {
+    *byte_ring rx;
+    *byte_ring tx;
+}
+
+watch<u32> dev_status = 10;
+byte_ring<16> uart_rx;
+byte_ring<16> uart_tx;
+signal synced;
+
+fn update_status(StatusCell<u32> cell, u32 next_v) {
+    assert(cell.state.read() == 10);
+    cell.state.publish(next_v);
+}
+
+fn send_frame(DuplexStream io) {
+    assert(io.tx.push("PING") == 4);
+}
+
+task reader(DuplexStream io, StatusCell<u32> cell) {
+    []u8 chunk = io.rx.wait_read();
+    u8 b0 = chunk[0];
+    io.rx.consume(chunk.len);
+    assert(cell.state.read() == 77);
+    println(f"BUNDLE_OK b0={b0} st={cell.state.read()}");
+    synced.notify();
+    loop { sys.delay(50ms); }
+}
+
+task driver() {
+    StatusCell<u32> c = StatusCell<u32> { state: &dev_status };
+    DuplexStream s = DuplexStream { rx: &uart_rx, tx: &uart_tx };
+    update_status(c, 77);
+    send_frame(s);
+    assert(uart_tx.len() == 4);
+    assert(uart_rx.push("ZEV!") == 4);
+    synced.wait();
+    sys.exit(0);
+}
+
+fn main() {
+    DuplexStream s = DuplexStream { rx: &uart_rx, tx: &uart_tx };
+    StatusCell<u32> c = StatusCell<u32> { state: &dev_status };
+    spawn reader(s, c) @normal;
+    spawn driver() @low;
+}
+"#;
+        let (_mir, _c, stdout) = run_zev_c_sim_and_freestanding("view_bundle_asan", src);
+        assert!(
+            stdout.contains("BUNDLE_OK b0=90 st=77"),
+            "stdout:\n{stdout}"
         );
     }
 }

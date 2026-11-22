@@ -320,8 +320,10 @@ pub enum OsPrimitiveType {
     Watch { elem: Box<TypeExpr> },
     /// `ping_pong<T, N>` — double-buffered zero-copy DMA endpoint (`N` = half/buffer size).
     PingPong { elem: Box<TypeExpr>, cap: usize },
-    /// `lease<T, N>` — static zero-copy buffer lending endpoint of size `cap`.
-    Lease { elem: Box<TypeExpr>, cap: usize },
+    /// `pool<T, K>` — bounded zero-copy DMA/buffer pool of `cap` slots (1..=32).
+    Pool { elem: Box<TypeExpr>, cap: usize },
+    /// `dma_slot<T>` — single-slot DMA ownership parking cell for in-flight `Lease<T>`.
+    DmaSlot { elem: Box<TypeExpr> },
     /// `byte_ring<N>` — lock-free SPSC circular + BipBuffer byte ring of capacity `cap`.
     ByteRing { cap: usize },
     /// `*byte_ring` — unsized pointer view over any `byte_ring<N>`.
@@ -335,7 +337,8 @@ impl OsPrimitiveType {
             Self::Inbox { .. } | Self::InboxUnsized { .. } => "inbox",
             Self::Watch { .. } => "watch",
             Self::PingPong { .. } => "ping_pong",
-            Self::Lease { .. } => "lease",
+            Self::Pool { .. } => "pool",
+            Self::DmaSlot { .. } => "dma_slot",
             Self::ByteRing { .. } | Self::ByteRingUnsized => "byte_ring",
         }
     }
@@ -434,6 +437,8 @@ pub enum TypeKind {
     Ptr(Box<TypeExpr>),
     /// Scheduler-aware OS primitive (`watch<u16>`, `ping_pong<u8, 64>`, `inbox<E, 8>`, ...).
     OsPrimitive(OsPrimitiveType),
+    /// Linear, move-only buffer lease `Lease<T>` allocated from a `pool<T, K>`.
+    Lease(Box<TypeExpr>),
     /// Function pointer type `fn(T1, T2) -> Ret` (for C interop callbacks, etc.).
     FnPtr {
         params: Vec<TypeExpr>,
@@ -607,6 +612,7 @@ pub struct StructDecl {
 /// A field inside a [`StructDecl`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructField {
+    pub attrs: Vec<Attr>,
     pub ty: TypeExpr,
     pub name: Ident,
     pub span: Span,
@@ -1381,6 +1387,16 @@ mod tests {
         };
         assert_eq!(inbox.kind_name(), "inbox");
         assert_eq!(OsPrimitiveType::Signal.kind_name(), "signal");
+        let pool = OsPrimitiveType::Pool {
+            elem: Box::new(u8_ty.clone()),
+            cap: 4,
+        };
+        let slot = OsPrimitiveType::DmaSlot {
+            elem: Box::new(u8_ty.clone()),
+        };
+        assert_eq!(pool.kind_name(), "pool");
+        assert_eq!(slot.kind_name(), "dma_slot");
+        let _lease_ty = TypeExpr::new(TypeKind::Lease(Box::new(u8_ty.clone())), sp);
 
         let restart_stmt = Stmt::new(StmtKind::Restart, sp);
         let defer_stmt = Stmt::new(StmtKind::Defer(Box::new(restart_stmt.clone())), sp);

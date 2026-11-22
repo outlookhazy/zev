@@ -1269,6 +1269,7 @@ impl<'a> AstRewriter<'a> {
             }
             TypeKind::Ptr(inner) => TypeKind::Ptr(Box::new(self.rewrite_type(inner))),
             TypeKind::OsPrimitive(op) => TypeKind::OsPrimitive(self.rewrite_os_primitive(op)),
+            TypeKind::Lease(inner) => TypeKind::Lease(Box::new(self.rewrite_type(inner))),
             TypeKind::FnPtr { params, ret } => TypeKind::FnPtr {
                 params: params.iter().map(|p| self.rewrite_type(p)).collect(),
                 ret: Box::new(self.rewrite_type(ret)),
@@ -1294,9 +1295,12 @@ impl<'a> AstRewriter<'a> {
                 elem: Box::new(self.rewrite_type(elem)),
                 cap: *cap,
             },
-            OsPrimitiveType::Lease { elem, cap } => OsPrimitiveType::Lease {
+            OsPrimitiveType::Pool { elem, cap } => OsPrimitiveType::Pool {
                 elem: Box::new(self.rewrite_type(elem)),
                 cap: *cap,
+            },
+            OsPrimitiveType::DmaSlot { elem } => OsPrimitiveType::DmaSlot {
+                elem: Box::new(self.rewrite_type(elem)),
             },
             OsPrimitiveType::ByteRing { cap } => OsPrimitiveType::ByteRing { cap: *cap },
             OsPrimitiveType::ByteRingUnsized => OsPrimitiveType::ByteRingUnsized,
@@ -1921,6 +1925,7 @@ fn rewrite_program(
                 let mut fields = Vec::with_capacity(st.fields.len());
                 for f in &st.fields {
                     fields.push(zev_ast::StructField {
+                        attrs: f.attrs.clone(),
                         ty: rw.rewrite_type(&f.ty),
                         name: f.name.clone(),
                         span: f.span,
@@ -2201,9 +2206,9 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
         (TypeKind::Path(x), TypeKind::Path(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(l, r)| l.name == r.name)
         }
-        (TypeKind::Slice(x), TypeKind::Slice(y)) | (TypeKind::Ptr(x), TypeKind::Ptr(y)) => {
-            types_structurally_equal(x, y)
-        }
+        (TypeKind::Slice(x), TypeKind::Slice(y))
+        | (TypeKind::Ptr(x), TypeKind::Ptr(y))
+        | (TypeKind::Lease(x), TypeKind::Lease(y)) => types_structurally_equal(x, y),
         (
             TypeKind::Array { elem: ex, len: lx },
             TypeKind::Array { elem: ey, len: ly },
