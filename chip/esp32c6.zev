@@ -56,9 +56,17 @@ pub mmio PlicMxRegs {
 }
 
 pub mmio PcrRegs {
-    @rw u32 rmt_conf      @ 0x2C;
-    @rw u32 rmt_sclk_conf @ 0x30;
-    @rw u32 systimer_conf @ 0x54;
+    @rw u32 rmt_conf       @ 0x2C;
+    @rw u32 rmt_sclk_conf  @ 0x30;
+    @rw u32 systimer_conf  @ 0x54;
+    @rw u32 saradc_conf    @ 0x80;
+    @rw u32 tsens_clk_conf @ 0x88;
+}
+
+pub mmio ApbSaradcRegs {
+    @rw u32 ctrl        @ 0x00;
+    @rw u32 tsens_ctrl  @ 0x58;
+    @rw u32 tsens_ctrl2 @ 0x5C;
 }
 
 pub mmio RmtRegs {
@@ -79,6 +87,7 @@ pub mmio PCR        : PcrRegs       @ 0x6009_6000;
 pub mmio RMT        : RmtRegs       @ 0x6000_6000;
 pub mmio RMTMEM     : RmtMemRegs    @ 0x6000_6400;
 pub mmio SYSTIMER   : SystimerRegs  @ 0x6000_A000;
+pub mmio APB_SARADC : ApbSaradcRegs @ 0x6000_E000;
 pub mmio USB_DEVICE : UsbDeviceRegs @ 0x6000_F000;
 pub mmio INTMTX     : IntmtxRegs    @ 0x6001_0000;
 pub mmio INTPRI     : IntpriRegs    @ 0x600C_5000;

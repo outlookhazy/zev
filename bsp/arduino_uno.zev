@@ -65,3 +65,56 @@ pub fn enable_uart_rx_irq() {
     u8 cur = hw.USART0.ucsr0b;
     hw.USART0.ucsr0b = cur | hw.BIT_RXCIE0;
 }
+
+pub fn enable_uart_udre_irq() {
+    hw.USART0.ucsr0b = hw.USART0.ucsr0b | hw.BIT_UDRIE0;
+}
+
+pub fn disable_uart_udre_irq() {
+    hw.USART0.ucsr0b = hw.USART0.ucsr0b & (~hw.BIT_UDRIE0);
+}
+
+pub fn init_adc() {
+    hw.ADC_REGS.admux = 0x40;
+    hw.ADC_REGS.adcsrb = 0;
+    hw.ADC_REGS.adcsra = 0x87;
+    hw.ADC_REGS.adcsra = 0xC7;
+    for (u32 i in 0..4096) {
+        if ((hw.ADC_REGS.adcsra & 0x40) == 0) {
+            break;
+        }
+    }
+}
+
+pub u16 read_adc_mux(u8 admux_val) {
+    hw.ADC_REGS.admux = admux_val;
+    // Settling conversion after mux change
+    hw.ADC_REGS.adcsra = 0xC7;
+    for (u32 i in 0..4096) {
+        if ((hw.ADC_REGS.adcsra & 0x40) == 0) {
+            break;
+        }
+    }
+    // Real conversion
+    hw.ADC_REGS.adcsra = 0xC7;
+    for (u32 i in 0..4096) {
+        if ((hw.ADC_REGS.adcsra & 0x40) == 0) {
+            break;
+        }
+    }
+    u8 lo = hw.ADC_REGS.adcl;
+    u8 hi = hw.ADC_REGS.adch;
+    return ((hi as u16) << 8) | (lo as u16);
+}
+
+pub u16 read_a0() {
+    return read_adc_mux(0x40);
+}
+
+pub u16 read_mcu_vcc_mv() {
+    u16 raw = read_adc_mux(0x4E);
+    if (raw == 0) {
+        return 0;
+    }
+    return (1125300u32 / (raw as u32)) as u16;
+}

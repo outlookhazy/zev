@@ -57,6 +57,15 @@ pub mmio Usart0Regs {
     @rw u8  udr0   @ 0x06;
 }
 
+pub mmio AdcRegs {
+    @rw u8 adcl   @ 0x00;
+    @rw u8 adch   @ 0x01;
+    @rw u8 adcsra @ 0x02;
+    @rw u8 adcsrb @ 0x03;
+    @rw u8 admux  @ 0x04;
+    @rw u8 didr0  @ 0x06;
+}
+
 pub mmio PORTB      : PortRegs   @ 0x23;
 pub mmio PORTC      : PortRegs   @ 0x26;
 pub mmio PORTD      : PortRegs   @ 0x29;
@@ -66,6 +75,7 @@ pub mmio EIFR       : EifrRegs   @ 0x3C;
 pub mmio PCICR_REGS : PcicrRegs  @ 0x68;
 pub mmio PCMSK_REGS : PcmskRegs  @ 0x6B;
 pub mmio TIMSK_REGS : TimskRegs  @ 0x6E;
+pub mmio ADC_REGS   : AdcRegs    @ 0x78;
 pub mmio TIMER1     : Timer1Regs @ 0x80;
 pub mmio USART0     : Usart0Regs @ 0xC0;
 
@@ -80,9 +90,11 @@ pub irq IRQ_TIMER2_COMPA = 7;
 pub irq IRQ_TIMER1_COMPA = 11;
 pub irq IRQ_TIMER1_OVF   = 13;
 pub irq IRQ_USART_RX     = 18;
+pub irq IRQ_USART_UDRE   = 19;
 
 pub const u8 BIT_PB5_LED  = 1 << 5; // Digital pin 13 (onboard L LED)
 pub const u8 BIT_PD2_IN   = 1 << 2; // Digital pin 2 (PCINT18 / INT0)
 pub const u8 BIT_OCF1A    = 1 << 1; // TIFR1 / TIMSK1 Timer1 Compare A
 pub const u8 BIT_PCIE0    = 1 << 0; // PCICR / PCIFR Pin-Change bank 0 (PORTB)
 pub const u8 BIT_RXCIE0   = 1 << 7; // UCSR0B USART0 RX Complete Interrupt Enable
+pub const u8 BIT_UDRIE0   = 1 << 5; // UCSR0B USART0 Data Register Empty Interrupt Enable

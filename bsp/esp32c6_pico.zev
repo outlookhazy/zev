@@ -93,3 +93,31 @@ pub u8 usb_rx_read_byte() {
 pub fn clear_usb_rx_irq() {
     hw.USB_DEVICE.int_clr = 4;
 }
+
+pub fn init_temp_sensor() {
+    hw.PCR.saradc_conf = 5;
+    hw.PCR.tsens_clk_conf = (1 << 23) | (1 << 22) | (1 << 20);
+    hw.PCR.tsens_clk_conf = (1 << 22) | (1 << 20);
+    hw.APB_SARADC.tsens_ctrl = (1 << 22) | (6 << 14);
+}
+
+pub u32 read_die_temp_raw() {
+    return hw.APB_SARADC.tsens_ctrl & 0xFF;
+}
+
+pub f32 read_die_temp_c() {
+    return 0.4386f32 * (read_die_temp_raw() as f32) - 20.52f32;
+}
+
+pub fn usb_tx_write_byte(u8 b) {
+    for (u32 spin in 0..4096) {
+        if ((hw.USB_DEVICE.ep1_conf & 2) != 0) {
+            hw.USB_DEVICE.ep1 = b as u32;
+            return;
+        }
+    }
+}
+
+pub fn usb_tx_flush() {
+    hw.USB_DEVICE.ep1_conf = 1;
+}

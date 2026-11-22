@@ -47,3 +47,67 @@ pub fn writer_u8(*ByteWriter w, u8 b) error IoErr {
     w.pos += 1;
     return;
 }
+
+bool is_ascii_ws(u8 b) {
+    return b == ' ' || b == '\t' || b == '\r' || b == '\n';
+}
+
+pub []u8 trim_ascii([]u8 s) {
+    usize start = 0;
+    usize end = s.len;
+    while (start < end) {
+        if (!is_ascii_ws(s[start])) {
+            break;
+        }
+        start += 1;
+    }
+    while (end > start) {
+        if (!is_ascii_ws(s[end - 1])) {
+            break;
+        }
+        end -= 1;
+    }
+    return s[start..end];
+}
+
+pub bool eq_bytes([]u8 a, []u8 b) {
+    if (a.len != b.len) {
+        return false;
+    }
+    for (usize i in 0..a.len) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub bool starts_with([]u8 s, []u8 prefix) {
+    if (s.len < prefix.len) {
+        return false;
+    }
+    for (usize i in 0..prefix.len) {
+        if (s[i] != prefix[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub u32 parse_u32([]u8 s) error IoErr {
+    if (s.len == 0) {
+        error Eof;
+    }
+    u32 acc = 0;
+    for (u8 b in s) {
+        if (b < '0' || b > '9') {
+            error Eof;
+        }
+        u32 digit = (b - '0') as u32;
+        if (acc > 429496729u32 || (acc == 429496729u32 && digit > 5u32)) {
+            error Overflow;
+        }
+        acc = (acc * 10u32) + digit;
+    }
+    return acc;
+}
