@@ -5153,4 +5153,324 @@ fn main() {
             "expected timeout and PASS marker:\n{stdout}"
         );
     }
+
+    fn run_zev_c_sim_and_freestanding(
+        test_name: &str,
+        src: &str,
+    ) -> (zev_mir::MirModule, String, String) {
+        let prog = zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {test_name}: {e:?}"));
+        zev_sema::analyze_program(&prog)
+            .unwrap_or_else(|e| panic!("sema {test_name}: {e:?}"));
+        let mir = lower_program(&prog).unwrap_or_else(|e| panic!("lower {test_name}: {e:?}"));
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles(test_name, &c_code);
+        let stdout = compile_and_run_clang_sanitized(test_name, &c_code, None);
+        (mir, c_code, stdout)
+    }
+
+    #[test]
+    fn unsized_views_byte_ring_and_inbox_multi_cap_asan() {
+        let src = r#"
+enum PacketTag { Ping = 1, Pong = 2 }
+
+struct ViewBundle {
+    *byte_ring ring;
+    *inbox<u32> q;
+}
+
+byte_ring<12> ring_a;
+byte_ring<24> ring_b;
+inbox<u32, 3> q_a;
+inbox<u32, 6> q_b;
+
+usize exercise_ring(*byte_ring r, u8 seed) {
+    usize cap = r.cap();
+    assert(r.is_empty());
+    assert(!r.is_full());
+    assert(r.free_space() == cap);
+    assert(r.push("ABC", boost: @high) == 3);
+    assert(r.push_byte(seed));
+    assert(r.len() == 4);
+
+    []u8 chunk = r.read_slice();
+    assert(chunk.len == 4);
+    assert(chunk[0] == 'A');
+    assert(chunk[3] == seed);
+    r.consume(2);
+    assert(r.len() == 2);
+
+    u8 popped[4];
+    usize npop = r.pop(popped);
+    assert(npop == 2);
+    assert(popped[0] == 'C');
+    assert(popped[1] == seed);
+    u8 pop_sentinel = r.try_pop_byte() catch { 0xEE };
+    assert(pop_sentinel == 0xEE);
+
+    []u8 dma = r.grant_write(3) catch { return 0; };
+    dma[0] = 'X';
+    dma[1] = 'Y';
+    dma[2] = 'Z';
+    r.commit_write(2, boost: @low);
+    assert(r.len() == 2);
+    u8 b0 = r.try_pop_byte() catch { return 0; };
+    assert(b0 == 'X');
+    r.clear();
+    assert(r.is_empty());
+    return cap;
+}
+
+usize exercise_inbox(*inbox<u32> q) {
+    usize cap = q.cap();
+    assert(q.is_empty());
+    assert(!q.is_full());
+    q.post(10);
+    assert(q.try_send(20, boost: @high));
+    assert(q.try_send(30));
+    assert(q.len() == 3);
+    if (cap == 3) {
+        assert(q.is_full());
+        assert(!q.try_send(40));
+    } else {
+        assert(!q.is_full());
+    }
+    u32 v1 = q.try_recv() catch { return 0; };
+    u32 v2 = q.try_recv() catch { return 0; };
+    u32 v3 = q.try_recv() catch { return 0; };
+    assert(v1 == 10 && v2 == 20 && v3 == 30);
+    u32 empty_sentinel = q.try_recv() catch { 9999 };
+    assert(empty_sentinel == 9999);
+    return cap;
+}
+
+task consumer_task(ViewBundle vb) {
+    set_priority(@low);
+    u8 i = 0;
+    while (i < 2) {
+        i += 1;
+        []u8 chunk = vb.ring.wait_read(timeout: 20ms) catch {
+            println("RING_TIMEOUT");
+            sys.exit(0);
+        };
+        println(f"VIEW_RX len={chunk.len} b0={chunk[0]} prio={sys.current_prio()}");
+        vb.ring.consume(chunk.len);
+        u32 msg = vb.q.recv(timeout: 20ms) catch {
+            println("INBOX_TIMEOUT");
+            sys.exit(0);
+        };
+        println(f"VIEW_MSG={msg} prio={sys.current_prio()}");
+    }
+    sys.exit(0);
+}
+
+task producer_task(*byte_ring r, *inbox<u32> q) {
+    sys.delay(2ms);
+    r.push("HI", boost: @critical);
+    q.send(77, timeout: 10ms) catch { loop { sys.delay(10ms); } };
+    sys.delay(3ms);
+    r.push("OK", boost: @high);
+    q.send(88, timeout: 10ms) catch { loop { sys.delay(10ms); } };
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    assert(exercise_ring(&ring_a, 99) == 12);
+    assert(exercise_ring(&ring_b, 42) == 24);
+    assert(exercise_inbox(&q_a) == 3);
+    assert(exercise_inbox(&q_b) == 6);
+    spawn consumer_task(ViewBundle{ ring: &ring_a, q: &q_a }) @low;
+    spawn producer_task(&ring_a, &q_a) @normal;
+}
+"#;
+        let (_mir, _c, stdout) =
+            run_zev_c_sim_and_freestanding("unsized_views_byte_ring_inbox_asan", src);
+        assert!(
+            stdout.contains("VIEW_RX len=2 b0=72 prio=0"),
+            "expected critical boost on first wait_read:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("VIEW_MSG=77"),
+            "expected inbox recv 77:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("VIEW_RX len=2 b0=79 prio=1"),
+            "expected high boost on second wait_read:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("VIEW_MSG=88"),
+            "expected inbox recv 88:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn subsystem_structs_nested_isr_and_view_coercion_asan() {
+        let src = r#"
+irq UartIrq = 0;
+
+struct Channel {
+    byte_ring<16> tx;
+    inbox<u16, 4> q;
+    signal ready;
+}
+
+struct UartSubsys {
+    byte_ring<12> rx;
+    Channel ch0;
+}
+
+UartSubsys uart0;
+UartSubsys uart1;
+
+isr on_rx(*byte_ring r, *inbox<u16> q) {
+    r.push("AB", boost: @high);
+    q.post(1234, boost: @high);
+}
+
+fn check_channel(*Channel ch, u16 tag) {
+    assert(ch.tx.cap() == 16);
+    assert(ch.q.cap() == 4);
+    usize n = fmt_ring(&ch.tx, f"tag={tag}") catch { 0 };
+    assert(n > 0);
+}
+
+task subsys_worker(*UartSubsys drv) {
+    set_priority(@low);
+    check_channel(&drv.ch0, 7);
+    []u8 s = drv.rx.wait_read(timeout: 20ms) catch {
+        println("SUBSYS_RX_TO");
+        sys.exit(0);
+    };
+    println(f"SUBSYS_RX len={s.len} b0={s[0]} prio={sys.current_prio()}");
+    drv.rx.consume(s.len);
+    u16 code = drv.ch0.q.recv(timeout: 20ms) catch {
+        println("SUBSYS_Q_TO");
+        sys.exit(0);
+    };
+    println(f"SUBSYS_Q code={code}");
+    []u8 txs = drv.ch0.tx.read_slice();
+    println(f"SUBSYS_TX len={txs.len} b0={txs[0]}");
+    drv.ch0.tx.consume(txs.len);
+    sys.exit(0);
+}
+
+task irq_driver() {
+    sys.delay(2ms);
+    sys.pend_irq(0);
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    check_channel(&uart1.ch0, 9);
+    assert(uart1.ch0.tx.len() == 5);
+    UartIrq.attach(on_rx(&uart0.rx, &uart0.ch0.q));
+    spawn subsys_worker(&uart0) @low;
+    spawn irq_driver() @normal;
+}
+"#;
+        let (mir, _c, stdout) = run_zev_c_sim_and_freestanding("subsys_nested_isr_asan", src);
+        let ram_tbl = mir.ram_report.format_table();
+        assert!(
+            ram_tbl.contains("uart0") && ram_tbl.contains("uart1"),
+            "expected subsystem globals in RAM report:\n{ram_tbl}"
+        );
+        assert!(
+            stdout.contains("SUBSYS_RX len=2 b0=65 prio=1"),
+            "expected boosted SUBSYS_RX:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("SUBSYS_Q code=1234"),
+            "expected SUBSYS_Q code=1234:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("SUBSYS_TX len=5 b0=116"),
+            "expected SUBSYS_TX len=5 ('tag=7'):\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn fmt_ring_wrap_single_wake_boost_and_truncation_asan() {
+        let src = r#"
+byte_ring<16> tx;
+signal sync;
+
+usize write_fmt_view(*byte_ring r, u16 v) error FmtErr {
+    return fmt_ring(r, f"V={v:04X}", boost: @high) catch (FmtErr e, usize pw) {
+        error e, pw;
+    };
+}
+
+task reader() {
+    set_priority(@low);
+    // 1. Wait on empty ring while writer calls multi-chunk `fmt_ring(..., boost: @high)`:
+    //    must wake ONCE at end with all 8 bytes ("X=2A Y=7") and boosted prio=1.
+    sync.notify();
+    []u8 cw = tx.wait_read(timeout: 20ms) catch {
+        println("FAIL_WAIT1");
+        sys.exit(0);
+    };
+    u32 prio = sys.current_prio();
+    usize cw_len = cw.len;
+    u8 first_b = cw[0];
+    assert(cw_len == 8);
+    tx.consume(cw_len);
+    println(f"FMT_WAKE len={cw_len} b0={first_b} prio={prio}");
+
+    // 2. Wrap-around test: push 11 bytes then pop 10 -> head=10, tail=11, count=1 ('A').
+    //    fmt_ring("V=1A2B", 6 bytes) wraps 5 bytes (11..16) + 1 byte (0..1)!
+    assert(tx.push("0123456789A") == 11);
+    u8 trash[10];
+    assert(tx.pop(trash) == 10);
+    usize w = write_fmt_view(&tx, 0x1A2B) catch { 0 };
+    assert(w == 6);
+
+    []u8 c1 = tx.read_slice();
+    usize c1_len = c1.len;
+    assert(c1_len == 6);
+    tx.consume(c1_len);
+    []u8 c2 = tx.read_slice();
+    assert(c2.len == 1);
+    u8 last_b = c2[0];
+    tx.consume(c2.len);
+    println(f"FMT_WRAP c1len={c1_len} last={last_b}");
+
+    // 3. Overflow test: prefill 12 bytes -> 4 free bytes left, then format 8 bytes -> Truncated with partial == 4
+    assert(tx.push("123456789012") == 12);
+    usize partial_w = fmt_ring(&tx, f"ABCD1234") catch (FmtErr e, usize pw) {
+        println(f"FMT_TRUNC partial={pw} total_len={tx.len()}");
+        sys.exit(0);
+    };
+    println(f"UNEXPECTED_OK={partial_w}");
+    sys.exit(0);
+}
+
+task writer() {
+    sync.wait();
+    sys.delay(2ms);
+    u8 x = 0x2A;
+    u8 y = 7;
+    usize w = fmt_ring(&tx, f"X={x:02X} Y={y}", boost: @high) catch { 0 };
+    assert(w == 8);
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    spawn reader() @low;
+    spawn writer() @normal;
+}
+"#;
+        let (_mir, _c, stdout) =
+            run_zev_c_sim_and_freestanding("fmt_ring_wrap_trunc_asan", src);
+        assert!(
+            stdout.contains("FMT_WAKE len=8 b0=88 prio=1"),
+            "expected single-wake multi-chunk FMT_WAKE with @high boost:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("FMT_WRAP c1len=6 last=66"),
+            "expected wrapped FMT_WRAP ('B'=66):\n{stdout}"
+        );
+        assert!(
+            stdout.contains("FMT_TRUNC partial=4 total_len=16"),
+            "expected Truncated partial=4 filling remaining ring space:\n{stdout}"
+        );
+    }
 }

@@ -99,10 +99,12 @@ impl fmt::Display for PrimitiveKind {
 pub enum ResolvedOsPrimitive {
     Signal,
     Inbox { elem: Box<Ty>, cap: usize },
+    InboxUnsized { elem: Box<Ty> },
     Watch { elem: Box<Ty> },
     PingPong { elem: Box<Ty>, cap: usize },
     Lease { elem: Box<Ty>, cap: usize },
     ByteRing { cap: usize },
+    ByteRingUnsized,
 }
 
 static BYTE_RING_ELEM_U8: Ty = Ty::Prim(PrimType::U8);
@@ -111,28 +113,36 @@ impl ResolvedOsPrimitive {
     pub const fn kind(&self) -> PrimitiveKind {
         match self {
             Self::Signal => PrimitiveKind::Signal,
-            Self::Inbox { .. } => PrimitiveKind::Inbox,
+            Self::Inbox { .. } | Self::InboxUnsized { .. } => PrimitiveKind::Inbox,
             Self::Watch { .. } => PrimitiveKind::Watch,
             Self::PingPong { .. } => PrimitiveKind::PingPong,
             Self::Lease { .. } => PrimitiveKind::Lease,
-            Self::ByteRing { .. } => PrimitiveKind::ByteRing,
+            Self::ByteRing { .. } | Self::ByteRingUnsized => PrimitiveKind::ByteRing,
         }
+    }
+
+    pub const fn is_unsized_view(&self) -> bool {
+        matches!(self, Self::InboxUnsized { .. } | Self::ByteRingUnsized)
     }
 
     pub fn elem_ty(&self) -> Option<&Ty> {
         match self {
             Self::Signal => None,
             Self::Inbox { elem, .. }
+            | Self::InboxUnsized { elem }
             | Self::Watch { elem }
             | Self::PingPong { elem, .. }
             | Self::Lease { elem, .. } => Some(elem),
-            Self::ByteRing { .. } => Some(&BYTE_RING_ELEM_U8),
+            Self::ByteRing { .. } | Self::ByteRingUnsized => Some(&BYTE_RING_ELEM_U8),
         }
     }
 
     pub const fn capacity(&self) -> Option<usize> {
         match self {
-            Self::Signal | Self::Watch { .. } => None,
+            Self::Signal
+            | Self::Watch { .. }
+            | Self::InboxUnsized { .. }
+            | Self::ByteRingUnsized => None,
             Self::Inbox { cap, .. }
             | Self::PingPong { cap, .. }
             | Self::Lease { cap, .. }
@@ -146,10 +156,12 @@ impl fmt::Display for ResolvedOsPrimitive {
         match self {
             Self::Signal => write!(f, "signal"),
             Self::Inbox { elem, cap } => write!(f, "inbox<{}, {}>", elem, cap),
+            Self::InboxUnsized { elem } => write!(f, "inbox<{}>", elem),
             Self::Watch { elem } => write!(f, "watch<{}>", elem),
             Self::PingPong { elem, cap } => write!(f, "ping_pong<{}, {}>", elem, cap),
             Self::Lease { elem, cap } => write!(f, "lease<{}, {}>", elem, cap),
             Self::ByteRing { cap } => write!(f, "byte_ring<{}>", cap),
+            Self::ByteRingUnsized => write!(f, "byte_ring"),
         }
     }
 }
@@ -184,6 +196,7 @@ pub struct FieldInfo {
 pub struct StructInfo {
     pub name: String,
     pub is_packed: bool,
+    pub is_subsystem: bool,
     pub fields: Vec<FieldInfo>,
     pub span: Span,
 }
@@ -373,6 +386,30 @@ impl Ty {
                 a == b || (matches!(**a, Ty::IntLit | Ty::FloatLit) && a.is_assignable_to(b))
             }
 
+            // Sized primitive pointers coerce implicitly to unsized primitive views.
+            (Ty::Ptr(a), Ty::Ptr(b))
+                if matches!(
+                    (&**a, &**b),
+                    (
+                        Ty::OsPrimitive(ResolvedOsPrimitive::ByteRing { .. }),
+                        Ty::OsPrimitive(ResolvedOsPrimitive::ByteRingUnsized),
+                    )
+                ) =>
+            {
+                true
+            }
+            (Ty::Ptr(a), Ty::Ptr(b))
+                if matches!(
+                    (&**a, &**b),
+                    (
+                        Ty::OsPrimitive(ResolvedOsPrimitive::Inbox { elem: ea, .. }),
+                        Ty::OsPrimitive(ResolvedOsPrimitive::InboxUnsized { elem: eb }),
+                    ) if ea == eb
+                ) =>
+            {
+                true
+            }
+
             // Any pointer `*T` coerces to opaque `*void` (e.g. for extern "C" or generic DMA helpers),
             // and string literals coerce to `*u8` / `*i8` / `[]u8` / `*void` for trace/C helpers.
             (Ty::Ptr(_), Ty::Ptr(inner)) if inner.is_void() => true,
@@ -422,7 +459,12 @@ impl Ty {
             Self::Duration => 8,
             Self::Priority | Self::Enum(_) => 1,
             Self::Str | Self::Slice(_) => ptr_bytes * 2,
-            Self::Ptr(_) | Self::FnPtr { .. } | Self::MmioInstance { .. } => ptr_bytes,
+            Self::Ptr(inner) => match &**inner {
+                Ty::OsPrimitive(ResolvedOsPrimitive::ByteRingUnsized) => ptr_bytes * 2,
+                Ty::OsPrimitive(ResolvedOsPrimitive::InboxUnsized { .. }) => ptr_bytes * 3,
+                _ => ptr_bytes,
+            },
+            Self::FnPtr { .. } | Self::MmioInstance { .. } => ptr_bytes,
             Self::IrqToken => 4,
             Self::MmioLayout(_) => 0,
             Self::Array { elem, len } => elem.byte_size(ptr_bytes, structs) * len,
@@ -442,6 +484,7 @@ impl Ty {
                 ResolvedOsPrimitive::Inbox { elem, cap } => {
                     elem.byte_size(ptr_bytes, structs) * cap + 16
                 }
+                ResolvedOsPrimitive::InboxUnsized { .. } => ptr_bytes * 3,
                 ResolvedOsPrimitive::PingPong { elem, cap } => {
                     elem.byte_size(ptr_bytes, structs) * cap * 2 + 16
                 }
@@ -449,6 +492,7 @@ impl Ty {
                     elem.byte_size(ptr_bytes, structs) * cap + 16
                 }
                 ResolvedOsPrimitive::ByteRing { cap } => cap + ptr_bytes + 28,
+                ResolvedOsPrimitive::ByteRingUnsized => ptr_bytes * 2,
             },
             Self::Namespace(_) | Self::Error => 0,
         }

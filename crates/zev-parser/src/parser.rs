@@ -2015,6 +2015,13 @@ impl<'a> Parser<'a> {
                             start.merge(gt_span),
                         )
                     }
+                    "byte_ring" if self.peek_n_kind(1) != TokenKind::Dot => {
+                        let tok = self.bump();
+                        TypeExpr::new(
+                            TypeKind::OsPrimitive(OsPrimitiveType::ByteRingUnsized),
+                            start.merge(tok.span),
+                        )
+                    }
                     "chan" if self.peek_n_kind(1) == TokenKind::Lt => {
                         // Trap retired `chan<T, N>` (or `chan<T>`) with `P0012` -> unified `inbox<T, N>`!
                         self.bump(); // `chan`
@@ -2033,7 +2040,31 @@ impl<'a> Parser<'a> {
                         }
                         return Err(self.trap_p0012(start.merge(end_span)));
                     }
-                    "inbox" | "ping_pong" | "lease"
+                    "inbox" if self.peek_n_kind(1) == TokenKind::Lt => {
+                        self.bump();
+                        self.expect(&TokenKind::Lt)?;
+                        let elem = self.parse_type()?;
+                        if self.eat(&TokenKind::Comma) {
+                            let cap = self.parse_usize_literal("OS primitive capacity")?;
+                            let gt_span = self.expect_type_gt()?;
+                            TypeExpr::new(
+                                TypeKind::OsPrimitive(OsPrimitiveType::Inbox {
+                                    elem: Box::new(elem),
+                                    cap,
+                                }),
+                                start.merge(gt_span),
+                            )
+                        } else {
+                            let gt_span = self.expect_type_gt()?;
+                            TypeExpr::new(
+                                TypeKind::OsPrimitive(OsPrimitiveType::InboxUnsized {
+                                    elem: Box::new(elem),
+                                }),
+                                start.merge(gt_span),
+                            )
+                        }
+                    }
+                    "ping_pong" | "lease"
                         if self.peek_n_kind(1) == TokenKind::Lt =>
                     {
                         self.bump();
@@ -2043,10 +2074,6 @@ impl<'a> Parser<'a> {
                         let cap = self.parse_usize_literal("OS primitive capacity")?;
                         let gt_span = self.expect_type_gt()?;
                         let os_ty = match s_clone.as_str() {
-                            "inbox" => OsPrimitiveType::Inbox {
-                                elem: Box::new(elem),
-                                cap,
-                            },
                             "ping_pong" => OsPrimitiveType::PingPong {
                                 elem: Box::new(elem),
                                 cap,

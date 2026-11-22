@@ -4589,4 +4589,260 @@ fn main() {
     );
 }
 
+#[test]
+fn verifies_unsized_views_and_stale_lease_tracking() {
+    let good = r#"
+byte_ring<64> r1;
+byte_ring<128> r2;
+inbox<u32, 4> q1;
+inbox<u32, 8> q2;
+
+fn push_msg(*byte_ring rx, []u8 msg) {
+    usize n = rx.push(msg);
+    bool b = rx.push_byte(65, boost: @high);
+    usize c = rx.cap();
+}
+
+fn read_msg(*byte_ring rx) {
+    []u8 s = rx.read_slice();
+    if (s.len > 0) {
+        u8 first = s[0];
+        rx.consume(1);
+    }
+}
+
+fn send_and_cap(*inbox<u32> q, u32 v) {
+    usize total = q.cap();
+    usize cur = q.len();
+    bool e = q.is_empty();
+    bool f = q.is_full();
+    bool ok = q.try_send(v);
+    q.post(v, boost: @normal);
+}
+
+task consumer(*inbox<u32> q, *byte_ring rx) {
+    loop {
+        u32 v = q.recv();
+        []u8 slice = rx.wait_read();
+        rx.consume(slice.len);
+        q.send(v + 1);
+    }
+}
+
+fn main() {
+    push_msg(&r1, "hi");
+    push_msg(&r2, "yo");
+    read_msg(&r1);
+    send_and_cap(&q1, 1);
+    send_and_cap(&q2, 2);
+    spawn consumer(&q1, &r1) @normal;
+    spawn consumer(&q2, &r2) @normal;
+}
+"#;
+    let prog = zev_parser::parse_str(good).expect("parse good unsized views");
+    let model = analyze(&[prog]).expect("good unsized views should pass");
+    assert_eq!(model.spawned_tasks.len(), 2);
+
+    // Reject bare unsized `byte_ring` and `inbox<T>` in top-level, struct, param, return, and local.
+    for bad in [
+        "byte_ring r; fn main() {}",
+        "inbox<u8> q; fn main() {}",
+        "struct Bad { byte_ring r; } fn main() {}",
+        "struct Bad { inbox<u8> q; } fn main() {}",
+        "fn f(byte_ring r) {} fn main() {}",
+        "inbox<u8> f() { fn_unreachable(); } fn fn_unreachable() {}",
+        "fn main() { byte_ring r; }",
+        "fn main() { inbox<u8> q; }",
+    ] {
+        let diags = expect_err_kind(bad, DiagnosticKind::InvalidOperation);
+        assert!(!diags.is_empty());
+    }
+
+    // Reject mismatched element type on `*inbox<T, N>` -> `*inbox<U>`.
+    let mismatch = r#"
+inbox<u16, 4> q16;
+fn take(*inbox<u32> q) {}
+fn main() { take(&q16); }
+"#;
+    expect_err_kind(mismatch, DiagnosticKind::TypeMismatch);
+
+    // Enforce E0011 StaleDmaLease on `*byte_ring` views (`read_slice`, `wait_read`, `grant_write`).
+    let stale_view = r#"
+byte_ring<64> ring;
+task t(*byte_ring rx) {
+    loop {
+        []u8 w = rx.wait_read();
+        rx.consume(1);
+        u8 stale_w = w[0];
+
+        []u8 s = rx.read_slice();
+        rx.consume(s.len);
+        u8 stale_s = s[0];
+
+        []u8 g = rx.grant_write(4) catch { continue; };
+        rx.commit_write(2);
+        u8 stale_g = g[0];
+    }
+}
+fn main() { spawn t(&ring) @normal; }
+"#;
+    let p_stale = zev_parser::parse_str(stale_view).expect("parse stale view");
+    let diags = analyze(&[p_stale]).expect_err("stale view leases must fail");
+    let stale_count = diags
+        .iter()
+        .filter(|d| d.kind == DiagnosticKind::StaleDmaLease)
+        .count();
+    assert_eq!(stale_count, 3, "expected 3 StaleDmaLease errors on *byte_ring");
+}
+
+#[test]
+fn verifies_subsystem_structs_rules_and_isr_isolation() {
+    let good = r#"
+irq IRQ_UART = 17;
+
+struct Channel {
+    byte_ring<64> rx;
+    inbox<u8, 8> tx;
+}
+
+struct DualUart {
+    Channel ch0;
+    Channel ch1;
+    signal ready;
+}
+
+DualUart uarts;
+
+isr uart_rx_isr(*DualUart d) {
+    d.ch0.rx.push_byte(42, boost: @high);
+    d.ch1.tx.post(7);
+    d.ready.notify();
+}
+
+fn check_independent_fields(*DualUart d) {
+    []u8 s0 = d.ch0.rx.read_slice();
+    d.ch1.rx.consume(1); // different field must NOT invalidate ch0.rx
+    if (s0.len > 0) {
+        u8 b = s0[0];
+    }
+    d.ch0.rx.consume(1);
+}
+
+task reader(*byte_ring rx) {
+    loop {
+        []u8 chunk = rx.wait_read();
+        rx.consume(chunk.len);
+    }
+}
+
+fn boot_setup(*DualUart d) {
+    IRQ_UART.attach(uart_rx_isr(&uarts));
+    spawn reader(&d.ch0.rx) @high;
+    spawn reader(&d.ch1.rx) @normal;
+}
+
+fn main() {
+    check_independent_fields(&uarts);
+    boot_setup(&uarts);
+}
+"#;
+    let prog = zev_parser::parse_str(good).expect("parse good subsystem");
+    let model = analyze(&[prog]).expect("good subsystem must pass");
+    assert!(model.structs["Channel"].is_subsystem);
+    assert!(model.structs["DualUart"].is_subsystem);
+    assert_eq!(model.subsystems["uarts"].struct_name, "DualUart");
+    assert_eq!(model.irq_bindings.len(), 1);
+    assert!(matches!(
+        &model.irq_bindings[0].args[0],
+        zev_sema::IrqBindingArg::SubsystemPath { root, root_struct, field_chain }
+            if root == "uarts" && root_struct == "DualUart" && field_chain.is_empty()
+    ));
+    assert_eq!(
+        model.spawned_tasks[0].endpoint_bindings,
+        vec![Some("uarts.ch0.rx".to_string())]
+    );
+    assert_eq!(
+        model.spawned_tasks[1].endpoint_bindings,
+        vec![Some("uarts.ch1.rx".to_string())]
+    );
+
+    // Reject rule (a): mixed raw scalar/array fields and packed subsystem structs.
+    for bad in [
+        "struct Mixed { byte_ring<16> rx; u32 baud; } fn main() {}",
+        "struct NestedMixed { Channel c; u8 tag; } struct Channel { signal s; } fn main() {}",
+        "packed struct PackedSub { byte_ring<16> rx; } fn main() {}",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::InvalidOperation);
+    }
+
+    // Reject rule (b): by-value locals, params, returns, struct literals, from_bytes, and init exprs.
+    let sub_def = "struct S { byte_ring<16> rx; }";
+    for bad in [
+        format!("{sub_def} fn f(S x) {{}} fn main() {{}}"),
+        format!("{sub_def} S f() {{}} fn main() {{}}"),
+        format!("{sub_def} fn main() {{ S local_s; }}"),
+        format!("{sub_def} byte_ring<16> tmp; fn main() {{ S s = S {{ rx: tmp }}; }}"),
+        format!("{sub_def} fn main() {{ [4]u8 b = [0, 0, 0, 0]; S s = S.from_bytes(b[0..4]) catch {{ return; }}; }}"),
+        format!("{sub_def} S s1 = 0; fn main() {{}}"),
+    ] {
+        expect_err_kind(&bad, DiagnosticKind::InvalidOperation);
+    }
+
+    // Reject rule (d): direct global subsystem instance access inside ISR -> E0002.
+    let bad_isr = r#"
+irq IRQ0 = 5;
+struct Sub { byte_ring<16> rx; }
+Sub inst;
+isr bad_handler() {
+    inst.rx.push_byte(1);
+}
+fn main() {
+    IRQ0.attach(bad_handler());
+}
+"#;
+    expect_err_kind(bad_isr, DiagnosticKind::GlobalIsolationViolation);
+}
+
+#[test]
+fn verifies_fmt_ring_typing_boost_and_e0028_overflow() {
+    let good = r#"
+byte_ring<32> tx32;
+
+fn log_view(*byte_ring tx, u32 code) {
+    usize n = fmt_ring(tx, f"err={code}", boost: @high) catch (FmtErr e, usize w) {
+        return;
+    };
+}
+
+fn main() {
+    u32 x = 42;
+    usize a = fmt_ring(&tx32, f"val={x}") or 0;
+    usize b = fmt_ring(&tx32, "raw") or 0;
+    log_view(&tx32, 7);
+}
+"#;
+    let prog = zev_parser::parse_str(good).expect("parse good fmt_ring");
+    let _ = analyze(&[prog]).expect("good fmt_ring should pass");
+
+    // E0028 when static minimum formatted bytes exceed sized `*byte_ring<N>`.
+    let bad_overflow = r#"
+byte_ring<4> tiny;
+fn main() {
+    u32 x = 1;
+    usize w = fmt_ring(&tiny, f"val={x}") or 0;
+}
+"#;
+    expect_err_kind(bad_overflow, DiagnosticKind::FormatBufferTooSmall);
+
+    // Must handle fallible result via `or`/`catch`.
+    let bad_unhandled = r#"
+byte_ring<32> tx;
+fn main() {
+    usize w = fmt_ring(&tx, f"hi");
+}
+"#;
+    expect_err_kind(bad_unhandled, DiagnosticKind::UnhandledFallibleExpr);
+}
+
+
 

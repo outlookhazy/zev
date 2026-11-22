@@ -247,6 +247,35 @@ fn compute_terminator_live_before(
                 }
                 out
             }
+            MirYieldKind::InboxViewRecv {
+                view,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
+                resume_bb,
+                ..
+            }
+            | MirYieldKind::ByteRingViewWaitRead {
+                view,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
+                resume_bb,
+                ..
+            } => {
+                let mut out = block_live(*resume_bb);
+                if let Some(dv) = dst_val {
+                    out.remove(dv);
+                }
+                if let Some(dr) = dst_res {
+                    out.remove(dr);
+                }
+                collect_expr_uses(view, &mut out);
+                if let Some(tv) = timeout_deadline_var {
+                    out.insert(*tv);
+                }
+                out
+            }
             MirYieldKind::InboxSend {
                 target,
                 val_var,
@@ -260,6 +289,25 @@ fn compute_terminator_live_before(
                     out.remove(dr);
                 }
                 collect_prim_target_uses(target, &mut out);
+                out.insert(*val_var);
+                if let Some(tv) = timeout_deadline_var {
+                    out.insert(*tv);
+                }
+                out
+            }
+            MirYieldKind::InboxViewSend {
+                view,
+                val_var,
+                timeout_deadline_var,
+                dst_res,
+                resume_bb,
+                ..
+            } => {
+                let mut out = block_live(*resume_bb);
+                if let Some(dr) = dst_res {
+                    out.remove(dr);
+                }
+                collect_expr_uses(view, &mut out);
                 out.insert(*val_var);
                 if let Some(tv) = timeout_deadline_var {
                     out.insert(*tv);
@@ -374,6 +422,12 @@ fn transfer_stmt(stmt: &MirStmt, live: &mut BTreeSet<VarId>) {
             dst_res,
             buf,
             chunks,
+        }
+        | MirStmt::FmtRing {
+            dst_res,
+            ring: buf,
+            chunks,
+            ..
         } => {
             live.remove(dst_res);
             collect_expr_uses(buf, live);
@@ -504,6 +558,18 @@ fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
         | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
             collect_prim_target_uses(target, uses);
         }
+        MirPrimNonBlockingOp::InboxViewPost { view, value, .. } => {
+            collect_expr_uses(view, uses);
+            collect_expr_uses(value, uses);
+        }
+        MirPrimNonBlockingOp::ByteRingViewConsume { view, len }
+        | MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len, .. } => {
+            collect_expr_uses(view, uses);
+            collect_expr_uses(len, uses);
+        }
+        MirPrimNonBlockingOp::ByteRingViewClear { view } => {
+            collect_expr_uses(view, uses);
+        }
     }
 }
 
@@ -532,6 +598,7 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
         | MirExprKind::EnumVariant { .. }
         | MirExprKind::ConstRef(_)
         | MirExprKind::GlobalPrimAddr(_)
+        | MirExprKind::SubsystemAddr(_)
         | MirExprKind::MmioAddr(_)
         | MirExprKind::FnAddr(_)
         | MirExprKind::ArrayLen(_)
@@ -545,7 +612,8 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
         }
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
-        | MirExprKind::SliceLen(inner) => {
+        | MirExprKind::SliceLen(inner)
+        | MirExprKind::MakePrimView { ptr: inner, .. } => {
             collect_expr_uses(inner, uses);
         }
         MirExprKind::MmioRead { base, index, .. } => {
@@ -617,6 +685,37 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             | MirPrimReadOp::ByteRingIsEmpty { target, .. }
             | MirPrimReadOp::ByteRingIsFull { target, .. } => {
                 collect_prim_target_uses(target, uses);
+            }
+            MirPrimReadOp::InboxViewTrySend { view, value, .. } => {
+                collect_expr_uses(view, uses);
+                collect_expr_uses(value, uses);
+            }
+            MirPrimReadOp::ByteRingViewPush { view, src, .. }
+            | MirPrimReadOp::ByteRingViewPop { view, dst: src } => {
+                collect_expr_uses(view, uses);
+                collect_expr_uses(src, uses);
+            }
+            MirPrimReadOp::ByteRingViewPushByte { view, byte, .. } => {
+                collect_expr_uses(view, uses);
+                collect_expr_uses(byte, uses);
+            }
+            MirPrimReadOp::ByteRingViewGrantWrite { view, len } => {
+                collect_expr_uses(view, uses);
+                collect_expr_uses(len, uses);
+            }
+            MirPrimReadOp::InboxViewTryRecv { view, .. }
+            | MirPrimReadOp::InboxViewLen { view, .. }
+            | MirPrimReadOp::InboxViewCap { view, .. }
+            | MirPrimReadOp::InboxViewIsEmpty { view, .. }
+            | MirPrimReadOp::InboxViewIsFull { view, .. }
+            | MirPrimReadOp::ByteRingViewReadSlice { view }
+            | MirPrimReadOp::ByteRingViewTryPopByte { view }
+            | MirPrimReadOp::ByteRingViewLen { view }
+            | MirPrimReadOp::ByteRingViewCap { view }
+            | MirPrimReadOp::ByteRingViewFreeSpace { view }
+            | MirPrimReadOp::ByteRingViewIsEmpty { view }
+            | MirPrimReadOp::ByteRingViewIsFull { view } => {
+                collect_expr_uses(view, uses);
             }
         },
         MirExprKind::CallDirect { args, .. } => {
@@ -698,8 +797,40 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
             | MirPrimReadOp::ByteRingGrantWrite { len: value, .. } => {
                 collect_addr_of_vars(value, out);
             }
+            MirPrimReadOp::InboxViewTrySend { view, value, .. } => {
+                collect_addr_of_vars(view, out);
+                collect_addr_of_vars(value, out);
+            }
+            MirPrimReadOp::ByteRingViewPush { view, src: value, .. }
+            | MirPrimReadOp::ByteRingViewPop { view, dst: value }
+            | MirPrimReadOp::ByteRingViewPushByte {
+                view,
+                byte: value,
+                ..
+            }
+            | MirPrimReadOp::ByteRingViewGrantWrite { view, len: value } => {
+                collect_addr_of_vars(view, out);
+                collect_addr_of_vars(value, out);
+            }
+            MirPrimReadOp::InboxViewTryRecv { view, .. }
+            | MirPrimReadOp::InboxViewLen { view, .. }
+            | MirPrimReadOp::InboxViewCap { view, .. }
+            | MirPrimReadOp::InboxViewIsEmpty { view, .. }
+            | MirPrimReadOp::InboxViewIsFull { view, .. }
+            | MirPrimReadOp::ByteRingViewReadSlice { view }
+            | MirPrimReadOp::ByteRingViewTryPopByte { view }
+            | MirPrimReadOp::ByteRingViewLen { view }
+            | MirPrimReadOp::ByteRingViewCap { view }
+            | MirPrimReadOp::ByteRingViewFreeSpace { view }
+            | MirPrimReadOp::ByteRingViewIsEmpty { view }
+            | MirPrimReadOp::ByteRingViewIsFull { view } => {
+                collect_addr_of_vars(view, out);
+            }
             _ => {}
         },
+        MirExprKind::MakePrimView { ptr, .. } => {
+            collect_addr_of_vars(ptr, out);
+        }
         _ => {}
     }
 }
@@ -709,6 +840,7 @@ fn type_may_carry_alias(ty: &MirType) -> bool {
         ty,
         MirType::Slice(_)
             | MirType::Ptr(_)
+            | MirType::PrimView(_)
             | MirType::Struct(_)
             | MirType::Array { .. }
             | MirType::Result { .. }
@@ -900,7 +1032,10 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
                 collect_fmt_chunk_addr_of(ch, &mut taken);
             }
         }
-        MirStmt::FmtBuf { buf, chunks, .. } => {
+        MirStmt::FmtBuf { buf, chunks, .. }
+        | MirStmt::FmtRing {
+            ring: buf, chunks, ..
+        } => {
             collect_addr_of_vars(buf, &mut taken);
             for ch in chunks {
                 collect_fmt_chunk_addr_of(ch, &mut taken);
@@ -911,9 +1046,21 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
             | MirPrimNonBlockingOp::InboxPost { value, .. } => {
                 collect_addr_of_vars(value, &mut taken);
             }
+            MirPrimNonBlockingOp::InboxViewPost { view, value, .. } => {
+                collect_addr_of_vars(view, &mut taken);
+                collect_addr_of_vars(value, &mut taken);
+            }
             MirPrimNonBlockingOp::ByteRingConsume { len, .. }
             | MirPrimNonBlockingOp::ByteRingCommitWrite { len, .. } => {
                 collect_addr_of_vars(len, &mut taken);
+            }
+            MirPrimNonBlockingOp::ByteRingViewConsume { view, len }
+            | MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len, .. } => {
+                collect_addr_of_vars(view, &mut taken);
+                collect_addr_of_vars(len, &mut taken);
+            }
+            MirPrimNonBlockingOp::ByteRingViewClear { view } => {
+                collect_addr_of_vars(view, &mut taken);
             }
             _ => {}
         },
@@ -986,6 +1133,14 @@ fn collect_terminator_forced_hoists(
                 timeout_deadline_var: Some(tv),
                 ..
             }
+            | MirYieldKind::InboxViewRecv {
+                timeout_deadline_var: Some(tv),
+                ..
+            }
+            | MirYieldKind::ByteRingViewWaitRead {
+                timeout_deadline_var: Some(tv),
+                ..
+            }
             | MirYieldKind::SignalWait {
                 timeout_deadline_var: Some(tv),
                 ..
@@ -993,6 +1148,11 @@ fn collect_terminator_forced_hoists(
                 force_hoist.insert(*tv);
             }
             MirYieldKind::InboxSend {
+                val_var,
+                timeout_deadline_var,
+                ..
+            }
+            | MirYieldKind::InboxViewSend {
                 val_var,
                 timeout_deadline_var,
                 ..

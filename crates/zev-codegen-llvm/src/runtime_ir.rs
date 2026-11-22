@@ -106,12 +106,14 @@ pub fn emit_kernel_runtime_ir_with_features(
         out,
         r#"; ── Zero-Heap Stream / Bounded-Buffer Format Sink ──
 %SynFmtSink = type {{
-  ptr, ; 0: dst_ptr (bounded byte buffer when is_buf != 0)
+  ptr, ; 0: dst_ptr (bounded byte buffer when is_buf == 1; %SynRingHdr ptr when is_buf == 2)
   i32, ; 1: cap     (capacity in bytes when is_buf != 0)
   i32, ; 2: written (bytes written; clamped to <= cap when is_buf != 0)
   i8,  ; 3: trunc   (1 if output exceeded cap, else 0)
-  i8   ; 4: is_buf  (0 => stream to @__syn_uart_putc; 1 => bounded byte buffer)
+  i8   ; 4: is_buf  (0 => UART; 1 => bounded byte buffer; 2 => byte_ring header/buf)
 }}
+
+%SynRingHdr = type {{ i32, i32, i32, i32, i32, i32, i8, [0 x i8] }}
 "#
     );
     let _ = writeln!(
@@ -3025,6 +3027,25 @@ entry:
   ret void
 }
 
+define weak void @__syn_fmt_init_ring(ptr %sink, ptr %hdr, i32 %cap) #99 {
+entry:
+  %c_neg = icmp slt i32 %cap, 0
+  %c_nonneg = select i1 %c_neg, i32 0, i32 %cap
+  %hdr_null = icmp eq ptr %hdr, null
+  %c_safe = select i1 %hdr_null, i32 0, i32 %c_nonneg
+  %p0 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 0
+  %p1 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 1
+  %p2 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 2
+  %p3 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3
+  %p4 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 4
+  store ptr %hdr, ptr %p0, align 4
+  store i32 %c_safe, ptr %p1, align 4
+  store i32 0, ptr %p2, align 4
+  store i8 0, ptr %p3, align 1
+  store i8 2, ptr %p4, align 1
+  ret void
+}
+
 define weak void @__syn_fmt_putc(ptr %sink, i8 %ch) noinline #99 {
 entry:
   %ib_ptr = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 4
@@ -3032,12 +3053,15 @@ entry:
   %wp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 2
   %w = load i32, ptr %wp, align 4
   %is_uart = icmp eq i8 %ib, 0
-  br i1 %is_uart, label %to_uart, label %to_buf
+  br i1 %is_uart, label %to_uart, label %chk_ring
 to_uart:
   call void @__syn_uart_putc(i8 %ch)
   %wu = add i32 %w, 1
   store i32 %wu, ptr %wp, align 4
   ret void
+chk_ring:
+  %is_ring = icmp eq i8 %ib, 2
+  br i1 %is_ring, label %to_ring, label %to_buf
 to_buf:
   %cp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 1
   %cap = load i32, ptr %cp, align 4
@@ -3054,6 +3078,50 @@ write_byte:
 mark_trunc:
   %tp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3
   store i8 1, ptr %tp, align 1
+  ret void
+to_ring:
+  %r_pm = call i32 @__syn_crit_enter()
+  %r_dp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 0
+  %r = load ptr, ptr %r_dp, align 4
+  %r_cp_s = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 1
+  %r_cap = load i32, ptr %r_cp_s, align 4
+  %r_no_cap = icmp ule i32 %r_cap, 0
+  br i1 %r_no_cap, label %ring_trunc, label %ring_chk
+ring_chk:
+  %r_gcp = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 5
+  store i32 0, ptr %r_gcp, align 4
+  %r_sep = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 3
+  %r_se = load i32, ptr %r_sep, align 4
+  %r_hp = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 0
+  %r_h = load i32, ptr %r_hp, align 4
+  %r_tp = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 1
+  %r_t = load i32, ptr %r_tp, align 4
+  %r_cntp = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 2
+  %r_cnt = load i32, ptr %r_cntp, align 4
+  %r_has_se = icmp ugt i32 %r_se, 0
+  %r_fs_se = sub i32 %r_h, %r_t
+  %r_fs_no = sub i32 %r_cap, %r_cnt
+  %r_fs = select i1 %r_has_se, i32 %r_fs_se, i32 %r_fs_no
+  %r_fit = icmp ugt i32 %r_fs, 0
+  br i1 %r_fit, label %ring_wr, label %ring_trunc
+ring_wr:
+  %r_bp = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 7, i32 %r_t
+  store i8 %ch, ptr %r_bp, align 1
+  %r_t1 = add i32 %r_t, 1
+  %r_wrap = icmp uge i32 %r_t1, %r_cap
+  %r_nt_circ = select i1 %r_wrap, i32 0, i32 %r_t1
+  %r_nt = select i1 %r_has_se, i32 %r_t1, i32 %r_nt_circ
+  store i32 %r_nt, ptr %r_tp, align 4
+  %r_c1 = add i32 %r_cnt, 1
+  store i32 %r_c1, ptr %r_cntp, align 4
+  %r_w1 = add i32 %w, 1
+  store i32 %r_w1, ptr %wp, align 4
+  call void @__syn_crit_exit(i32 %r_pm)
+  ret void
+ring_trunc:
+  %r_trp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3
+  store i8 1, ptr %r_trp, align 1
+  call void @__syn_crit_exit(i32 %r_pm)
   ret void
 }
 

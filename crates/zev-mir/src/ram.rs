@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::ir::{
-    MirChildCallSlot, MirFnBody, MirFunction, MirIrqVector, MirModule, MirPrimKind, MirPrimitive,
-    MirPriority, MirSpawnInstance, MirStruct, MirTaskBlueprint, MirType, MirVar,
-    MonomorphizedItemKind, MonomorphizedMirItem, VarRole,
+    MirChildCallSlot, MirFnBody, MirFunction, MirIrqVector, MirModule, MirPrimKind,
+    MirPrimViewKind, MirPrimitive, MirPriority, MirSpawnInstance, MirStruct, MirSubsystemGlobal,
+    MirTaskBlueprint, MirType, MirVar, MonomorphizedItemKind, MonomorphizedMirItem, VarRole,
 };
 
 /// Target data-model parameters for C/ABI struct layout calculation.
@@ -532,6 +532,8 @@ impl<'a> LayoutCtx<'a> {
                 SizeAlign::new(el.size * len, el.align)
             }
             MirType::Primitive(pk) => self.prim_layout(pk, false, abi),
+            MirType::PrimView(MirPrimViewKind::ByteRing) => SizeAlign::new(ptr * 2, ptr),
+            MirType::PrimView(MirPrimViewKind::Inbox { .. }) => SizeAlign::new(ptr * 3, ptr),
             MirType::Result { ok, err } => {
                 let mut fields = vec![SizeAlign::new(1, 1)]; // bool is_err
                 if let Some(et) = err {
@@ -567,17 +569,24 @@ impl<'a> LayoutCtx<'a> {
                 self.struct_layout(&[el, SizeAlign::new(4, 4)], false)
             }
             MirPrimKind::Inbox { elem, cap } => {
-                // `{ T buf[N]; uint8_t boost_buf[N]; syn_task_t *rx_waiter; syn_task_t *tx_waiter; uint16_t head, tail, count; }`
+                // `{ syn_inbox_hdr_t hdr; T buf[N]; uint8_t boost_buf[N]; }`
+                let hdr = self.struct_layout(
+                    &[
+                        SizeAlign::new(ptr, ptr),
+                        SizeAlign::new(ptr, ptr),
+                        SizeAlign::new(2, 2),
+                        SizeAlign::new(2, 2),
+                        SizeAlign::new(2, 2),
+                        SizeAlign::new(2, 2),
+                    ],
+                    false,
+                );
                 let el = self.type_layout(elem, abi);
                 self.struct_layout(
                     &[
+                        hdr,
                         SizeAlign::new(el.size * cap, el.align),
                         SizeAlign::new(*cap, 1),
-                        SizeAlign::new(ptr, ptr),
-                        SizeAlign::new(ptr, ptr),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(2, 2),
                     ],
                     false,
                 )
@@ -615,10 +624,9 @@ impl<'a> LayoutCtx<'a> {
                 )
             }
             MirPrimKind::ByteRing { cap } => {
-                // `{ uint8_t buf[N]; syn_task_t *rx_waiter; uint32_t head, tail, count, split_end, grant_off, grant_cap; uint8_t boost_prio; }`
-                self.struct_layout(
+                // `{ syn_ring_hdr_t hdr; uint8_t buf[N]; }`
+                let hdr = self.struct_layout(
                     &[
-                        SizeAlign::new(*cap, 1),
                         SizeAlign::new(ptr, ptr),
                         SizeAlign::new(4, 4),
                         SizeAlign::new(4, 4),
@@ -629,7 +637,8 @@ impl<'a> LayoutCtx<'a> {
                         SizeAlign::new(1, 1),
                     ],
                     false,
-                )
+                );
+                self.struct_layout(&[hdr, SizeAlign::new(*cap, 1)], false)
             }
         };
 
@@ -666,6 +675,17 @@ fn scheduler_bytes(abi: TargetAbi) -> usize {
     }
 }
 
+fn struct_holds_dma_sleep_lock(name: &str, structs: &BTreeMap<&str, &MirStruct>) -> bool {
+    let Some(st) = structs.get(name) else {
+        return false;
+    };
+    st.fields.iter().any(|f| match &f.ty {
+        MirType::Primitive(pk) => pk.holds_dma_sleep_lock(),
+        MirType::Struct(sub) => struct_holds_dma_sleep_lock(sub, structs),
+        _ => false,
+    })
+}
+
 /// Compute the complete static `RamReport` for `module` and store it in `module.ram_report`.
 pub fn compute_ram_report(
     structs: &[MirStruct],
@@ -673,6 +693,28 @@ pub fn compute_ram_report(
     blueprints: &[MirTaskBlueprint],
     spawned: &[MirSpawnInstance],
     primitives: &[MirPrimitive],
+    irq_vectors: &[MirIrqVector],
+    boot_yielding_callees: &[String],
+) -> RamReport {
+    compute_ram_report_with_subsystems(
+        structs,
+        functions,
+        blueprints,
+        spawned,
+        primitives,
+        &[],
+        irq_vectors,
+        boot_yielding_callees,
+    )
+}
+
+pub fn compute_ram_report_with_subsystems(
+    structs: &[MirStruct],
+    functions: &[MirFunction],
+    blueprints: &[MirTaskBlueprint],
+    spawned: &[MirSpawnInstance],
+    primitives: &[MirPrimitive],
+    subsystems: &[MirSubsystemGlobal],
     irq_vectors: &[MirIrqVector],
     boot_yielding_callees: &[String],
 ) -> RamReport {
@@ -794,6 +836,29 @@ pub fn compute_ram_report(
             kind_display: p.kind.display_name(),
             dma_safe: p.dma_safe,
             holds_sleep_lock: p.kind.holds_dma_sleep_lock(),
+            bytes_32: s32,
+            bytes_64: s64,
+        });
+    }
+    for sub in subsystems {
+        let ty = MirType::Struct(sub.struct_name.clone());
+        let l32 = ctx.type_layout(&ty, TargetAbi::Mcu32);
+        let l64 = ctx.type_layout(&ty, TargetAbi::Host64);
+        let s32 = if sub.dma_safe {
+            align_up(l32.size, l32.align.max(4))
+        } else {
+            l32.size
+        };
+        let s64 = if sub.dma_safe {
+            align_up(l64.size, l64.align.max(4))
+        } else {
+            l64.size
+        };
+        prim_rams.push(PrimitiveRam {
+            name: sub.name.clone(),
+            kind_display: sub.struct_name.clone(),
+            dma_safe: sub.dma_safe,
+            holds_sleep_lock: struct_holds_dma_sleep_lock(&sub.struct_name, &ctx.structs),
             bytes_32: s32,
             bytes_64: s64,
         });
@@ -1104,12 +1169,13 @@ fn build_frame_report(
 
 /// Recompute `module.ram_report` in-place (including `monomorphized_instances` ABI sizes).
 pub fn populate_module_ram_report(module: &mut MirModule) {
-    let mut rep = compute_ram_report(
+    let mut rep = compute_ram_report_with_subsystems(
         &module.structs,
         &module.functions,
         &module.task_blueprints,
         &module.spawned_tasks,
         &module.primitives,
+        &module.subsystems,
         &module.irq_vectors,
         &module.boot.boot_yielding_callees,
     );

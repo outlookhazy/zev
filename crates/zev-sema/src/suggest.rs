@@ -142,10 +142,10 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             (direct, table)
         }
 
-        ResolvedOsPrimitive::Inbox { elem, .. } => {
+        ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => {
             let valid = [
-                "post", "try_post", "send", "try_send", "recv", "try_recv", "len", "is_empty",
-                "is_full",
+                "post", "try_post", "send", "try_send", "recv", "try_recv", "len", "cap",
+                "is_empty", "is_full",
             ];
             let direct = match method {
                 "push" | "put" | "enqueue" | "write" | "publish" | "emit" | "notify" => {
@@ -161,7 +161,7 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
                 _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
             };
             let table = format!(
-                "valid methods on `{}`: `.post({} val [, boost: @prio])`, `.send({} val [, timeout: <dur>])`, `.try_send({} val) -> bool`, `.recv([timeout: <dur>]) -> {}`, `.try_recv() -> {} error`, `.len()`, `.is_empty()`, `.is_full()`",
+                "valid methods on `{}`: `.post({} val [, boost: @prio])`, `.send({} val [, timeout: <dur>])`, `.try_send({} val) -> bool`, `.recv([timeout: <dur>]) -> {}`, `.try_recv() -> {} error`, `.len()`, `.cap()`, `.is_empty()`, `.is_full()`",
                 prim, elem, elem, elem, elem, elem
             );
             (direct, table)
@@ -227,7 +227,7 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             (direct, table)
         }
 
-        ResolvedOsPrimitive::ByteRing { .. } => {
+        ResolvedOsPrimitive::ByteRing { .. } | ResolvedOsPrimitive::ByteRingUnsized => {
             let valid = [
                 "push",
                 "push_byte",

@@ -8,8 +8,9 @@ use zev_mir::{
     BlockId, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootStep, MirCallDst,
     MirChildCallSlot, MirErrorSpec, MirExpr, MirExprKind, MirFloatFmt, MirFmtChunk, MirFnBody,
     MirFunction, MirIntFmt, MirIntrinsicOp, MirIsr, MirModule, MirPlace, MirPrimKind,
-    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern,
-    MirSysQuery, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
+    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirStmt, MirStruct,
+    MirSwitchPattern, MirSysQuery, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId,
+    VarRole,
 };
 
 use crate::runtime::c99_runtime_preamble;
@@ -56,6 +57,8 @@ struct C99Emitter<'a> {
     task_param_names: BTreeMap<String, Vec<(VarId, MirType)>>,
     builtin_c_syms: BTreeSet<String>,
     uses_float_sci: bool,
+    inbox_views: BTreeMap<String, MirType>,
+    uses_byte_ring_view: bool,
 }
 
 impl<'a> C99Emitter<'a> {
@@ -127,6 +130,8 @@ impl<'a> C99Emitter<'a> {
             task_param_names,
             builtin_c_syms,
             uses_float_sci: false,
+            inbox_views: BTreeMap::new(),
+            uses_byte_ring_view: false,
         }
     }
 
@@ -311,13 +316,16 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
 "#,
         );
 
-        // 3. Enums & Structs (plus forward declarations, slices, arrays, results, `from_bytes`)
+        // 3. Enums & Value Structs (plus forward declarations, slices, arrays, results, views, `from_bytes`)
         self.emit_enums_and_structs();
 
         // 4. Concrete OS Primitive Types & Helpers
         self.emit_primitive_types();
 
-        // 5. Top-level Constants, Static OS Primitive Instances, and `extern "C"` Prototypes
+        // 4b. Subsystem Structs (containing concrete OS primitives)
+        self.emit_subsystem_structs();
+
+        // 5. Top-level Constants, Static OS Primitive Instances, & `extern "C"` Prototypes
         self.emit_globals_and_externs();
 
         // 6. Coroutine Frame Structs (topologically ordered) + Static Task Slots & TCB Table
@@ -348,11 +356,13 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             for f in &st.fields {
                 self.register_type(&f.ty);
             }
-            // Register Result type for `<Struct>.from_bytes(...)`
-            self.register_type(&MirType::Result {
-                ok: Box::new(MirType::Struct(st.name.clone())),
-                err: None,
-            });
+            // Register Result type for `<Struct>.from_bytes(...)` (wire structs only)
+            if !st.is_subsystem {
+                self.register_type(&MirType::Result {
+                    ok: Box::new(MirType::Struct(st.name.clone())),
+                    err: None,
+                });
+            }
         }
         for c in &self.m.consts {
             self.register_type(&c.ty);
@@ -458,6 +468,24 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             }
             MirType::Ptr(inner) => self.register_type(inner),
             MirType::Primitive(pk) => self.register_prim_kind(pk),
+            MirType::PrimView(vk) => match vk {
+                MirPrimViewKind::ByteRing => {
+                    self.uses_byte_ring_view = true;
+                    let sl = MirType::Slice(Box::new(MirType::U8));
+                    self.register_type(&sl);
+                    self.register_type(&MirType::Result {
+                        ok: Box::new(MirType::U8),
+                        err: None,
+                    });
+                    self.register_type(&MirType::Result {
+                        ok: Box::new(sl),
+                        err: None,
+                    });
+                }
+                MirPrimViewKind::Inbox { elem } => {
+                    self.register_inbox_view(elem);
+                }
+            },
             MirType::FnPtr { params, ret } => {
                 for p in params {
                     self.register_type(p);
@@ -480,6 +508,18 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
         }
     }
 
+    fn register_inbox_view(&mut self, elem: &MirType) {
+        self.register_type(elem);
+        self.register_type(&MirType::Result {
+            ok: Box::new(elem.clone()),
+            err: None,
+        });
+        let key = elem.mangle_name();
+        if !self.inbox_views.contains_key(&key) {
+            self.inbox_views.insert(key, elem.clone());
+        }
+    }
+
     fn register_prim_kind(&mut self, pk: &MirPrimKind) {
         match pk {
             MirPrimKind::Signal => {}
@@ -487,11 +527,7 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 self.register_type(elem);
             }
             MirPrimKind::Inbox { elem, .. } => {
-                self.register_type(elem);
-                self.register_type(&MirType::Result {
-                    ok: elem.clone(),
-                    err: None,
-                });
+                self.register_inbox_view(elem);
             }
             MirPrimKind::PingPong { elem, .. } | MirPrimKind::Lease { elem, .. } => {
                 self.register_type(elem);
@@ -619,6 +655,26 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                     self.register_prim_target(target);
                     self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
                 }
+                MirPrimNonBlockingOp::InboxViewPost {
+                    view,
+                    elem_ty,
+                    value,
+                    ..
+                } => {
+                    self.register_expr(view);
+                    self.register_inbox_view(elem_ty);
+                    self.register_expr(value);
+                }
+                MirPrimNonBlockingOp::ByteRingViewConsume { view, len }
+                | MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len, .. } => {
+                    self.register_expr(view);
+                    self.uses_byte_ring_view = true;
+                    self.register_expr(len);
+                }
+                MirPrimNonBlockingOp::ByteRingViewClear { view } => {
+                    self.register_expr(view);
+                    self.uses_byte_ring_view = true;
+                }
             },
             MirStmt::Intrinsic(intr) => match intr {
                 MirIntrinsicOp::UseSystick { hz } => self.register_expr(hz),
@@ -683,6 +739,17 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                     self.register_expr(idx);
                 }
                 self.register_expr(value);
+            }
+            MirStmt::FmtRing { ring, chunks, .. } => {
+                self.register_expr(ring);
+                self.uses_byte_ring_view = true;
+                for ch in chunks {
+                    self.register_fmt_chunk(ch);
+                }
+                self.register_type(&MirType::Result {
+                    ok: Box::new(MirType::Usize),
+                    err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
+                });
             }
             _ => {}
         }
@@ -776,6 +843,48 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 } => {
                     self.register_prim_target(target);
                     self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                    if dst_res.is_some() {
+                        self.register_type(&MirType::Result {
+                            ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+                            err: None,
+                        });
+                    }
+                }
+                MirYieldKind::InboxViewRecv {
+                    view,
+                    elem_ty,
+                    dst_res,
+                    ..
+                } => {
+                    self.register_expr(view);
+                    self.register_inbox_view(elem_ty);
+                    if dst_res.is_some() {
+                        self.register_type(&MirType::Result {
+                            ok: Box::new(elem_ty.clone()),
+                            err: None,
+                        });
+                    }
+                }
+                MirYieldKind::InboxViewSend {
+                    view,
+                    elem_ty,
+                    dst_res,
+                    ..
+                } => {
+                    self.register_expr(view);
+                    self.register_inbox_view(elem_ty);
+                    if dst_res.is_some() {
+                        self.register_type(&MirType::Result {
+                            ok: Box::new(MirType::Void),
+                            err: None,
+                        });
+                    }
+                }
+                MirYieldKind::ByteRingViewWaitRead {
+                    view, dst_res, ..
+                } => {
+                    self.register_expr(view);
+                    self.uses_byte_ring_view = true;
                     if dst_res.is_some() {
                         self.register_type(&MirType::Result {
                             ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
@@ -885,6 +994,49 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                         cap: *cap,
                     });
                 }
+                MirPrimReadOp::InboxViewTryRecv { view, elem_ty } => {
+                    self.register_expr(view);
+                    self.register_inbox_view(elem_ty);
+                }
+                MirPrimReadOp::InboxViewTrySend {
+                    view,
+                    elem_ty,
+                    value,
+                    ..
+                } => {
+                    self.register_expr(view);
+                    self.register_inbox_view(elem_ty);
+                    self.register_expr(value);
+                }
+                MirPrimReadOp::InboxViewLen { view, elem_ty }
+                | MirPrimReadOp::InboxViewCap { view, elem_ty }
+                | MirPrimReadOp::InboxViewIsEmpty { view, elem_ty }
+                | MirPrimReadOp::InboxViewIsFull { view, elem_ty } => {
+                    self.register_expr(view);
+                    self.register_inbox_view(elem_ty);
+                }
+                MirPrimReadOp::ByteRingViewPush {
+                    view, src: val, ..
+                }
+                | MirPrimReadOp::ByteRingViewPop { view, dst: val }
+                | MirPrimReadOp::ByteRingViewPushByte {
+                    view, byte: val, ..
+                }
+                | MirPrimReadOp::ByteRingViewGrantWrite { view, len: val } => {
+                    self.register_expr(view);
+                    self.uses_byte_ring_view = true;
+                    self.register_expr(val);
+                }
+                MirPrimReadOp::ByteRingViewReadSlice { view }
+                | MirPrimReadOp::ByteRingViewTryPopByte { view }
+                | MirPrimReadOp::ByteRingViewLen { view }
+                | MirPrimReadOp::ByteRingViewCap { view }
+                | MirPrimReadOp::ByteRingViewFreeSpace { view }
+                | MirPrimReadOp::ByteRingViewIsEmpty { view }
+                | MirPrimReadOp::ByteRingViewIsFull { view } => {
+                    self.register_expr(view);
+                    self.uses_byte_ring_view = true;
+                }
                 MirPrimReadOp::SignalIsSet { target } | MirPrimReadOp::SignalTryWait { target } => {
                     self.register_prim_target(target);
                     self.register_prim_kind(&MirPrimKind::Signal);
@@ -941,6 +1093,23 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 self.register_expr(base);
                 if let Some(idx) = index {
                     self.register_expr(idx);
+                }
+            }
+            MirExprKind::MakePrimView { ptr, kind, .. } => {
+                self.register_expr(ptr);
+                match kind {
+                    MirPrimViewKind::ByteRing => {
+                        self.uses_byte_ring_view = true;
+                        self.register_type(&MirType::Result {
+                            ok: Box::new(MirType::U8),
+                            err: None,
+                        });
+                        self.register_type(&MirType::Result {
+                            ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+                            err: None,
+                        });
+                    }
+                    MirPrimViewKind::Inbox { elem } => self.register_inbox_view(elem),
                 }
             }
             _ => {}
@@ -1009,6 +1178,10 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirType::Array { .. } => format!("syn_{}_t", ty.mangle_name()),
             MirType::Ptr(inner) => format!("{} *", self.c_type(inner)),
             MirType::Primitive(pk) => format!("syn_{}_t", pk.mangle_name()),
+            MirType::PrimView(MirPrimViewKind::ByteRing) => "syn_view_byte_ring_t".to_string(),
+            MirType::PrimView(MirPrimViewKind::Inbox { elem }) => {
+                format!("syn_view_inbox_{}_t", elem.mangle_name())
+            }
             MirType::MmioPtr(_) => "volatile uint8_t *".to_string(),
             MirType::FnPtr { .. } => format!("syn_{}_t", ty.mangle_name()),
             MirType::Result { .. } => format!("syn_{}_t", ty.mangle_name()),
@@ -1035,6 +1208,15 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirType::F64 => "0.0".to_string(),
             MirType::Str | MirType::Ptr(_) | MirType::MmioPtr(_) | MirType::FnPtr { .. } => {
                 "NULL".to_string()
+            }
+            MirType::PrimView(MirPrimViewKind::ByteRing) => {
+                "((syn_view_byte_ring_t){ .hdr = NULL, .buf = NULL, .cap = 0U })".to_string()
+            }
+            MirType::PrimView(MirPrimViewKind::Inbox { .. }) => {
+                format!(
+                    "(({}){{ .hdr = NULL, .buf = NULL, .boost_buf = NULL, .cap = 0U }})",
+                    self.c_type(ty)
+                )
             }
             MirType::Enum(name) => format!("((syn_enum_{name})0)"),
             MirType::EndianInt {
@@ -1106,12 +1288,13 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             }
         }
 
-        // Forward-declare structs, fixed-size arrays, slices, results, & primitives so pointer/fnptr/slice typedefs can reference any of them
+        // Forward-declare structs, fixed-size arrays, slices, results, primitives, & inbox views so pointer/fnptr/slice typedefs can reference any of them
         let arrays_snapshot = self.arrays.clone();
         let slices_snapshot = self.slices.clone();
         let fn_ptrs_snapshot = self.fn_ptrs.clone();
         let results_snapshot = self.results.clone();
         let prims_snapshot = self.prims.clone();
+        let inbox_views_snapshot = self.inbox_views.clone();
 
         for st in &self.m.structs {
             let _ = writeln!(
@@ -1148,11 +1331,19 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 mangle
             );
         }
+        for mangle in inbox_views_snapshot.keys() {
+            let _ = writeln!(
+                self.out,
+                "typedef struct syn_view_inbox_{0}_t syn_view_inbox_{0}_t;",
+                mangle
+            );
+        }
         if !self.m.structs.is_empty()
             || !arrays_snapshot.is_empty()
             || !slices_snapshot.is_empty()
             || !results_snapshot.is_empty()
             || !prims_snapshot.is_empty()
+            || !inbox_views_snapshot.is_empty()
         {
             self.out.push('\n');
         }
@@ -1172,9 +1363,19 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             self.emit_slice_topo(mangle, elem, &slices_snapshot, &mut emitted_slices);
         }
 
-        // Joint topological emission over `{ struct bodies ∪ fixed-size array wrappers }` so every
+        // Emit inbox view struct bodies BEFORE value structs/arrays so value structs can hold `*inbox<T>` fields
+        for (em, elem) in &inbox_views_snapshot {
+            let ec = self.c_type(elem);
+            let _ = writeln!(
+                self.out,
+                "struct syn_view_inbox_{em}_t {{\n    syn_inbox_hdr_t *hdr;\n    {ec} *buf;\n    uint8_t *boost_buf;\n    size_t cap;\n}};\n"
+            );
+        }
+
+        // Joint topological emission over `{ value struct bodies ∪ fixed-size array wrappers }` so every
         // by-value dependency (`[N]SomeStruct`, `FixedVec<FixedVec<u8, 2>, 2>`, reverse-declared
         // outer-before-inner structs) is defined before its dependent type!
+        // Subsystem structs are emitted AFTER `emit_primitive_types()` so embedded OS primitives are complete.
         let structs_by_name: BTreeMap<&str, &MirStruct> =
             self.m.structs.iter().map(|s| (s.name.as_str(), s)).collect();
         let mut emitted_structs: BTreeSet<String> = BTreeSet::new();
@@ -1192,13 +1393,15 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             );
         }
         for st in &self.m.structs {
-            self.emit_struct_topo(
-                st,
-                &structs_by_name,
-                &arrays_snapshot,
-                &mut emitted_structs,
-                &mut emitted_arrays,
-            );
+            if !st.is_subsystem {
+                self.emit_struct_topo(
+                    st,
+                    &structs_by_name,
+                    &arrays_snapshot,
+                    &mut emitted_structs,
+                    &mut emitted_arrays,
+                );
+            }
         }
 
         // Emit slice subslice helpers AFTER all struct/array bodies are complete (so `s.ptr + start` has complete sizeof!)
@@ -1224,8 +1427,41 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             let _ = writeln!(self.out, "}};\n");
         }
 
-        // Emit `<Struct>_from_bytes(syn_slice_u8)` helpers
+        // Emit Result-returning view wrappers once Result structs are complete
+        if self.uses_byte_ring_view {
+            let res_u8 = MirType::Result {
+                ok: Box::new(MirType::U8),
+                err: None,
+            }
+            .mangle_name();
+            let res_sl = MirType::Result {
+                ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+                err: None,
+            }
+            .mangle_name();
+            let _ = writeln!(
+                self.out,
+                "static SYN_UNUSED inline syn_{res_u8}_t syn_ring_view_try_pop_byte(syn_view_byte_ring_t v, syn_task_t *task) {{\n    uint8_t _b = 0U;\n    if (syn_ring_view_try_pop_byte_raw(v, task, &_b)) {{\n        return (syn_{res_u8}_t){{ .is_err = false, .val = _b }};\n    }}\n    return (syn_{res_u8}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline syn_{res_sl}_t syn_ring_view_grant_write(syn_view_byte_ring_t v, size_t req_sz) {{\n    syn_slice_u8 _sl = {{ .ptr = NULL, .len = 0U }};\n    if (syn_ring_view_grant_write_raw(v, req_sz, &_sl)) {{\n        return (syn_{res_sl}_t){{ .is_err = false, .val = _sl }};\n    }}\n    return (syn_{res_sl}_t){{ .is_err = true }};\n}}\n"
+            );
+        }
+        for (em, elem) in &inbox_views_snapshot {
+            let ec = self.c_type(elem);
+            let res_mangle = MirType::Result {
+                ok: Box::new(elem.clone()),
+                err: None,
+            }
+            .mangle_name();
+            let _ = writeln!(
+                self.out,
+                "static SYN_UNUSED inline bool syn_view_inbox_{em}_post(syn_view_inbox_{em}_t v, {ec} item, uint8_t boost_prio) {{\n    syn_enter_critical();\n    if (v.cap == 0U || (size_t)v.hdr->count >= v.cap) {{\n        syn_exit_critical();\n        return false;\n    }}\n    v.buf[v.hdr->tail] = item;\n    v.boost_buf[v.hdr->tail] = boost_prio;\n    v.hdr->tail = (uint16_t)(((size_t)v.hdr->tail + 1U) % v.cap);\n    v.hdr->count++;\n    syn_task_t *rw = v.hdr->rx_waiter;\n    v.hdr->rx_waiter = NULL;\n    if (rw != NULL) {{\n        syn_task_wake_from_isr_or_task(rw, boost_prio);\n    }}\n    syn_exit_critical();\n    return true;\n}}\nstatic SYN_UNUSED inline bool syn_view_inbox_{em}_try_pop(syn_view_inbox_{em}_t v, syn_task_t *task, {ec} *out_item) {{\n    syn_enter_critical();\n    if (v.cap == 0U || v.hdr->count == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    *out_item = v.buf[v.hdr->head];\n    uint8_t bp = v.boost_buf[v.hdr->head];\n    v.hdr->head = (uint16_t)(((size_t)v.hdr->head + 1U) % v.cap);\n    v.hdr->count--;\n    if (v.hdr->rx_waiter == task) {{ v.hdr->rx_waiter = NULL; }}\n    syn_task_t *tw = v.hdr->tx_waiter;\n    v.hdr->tx_waiter = NULL;\n    if (tw != NULL) {{\n        syn_task_wake_from_isr_or_task(tw, SYN_NO_BOOST);\n    }}\n    syn_exit_critical();\n    if (task != NULL && bp < SYN_PRIO_LEVELS) {{\n        syn_task_apply_boost(task, bp);\n    }}\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_view_inbox_{em}_try_recv(syn_view_inbox_{em}_t v) {{\n    {ec} _item;\n    if (syn_view_inbox_{em}_try_pop(v, g_syn_sched.running, &_item)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _item }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_arm_rx(syn_view_inbox_{em}_t v, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (v.hdr->count > 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    v.hdr->rx_waiter = task;\n    task->wait_check = syn_inbox_hdr_rx_ready;\n    task->wait_obj = v.hdr;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_cancel_rx(syn_view_inbox_{em}_t v, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (v.hdr->rx_waiter == task) {{ v.hdr->rx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_arm_tx(syn_view_inbox_{em}_t v, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (v.hdr->tx_cap == 0U) {{ v.hdr->tx_cap = (uint16_t)v.cap; }}\n    if ((size_t)v.hdr->count < v.cap) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    v.hdr->tx_waiter = task;\n    task->wait_check = syn_inbox_hdr_tx_ready;\n    task->wait_obj = v.hdr;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_cancel_tx(syn_view_inbox_{em}_t v, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (v.hdr->tx_waiter == task) {{ v.hdr->tx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline bool syn_view_inbox_{em}_is_full(syn_view_inbox_{em}_t v) {{\n    return v.cap == 0U || (size_t)v.hdr->count >= v.cap;\n}}\n"
+            );
+        }
+
+        // Emit `<Struct>_from_bytes(syn_slice_u8)` helpers for wire-value structs
         for st in &self.m.structs {
+            if st.is_subsystem {
+                continue;
+            }
             let res_mangle = MirType::Result {
                 ok: Box::new(MirType::Struct(st.name.clone())),
                 err: None,
@@ -1508,6 +1744,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 }
                 MirPrimKind::Inbox { elem, cap } => {
                     let ec = self.c_type(elem);
+                    let em = elem.mangle_name();
                     let n = (*cap).max(1);
                     let res_mangle = MirType::Result {
                         ok: elem.clone(),
@@ -1516,7 +1753,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     .mangle_name();
                     let _ = writeln!(
                         self.out,
-                        "struct syn_{mangle}_t {{\n    {ec} buf[{n}];\n    uint8_t boost_buf[{n}];\n    syn_task_t *rx_waiter;\n    syn_task_t *tx_waiter;\n    uint16_t head;\n    uint16_t tail;\n    volatile uint16_t count;\n}};\n\nstatic SYN_UNUSED inline bool syn_{mangle}_rx_ready(void *obj) {{\n    const syn_{mangle}_t *q = (const syn_{mangle}_t *)obj;\n    return q != NULL && q->count > 0U;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_tx_ready(void *obj) {{\n    const syn_{mangle}_t *q = (const syn_{mangle}_t *)obj;\n    return q != NULL && q->count < {n}U;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_post(syn_{mangle}_t *q, {ec} item, uint8_t boost_prio) {{\n    syn_enter_critical();\n    if (q->count >= {n}U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    q->buf[q->tail] = item;\n    q->boost_buf[q->tail] = boost_prio;\n    q->tail = (uint16_t)((q->tail + 1U) % {n}U);\n    q->count++;\n    syn_task_t *rw = q->rx_waiter;\n    q->rx_waiter = NULL;\n    if (rw != NULL) {{\n        syn_task_wake_from_isr_or_task(rw, boost_prio);\n    }}\n    syn_exit_critical();\n    return true;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_pop(syn_{mangle}_t *q, syn_task_t *task, {ec} *out_item) {{\n    syn_enter_critical();\n    if (q->count == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    *out_item = q->buf[q->head];\n    uint8_t bp = q->boost_buf[q->head];\n    q->head = (uint16_t)((q->head + 1U) % {n}U);\n    q->count--;\n    if (q->rx_waiter == task) {{ q->rx_waiter = NULL; }}\n    syn_task_t *tw = q->tx_waiter;\n    q->tx_waiter = NULL;\n    if (tw != NULL) {{\n        syn_task_wake_from_isr_or_task(tw, SYN_NO_BOOST);\n    }}\n    syn_exit_critical();\n    if (task != NULL && bp < SYN_PRIO_LEVELS) {{\n        syn_task_apply_boost(task, bp);\n    }}\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_{mangle}_try_recv(syn_{mangle}_t *q) {{\n    {ec} _item;\n    if (syn_{mangle}_try_pop(q, g_syn_sched.running, &_item)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _item }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_rx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (q->count > 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    q->rx_waiter = task;\n    task->wait_check = syn_{mangle}_rx_ready;\n    task->wait_obj = q;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (q->rx_waiter == task) {{ q->rx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_tx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (q->count < {n}U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    q->tx_waiter = task;\n    task->wait_check = syn_{mangle}_tx_ready;\n    task->wait_obj = q;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_tx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (q->tx_waiter == task) {{ q->tx_waiter = NULL; }}\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    syn_inbox_hdr_t hdr;\n    {ec} buf[{n}];\n    uint8_t boost_buf[{n}];\n}};\n\nstatic SYN_UNUSED inline syn_view_inbox_{em}_t syn_{mangle}_view(syn_{mangle}_t *q) {{\n    return (syn_view_inbox_{em}_t){{ .hdr = &q->hdr, .buf = &q->buf[0], .boost_buf = &q->boost_buf[0], .cap = (size_t){n}U }};\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_post(syn_{mangle}_t *q, {ec} item, uint8_t boost_prio) {{\n    return syn_view_inbox_{em}_post(syn_{mangle}_view(q), item, boost_prio);\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_pop(syn_{mangle}_t *q, syn_task_t *task, {ec} *out_item) {{\n    return syn_view_inbox_{em}_try_pop(syn_{mangle}_view(q), task, out_item);\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_{mangle}_try_recv(syn_{mangle}_t *q) {{\n    return syn_view_inbox_{em}_try_recv(syn_{mangle}_view(q));\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_rx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_view_inbox_{em}_arm_rx(syn_{mangle}_view(q), task, has_to, dl);\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_view_inbox_{em}_cancel_rx(syn_{mangle}_view(q), task);\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_tx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_view_inbox_{em}_arm_tx(syn_{mangle}_view(q), task, has_to, dl);\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_tx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_view_inbox_{em}_cancel_tx(syn_{mangle}_view(q), task);\n}}\n"
                     );
                 }
                 MirPrimKind::PingPong { elem, cap } => {
@@ -1550,277 +1787,88 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     let _ = writeln!(
                         self.out,
                         r#"struct syn_{mangle}_t {{
+    syn_ring_hdr_t hdr;
     uint8_t buf[{n}];
-    syn_task_t *rx_waiter;
-    uint32_t head;
-    uint32_t tail;
-    volatile uint32_t count;
-    uint32_t split_end;
-    uint32_t grant_off;
-    uint32_t grant_cap;
-    uint8_t boost_enc;
 }};
 
-static SYN_UNUSED inline uint32_t syn_{mangle}_seg1_nolock(const syn_{mangle}_t *r) {{
-    if (r->count == 0U) {{ return 0U; }}
-    if (r->split_end > 0U) {{ return r->split_end - r->head; }}
-    if (r->head < r->tail) {{ return r->tail - r->head; }}
-    return {n}U - r->head;
-}}
-static SYN_UNUSED inline uint32_t syn_{mangle}_free_space_nolock(const syn_{mangle}_t *r) {{
-    return (r->split_end > 0U) ? (r->head - r->tail) : ({n}U - r->count);
-}}
-static SYN_UNUSED inline void syn_{mangle}_advance_nolock(syn_{mangle}_t *r, uint32_t req) {{
-    uint32_t rem = (req < r->count) ? req : r->count;
-    if (rem == 0U) {{ return; }}
-    uint32_t s1 = syn_{mangle}_seg1_nolock(r);
-    if (rem == r->count) {{
-        r->head = (r->grant_cap > 0U) ? r->tail : 0U;
-        if (r->grant_cap == 0U) {{ r->tail = 0U; }}
-        r->count = 0U;
-        r->split_end = 0U;
-    }} else if (rem < s1) {{
-        r->head += rem;
-        r->count -= rem;
-    }} else {{
-        r->head = rem - s1;
-        r->count -= rem;
-        r->split_end = 0U;
-    }}
-}}
-static SYN_UNUSED inline void syn_{mangle}_wake_nolock(syn_{mangle}_t *r, uint8_t boost_prio) {{
-    if (boost_prio < SYN_PRIO_LEVELS) {{
-        uint8_t enc = (uint8_t)(boost_prio + 1U);
-        if (r->boost_enc == 0U || enc < r->boost_enc) {{ r->boost_enc = enc; }}
-    }}
-    syn_task_t *rw = r->rx_waiter;
-    r->rx_waiter = NULL;
-    if (rw != NULL) {{ syn_task_wake_from_isr_or_task(rw, boost_prio); }}
-}}
-static SYN_UNUSED inline bool syn_{mangle}_rx_ready(void *obj) {{
-    const syn_{mangle}_t *r = (const syn_{mangle}_t *)obj;
-    return r != NULL && r->count > 0U;
+static SYN_UNUSED inline syn_view_byte_ring_t syn_{mangle}_view(syn_{mangle}_t *r) {{
+    return (syn_view_byte_ring_t){{ .hdr = &r->hdr, .buf = &r->buf[0], .cap = (size_t){n}U }};
 }}
 static SYN_UNUSED inline bool syn_{mangle}_push_byte(syn_{mangle}_t *r, uint8_t b, uint8_t boost_prio) {{
-    syn_enter_critical();
-    r->grant_cap = 0U;
-    if (syn_{mangle}_free_space_nolock(r) == 0U) {{
-        syn_exit_critical();
-        return false;
-    }}
-    r->buf[r->tail] = b;
-    if (r->split_end > 0U) {{
-        r->tail += 1U;
-    }} else {{
-        uint32_t nt = r->tail + 1U;
-        r->tail = (nt >= {n}U) ? 0U : nt;
-    }}
-    r->count += 1U;
-    syn_{mangle}_wake_nolock(r, boost_prio);
-    syn_exit_critical();
-    return true;
+    return syn_ring_view_push_byte(syn_{mangle}_view(r), b, boost_prio);
 }}
 static SYN_UNUSED inline size_t syn_{mangle}_push(syn_{mangle}_t *r, syn_slice_u8 src, uint8_t boost_prio) {{
-    syn_enter_critical();
-    r->grant_cap = 0U;
-    uint32_t avail = syn_{mangle}_free_space_nolock(r);
-    uint32_t nw = (src.len < (size_t)avail) ? (uint32_t)src.len : avail;
-    if (src.ptr == NULL) {{ nw = 0U; }}
-    for (uint32_t i = 0U; i < nw; i++) {{
-        r->buf[r->tail] = src.ptr[i];
-        if (r->split_end > 0U) {{
-            r->tail += 1U;
-        }} else {{
-            uint32_t nt = r->tail + 1U;
-            r->tail = (nt >= {n}U) ? 0U : nt;
-        }}
-    }}
-    r->count += nw;
-    if (nw > 0U) {{ syn_{mangle}_wake_nolock(r, boost_prio); }}
-    syn_exit_critical();
-    return (size_t)nw;
+    return syn_ring_view_push(syn_{mangle}_view(r), src, boost_prio);
 }}
 static SYN_UNUSED inline {res_slice_c} syn_{mangle}_grant_write(syn_{mangle}_t *r, size_t req_sz) {{
-    syn_enter_critical();
-    if (req_sz == 0U) {{
-        r->grant_off = r->tail;
-        r->grant_cap = 0U;
-        syn_exit_critical();
-        return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[0], .len = 0U }} }};
+    syn_slice_u8 _sl = {{ .ptr = NULL, .len = 0U }};
+    if (syn_ring_view_grant_write_raw(syn_{mangle}_view(r), req_sz, &_sl)) {{
+        return ({res_slice_c}){{ .is_err = false, .val = _sl }};
     }}
-    if (req_sz > {n}U) {{
-        syn_exit_critical();
-        return ({res_slice_c}){{ .is_err = true }};
-    }}
-    uint32_t req = (uint32_t)req_sz;
-    if (r->count == 0U) {{
-        r->head = 0U;
-        r->tail = 0U;
-        r->split_end = 0U;
-        r->grant_off = 0U;
-        r->grant_cap = req;
-        syn_exit_critical();
-        return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[0], .len = req_sz }} }};
-    }}
-    if (r->split_end == 0U && r->head < r->tail) {{
-        if (req <= ({n}U - r->tail)) {{
-            r->grant_off = r->tail;
-            r->grant_cap = req;
-            uint32_t off = r->grant_off;
-            syn_exit_critical();
-            return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[off], .len = req_sz }} }};
-        }} else if (req <= r->head) {{
-            r->grant_off = 0U;
-            r->grant_cap = req;
-            syn_exit_critical();
-            return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[0], .len = req_sz }} }};
-        }} else {{
-            syn_exit_critical();
-            return ({res_slice_c}){{ .is_err = true }};
-        }}
-    }} else {{
-        uint32_t gap = (r->split_end > 0U || r->head > r->tail) ? (r->head - r->tail) : 0U;
-        if (req <= gap) {{
-            r->grant_off = r->tail;
-            r->grant_cap = req;
-            uint32_t off = r->grant_off;
-            syn_exit_critical();
-            return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[off], .len = req_sz }} }};
-        }} else {{
-            syn_exit_critical();
-            return ({res_slice_c}){{ .is_err = true }};
-        }}
-    }}
+    return ({res_slice_c}){{ .is_err = true }};
 }}
 static SYN_UNUSED inline void syn_{mangle}_commit_write(syn_{mangle}_t *r, size_t req_sz, uint8_t boost_prio) {{
-    syn_enter_critical();
-    uint32_t nw = (req_sz < (size_t)r->grant_cap) ? (uint32_t)req_sz : r->grant_cap;
-    r->grant_cap = 0U;
-    if (nw == 0U) {{
-        syn_exit_critical();
-        return;
-    }}
-    if (r->grant_off == 0U && r->tail > 0U && r->split_end == 0U) {{
-        if (r->count == 0U) {{
-            r->head = 0U;
-            r->tail = nw;
-            r->count = nw;
-        }} else {{
-            r->split_end = r->tail;
-            r->tail = nw;
-            r->count += nw;
-        }}
-    }} else {{
-        uint32_t nt = r->tail + nw;
-        r->tail = (r->split_end == 0U && nt >= {n}U) ? 0U : nt;
-        r->count += nw;
-    }}
-    syn_{mangle}_wake_nolock(r, boost_prio);
-    syn_exit_critical();
+    syn_ring_view_commit_write(syn_{mangle}_view(r), req_sz, boost_prio);
 }}
 static SYN_UNUSED inline syn_slice_u8 syn_{mangle}_read_slice(syn_{mangle}_t *r) {{
-    syn_enter_critical();
-    uint32_t s1 = syn_{mangle}_seg1_nolock(r);
-    uint8_t *p = (s1 > 0U) ? &r->buf[r->head] : &r->buf[0];
-    syn_exit_critical();
-    return (syn_slice_u8){{ .ptr = p, .len = (size_t)s1 }};
+    return syn_ring_view_read_slice(syn_{mangle}_view(r));
 }}
 static SYN_UNUSED inline bool syn_{mangle}_poll_read(syn_{mangle}_t *r, syn_task_t *task, syn_slice_u8 *out_slice) {{
-    syn_enter_critical();
-    if (r->count == 0U) {{
-        syn_exit_critical();
-        return false;
-    }}
-    uint32_t s1 = syn_{mangle}_seg1_nolock(r);
-    out_slice->ptr = &r->buf[r->head];
-    out_slice->len = (size_t)s1;
-    if (r->rx_waiter == task) {{ r->rx_waiter = NULL; }}
-    uint8_t enc = r->boost_enc;
-    r->boost_enc = 0U;
-    syn_exit_critical();
-    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
-    return true;
+    return syn_ring_view_poll_read(syn_{mangle}_view(r), task, out_slice);
 }}
 static SYN_UNUSED inline void syn_{mangle}_consume(syn_{mangle}_t *r, size_t req_sz) {{
-    syn_enter_critical();
-    uint32_t req = (req_sz > (size_t)r->count) ? r->count : (uint32_t)req_sz;
-    syn_{mangle}_advance_nolock(r, req);
-    syn_exit_critical();
+    syn_ring_view_consume(syn_{mangle}_view(r), req_sz);
 }}
 static SYN_UNUSED inline size_t syn_{mangle}_pop(syn_{mangle}_t *r, syn_slice_u8 dst, syn_task_t *task) {{
-    syn_enter_critical();
-    uint32_t rem = (dst.len < (size_t)r->count) ? (uint32_t)dst.len : r->count;
-    if (rem > 0U && dst.ptr != NULL) {{
-        uint32_t s1 = syn_{mangle}_seg1_nolock(r);
-        uint32_t c1 = (rem < s1) ? rem : s1;
-        for (uint32_t i = 0U; i < c1; i++) {{ dst.ptr[i] = r->buf[r->head + i]; }}
-        uint32_t c2 = rem - c1;
-        for (uint32_t i = 0U; i < c2; i++) {{ dst.ptr[c1 + i] = r->buf[i]; }}
-        syn_{mangle}_advance_nolock(r, rem);
-    }} else {{
-        rem = 0U;
-    }}
-    uint8_t enc = (rem > 0U) ? r->boost_enc : 0U;
-    if (rem > 0U) {{ r->boost_enc = 0U; }}
-    syn_exit_critical();
-    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
-    return (size_t)rem;
+    return syn_ring_view_pop(syn_{mangle}_view(r), dst, task);
 }}
 static SYN_UNUSED inline {res_u8_c} syn_{mangle}_try_pop_byte(syn_{mangle}_t *r, syn_task_t *task) {{
-    syn_enter_critical();
-    if (r->count == 0U) {{
-        syn_exit_critical();
-        return ({res_u8_c}){{ .is_err = true }};
+    uint8_t _b = 0U;
+    if (syn_ring_view_try_pop_byte_raw(syn_{mangle}_view(r), task, &_b)) {{
+        return ({res_u8_c}){{ .is_err = false, .val = _b }};
     }}
-    uint8_t b = r->buf[r->head];
-    syn_{mangle}_advance_nolock(r, 1U);
-    uint8_t enc = r->boost_enc;
-    r->boost_enc = 0U;
-    syn_exit_critical();
-    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
-    return ({res_u8_c}){{ .is_err = false, .val = b }};
+    return ({res_u8_c}){{ .is_err = true }};
 }}
 static SYN_UNUSED inline void syn_{mangle}_clear(syn_{mangle}_t *r) {{
-    syn_enter_critical();
-    r->head = 0U;
-    r->tail = 0U;
-    r->count = 0U;
-    r->split_end = 0U;
-    r->grant_off = 0U;
-    r->grant_cap = 0U;
-    r->boost_enc = 0U;
-    syn_exit_critical();
+    syn_ring_view_clear(syn_{mangle}_view(r));
 }}
 static SYN_UNUSED inline size_t syn_{mangle}_free_space(syn_{mangle}_t *r) {{
-    syn_enter_critical();
-    uint32_t fs = syn_{mangle}_free_space_nolock(r);
-    syn_exit_critical();
-    return (size_t)fs;
+    return syn_ring_view_free_space(syn_{mangle}_view(r));
 }}
 static SYN_UNUSED inline void syn_{mangle}_arm_rx(syn_{mangle}_t *r, syn_task_t *task, bool has_to, uint32_t dl) {{
-    syn_enter_critical();
-    if (r->count > 0U) {{
-        task->state = SYN_TASK_READY;
-        task->sched_flags |= SYN_FLAG_MORE;
-        syn_exit_critical();
-        return;
-    }}
-    r->rx_waiter = task;
-    task->wait_check = syn_{mangle}_rx_ready;
-    task->wait_obj = r;
-    task->has_deadline = has_to;
-    task->delay_until = dl;
-    task->state = SYN_TASK_BLOCKED;
-    syn_exit_critical();
+    syn_ring_view_arm_rx(syn_{mangle}_view(r), task, has_to, dl);
 }}
 static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const syn_task_t *task) {{
-    syn_enter_critical();
-    if (r->rx_waiter == task) {{ r->rx_waiter = NULL; }}
-    syn_exit_critical();
+    syn_ring_view_cancel_rx(syn_{mangle}_view(r), task);
 }}
 "#
                     );
                 }
+            }
+        }
+    }
+
+    fn emit_subsystem_structs(&mut self) {
+        let structs_by_name: BTreeMap<&str, &MirStruct> =
+            self.m.structs.iter().map(|s| (s.name.as_str(), s)).collect();
+        let arrays_snapshot = self.arrays.clone();
+        let mut emitted_structs: BTreeSet<String> = self
+            .m
+            .structs
+            .iter()
+            .filter(|s| !s.is_subsystem)
+            .map(|s| s.name.clone())
+            .collect();
+        let mut emitted_arrays: BTreeSet<String> = arrays_snapshot.keys().cloned().collect();
+        for st in &self.m.structs {
+            if st.is_subsystem {
+                self.emit_struct_topo(
+                    st,
+                    &structs_by_name,
+                    &arrays_snapshot,
+                    &mut emitted_structs,
+                    &mut emitted_arrays,
+                );
             }
         }
     }
@@ -1908,19 +1956,34 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                             "static SYN_UNUSED {dma_attr}{pt} {pname} = {{ .waiter = NULL, .flag = false, .boost_prio = SYN_NO_BOOST }};"
                         );
                     }
-                    MirPrimKind::Inbox { .. } => {
+                    MirPrimKind::Inbox { cap, .. } => {
+                        let n = (*cap).max(1);
                         let _ = writeln!(
                             self.out,
-                            "static SYN_UNUSED {dma_attr}{pt} {pname} = {{ .rx_waiter = NULL, .tx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U }};"
+                            "static SYN_UNUSED {dma_attr}{pt} {pname} = {{ .hdr = {{ .rx_waiter = NULL, .tx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U, .tx_cap = {n}U }} }};"
                         );
                     }
                     MirPrimKind::ByteRing { .. } => {
                         let _ = writeln!(
                             self.out,
-                            "static SYN_UNUSED {dma_attr}{pt} {pname} = {{ .rx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U, .split_end = 0U, .grant_off = 0U, .grant_cap = 0U, .boost_enc = 0U }};"
+                            "static SYN_UNUSED {dma_attr}{pt} {pname} = {{ .hdr = {{ .rx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U, .split_end = 0U, .grant_off = 0U, .grant_cap = 0U, .boost_enc = 0U }} }};"
                         );
                     }
                 }
+            }
+            self.out.push('\n');
+        }
+
+        if !self.m.subsystems.is_empty() {
+            self.out.push_str("/* ── Static Subsystem Driver Instances ────────────────────────────────── */\n\n");
+            for sub in &self.m.subsystems {
+                let sym = format!("__zev_subsys_{}", sanitize_ident(&sub.name));
+                let init_s = self.fmt_subsystem_init(&sub.struct_name, &sym);
+                let _ = writeln!(
+                    self.out,
+                    "static SYN_UNUSED syn_struct_{} {sym} = {init_s};",
+                    sub.struct_name
+                );
             }
             self.out.push('\n');
         }
@@ -2184,14 +2247,126 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
         )
     }
 
+    fn fmt_subsystem_prim_init(&self, pk: &MirPrimKind, c_path: &str) -> String {
+        match pk {
+            MirPrimKind::Watch { elem } => {
+                format!("{{ .value = {}, .seq = 0U }}", self.zero_init_expr(elem))
+            }
+            MirPrimKind::PingPong { elem, cap } => {
+                let ec = self.c_type(elem);
+                format!(
+                    "{{ .hdr = {{ .buf0 = {c_path}.buf[0], .buf1 = {c_path}.buf[1], .waiter = NULL, .sleep_lock_bit = (1U << 0U), .cap = {cap}U, .elem_size = (uint16_t)sizeof({ec}), .pending_write_len = 0U, .ready_len = 0U, .write_idx = 0U, .ready_idx = 0U, .chunk_ready = false, .dma_active = false }} }}"
+                )
+            }
+            MirPrimKind::Lease { .. } => {
+                "{ .waiter = NULL, .sleep_lock_bit = (1U << 0U), .len = 0U, .leased = false, .ready = false }".to_string()
+            }
+            MirPrimKind::Signal => "{ .waiter = NULL, .flag = false, .boost_prio = SYN_NO_BOOST }".to_string(),
+            MirPrimKind::Inbox { cap, .. } => {
+                let n = (*cap).max(1);
+                format!(
+                    "{{ .hdr = {{ .rx_waiter = NULL, .tx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U, .tx_cap = {n}U }} }}"
+                )
+            }
+            MirPrimKind::ByteRing { .. } => {
+                "{ .hdr = { .rx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U, .split_end = 0U, .grant_off = 0U, .grant_cap = 0U, .boost_enc = 0U } }".to_string()
+            }
+        }
+    }
+
+    fn fmt_subsystem_init(&self, struct_name: &str, c_path: &str) -> String {
+        let Some(st) = self.m.structs.iter().find(|s| s.name == struct_name) else {
+            return "{ 0 }".to_string();
+        };
+        if st.fields.is_empty() {
+            return "{ ._empty = 0U }".to_string();
+        }
+        let parts: Vec<String> = st
+            .fields
+            .iter()
+            .map(|f| {
+                let fpath = format!("{c_path}.{}", c_ident(&f.name));
+                let val = match &f.ty {
+                    MirType::Primitive(pk) => self.fmt_subsystem_prim_init(pk, &fpath),
+                    MirType::Struct(sub_name) => self.fmt_subsystem_init(sub_name, &fpath),
+                    other => self.zero_init_expr(other),
+                };
+                format!(".{} = {val}", c_ident(&f.name))
+            })
+            .collect();
+        format!("{{ {} }}", parts.join(", "))
+    }
+
+    fn resolve_prim_kind_at_subsys_path(
+        &self,
+        root_struct: &str,
+        field_chain: &[(String, String)],
+    ) -> Option<MirPrimKind> {
+        let mut cur_struct = root_struct;
+        for (idx, (fname, _)) in field_chain.iter().enumerate() {
+            let st = self.m.structs.iter().find(|s| s.name == cur_struct)?;
+            let f = st.fields.iter().find(|f| f.name == *fname)?;
+            if idx + 1 == field_chain.len() {
+                if let MirType::Primitive(pk) = &f.ty {
+                    return Some(pk.clone());
+                }
+                return None;
+            }
+            if let MirType::Struct(next_s) = &f.ty {
+                cur_struct = next_s.as_str();
+            } else {
+                return None;
+            }
+        }
+        None
+    }
+
     fn fmt_irq_binding_call(&self, b: &zev_mir::MirIrqBinding) -> String {
+        let isr_param_tys: Vec<MirType> = self
+            .m
+            .isrs
+            .iter()
+            .find(|i| i.name == b.isr_name)
+            .map(|i| i.params.iter().map(|&vid| i.vars[vid.0].ty.clone()).collect())
+            .unwrap_or_default();
         let mut call_args: Vec<String> = b
             .baked_args
             .iter()
-            .map(|ba| match ba {
-                MirBakedArg::PrimAddr(p) => format!("(&{})", c_ident(p)),
-                MirBakedArg::MmioAddr(m) => mmio_c_macro_name(m),
-                MirBakedArg::Const(e) => self.fmt_const_init_expr(e),
+            .enumerate()
+            .map(|(idx, ba)| {
+                let expected_view = matches!(isr_param_tys.get(idx), Some(MirType::PrimView(_)));
+                match ba {
+                    MirBakedArg::PrimAddr(p) => {
+                        let raw = format!("(&{})", c_ident(p));
+                        if expected_view {
+                            if let Some(prim) = self.m.primitives.iter().find(|pr| pr.name == *p) {
+                                return format!("syn_{}_view({raw})", prim.kind.mangle_name());
+                            }
+                        }
+                        raw
+                    }
+                    MirBakedArg::SubsystemPath {
+                        root,
+                        root_struct,
+                        field_chain,
+                    } => {
+                        let mut path = format!("__zev_subsys_{}", sanitize_ident(root));
+                        for (fname, _) in field_chain {
+                            path.push_str(&format!(".{}", c_ident(fname)));
+                        }
+                        let raw = format!("(&({path}))");
+                        if expected_view {
+                            if let Some(pk) =
+                                self.resolve_prim_kind_at_subsys_path(root_struct, field_chain)
+                            {
+                                return format!("syn_{}_view({raw})", pk.mangle_name());
+                            }
+                        }
+                        raw
+                    }
+                    MirBakedArg::MmioAddr(m) => mmio_c_macro_name(m),
+                    MirBakedArg::Const(e) => self.fmt_const_init_expr(e),
+                }
             })
             .collect();
         for sv in &b.state_vars {
@@ -2821,6 +2996,181 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 }
                 let _ = writeln!(self.out, "    _f->_pc = {p}U;\n    return SYN_STEP_IDLE;");
             }
+            MirYieldKind::InboxViewRecv {
+                view,
+                elem_ty,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
+                poll_bb,
+                resume_bb,
+            } => {
+                let em = elem_ty.mangle_name();
+                let vw = self.fmt_expr(view, vars);
+                let ec = self.c_type(elem_ty);
+                let p = poll_bb.0;
+                let r = resume_bb.0;
+
+                self.out.push_str("    {\n");
+                let _ = writeln!(self.out, "        {ec} _rx_item;");
+                let _ = writeln!(
+                    self.out,
+                    "        if (syn_view_inbox_{em}_try_pop({vw}, _task, &_rx_item)) {{"
+                );
+                self.out.push_str("            syn_task_clear_wait(_task);\n");
+                if let Some(dv) = dst_val {
+                    let _ = writeln!(self.out, "            {} = _rx_item;", self.var_ref(*dv, vars));
+                }
+                if let Some(dr) = dst_res {
+                    let rc = self.c_type(&vars[dr.0].ty);
+                    let _ = writeln!(
+                        self.out,
+                        "            {} = ({rc}){{ .is_err = false, .val = _rx_item }};",
+                        self.var_ref(*dr, vars)
+                    );
+                }
+                let _ = writeln!(self.out, "            goto _bb{r};\n        }}");
+
+                if let Some(tv) = timeout_deadline_var {
+                    let dl = self.var_ref(*tv, vars);
+                    let _ = writeln!(
+                        self.out,
+                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_view_inbox_{em}_cancel_rx({vw}, _task);\n            syn_task_clear_wait(_task);"
+                    );
+                    if let Some(dr) = dst_res {
+                        let rc = self.c_type(&vars[dr.0].ty);
+                        let _ = writeln!(
+                            self.out,
+                            "            {} = ({rc}){{ .is_err = true }};",
+                            self.var_ref(*dr, vars)
+                        );
+                    }
+                    let _ = writeln!(
+                        self.out,
+                        "            goto _bb{r};\n        }}\n        syn_view_inbox_{em}_arm_rx({vw}, _task, true, {dl});"
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "        syn_view_inbox_{em}_arm_rx({vw}, _task, false, 0U);"
+                    );
+                }
+                let _ = writeln!(
+                    self.out,
+                    "        _f->_pc = {p}U;\n        return SYN_STEP_IDLE;\n    }}"
+                );
+            }
+            MirYieldKind::ByteRingViewWaitRead {
+                view,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
+                poll_bb,
+                resume_bb,
+            } => {
+                let vw = self.fmt_expr(view, vars);
+                let p = poll_bb.0;
+                let r = resume_bb.0;
+
+                self.out.push_str("    {\n");
+                self.out.push_str("        syn_slice_u8 _ring_chunk;\n");
+                let _ = writeln!(
+                    self.out,
+                    "        if (syn_ring_view_poll_read({vw}, _task, &_ring_chunk)) {{"
+                );
+                self.out.push_str("            syn_task_clear_wait(_task);\n");
+                if let Some(dv) = dst_val {
+                    let _ = writeln!(self.out, "            {} = _ring_chunk;", self.var_ref(*dv, vars));
+                }
+                if let Some(dr) = dst_res {
+                    let rc = self.c_type(&vars[dr.0].ty);
+                    let _ = writeln!(
+                        self.out,
+                        "            {} = ({rc}){{ .is_err = false, .val = _ring_chunk }};",
+                        self.var_ref(*dr, vars)
+                    );
+                }
+                let _ = writeln!(self.out, "            goto _bb{r};\n        }}");
+
+                if let Some(tv) = timeout_deadline_var {
+                    let dl = self.var_ref(*tv, vars);
+                    let _ = writeln!(
+                        self.out,
+                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_ring_view_cancel_rx({vw}, _task);\n            syn_task_clear_wait(_task);"
+                    );
+                    if let Some(dr) = dst_res {
+                        let rc = self.c_type(&vars[dr.0].ty);
+                        let _ = writeln!(
+                            self.out,
+                            "            {} = ({rc}){{ .is_err = true }};",
+                            self.var_ref(*dr, vars)
+                        );
+                    }
+                    let _ = writeln!(
+                        self.out,
+                        "            goto _bb{r};\n        }}\n        syn_ring_view_arm_rx({vw}, _task, true, {dl});"
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "        syn_ring_view_arm_rx({vw}, _task, false, 0U);"
+                    );
+                }
+                let _ = writeln!(
+                    self.out,
+                    "        _f->_pc = {p}U;\n        return SYN_STEP_IDLE;\n    }}"
+                );
+            }
+            MirYieldKind::InboxViewSend {
+                view,
+                elem_ty,
+                val_var,
+                timeout_deadline_var,
+                dst_res,
+                poll_bb,
+                resume_bb,
+            } => {
+                let em = elem_ty.mangle_name();
+                let vw = self.fmt_expr(view, vars);
+                let vv = self.var_ref(*val_var, vars);
+                let p = poll_bb.0;
+                let r = resume_bb.0;
+                let _ = writeln!(
+                    self.out,
+                    "    if (syn_view_inbox_{em}_post({vw}, {vv}, SYN_NO_BOOST)) {{\n        syn_task_clear_wait(_task);"
+                );
+                if let Some(dr) = dst_res {
+                    let rc = self.c_type(&vars[dr.0].ty);
+                    let _ = writeln!(
+                        self.out,
+                        "        {} = ({rc}){{ .is_err = false }};",
+                        self.var_ref(*dr, vars)
+                    );
+                }
+                let _ = writeln!(self.out, "        goto _bb{r};\n    }}");
+                if let Some(tv) = timeout_deadline_var {
+                    let dl = self.var_ref(*tv, vars);
+                    let _ = writeln!(
+                        self.out,
+                        "    if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n        syn_view_inbox_{em}_cancel_tx({vw}, _task);\n        syn_task_clear_wait(_task);"
+                    );
+                    if let Some(dr) = dst_res {
+                        let rc = self.c_type(&vars[dr.0].ty);
+                        let _ = writeln!(
+                            self.out,
+                            "        {} = ({rc}){{ .is_err = true }};",
+                            self.var_ref(*dr, vars)
+                        );
+                    }
+                    let _ = writeln!(
+                        self.out,
+                        "        goto _bb{r};\n    }}\n    syn_view_inbox_{em}_arm_tx({vw}, _task, true, {dl});"
+                    );
+                } else {
+                    let _ = writeln!(self.out, "    syn_view_inbox_{em}_arm_tx({vw}, _task, false, 0U);");
+                }
+                let _ = writeln!(self.out, "    _f->_pc = {p}U;\n    return SYN_STEP_IDLE;");
+            }
             MirYieldKind::SignalWait {
                 target,
                 timeout_deadline_var,
@@ -3075,7 +3425,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 let _ = writeln!(self.out, "{pad}{{");
                 let _ = writeln!(
                     self.out,
-                    "{pad}    syn_fmt_sink_t _sink = {{ .dst = NULL, .cap = 0U, .pos = 0U, .truncated = false, .is_buf = false }};"
+                    "{pad}    syn_fmt_sink_t _sink = {{ .dst = NULL, .ring_hdr = NULL, .cap = 0U, .pos = 0U, .truncated = false, .mode = 0U }};"
                 );
                 self.emit_fmt_chunks("_sink", chunks, vars, indent + 1);
                 if *newline {
@@ -3098,7 +3448,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 let _ = writeln!(self.out, "{pad}    syn_slice_u8 _fbuf = {buf_s};");
                 let _ = writeln!(
                     self.out,
-                    "{pad}    syn_fmt_sink_t _sink = {{ .dst = _fbuf.ptr, .cap = _fbuf.len, .pos = 0U, .truncated = false, .is_buf = true }};"
+                    "{pad}    syn_fmt_sink_t _sink = {{ .dst = _fbuf.ptr, .ring_hdr = NULL, .cap = _fbuf.len, .pos = 0U, .truncated = false, .mode = 1U }};"
                 );
                 self.emit_fmt_chunks("_sink", chunks, vars, indent + 1);
                 let _ = writeln!(
@@ -3108,6 +3458,32 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 let _ = writeln!(
                     self.out,
                     "{pad}    if (_sink.truncated) {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = true, .err = syn_FmtErr_Truncated, .val = _written }};\n{pad}    }} else {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = false, .val = _written }};\n{pad}    }}\n{pad}}}"
+                );
+            }
+            MirStmt::FmtRing {
+                dst_res,
+                ring,
+                chunks,
+                boost,
+            } => {
+                let ring_s = self.fmt_expr(ring, vars);
+                let dst_s = self.var_ref(*dst_res, vars);
+                let res_c = self.c_type(&vars[dst_res.0].ty);
+                let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                let _ = writeln!(self.out, "{pad}{{");
+                let _ = writeln!(self.out, "{pad}    syn_view_byte_ring_t _fring = {ring_s};");
+                let _ = writeln!(
+                    self.out,
+                    "{pad}    syn_fmt_sink_t _sink = {{ .dst = _fring.buf, .ring_hdr = _fring.hdr, .cap = _fring.cap, .pos = 0U, .truncated = false, .mode = 2U }};"
+                );
+                self.emit_fmt_chunks("_sink", chunks, vars, indent + 1);
+                let _ = writeln!(
+                    self.out,
+                    "{pad}    if (_sink.pos > 0U && _fring.hdr != NULL) {{\n{pad}        syn_enter_critical();\n{pad}        syn_ring_hdr_wake_nolock(_fring.hdr, {b});\n{pad}        syn_exit_critical();\n{pad}    }}"
+                );
+                let _ = writeln!(
+                    self.out,
+                    "{pad}    if (_sink.truncated) {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = true, .err = syn_FmtErr_Truncated, .val = _sink.pos }};\n{pad}    }} else {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = false, .val = _sink.pos }};\n{pad}    }}\n{pad}}}"
                 );
             }
             MirStmt::MmioWrite {
@@ -3431,6 +3807,36 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 let ptr = self.fmt_prim_ptr(target, vars);
                 let _ = writeln!(self.out, "{pad}syn_{mangle}_clear({ptr});");
             }
+            MirPrimNonBlockingOp::InboxViewPost {
+                view,
+                elem_ty,
+                value,
+                boost,
+            } => {
+                let em = elem_ty.mangle_name();
+                let vw = self.fmt_expr(view, vars);
+                let v = self.fmt_expr(value, vars);
+                let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                let _ = writeln!(self.out, "{pad}(void)syn_view_inbox_{em}_post({vw}, {v}, {b});");
+            }
+            MirPrimNonBlockingOp::ByteRingViewConsume { view, len } => {
+                let vw = self.fmt_expr(view, vars);
+                let l = self.fmt_expr(len, vars);
+                let _ = writeln!(self.out, "{pad}syn_ring_view_consume({vw}, (size_t)({l}));");
+            }
+            MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len, boost } => {
+                let vw = self.fmt_expr(view, vars);
+                let l = self.fmt_expr(len, vars);
+                let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                let _ = writeln!(
+                    self.out,
+                    "{pad}syn_ring_view_commit_write({vw}, (size_t)({l}), {b});"
+                );
+            }
+            MirPrimNonBlockingOp::ByteRingViewClear { view } => {
+                let vw = self.fmt_expr(view, vars);
+                let _ = writeln!(self.out, "{pad}syn_ring_view_clear({vw});");
+            }
         }
     }
 
@@ -3619,6 +4025,20 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
             }
             MirExprKind::ConstRef(name) => c_ident(name),
             MirExprKind::GlobalPrimAddr(name) => format!("(&{})", c_ident(name)),
+            MirExprKind::SubsystemAddr(name) => format!("(&__zev_subsys_{})", sanitize_ident(name)),
+            MirExprKind::MakePrimView { ptr, cap, kind } => {
+                let p = self.fmt_expr(ptr, vars);
+                let n = (*cap).max(1);
+                let mangle = match kind {
+                    MirPrimViewKind::ByteRing => MirPrimKind::ByteRing { cap: n }.mangle_name(),
+                    MirPrimViewKind::Inbox { elem } => MirPrimKind::Inbox {
+                        elem: elem.clone(),
+                        cap: n,
+                    }
+                    .mangle_name(),
+                };
+                format!("syn_{mangle}_view({p})")
+            }
             MirExprKind::MmioAddr(name) => mmio_c_macro_name(name),
             MirExprKind::MmioRead {
                 base,
@@ -3863,14 +4283,43 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     format!("syn_{mangle}_post({ptr}, {v}, {b})")
                 }
                 MirPrimReadOp::InboxLen { target, .. } => {
-                    format!("((size_t)(({})->count))", self.fmt_prim_ptr(target, vars))
+                    format!("((size_t)(({})->hdr.count))", self.fmt_prim_ptr(target, vars))
                 }
                 MirPrimReadOp::InboxIsEmpty { target, .. } => {
-                    format!("((({})->count) == 0U)", self.fmt_prim_ptr(target, vars))
+                    format!("((({})->hdr.count) == 0U)", self.fmt_prim_ptr(target, vars))
                 }
                 MirPrimReadOp::InboxIsFull { target, cap, .. } => {
                     let n = (*cap).max(1);
-                    format!("((({})->count) >= {n}U)", self.fmt_prim_ptr(target, vars))
+                    format!("((({})->hdr.count) >= {n}U)", self.fmt_prim_ptr(target, vars))
+                }
+                MirPrimReadOp::InboxViewTryRecv { view, elem_ty } => {
+                    let em = elem_ty.mangle_name();
+                    format!("syn_view_inbox_{em}_try_recv({})", self.fmt_expr(view, vars))
+                }
+                MirPrimReadOp::InboxViewTrySend {
+                    view,
+                    elem_ty,
+                    value,
+                    boost,
+                } => {
+                    let em = elem_ty.mangle_name();
+                    let vw = self.fmt_expr(view, vars);
+                    let v = self.fmt_expr(value, vars);
+                    let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                    format!("syn_view_inbox_{em}_post({vw}, {v}, {b})")
+                }
+                MirPrimReadOp::InboxViewLen { view, .. } => {
+                    format!("((size_t)(({}).hdr->count))", self.fmt_expr(view, vars))
+                }
+                MirPrimReadOp::InboxViewCap { view, .. } => {
+                    format!("(({}).cap)", self.fmt_expr(view, vars))
+                }
+                MirPrimReadOp::InboxViewIsEmpty { view, .. } => {
+                    format!("((({}).hdr->count) == 0U)", self.fmt_expr(view, vars))
+                }
+                MirPrimReadOp::InboxViewIsFull { view, elem_ty } => {
+                    let em = elem_ty.mangle_name();
+                    format!("syn_view_inbox_{em}_is_full({})", self.fmt_expr(view, vars))
                 }
                 MirPrimReadOp::SignalIsSet { target } => {
                     format!("(({})->flag)", self.fmt_prim_ptr(target, vars))
@@ -3944,7 +4393,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     )
                 }
                 MirPrimReadOp::ByteRingLen { target, .. } => {
-                    format!("((size_t)(({})->count))", self.fmt_prim_ptr(target, vars))
+                    format!("((size_t)(({})->hdr.count))", self.fmt_prim_ptr(target, vars))
                 }
                 MirPrimReadOp::ByteRingFreeSpace { target, cap } => {
                     let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
@@ -3954,13 +4403,74 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     )
                 }
                 MirPrimReadOp::ByteRingIsEmpty { target, .. } => {
-                    format!("((({})->count) == 0U)", self.fmt_prim_ptr(target, vars))
+                    format!("((({})->hdr.count) == 0U)", self.fmt_prim_ptr(target, vars))
                 }
                 MirPrimReadOp::ByteRingIsFull { target, cap } => {
                     let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
                     format!(
                         "(syn_{mangle}_free_space({}) == 0U)",
                         self.fmt_prim_ptr(target, vars)
+                    )
+                }
+                MirPrimReadOp::ByteRingViewPush {
+                    view, src, boost
+                } => {
+                    let vw = self.fmt_expr(view, vars);
+                    let s = self.fmt_expr(src, vars);
+                    let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                    format!("syn_ring_view_push({vw}, {s}, {b})")
+                }
+                MirPrimReadOp::ByteRingViewPushByte {
+                    view,
+                    byte,
+                    boost,
+                } => {
+                    let vw = self.fmt_expr(view, vars);
+                    let by = self.fmt_expr(byte, vars);
+                    let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                    format!("syn_ring_view_push_byte({vw}, (uint8_t)({by}), {b})")
+                }
+                MirPrimReadOp::ByteRingViewGrantWrite { view, len } => {
+                    let vw = self.fmt_expr(view, vars);
+                    let l = self.fmt_expr(len, vars);
+                    format!("syn_ring_view_grant_write({vw}, (size_t)({l}))")
+                }
+                MirPrimReadOp::ByteRingViewReadSlice { view } => {
+                    format!(
+                        "syn_ring_view_read_slice({})",
+                        self.fmt_expr(view, vars)
+                    )
+                }
+                MirPrimReadOp::ByteRingViewPop { view, dst } => {
+                    let vw = self.fmt_expr(view, vars);
+                    let d = self.fmt_expr(dst, vars);
+                    format!("syn_ring_view_pop({vw}, {d}, g_syn_sched.running)")
+                }
+                MirPrimReadOp::ByteRingViewTryPopByte { view } => {
+                    format!(
+                        "syn_ring_view_try_pop_byte({}, g_syn_sched.running)",
+                        self.fmt_expr(view, vars)
+                    )
+                }
+                MirPrimReadOp::ByteRingViewLen { view } => {
+                    format!("((size_t)(({}).hdr->count))", self.fmt_expr(view, vars))
+                }
+                MirPrimReadOp::ByteRingViewCap { view } => {
+                    format!("(({}).cap)", self.fmt_expr(view, vars))
+                }
+                MirPrimReadOp::ByteRingViewFreeSpace { view } => {
+                    format!(
+                        "syn_ring_view_free_space({})",
+                        self.fmt_expr(view, vars)
+                    )
+                }
+                MirPrimReadOp::ByteRingViewIsEmpty { view } => {
+                    format!("((({}).hdr->count) == 0U)", self.fmt_expr(view, vars))
+                }
+                MirPrimReadOp::ByteRingViewIsFull { view } => {
+                    format!(
+                        "(syn_ring_view_free_space({}) == 0U)",
+                        self.fmt_expr(view, vars)
                     )
                 }
             },
@@ -4097,6 +4607,19 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                         .map(|e| self.fmt_const_init_expr(e))
                         .collect();
                     format!("(({ct}){{ .data = {{ {} }} }})", es.join(", "))
+                }
+            }
+            MirExprKind::MakePrimView { ptr, cap, kind } => {
+                let p = self.fmt_const_init_expr(ptr);
+                let n = (*cap).max(1);
+                match kind {
+                    MirPrimViewKind::ByteRing => format!(
+                        "((syn_view_byte_ring_t){{ .hdr = &(({p})->hdr), .buf = &(({p})->buf[0]), .cap = (size_t){n}U }})"
+                    ),
+                    MirPrimViewKind::Inbox { elem } => format!(
+                        "((syn_view_inbox_{}_t){{ .hdr = &(({p})->hdr), .buf = &(({p})->buf[0]), .boost_buf = &(({p})->boost_buf[0]), .cap = (size_t){n}U }})",
+                        elem.mangle_name()
+                    ),
                 }
             }
             _ => self.fmt_expr(expr, &[]),

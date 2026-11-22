@@ -352,197 +352,6 @@ static SYN_UNUSED inline ptrdiff_t syn_f64_to_isize_sat(double x) {{
 #endif
 }}
 
-typedef struct {{
-    uint8_t *dst;
-    size_t cap;
-    size_t pos;
-    bool truncated;
-    bool is_buf;
-}} syn_fmt_sink_t;
-
-static SYN_UNUSED inline void syn_fmt_write(syn_fmt_sink_t *s, const void *data, size_t len) {{
-    if (len == 0U) {{ return; }}
-    if (s->is_buf) {{
-        size_t avail = (s->dst != NULL && s->pos < s->cap) ? (s->cap - s->pos) : 0U;
-        size_t n = (len <= avail) ? len : avail;
-        if (n > 0U && data != NULL) {{
-            memmove(s->dst + s->pos, data, n);
-            s->pos += n;
-        }}
-        if (n < len) {{
-            s->truncated = true;
-        }}
-    }} else {{
-#if !defined(SYN_FREESTANDING)
-        if (data != NULL) {{
-            (void)fwrite(data, 1U, len, stdout);
-        }}
-#else
-        (void)data;
-#endif
-    }}
-}}
-
-static SYN_UNUSED inline void syn_fmt_putc(syn_fmt_sink_t *s, char ch) {{
-    syn_fmt_write(s, &ch, 1U);
-}}
-
-static SYN_UNUSED inline void syn_fmt_cstr(syn_fmt_sink_t *s, const char *cstr) {{
-    if (cstr == NULL) {{ return; }}
-    size_t n = 0U;
-    while (cstr[n] != '\0') {{ n++; }}
-    syn_fmt_write(s, cstr, n);
-}}
-
-static SYN_UNUSED inline void syn_fmt_bytes(syn_fmt_sink_t *s, syn_slice_u8 sl) {{
-    if (sl.ptr != NULL && sl.len > 0U) {{
-        syn_fmt_write(s, sl.ptr, sl.len);
-    }}
-}}
-
-static SYN_UNUSED inline void syn_fmt_bool(syn_fmt_sink_t *s, bool v) {{
-    if (v) {{ syn_fmt_write(s, "true", 4U); }}
-    else   {{ syn_fmt_write(s, "false", 5U); }}
-}}
-
-static SYN_UNUSED inline void syn_fmt_u64_dec_pad(syn_fmt_sink_t *s, uint64_t v, uint8_t min_width) {{
-    char tmp[20];
-    size_t n = 0U;
-    do {{
-        tmp[19U - n] = (char)('0' + (v % 10ULL));
-        v /= 10ULL;
-        n++;
-    }} while (v > 0ULL && n < 20U);
-    size_t target_w = (min_width > 20U) ? 20U : (size_t)min_width;
-    while (n < target_w) {{
-        tmp[19U - n] = '0';
-        n++;
-    }}
-    syn_fmt_write(s, &tmp[20U - n], n);
-}}
-
-static SYN_UNUSED inline void syn_fmt_u64_dec(syn_fmt_sink_t *s, uint64_t v) {{
-    syn_fmt_u64_dec_pad(s, v, 1U);
-}}
-
-static SYN_UNUSED inline void syn_fmt_i64_dec(syn_fmt_sink_t *s, int64_t v) {{
-    if (v < 0) {{
-        syn_fmt_putc(s, '-');
-        uint64_t mag = (uint64_t)(0ULL - (uint64_t)v);
-        syn_fmt_u64_dec(s, mag);
-    }} else {{
-        syn_fmt_u64_dec(s, (uint64_t)v);
-    }}
-}}
-
-static SYN_UNUSED inline void syn_fmt_u64_hex(syn_fmt_sink_t *s, uint64_t v, bool upper, uint8_t pad_width) {{
-    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
-    char tmp[64];
-    size_t n = 0U;
-    do {{
-        tmp[63U - n] = digits[(size_t)(v & 0xFULL)];
-        v >>= 4;
-        n++;
-    }} while (v > 0ULL && n < 64U);
-    size_t target_w = (pad_width > 64U) ? 64U : (size_t)pad_width;
-    while (n < target_w) {{
-        tmp[63U - n] = '0';
-        n++;
-    }}
-    syn_fmt_write(s, &tmp[64U - n], n);
-}}
-
-static SYN_UNUSED inline void syn_fmt_u64_bin(syn_fmt_sink_t *s, uint64_t v, uint8_t pad_width) {{
-    char tmp[64];
-    size_t n = 0U;
-    do {{
-        tmp[63U - n] = (char)('0' + (v & 1ULL));
-        v >>= 1;
-        n++;
-    }} while (v > 0ULL && n < 64U);
-    size_t target_w = (pad_width > 64U) ? 64U : (size_t)pad_width;
-    while (n < target_w) {{
-        tmp[63U - n] = '0';
-        n++;
-    }}
-    syn_fmt_write(s, &tmp[64U - n], n);
-}}
-
-static SYN_UNUSED inline void syn_fmt_float_fixed(syn_fmt_sink_t *s, double val, uint8_t prec) {{
-    static const uint64_t pow10_tbl[10] = {{
-        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL,
-        100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL
-    }};
-    uint64_t bits = syn_f64_to_bits(val);
-    uint64_t abs_bits = bits & 0x7FFFFFFFFFFFFFFFULL;
-    bool neg_bit = (bits >> 63) != 0ULL;
-    if (abs_bits > 0x7FF0000000000000ULL) {{
-        syn_fmt_write(s, "nan", 3U);
-        return;
-    }}
-    if (abs_bits == 0x7FF0000000000000ULL) {{
-        if (neg_bit) {{ syn_fmt_write(s, "-inf", 4U); }}
-        else         {{ syn_fmt_write(s, "inf", 3U); }}
-        return;
-    }}
-    /* Arduino overflow threshold: fabs(val) > 4294967040.0 (0x41EFFFFFE0000000) */
-    if (abs_bits > 0x41EFFFFFE0000000ULL) {{
-        if (neg_bit) {{ syn_fmt_write(s, "-ovf", 4U); }}
-        else         {{ syn_fmt_write(s, "ovf", 3U); }}
-        return;
-    }}
-    uint8_t p = (prec > 9U) ? 9U : prec;
-    uint64_t scale = pow10_tbl[p];
-    uint64_t int_part = 0ULL;
-    uint64_t frac_part = 0ULL;
-    if (abs_bits != 0ULL) {{
-        uint32_t exp = (uint32_t)(abs_bits >> 52);
-        uint64_t frac = abs_bits & 0x000FFFFFFFFFFFFFULL;
-        uint64_t sig53 = (exp == 0U) ? frac : (frac | (1ULL << 52));
-        uint32_t eff_exp = (exp == 0U) ? 1U : exp;
-        /* For abs_val <= 4294967040.0, eff_exp <= 1054, so rsh = 1075 - eff_exp >= 21 */
-        uint32_t rsh = 1075U - eff_exp;
-        if (rsh < 85U) {{
-            uint64_t a_lo = sig53 & 0xFFFFFFFFULL;
-            uint64_t a_hi = sig53 >> 32;
-            uint64_t m0 = a_lo * scale;
-            uint64_t m1 = a_hi * scale + (m0 >> 32);
-            uint64_t p_lo = (m0 & 0xFFFFFFFFULL) | (m1 << 32);
-            uint64_t p_hi = m1 >> 32;
-
-            uint32_t hm1 = rsh - 1U;
-            uint64_t r_lo = p_lo;
-            uint64_t r_hi = p_hi;
-            if (hm1 < 64U) {{
-                uint64_t h_lo = 1ULL << hm1;
-                r_lo = p_lo + h_lo;
-                if (r_lo < p_lo) {{ r_hi += 1ULL; }}
-            }} else {{
-                r_hi += 1ULL << (hm1 - 64U);
-            }}
-
-            uint64_t tot64 = 0ULL;
-            if (rsh < 64U) {{
-                tot64 = (r_lo >> rsh) | (r_hi << (64U - rsh));
-            }} else if (rsh == 64U) {{
-                tot64 = r_hi;
-            }} else {{
-                tot64 = r_hi >> (rsh - 64U);
-            }}
-            int_part = tot64 / scale;
-            frac_part = tot64 % scale;
-        }}
-    }}
-    if (neg_bit && (int_part != 0ULL || frac_part != 0ULL)) {{
-        syn_fmt_putc(s, '-');
-    }}
-    syn_fmt_u64_dec(s, int_part);
-    if (p > 0U) {{
-        syn_fmt_putc(s, '.');
-        syn_fmt_u64_dec_pad(s, frac_part, p);
-    }}
-}}
-
 /* ── Critical Section, Clock, & Low-Power Sleep Coordinator ─────────────── */
 
 typedef enum {{
@@ -1156,6 +965,551 @@ static SYN_UNUSED inline void syn_pp_hdr_flip(syn_pp_hdr_t *h) {{
         syn_task_wake_from_isr_or_task(w, SYN_NO_BOOST);
     }}
     syn_exit_critical();
+}}
+
+/* ── Generic Inbox & ByteRing Headers + Unsized Views + Format Sink ─────── */
+
+typedef struct {{
+    syn_task_t *rx_waiter;
+    syn_task_t *tx_waiter;
+    uint16_t head;
+    uint16_t tail;
+    volatile uint16_t count;
+    uint16_t tx_cap;
+}} syn_inbox_hdr_t;
+
+static SYN_UNUSED inline bool syn_inbox_hdr_rx_ready(void *obj) {{
+    const syn_inbox_hdr_t *h = (const syn_inbox_hdr_t *)obj;
+    return h != NULL && h->count > 0U;
+}}
+
+static SYN_UNUSED inline bool syn_inbox_hdr_tx_ready(void *obj) {{
+    const syn_inbox_hdr_t *h = (const syn_inbox_hdr_t *)obj;
+    return h != NULL && h->count < h->tx_cap;
+}}
+
+typedef struct {{
+    syn_task_t *rx_waiter;
+    uint32_t head;
+    uint32_t tail;
+    volatile uint32_t count;
+    uint32_t split_end;
+    uint32_t grant_off;
+    uint32_t grant_cap;
+    uint8_t boost_enc;
+}} syn_ring_hdr_t;
+
+typedef struct {{
+    syn_ring_hdr_t *hdr;
+    uint8_t *buf;
+    size_t cap;
+}} syn_view_byte_ring_t;
+
+static SYN_UNUSED inline uint32_t syn_ring_hdr_seg1_nolock(const syn_ring_hdr_t *r, size_t cap) {{
+    if (r->count == 0U) {{ return 0U; }}
+    if (r->split_end > 0U) {{ return r->split_end - r->head; }}
+    if (r->head < r->tail) {{ return r->tail - r->head; }}
+    return (uint32_t)cap - r->head;
+}}
+
+static SYN_UNUSED inline uint32_t syn_ring_hdr_free_space_nolock(const syn_ring_hdr_t *r, size_t cap) {{
+    return (r->split_end > 0U) ? (r->head - r->tail) : ((uint32_t)cap - r->count);
+}}
+
+static SYN_UNUSED inline void syn_ring_hdr_advance_nolock(syn_ring_hdr_t *r, size_t cap, uint32_t req) {{
+    uint32_t rem = (req < r->count) ? req : r->count;
+    if (rem == 0U) {{ return; }}
+    uint32_t s1 = syn_ring_hdr_seg1_nolock(r, cap);
+    if (rem == r->count) {{
+        r->head = (r->grant_cap > 0U) ? r->tail : 0U;
+        if (r->grant_cap == 0U) {{ r->tail = 0U; }}
+        r->count = 0U;
+        r->split_end = 0U;
+    }} else if (rem < s1) {{
+        r->head += rem;
+        r->count -= rem;
+    }} else {{
+        r->head = rem - s1;
+        r->count -= rem;
+        r->split_end = 0U;
+    }}
+}}
+
+static SYN_UNUSED inline void syn_ring_hdr_wake_nolock(syn_ring_hdr_t *r, uint8_t boost_prio) {{
+    if (boost_prio < SYN_PRIO_LEVELS) {{
+        uint8_t enc = (uint8_t)(boost_prio + 1U);
+        if (r->boost_enc == 0U || enc < r->boost_enc) {{ r->boost_enc = enc; }}
+    }}
+    syn_task_t *rw = r->rx_waiter;
+    r->rx_waiter = NULL;
+    if (rw != NULL) {{ syn_task_wake_from_isr_or_task(rw, boost_prio); }}
+}}
+
+static SYN_UNUSED inline bool syn_ring_hdr_rx_ready(void *obj) {{
+    const syn_ring_hdr_t *r = (const syn_ring_hdr_t *)obj;
+    return r != NULL && r->count > 0U;
+}}
+
+static SYN_UNUSED inline bool syn_ring_view_push_byte(syn_view_byte_ring_t v, uint8_t b, uint8_t boost_prio) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    r->grant_cap = 0U;
+    if (syn_ring_hdr_free_space_nolock(r, v.cap) == 0U) {{
+        syn_exit_critical();
+        return false;
+    }}
+    v.buf[r->tail] = b;
+    if (r->split_end > 0U) {{
+        r->tail += 1U;
+    }} else {{
+        uint32_t nt = r->tail + 1U;
+        r->tail = (nt >= (uint32_t)v.cap) ? 0U : nt;
+    }}
+    r->count += 1U;
+    syn_ring_hdr_wake_nolock(r, boost_prio);
+    syn_exit_critical();
+    return true;
+}}
+
+static SYN_UNUSED inline size_t syn_ring_view_push(syn_view_byte_ring_t v, syn_slice_u8 src, uint8_t boost_prio) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    r->grant_cap = 0U;
+    uint32_t avail = syn_ring_hdr_free_space_nolock(r, v.cap);
+    uint32_t nw = (src.len < (size_t)avail) ? (uint32_t)src.len : avail;
+    if (src.ptr == NULL) {{ nw = 0U; }}
+    for (uint32_t i = 0U; i < nw; i++) {{
+        v.buf[r->tail] = src.ptr[i];
+        if (r->split_end > 0U) {{
+            r->tail += 1U;
+        }} else {{
+            uint32_t nt = r->tail + 1U;
+            r->tail = (nt >= (uint32_t)v.cap) ? 0U : nt;
+        }}
+    }}
+    r->count += nw;
+    if (nw > 0U) {{ syn_ring_hdr_wake_nolock(r, boost_prio); }}
+    syn_exit_critical();
+    return (size_t)nw;
+}}
+
+static SYN_UNUSED inline bool syn_ring_view_grant_write_raw(syn_view_byte_ring_t v, size_t req_sz, syn_slice_u8 *out_slice) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    if (req_sz == 0U) {{
+        r->grant_off = r->tail;
+        r->grant_cap = 0U;
+        syn_exit_critical();
+        *out_slice = (syn_slice_u8){{ .ptr = v.buf, .len = 0U }};
+        return true;
+    }}
+    if (req_sz > v.cap) {{
+        syn_exit_critical();
+        return false;
+    }}
+    uint32_t req = (uint32_t)req_sz;
+    if (r->count == 0U) {{
+        r->head = 0U;
+        r->tail = 0U;
+        r->split_end = 0U;
+        r->grant_off = 0U;
+        r->grant_cap = req;
+        syn_exit_critical();
+        *out_slice = (syn_slice_u8){{ .ptr = v.buf, .len = req_sz }};
+        return true;
+    }}
+    if (r->split_end == 0U && r->head < r->tail) {{
+        if (req <= ((uint32_t)v.cap - r->tail)) {{
+            r->grant_off = r->tail;
+            r->grant_cap = req;
+            uint32_t off = r->grant_off;
+            syn_exit_critical();
+            *out_slice = (syn_slice_u8){{ .ptr = &v.buf[off], .len = req_sz }};
+            return true;
+        }} else if (req <= r->head) {{
+            r->grant_off = 0U;
+            r->grant_cap = req;
+            syn_exit_critical();
+            *out_slice = (syn_slice_u8){{ .ptr = v.buf, .len = req_sz }};
+            return true;
+        }} else {{
+            syn_exit_critical();
+            return false;
+        }}
+    }} else {{
+        uint32_t gap = (r->split_end > 0U || r->head > r->tail) ? (r->head - r->tail) : 0U;
+        if (req <= gap) {{
+            r->grant_off = r->tail;
+            r->grant_cap = req;
+            uint32_t off = r->grant_off;
+            syn_exit_critical();
+            *out_slice = (syn_slice_u8){{ .ptr = &v.buf[off], .len = req_sz }};
+            return true;
+        }} else {{
+            syn_exit_critical();
+            return false;
+        }}
+    }}
+}}
+
+static SYN_UNUSED inline void syn_ring_view_commit_write(syn_view_byte_ring_t v, size_t req_sz, uint8_t boost_prio) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    uint32_t nw = (req_sz < (size_t)r->grant_cap) ? (uint32_t)req_sz : r->grant_cap;
+    r->grant_cap = 0U;
+    if (nw == 0U) {{
+        syn_exit_critical();
+        return;
+    }}
+    if (r->grant_off == 0U && r->tail > 0U && r->split_end == 0U) {{
+        if (r->count == 0U) {{
+            r->head = 0U;
+            r->tail = nw;
+            r->count = nw;
+        }} else {{
+            r->split_end = r->tail;
+            r->tail = nw;
+            r->count += nw;
+        }}
+    }} else {{
+        uint32_t nt = r->tail + nw;
+        r->tail = (r->split_end == 0U && nt >= (uint32_t)v.cap) ? 0U : nt;
+        r->count += nw;
+    }}
+    syn_ring_hdr_wake_nolock(r, boost_prio);
+    syn_exit_critical();
+}}
+
+static SYN_UNUSED inline syn_slice_u8 syn_ring_view_read_slice(syn_view_byte_ring_t v) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    uint32_t s1 = syn_ring_hdr_seg1_nolock(r, v.cap);
+    uint8_t *p = (s1 > 0U) ? &v.buf[r->head] : v.buf;
+    syn_exit_critical();
+    return (syn_slice_u8){{ .ptr = p, .len = (size_t)s1 }};
+}}
+
+static SYN_UNUSED inline bool syn_ring_view_poll_read(syn_view_byte_ring_t v, syn_task_t *task, syn_slice_u8 *out_slice) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    if (r->count == 0U) {{
+        syn_exit_critical();
+        return false;
+    }}
+    uint32_t s1 = syn_ring_hdr_seg1_nolock(r, v.cap);
+    out_slice->ptr = &v.buf[r->head];
+    out_slice->len = (size_t)s1;
+    if (r->rx_waiter == task) {{ r->rx_waiter = NULL; }}
+    uint8_t enc = r->boost_enc;
+    r->boost_enc = 0U;
+    syn_exit_critical();
+    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
+    return true;
+}}
+
+static SYN_UNUSED inline void syn_ring_view_consume(syn_view_byte_ring_t v, size_t req_sz) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    uint32_t req = (req_sz > (size_t)r->count) ? r->count : (uint32_t)req_sz;
+    syn_ring_hdr_advance_nolock(r, v.cap, req);
+    syn_exit_critical();
+}}
+
+static SYN_UNUSED inline size_t syn_ring_view_pop(syn_view_byte_ring_t v, syn_slice_u8 dst, syn_task_t *task) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    uint32_t rem = (dst.len < (size_t)r->count) ? (uint32_t)dst.len : r->count;
+    if (rem > 0U && dst.ptr != NULL) {{
+        uint32_t s1 = syn_ring_hdr_seg1_nolock(r, v.cap);
+        uint32_t c1 = (rem < s1) ? rem : s1;
+        for (uint32_t i = 0U; i < c1; i++) {{ dst.ptr[i] = v.buf[r->head + i]; }}
+        uint32_t c2 = rem - c1;
+        for (uint32_t i = 0U; i < c2; i++) {{ dst.ptr[c1 + i] = v.buf[i]; }}
+        syn_ring_hdr_advance_nolock(r, v.cap, rem);
+    }} else {{
+        rem = 0U;
+    }}
+    uint8_t enc = (rem > 0U) ? r->boost_enc : 0U;
+    if (rem > 0U) {{ r->boost_enc = 0U; }}
+    syn_exit_critical();
+    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
+    return (size_t)rem;
+}}
+
+static SYN_UNUSED inline bool syn_ring_view_try_pop_byte_raw(syn_view_byte_ring_t v, syn_task_t *task, uint8_t *out_b) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    if (r->count == 0U) {{
+        syn_exit_critical();
+        return false;
+    }}
+    uint8_t b = v.buf[r->head];
+    syn_ring_hdr_advance_nolock(r, v.cap, 1U);
+    uint8_t enc = r->boost_enc;
+    r->boost_enc = 0U;
+    syn_exit_critical();
+    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
+    *out_b = b;
+    return true;
+}}
+
+static SYN_UNUSED inline void syn_ring_view_clear(syn_view_byte_ring_t v) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    r->head = 0U;
+    r->tail = 0U;
+    r->count = 0U;
+    r->split_end = 0U;
+    r->grant_off = 0U;
+    r->grant_cap = 0U;
+    r->boost_enc = 0U;
+    syn_exit_critical();
+}}
+
+static SYN_UNUSED inline size_t syn_ring_view_free_space(syn_view_byte_ring_t v) {{
+    syn_enter_critical();
+    uint32_t fs = syn_ring_hdr_free_space_nolock(v.hdr, v.cap);
+    syn_exit_critical();
+    return (size_t)fs;
+}}
+
+static SYN_UNUSED inline void syn_ring_view_arm_rx(syn_view_byte_ring_t v, syn_task_t *task, bool has_to, uint32_t dl) {{
+    syn_ring_hdr_t *r = v.hdr;
+    syn_enter_critical();
+    if (r->count > 0U) {{
+        task->state = SYN_TASK_READY;
+        task->sched_flags |= SYN_FLAG_MORE;
+        syn_exit_critical();
+        return;
+    }}
+    r->rx_waiter = task;
+    task->wait_check = syn_ring_hdr_rx_ready;
+    task->wait_obj = r;
+    task->has_deadline = has_to;
+    task->delay_until = dl;
+    task->state = SYN_TASK_BLOCKED;
+    syn_exit_critical();
+}}
+
+static SYN_UNUSED inline void syn_ring_view_cancel_rx(syn_view_byte_ring_t v, const syn_task_t *task) {{
+    syn_enter_critical();
+    if (v.hdr->rx_waiter == task) {{ v.hdr->rx_waiter = NULL; }}
+    syn_exit_critical();
+}}
+
+typedef struct {{
+    uint8_t *dst;
+    syn_ring_hdr_t *ring_hdr;
+    size_t cap;
+    size_t pos;
+    bool truncated;
+    uint8_t mode;
+}} syn_fmt_sink_t;
+
+static SYN_UNUSED inline void syn_fmt_write(syn_fmt_sink_t *s, const void *data, size_t len) {{
+    if (len == 0U) {{ return; }}
+    if (s->mode == 1U) {{
+        size_t avail = (s->dst != NULL && s->pos < s->cap) ? (s->cap - s->pos) : 0U;
+        size_t n = (len <= avail) ? len : avail;
+        if (n > 0U && data != NULL) {{
+            memmove(s->dst + s->pos, data, n);
+            s->pos += n;
+        }}
+        if (n < len) {{
+            s->truncated = true;
+        }}
+    }} else if (s->mode == 2U) {{
+        syn_ring_hdr_t *r = s->ring_hdr;
+        syn_enter_critical();
+        r->grant_cap = 0U;
+        uint32_t avail = syn_ring_hdr_free_space_nolock(r, s->cap);
+        const uint8_t *src = (const uint8_t *)data;
+        uint32_t nw = (len < (size_t)avail) ? (uint32_t)len : avail;
+        if (src == NULL || s->dst == NULL) {{ nw = 0U; }}
+        for (uint32_t i = 0U; i < nw; i++) {{
+            s->dst[r->tail] = src[i];
+            if (r->split_end > 0U) {{
+                r->tail += 1U;
+            }} else {{
+                uint32_t nt = r->tail + 1U;
+                r->tail = (nt >= (uint32_t)s->cap) ? 0U : nt;
+            }}
+        }}
+        r->count += nw;
+        syn_exit_critical();
+        s->pos += (size_t)nw;
+        if ((size_t)nw < len) {{
+            s->truncated = true;
+        }}
+    }} else {{
+#if !defined(SYN_FREESTANDING)
+        if (data != NULL) {{
+            (void)fwrite(data, 1U, len, stdout);
+        }}
+#else
+        (void)data;
+#endif
+    }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_putc(syn_fmt_sink_t *s, char ch) {{
+    syn_fmt_write(s, &ch, 1U);
+}}
+
+static SYN_UNUSED inline void syn_fmt_cstr(syn_fmt_sink_t *s, const char *cstr) {{
+    if (cstr == NULL) {{ return; }}
+    size_t n = 0U;
+    while (cstr[n] != '\0') {{ n++; }}
+    syn_fmt_write(s, cstr, n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_bytes(syn_fmt_sink_t *s, syn_slice_u8 sl) {{
+    if (sl.ptr != NULL && sl.len > 0U) {{
+        syn_fmt_write(s, sl.ptr, sl.len);
+    }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_bool(syn_fmt_sink_t *s, bool v) {{
+    if (v) {{ syn_fmt_write(s, "true", 4U); }}
+    else   {{ syn_fmt_write(s, "false", 5U); }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_dec_pad(syn_fmt_sink_t *s, uint64_t v, uint8_t min_width) {{
+    char tmp[20];
+    size_t n = 0U;
+    do {{
+        tmp[19U - n] = (char)('0' + (v % 10ULL));
+        v /= 10ULL;
+        n++;
+    }} while (v > 0ULL && n < 20U);
+    size_t target_w = (min_width > 20U) ? 20U : (size_t)min_width;
+    while (n < target_w) {{
+        tmp[19U - n] = '0';
+        n++;
+    }}
+    syn_fmt_write(s, &tmp[20U - n], n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_dec(syn_fmt_sink_t *s, uint64_t v) {{
+    syn_fmt_u64_dec_pad(s, v, 1U);
+}}
+
+static SYN_UNUSED inline void syn_fmt_i64_dec(syn_fmt_sink_t *s, int64_t v) {{
+    if (v < 0) {{
+        syn_fmt_putc(s, '-');
+        uint64_t mag = (uint64_t)(0ULL - (uint64_t)v);
+        syn_fmt_u64_dec(s, mag);
+    }} else {{
+        syn_fmt_u64_dec(s, (uint64_t)v);
+    }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_hex(syn_fmt_sink_t *s, uint64_t v, bool upper, uint8_t pad_width) {{
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    char tmp[64];
+    size_t n = 0U;
+    do {{
+        tmp[63U - n] = digits[(size_t)(v & 0xFULL)];
+        v >>= 4;
+        n++;
+    }} while (v > 0ULL && n < 64U);
+    size_t target_w = (pad_width > 64U) ? 64U : (size_t)pad_width;
+    while (n < target_w) {{
+        tmp[63U - n] = '0';
+        n++;
+    }}
+    syn_fmt_write(s, &tmp[64U - n], n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_bin(syn_fmt_sink_t *s, uint64_t v, uint8_t pad_width) {{
+    char tmp[64];
+    size_t n = 0U;
+    do {{
+        tmp[63U - n] = (char)('0' + (v & 1ULL));
+        v >>= 1;
+        n++;
+    }} while (v > 0ULL && n < 64U);
+    size_t target_w = (pad_width > 64U) ? 64U : (size_t)pad_width;
+    while (n < target_w) {{
+        tmp[63U - n] = '0';
+        n++;
+    }}
+    syn_fmt_write(s, &tmp[64U - n], n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_float_fixed(syn_fmt_sink_t *s, double val, uint8_t prec) {{
+    static const uint64_t pow10_tbl[10] = {{
+        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL,
+        100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL
+    }};
+    uint64_t bits = syn_f64_to_bits(val);
+    uint64_t abs_bits = bits & 0x7FFFFFFFFFFFFFFFULL;
+    bool neg_bit = (bits >> 63) != 0ULL;
+    if (abs_bits > 0x7FF0000000000000ULL) {{
+        syn_fmt_write(s, "nan", 3U);
+        return;
+    }}
+    if (abs_bits == 0x7FF0000000000000ULL) {{
+        if (neg_bit) {{ syn_fmt_write(s, "-inf", 4U); }}
+        else         {{ syn_fmt_write(s, "inf", 3U); }}
+        return;
+    }}
+    /* Arduino overflow threshold: fabs(val) > 4294967040.0 (0x41EFFFFFE0000000) */
+    if (abs_bits > 0x41EFFFFFE0000000ULL) {{
+        if (neg_bit) {{ syn_fmt_write(s, "-ovf", 4U); }}
+        else         {{ syn_fmt_write(s, "ovf", 3U); }}
+        return;
+    }}
+    uint8_t p = (prec > 9U) ? 9U : prec;
+    uint64_t scale = pow10_tbl[p];
+    uint64_t int_part = 0ULL;
+    uint64_t frac_part = 0ULL;
+    if (abs_bits != 0ULL) {{
+        uint32_t exp = (uint32_t)(abs_bits >> 52);
+        uint64_t frac = abs_bits & 0x000FFFFFFFFFFFFFULL;
+        uint64_t sig53 = (exp == 0U) ? frac : (frac | (1ULL << 52));
+        uint32_t eff_exp = (exp == 0U) ? 1U : exp;
+        /* For abs_val <= 4294967040.0, eff_exp <= 1054, so rsh = 1075 - eff_exp >= 21 */
+        uint32_t rsh = 1075U - eff_exp;
+        if (rsh < 85U) {{
+            uint64_t a_lo = sig53 & 0xFFFFFFFFULL;
+            uint64_t a_hi = sig53 >> 32;
+            uint64_t m0 = a_lo * scale;
+            uint64_t m1 = a_hi * scale + (m0 >> 32);
+            uint64_t p_lo = (m0 & 0xFFFFFFFFULL) | (m1 << 32);
+            uint64_t p_hi = m1 >> 32;
+
+            uint32_t hm1 = rsh - 1U;
+            uint64_t r_lo = p_lo;
+            uint64_t r_hi = p_hi;
+            if (hm1 < 64U) {{
+                uint64_t h_lo = 1ULL << hm1;
+                r_lo = p_lo + h_lo;
+                if (r_lo < p_lo) {{ r_hi += 1ULL; }}
+            }} else {{
+                r_hi += 1ULL << (hm1 - 64U);
+            }}
+
+            uint64_t tot64 = 0ULL;
+            if (rsh < 64U) {{
+                tot64 = (r_lo >> rsh) | (r_hi << (64U - rsh));
+            }} else if (rsh == 64U) {{
+                tot64 = r_hi;
+            }} else {{
+                tot64 = r_hi >> (rsh - 64U);
+            }}
+            int_part = tot64 / scale;
+            frac_part = tot64 % scale;
+        }}
+    }}
+    if (neg_bit && (int_part != 0ULL || frac_part != 0ULL)) {{
+        syn_fmt_putc(s, '-');
+    }}
+    syn_fmt_u64_dec(s, int_part);
+    if (p > 0U) {{
+        syn_fmt_putc(s, '.');
+        syn_fmt_u64_dec_pad(s, frac_part, p);
+    }}
 }}
 
 /* Host Simulation API (`syn_sim_*`) */

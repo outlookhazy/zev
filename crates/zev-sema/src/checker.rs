@@ -18,7 +18,7 @@ use crate::model::{
     ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo,
     IrqInfo, IsrInfo, IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo,
     MonomorphizedInstance, MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite,
-    SemanticModel, SpawnedTaskInstance, TaskInfo,
+    SemanticModel, SpawnedTaskInstance, SubsystemInfo, TaskInfo,
 };
 use crate::modules::LinkedModulesOutput;
 use crate::provenance::{LeaseEnv, Provenance};
@@ -129,14 +129,14 @@ enum ActiveBodyKind {
 #[derive(Clone, Debug)]
 struct BootArgBinding {
     static_endpoint: Option<String>,
-    endpoint_from_param: Option<usize>,
+    endpoint_from_param: Option<(usize, Option<String>)>,
     ref_param_origins: BTreeSet<usize>,
 }
 
 #[derive(Clone, Debug)]
 struct BootCallArg {
     static_endpoint: Option<String>,
-    endpoint_from_param: Option<usize>,
+    endpoint_from_param: Option<(usize, Option<String>)>,
     has_non_static_local_ref: bool,
     has_isr_state_ref: bool,
     ref_param_origins: BTreeSet<usize>,
@@ -163,7 +163,10 @@ enum BootStep {
 #[derive(Clone, Debug)]
 enum BootAttachArgSpec {
     Static(IrqBindingArg),
-    Param { index: usize },
+    Param {
+        index: usize,
+        field_chain: Vec<(String, String)>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +222,7 @@ pub(crate) struct Analyzer {
     consts: BTreeMap<String, ConstInfo>,
     raw_const_exprs: BTreeMap<String, (Expr, Ty)>,
     primitives: BTreeMap<String, PrimitiveInfo>,
+    subsystems: BTreeMap<String, SubsystemInfo>,
     mmio_layout_names: BTreeSet<String>,
     mmio_layouts: BTreeMap<String, MmioLayoutInfo>,
     mmio_instances: BTreeMap<String, MmioInstanceInfo>,
@@ -266,6 +270,7 @@ impl Analyzer {
             consts: BTreeMap::new(),
             raw_const_exprs: BTreeMap::new(),
             primitives: BTreeMap::new(),
+            subsystems: BTreeMap::new(),
             mmio_layout_names: BTreeSet::new(),
             mmio_layouts: BTreeMap::new(),
             mmio_instances: BTreeMap::new(),
@@ -431,6 +436,7 @@ impl Analyzer {
         }
         self.current_file = None;
         self.check_recursive_struct_values();
+        self.finalize_subsystem_structs();
 
         // Pass 1c: Pre-scan for `sys.use_systick` / `sys.set_tick` so custom tick period is known
         // before validating duration literals anywhere in the program.
@@ -522,6 +528,7 @@ impl Analyzer {
             enums: self.enums,
             consts: self.consts,
             primitives: self.primitives,
+            subsystems: self.subsystems,
             functions: self.functions,
             tasks: self.tasks,
             isrs: self.isrs,
@@ -581,6 +588,7 @@ impl Analyzer {
             StructInfo {
                 name: st.name.name.clone(),
                 is_packed: st.is_packed,
+                is_subsystem: false,
                 fields: Vec::new(),
                 span: st.span,
             },
@@ -655,7 +663,7 @@ impl Analyzer {
                     ),
                 ));
             }
-            self.check_type_no_byval_mmio(
+            self.check_type_no_byval_mmio_or_unsized(
                 &ty,
                 f.ty.span,
                 &format!("field '{}' of struct '{}'", f.name.name, st.name.name),
@@ -730,6 +738,78 @@ impl Analyzer {
             }
         }
         false
+    }
+
+    fn finalize_subsystem_structs(&mut self) {
+        let names: Vec<String> = self.structs.keys().cloned().collect();
+        // Fixed-point propagate `is_subsystem` across nested subsystem structs.
+        loop {
+            let mut changed = false;
+            for name in &names {
+                if self.structs[name].is_subsystem {
+                    continue;
+                }
+                let has_subsys_content = self.structs[name].fields.iter().any(|f| {
+                    ty_embeds_os_primitive(&f.ty)
+                        || ty_contains_byval_subsys(&f.ty, &self.structs).is_some()
+                });
+                if has_subsys_content {
+                    if let Some(info) = self.structs.get_mut(name) {
+                        info.is_subsystem = true;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for name in &names {
+            let Some(st) = self.structs.get(name).cloned() else {
+                continue;
+            };
+            if !st.is_subsystem {
+                continue;
+            }
+            let file = self.struct_files.get(name).cloned().flatten();
+            self.current_instantiation_note = self.mono_instantiation_notes.get(name).cloned();
+            if st.is_packed {
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        st.span,
+                        format!(
+                            "packed struct '{}' cannot embed OS primitives or act as a subsystem struct",
+                            st.name
+                        ),
+                    )
+                    .with_file(file.clone()),
+                );
+            }
+            for f in &st.fields {
+                let valid_field = match &f.ty {
+                    Ty::OsPrimitive(os) => !os.is_unsized_view(),
+                    Ty::Struct(sub) => self.structs.get(sub).is_some_and(|s| s.is_subsystem),
+                    _ => false,
+                };
+                if !valid_field {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            f.span,
+                            format!(
+                                "subsystem struct '{}' cannot mix non-primitive field '{}' of type '{}' (all fields must be concrete OS primitives or nested subsystem structs)",
+                                st.name, f.name, f.ty
+                            ),
+                        )
+                        .with_file(file.clone())
+                        .with_note("move raw scalar/buffer fields into `watch<T>`, `inbox<T, N>`, or `byte_ring<N>` fields"),
+                    );
+                }
+            }
+            self.current_instantiation_note = None;
+        }
     }
 
     fn prescan_tick_config(&mut self, block: &Block) {
@@ -809,6 +889,7 @@ impl Analyzer {
     fn check_top_level_name_unique(&mut self, name: &Ident) -> bool {
         if self.consts.contains_key(&name.name)
             || self.primitives.contains_key(&name.name)
+            || self.subsystems.contains_key(&name.name)
             || self.mmio_instances.contains_key(&name.name)
             || self.irqs.contains_key(&name.name)
             || self.illegal_globals.contains_key(&name.name)
@@ -1331,6 +1412,17 @@ impl Analyzer {
         }
         let dma_safe = has_attr_dma_safe(item_attrs) || has_attr_dma_safe(&p.attrs);
         let resolved = self.resolve_os_primitive(&p.ty, p.span);
+        if resolved.is_unsized_view() {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::InvalidOperation,
+                p.span,
+                format!(
+                    "top-level OS primitive '{}' requires a concrete capacity `<N>` (use `{}` view only behind pointer `*`)",
+                    resolved, resolved
+                ),
+            ));
+            return;
+        }
 
         if let Some(init_expr) = &p.init {
             let mut body_checker = BodyChecker::new(
@@ -1416,6 +1508,30 @@ impl Analyzer {
             return;
         }
         let ty = self.resolve_type(&g.ty);
+        if let Ty::Struct(struct_name) = &ty {
+            if self.structs.get(struct_name).is_some_and(|s| s.is_subsystem) {
+                if let Some(init_expr) = &g.init {
+                    self.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        init_expr.span,
+                        format!(
+                            "subsystem instance '{}' of type '{}' cannot have a runtime initializer; embedded OS primitives are statically zero-initialized",
+                            g.name.name, struct_name
+                        ),
+                    ));
+                }
+                self.subsystems.insert(
+                    g.name.name.clone(),
+                    SubsystemInfo {
+                        name: g.name.name.clone(),
+                        struct_name: struct_name.clone(),
+                        dma_safe: has_attr_dma_safe(item_attrs),
+                        span: g.span,
+                    },
+                );
+                return;
+            }
+        }
         let ty_str = if ty.is_error() {
             "u32".to_string()
         } else {
@@ -1613,7 +1729,7 @@ impl Analyzer {
         out
     }
 
-    fn check_type_no_byval_mmio(&mut self, ty: &Ty, span: Span, context: &str) {
+    fn check_type_no_byval_mmio_or_unsized(&mut self, ty: &Ty, span: Span, context: &str) {
         if let Some(layout_name) = ty_contains_byval_mmio(ty) {
             self.emit(Diagnostic::new(
                 DiagnosticKind::MmioViolation,
@@ -1621,6 +1737,30 @@ impl Analyzer {
                 format!(
                     "cannot pass or store MMIO register layout '{}' by value in {} (use pointer `*{}`)",
                     layout_name, context, layout_name
+                ),
+            ));
+        }
+        if let Some(unsized_ty) = ty_contains_bare_unsized_prim(ty) {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::InvalidOperation,
+                span,
+                format!(
+                    "unsized primitive type '{}' in {} requires a concrete capacity `<N>` (or pointer view `*{}`)",
+                    unsized_ty, context, unsized_ty
+                ),
+            ));
+        }
+    }
+
+    fn check_type_no_byval_mmio(&mut self, ty: &Ty, span: Span, context: &str) {
+        self.check_type_no_byval_mmio_or_unsized(ty, span, context);
+        if let Some(subsys_name) = ty_contains_byval_subsys(ty, &self.structs) {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::InvalidOperation,
+                span,
+                format!(
+                    "cannot pass, store, or return subsystem struct '{}' by value in {} (use pointer `*{}`)",
+                    subsys_name, context, subsys_name
                 ),
             ));
         }
@@ -1775,6 +1915,9 @@ impl Analyzer {
                     cap: *cap,
                 }
             }
+            OsPrimitiveType::InboxUnsized { elem } => ResolvedOsPrimitive::InboxUnsized {
+                elem: Box::new(self.resolve_non_void_elem(elem)),
+            },
             OsPrimitiveType::Watch { elem } => ResolvedOsPrimitive::Watch {
                 elem: Box::new(self.resolve_non_void_elem(elem)),
             },
@@ -1814,6 +1957,7 @@ impl Analyzer {
                 }
                 ResolvedOsPrimitive::ByteRing { cap: *cap }
             }
+            OsPrimitiveType::ByteRingUnsized => ResolvedOsPrimitive::ByteRingUnsized,
         }
     }
 
@@ -2711,9 +2855,36 @@ impl Analyzer {
                             Some(BootAttachArgSpec::Static(arg)) => {
                                 resolved_args.push(arg.clone());
                             }
-                            Some(BootAttachArgSpec::Param { index, .. }) => {
+                            Some(BootAttachArgSpec::Param { index, field_chain }) => {
                                 if let Some(Some(forwarded)) = param_args.get(*index) {
-                                    resolved_args.push(forwarded.clone());
+                                    if field_chain.is_empty() {
+                                        resolved_args.push(forwarded.clone());
+                                    } else if let IrqBindingArg::SubsystemPath {
+                                        root,
+                                        root_struct,
+                                        field_chain: mut base_chain,
+                                    } = forwarded.clone()
+                                    {
+                                        base_chain.extend(field_chain.iter().cloned());
+                                        resolved_args.push(IrqBindingArg::SubsystemPath {
+                                            root,
+                                            root_struct,
+                                            field_chain: base_chain,
+                                        });
+                                    } else {
+                                        self.emit(
+                                            Diagnostic::new(
+                                                DiagnosticKind::IrqAttachmentError,
+                                                *arg_span,
+                                                format!(
+                                                    "parameter '{}' forwarded into '{}.attach({}(...))' in '{}' must resolve to a static subsystem `&inst`",
+                                                    pname, att.irq_name, att.isr_name, att.in_caller
+                                                ),
+                                            )
+                                            .with_file(att.file.clone()),
+                                        );
+                                        args_ok = false;
+                                    }
                                 } else {
                                     self.emit(
                                         Diagnostic::new(
@@ -2810,8 +2981,25 @@ impl Analyzer {
                         .iter()
                         .map(|a| match &a.spec {
                             Some(BootAttachArgSpec::Static(s)) => Some(s.clone()),
-                            Some(BootAttachArgSpec::Param { index, .. }) => {
-                                param_args.get(*index).cloned().flatten()
+                            Some(BootAttachArgSpec::Param { index, field_chain }) => {
+                                let base = param_args.get(*index).cloned().flatten()?;
+                                if field_chain.is_empty() {
+                                    Some(base)
+                                } else if let IrqBindingArg::SubsystemPath {
+                                    root,
+                                    root_struct,
+                                    field_chain: mut base_chain,
+                                } = base
+                                {
+                                    base_chain.extend(field_chain.iter().cloned());
+                                    Some(IrqBindingArg::SubsystemPath {
+                                        root,
+                                        root_struct,
+                                        field_chain: base_chain,
+                                    })
+                                } else {
+                                    None
+                                }
                             }
                             None => None,
                         })
@@ -2913,8 +3101,14 @@ impl Analyzer {
                     let mut endpoint_bindings = Vec::with_capacity(arg_bindings.len());
                     for b in &arg_bindings {
                         let resolved = b.static_endpoint.clone().or_else(|| {
-                            b.endpoint_from_param
-                                .and_then(|idx| param_endpoints.get(idx).cloned().flatten())
+                            b.endpoint_from_param.as_ref().and_then(|(idx, suffix)| {
+                                param_endpoints.get(*idx).cloned().flatten().map(|base| {
+                                    match suffix {
+                                        Some(suf) => format!("{base}.{suf}"),
+                                        None => base,
+                                    }
+                                })
+                            })
                         });
                         endpoint_bindings.push(resolved);
                     }
@@ -2952,8 +3146,14 @@ impl Analyzer {
                     let mut child_endpoints = Vec::with_capacity(args.len());
                     for a in &args {
                         let resolved = a.static_endpoint.clone().or_else(|| {
-                            a.endpoint_from_param
-                                .and_then(|idx| param_endpoints.get(idx).cloned().flatten())
+                            a.endpoint_from_param.as_ref().and_then(|(idx, suffix)| {
+                                param_endpoints.get(*idx).cloned().flatten().map(|base| {
+                                    match suffix {
+                                        Some(suf) => format!("{base}.{suf}"),
+                                        None => base,
+                                    }
+                                })
+                            })
                         });
                         child_endpoints.push(resolved);
                     }
@@ -3080,10 +3280,20 @@ impl<'a> BodyChecker<'a> {
             && !self.main_supervisor_started
     }
 
-    fn resolve_param_endpoint_index(&self, endpoint_name: &Option<String>) -> Option<usize> {
+    fn resolve_param_endpoint_index(
+        &self,
+        endpoint_name: &Option<String>,
+    ) -> Option<(usize, Option<String>)> {
         let ep = endpoint_name.as_deref()?;
-        let pname = ep.strip_prefix("param:")?;
-        self.param_names.iter().position(|n| n == pname)
+        let rest = ep.strip_prefix("param:")?;
+        let (pname, suffix) = match rest.split_once('.') {
+            Some((head, tail)) => (head, Some(tail.to_string())),
+            None => (rest, None),
+        };
+        self.param_names
+            .iter()
+            .position(|n| n == pname)
+            .map(|idx| (idx, suffix))
     }
 
     fn call_context(&self) -> CallContext {
@@ -3112,6 +3322,19 @@ impl<'a> BodyChecker<'a> {
             let endpoint_alias = match &p.ty {
                 Ty::OsPrimitive(_) => Some(format!("param:{}", p.name)),
                 Ty::Ptr(inner) if matches!(**inner, Ty::OsPrimitive(_)) => {
+                    Some(format!("param:{}", p.name))
+                }
+                Ty::Struct(s)
+                    if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem) =>
+                {
+                    Some(format!("param:{}", p.name))
+                }
+                Ty::Ptr(inner)
+                    if matches!(
+                        &**inner,
+                        Ty::Struct(s) if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem)
+                    ) =>
+                {
                     Some(format!("param:{}", p.name))
                 }
                 _ => None,
@@ -4858,6 +5081,17 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return;
                 }
+                if self.sema.subsystems.contains_key(&ident.name) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        target.span,
+                        format!(
+                            "cannot overwrite subsystem instance '{}' directly; operate on its fields via methods",
+                            ident.name
+                        ),
+                    ));
+                    return;
+                }
                 if self.sema.mmio_instances.contains_key(&ident.name)
                     || self.sema.irqs.contains_key(&ident.name)
                 {
@@ -5045,6 +5279,23 @@ impl<'a> BodyChecker<'a> {
                     );
                     return;
                 };
+
+                if self
+                    .sema
+                    .structs
+                    .get(&struct_name)
+                    .is_some_and(|s| s.is_subsystem)
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        target.span,
+                        format!(
+                            "cannot overwrite field '{}.{}' of subsystem struct directly; operate on it via its methods",
+                            struct_name, field.name
+                        ),
+                    ));
+                    return;
+                }
 
                 if op == AssignOp::Assign {
                     if !rhs.ty.is_assignable_to(&field_ty) {
@@ -5677,6 +5928,21 @@ impl<'a> BodyChecker<'a> {
                     return ExprVal::error(expr.span);
                 };
 
+                if st_info.is_subsystem {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        expr.span,
+                        format!(
+                            "cannot construct subsystem struct '{}' via struct literal; declare a top-level static instance instead",
+                            name.name
+                        ),
+                    ));
+                    for fi in fields {
+                        let _ = self.check_expr_infallible(&fi.value);
+                    }
+                    return ExprVal::scalar(Ty::Struct(name.name.clone()), expr.span);
+                }
+
                 let mut seen = BTreeSet::new();
                 let mut combined_prov = Provenance::pure_static();
                 let mut per_field_prov = BTreeMap::new();
@@ -5987,6 +6253,36 @@ impl<'a> BodyChecker<'a> {
                 ty: Ty::OsPrimitive(p.primitive),
                 error_spec: ResolvedErrorSpec::None,
                 prov: Provenance::pure_static(),
+                endpoint_name: Some(ident.name.clone()),
+                span: ident.span,
+            };
+        }
+
+        // 3b. Static subsystem struct instance (`uart0`).
+        if let Some(sub) = self.sema.subsystems.get(&ident.name).cloned() {
+            if self.in_isr() {
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::GlobalIsolationViolation,
+                        ident.span,
+                        format!(
+                            "ISR isolation violation: '{}' cannot access global subsystem instance '{}' directly",
+                            self.display_caller_name(),
+                            ident.name
+                        ),
+                    )
+                    .with_note(format!(
+                        "pass `&{name}` through `irq.attach({isr}(&{name}))` as a `*{st}` ISR parameter instead",
+                        name = ident.name,
+                        isr = self.display_caller_name(),
+                        st = sub.struct_name,
+                    )),
+                );
+            }
+            return ExprVal {
+                ty: Ty::Struct(sub.struct_name),
+                error_spec: ResolvedErrorSpec::None,
+                prov: Provenance::addr_of_static(),
                 endpoint_name: Some(ident.name.clone()),
                 span: ident.span,
             };
@@ -6383,6 +6679,30 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
+    fn expr_walks_through_ptr(&self, expr: &Expr) -> bool {
+        let mut cur = expr;
+        let mut walked_member = false;
+        loop {
+            match &cur.kind {
+                ExprKind::Field { target, .. } | ExprKind::Index { target, .. } => {
+                    walked_member = true;
+                    cur = target;
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    ..
+                } => return true,
+                ExprKind::Ident(id) => {
+                    return walked_member
+                        && self
+                            .lookup_local(&id.name)
+                            .is_some_and(|v| matches!(v.ty, Ty::Ptr(_) | Ty::Slice(_)));
+                }
+                _ => return false,
+            }
+        }
+    }
+
     fn resolve_addr_of_provenance(
         &self,
         inner: &Expr,
@@ -6391,23 +6711,29 @@ impl<'a> BodyChecker<'a> {
     ) -> (Provenance, Option<String>) {
         if let Some(root_name) = root_ident_of(inner) {
             if let Some(local) = self.lookup_local(&root_name) {
-                if local.is_isr_state {
-                    prov = prov.merge(&Provenance::addr_of_isr_state(
-                        &local.name,
-                        local.decl_depth,
-                    ));
-                } else {
-                    prov = prov.merge(&Provenance::addr_of_local(
-                        &local.name,
-                        local.decl_depth,
-                    ));
+                if !self.expr_walks_through_ptr(inner) {
+                    if local.is_isr_state {
+                        prov = prov.merge(&Provenance::addr_of_isr_state(
+                            &local.name,
+                            local.decl_depth,
+                        ));
+                    } else {
+                        prov = prov.merge(&Provenance::addr_of_local(
+                            &local.name,
+                            local.decl_depth,
+                        ));
+                    }
                 }
                 if endpoint_name.is_none() {
                     endpoint_name = local.endpoint_alias.clone();
                 }
-            } else if self.sema.primitives.contains_key(&root_name) {
+            } else if self.sema.primitives.contains_key(&root_name)
+                || self.sema.subsystems.contains_key(&root_name)
+            {
                 prov = Provenance::addr_of_static();
-                endpoint_name = Some(root_name);
+                if endpoint_name.is_none() {
+                    endpoint_name = Some(root_name);
+                }
             }
         } else {
             // Taking address of temporary expression at current lexical depth.
@@ -6529,7 +6855,13 @@ impl<'a> BodyChecker<'a> {
                     return ExprVal::error(span);
                 };
 
-                let prov = if f_info.ty.contains_reference(&self.sema.structs)
+                let is_subsys_field = matches!(&f_info.ty, Ty::OsPrimitive(_))
+                    || matches!(
+                        &f_info.ty,
+                        Ty::Struct(s) if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem)
+                    );
+                let prov = if is_subsys_field
+                    || f_info.ty.contains_reference(&self.sema.structs)
                     || f_info.ty.contains_fn_ptr(&self.sema.structs)
                 {
                     if let Some(root) = root_ident_of(target) {
@@ -6539,20 +6871,28 @@ impl<'a> BodyChecker<'a> {
                                 .cloned()
                                 .unwrap_or_else(|| tv.prov.clone())
                         } else {
-                            tv.prov
+                            tv.prov.clone()
                         }
                     } else {
-                        tv.prov
+                        tv.prov.clone()
                     }
                 } else {
                     Provenance::pure_static()
+                };
+
+                let endpoint_name = if is_subsys_field {
+                    tv.endpoint_name
+                        .as_ref()
+                        .map(|parent| format!("{parent}.{}", field.name))
+                } else {
+                    None
                 };
 
                 ExprVal {
                     ty: f_info.ty,
                     error_spec: ResolvedErrorSpec::None,
                     prov,
-                    endpoint_name: None,
+                    endpoint_name,
                     span,
                 }
             }
@@ -7048,6 +7388,7 @@ impl<'a> BodyChecker<'a> {
             }
 
             "fmt_buf" => Some(self.check_fmt_buf_call(args, span)),
+            "fmt_ring" => Some(self.check_fmt_ring_call(args, span)),
 
             "assert" => {
                 if args.len() != 1 {
@@ -7156,7 +7497,21 @@ impl<'a> BodyChecker<'a> {
                         }
                     }
                     let struct_ty = Ty::Struct(type_name.clone());
-                    if struct_ty.contains_reference(&self.sema.structs) {
+                    if self
+                        .sema
+                        .structs
+                        .get(&type_name)
+                        .is_some_and(|s| s.is_subsystem)
+                    {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            format!(
+                                "'{}.from_bytes' cannot construct subsystem struct '{}' (requires a wire-value struct)",
+                                type_name, type_name
+                            ),
+                        ));
+                    } else if struct_ty.contains_reference(&self.sema.structs) {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::InvalidOperation,
                             span,
@@ -7732,7 +8087,7 @@ impl<'a> BodyChecker<'a> {
                 _ => self.unknown_prim_method(prim, method, span),
             },
 
-            ResolvedOsPrimitive::Inbox { elem, .. } => match m {
+            ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => match m {
                 "post" | "try_post" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
                     ExprVal::scalar(Ty::void(), span)
@@ -7789,7 +8144,7 @@ impl<'a> BodyChecker<'a> {
                         span,
                     }
                 }
-                "len" => {
+                "len" | "cap" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
                     ExprVal::scalar(Ty::usize(), span)
                 }
@@ -7881,7 +8236,7 @@ impl<'a> BodyChecker<'a> {
                 _ => self.unknown_prim_method(prim, method, span),
             },
 
-            ResolvedOsPrimitive::ByteRing { .. } => {
+            ResolvedOsPrimitive::ByteRing { .. } | ResolvedOsPrimitive::ByteRingUnsized => {
                 let u8_slice = Ty::Slice(Box::new(Ty::u8()));
                 match m {
                     "push" => {
@@ -8460,6 +8815,311 @@ impl<'a> BodyChecker<'a> {
             prov: ret_prov,
             endpoint_name: None,
             span,
+        }
+    }
+
+    fn check_fmt_ring_call(&mut self, args: &[CallArg], span: Span) -> ExprVal {
+        let fmt_err_spec = ResolvedErrorSpec::Typed(Ty::Enum("FmtErr".to_string()));
+        let mut pos_args = Vec::new();
+        let mut boost_prio: Option<(Priority, Span)> = None;
+
+        for a in args {
+            if let Some(arg_name) = &a.name {
+                if arg_name.name == "boost" {
+                    let bv = self.check_expr_infallible(&a.value);
+                    if bv.ty != Ty::Priority && !bv.ty.is_error() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            a.span,
+                            format!(
+                                "'boost:' must be a priority (@critical..@low), found '{}'",
+                                bv.ty
+                            ),
+                        ));
+                    }
+                    if let ExprKind::Priority(prio) = a.value.kind {
+                        boost_prio = Some((prio, a.span));
+                    }
+                } else {
+                    let _ = self.check_expr_infallible(&a.value);
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        arg_name.span,
+                        format!(
+                            "unknown named argument '{}:' in 'fmt_ring'",
+                            arg_name.name
+                        ),
+                    ));
+                }
+            } else {
+                pos_args.push(a);
+            }
+        }
+
+        if pos_args.len() != 2 {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                span,
+                format!(
+                    "'fmt_ring' expects 2 positional arguments (tx, f\"...\" [, boost: @prio]), found {}",
+                    pos_args.len()
+                ),
+            ));
+            for a in &pos_args {
+                if let ExprKind::FormatString(parts) = &a.value.kind {
+                    let _ = self.check_format_string(parts);
+                } else {
+                    let _ = self.check_expr_infallible(&a.value);
+                }
+            }
+            return ExprVal {
+                ty: Ty::usize(),
+                error_spec: fmt_err_spec,
+                prov: Provenance::pure_static(),
+                endpoint_name: None,
+                span,
+            };
+        }
+
+        let ring_arg = pos_args[0];
+        let fmt_arg = pos_args[1];
+        let rv = self.check_expr_infallible(&ring_arg.value);
+        let ring_cap = match &rv.ty {
+            Ty::Ptr(inner) => match &**inner {
+                Ty::OsPrimitive(ResolvedOsPrimitive::ByteRing { cap }) => Some(*cap),
+                Ty::OsPrimitive(ResolvedOsPrimitive::ByteRingUnsized) => None,
+                Ty::Error => None,
+                _ => {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        ring_arg.span,
+                        format!(
+                            "'fmt_ring' first argument must be '*byte_ring<N>' or '*byte_ring', found '{}'",
+                            rv.ty
+                        ),
+                    ));
+                    None
+                }
+            },
+            Ty::Error => None,
+            _ => {
+                let mut diag = Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    ring_arg.span,
+                    format!(
+                        "'fmt_ring' first argument must be '*byte_ring<N>' or '*byte_ring', found '{}'",
+                        rv.ty
+                    ),
+                );
+                if matches!(
+                    rv.ty,
+                    Ty::OsPrimitive(ResolvedOsPrimitive::ByteRing { .. })
+                ) {
+                    diag = diag.with_note("pass `&ring` or a `*byte_ring` view pointer");
+                }
+                self.sema.emit(diag);
+                None
+            }
+        };
+
+        if let Some((prio, boost_span)) = boost_prio {
+            let source_key = rv
+                .endpoint_name
+                .clone()
+                .or_else(|| root_ident_of(&ring_arg.value))
+                .unwrap_or_else(|| "<anon_endpoint>".to_string());
+            self.recorded_boosts.push(PriorityBoostSite {
+                primitive_name: source_key,
+                boost_priority: prio,
+                span: boost_span,
+            });
+        }
+
+        let min_len = if let ExprKind::FormatString(parts) = &fmt_arg.value.kind {
+            let _ = self.check_format_string(parts);
+            self.min_format_string_len(parts)
+        } else {
+            let fv = self.check_expr_infallible(&fmt_arg.value);
+            if !fv.ty.is_error() {
+                let _ = self.check_format_hole(
+                    &fmt_arg.value,
+                    &fv.ty,
+                    FormatSpec::Default,
+                    fmt_arg.span,
+                );
+            }
+            self.min_format_value_len(&fv.ty, &FormatSpec::Default, &fmt_arg.value)
+        };
+
+        if let Some(cap) = ring_cap {
+            if min_len > cap {
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::FormatBufferTooSmall,
+                        span,
+                        format!(
+                            "format output minimum length ({} bytes) exceeds byte_ring<{}> capacity ({} bytes)",
+                            min_len, cap, cap
+                        ),
+                    )
+                    .with_note(format!(
+                        "increase the byte_ring capacity to at least `byte_ring<{}>`, or use an unsized `*byte_ring` view if capacity varies",
+                        min_len
+                    )),
+                );
+            }
+        }
+
+        ExprVal {
+            ty: Ty::usize(),
+            error_spec: fmt_err_spec,
+            prov: Provenance::pure_static(),
+            endpoint_name: None,
+            span,
+        }
+    }
+
+    fn min_format_string_len(&self, parts: &[FormatPart]) -> usize {
+        let mut total = 0usize;
+        for part in parts {
+            let step = match part {
+                FormatPart::Literal(s) => zev_ast::decoded_string_byte_len(s),
+                FormatPart::Hole { expr, spec, .. } => {
+                    let Some(ty) = self.structural_expr_ty(expr).or_else(|| match &expr.kind {
+                        ExprKind::Literal(Literal::String(_)) => Some(Ty::Str),
+                        ExprKind::Literal(Literal::Int(_)) => Some(Ty::IntLit),
+                        ExprKind::Literal(Literal::Float { .. }) => Some(Ty::FloatLit),
+                        ExprKind::Literal(Literal::Bool(_)) => Some(Ty::bool()),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    self.min_format_value_len(&ty, spec, expr)
+                }
+            };
+            total = total.saturating_add(step);
+        }
+        total
+    }
+
+    fn min_format_value_len(&self, ty: &Ty, spec: &FormatSpec, expr: &Expr) -> usize {
+        if let ExprKind::Literal(Literal::String(s)) = &expr.kind {
+            return zev_ast::decoded_string_byte_len(s);
+        }
+        if ty.is_bool() {
+            return if let ExprKind::Literal(Literal::Bool(b)) = &expr.kind {
+                if *b { 4 } else { 5 }
+            } else {
+                4
+            };
+        }
+        if ty.is_integer() {
+            return match spec {
+                FormatSpec::Hex { width, .. } | FormatSpec::Bin { width } => {
+                    width.unwrap_or(1).max(1) as usize
+                }
+                _ => match &expr.kind {
+                    ExprKind::Literal(Literal::Int(n)) => {
+                        if *n == 0 {
+                            1
+                        } else {
+                            n.ilog10() as usize + 1
+                        }
+                    }
+                    ExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        expr: inner,
+                    } => {
+                        if let ExprKind::Literal(Literal::Int(n)) = &inner.kind {
+                            let d = if *n == 0 { 1 } else { n.ilog10() as usize + 1 };
+                            d + 1
+                        } else {
+                            1
+                        }
+                    }
+                    _ => 1,
+                },
+            };
+        }
+        if ty.is_float() {
+            return match spec {
+                FormatSpec::Fixed { precision: p } => {
+                    if *p == 0 {
+                        1
+                    } else {
+                        2 + (*p as usize)
+                    }
+                }
+                FormatSpec::Sci { .. } => 3,
+                _ => 1,
+            };
+        }
+        if let Ty::Enum(en_name) = ty {
+            return self
+                .sema
+                .enums
+                .get(en_name)
+                .and_then(|en| en.variants.iter().map(|v| v.len()).min())
+                .unwrap_or(1);
+        }
+        match (ty, spec) {
+            (Ty::Array { elem, len }, FormatSpec::Default) if **elem == Ty::u8() => *len,
+            (Ty::Struct(_) | Ty::Slice(_) | Ty::Array { .. }, FormatSpec::Debug) => {
+                let mut visiting = BTreeSet::new();
+                self.debug_min_case_ty(ty, &mut visiting)
+            }
+            (Ty::Ptr(_), FormatSpec::Debug) => 3,
+            _ => 0,
+        }
+    }
+
+    fn debug_min_case_ty(&self, ty: &Ty, visiting: &mut BTreeSet<String>) -> usize {
+        match ty {
+            Ty::Prim(PrimType::Bool) => 4,
+            Ty::Prim(p) if p.is_integer() => 1,
+            Ty::Prim(p) if p.is_float() => 1,
+            Ty::IntLit | Ty::FloatLit => 1,
+            Ty::Enum(en_name) => self
+                .sema
+                .enums
+                .get(en_name)
+                .and_then(|en| en.variants.iter().map(|v| v.len()).min())
+                .unwrap_or(1),
+            Ty::Struct(st_name) => {
+                if !visiting.insert(st_name.clone()) {
+                    return 0;
+                }
+                let Some(st_info) = self.sema.structs.get(st_name) else {
+                    visiting.remove(st_name);
+                    return 0;
+                };
+                if st_info.fields.is_empty() {
+                    visiting.remove(st_name);
+                    return st_name.len() + 4;
+                }
+                let mut acc = st_name.len() + 3;
+                for (i, field) in st_info.fields.iter().enumerate() {
+                    if i > 0 {
+                        acc = acc.saturating_add(2);
+                    }
+                    acc = acc.saturating_add(field.name.len() + 2);
+                    acc = acc.saturating_add(self.debug_min_case_ty(&field.ty, visiting));
+                }
+                visiting.remove(st_name);
+                acc.saturating_add(2)
+            }
+            Ty::Array { elem, len } => {
+                if *len == 0 {
+                    2
+                } else {
+                    2usize
+                        .saturating_add(2 * (*len - 1))
+                        .saturating_add(len.saturating_mul(self.debug_min_case_ty(elem, visiting)))
+                }
+            }
+            Ty::Slice(_) => 2,
+            Ty::Ptr(_) => 3,
+            _ => 0,
         }
     }
 
@@ -9196,6 +9856,47 @@ fn ty_contains_byval_mmio(ty: &Ty) -> Option<&str> {
     }
 }
 
+fn ty_contains_bare_unsized_prim(ty: &Ty) -> Option<String> {
+    match ty {
+        Ty::OsPrimitive(os) if os.is_unsized_view() => Some(os.to_string()),
+        Ty::OsPrimitive(os) => os.elem_ty().and_then(ty_contains_bare_unsized_prim),
+        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_contains_bare_unsized_prim(elem),
+        Ty::FnPtr { params, ret } => params
+            .iter()
+            .find_map(ty_contains_bare_unsized_prim)
+            .or_else(|| ty_contains_bare_unsized_prim(ret)),
+        _ => None,
+    }
+}
+
+fn ty_embeds_os_primitive(ty: &Ty) -> bool {
+    match ty {
+        Ty::OsPrimitive(os) => !os.is_unsized_view(),
+        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_embeds_os_primitive(elem),
+        _ => false,
+    }
+}
+
+fn ty_contains_byval_subsys<'a>(
+    ty: &'a Ty,
+    structs: &'a BTreeMap<String, StructInfo>,
+) -> Option<&'a str> {
+    match ty {
+        Ty::Struct(name) if structs.get(name).is_some_and(|s| s.is_subsystem) => {
+            Some(name.as_str())
+        }
+        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_contains_byval_subsys(elem, structs),
+        Ty::OsPrimitive(os) => os
+            .elem_ty()
+            .and_then(|e| ty_contains_byval_subsys(e, structs)),
+        Ty::FnPtr { params, ret } => params
+            .iter()
+            .find_map(|p| ty_contains_byval_subsys(p, structs))
+            .or_else(|| ty_contains_byval_subsys(ret, structs)),
+        _ => None,
+    }
+}
+
 impl Analyzer {
     fn check_extern_c_access(&mut self, prog_idx: usize, ident: &Ident) {
         if self.program_extern_c_scopes.is_empty()
@@ -9593,29 +10294,90 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
+    fn build_subsystem_field_chain(
+        &self,
+        mut base_ty: Ty,
+        field_names: &[String],
+    ) -> Option<Vec<(String, String)>> {
+        let mut chain = Vec::with_capacity(field_names.len());
+        for fname in field_names {
+            let Ty::Struct(sname) = base_ty else {
+                return None;
+            };
+            let f = self.sema.structs.get(&sname)?.field(fname)?;
+            chain.push((fname.clone(), f.ty.to_string()));
+            base_ty = f.ty.clone();
+        }
+        Some(chain)
+    }
+
     fn classify_irq_attach_arg(&self, expr: &Expr, val: &ExprVal) -> Option<BootAttachArgSpec> {
         match &expr.kind {
             ExprKind::Unary {
                 op: UnaryOp::AddrOf,
                 expr: inner,
             } => {
-                if let ExprKind::Ident(id) = &inner.kind {
-                    if self.sema.primitives.contains_key(&id.name) {
-                        return Some(BootAttachArgSpec::Static(IrqBindingArg::PrimAddr(
-                            id.name.clone(),
-                        )));
+                let mut rev_fields = Vec::new();
+                let mut cur = &**inner;
+                while let ExprKind::Field { target, field } = &cur.kind {
+                    rev_fields.push(field.name.clone());
+                    cur = target;
+                }
+                rev_fields.reverse();
+                if let ExprKind::Ident(id) = &cur.kind {
+                    if rev_fields.is_empty() {
+                        if self.sema.primitives.contains_key(&id.name) {
+                            return Some(BootAttachArgSpec::Static(IrqBindingArg::PrimAddr(
+                                id.name.clone(),
+                            )));
+                        }
+                        if self.sema.mmio_instances.contains_key(&id.name) {
+                            return Some(BootAttachArgSpec::Static(IrqBindingArg::MmioAddr(
+                                id.name.clone(),
+                            )));
+                        }
                     }
-                    if self.sema.mmio_instances.contains_key(&id.name) {
-                        return Some(BootAttachArgSpec::Static(IrqBindingArg::MmioAddr(
-                            id.name.clone(),
-                        )));
+                    if let Some(sub) = self.sema.subsystems.get(&id.name) {
+                        let base_ty = Ty::Struct(sub.struct_name.clone());
+                        if let Some(field_chain) =
+                            self.build_subsystem_field_chain(base_ty, &rev_fields)
+                        {
+                            return Some(BootAttachArgSpec::Static(
+                                IrqBindingArg::SubsystemPath {
+                                    root: id.name.clone(),
+                                    root_struct: sub.struct_name.clone(),
+                                    field_chain,
+                                },
+                            ));
+                        }
+                    }
+                    if !rev_fields.is_empty() {
+                        if let Some(idx) = self.param_names.iter().position(|p| p == &id.name) {
+                            if let Some(local) = self.lookup_local(&id.name) {
+                                let base_ty = match &local.ty {
+                                    Ty::Ptr(inner_ty) => (**inner_ty).clone(),
+                                    other => other.clone(),
+                                };
+                                if let Some(field_chain) =
+                                    self.build_subsystem_field_chain(base_ty, &rev_fields)
+                                {
+                                    return Some(BootAttachArgSpec::Param {
+                                        index: idx,
+                                        field_chain,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
                 None
             }
             ExprKind::Ident(id) => {
                 if let Some(idx) = self.param_names.iter().position(|p| p == &id.name) {
-                    return Some(BootAttachArgSpec::Param { index: idx });
+                    return Some(BootAttachArgSpec::Param {
+                        index: idx,
+                        field_chain: Vec::new(),
+                    });
                 }
                 if self.sema.mmio_instances.contains_key(&id.name) {
                     return Some(BootAttachArgSpec::Static(IrqBindingArg::MmioAddr(

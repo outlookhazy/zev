@@ -84,6 +84,8 @@ pub enum MirType {
     Ptr(Box<MirType>),
     /// OS primitive endpoint type (usually accessed as global or via `*Primitive`).
     Primitive(MirPrimKind),
+    /// Unsized fat-pointer view over any `byte_ring<N>` or `inbox<T, N>`.
+    PrimView(MirPrimViewKind),
     /// Typed pointer to an `mmio` register layout (`*UartRegs`).
     MmioPtr(String),
     /// Function pointer type (for C interop callbacks).
@@ -180,6 +182,7 @@ impl MirType {
             MirType::Array { elem, len } => format!("arr_{}_{}", len, elem.mangle_name()),
             MirType::Ptr(inner) => format!("ptr_{}", inner.mangle_name()),
             MirType::Primitive(pk) => pk.mangle_name(),
+            MirType::PrimView(vk) => vk.mangle_name(),
             MirType::MmioPtr(n) => format!("mmio_ptr_{n}"),
             MirType::FnPtr { params, ret } => {
                 if params.is_empty() {
@@ -228,6 +231,7 @@ impl MirType {
             MirType::Array { elem, len } => format!("[{len}]{}", elem.display_name()),
             MirType::Ptr(inner) => format!("*{}", inner.display_name()),
             MirType::Primitive(pk) => pk.display_name(),
+            MirType::PrimView(vk) => vk.display_name(),
             MirType::MmioPtr(n) => format!("*{n}"),
             MirType::FnPtr { .. } => "fn(...)".to_string(),
             MirType::Result { ok, err } => match err {
@@ -282,6 +286,29 @@ impl MirPrimKind {
     }
 }
 
+/// Unsized view endpoint kind (`*byte_ring` or `*inbox<T>`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MirPrimViewKind {
+    ByteRing,
+    Inbox { elem: Box<MirType> },
+}
+
+impl MirPrimViewKind {
+    pub fn mangle_name(&self) -> String {
+        match self {
+            MirPrimViewKind::ByteRing => "view_byte_ring".to_string(),
+            MirPrimViewKind::Inbox { elem } => format!("view_inbox_{}", elem.mangle_name()),
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match self {
+            MirPrimViewKind::ByteRing => "*byte_ring".to_string(),
+            MirPrimViewKind::Inbox { elem } => format!("*inbox<{}>", elem.display_name()),
+        }
+    }
+}
+
 /// Imported chip/module descriptor.
 #[derive(Debug, Clone)]
 pub struct MirImport {
@@ -316,7 +343,16 @@ pub struct MirField {
 pub struct MirStruct {
     pub name: String,
     pub packed: bool,
+    pub is_subsystem: bool,
     pub fields: Vec<MirField>,
+}
+
+/// Top-level static subsystem struct instance (`UartSubsys uart0;`).
+#[derive(Debug, Clone)]
+pub struct MirSubsystemGlobal {
+    pub name: String,
+    pub struct_name: String,
+    pub dma_safe: bool,
 }
 
 /// Top-level OS primitive endpoint declaration.
@@ -490,6 +526,13 @@ pub enum MirStmt {
         dst_res: VarId,
         buf: MirExpr,
         chunks: Vec<MirFmtChunk>,
+    },
+    /// Zero-heap bounded ring formatting `fmt_ring(tx, f"..." [, boost: @prio]) -> usize error FmtErr`.
+    FmtRing {
+        dst_res: VarId,
+        ring: MirExpr,
+        chunks: Vec<MirFmtChunk>,
+        boost: Option<MirPriority>,
     },
     /// Volatile MMIO register write (`regs.cr1 = val;` or `regs.arr[i] = val;`).
     MmioWrite {
@@ -668,6 +711,24 @@ pub enum MirPrimNonBlockingOp {
         target: MirPrimTarget,
         cap: usize,
     },
+    InboxViewPost {
+        view: MirExpr,
+        elem_ty: MirType,
+        value: MirExpr,
+        boost: Option<MirPriority>,
+    },
+    ByteRingViewConsume {
+        view: MirExpr,
+        len: MirExpr,
+    },
+    ByteRingViewCommitWrite {
+        view: MirExpr,
+        len: MirExpr,
+        boost: Option<MirPriority>,
+    },
+    ByteRingViewClear {
+        view: MirExpr,
+    },
 }
 
 /// Built-in system, hardware SVD, and simulation intrinsics.
@@ -782,6 +843,35 @@ pub enum MirYieldKind {
         poll_bb: BlockId,
         resume_bb: BlockId,
     },
+    /// Blocking receive on unsized `*inbox<T>` view, optionally bounded by `timeout_deadline_var`.
+    InboxViewRecv {
+        view: MirExpr,
+        elem_ty: MirType,
+        timeout_deadline_var: Option<VarId>,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+        poll_bb: BlockId,
+        resume_bb: BlockId,
+    },
+    /// Blocking backpressure send on unsized `*inbox<T>` view, optionally bounded by `timeout_deadline_var`.
+    InboxViewSend {
+        view: MirExpr,
+        elem_ty: MirType,
+        val_var: VarId,
+        timeout_deadline_var: Option<VarId>,
+        dst_res: Option<VarId>,
+        poll_bb: BlockId,
+        resume_bb: BlockId,
+    },
+    /// Blocking receive/view wait on unsized `*byte_ring` view, optionally bounded by `timeout_deadline_var`.
+    ByteRingViewWaitRead {
+        view: MirExpr,
+        timeout_deadline_var: Option<VarId>,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+        poll_bb: BlockId,
+        resume_bb: BlockId,
+    },
     /// Initialize and invoke a yielding child function via `union _child.<slot_name>`.
     CallYielding {
         callee: String,
@@ -862,6 +952,15 @@ impl MirTerminator {
                 }
                 | MirYieldKind::ByteRingWaitRead {
                     poll_bb, resume_bb, ..
+                }
+                | MirYieldKind::InboxViewRecv {
+                    poll_bb, resume_bb, ..
+                }
+                | MirYieldKind::InboxViewSend {
+                    poll_bb, resume_bb, ..
+                }
+                | MirYieldKind::ByteRingViewWaitRead {
+                    poll_bb, resume_bb, ..
                 } => vec![*poll_bb, *resume_bb],
                 MirYieldKind::CallYielding { poll_bb, .. } => vec![*poll_bb],
                 MirYieldKind::PollChild {
@@ -884,6 +983,9 @@ impl MirTerminator {
                 | MirYieldKind::PingPongWaitChunk { poll_bb, .. }
                 | MirYieldKind::LeaseWaitChunk { poll_bb, .. }
                 | MirYieldKind::ByteRingWaitRead { poll_bb, .. }
+                | MirYieldKind::InboxViewRecv { poll_bb, .. }
+                | MirYieldKind::InboxViewSend { poll_bb, .. }
+                | MirYieldKind::ByteRingViewWaitRead { poll_bb, .. }
                 | MirYieldKind::PollChild { poll_bb, .. } => vec![*poll_bb],
                 MirYieldKind::CallYielding { .. } => vec![],
             },
@@ -920,6 +1022,14 @@ pub enum MirExprKind {
     },
     ConstRef(String),
     GlobalPrimAddr(String),
+    /// Base pointer to a static subsystem struct instance (`*Subsys`).
+    SubsystemAddr(String),
+    /// Construct an unsized primitive view `{ hdr/buf, cap }` from a sized primitive pointer.
+    MakePrimView {
+        ptr: Box<MirExpr>,
+        cap: usize,
+        kind: MirPrimViewKind,
+    },
     /// Base address of a typed `mmio` peripheral instance (`MirType::MmioPtr(layout)`).
     MmioAddr(String),
     /// Volatile MMIO register read (`regs.isr` or `regs.arr[i]`).
@@ -1102,6 +1212,71 @@ pub enum MirPrimReadOp {
         target: MirPrimTarget,
         cap: usize,
     },
+    InboxViewTryRecv {
+        view: MirExpr,
+        elem_ty: MirType,
+    },
+    InboxViewTrySend {
+        view: MirExpr,
+        elem_ty: MirType,
+        value: Box<MirExpr>,
+        boost: Option<MirPriority>,
+    },
+    InboxViewLen {
+        view: MirExpr,
+        elem_ty: MirType,
+    },
+    InboxViewCap {
+        view: MirExpr,
+        elem_ty: MirType,
+    },
+    InboxViewIsEmpty {
+        view: MirExpr,
+        elem_ty: MirType,
+    },
+    InboxViewIsFull {
+        view: MirExpr,
+        elem_ty: MirType,
+    },
+    ByteRingViewPush {
+        view: MirExpr,
+        src: Box<MirExpr>,
+        boost: Option<MirPriority>,
+    },
+    ByteRingViewPushByte {
+        view: MirExpr,
+        byte: Box<MirExpr>,
+        boost: Option<MirPriority>,
+    },
+    ByteRingViewGrantWrite {
+        view: MirExpr,
+        len: Box<MirExpr>,
+    },
+    ByteRingViewReadSlice {
+        view: MirExpr,
+    },
+    ByteRingViewPop {
+        view: MirExpr,
+        dst: Box<MirExpr>,
+    },
+    ByteRingViewTryPopByte {
+        view: MirExpr,
+    },
+    ByteRingViewLen {
+        view: MirExpr,
+    },
+    ByteRingViewCap {
+        view: MirExpr,
+    },
+    ByteRingViewFreeSpace {
+        view: MirExpr,
+    },
+    ByteRingViewIsEmpty {
+        view: MirExpr,
+    },
+    ByteRingViewIsFull {
+        view: MirExpr,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1203,6 +1378,12 @@ pub struct MirIsrStateVar {
 pub enum MirBakedArg {
     /// Address of a static OS/DMA primitive (`&sup_inbox`).
     PrimAddr(String),
+    /// Address of a static subsystem struct instance or nested field (`&uart0`, `&uart0.rx`).
+    SubsystemPath {
+        root: String,
+        root_struct: String,
+        field_chain: Vec<(String, String)>,
+    },
     /// Base pointer of an `mmio` peripheral instance (`hw.USART1` / `&hw.USART1`).
     MmioAddr(String),
     /// Compile-time constant scalar (`u32`, `bool`, enum variant, etc.).
@@ -1368,6 +1549,7 @@ pub struct MirModule {
     pub mmio_layouts: Vec<MirMmioLayout>,
     pub mmio_instances: Vec<MirMmioInstance>,
     pub primitives: Vec<MirPrimitive>,
+    pub subsystems: Vec<MirSubsystemGlobal>,
     pub extern_fns: Vec<MirExternFn>,
     pub isrs: Vec<MirIsr>,
     pub irq_vectors: Vec<MirIrqVector>,

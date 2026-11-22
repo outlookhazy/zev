@@ -1287,6 +1287,9 @@ impl<'a> AstRewriter<'a> {
                 elem: Box::new(self.rewrite_type(elem)),
                 cap: *cap,
             },
+            OsPrimitiveType::InboxUnsized { elem } => OsPrimitiveType::InboxUnsized {
+                elem: Box::new(self.rewrite_type(elem)),
+            },
             OsPrimitiveType::PingPong { elem, cap } => OsPrimitiveType::PingPong {
                 elem: Box::new(self.rewrite_type(elem)),
                 cap: *cap,
@@ -1296,6 +1299,7 @@ impl<'a> AstRewriter<'a> {
                 cap: *cap,
             },
             OsPrimitiveType::ByteRing { cap } => OsPrimitiveType::ByteRing { cap: *cap },
+            OsPrimitiveType::ByteRingUnsized => OsPrimitiveType::ByteRingUnsized,
         }
     }
 
