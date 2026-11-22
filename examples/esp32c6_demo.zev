@@ -247,9 +247,11 @@ task usb_cmd_worker(
             } else if (ch == 's' || ch == 'S' || ch == 't' || ch == 'T') {
                 cmds += 1;
                 u32 raw = bsp.read_die_temp_raw();
+                i32 cal = bsp.read_temp_calib_tenths_c();
+                u8 dac = bsp.read_tsens_dac();
                 f32 die_c = bsp.read_die_temp_c();
                 u32 slot = slot_w.read();
-                usize wn = fmt_ring(tx, f"[SENS ESP32-C6] die_temp={die_c:.1}C raw={raw} slot={slot} cmds={cmds}\n") catch { 0 };
+                usize wn = fmt_ring(tx, f"[SENS ESP32-C6] die_temp={die_c:.1}C raw={raw} cal={cal} dac={dac} slot={slot} cmds={cmds}\n") catch { 0 };
                 if (wn > 0) {
                     flush_tx_ring(tx);
                 }

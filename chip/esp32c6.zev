@@ -69,6 +69,38 @@ pub mmio ApbSaradcRegs {
     @rw u32 tsens_ctrl2 @ 0x5C;
 }
 
+pub mmio ModemSysconRegs {
+    @rw u32 test_conf         @ 0x00;
+    @rw u32 clk_conf_power_st @ 0x0C;
+}
+
+pub mmio ModemLpconRegs {
+    @rw u32 test_conf         @ 0x00;
+    @rw u32 i2c_mst_clk_conf  @ 0x10;
+    @rw u32 clk_conf          @ 0x18;
+    @rw u32 clk_conf_force_on @ 0x1C;
+    @rw u32 clk_conf_power_st @ 0x20;
+}
+
+pub mmio PmuRegs {
+    @rw u32 hp_active_icg_modem @ 0x0C;
+    @wo u32 imm_sleep_sysclk    @ 0xD0;
+    @wo u32 imm_modem_icg       @ 0xDC;
+    @rw u32 rf_pwc              @ 0x154;
+}
+
+pub mmio I2cAnaMstRegs {
+    @rw [2]u32 i2c_ctrl  @ 0x00;
+    @rw u32    ana_conf0 @ 0x18;
+    @rw u32    ana_conf1 @ 0x1C;
+    @rw u32    ana_conf2 @ 0x20;
+}
+
+pub mmio EfuseRegs {
+    @ro u32 rd_sys_part1_data3 @ 0x68;
+    @ro u32 rd_sys_part1_data4 @ 0x6C;
+}
+
 pub mmio RmtRegs {
     @rw  u32 ch0conf0    @ 0x10;
     @ro  u32 int_raw     @ 0x38;
@@ -90,8 +122,13 @@ pub mmio SYSTIMER   : SystimerRegs  @ 0x6000_A000;
 pub mmio APB_SARADC : ApbSaradcRegs @ 0x6000_E000;
 pub mmio USB_DEVICE : UsbDeviceRegs @ 0x6000_F000;
 pub mmio INTMTX     : IntmtxRegs    @ 0x6001_0000;
-pub mmio INTPRI     : IntpriRegs    @ 0x600C_5000;
-pub mmio PLIC_MX    : PlicMxRegs    @ 0x2000_1000;
+pub mmio INTPRI      : IntpriRegs     @ 0x600C_5000;
+pub mmio PLIC_MX     : PlicMxRegs     @ 0x2000_1000;
+pub mmio MODEM_SYSCON : ModemSysconRegs @ 0x600A_9800;
+pub mmio MODEM_LPCON  : ModemLpconRegs  @ 0x600A_F000;
+pub mmio I2C_ANA_MST  : I2cAnaMstRegs   @ 0x600A_F800;
+pub mmio PMU          : PmuRegs         @ 0x600B_0000;
+pub mmio EFUSE        : EfuseRegs       @ 0x600B_0800;
 
 // Peripheral interrupt matrix source IDs (ESP-IDF esp32c6/include/soc/interrupts.h)
 pub irq IRQ_FROM_CPU0        = 22;

@@ -94,19 +94,93 @@ pub fn clear_usb_rx_irq() {
     hw.USB_DEVICE.int_clr = 4;
 }
 
+usize regi2c_enable_sar() {
+    // 1. Release analog peripheral I2C from reset and power it up in PMU (BIT(26) | BIT(27)).
+    hw.PMU.rf_pwc = hw.PMU.rf_pwc | (1 << 26) | (1 << 27);
+
+    // 2. Ungate MODEM_APB, LP_APB, and I2C_MST across all PMU ICG states and latch in PMU.
+    hw.MODEM_SYSCON.test_conf = hw.MODEM_SYSCON.test_conf | 1;
+    hw.MODEM_SYSCON.clk_conf_power_st = hw.MODEM_SYSCON.clk_conf_power_st | 0xF000_0000;
+    hw.MODEM_LPCON.test_conf = hw.MODEM_LPCON.test_conf | 1;
+    hw.MODEM_LPCON.clk_conf_power_st = hw.MODEM_LPCON.clk_conf_power_st | 0xFF00_0000;
+    hw.PMU.imm_modem_icg = 1 << 31;
+    hw.PMU.imm_sleep_sysclk = 1 << 28;
+
+    // 3. Enable I2C_MST clock on XTAL/FOSC (keep SEL_160M = 0 since Direct-Boot runs on 40 MHz XTAL).
+    hw.MODEM_LPCON.i2c_mst_clk_conf = 0;
+    hw.MODEM_LPCON.clk_conf = hw.MODEM_LPCON.clk_conf | (1 << 2);
+    hw.MODEM_LPCON.clk_conf_force_on = hw.MODEM_LPCON.clk_conf_force_on | (1 << 2) | (1 << 5);
+
+    // 4. Power up SAR analog I2C slave and select REGI2C_SAR_I2C (0x69).
+    hw.I2C_ANA_MST.ana_conf2 = hw.I2C_ANA_MST.ana_conf2 | (1 << 16);
+    u32 sel_bit = hw.I2C_ANA_MST.ana_conf2 & (1 << 11);
+    hw.I2C_ANA_MST.ana_conf1 = 0x00FF_FDFF;
+    if (sel_bit != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+fn regi2c_wait_idle(usize m) {
+    for (u32 spin in 0..4096) {
+        if ((hw.I2C_ANA_MST.i2c_ctrl[m] & (1 << 25)) == 0) {
+            break;
+        }
+    }
+}
+
+u8 regi2c_sar_read(u8 reg_add) {
+    usize m = regi2c_enable_sar();
+    regi2c_wait_idle(m);
+    hw.I2C_ANA_MST.i2c_ctrl[m] = 0x69u32 | ((reg_add as u32) << 8);
+    regi2c_wait_idle(m);
+    return ((hw.I2C_ANA_MST.i2c_ctrl[m] >> 16) & 0xFF) as u8;
+}
+
+fn regi2c_sar_write_dac(u8 dac) {
+    u8 cur = regi2c_sar_read(6);
+    u8 next = (cur & 0xF0) | (dac & 0x0F);
+    usize m = regi2c_enable_sar();
+    regi2c_wait_idle(m);
+    hw.I2C_ANA_MST.i2c_ctrl[m] = 0x69u32 | (6u32 << 8) | (1u32 << 24) | ((next as u32) << 16);
+    regi2c_wait_idle(m);
+}
+
 pub fn init_temp_sensor() {
     hw.PCR.saradc_conf = 5;
     hw.PCR.tsens_clk_conf = (1 << 23) | (1 << 22) | (1 << 20);
     hw.PCR.tsens_clk_conf = (1 << 22) | (1 << 20);
     hw.APB_SARADC.tsens_ctrl = (1 << 22) | (6 << 14);
+    regi2c_sar_write_dac(15);
+    u32 t0 = read_systimer_ticks();
+    for (u32 i in 0..16384) {
+        if ((read_systimer_ticks() - t0) >= 8000) {
+            break;
+        }
+    }
 }
 
 pub u32 read_die_temp_raw() {
     return hw.APB_SARADC.tsens_ctrl & 0xFF;
 }
 
+pub u8 read_tsens_dac() {
+    return regi2c_sar_read(6) & 0x0F;
+}
+
+pub i32 read_temp_calib_tenths_c() {
+    u32 raw_cal = hw.EFUSE.rd_sys_part1_data4 & 0x1FF;
+    i32 mag = (raw_cal & 0xFF) as i32;
+    if ((raw_cal & 0x100) != 0) {
+        return -mag;
+    }
+    return mag;
+}
+
 pub f32 read_die_temp_c() {
-    return 0.4386f32 * (read_die_temp_raw() as f32) - 20.52f32;
+    f32 uncal = 0.4386f32 * (read_die_temp_raw() as f32) - 20.52f32;
+    f32 cal_c = (read_temp_calib_tenths_c() as f32) * 0.1f32;
+    return uncal - cal_c;
 }
 
 pub fn usb_tx_write_byte(u8 b) {
