@@ -2,7 +2,7 @@
 //!
 //! Designed so an AI coding agent or embedded systems engineer can learn idiomatic Zev
 //! in 1 tool call (`zevc doc`), drill into focused ~60-line topic guides (`zevc doc <topic>`),
-//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0012`, `E0001`..`E0027`).
+//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0012`, `E0001`..`E0029`).
 
 use crate::docs_errors::{ErrorDoc, ERROR_DOCS};
 use std::fmt::Write;
@@ -20,8 +20,8 @@ pub const PRIMER_DOC: &str = "\
 ================================================================================
 
 CORE MENTAL MODEL (5 RULES):
-  1. Explicit C-Style Types: Write `u16 rpm = 1800;` and `[]u8 buf` (never `let`/`var`).
-     Value-returning functions put the return type first (`u16 calc(u16 x)`); `fn f()` is `void`.
+  1. Explicit Types + Bounded Generics: Write `u16 rpm = 1800;`, `f32 kp = 0.4;`, and `[]u8 buf`
+     (never `let`/`var`). `struct FixedVec<T, usize N>` and `T clamp<T>(...)` monomorphize at compile time.
   2. Boot-Tree `spawn` + Immortal Tasks: Execution starts sequentially in `fn main()`. `task` items
      are permanent actors (`loop` / `loop every <period>`, reset via `restart;`) instantiated statically
      in `main()` or boot-helper `fn`s (`spawn worker(&ep, 1) @high;`). Use `sys.exit(0)` in sim/QEMU.
@@ -31,39 +31,38 @@ CORE MENTAL MODEL (5 RULES):
   4. Strict Task/ISR Isolation: Zero mutable raw globals. Cross-task/ISR state goes exclusively
      through static primitives: `watch<T>`, unified `inbox<T, N>` (`.post`, `.send`, `.recv`),
      `signal`, `ping_pong<T, N>`, and `lease<T, N>` (with optional ISR `boost: @critical`).
-  5. Dual-Exit Errors + `defer`: Normal exit is `return val;`; failure exit is `error [Reason [, val]];`,
-     handled via `or <val>` or `catch (...) { ... }`. `defer <stmt>;` runs LIFO across both exits.
+  5. Dual-Exit Errors, `defer` & Zero-Heap `f\"...\"`: Normal exit `return val;`, failure `error [E [, v]];`,
+     handled via `or <val>` / `catch (...)`. `println(f\"t={t:.2} x=0x{v:04x}\")` & `fmt_buf(dst, f\"...\")` use 0 heap.
 
 ROSETTA STONE (FOREIGN HABIT -> IDIOMATIC ZEV):
   Foreign Habit (Rust / Zig / Go / C)     | Idiomatic Zev (`.zev`)
   ----------------------------------------+-----------------------------------------------------
-  `let mut x: u32 = 1;` / `var x = 1;`    | `u32 x = 1;`
+  `let mut x: u32 = 1;` / `var x = 1;`    | `u32 x = 1;` / `f32 gain = 0.25f32;`
   `fn add(a: u16, b: u16) -> u16`         | `u16 add(u16 a, u16 b)`   (`fn init()` = `void`)
+  `template<class T, size_t N>` / `Vec<T>`| `struct FixedVec<T, usize N> { [N]T data; usize len; }`
   `async fn f()` + `f().await`            | `u16 f()` + `f()`         (3-tier call-graph inferred)
   `select { a = ch1 => ..., b = ch2 }`    | `Ev e = q.recv(timeout: 50ms) or Idle; switch (e)`
   `match ev { A => ..., B => ... }`       | `switch (ev) { A => { ... } _ => { ... } }`
   `Result<u16, E>` / `!u16` / `try f()`   | `u16 f() error E` + `error Bad;` + `catch (E e)` / `or 0`
-  `catch |err| { ... }`                   | `catch (ParseErr err) { ... }`
   `for (int i=0; i<n; i++)` / `for i in`  | `for (usize i in 0..n) { ... }` / `for (u8 b in slice)`
-  `every 1ms { ... }` (v0.1 bare `every`) | `loop every 1ms { ... }` / `loop every period_ms { ... }`
-  `chan<T, N>` (retired separate channel) | `inbox<T, N>` (`.post`, `.try_send`, `.send`, `.recv`)
+  `every 1ms { ... }` / `chan<T, N>`      | `loop every 1ms { ... }` / unified `inbox<T, N>`
   `struct R<'a> { b: &'a mut [u8] }`      | `struct R { []u8 b; }` + `i32 *ptr` (0 `'a` syntax)
-  `static mut G: u32 = 0;`                | `watch<u32> g = 0;` or `inbox<Ev, 8> q;` (`const` for ROM)
+  `println!(\"t={:.2}\", t)` / `snprintf`   | `println(f\"t={t:.2} {pkt:?}\");` / `fmt_buf(dst, f\"...\")`
   RAII Drop guard                         | `defer cs_high();` or `defer { ... }` (LIFO on return/error)
 
 SHARDED TOPIC GUIDES (`zevc doc <topic>`):
-  zevc doc syntax       Types, `u16be`/`packed struct`, `switch`, `defer`, `for (usize i in 0..n)`
-  zevc doc errors       Dual-exit `error` / `error ErrType`, partial progress, multi-stmt `catch`, `or`
+  zevc doc syntax       Types (`f32`/`f64`), `<T, usize N>` generics, `packed struct`, `switch`, `for`/`defer`
+  zevc doc errors       Dual-exit `error`, partial progress, `fmt_buf -> []u8 error FmtErr`, `catch` / `or`
   zevc doc tasks        Boot-Tree `spawn`, immortal `task` + `restart;`, `loop every <period_expr>`
   zevc doc yielding     3-tier effects (`SoftYielding` dual-spec), `noyield`, `critical`, `isr`, FFI
   zevc doc primitives   Unified `inbox` (`.post`/`.send`/`.recv`), `watch`, `signal`, `boost: @critical`
   zevc doc dma          `@dma_safe ping_pong`, `lease`, zero-`'a` scope/lease rules, sleep locks
-  zevc doc runtime      Portable `println` / `sys.*` (`sys.exit`), `chip.stm32g4` (`hw.*`), NVIC map
+  zevc doc runtime      Zero-heap `f\"...\"` (`println`, `fmt_buf`, `:.2`/`:e`/`:?`), `sys.*`, `hw.*`, NVIC
   zevc doc targets      `zevc check [--json]`, `ram`, `run`, `run-qemu [--max-ticks]`, ESP32-C6
 
 ERROR CODE EXPLAINERS (`zevc doc <code>` or `zevc doc --list`):
   Parser Traps   : P0001..P0012  (instant rewrites for `let`, `->`, `async`, `for(;;)`, bare `every`, `chan`)
-  Static Verifier: E0001..E0027  (isolation, 3-tier yields, DMA leases, unreachable/immortal/boot-spawn)
+  Static Verifier: E0001..E0029  (isolation, 3-tier yields, DMA leases, `fmt_buf` fit, `<T, usize N>` generics)
 ================================================================================
 ";
 
@@ -72,22 +71,22 @@ pub const TOPIC_DOCS: &[TopicDoc] = &[
         name: "syntax",
         aliases: &[
             "types", "struct", "structs", "enum", "enums", "packed", "endian", "fn", "functions",
-            "switch", "loops", "for", "defer",
+            "switch", "loops", "for", "defer", "generics", "float", "floats",
         ],
-        summary: "Explicit scalar/endian types, `packed struct`, `switch`, bounded `for..in`, and `defer`",
+        summary: "Scalar/float/endian types, `<T, usize N>` generics, `packed struct`, `switch`, `for`/`defer`",
         body: "\
 # Zev Topic Guide: `syntax`
 
-## 1. Scalar, Endian, Pointer, Slice & Array Types
-- Unsigned / Signed: `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, `isize`, `bool`, `void`
+## 1. Scalar, Float, Endian, Pointer, Slice & Array Types
+- Integers & Bool: `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, `isize`, `bool`, `void`
+- IEEE-754 Floats: `f32`, `f64` (`0.25f32`, `2.5e-3`, casts `raw as f32` / `val as i32`)
 - Wire-Endian (valid in `packed struct`): `u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le`
-- Compound: fat slices `[]u8` (`.len`, `buf[i]`, clamped `buf[0..5]`), pointers `i32 *p` / `*u8`, arrays `[16]u8`
-- Casts & Literals: `raw as i32`, integer separators `170_000_000`, durations `500us`, `1ms`, `5s`
+- Compound: fat slices `[]u8` (`.len`, `buf[i]`, clamped `buf[0..5]`), pointers `i32 *p` / `*u8`, arrays `[16]u8` / `u8 b[16]`
 
 ## 2. Wire `packed struct`, In-Memory `struct`, `enum` & `const`
 ```zev
 const u8 CMD_SET_RPM = 1;
-const u8 CMD_STOP    = 2;
+const usize MAX_SAMPLES = 8;
 
 packed struct CmdFrame {
     u8    op;
@@ -95,55 +94,39 @@ packed struct CmdFrame {
     u16be crc;
 }
 
-struct ByteReader {
-    []u8  buf;        // Slices/pointers allowed in normal `struct` (forbidden in `packed struct`)
-    usize pos;
-}
-
 enum Mode { Idle, ClosedLoop, Fault }
 ```
 Decode a `packed struct` directly from a `[]u8` slice with `CmdFrame.from_bytes(buf[0..5]) catch { ... };`.
 
-## 3. Function Signatures (`Ret name(...)` vs `fn name(...)`)
-- Value-returning functions put the return type BEFORE the name (C-style):
-  ```zev
-  u16 pi_step(u16 target, u16 actual, i32 *integral) {
-      i32 err = (target as i32) - (actual as i32);
-      *integral += err;
-      return target;
-  }
-  ```
-- Void functions use `fn`: `fn setup_clocks() { ... }`
-- C FFI prototypes: `extern \"C\" fn log_kv(*u8 key, i32 val);` or `extern \"C\" u32 read_csr();`
+## 3. Signatures (`Ret name(...)` vs `fn name(...)`) & Monomorphized `<T, usize N>` Generics
+- Value-returning functions put the return type first; `fn` is `void`. User `struct`s and `fn`s support
+  compile-time monomorphized `<T>` and `<T, usize N>` parameters (concrete Flash instantiations are reported in
+  `zevc ram` and `zevc check --json`; C++ ad-hoc overloading and trait hierarchies are omitted; `E0029` on misuse):
+```zev
+struct FixedVec<T, usize N> {
+    [N]T  data;
+    usize len;
+}
+
+T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) { return lo; }
+    if (val > hi) { return hi; }
+    return val;
+}
+// Call with inferred `clamp(x, 0.0f32, 1.0f32)` or explicit `clamp<f32>(...)` / `clamp::<f32>(...)`!
+```
 
 ## 4. `switch`, Bounded `for..in` Loops & Zero-Cost `defer`
 - `switch` dispatches on `enum` variants AND integer/`bool`/`const` values (`_` / `default` wildcard, zero fallthrough).
-- Bounded `for..in` loops support half-open `0..n`, inclusive `0..=max` (overflow-safe at `T::MAX`), and slices/arrays
-  `for (u8 b in slice)` (while C's 3-clause `for (;;)` and untyped `for i in 0..n` are trapped via `P0008`).
+- Bounded `for..in` loops support `for (usize i in 0..n)`, `0..=max`, and `for (u8 b in slice)` (3-clause `for (;;)` -> `P0008`).
 - `defer <stmt>;` and `defer { ... }` execute in strict LIFO order across scope exit, `return`, `error`, `break`,
-  `continue`, `restart`, and `sys.exit` (`defer` bodies are implicitly non-yielding).
-- Any statement after diverging control flow (`return`, `error`, `restart`, `sys.exit`, or break-less `loop`) is rejected (`E0025`).
-```zev
-u16 checksum_with_cs([]u8 payload) {
-    cs_assert_low();
-    defer cs_release_high();
-
-    u16 acc = 0;
-    for (u8 b in payload) {
-        acc = (acc + (b as u16)) & 0xFFFF;
-    }
-    for (usize pad in 0..4) {
-        acc ^= (pad as u16);
-    }
-    return acc;
-}
-```
+  `continue`, `restart`, and `sys.exit` (`defer` bodies are implicitly non-yielding; dead code after exits -> `E0025`).
 ",
     },
     TopicDoc {
         name: "errors",
-        aliases: &["err", "error", "catch", "or", "fallible", "result"],
-        summary: "Dual-exit `return` vs `error` (`0/1/2` args), multi-stmt `catch`, and `or` fallback",
+        aliases: &["err", "error", "catch", "or", "fallible", "result", "fmt_buf"],
+        summary: "Dual-exit `return` vs `error`, partial progress (`fmt_buf` `Truncated`), `catch`, and `or`",
         body: "\
 # Zev Topic Guide: `errors`
 
@@ -166,47 +149,34 @@ cleanly on both paths after return/error expressions are evaluated):
   enum ParseErr { TooShort, BadCrc }
 
   u16 parse_setpoint([]u8 buf, u16 expected_crc) error ParseErr {
-      if (buf.len < 5) {
-          error TooShort;
-      }
-      CmdFrame f = CmdFrame.from_bytes(buf[0..5]) catch {
-          error TooShort;
-      };
-      if (f.crc != expected_crc) {
-          error BadCrc;
-      }
+      if (buf.len < 5) { error TooShort; }
+      CmdFrame f = CmdFrame.from_bytes(buf[0..5]) catch { error TooShort; };
+      if (f.crc != expected_crc) { error BadCrc; }
       return f.setpoint;
   }
   ```
-- **Typed failure + partial progress (`error Reason, partial_val;`)**:
+- **Typed failure + partial progress (`error Reason, partial_val;`) & `fmt_buf`**:
+  Built-in `fmt_buf(dst, f\"...\") -> []u8 error FmtErr` proves worst-case buffer fit at compile time when all
+  holes are statically bounded (`E0028` if `dst` is too small), and returns `error Truncated, clamped_slice;`
+  at runtime when dynamic `[]u8` slices exceed `dst.len`:
   ```zev
-  enum StreamErr { Timeout, Framing }
-
-  u32 read_burst(u32 requested) error StreamErr {
-      if (requested > 16) {
-          error Timeout, 16;   // Returns partial count `16` in `r0` alongside `Timeout` in `r1`!
-      }
-      return requested;
-  }
+  u8 buf[24];
+  []u8 line = fmt_buf(buf[..], f\"tag={dyn_slice}\") catch (FmtErr err, []u8 clamped) {
+      clamped     // Zero-copy clamped prefix written into `buf` before truncation!
+  };
   ```
 
 ## 2. Symmetric Caller Handling (`or` and Multi-Statement `catch`)
-Every fallible call (including `recv(timeout: 5s)` and `send(v, timeout: 10ms)`) MUST be handled via `or` or `catch`:
+Every dynamically fallible call (including `recv(timeout: 5s)`, `send(v, timeout: 10ms)`, and `fmt_buf`
+when not statically proven to fit at compile time; proven-fit fixed-buffer `fmt_buf` calls need neither
+`or` nor `catch`) MUST use `or` or `catch`:
 ```zev
-// 1. Inline default fallback (`or`):
 u16 safe_rpm = parse_setpoint(half, 0x1EBF) or 0;
 SupEvent ev  = sup_inbox.recv(timeout: 5s) or IdleCheck;
 
-// 2. Diverging `catch` (`continue;`, `break;`, `return;`, `restart;`, or `error ...;`):
 u16 rpm = parse_setpoint(half, 0x1EBF) catch (ParseErr err) {
     sup_inbox.post(BadPacket);
     continue;
-};
-
-// 3. Multi-statement value-recovering `catch` (trailing expression w/ or w/o `;`):
-u32 count = read_burst(32) catch (StreamErr err, u32 completed) {
-    recoveries += 1;
-    completed + 100
 };
 ```
 ",
@@ -442,41 +412,43 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
     TopicDoc {
         name: "runtime",
         aliases: &[
-            "io", "std", "sys", "hw", "chip", "irq", "nvic", "print", "println", "uart",
+            "io", "std", "sys", "hw", "chip", "irq", "nvic", "print", "println", "uart", "fmt",
+            "format", "fstring",
         ],
-        summary: "Portable `print`/`println`/`sys.*` built-ins, `hw.*` chip peripherals, and NVIC `isr` map",
+        summary: "Zero-heap `f\"...\"` (`println`, `fmt_buf`), `sys.*` built-ins, `hw.*`, and NVIC `isr` map",
         body: "\
 # Zev Topic Guide: `runtime`
 
-## 1. Portable Built-In Functions & `sys.*` Namespace (Works Across C99 Sim, Cortex-M3 & ESP32-C6)
-- **String & Assertion Built-Ins**:
-  - `print(\"text\");` / `println(\"line\");` — Writes a string literal/`*u8` to host `stdout`, Cortex-M3
-    `UART0` (`0x4000C000`), or ESP32-C6 `USB_DEVICE` (`/dev/ttyACM0`). (String-only; use `sys.log_kv` for numbers!)
-  - `assert(cond);` — Verifies a `bool` invariant (`E0019` if non-`bool`).
-  - `delay(10ms);` / `checkpoint();` / `set_priority(@low);` — Scheduler timing, cooperative yield & priority.
-- **Portable `sys.*` System & Telemetry Methods** (strictly typechecked; unknown `sys.*`/`sim.*` rejected w/ `E0020`):
-  - `sys.use_systick(u32 hz);` — Configures core timer (`12_000_000` on QEMU LM3S, `170_000_000` on STM32G4).
-  - `sys.now_ms() -> u32` / `sys.now_ticks() -> u32` — Current monotonic millisecond tick counter.
-  - `sys.log(*u8 msg);` — Writes raw message string without newline.
-  - `sys.log_kv(*u8 label, i32 val);` — Prints `label` followed by signed decimal `val` + newline!
-  - `sys.log_hex(*u8 label, u32 val);` — Prints `label` followed by `0x...` hex `val` + newline!
-  - `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` in QEMU & host sim).
-  - `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then exits host sim or QEMU).
+## 1. Zero-Heap Streamable `f\"...\"` Formatting (`print`, `println`, `fmt_buf`)
+`f\"...\"` unpacks at compile time into direct per-call-site chunk writes (zero `malloc`, zero runtime
+format-string parser, zero global handler registry):
+- **Console / UART Sinks**: `print(f\"...\");` and `println(f\"...\");` stream directly to host `stdout`,
+  Cortex-M3 `UART0` (`0x4000C000`), or ESP32-C6 `USB_DEVICE` (`/dev/ttyACM0`).
+- **Bounded Buffer Sink**: `fmt_buf(dst, f\"...\") -> []u8 error FmtErr` proves worst-case capacity fit at
+  compile time when all holes are bounded (`E0028` if `dst` is too small) and returns dual-exit
+  `error Truncated, clamped_slice;` when dynamic `[]u8` slices exceed `dst.len`.
+- **Supported `{...}` Specifiers** (`{{` and `}}` escape literal braces):
+  - `{v}` — Decimal integers, `bool`, `[]u8` / string literals, default `.2` fixed float, and automatic
+    `enum` variant names (`.rodata` emitted only for formatted enums!).
+  - `{v:x}` / `{v:X}` / `{v:04x}` — Hexadecimal with optional zero-padded width; `{v:b}` / `{v:08b}` — Binary.
+  - `{t:.2}` — Compact (~150 B Arduino-style) fixed-decimal `f32`/`f64` (`\"nan\"`, `\"inf\"`, `\"ovf\"`).
+  - `{t:e}` / `{t:.3e}` — Scientific float (linked via `--gc-sections` *only* if `:e` appears in program!).
+  - `{pkt:?}` — Compile-time struct field debug expansion (`\"CmdFrame { op: 1, ... }\"`).
 
-## 2. Virtual SVD Hardware Namespace (`import chip.stm32g4 as hw;`)
-- `hw.GPIOA.set_pin(pin)` / `hw.GPIOA.clear_pin(pin)` (built-in `MOTOR_EN` pin constant available)
-- `hw.TIM1.set_compare(pwm_ch, duty)`
-- `hw.UART0.puts(\"...\")` / `hw.USART1.puts(\"...\")` (writes to `stdout` in host sim and `UART0` in QEMU)
-- `hw.DMA1.CH5.clear_irq(HALF_TRANSFER | FULL_TRANSFER)` / `hw.DMA1.bind_circular_rx(ch, usart, &ring)`
-- `hw.RCC.enable_pll_170mhz()`, `hw.FLASH.*`, `hw.CRC.*`
+## 2. Portable Built-Ins & `sys.*` Namespace (Works Across C99 Sim, Cortex-M3 & ESP32-C6)
+- `assert(cond);` / `delay(10ms);` / `checkpoint();` / `set_priority(@low);`
+- `sys.use_systick(u32 hz);` — Configures core timer (`12_000_000` on QEMU LM3S, `170_000_000` on STM32G4).
+- `sys.now_ms() -> u32` / `sys.now_ticks() -> u32` — Current monotonic millisecond tick counter.
+- `sys.log(*u8 msg);` / `sys.log_kv(*u8 label, i32 val);` / `sys.log_hex(*u8 label, u32 val);`
+- `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` in QEMU & host sim).
+- `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then exits host sim or QEMU).
 
-## 3. ARM Cortex-M3 NVIC `isr <NAME>` Vector Mapping (`zevc build-elf` / `zevc run-qemu`)
-User `isr <NAME> { ... }` blocks are wired directly into `.isr_vector` and auto-enabled in `NVIC_ISER0`:
-- `EXTI0` / `GPIOA` -> `IRQ0`  |  `EXTI1` / `GPIOB` -> `IRQ1`  |  `EXTI2`..`EXTI4` -> `IRQ2`..`IRQ4`
-- `UART0` / `USART1` / `DMA1_CH5` -> `IRQ5`  |  `UART1` / `USART2` / `DMA1_CH6` -> `IRQ6`
-- `SSI0` / `SPI1` / `DMA1_CH1` -> `IRQ7`     |  `I2C0` / `I2C1` / `DMA1_CH2` -> `IRQ8`
-- `ADC0` / `ADC1` -> `IRQ14`   |  `TIM0A` / `TIM1` -> `IRQ19`  |  `TIM1A` / `TIM2` -> `IRQ21`
-- Explicit `IRQ0`..`IRQ31` names map 1-to-1; call `sys.pend_irq(5)` to trigger `IRQ5` in QEMU!
+## 3. Virtual SVD Hardware (`import chip.stm32g4 as hw;`) & ARM Cortex-M3 NVIC Map
+- `hw.GPIOA.set_pin(pin)` / `clear_pin(pin)`, `hw.TIM1.set_compare(ch, duty)`, `hw.UART0.puts(...)`,
+  `hw.DMA1.CH5.clear_irq(...)`, `hw.DMA1.bind_circular_rx(...)`, `hw.RCC.enable_pll_170mhz()`
+- NVIC `isr <NAME>`: `EXTI0`/`GPIOA` -> `IRQ0`, `EXTI1`..`EXTI4` -> `IRQ1`..`IRQ4`,
+  `UART0`/`USART1`/`DMA1_CH5` -> `IRQ5`, `UART1`/`USART2`/`DMA1_CH6` -> `IRQ6`, `SSI0`/`SPI1` -> `IRQ7`,
+  `I2C0`/`I2C1` -> `IRQ8`, `ADC0`/`ADC1` -> `IRQ14`, `TIM0A`/`TIM1` -> `IRQ19`, `IRQ0`..`IRQ31` 1-to-1.
 ",
     },
     TopicDoc {
@@ -490,18 +462,18 @@ User `isr <NAME> { ... }` blocks are wired directly into `.isr_vector` and auto-
 # Zev Topic Guide: `targets`
 
 ## 1. Static Verification & Machine-Readable JSON (`zevc check`)
-Reports task/primitive counts, tick period, and any dual-specialized `SoftYielding` functions
-(`dual_specialized=[...]` in human output, `\"dual_specialized_functions\": [...]` in `--json`):
+Reports task/primitive counts, tick period, dual-specialized `SoftYielding` functions, and concrete
+monomorphized generic instances (`dual_specialized_functions` & `monomorphized_instances` in `--json`):
 ```bash
 zevc check examples/motor_controller.zev examples/motor_support.zev
-zevc check --json app.zev             # Structured JSON diagnostics + dual-specialization list
+zevc check --json app.zev             # Structured JSON diagnostics + dual-spec & monomorphized lists
 ```
 
-## 2. Zero-Heap Static SRAM & Provenance Report (`zevc ram`)
+## 2. Zero-Heap Static SRAM, Provenance & Monomorphization Report (`zevc ram`)
 Computes exact 32-bit MCU and 64-bit host byte counts per spawned task slot (including full Boot-Tree
 `spawn` provenance `main -> helper -> worker` and `[conditional]` tags), hoisted vs stack-local `[noyield]`
 variables, disjoint child `union` bytes saved, OS primitives, dual-specialized `SoftYielding` functions,
-and `0 B` dynamic heap:
+concrete `<T, usize N>` monomorphizations, and `0 B` dynamic heap:
 ```bash
 zevc ram examples/motor_controller.zev examples/motor_support.zev
 ```
@@ -597,7 +569,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
         }
     }
 
-    // 2. Error code match (`P0001`..`P0012`, `E0001`..`E0027`, case-insensitive)
+    // 2. Error code match (`P0001`..`P0012`, `E0001`..`E0029`, case-insensitive)
     let upper = q.to_ascii_uppercase();
     for err_doc in ERROR_DOCS {
         if err_doc.code == upper {
@@ -606,7 +578,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
     }
 
     Err(format!(
-        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0012 / E0001..E0027 codes)"
+        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0012 / E0001..E0029 codes)"
     ))
 }
 
@@ -621,14 +593,14 @@ mod tests {
         assert!(primer.contains("zevc doc syntax"));
         assert!(primer.contains("zevc doc runtime"));
         assert!(primer.contains("P0001..P0012"));
-        assert!(primer.contains("E0001..E0027"));
+        assert!(primer.contains("E0001..E0029"));
 
         let list = lookup_doc(None, true).unwrap();
         assert!(list.contains("runtime"));
         assert!(list.contains("P0001"));
         assert!(list.contains("P0012"));
         assert!(list.contains("E0001"));
-        assert!(list.contains("E0027"));
+        assert!(list.contains("E0029"));
     }
 
     #[test]
@@ -643,6 +615,10 @@ mod tests {
             "dma",
             "runtime",
             "targets",
+            "generics",
+            "floats",
+            "fmt",
+            "fmt_buf",
             "for",
             "defer",
             "restart",
@@ -676,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn all_39_error_codes_resolve_and_bad_and_good_snippets_verify() {
+    fn all_41_error_codes_resolve_and_bad_and_good_snippets_verify() {
         for n in 1..=12 {
             let code = format!("P{n:04}");
             let lower = code.to_ascii_lowercase();
@@ -684,7 +660,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("missing {code}: {e}"));
             assert!(doc.contains(&code));
         }
-        for n in 1..=27 {
+        for n in 1..=29 {
             let code = format!("E{n:04}");
             let lower = code.to_ascii_lowercase();
             let doc = lookup_doc(Some(&lower), false)
@@ -692,21 +668,80 @@ mod tests {
             assert!(doc.contains(&code));
         }
 
-        assert_eq!(ERROR_DOCS.len(), 39);
+        assert_eq!(ERROR_DOCS.len(), 41);
         for e in ERROR_DOCS {
-            // 1. Every GOOD snippet must parse AND pass zev-sema cleanly
+            // 1. Every GOOD snippet must parse, monomorphize & pass zev-sema, AND lower cleanly
+            //    through zev-mir, zev-codegen-c (including clang -std=c99 syntax check), and zev-codegen-llvm!
             let prog = zev_parser::parse_str_named(e.good_zev, e.code).unwrap_or_else(|pe| {
                 panic!(
                     "GOOD snippet for {} failed to parse:\n{}\n---\n{}",
                     e.code, pe, e.good_zev
                 )
             });
-            zev_sema::analyze_program(&prog).unwrap_or_else(|diags| {
+            let (mono_progs, _) = zev_sema::analyze_and_monomorphize_programs(
+                &[prog],
+                &zev_sema::AnalyzeOptions::default(),
+            )
+            .into_result()
+            .unwrap_or_else(|diags| {
                 panic!(
                     "GOOD snippet for {} failed zev-sema:\n{:#?}\n---\n{}",
                     e.code, diags, e.good_zev
                 )
             });
+            let mir = zev_mir::lower_programs(&mono_progs).unwrap_or_else(|me| {
+                panic!(
+                    "GOOD snippet for {} failed zev-mir lowering:\n{}\n---\n{}",
+                    e.code, me, e.good_zev
+                )
+            });
+            let c_src = zev_codegen_c::emit_c(&mir);
+            assert!(!c_src.is_empty(), "empty C99 output for {}", e.code);
+            let mut clang = std::process::Command::new("/bin/clang")
+                .args([
+                    "-std=c99",
+                    "-fsyntax-only",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-Wno-unused-function",
+                    "-Wno-unused-variable",
+                    "-Wno-unused-parameter",
+                    "-Wno-unused-but-set-variable",
+                    "-x",
+                    "c",
+                    "-",
+                ])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn /bin/clang for doc snippet verification");
+            {
+                use std::io::Write as _;
+                clang
+                    .stdin
+                    .as_mut()
+                    .unwrap()
+                    .write_all(c_src.as_bytes())
+                    .unwrap();
+            }
+            let clang_out = clang.wait_with_output().unwrap();
+            assert!(
+                clang_out.status.success(),
+                "GOOD snippet for {} emitted invalid C99:\n{}\n---\n{}",
+                e.code,
+                String::from_utf8_lossy(&clang_out.stderr),
+                e.good_zev
+            );
+
+            let ll_src = zev_codegen_llvm::emit_llvm_ir(&mir).unwrap_or_else(|le| {
+                panic!(
+                    "GOOD snippet for {} failed zev-codegen-llvm:\n{}\n---\n{}",
+                    e.code, le, e.good_zev
+                )
+            });
+            assert!(!ll_src.is_empty(), "empty LLVM IR output for {}", e.code);
 
             // 2. Every BAD snippet must trigger its exact documented error code
             if e.code.starts_with('P') {

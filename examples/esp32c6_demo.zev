@@ -8,12 +8,8 @@
 //   - Debounced `BOOT` button (`GPIO9`) posting `ButtonPressed` with `boost: @critical`
 //   - Built-in `USB_DEVICE` Serial/JTAG console (`0x6000F000` -> `/dev/ttyACM0`)
 
-import chip.stm32g4 as hw;
-
 // Synthesized directly in RISC-V LLVM 23 IR by `zev-codegen-llvm` (zero C / zero ESP-IDF):
 extern "C" fn zev_uart_puts(*u8 msg);
-extern "C" fn zev_uart_u32(u32 val);
-extern "C" fn zev_uart_hex(u32 val);
 extern "C" fn zev_uart_kv(*u8 label, i32 val);
 extern "C" fn zev_ws2812_rgb(u8 r, u8 g, u8 b);
 extern "C" u32 zev_gpio_read(u32 pin);
@@ -21,7 +17,6 @@ extern "C" u32 zev_now_ms();
 extern "C" u32 zev_current_prio();
 extern "C" u32 zev_cpu_calib_ticks();
 extern "C" u32 zev_ws2812_store_ns();
-extern "C" u32 zev_ws2812_t0h();
 extern "C" u32 zev_pad8_ok();
 
 const u32 PIN_WS2812_RGB = 8;
@@ -69,19 +64,9 @@ u32 drive_palette_slot(u32 slot) {
 }
 
 fn print_telemetry_line(u32 uptime_ms, u32 color_rgb, u32 presses, u32 prio) {
-    zev_uart_puts("[Zev on ESP32-C6 rv32imac] uptime=");
-    zev_uart_u32(uptime_ms);
-    zev_uart_puts("ms color=");
-    zev_uart_hex(color_rgb);
-    zev_uart_puts(" presses=");
-    zev_uart_u32(presses);
-    zev_uart_puts(" prio=");
-    zev_uart_u32(prio);
-    zev_uart_puts(" store_ns=");
-    zev_uart_u32(zev_ws2812_store_ns());
-    zev_uart_puts(" pad8_ok=");
-    zev_uart_u32(zev_pad8_ok());
-    zev_uart_puts("\n");
+    u32 store_ns = zev_ws2812_store_ns();
+    u32 pad8_ok = zev_pad8_ok();
+    println(f"[Zev on ESP32-C6 rv32imac] uptime={uptime_ms}ms color=0x{color_rgb:06x} presses={presses} prio={prio} store_ns={store_ns} pad8_ok={pad8_ok}");
 }
 
 // ── Disjoint Yielding Supervisor Helpers (Union-Aliased Static Frames) ──────

@@ -9,7 +9,8 @@ use std::fmt;
 
 use crate::ir::{
     MirChildCallSlot, MirFnBody, MirFunction, MirModule, MirPrimKind, MirPrimitive, MirPriority,
-    MirSpawnInstance, MirStruct, MirTaskBlueprint, MirType, MirVar, VarRole,
+    MirSpawnInstance, MirStruct, MirTaskBlueprint, MirType, MirVar, MonomorphizedItemKind,
+    MonomorphizedMirItem, VarRole,
 };
 
 /// Target data-model parameters for C/ABI struct layout calculation.
@@ -157,6 +158,7 @@ pub struct RamReport {
     pub primitives: Vec<PrimitiveRam>,
     pub boot_frames: Vec<(String, usize, usize)>,
     pub dual_specialized_fns: Vec<DualSpecializedFnRam>,
+    pub monomorphized_instances: Vec<MonomorphizedMirItem>,
     pub mcu32: ArchRamTotals,
     pub host64: ArchRamTotals,
 }
@@ -379,6 +381,34 @@ impl RamReport {
             }
         }
 
+        if !self.monomorphized_instances.is_empty() {
+            out.push_str("\n7. Monomorphized Generic Instantiations\n");
+            out.push_str("--------------------------------------------------------------------------------\n");
+            for m in &self.monomorphized_instances {
+                match m.kind {
+                    MonomorphizedItemKind::Struct => {
+                        out.push_str(&format!(
+                            "  struct {:<28} -> `{}` ({} B 32b / {} B 64b)\n",
+                            m.signature, m.mangled_name, m.size_32, m.size_64
+                        ));
+                    }
+                    MonomorphizedItemKind::Fn => {
+                        if m.size_32 > 0 || m.size_64 > 0 {
+                            out.push_str(&format!(
+                                "  fn     {:<28} -> `{}` (coro frame: {} B 32b / {} B 64b)\n",
+                                m.signature, m.mangled_name, m.size_32, m.size_64
+                            ));
+                        } else {
+                            out.push_str(&format!(
+                                "  fn     {:<28} -> `{}` (direct, 0 B static SRAM)\n",
+                                m.signature, m.mangled_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
         out.push_str("================================================================================\n");
         out
     }
@@ -441,8 +471,10 @@ impl<'a> LayoutCtx<'a> {
             MirType::Void => SizeAlign::new(0, 1),
             MirType::Bool | MirType::U8 | MirType::I8 => SizeAlign::new(1, 1),
             MirType::U16 | MirType::I16 => SizeAlign::new(2, 2),
-            MirType::U32 | MirType::I32 | MirType::HwPeripheral(_) => SizeAlign::new(4, 4),
-            MirType::U64 | MirType::I64 => SizeAlign::new(8, 8),
+            MirType::U32 | MirType::I32 | MirType::F32 | MirType::HwPeripheral(_) => {
+                SizeAlign::new(4, 4)
+            }
+            MirType::U64 | MirType::I64 | MirType::F64 => SizeAlign::new(8, 8),
             MirType::Usize | MirType::Isize | MirType::Str | MirType::Ptr(_) | MirType::FnPtr { .. } => {
                 SizeAlign::new(ptr, ptr)
             }
@@ -750,6 +782,7 @@ pub fn compute_ram_report(
         primitives: prim_rams,
         boot_frames,
         dual_specialized_fns,
+        monomorphized_instances: Vec::new(),
         mcu32,
         host64,
     }
@@ -991,9 +1024,9 @@ fn build_frame_report(
     }
 }
 
-/// Recompute `module.ram_report` in-place.
+/// Recompute `module.ram_report` in-place (including `monomorphized_instances` ABI sizes).
 pub fn populate_module_ram_report(module: &mut MirModule) {
-    module.ram_report = compute_ram_report(
+    let mut rep = compute_ram_report(
         &module.structs,
         &module.functions,
         &module.task_blueprints,
@@ -1001,4 +1034,34 @@ pub fn populate_module_ram_report(module: &mut MirModule) {
         &module.primitives,
         &module.boot.boot_yielding_callees,
     );
+    if !module.monomorphized_instances.is_empty() {
+        let ctx = LayoutCtx {
+            structs: module
+                .structs
+                .iter()
+                .map(|s| (s.name.as_str(), s))
+                .collect(),
+            enums: BTreeSet::new(),
+        };
+        for item in &mut module.monomorphized_instances {
+            match item.kind {
+                MonomorphizedItemKind::Struct => {
+                    let st_ty = MirType::Struct(item.mangled_name.clone());
+                    item.size_32 = ctx.type_layout(&st_ty, TargetAbi::Mcu32).size;
+                    item.size_64 = ctx.type_layout(&st_ty, TargetAbi::Host64).size;
+                }
+                MonomorphizedItemKind::Fn => {
+                    if let Some(fr) = rep.fn_frames.iter().find(|r| r.name == item.mangled_name) {
+                        item.size_32 = fr.packed_bytes_32;
+                        item.size_64 = fr.packed_bytes_64;
+                    } else {
+                        item.size_32 = 0;
+                        item.size_64 = 0;
+                    }
+                }
+            }
+        }
+        rep.monomorphized_instances = module.monomorphized_instances.clone();
+    }
+    module.ram_report = rep;
 }

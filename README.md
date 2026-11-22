@@ -14,15 +14,15 @@ See [`DESIGN_V0.md`](DESIGN_V0.md) for the complete language specification and a
   .zev sources
        │
        ▼
-  zev-parser          Recursive-descent parser + foreign-idiom traps (P0001..P0012)
+  zev-parser          Recursive-descent parser, `f32`/`f64`, `<T, usize N>`, `f"..."`, traps (P0001..P0012)
        │
        ▼
-  zev-sema            3-tier yield inference (`SoftYielding` dual-spec), Boot-Tree `spawn`
-       │              provenance, immortal `task` + ISR/task isolation, zero-lifetime DMA
-       │              lease & scope-depth tracking, unreachable-code safety (E0001..E0027)
+  zev-sema            `<T, usize N>` monomorphizer, 3-tier yield inference (`SoftYielding` dual-spec),
+       │              Boot-Tree `spawn` provenance, immortal `task` + ISR/task isolation, static
+       │              `fmt_buf` capacity proofs, zero-`'a` DMA lease & scope tracking (E0001..E0029)
        ▼
   zev-mir             Stackless state-machine lowering, live-across-yield hoisting,
-       │              disjoint child coroutine frame `union` packing, static RAM report
+       │              disjoint child coroutine frame `union` packing, `f"..."` / `{pkt:?}` unpacking
        ├──► zev-codegen-c     Stage 0: Freestanding C99 + deterministic host simulation
        └──► zev-codegen-llvm  Stage 1: Direct LLVM 23 IR -> llc -> ld.lld -> Bare-Metal Firmware
                               • ARM Cortex-M3 (`thumbv7m-none-eabi`, QEMU `lm3s6965evb`)
@@ -37,7 +37,7 @@ See [`DESIGN_V0.md`](DESIGN_V0.md) for the complete language specification and a
 
 ```bash
 make test           # Runs unit & integration suites across all 7 workspace crates
-make doc            # Smoke-checks built-in `zevc doc` primer, 8 topic guides & 39 error explainers
+make doc            # Smoke-checks built-in `zevc doc` primer, 8 topic guides & representative explainers (all 41 verified in `make test`)
 make check          # Runs `zevc check` on all example firmware slices
 make ram            # Prints the static zero-heap SRAM budget & Boot-Tree spawn provenance report
 make demo           # Runs deterministic ASan+UBSan C99 host simulation (`sim_demo.zev`)
@@ -54,20 +54,20 @@ cargo run --bin zevc -- --help
 
 ### 0. Built-In Agent & Engineer Reference (`zevc doc`)
 
-`zevc` ships a progressive-disclosure documentation engine right inside the compiler binary—giving humans and AI coding agents a 1-call language primer, Rosetta Stone mapping from Rust/Zig/Go/C, 8 focused topic guides, and `BAD` vs `GOOD` explainers for every parser trap (`P0001`..`P0012`) and verifier code (`E0001`..`E0027`):
+`zevc` ships a progressive-disclosure documentation engine right inside the compiler binary—giving humans and AI coding agents a 1-call language primer, Rosetta Stone mapping from Rust/Zig/Go/C, 8 focused topic guides, and `BAD` vs `GOOD` explainers for every parser trap (`P0001`..`P0012`) and verifier code (`E0001`..`E0029`):
 
 ```bash
 zevc doc                  # ~80-line Zev Quick Primer + Rosetta Stone + topic/error index
-zevc doc --list           # List all 8 topic guides and 39 error codes
+zevc doc --list           # List all 8 topic guides and 41 error codes
 zevc doc syntax           # Guides: syntax | errors | tasks | yielding | primitives | dma | runtime | targets
-zevc doc runtime          # Portable `println` / `sys.*` I/O, `chip.stm32g4`, NVIC `isr` vector map
+zevc doc runtime          # Zero-heap `f"..."` (`println`, `fmt_buf`, `:.2`/`:e`/`:?`), `sys.*`, `hw.*`, NVIC
 zevc doc P0001            # Foreign-idiom trap explainers (P0001..P0012)
-zevc doc E0008            # Static verifier explainers with BAD vs GOOD .zev (E0001..E0027)
+zevc doc E0028            # Static verifier explainers with BAD vs GOOD .zev (E0001..E0029)
 ```
 
 ### 1. Static Verification (`zevc check` & `zevc check --json`)
 
-Parses `.zev` sources and runs full whole-program semantic verification (3-tier call-graph yield inference with `SoftYielding` `noyield` dual-specialization reporting, Boot-Tree `spawn` + immortal `task` rules, `isr` / `noyield` / `critical` / `defer` safety, task/ISR global isolation, DMA `ping_pong` buffer lease lifetimes, tick-period resolution, and `return`/`error`/`catch` checking), emitting rich `= help:` + `= docs:` pointers or structured JSON:
+Parses `.zev` sources, monomorphizes `<T>` / `<T, usize N>` generics (`E0029`), and runs full whole-program semantic verification (3-tier call-graph yield inference with `SoftYielding` `noyield` dual-specialization reporting, Boot-Tree `spawn` + immortal `task` rules, static `fmt_buf` worst-case buffer-fit proofs (`E0028`), `isr` / `noyield` / `critical` / `defer` safety, task/ISR global isolation, DMA `ping_pong` buffer lease lifetimes, and `return`/`error`/`catch` checking), emitting rich `= help:` + `= docs:` pointers or structured JSON (`dual_specialized_functions` + `monomorphized_instances`):
 
 ```bash
 zevc check examples/motor_controller.zev examples/motor_support.zev
@@ -79,7 +79,7 @@ zevc check --json examples/motor_controller.zev examples/motor_support.zev
 
 ### 2. Static Zero-Heap RAM Budget (`zevc ram`)
 
-Computes exact compile-time SRAM usage across spawned task instances (with full Boot-Tree `spawn` provenance paths), hoisted coroutine state frames, **`union`-aliased disjoint child frames** (e.g., overlapping `save_fault_record` and `scrub_flash_crc` inside `main`'s supervisor frame), dual-specialized `SoftYielding` functions, unified `inbox` / `watch` / DMA primitives, and scheduler descriptors:
+Computes exact compile-time SRAM usage across spawned task instances (with full Boot-Tree `spawn` provenance paths), hoisted coroutine state frames, **`union`-aliased disjoint child frames** (e.g., overlapping `save_fault_record` and `scrub_flash_crc` inside `main`'s supervisor frame), dual-specialized `SoftYielding` functions, concrete `<T, usize N>` monomorphized instantiations, unified `inbox` / `watch` / DMA primitives, and scheduler descriptors:
 
 ```bash
 zevc ram examples/motor_controller.zev examples/motor_support.zev
@@ -125,16 +125,16 @@ zevc flash-esp32c6 examples/esp32c6_demo.zev --port /dev/ttyACM0
 | [`examples/motor_support.zev`](examples/motor_support.zev) | Companion hardware setup, bounded `for..in` `crc16`, `pi_step`, yielding `adc_read_rpm`, and mutually exclusive yielding flash helpers (`save_fault_record` & `scrub_flash_crc`). |
 | [`examples/sim_demo.zev`](examples/sim_demo.zev) | Self-contained runnable host simulation exercising periodic `loop every 1ms` control, big-endian `u16be` DMA packets, `error BadCrc` / `catch` recovery, `EXTI0` priority boost & restoration, and `@dma_safe` sleep-depth clamping (`Deep` vs `Light`). |
 | [`examples/cortex_m_demo.zev`](examples/cortex_m_demo.zev) | Bare-metal ARM Cortex-M3 firmware slice compiled directly via LLVM 23 + `ld.lld` and executed in `qemu-system-arm` with real NVIC interrupts and `SysTick`. |
-| [`examples/esp32c6_demo.zev`](examples/esp32c6_demo.zev) | Bare-metal ESP32-C6-Pico (`rv32imac`) Direct-Boot firmware driving the `GPIO8` WS2812B RGB LED (`Red -> Green -> Blue -> Cyan -> Magenta`), `GPIO9` `BOOT` button (`boost: @critical`), and live `USB_DEVICE` telemetry. |
+| [`examples/esp32c6_demo.zev`](examples/esp32c6_demo.zev) | Bare-metal ESP32-C6-Pico (`rv32imac`) Direct-Boot firmware driving the `GPIO8` WS2812B RGB LED (`Red -> Green -> Blue -> Cyan -> Magenta`), `GPIO9` `BOOT` button (`boost: @critical`), and live zero-heap `println(f"...")` `USB_DEVICE` telemetry. |
 
 ---
 
 ## Workspace Layout
 
-- `crates/zev-ast` — Core AST and source span definitions
+- `crates/zev-ast` — Core AST, `f32`/`f64`, `<T, usize N>` generics, `f"..."` format specs, and source spans
 - `crates/zev-parser` — Lexer, recursive-descent `.zev` parser, and `P0001`..`P0012` foreign-idiom traps
-- `crates/zev-sema` — Whole-program static verifier, 3-tier yield-chain tracer, Boot-Tree `spawn` unroller, and `E0001`..`E0027` diagnostics
-- `crates/zev-mir` — Stackless coroutine state-machine MIR, `SoftYielding` `noyield` clone specializer & static `union` RAM packer
+- `crates/zev-sema` — `<T, usize N>` monomorphizer, 3-tier yield-chain tracer, Boot-Tree `spawn` unroller, static `fmt_buf` fit prover, and `E0001`..`E0029` diagnostics
+- `crates/zev-mir` — Stackless coroutine state-machine MIR, `SoftYielding` `noyield` clone specializer, `f"..."` / `{pkt:?}` unpacker & static `union` RAM packer
 - `crates/zev-codegen-c` — Stage-0 freestanding C99 code generator & host simulation runtime
 - `crates/zev-codegen-llvm` — Stage-1 native LLVM 23 IR + ARM Cortex-M3 & ESP32-C6 (`rv32imac`) bare-metal backend
 - `crates/zev-cli` — `zevc` compiler & built-in `zevc doc` reference (`doc`, `check [--json]`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`)

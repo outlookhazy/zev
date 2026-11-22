@@ -5,9 +5,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
-    BlockId, MirAssignOp, MirBlock, MirCallDst, MirChildCallSlot, MirExpr, MirExprKind, MirFnBody,
-    MirFunction, MirPlace, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirStmt,
-    MirTaskBlueprint, MirTerminator, MirVar, MirYieldKind, VarId, VarRole,
+    BlockId, MirAssignOp, MirBlock, MirCallDst, MirChildCallSlot, MirExpr, MirExprKind,
+    MirFmtChunk, MirFnBody, MirFunction, MirPlace, MirPrimNonBlockingOp, MirPrimReadOp,
+    MirPrimTarget, MirStmt, MirTaskBlueprint, MirTerminator, MirType, MirVar, MirYieldKind, VarId,
+    VarRole,
 };
 
 /// Run variable hoisting and child-frame union packing on a task blueprint.
@@ -101,21 +102,13 @@ fn compute_hoisting(
         }
     }
 
-    // If a pointer/struct variable `p` is hoisted and was assigned `&x`, ensure `x` is hoisted too
-    // so `_f->p` never holds a dangling pointer to a C stack variable!
+    // If a pointer/slice/struct variable `p` is hoisted and was assigned `&x` or derived from `x`
+    // (including via `fmt_buf(x, ...)`), ensure `x` is hoisted too so `_f->p` never holds a
+    // dangling pointer to a C stack variable!
     let mut alias_edges: Vec<(VarId, VarId)> = Vec::new(); // (holder, pointee)
     for blk in blocks {
         for stmt in &blk.stmts {
-            if let MirStmt::Assign { target, value, .. } = stmt {
-                let holder = root_place_var(target);
-                let mut pointees = BTreeSet::new();
-                collect_addr_of_vars(value, &mut pointees);
-                if let Some(h) = holder {
-                    for pt in pointees {
-                        alias_edges.push((h, pt));
-                    }
-                }
-            }
+            collect_alias_edges_stmt(stmt, &mut alias_edges);
         }
     }
     let mut alias_changed = true;
@@ -352,6 +345,22 @@ fn transfer_stmt(stmt: &MirStmt, live: &mut BTreeSet<VarId>) {
                 collect_expr_uses(a, live);
             }
         }
+        MirStmt::PrintFmt { chunks, .. } => {
+            for ch in chunks {
+                collect_fmt_chunk_uses(ch, live);
+            }
+        }
+        MirStmt::FmtBuf {
+            dst_res,
+            buf,
+            chunks,
+        } => {
+            live.remove(dst_res);
+            collect_expr_uses(buf, live);
+            for ch in chunks {
+                collect_fmt_chunk_uses(ch, live);
+            }
+        }
         MirStmt::If {
             cond,
             then_body,
@@ -462,9 +471,25 @@ fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
     }
 }
 
+fn collect_fmt_chunk_uses(chunk: &MirFmtChunk, uses: &mut BTreeSet<VarId>) {
+    match chunk {
+        MirFmtChunk::Literal(_) => {}
+        MirFmtChunk::Int { value, .. }
+        | MirFmtChunk::Float { value, .. }
+        | MirFmtChunk::Bool(value)
+        | MirFmtChunk::Str(value)
+        | MirFmtChunk::Bytes(value)
+        | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::DebugSlice { slice: value, .. } => {
+            collect_expr_uses(value, uses);
+        }
+    }
+}
+
 fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
     match &expr.kind {
         MirExprKind::IntLit(_)
+        | MirExprKind::FloatLit(_)
         | MirExprKind::BoolLit(_)
         | MirExprKind::StringLit(_)
         | MirExprKind::TicksLit(_)
@@ -547,12 +572,26 @@ fn root_place_var(place: &MirPlace) -> Option<VarId> {
     }
 }
 
+fn collect_place_addr_of_vars(place: &MirPlace, out: &mut BTreeSet<VarId>) {
+    match place {
+        MirPlace::Var(vid) => {
+            out.insert(*vid);
+        }
+        MirPlace::Field { base, .. } => collect_place_addr_of_vars(base, out),
+        MirPlace::Index { base, index, .. } => {
+            collect_place_addr_of_vars(base, out);
+            collect_addr_of_vars(index, out);
+        }
+        MirPlace::Deref(ptr_expr, _) => {
+            collect_addr_of_vars(ptr_expr, out);
+        }
+    }
+}
+
 fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
     match &expr.kind {
         MirExprKind::AddrOfPlace(p) | MirExprKind::ArrayToSlice { array_place: p, .. } => {
-            if let Some(vid) = root_place_var(p) {
-                out.insert(vid);
-            }
+            collect_place_addr_of_vars(p, out);
         }
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
@@ -588,6 +627,148 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
     }
 }
 
+fn type_may_carry_alias(ty: &MirType) -> bool {
+    matches!(
+        ty,
+        MirType::Slice(_)
+            | MirType::Ptr(_)
+            | MirType::Struct(_)
+            | MirType::Array { .. }
+            | MirType::Result { .. }
+    )
+}
+
+fn collect_place_alias_sources(place: &MirPlace, out: &mut BTreeSet<VarId>) {
+    match place {
+        MirPlace::Var(vid) => {
+            out.insert(*vid);
+        }
+        MirPlace::Field { base, .. } => collect_place_alias_sources(base, out),
+        MirPlace::Index { base, index, .. } => {
+            collect_place_alias_sources(base, out);
+            collect_addr_of_vars(index, out);
+        }
+        MirPlace::Deref(ptr_expr, _) => {
+            collect_alias_sources_expr(ptr_expr, out);
+        }
+    }
+}
+
+fn collect_alias_sources_expr(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
+    collect_addr_of_vars(expr, out);
+    match &expr.kind {
+        MirExprKind::AddrOfPlace(p) | MirExprKind::ArrayToSlice { array_place: p, .. } => {
+            collect_place_alias_sources(p, out);
+        }
+        MirExprKind::Var(vid) | MirExprKind::ResultVal(vid) => {
+            if type_may_carry_alias(&expr.ty) {
+                out.insert(*vid);
+            }
+        }
+        MirExprKind::SubSlice { base, .. }
+        | MirExprKind::FieldAccess { base, .. }
+        | MirExprKind::Index { base, .. }
+        | MirExprKind::Cast { expr: base, .. }
+        | MirExprKind::Unary { expr: base, .. } => {
+            collect_alias_sources_expr(base, out);
+        }
+        MirExprKind::StructLit { fields, .. } => {
+            for (_, fe, _) in fields {
+                collect_alias_sources_expr(fe, out);
+            }
+        }
+        MirExprKind::ArrayLit { elems, .. } => {
+            for e in elems {
+                collect_alias_sources_expr(e, out);
+            }
+        }
+        MirExprKind::CallDirect { args, .. } => {
+            if type_may_carry_alias(&expr.ty) {
+                for a in args {
+                    collect_alias_sources_expr(a, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_alias_edges_stmt(stmt: &MirStmt, alias_edges: &mut Vec<(VarId, VarId)>) {
+    match stmt {
+        MirStmt::Assign { target, value, .. } => {
+            let mut holders = BTreeSet::new();
+            if let Some(h) = root_place_var(target) {
+                holders.insert(h);
+            } else {
+                collect_place_alias_sources(target, &mut holders);
+            }
+            if !holders.is_empty() {
+                let mut pointees = BTreeSet::new();
+                collect_alias_sources_expr(value, &mut pointees);
+                for h in holders {
+                    for &pt in &pointees {
+                        if pt != h {
+                            alias_edges.push((h, pt));
+                        }
+                    }
+                }
+            }
+        }
+        MirStmt::FmtBuf { dst_res, buf, .. } => {
+            let mut pointees = BTreeSet::new();
+            collect_alias_sources_expr(buf, &mut pointees);
+            for pt in pointees {
+                if pt != *dst_res {
+                    alias_edges.push((*dst_res, pt));
+                }
+            }
+        }
+        MirStmt::If {
+            then_body,
+            else_body,
+            ..
+        } => {
+            for s in then_body {
+                collect_alias_edges_stmt(s, alias_edges);
+            }
+            for s in else_body {
+                collect_alias_edges_stmt(s, alias_edges);
+            }
+        }
+        MirStmt::While { body, .. } => {
+            for s in body {
+                collect_alias_edges_stmt(s, alias_edges);
+            }
+        }
+        MirStmt::Switch { arms, default, .. } => {
+            for (_, b) in arms {
+                for s in b {
+                    collect_alias_edges_stmt(s, alias_edges);
+                }
+            }
+            for s in default {
+                collect_alias_edges_stmt(s, alias_edges);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_fmt_chunk_addr_of(chunk: &MirFmtChunk, out: &mut BTreeSet<VarId>) {
+    match chunk {
+        MirFmtChunk::Literal(_) => {}
+        MirFmtChunk::Int { value, .. }
+        | MirFmtChunk::Float { value, .. }
+        | MirFmtChunk::Bool(value)
+        | MirFmtChunk::Str(value)
+        | MirFmtChunk::Bytes(value)
+        | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::DebugSlice { slice: value, .. } => {
+            collect_addr_of_vars(value, out);
+        }
+    }
+}
+
 fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
     let mut taken = BTreeSet::new();
     match stmt {
@@ -597,6 +778,17 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
         MirStmt::SpawnActivate { args, .. } => {
             for a in args {
                 collect_addr_of_vars(a, &mut taken);
+            }
+        }
+        MirStmt::PrintFmt { chunks, .. } => {
+            for ch in chunks {
+                collect_fmt_chunk_addr_of(ch, &mut taken);
+            }
+        }
+        MirStmt::FmtBuf { buf, chunks, .. } => {
+            collect_addr_of_vars(buf, &mut taken);
+            for ch in chunks {
+                collect_fmt_chunk_addr_of(ch, &mut taken);
             }
         }
         MirStmt::PrimOp(op) => match op {
@@ -688,11 +880,13 @@ fn collect_terminator_forced_hoists(
                 }
             }
             MirYieldKind::CallYielding { args, .. } => {
-                // Any variable whose address `&v` is passed into a yielding function MUST
-                // live in the static frame so the child coroutine never holds a stack pointer!
+                // Any variable whose address `&v` or slice/pointer alias (`s = fmt_buf(buf, ...)`)
+                // is passed into a yielding function MUST live in the static frame so the child
+                // coroutine never holds a dangling C stack pointer across yields!
                 let mut taken = BTreeSet::new();
                 for arg in args {
                     collect_addr_of_vars(arg, &mut taken);
+                    collect_alias_sources_expr(arg, force_hoist);
                 }
                 for vid in taken {
                     if let Some(v) = vars.get_mut(vid.0) {

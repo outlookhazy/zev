@@ -101,10 +101,10 @@ Where [SyntropicOS](../SyntropicOS/README.md) pushes C99 to its limits via Duff'
        - **IRQ-safe `O(1)` bitmap allocator & cache-line alignment:** Because both `task` and `isr` allocate/free concurrently across preemptible boundaries, `pool<T, K>` uses an atomic/IRQ-masked `u32` bitmap free-list (`O(1)` bounded latency, zero linked-list races), and `@dma_safe` enforces DMA/cache-line alignment on pool slots so adjacent buffers never false-share cache lines with active DMA.
 
 ### 2.5 Everyday Types, Bounded Generics, Dual-Exit Errors & Ergonomics
-- **Explicit Types Everywhere:** C-style `Type name = ...` declarations (`u8`, `u16`, `i32`, `[]u8` fat slices)—no `let`/`var` hiding bit-widths, overflow boundaries, or static task RAM costs.
+- **Explicit Types Everywhere:** C-style `Type name = ...` declarations (`u8`, `u16`, `i32`, `f32`, `f64`, `[]u8` fat slices)—no `let`/`var` hiding bit-widths, overflow boundaries, or static task RAM costs.
 - **Wire-Exact Layout:** `packed struct` with native endian types (`u16be`, `u32le`) decoded safely via `Type.from_bytes(slice)`.
-- **Monomorphized `<T>` / `<T, usize N>` Generics (No Ad-Hoc Overloading, No Trait Hierarchies) *(queued)*:**
-  - User `.zev` `struct`s (`FixedVec<T, usize N>`) and `fn`s (`clamp<T>(...)`) may declare `<T>` and `<T, usize N>` parameters monomorphized before MIR lowering, with concrete Flash instantiations reported in `zevc ram`.
+- **Monomorphized `<T>` / `<T, usize N>` Generics (No Ad-Hoc Overloading, No Trait Hierarchies):**
+  - User `.zev` `struct`s (`FixedVec<T, usize N>`) and `fn`s (`clamp<T>(...)`) may declare `<T>` and `<T, usize N>` parameters monomorphized before MIR lowering (`E0029` on invalid instantiations), with concrete Flash instantiations reported in `zevc ram` and `zevc check --json`.
   - C++-style ad-hoc function overloading (which risks silent register-width promotion bugs) and user-defined trait hierarchies / `'a` lifetime annotations are intentionally omitted.
 - **Distinct `return` vs. `error` Exit Paths:**
   - `return val;` always represents normal completion (`r1 == 0`, `r0 = val`).
@@ -113,8 +113,8 @@ Where [SyntropicOS](../SyntropicOS/README.md) pushes C99 to its limits via Duff'
     - `error BadCrc;` — typed failure (error enums contain only real errors, no fake `OK`).
     - `error Timeout, bytes_read;` — typed failure *plus* partial progress in `r0`.
   - Callers handle failure symmetrically via `or <fallback>` or single-/multi-statement `catch ([ErrType err [, ValType partial]]) { ... }`.
-- **Zero-Heap Streamable `f"..."` Formatting (Per-Call-Site Dispatch, Zero Global Handler Registry) *(queued)*:**
-  - **Compile-Time Unpacked Sink Writes & Static Fit Proof:** `f"..."` unpacks at compile time into direct chunk writes for any destination (`println`, `*byte_ring`, or `fmt_buf(dst, f"...") -> []u8 error FmtErr`), proving worst-case buffer fit at compile time when all arguments have statically bounded widths and returning dual-exit `error Truncated, clamped_slice;` when runtime `[]u8` slices exceed `dst.len`.
+- **Zero-Heap Streamable `f"..."` Formatting (Per-Call-Site Dispatch, Zero Global Handler Registry):**
+  - **Compile-Time Unpacked Sink Writes & Static Fit Proof:** `f"..."` unpacks at compile time into direct chunk writes across `print`, `println`, and `fmt_buf(dst, f"...") -> []u8 error FmtErr` *(with `*byte_ring` sink support landing alongside `byte_ring<N>` in §6.3)*, proving worst-case buffer fit at compile time (`E0028`) when all arguments have statically bounded widths and returning dual-exit `error Truncated, clamped_slice;` when runtime `[]u8` slices exceed `dst.len`.
   - **Call-Site Tiered Float Formatting (No Global `_printf_float` Swapping):** Because `zevc` resolves each `{...}` specifier at compile time rather than routing through a monolithic runtime `printf` table, `{temp}` / `{temp:.2}` emits a direct call to a compact (~150 B Arduino-style / scaled-integer) fixed-decimal converter while `{val:e}` calls a scientific float converter—so `ld.lld --gc-sections` links scientific float code *only* if `:e` appears in the program, and independent libraries never conflict over global float-handler state.
   - **`enum` Names & `{pkt:?}` Debug Without Custom Format Traits:** App-wide `Display`/`Format` traits and struct formatter registries are omitted (avoiding console-vs-log format conflicts; callers write `f"{pt.x},{pt.y}"` explicitly), while `zevc` provides automatic `enum` variant-name strings (`f"{err}"` -> `"BadCrc"`, `.rodata` emitted only for formatted enums) and optional `{pkt:?}` compile-time struct field debug expansion.
 - **Zero-Cost Control-Flow Conveniences:**
@@ -123,8 +123,8 @@ Where [SyntropicOS](../SyntropicOS/README.md) pushes C99 to its limits via Duff'
 
 ### 2.6 Agent-First Diagnostics & Progressive Disclosure (`zevc doc`)
 - **Foreign-Idiom Parser Traps (`P0001`..`P0012`):** Actively detects Rust/Zig/Go/C muscle-memory and retired syntax (`let`/`var`, `fn f(x: T) -> R`, `async`/`.await`, `select`, `match`, `catch |e|`, `!T`/`try`, C-style `for (;;)`, `'a`/`&mut`, `static`/`pub`, bare `every`, and `chan<T, N>`) and emits 1-shot idiomatic Zev rewrites.
-- **Actionable Verifier Diagnostics (`E0001`..`E0027`) & `--json`:** Includes shortest-path transitive yield call chains (`isr -> f1 -> f2 -> checkpoint()`), primitive method fuzzy suggestions (`watch.write` -> `watch.publish`), `= docs: run 'zevc doc CODE'`, and machine-readable `zevc check --json` (including `dual_specialized_functions`).
-- **Self-Documenting Binary (`zevc doc`):** Ships a ~80-line quick primer + Rosetta Stone, 8 sharded topic guides (`syntax`, `errors`, `tasks`, `yielding`, `primitives`, `dma`, `runtime`, `targets`), and `BAD` vs `GOOD` `.zev` explainers for all 39 error codes directly inside `zevc`.
+- **Actionable Verifier Diagnostics (`E0001`..`E0029`) & `--json`:** Includes shortest-path transitive yield call chains (`isr -> f1 -> f2 -> checkpoint()`), static `fmt_buf` capacity proofs (`E0028`), generic instantiation checks (`E0029`), primitive method fuzzy suggestions (`watch.write` -> `watch.publish`), `= docs: run 'zevc doc CODE'`, and machine-readable `zevc check --json` (including `dual_specialized_functions` and `monomorphized_instances`).
+- **Self-Documenting Binary (`zevc doc`):** Ships a ~80-line quick primer + Rosetta Stone, 8 sharded topic guides (`syntax`, `errors`, `tasks`, `yielding`, `primitives`, `dma`, `runtime`, `targets`), and `BAD` vs `GOOD` `.zev` explainers for all 41 error codes directly inside `zevc`.
 
 ### 2.7 Modules, Libraries & Core-vs-Library Boundary
 - **Modules & Visibility (`import` + `pub`):** File and directory modules default to module-private declarations with explicit `pub` exports (`pub struct`, `pub fn`, `pub task`, `pub const`, `pub enum`, `pub mmio`, `pub irq`), replacing v0.1's single-file `P0010` placeholder trap on `pub` so subsystems encapsulate internal state and worker tasks cleanly.
@@ -199,14 +199,14 @@ flowchart LR
 ## 6. Implementation Status & Queued Compiler Work
 
 ### 6.1 Live in `zevc` v0.1 Today
-- [x] Lexer, recursive-descent `.zev` parser, and foreign-idiom traps `P0001`–`P0012` (`crates/zev-parser`).
-- [x] Whole-program static verifier `E0001`–`E0027`: 3-tier call-graph yield inference, shortest-path yield traces, Boot-Tree `spawn` provenance, immortal `task` + unreachable-code safety, global/ISR isolation, `noyield`/`critical`/`defer`/`extern "C"` callback safety, zero-`'a` scope-depth & DMA `ping_pong` lease tracking, and fuzzy primitive/identifier hints (`crates/zev-sema`).
-- [x] Built-in `zevc doc` progressive-disclosure primer, 8 topic guides, 39 verified `BAD`/`GOOD` error explainers, and `zevc check --json` (`crates/zev-cli`).
-- [x] CFG state-machine MIR lowering, backward-liveness frame variable hoisting, disjoint child coroutine `union` packing, `SoftYielding` `noyield` clone specialization, and static zero-heap `zevc ram` budget & provenance reports (`crates/zev-mir`).
+- [x] Lexer, recursive-descent `.zev` parser, `f32`/`f64` float literals, `<T, usize N>` generics, `f"..."` interpolation, and foreign-idiom traps `P0001`–`P0012` (`crates/zev-parser`).
+- [x] Whole-program static verifier `E0001`–`E0029`: `<T, usize N>` monomorphization, 3-tier call-graph yield inference, shortest-path yield traces, Boot-Tree `spawn` provenance, immortal `task` + unreachable-code safety, static `fmt_buf` capacity proofs, global/ISR isolation, `noyield`/`critical`/`defer`/`extern "C"` callback safety, zero-`'a` scope-depth & DMA `ping_pong` lease tracking, and fuzzy primitive/identifier hints (`crates/zev-sema`).
+- [x] Built-in `zevc doc` progressive-disclosure primer, 8 topic guides, 41 verified `BAD`/`GOOD` error explainers, and `zevc check --json` (`crates/zev-cli`).
+- [x] CFG state-machine MIR lowering, backward-liveness frame variable hoisting, disjoint child coroutine `union` packing, `SoftYielding` `noyield` clone specialization, compile-time `f"..."` / `{pkt:?}` expansion, and static zero-heap `zevc ram` budget & provenance reports (`crates/zev-mir`).
 - [x] Stage-0 freestanding C99 emitter + deterministic host simulation harness verified under Clang `-fsanitize=address,undefined` (`crates/zev-codegen-c`).
 - [x] Stage-1 native LLVM 23 backend (`crates/zev-codegen-llvm`) with `/bin/opt` + `/bin/llc` (`-O0`..`-O3`, `-Os`, `-Oz`) targeting bare-metal ARM Cortex-M3 `.elf` (`qemu-system-arm`) and physical Espressif ESP32-C6 (`rv32imac` Direct-Boot `.bin`).
 
-### 6.2 Established Semantic Refinements (Wave 1 Live; Wave 2 Ready Next)
+### 6.2 Established Semantic Refinements (Wave 1 & Wave 2 Complete)
 - [x] Enforce **Boot-Tree `spawn`** (`E0027`): permit `spawn` inside `fn main()` (including conditional `if` / `switch` boot branches) and boot-only setup `fn`s called before scheduler start; forbid `spawn` inside loops, recursion, `task`s, and `isr`s; print full static spawn provenance paths (`main -> usb.start -> usb::xfer_task @high`) in `zevc ram`.
 - [x] Compile-time unreachable-code error (`E0025`) on any statement following a `break`-less diverging `loop`, `return`, `error`, `restart`, or `sys.exit`.
 - [x] Immortal `task` enforcement (`E0026`: reject `return;` and falling off `}` in `task` bodies) + `restart;` self-reset statement + `sys.exit(code)` termination rules.
@@ -214,8 +214,8 @@ flowchart LR
 - [x] Three-tier function effect inference (*Non-yielding* / *Soft-yielding* / *Hard-blocking*) with automatic `noyield` stack-clone specialization of `checkpoint()`-only functions and explicit dual-specialization reporting in `zevc ram` / `zevc check --json`.
 - [x] Unify `inbox<T, N>` and `chan<T, N>` (`P0012`) into a single bounded `inbox<T, N>` supporting non-blocking `.post(v [, boost: @prio])` / `.try_send(v)` (ISR/task-safe), yielding backpressured `.send(v [, timeout: d])` (task-only), `.recv([timeout: d])`, and `.try_recv()`.
 - [x] Zero-cost `defer <stmt>;` / `defer { ... }` LIFO cleanup across `return`, `error`, `restart`, and `sys.exit`, plus bounded `for (u8 b in slice)` and `for (usize i in 0..n)` / `0..=max` loops (keeping C's 3-clause `for (;;)` forbidden via `P0008`).
-- [ ] Monomorphized `<T>` / `<T, usize N>` generics on user `struct`s and `fn`s with concrete Flash instantiation reporting in `zevc ram` (omitting C++-style overloading and user trait hierarchies).
-- [ ] Zero-heap per-call-site `f"..."` formatting across `println`, `*byte_ring`, and `fmt_buf` (compile-time buffer-fit proof + `error Truncated, clamped_slice;`, call-site tiered fixed-decimal vs. `:e` scientific float converters for `--gc-sections`, on-demand `enum` variant names, and `{pkt:?}` struct debug expansion).
+- [x] Monomorphized `<T>` / `<T, usize N>` generics (`E0029`) on user `struct`s and `fn`s with concrete Flash instantiation reporting in `zevc ram` and `zevc check --json` (omitting C++-style overloading and user trait hierarchies).
+- [x] Zero-heap per-call-site `f"..."` formatting across `print`, `println`, and `fmt_buf` *(with `*byte_ring` sink support landing alongside `byte_ring<N>` in §6.3)*: compile-time buffer-fit proof `E0028` + `error Truncated, clamped_slice;`, call-site tiered fixed-decimal vs. `:e` scientific float converters for `--gc-sections`, on-demand `enum` variant names, and `{pkt:?}` struct debug expansion.
 
 ### 6.3 Next-Stage Modules, Driver Architecture, Primitives & Optimizations (Under Design)
 - [ ] File/directory module system (`import` + private-by-default declarations + explicit `pub` exports, graduating `pub` out of `P0010`) and strict Core-vs-Library separation (`chip/*.zev` SVD maps replacing hardcoded `chip.*` intrinsics, `bsp/*.zev` board wiring, and plain-`.zev` `std/io`, `std/bus`, `std/fmt`).

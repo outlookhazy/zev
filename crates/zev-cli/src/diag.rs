@@ -1,6 +1,7 @@
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use zev_ast::Span;
+use zev_sema::MonomorphizedInstance;
 
 #[derive(Debug, Clone)]
 pub struct SourceFile {
@@ -185,20 +186,27 @@ pub fn format_check_human_ok(
     primitives: usize,
     tick_period_us: u64,
     dual_specialized: &[String],
+    monomorphized: &[MonomorphizedInstance],
 ) -> String {
-    let mut sorted: Vec<&str> = dual_specialized.iter().map(String::as_str).collect();
-    sorted.sort_unstable();
-    sorted.dedup();
-    if sorted.is_empty() {
-        format!(
-            "OK ({files} file(s) verified, {spawned_tasks} task instance(s), {primitives} primitive(s), tick={tick_period_us}us)"
-        )
-    } else {
-        format!(
-            "OK ({files} file(s) verified, {spawned_tasks} task instance(s), {primitives} primitive(s), tick={tick_period_us}us, dual_specialized=[{}])",
-            sorted.join(", ")
-        )
+    let mut sorted_dual: Vec<&str> = dual_specialized.iter().map(String::as_str).collect();
+    sorted_dual.sort_unstable();
+    sorted_dual.dedup();
+
+    let mut sorted_mono: Vec<&str> = monomorphized.iter().map(|m| m.signature.as_str()).collect();
+    sorted_mono.sort_unstable();
+    sorted_mono.dedup();
+
+    let mut out = format!(
+        "OK ({files} file(s) verified, {spawned_tasks} task instance(s), {primitives} primitive(s), tick={tick_period_us}us"
+    );
+    if !sorted_dual.is_empty() {
+        let _ = write!(out, ", dual_specialized=[{}]", sorted_dual.join(", "));
     }
+    if !sorted_mono.is_empty() {
+        let _ = write!(out, ", monomorphized=[{}]", sorted_mono.join(", "));
+    }
+    out.push(')');
+    out
 }
 
 pub fn render_check_json_ok(
@@ -207,6 +215,7 @@ pub fn render_check_json_ok(
     primitives: usize,
     tick_period_us: u64,
     dual_specialized: &[String],
+    monomorphized: &[MonomorphizedInstance],
 ) -> String {
     let mut sorted: Vec<&str> = dual_specialized.iter().map(String::as_str).collect();
     sorted.sort_unstable();
@@ -219,8 +228,37 @@ pub fn render_check_json_ok(
         let _ = write!(dual_json, "\"{}\"", json_escape(name));
     }
     dual_json.push(']');
+
+    let mut sorted_mono: Vec<(&str, &str, &str)> = monomorphized
+        .iter()
+        .map(|inst| {
+            (
+                inst.kind.as_str(),
+                inst.signature.as_str(),
+                inst.mangled_name.as_str(),
+            )
+        })
+        .collect();
+    sorted_mono.sort_unstable_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)).then_with(|| a.2.cmp(b.2)));
+    sorted_mono.dedup();
+
+    let mut mono_json = String::from("[");
+    for (idx, (kind, sig, mangled)) in sorted_mono.iter().enumerate() {
+        if idx > 0 {
+            mono_json.push_str(", ");
+        }
+        let _ = write!(
+            mono_json,
+            "{{\"kind\": \"{}\", \"signature\": \"{}\", \"mangled_name\": \"{}\"}}",
+            json_escape(kind),
+            json_escape(sig),
+            json_escape(mangled),
+        );
+    }
+    mono_json.push(']');
+
     format!(
-        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"dual_specialized_functions\": {dual_json}, \"diagnostics\": []}}"
+        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"dual_specialized_functions\": {dual_json}, \"monomorphized_instances\": {mono_json}, \"diagnostics\": []}}"
     )
 }
 
@@ -298,26 +336,48 @@ mod tests {
     }
 
     #[test]
-    fn renders_dual_specialized_functions_in_json_and_human_ok_outputs() {
-        let empty_json = render_check_json_ok(1, 2, 3, 1000, &[]);
+    fn renders_dual_specialized_and_monomorphized_instances_in_json_and_human_ok_outputs() {
+        let empty_json = render_check_json_ok(1, 2, 3, 1000, &[], &[]);
         assert_eq!(
             empty_json,
-            "{\"ok\": true, \"files\": 1, \"spawned_tasks\": 2, \"primitives\": 3, \"tick_period_us\": 1000, \"dual_specialized_functions\": [], \"diagnostics\": []}"
+            "{\"ok\": true, \"files\": 1, \"spawned_tasks\": 2, \"primitives\": 3, \"tick_period_us\": 1000, \"dual_specialized_functions\": [], \"monomorphized_instances\": [], \"diagnostics\": []}"
         );
         assert_eq!(
-            format_check_human_ok(1, 2, 3, 1000, &[]),
+            format_check_human_ok(1, 2, 3, 1000, &[], &[]),
             "OK (1 file(s) verified, 2 task instance(s), 3 primitive(s), tick=1000us)"
         );
 
         let fns = vec!["sha256_block".to_string(), "crc_chunk".to_string()];
-        let dual_json = render_check_json_ok(2, 4, 5, 1000, &fns);
+        // Unsorted + duplicate entry to verify internal sorting and deduplication
+        let mono = vec![
+            MonomorphizedInstance {
+                kind: zev_sema::MonomorphizedKind::Fn,
+                signature: "clamp<f32>".to_string(),
+                mangled_name: "clamp__f32".to_string(),
+            },
+            MonomorphizedInstance {
+                kind: zev_sema::MonomorphizedKind::Struct,
+                signature: "FixedVec<u32, 8>".to_string(),
+                mangled_name: "FixedVec__u32__8".to_string(),
+            },
+            MonomorphizedInstance {
+                kind: zev_sema::MonomorphizedKind::Fn,
+                signature: "clamp<f32>".to_string(),
+                mangled_name: "clamp__f32".to_string(),
+            },
+        ];
+        let dual_json = render_check_json_ok(2, 4, 5, 1000, &fns, &mono);
         assert!(
             dual_json.contains("\"dual_specialized_functions\": [\"crc_chunk\", \"sha256_block\"]"),
             "json={dual_json}"
         );
+        assert!(
+            dual_json.contains("\"monomorphized_instances\": [{\"kind\": \"struct\", \"signature\": \"FixedVec<u32, 8>\", \"mangled_name\": \"FixedVec__u32__8\"}, {\"kind\": \"fn\", \"signature\": \"clamp<f32>\", \"mangled_name\": \"clamp__f32\"}]"),
+            "json={dual_json}"
+        );
         assert_eq!(
-            format_check_human_ok(2, 4, 5, 1000, &fns),
-            "OK (2 file(s) verified, 4 task instance(s), 5 primitive(s), tick=1000us, dual_specialized=[crc_chunk, sha256_block])"
+            format_check_human_ok(2, 4, 5, 1000, &fns, &mono),
+            "OK (2 file(s) verified, 4 task instance(s), 5 primitive(s), tick=1000us, dual_specialized=[crc_chunk, sha256_block], monomorphized=[FixedVec<u32, 8>, clamp<f32>])"
         );
     }
 }

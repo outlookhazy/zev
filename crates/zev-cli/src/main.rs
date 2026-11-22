@@ -10,12 +10,12 @@ use diag::{
     SourceFile,
 };
 use runner::TempWorkDir;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use zev_ast::Program;
 use zev_mir::MirModule;
-use zev_sema::{analyze_named_programs, AnalyzeOptions, SemanticModel};
+use zev_sema::{analyze_and_monomorphize_named_programs, AnalyzeOptions, SemanticModel};
 
 struct CheckedBundle {
     programs: Vec<Program>,
@@ -28,10 +28,16 @@ struct CheckFailure {
 }
 
 fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFailure> {
-    let mut loaded: Vec<(String, SourceFile, Program)> = Vec::with_capacity(files.len());
-    let mut by_name: HashMap<String, usize> = HashMap::new();
+    let mut source_files: Vec<(String, SourceFile)> = Vec::with_capacity(files.len());
+    let mut seen_canon: HashSet<PathBuf> = HashSet::with_capacity(files.len());
+    let mut all_generics: BTreeSet<String> = BTreeSet::new();
 
     for path in files {
+        let canon_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if !seen_canon.insert(canon_key) {
+            continue;
+        }
+
         let display = path.display().to_string();
         let sf = SourceFile::load(path).map_err(|msg| CheckFailure {
             human: format!("error: {msg}"),
@@ -46,35 +52,47 @@ fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFail
             }],
         })?;
 
-        match zev_parser::parse_str_named(&sf.src, &display) {
+        all_generics.extend(zev_parser::collect_declared_generic_names(&sf.src));
+        source_files.push((display, sf));
+    }
+
+    let mut loaded: Vec<(String, SourceFile, Program)> = Vec::with_capacity(source_files.len());
+    let mut by_name: HashMap<String, usize> = HashMap::with_capacity(source_files.len());
+
+    for (display, sf) in source_files {
+        match zev_parser::parse_str_named_with_generics(&sf.src, &display, Some(&all_generics)) {
             Ok(prog) => {
                 let idx = loaded.len();
                 by_name.insert(display.clone(), idx);
                 loaded.push((display, sf, prog));
             }
-            Err(pe) => {
-                let (line, col) = sf.line_col(pe.span.start as usize);
-                let topic = pe.doc_topic.unwrap_or("syntax");
-                let doc_cmd = pe.doc_command();
-                let human = sf.format_rich_span_error(
-                    pe.span,
-                    pe.code,
-                    &pe.message,
-                    pe.hint.as_deref(),
-                    Some(topic),
-                );
-                let json_diag = JsonDiag {
-                    code: pe.code.map(str::to_string),
-                    file: display,
-                    line,
-                    col,
-                    message: pe.message,
-                    help: pe.hint,
-                    doc_cmd,
-                };
+            Err(pes) => {
+                let mut human = String::new();
+                let mut json_diags = Vec::with_capacity(pes.len());
+                for pe in pes {
+                    let (line, col) = sf.line_col(pe.span.start as usize);
+                    let topic = pe.doc_topic.unwrap_or("syntax");
+                    let doc_cmd = pe.doc_command();
+                    human.push_str(&sf.format_rich_span_error(
+                        pe.span,
+                        pe.code,
+                        &pe.message,
+                        pe.hint.as_deref(),
+                        Some(topic),
+                    ));
+                    json_diags.push(JsonDiag {
+                        code: pe.code.map(str::to_string),
+                        file: display.clone(),
+                        line,
+                        col,
+                        message: pe.message,
+                        help: pe.hint,
+                        doc_cmd,
+                    });
+                }
                 return Err(CheckFailure {
                     human: human.trim_end().to_string(),
-                    json_diags: vec![json_diag],
+                    json_diags,
                 });
             }
         }
@@ -85,7 +103,7 @@ fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFail
         .map(|(name, _, prog)| (prog, Some(name.as_str())))
         .collect();
 
-    let out = analyze_named_programs(&named_refs, &AnalyzeOptions::default());
+    let out = analyze_and_monomorphize_named_programs(&named_refs, &AnalyzeOptions::default());
     if !out.diagnostics.is_empty() {
         let mut rendered = String::new();
         let mut json_diags = Vec::with_capacity(out.diagnostics.len());
@@ -142,9 +160,8 @@ fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFail
         });
     }
 
-    let programs = loaded.into_iter().map(|(_, _, p)| p).collect();
     Ok(CheckedBundle {
-        programs,
+        programs: out.programs,
         sema: out.model,
     })
 }
@@ -256,28 +273,31 @@ fn main() -> ExitCode {
         },
         Command::Check { files, json } => match load_and_check_detailed(&files) {
             Ok(bundle) => {
+                let verified_files = bundle.programs.len();
                 let dual_vec: Vec<String> =
                     bundle.sema.dual_specialized_fns.iter().cloned().collect();
                 if json {
                     println!(
                         "{}",
                         render_check_json_ok(
-                            files.len(),
+                            verified_files,
                             bundle.sema.spawned_tasks.len(),
                             bundle.sema.primitives.len(),
                             bundle.sema.tick_period_us,
                             &dual_vec,
+                            &bundle.sema.monomorphized_instances,
                         )
                     );
                 } else {
                     println!(
                         "{}",
                         format_check_human_ok(
-                            files.len(),
+                            verified_files,
                             bundle.sema.spawned_tasks.len(),
                             bundle.sema.primitives.len(),
                             bundle.sema.tick_period_us,
                             &dual_vec,
+                            &bundle.sema.monomorphized_instances,
                         )
                     );
                 }
@@ -728,9 +748,11 @@ mod tests {
             ok.sema.primitives.len(),
             ok.sema.tick_period_us,
             &ok_dual,
+            &ok.sema.monomorphized_instances,
         );
         assert!(ok_json.starts_with("{\"ok\": true"));
         assert!(ok_json.contains("\"dual_specialized_functions\": []"), "json={ok_json}");
+        assert!(ok_json.contains("\"monomorphized_instances\": []"), "json={ok_json}");
     }
 
     #[test]
@@ -776,6 +798,7 @@ fn main() {
             bundle.sema.primitives.len(),
             bundle.sema.tick_period_us,
             &dual_vec,
+            &bundle.sema.monomorphized_instances,
         );
         assert!(
             json.contains("\"dual_specialized_functions\": [\"hash_chunk\"]"),
@@ -788,6 +811,7 @@ fn main() {
             bundle.sema.primitives.len(),
             bundle.sema.tick_period_us,
             &dual_vec,
+            &bundle.sema.monomorphized_instances,
         );
         assert!(
             human.contains(", dual_specialized=[hash_chunk]"),
@@ -820,6 +844,192 @@ fn main() {
             assert!(fail.human.contains(&format!("zevc doc {code}")), "human=\n{}", fail.human);
             assert!(docs::lookup_doc(Some(code), false).is_ok());
         }
+    }
+
+    #[test]
+    fn wave2_monomorphized_generics_check_json_ram_and_fmt_buf_fit_vs_catch() {
+        let wave2_src = "\
+struct FixedVec<T, usize N> {
+    [N]T data;
+    usize len;
+}
+
+T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
+
+fn check_dynamic_slice([]u8 dyn_tag) {
+    // 1. Statically proven buffer fit (`worst = 4 + 5 = 9 <= 16`) requires NO `or`/`catch`!
+    u8 static_buf[16];
+    u16 rpm = 2400;
+    []u8 fit_line = fmt_buf(static_buf, f\"rpm={rpm}\");
+    println(fit_line);
+
+    // 2. Dynamic `[]u8` slice hole uses `catch (FmtErr err, []u8 partial)` cleanly!
+    u8 small_buf[10];
+    []u8 trunc_line = fmt_buf(small_buf, f\"tag={dyn_tag}\") catch (FmtErr err, []u8 partial) {
+        partial
+    };
+    println(trunc_line);
+}
+
+fn main() {
+    FixedVec<u32, 8> vec = FixedVec<u32, 8> {
+        data: [1, 2, 3, 4, 5, 6, 7, 8],
+        len: 8
+    };
+    f32 ratio = clamp<f32>(1.75f32, 0.0f32, 1.0f32);
+    u8 long_tag[12] = [65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76];
+    check_dynamic_slice(long_tag[0..12]);
+    println(f\"len={vec.len} ratio={ratio:.2}\");
+    sys.exit(0);
+}
+";
+        let temp = TempWorkDir::create("zevc-wave2").unwrap();
+        let src_path = temp.dir.join("wave2.zev");
+        std::fs::write(&src_path, wave2_src).unwrap();
+
+        let (bundle, mir) = compile_to_mir(&[src_path])
+            .unwrap_or_else(|e| panic!("wave2.zev must check & lower:\n{e}"));
+
+        // 1. Verify `zevc check --json` outputs `monomorphized_instances`
+        let dual_vec: Vec<String> = bundle.sema.dual_specialized_fns.iter().cloned().collect();
+        let json = render_check_json_ok(
+            1,
+            bundle.sema.spawned_tasks.len(),
+            bundle.sema.primitives.len(),
+            bundle.sema.tick_period_us,
+            &dual_vec,
+            &bundle.sema.monomorphized_instances,
+        );
+        assert!(
+            json.contains("{\"kind\": \"struct\", \"signature\": \"FixedVec<u32, 8>\", \"mangled_name\": \"FixedVec__u32__8\"}"),
+            "json={json}"
+        );
+        assert!(
+            json.contains("{\"kind\": \"fn\", \"signature\": \"clamp<f32>\", \"mangled_name\": \"clamp__f32\"}"),
+            "json={json}"
+        );
+
+        let human = format_check_human_ok(
+            1,
+            bundle.sema.spawned_tasks.len(),
+            bundle.sema.primitives.len(),
+            bundle.sema.tick_period_us,
+            &dual_vec,
+            &bundle.sema.monomorphized_instances,
+        );
+        assert!(
+            human.contains("monomorphized=[FixedVec<u32, 8>, clamp<f32>]"),
+            "human={human}"
+        );
+
+        // 2. Verify `zevc ram` prints Section 7 (`Monomorphized Generic Instantiations`)
+        let ram_table = mir.ram_report.format_table();
+        assert!(
+            ram_table.contains("7. Monomorphized Generic Instantiations"),
+            "ram_table=\n{ram_table}"
+        );
+        assert!(ram_table.contains("FixedVec<u32, 8>"), "ram_table=\n{ram_table}");
+        assert!(ram_table.contains("clamp<f32>"), "ram_table=\n{ram_table}");
+
+        // 3. Verify emitted C99 runs cleanly under ASan/UBSan (`fit_line` + `trunc_line` + `println(f"...")`)
+        let c_src = zev_codegen_c::emit_c(&mir);
+        let c_exit = runner::compile_and_run_c99(&c_src, true, Some(10), &[]).unwrap();
+        assert_eq!(c_exit, 0);
+
+        // 4. Verify E0028 & E0029 diagnostics and `zevc doc` explainers (41 total)
+        let doc_list = docs::lookup_doc(None, true).unwrap();
+        assert!(doc_list.contains("E0028") && doc_list.contains("E0029"));
+
+        let wave2_errs = [
+            (
+                "e28.zev",
+                "fn main() { u8 dst[8]; u32 rpm = 1800; []u8 s = fmt_buf(dst, f\"rpm={rpm}\"); }\n",
+                "E0028",
+            ),
+            (
+                "e29.zev",
+                "struct FixedVec<T, usize N> { [N]T data; }\nfn main() { usize n = 4; FixedVec<u8, n> v; }\n",
+                "E0029",
+            ),
+        ];
+        for (fname, src, code) in wave2_errs {
+            let Err(fail) = check_temp_file(fname, src) else {
+                panic!("expected `{fname}` to fail with `{code}`");
+            };
+            assert!(fail.human.contains(&format!("error[{code}]")), "human=\n{}", fail.human);
+            assert!(fail.human.contains(&format!("zevc doc {code}")), "human=\n{}", fail.human);
+            assert!(docs::lookup_doc(Some(code), false).is_ok());
+        }
+    }
+
+    #[test]
+    fn multi_file_generic_disambiguation_and_duplicate_path_dedup() {
+        let lib_src = "\
+const u32 A = 2;
+const u32 B = 5;
+const u32 C = 9;
+const u32 D = 3;
+
+struct FixedVec<T, usize N> {
+    [N]T data;
+    usize len;
+}
+
+T scale_add<T, usize N>(T v) {
+    return v;
+}
+
+bool check_window(bool lo_ok, bool hi_ok) {
+    return lo_ok && hi_ok;
+}
+";
+        let app_src = "\
+fn main() {
+    FixedVec<u32, 4> buf = FixedVec<u32, 4> { data: [1, 2, 3, 4], len: 4 };
+    u32 x = scale_add<u32, 4>(buf.data[0]);
+    bool ok = check_window(A < B, C > (D + 1));
+    if (ok && x == 1) {
+        return;
+    }
+}
+";
+        let temp = TempWorkDir::create("zevc-multifile-gen").unwrap();
+        let lib_path = temp.dir.join("lib.zev");
+        let app_path = temp.dir.join("app.zev");
+        std::fs::write(&lib_path, lib_src).unwrap();
+        std::fs::write(&app_path, app_src).unwrap();
+
+        // Pass `app_path` twice to also verify canonical input path deduplication (no E0021!)
+        let bundle = load_and_check_detailed(&[lib_path, app_path.clone(), app_path])
+            .unwrap_or_else(|e| panic!("multi-file generic + comparison check failed:\n{}", e.human));
+        assert_eq!(bundle.programs.len(), 2);
+
+        let dual_vec: Vec<String> = bundle.sema.dual_specialized_fns.iter().cloned().collect();
+        let json = render_check_json_ok(
+            bundle.programs.len(),
+            bundle.sema.spawned_tasks.len(),
+            bundle.sema.primitives.len(),
+            bundle.sema.tick_period_us,
+            &dual_vec,
+            &bundle.sema.monomorphized_instances,
+        );
+        assert!(json.contains("\"files\": 2"), "json={json}");
+        assert!(
+            json.contains("\"mangled_name\": \"FixedVec__u32__4\""),
+            "json={json}"
+        );
+        assert!(
+            json.contains("\"mangled_name\": \"scale_add__u32__4\""),
+            "json={json}"
+        );
     }
 
     #[test]

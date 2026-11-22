@@ -61,11 +61,15 @@ pub enum DiagnosticKind {
     NonDivergingTask,
     /// `spawn` (or call to a boot-spawning `fn`) inside a `task`, `isr`, loop, recursive cycle, or post-supervisor code (`E0027`).
     InvalidSpawnContext,
+    /// `fmt_buf(dst, f"...")` static worst-case formatted length exceeds known destination buffer capacity (`E0028`).
+    FormatBufferTooSmall,
+    /// Invalid `<T>` / `<T, usize N>` generic instantiation (arity, kind, inference, non-const `usize`, or recursion depth > 32) (`E0029`).
+    GenericInstantiationError,
 }
 
 impl DiagnosticKind {
-    /// All 27 semantic error kinds (`E0001`..`E0027`) in code order.
-    pub const ALL: [Self; 27] = [
+    /// All 29 semantic error kinds (`E0001`..`E0029`) in code order.
+    pub const ALL: [Self; 29] = [
         Self::IllegalMutableGlobal,
         Self::GlobalIsolationViolation,
         Self::YieldInNoYield,
@@ -93,9 +97,11 @@ impl DiagnosticKind {
         Self::UnreachableCode,
         Self::NonDivergingTask,
         Self::InvalidSpawnContext,
+        Self::FormatBufferTooSmall,
+        Self::GenericInstantiationError,
     ];
 
-    /// Stable error code (`"E0001"`..`"E0027"`).
+    /// Stable error code (`"E0001"`..`"E0029"`).
     pub const fn code(self) -> &'static str {
         match self {
             Self::IllegalMutableGlobal => "E0001",
@@ -125,6 +131,8 @@ impl DiagnosticKind {
             Self::UnreachableCode => "E0025",
             Self::NonDivergingTask => "E0026",
             Self::InvalidSpawnContext => "E0027",
+            Self::FormatBufferTooSmall => "E0028",
+            Self::GenericInstantiationError => "E0029",
         }
     }
 
@@ -151,12 +159,14 @@ impl DiagnosticKind {
             | Self::UnhandledFallibleExpr
             | Self::InvalidCatchSignature
             | Self::InvalidOrFallback => "errors",
+            Self::FormatBufferTooSmall => "runtime",
             Self::TypeMismatch
             | Self::UndefinedSymbol
             | Self::DuplicateDefinition
             | Self::ImmutableAssignment
             | Self::InvalidOperation
-            | Self::UnreachableCode => "syntax",
+            | Self::UnreachableCode
+            | Self::GenericInstantiationError => "syntax",
         }
     }
 
@@ -253,6 +263,12 @@ impl DiagnosticKind {
             Self::InvalidSpawnContext => {
                 "`spawn` is only permitted during sequential boot in `fn main()` and non-loop, non-recursive boot-helper `fn`s called before `main()`'s supervisor loop"
             }
+            Self::FormatBufferTooSmall => {
+                "increase the destination `[N]u8` buffer size to fit the worst-case `f\"...\"` byte count, or pass a `[]u8` slice and handle truncation via `catch (FmtErr err, []u8 clamped) { ... }`"
+            }
+            Self::GenericInstantiationError => {
+                "supply matching `<Type, usize N>` generic arguments (with compile-time constant `usize` bounds and non-recursive type expansion)"
+            }
         }
     }
 }
@@ -288,12 +304,12 @@ impl Diagnostic {
         self
     }
 
-    /// Stable error code (`"E0001"`..`"E0027"`).
+    /// Stable error code (`"E0001"`..`"E0029"`).
     pub const fn code(&self) -> &'static str {
         self.kind.code()
     }
 
-    /// Documentation topic (`"primitives"`, `"yielding"`, `"dma"`, `"tasks"`, `"errors"`, `"syntax"`).
+    /// Documentation topic (`"primitives"`, `"yielding"`, `"dma"`, `"tasks"`, `"errors"`, `"runtime"`, `"syntax"`).
     pub const fn doc_topic(&self) -> &'static str {
         self.kind.doc_topic()
     }

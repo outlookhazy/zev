@@ -11,16 +11,24 @@ mod lexer;
 mod parser;
 mod token;
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub use error::ParseError;
-pub use token::{Token, TokenKind};
+pub use token::{LexedFormatPart, Token, TokenKind};
 pub use zev_ast;
 pub use zev_ast::Program;
 
 /// Tokenize an in-memory `.zev` source string.
 pub fn lex(source: &str) -> Result<Vec<Token>, ParseError> {
     lexer::lex(source, None)
+}
+
+/// Pre-scan `.zev` source text at brace-depth `0` and return all top-level generic `struct` and
+/// `fn` names declared in `src`.
+pub fn collect_declared_generic_names(src: &str) -> BTreeSet<String> {
+    let tokens = lexer::lex_prefix_best_effort(src);
+    parser::Parser::collect_declared_generics(src, tokens)
 }
 
 /// Parse an in-memory `.zev` source string into a [`Program`].
@@ -33,6 +41,20 @@ pub fn parse_str_named(source: &str, filename: &str) -> Result<Program, ParseErr
     let tokens = lexer::lex(source, Some(filename))?;
     let mut parser = parser::Parser::new(source, Some(filename), tokens);
     parser.parse_program()
+}
+
+/// Parse an in-memory `.zev` source string with an optional whole-program set of declared generic
+/// `struct` / `fn` names (used to disambiguate bare `f<T>(...)` calls from multi-argument `<` / `>`
+/// relational comparisons across multi-file builds).
+pub fn parse_str_named_with_generics(
+    src: &str,
+    file_name: &str,
+    known_generics: Option<&BTreeSet<String>>,
+) -> Result<Program, Vec<ParseError>> {
+    let tokens = lexer::lex(src, Some(file_name)).map_err(|e| vec![e])?;
+    let mut parser =
+        parser::Parser::new_with_generics(src, Some(file_name), tokens, known_generics);
+    parser.parse_program().map_err(|e| vec![e])
 }
 
 /// Read and parse a `.zev` source file from disk.
@@ -1074,7 +1096,7 @@ mod tests {
                     assert!(matches!(clause.body.stmts[0].kind, StmtKind::Assign { .. }));
                     match &clause.body.stmts[1].kind {
                         StmtKind::Expr(Expr {
-                            kind: ExprKind::StructLit { name, fields },
+                            kind: ExprKind::StructLit { name, fields, .. },
                             ..
                         }) => {
                             assert_eq!(name.as_str(), "DecodedPacket");
@@ -1109,5 +1131,665 @@ mod tests {
         assert!(parse_str("fn main() { u16 x = foo() catch { bar() 42 }; }").is_err());
         // Missing `;` at the end of a regular `fn` block must still fail cleanly
         assert!(parse_str("u16 f() { 42 }").is_err());
+    }
+
+    #[test]
+    fn wave2_parses_floats_vs_ranges_and_rejects_malformed_floats() {
+        let src = r#"
+            fn float_and_range_ops() {
+                f32 a = 0.4;
+                f32 b = 3.141_592f32;
+                f64 c = 2.5e-3;
+                f64 d = 1_000e+2f64;
+                f32 e = 42f32;
+                f32 neg = -0.5;
+                f32 casted = (f32)10 + (a as f32);
+
+                u8 arr[8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                []u8 sl = arr[0..4];
+                u32 acc = 0;
+                for (usize i in 0..4) {
+                    acc += sl[i] as u32;
+                }
+                for (usize j in 0..=4) {
+                    acc += j as u32;
+                }
+            }
+        "#;
+
+        let prog = parse_str(src).unwrap_or_else(|e| panic!("float/range parse failed:\n{e}"));
+        let f = match &prog.items[0].kind {
+            ItemKind::Fn(f) => f,
+            other => panic!("expected Fn, got {other:?}"),
+        };
+        let stmts = &f.body.as_ref().unwrap().stmts;
+
+        // `0.4` -> unsuffixed Float
+        match &stmts[0].kind {
+            StmtKind::VarDecl {
+                ty,
+                init:
+                    Some(Expr {
+                        kind: ExprKind::Literal(Literal::Float { bits, suffix }),
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(ty.kind, TypeKind::Prim(PrimType::F32));
+                assert_eq!(f64::from_bits(*bits), 0.4);
+                assert_eq!(*suffix, None);
+            }
+            other => panic!("expected f32 VarDecl, got {other:?}"),
+        }
+
+        // `3.141_592f32` -> f32-suffixed Float
+        match &stmts[1].kind {
+            StmtKind::VarDecl {
+                init:
+                    Some(Expr {
+                        kind: ExprKind::Literal(Literal::Float { bits, suffix }),
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(f64::from_bits(*bits), 3.141_592_f32 as f64);
+                assert_eq!(*suffix, Some(PrimType::F32));
+            }
+            other => panic!("expected suffixed f32 VarDecl, got {other:?}"),
+        }
+
+        // `42f32` -> `<int>f32` Float
+        match &stmts[4].kind {
+            StmtKind::VarDecl {
+                init:
+                    Some(Expr {
+                        kind: ExprKind::Literal(Literal::Float { bits, suffix }),
+                        ..
+                    }),
+                ..
+            } => {
+                assert_eq!(f64::from_bits(*bits), 42.0);
+                assert_eq!(*suffix, Some(PrimType::F32));
+            }
+            other => panic!("expected 42f32 Float VarDecl, got {other:?}"),
+        }
+
+        // Malformed float literals must fail cleanly in lexer (no panic)
+        for bad in [
+            "fn main() { f32 x = 1.; }",
+            "fn main() { f32 x = 1.f32; }",
+            "fn main() { f32 x = 1.5e; }",
+            "fn main() { f32 x = 1.5e+; }",
+            "fn main() { f32 x = 1.2.3; }",
+            "fn main() { f32 x = 1.5f16; }",
+        ] {
+            assert!(
+                parse_str(bad).is_err(),
+                "expected malformed float error on `{bad}`"
+            );
+        }
+    }
+
+    #[test]
+    fn wave2_parses_bounded_generics_nested_shr_calls_and_comparisons() {
+        let src = r#"
+            struct FixedVec<T, usize N> {
+                [N]T data;
+                usize len;
+            }
+
+            struct Boxed<T> {
+                T inner;
+            }
+
+            T clamp<T>(T val, T lo, T hi) {
+                T v = val;
+                if (v < lo) {
+                    return lo;
+                }
+                if (v > hi) {
+                    return hi;
+                }
+                return v;
+            }
+
+            fn reset_vec<T, usize N>(*FixedVec<T, N> vec) {
+                vec.len = 0;
+            }
+
+            fn main() {
+                u8 raw[16];
+                [16]u8 raw2;
+                FixedVec<u32, 4> v = FixedVec<u32, 4> { data: [1, 2, 3, 4], len: 4 };
+                FixedVec<FixedVec<u8, 4>, 2> nested;
+                Boxed<Boxed<u32>> dbl = Boxed<Boxed<u32>> {
+                    inner: Boxed<u32> { inner: 9 }
+                };
+
+                f32 c1 = clamp<f32>(1.5, 0.0, 1.0);
+                f32 c2 = clamp::<f32>(-0.5, 0.0, 1.0);
+                reset_vec<u32, 4>(&v);
+
+                // Ensure `<`, `>`, `&&`, and `>>` comparisons NEVER collide with generic lookahead!
+                u32 x = 3;
+                u32 y = 5;
+                u32 z = 2;
+                if (x < y && (z > 0)) {
+                    x += 1;
+                }
+                if (x < y >> (1)) {
+                    y += 1;
+                }
+            }
+        "#;
+
+        let prog = parse_str(src).unwrap_or_else(|e| panic!("Wave 2 generics parse failed:\n{e}"));
+        assert_eq!(prog.items.len(), 5);
+
+        // 1. `struct FixedVec<T, usize N> { [N]T data; usize len; }`
+        match &prog.items[0].kind {
+            ItemKind::Struct(st) => {
+                assert_eq!(st.name.as_str(), "FixedVec");
+                assert_eq!(st.generic_params.len(), 2);
+                assert_eq!(st.generic_params[0].name.as_str(), "T");
+                assert_eq!(st.generic_params[0].kind, GenericParamKind::Type);
+                assert_eq!(st.generic_params[1].name.as_str(), "N");
+                assert_eq!(st.generic_params[1].kind, GenericParamKind::ConstUsize);
+                match &st.fields[0].ty.kind {
+                    TypeKind::Array { elem, len } => {
+                        assert!(matches!(elem.kind, TypeKind::Named(_)));
+                        assert!(matches!(len, ArrayLen::Expr(_)));
+                    }
+                    other => panic!("expected [N]T Array, got {other:?}"),
+                }
+            }
+            other => panic!("expected Struct, got {other:?}"),
+        }
+
+        // 2. `T clamp<T>(T val, T lo, T hi)` with `T v = val;` local VarDecl
+        match &prog.items[2].kind {
+            ItemKind::Fn(f) => {
+                assert_eq!(f.name.as_str(), "clamp");
+                assert_eq!(f.generic_params.len(), 1);
+                assert_eq!(f.generic_params[0].kind, GenericParamKind::Type);
+                assert!(matches!(
+                    f.body.as_ref().unwrap().stmts[0].kind,
+                    StmtKind::VarDecl { .. }
+                ));
+            }
+            other => panic!("expected generic Fn clamp, got {other:?}"),
+        }
+
+        // 3. Verify `main` statements: `[16]u8`, `FixedVec<u32, 4> { ... }`, `Boxed<Boxed<u32>>`, `clamp<f32>`, `clamp::<f32>`, `x < y && (z > 0)`
+        let main_fn = match &prog.items[4].kind {
+            ItemKind::Fn(f) => f,
+            other => panic!("expected main Fn, got {other:?}"),
+        };
+        let stmts = &main_fn.body.as_ref().unwrap().stmts;
+
+        // `u8 raw[16];` and `[16]u8 raw2;` both use `ArrayLen::Fixed(16)`
+        for idx in [0, 1] {
+            match &stmts[idx].kind {
+                StmtKind::VarDecl { ty, .. } => match &ty.kind {
+                    TypeKind::Array { len, .. } => assert_eq!(*len, ArrayLen::Fixed(16)),
+                    other => panic!("expected Fixed(16) Array, got {other:?}"),
+                },
+                other => panic!("expected VarDecl, got {other:?}"),
+            }
+        }
+
+        // `Boxed<Boxed<u32>>` (`>>` split cleanly!)
+        match &stmts[4].kind {
+            StmtKind::VarDecl { ty, init: Some(init), .. } => {
+                match &ty.kind {
+                    TypeKind::Generic { base, args } => {
+                        assert_eq!(base.as_str(), "Boxed");
+                        assert_eq!(args.len(), 1);
+                        assert!(matches!(
+                            &args[0],
+                            GenericArg::Type(TypeExpr {
+                                kind: TypeKind::Generic { .. },
+                                ..
+                            })
+                        ));
+                    }
+                    other => panic!("expected nested Generic type, got {other:?}"),
+                }
+                assert!(matches!(
+                    init.kind,
+                    ExprKind::StructLit {
+                        ref generic_args,
+                        ..
+                    } if generic_args.len() == 1
+                ));
+            }
+            other => panic!("expected Boxed<Boxed<u32>> VarDecl, got {other:?}"),
+        }
+
+        // `clamp<f32>(...)` & `clamp::<f32>(...)`
+        for idx in [5, 6] {
+            match &stmts[idx].kind {
+                StmtKind::VarDecl {
+                    init:
+                        Some(Expr {
+                            kind: ExprKind::Call { generic_args, args, .. },
+                            ..
+                        }),
+                    ..
+                } => {
+                    assert_eq!(generic_args.len(), 1);
+                    assert_eq!(args.len(), 3);
+                }
+                other => panic!("expected generic Call VarDecl at {idx}, got {other:?}"),
+            }
+        }
+
+        // Empty `<>` and trait bounds `<T: Copy>` must fail cleanly
+        assert!(parse_str("struct Bad<> { u8 x; }").is_err());
+        assert!(parse_str("fn bad<T: Copy>(T x) {}").is_err());
+    }
+
+    #[test]
+    fn wave2_parses_zero_heap_format_strings_and_preserves_subexpr_spans() {
+        let src = concat!(
+            "fn log_it(f32 t, u32 v, CmdFrame pkt) {\n",
+            "    println(f\"temp={t:.2} hex={v:04x} HEX={v:X} bin={v:08b} sci={t:e} sci2={t:.3e} pkt={pkt:?} {{brace}}\");\n",
+            "    println(f\"nested={CmdFrame { op: 1 }:?} path={hw::REG:02x}\");\n",
+            "}\n",
+        );
+
+        let prog = parse_str(src).unwrap_or_else(|e| panic!("f-string parse failed:\n{e}"));
+        let f = match &prog.items[0].kind {
+            ItemKind::Fn(f) => f,
+            other => panic!("expected Fn, got {other:?}"),
+        };
+        let stmts = &f.body.as_ref().unwrap().stmts;
+
+        // First `println(f"...")`
+        match &stmts[0].kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { args, .. },
+                ..
+            }) => match &args[0].value.kind {
+                ExprKind::FormatString(parts) => {
+                    // Expected parts:
+                    // 0: "temp=", 1: {t:.2}, 2: " hex=", 3: {v:04x}, 4: " HEX=", 5: {v:X},
+                    // 6: " bin=", 7: {v:08b}, 8: " sci=", 9: {t:e}, 10: " sci2=", 11: {t:.3e},
+                    // 12: " pkt=", 13: {pkt:?}, 14: " {brace}"
+                    assert_eq!(parts.len(), 15);
+                    assert_eq!(parts[0], FormatPart::Literal("temp=".to_owned()));
+                    match &parts[1] {
+                        FormatPart::Hole { expr, spec, .. } => {
+                            assert_eq!(*spec, FormatSpec::Fixed { precision: 2 });
+                            // Verify exact line & col span inside line 2 (`    println(f"temp={t:.2}...`):
+                            // `t` is at line 2, column 21!
+                            assert_eq!(expr.span.line, 2);
+                            assert_eq!(expr.span.col, 21);
+                            assert_eq!(&src[expr.span.start as usize..expr.span.end as usize], "t");
+                        }
+                        other => panic!("expected Hole, got {other:?}"),
+                    }
+                    assert!(matches!(
+                        parts[3],
+                        FormatPart::Hole {
+                            spec: FormatSpec::Hex {
+                                upper: false,
+                                width: Some(4)
+                            },
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        parts[5],
+                        FormatPart::Hole {
+                            spec: FormatSpec::Hex {
+                                upper: true,
+                                width: None
+                            },
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        parts[7],
+                        FormatPart::Hole {
+                            spec: FormatSpec::Bin { width: Some(8) },
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        parts[9],
+                        FormatPart::Hole {
+                            spec: FormatSpec::Sci { precision: None },
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        parts[11],
+                        FormatPart::Hole {
+                            spec: FormatSpec::Sci { precision: Some(3) },
+                            ..
+                        }
+                    ));
+                    assert!(matches!(
+                        parts[13],
+                        FormatPart::Hole {
+                            spec: FormatSpec::Debug,
+                            ..
+                        }
+                    ));
+                    assert_eq!(parts[14], FormatPart::Literal(" {brace}".to_owned()));
+                }
+                other => panic!("expected FormatString arg, got {other:?}"),
+            },
+            other => panic!("expected Call stmt, got {other:?}"),
+        }
+
+        // Second `println(f"nested={CmdFrame { op: 1 }:?} path={hw::CONST:02x}")`
+        match &stmts[1].kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { args, .. },
+                ..
+            }) => match &args[0].value.kind {
+                ExprKind::FormatString(parts) => {
+                    assert_eq!(parts.len(), 4);
+                    match &parts[1] {
+                        FormatPart::Hole { expr, spec, .. } => {
+                            assert_eq!(*spec, FormatSpec::Debug);
+                            assert!(matches!(expr.kind, ExprKind::StructLit { .. }));
+                        }
+                        other => panic!("expected nested StructLit Hole, got {other:?}"),
+                    }
+                }
+                other => panic!("expected FormatString, got {other:?}"),
+            },
+            other => panic!("expected Call stmt, got {other:?}"),
+        }
+
+        // Malformed f-strings must produce clean errors (zero panics)
+        for bad_fstr in [
+            "fn main() { println(f\"empty={}\"); }",
+            "fn main() { println(f\"unmatched }\"); }",
+            "fn main() { println(f\"badspec={x:zzz}\"); }",
+            "fn main() { println(f\"empty_spec={x:}\"); }",
+            "fn main() { println(f\"unclosed {x\"); }",
+            "fn main() { println(f\"extra={x y}\"); }",
+        ] {
+            assert!(
+                parse_str(bad_fstr).is_err(),
+                "expected f-string error on `{bad_fstr}`"
+            );
+        }
+    }
+
+    #[test]
+    fn review_r1_raw_hex_byte_escapes_preserve_exact_bytes_and_utf8() {
+        let src = r#"
+fn main() {
+    println("\x00\x7F5µs\x80\xAA\xFF");
+    println(f"\xFF\xFE dt=5µs \x80");
+    u8 ch = '\xFF';
+}
+"#;
+        let prog = parse_str(src).expect("parse raw byte escapes");
+        let stmts = match &prog.items[0].kind {
+            ItemKind::Fn(f) => &f.body.as_ref().unwrap().stmts,
+            other => panic!("expected Fn, got {other:?}"),
+        };
+
+        // 1. Standard string literal `"\x00\x7F5µs\x80\xAA\xFF"`
+        match &stmts[0].kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { args, .. },
+                ..
+            }) => match &args[0].value.kind {
+                ExprKind::Literal(Literal::String(s)) => {
+                    let expected = vec![0x00, 0x7F, b'5', 0xC2, 0xB5, b's', 0x80, 0xAA, 0xFF];
+                    assert_eq!(decoded_string_bytes(s), expected);
+                    assert_eq!(decoded_string_byte_len(s), 9);
+                }
+                other => panic!("expected String literal, got {other:?}"),
+            },
+            other => panic!("expected Call, got {other:?}"),
+        }
+
+        // 2. Format string literal `f"\xFF\xFE dt=5µs \x80"`
+        match &stmts[1].kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { args, .. },
+                ..
+            }) => match &args[0].value.kind {
+                ExprKind::FormatString(parts) => match &parts[0] {
+                    FormatPart::Literal(s) => {
+                        let expected = vec![
+                            0xFF, 0xFE, b' ', b'd', b't', b'=', b'5', 0xC2, 0xB5, b's', b' ', 0x80,
+                        ];
+                        assert_eq!(decoded_string_bytes(s), expected);
+                        assert_eq!(decoded_string_byte_len(s), expected.len());
+                    }
+                    other => panic!("expected FormatPart::Literal, got {other:?}"),
+                },
+                other => panic!("expected FormatString, got {other:?}"),
+            },
+            other => panic!("expected Call, got {other:?}"),
+        }
+
+        // 3. Char literal `'\xFF'` still produces integer 255
+        match &stmts[2].kind {
+            StmtKind::VarDecl {
+                init:
+                    Some(Expr {
+                        kind: ExprKind::Literal(Literal::Int(255)),
+                        ..
+                    }),
+                ..
+            } => {}
+            other => panic!("expected `u8 ch = 255`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_r1_generic_calls_never_hijack_multi_arg_relational_comparisons() {
+        let lib_src = r#"
+struct Pair {
+    u32 a;
+    u32 b;
+}
+
+struct FixedVec<T, usize N> {
+    [N]T data;
+}
+
+T clamp<T>(T val, T lo, T hi) {
+    return val;
+}
+"#;
+        let app_src = r#"
+import math.dsp as dsp;
+
+const u32 GLOBAL_LO = 3;
+
+fn check_window(bool lo_ok, bool hi_ok) {
+    assert(lo_ok && hi_ok);
+}
+
+fn main() {
+    u32 a = 3;
+    u32 b = 10;
+    u32 c = 8;
+    u32 d = 4;
+    Pair s = Pair { a: 3, b: 10 };
+
+    // 1. Multi-arg comparisons with parenthesized RHS after `>` MUST parse as 2 boolean args!
+    check_window(a < b, c > (d + 1));
+    check_window(GLOBAL_LO < b, c > (d + 1));
+    check_window(s.a < b, c > (d + 1));
+    [2]bool flags = [a < 10, c > (d + 1)];
+
+    // 2. Real generic calls (local/cross-file `clamp<f32>`, module alias `dsp.clamp<f32>`, turbofish `::<f32>`) still parse!
+    f32 x1 = clamp<f32>(1.5f32, 0.0f32, 2.0f32);
+    f32 x2 = clamp::<f32>(x1, 0.0f32, 1.0f32);
+    f32 x3 = dsp.clamp<f32>(x2, 0.0f32, 1.0f32);
+
+    // 3. Undeclared value identifier `unk < b, c > (d + 1)` also skips speculation when `known_generics` is supplied!
+    check_window(unk < b, c > (d + 1));
+    println(f"{flags[0]} {x3}");
+}
+"#;
+        let mut generics = collect_declared_generic_names(lib_src);
+        generics.extend(collect_declared_generic_names(app_src));
+        assert!(generics.contains("FixedVec"));
+        assert!(generics.contains("clamp"));
+        assert!(!generics.contains("Pair"));
+        assert!(!generics.contains("check_window"));
+
+        let prog = parse_str_named_with_generics(app_src, "app.zev", Some(&generics))
+            .expect("parse app.zev with known_generics");
+
+        let main_fn = prog
+            .items
+            .iter()
+            .find_map(|it| match &it.kind {
+                ItemKind::Fn(f) if f.name.name == "main" => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        let stmts = &main_fn.body.as_ref().unwrap().stmts;
+
+        // Verify `check_window(a < b, c > (d + 1))`, `check_window(GLOBAL_LO < b, ...)`, and `check_window(s.a < b, ...)`
+        // each parsed with `args.len() == 2`!
+        for idx in [5usize, 6, 7, 12] {
+            match &stmts[idx].kind {
+                StmtKind::Expr(Expr {
+                    kind: ExprKind::Call { args, .. },
+                    ..
+                }) => assert_eq!(args.len(), 2, "stmt {idx} should have 2 comparison args"),
+                other => panic!("expected 2-arg Call at stmt {idx}, got {other:?}"),
+            }
+        }
+
+        // Verify `[a < 10, c > (d + 1)]` parsed as 2-element `ArrayLit`
+        match &stmts[8].kind {
+            StmtKind::VarDecl {
+                init:
+                    Some(Expr {
+                        kind: ExprKind::ArrayLit(elems),
+                        ..
+                    }),
+                ..
+            } => assert_eq!(elems.len(), 2),
+            other => panic!("expected 2-element ArrayLit, got {other:?}"),
+        }
+
+        // Verify `clamp<f32>`, `clamp::<f32>`, and `dsp.clamp<f32>` parsed with 1 generic arg & 3 call args
+        for idx in [9usize, 10, 11] {
+            match &stmts[idx].kind {
+                StmtKind::VarDecl {
+                    init:
+                        Some(Expr {
+                            kind:
+                                ExprKind::Call {
+                                    generic_args, args, ..
+                                },
+                            ..
+                        }),
+                    ..
+                } => {
+                    assert_eq!(generic_args.len(), 1);
+                    assert_eq!(args.len(), 3);
+                }
+                other => panic!("expected generic Call at stmt {idx}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn review_r1_f32_direct_parse_fstring_comments_pad_specs_shl_generics_and_local_const() {
+        // 1. M11: Direct `f32` parsing avoids `str -> f64 -> f32` double-rounding at binary64/binary32 midpoints!
+        // `1 + 2^-24 + 2^-54` = `1.000000059604644775390625 + ~5.55e-17`:
+        // - `parse::<f64>()` rounds to even `1 + 2^-24`, and `(v64 as f32)` rounds to even `1.0f32` (`0x3f800000`).
+        // - Direct `parse::<f32>()` sees the exact decimal > midpoint and rounds up to `0x3f800001`!
+        let f32_src = "fn main() { f32 x = 1.000000059604644830901776231257827021181583404541015625f32; }";
+        let f32_prog = parse_str(f32_src).expect("parse midpoint f32");
+        if let ItemKind::Fn(f) = &f32_prog.items[0].kind {
+            if let StmtKind::VarDecl {
+                init:
+                    Some(Expr {
+                        kind: ExprKind::Literal(Literal::Float { bits, suffix }),
+                        ..
+                    }),
+                ..
+            } = &f.body.as_ref().unwrap().stmts[0].kind
+            {
+                assert_eq!(*suffix, Some(PrimType::F32));
+                assert_eq!((f64::from_bits(*bits) as f32).to_bits(), 0x3f80_0001);
+            } else {
+                panic!("expected Float literal");
+            }
+        }
+
+        // 2. M12 + Low #1: Comments (`/* a:b */`, `/* } */`) inside f-string holes + `<<`/`|`/`&`/`^` in generic const args!
+        let clean_src = r#"
+struct FixedVec<T, usize N> { [N]T data; }
+struct Outer<T> { T inner; }
+
+fn main() {
+    FixedVec<u8, 1 << 4> v1;
+    Outer<FixedVec<u8, (1 << 3) | 2>> v2;
+    u32 x = 10;
+    u32 y = 0xab;
+    println(f"val={x /* a:b */} hex={y /* } */ :04x}");
+}
+"#;
+        let clean_prog = parse_str(clean_src).expect("parse << generic args and f-string comments");
+        assert_eq!(clean_prog.items.len(), 3);
+
+        // 3. M12: Escaped `\"` inside `{...}` hole produces targeted hint instead of bogus unterminated hole!
+        let esc_err = parse_str("fn main() { println(f\"hdr={\\\"ok\\\"}\"); }")
+            .expect_err("expected targeted error on escaped quote inside hole");
+        assert!(
+            esc_err.message.contains("unescaped")
+                && esc_err.hint.as_deref().unwrap_or("").contains("hdr={\"ok\"}"),
+            "unexpected error: {esc_err}"
+        );
+
+        // 4. M13: Reject `:4x`, `:8b`, `:0x`, `:0X`, `:0b`, `:00x` with actionable zero-pad / prefix hints!
+        let e_4x = parse_str("fn main() { u16 v = 1; println(f\"{v:4x}\"); }").unwrap_err();
+        assert!(e_4x.hint.as_deref().unwrap_or("").contains(":04x"), "{e_4x}");
+        let e_8b = parse_str("fn main() { u8 v = 1; println(f\"{v:8b}\"); }").unwrap_err();
+        assert!(e_8b.hint.as_deref().unwrap_or("").contains(":08b"), "{e_8b}");
+        let e_0x = parse_str("fn main() { u16 v = 1; println(f\"{v:0x}\"); }").unwrap_err();
+        assert!(
+            e_0x.hint.as_deref().unwrap_or("").contains("0x{val:x}")
+                && e_0x.hint.as_deref().unwrap_or("").contains(":02x"),
+            "{e_0x}"
+        );
+        let e_0b = parse_str("fn main() { u8 v = 1; println(f\"{v:0b}\"); }").unwrap_err();
+        assert!(e_0b.hint.as_deref().unwrap_or("").contains("0b{val:b}"), "{e_0b}");
+
+        // 5. Low #2: Reject block-local `const Type name = ...;` with clear top-level guidance!
+        let e_local_const =
+            parse_str("fn main() { const usize CAP = 8; }").expect_err("reject block-local const");
+        assert!(
+            e_local_const.message.contains("block-local `const`")
+                && e_local_const.hint.as_deref().unwrap_or("").contains("module top level"),
+            "{e_local_const}"
+        );
+
+        // 6. Low #3: Malformed floats (`0x1.5`, `1._5`, `1.<2.0`, `1.==1.0`, `.5`) emit float diagnostics,
+        //    while hex/dec ranges (`0x00..0x10`, `0..4`) still parse cleanly!
+        parse_str("fn main() { for (u8 i in 0x00..0x10) {} }").expect("hex range must still parse");
+        for bad_num in [
+            "fn main() { f64 x = 0x1.5; }",
+            "fn main() { f64 x = 1._5; }",
+            "fn main() { bool b = 1.<2.0; }",
+            "fn main() { bool b = 1.==1.0; }",
+            "fn main() { f64 x = .5; }",
+        ] {
+            let err = parse_str(bad_num).expect_err(&format!("expected error on `{bad_num}`"));
+            assert!(
+                err.message.contains("float literal"),
+                "expected float literal diagnostic for `{bad_num}`, got: {err}"
+            );
+        }
     }
 }

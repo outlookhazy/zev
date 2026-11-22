@@ -3,17 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use zev_ast::{
-    AssignOp, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, ConstDecl, DurationLit,
-    EnumDecl, ErrorSpec, Expr, ExprKind, FnDecl, GlobalVarDecl, Ident, ImportDecl, IsrDecl, Item,
-    ItemKind, Literal, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType, Priority, Program,
-    SpawnStmt, Span, Stmt, StmtKind, StructDecl, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
+    ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, ConstDecl,
+    DurationLit, EnumDecl, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec,
+    GlobalVarDecl, Ident, ImportDecl, IsrDecl, Item, ItemKind, Literal, OsPrimitiveDecl,
+    OsPrimitiveType, Param, PrimType, Priority, Program, SpawnStmt, Span, Stmt, StmtKind,
+    StructDecl, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
 };
 
 use crate::call_graph::{CallContext, CallEdge, CallGraph, CallableKind, ExternCallbackSite};
 use crate::diag::{Diagnostic, DiagnosticKind};
 use crate::model::{
-    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IsrInfo, ParamInfo, PrimitiveInfo,
-    PriorityBoostSite, SemanticModel, SpawnedTaskInstance, TaskInfo,
+    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IsrInfo, MonomorphizedInstance,
+    MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite, SemanticModel,
+    SpawnedTaskInstance, TaskInfo,
 };
 use crate::provenance::{LeaseEnv, Provenance};
 use crate::suggest::{
@@ -186,10 +188,12 @@ pub(crate) struct Analyzer {
     has_chip_import: bool,
     chip_imports: BTreeMap<String, String>,
     structs: BTreeMap<String, StructInfo>,
+    struct_files: BTreeMap<String, Option<String>>,
     enums: BTreeMap<String, EnumInfo>,
     /// Maps unqualified enum variant name -> list of enums defining that variant.
     variant_to_enums: BTreeMap<String, Vec<String>>,
     consts: BTreeMap<String, ConstInfo>,
+    raw_const_exprs: BTreeMap<String, (Expr, Ty)>,
     builtin_svd_consts: BTreeSet<String>,
     primitives: BTreeMap<String, PrimitiveInfo>,
     illegal_globals: BTreeMap<String, IllegalGlobalInfo>,
@@ -206,6 +210,9 @@ pub(crate) struct Analyzer {
     main_supervisor_priority: Option<Priority>,
     call_graph: CallGraph,
     current_file: Option<String>,
+    current_instantiation_note: Option<String>,
+    mono_instantiation_notes: BTreeMap<String, String>,
+    f32_overflow_reported_spans: BTreeSet<(u32, u32)>,
     node_files: BTreeMap<String, String>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -219,9 +226,11 @@ impl Analyzer {
             has_chip_import: false,
             chip_imports: BTreeMap::new(),
             structs: BTreeMap::new(),
+            struct_files: BTreeMap::new(),
             enums: BTreeMap::new(),
             variant_to_enums: BTreeMap::new(),
             consts: BTreeMap::new(),
+            raw_const_exprs: BTreeMap::new(),
             builtin_svd_consts: BTreeSet::new(),
             primitives: BTreeMap::new(),
             illegal_globals: BTreeMap::new(),
@@ -238,6 +247,9 @@ impl Analyzer {
             main_supervisor_priority: None,
             call_graph: CallGraph::new(),
             current_file: None,
+            current_instantiation_note: None,
+            mono_instantiation_notes: BTreeMap::new(),
+            f32_overflow_reported_spans: BTreeSet::new(),
             node_files: BTreeMap::new(),
             diagnostics: Vec::new(),
         }
@@ -249,6 +261,15 @@ impl Analyzer {
         }
         if diag.note.is_none() {
             diag.note = Some(diag.kind.doc_hint().to_string());
+        }
+        if let Some(origin) = &self.current_instantiation_note {
+            if let Some(existing) = &mut diag.note {
+                if !existing.contains("instantiated from ") {
+                    existing.push_str(&format!(" (instantiated from `{}`)", origin));
+                }
+            } else {
+                diag.note = Some(format!("instantiated from `{}`", origin));
+            }
         }
         self.diagnostics.push(diag);
     }
@@ -263,13 +284,61 @@ impl Analyzer {
         }
 
         // Pass 1a: Imports, struct names, and enum declarations.
+        let mut mono_instances_from_attrs: BTreeSet<MonomorphizedInstance> = BTreeSet::new();
         for (item, file) in &all_items {
             self.current_file = file.clone();
             match &item.kind {
                 ItemKind::Import(imp) => self.collect_import(imp),
-                ItemKind::Struct(st) => self.register_struct_header(st),
+                ItemKind::Struct(st) => {
+                    if !st.generic_params.is_empty() {
+                        continue;
+                    }
+                    if let Some(sig) = extract_monomorphized_attr(&item.attrs) {
+                        mono_instances_from_attrs.insert(MonomorphizedInstance {
+                            kind: MonomorphizedKind::Struct,
+                            signature: sig,
+                            mangled_name: st.name.name.clone(),
+                        });
+                    }
+                    if let Some(orig) = extract_instantiated_from_attr(&item.attrs) {
+                        self.mono_instantiation_notes
+                            .insert(st.name.name.clone(), orig);
+                    }
+                    self.struct_files
+                        .insert(st.name.name.clone(), file.clone());
+                    self.register_struct_header(st);
+                }
                 ItemKind::Enum(en) => self.collect_enum(en),
+                ItemKind::Fn(f) if f.generic_params.is_empty() => {
+                    if let Some(sig) = extract_monomorphized_attr(&item.attrs) {
+                        mono_instances_from_attrs.insert(MonomorphizedInstance {
+                            kind: MonomorphizedKind::Fn,
+                            signature: sig,
+                            mangled_name: f.name.name.clone(),
+                        });
+                    }
+                    if let Some(orig) = extract_instantiated_from_attr(&item.attrs) {
+                        self.mono_instantiation_notes
+                            .insert(f.name.name.clone(), orig);
+                    }
+                }
                 _ => {}
+            }
+        }
+
+        // Pre-register built-in `enum FmtErr { Truncated }` if not user-declared.
+        if !self.enums.contains_key("FmtErr") && !self.structs.contains_key("FmtErr") {
+            self.enums.insert(
+                "FmtErr".to_string(),
+                EnumInfo {
+                    name: "FmtErr".to_string(),
+                    variants: vec!["Truncated".to_string()],
+                    span: Span::dummy(),
+                },
+            );
+            if !self.variant_to_enums.contains_key("Truncated") {
+                self.variant_to_enums
+                    .insert("Truncated".to_string(), vec!["FmtErr".to_string()]);
             }
         }
 
@@ -283,7 +352,12 @@ impl Analyzer {
         for (item, file) in &all_items {
             self.current_file = file.clone();
             if let ItemKind::Struct(st) = &item.kind {
-                self.resolve_struct_fields(st);
+                if st.generic_params.is_empty() {
+                    self.current_instantiation_note =
+                        self.mono_instantiation_notes.get(&st.name.name).cloned();
+                    self.resolve_struct_fields(st);
+                    self.current_instantiation_note = None;
+                }
             }
         }
         self.current_file = None;
@@ -293,8 +367,10 @@ impl Analyzer {
         // before validating duration literals anywhere in the program.
         for (item, _) in &all_items {
             if let ItemKind::Fn(f) = &item.kind {
-                if let Some(body) = &f.body {
-                    self.prescan_tick_config(body);
+                if f.generic_params.is_empty() {
+                    if let Some(body) = &f.body {
+                        self.prescan_tick_config(body);
+                    }
                 }
             }
         }
@@ -306,19 +382,25 @@ impl Analyzer {
                 ItemKind::Const(c) => self.collect_const(c),
                 ItemKind::OsPrimitive(p) => self.collect_os_primitive(&item.attrs, p),
                 ItemKind::GlobalVar(g) => self.collect_global_var(&item.attrs, g),
-                ItemKind::Fn(f) => self.collect_fn_sig(&item.attrs, f),
+                ItemKind::Fn(f) if f.generic_params.is_empty() => {
+                    self.current_instantiation_note =
+                        self.mono_instantiation_notes.get(&f.name.name).cloned();
+                    self.collect_fn_sig(&item.attrs, f);
+                    self.current_instantiation_note = None;
+                }
                 ItemKind::Task(t) => self.collect_task_sig(&item.attrs, t),
                 ItemKind::Isr(i) => self.collect_isr_sig(&item.attrs, i),
                 _ => {}
             }
         }
+        self.evaluate_all_const_int_values();
 
         // Pass 2a: Analyze non-`main` helper functions first so interprocedural `return_param_origins`
         // summaries are ready before `main` and `task` bodies call them.
         for (item, file) in &all_items {
             self.current_file = file.clone();
             if let ItemKind::Fn(f) = &item.kind {
-                if f.name.name != "main" {
+                if f.generic_params.is_empty() && f.name.name != "main" {
                     self.check_fn_body(&item.attrs, f);
                 }
             }
@@ -327,7 +409,9 @@ impl Analyzer {
         for (item, file) in &all_items {
             self.current_file = file.clone();
             match &item.kind {
-                ItemKind::Fn(f) if f.name.name == "main" => self.check_fn_body(&item.attrs, f),
+                ItemKind::Fn(f) if f.generic_params.is_empty() && f.name.name == "main" => {
+                    self.check_fn_body(&item.attrs, f);
+                }
                 ItemKind::Task(t) => self.check_task_body(&item.attrs, t),
                 ItemKind::Isr(i) => self.check_isr_body(&item.attrs, i),
                 _ => {}
@@ -344,6 +428,10 @@ impl Analyzer {
             .get("main")
             .is_some_and(|m| m.can_yield);
 
+        let mut monomorphized_instances: Vec<MonomorphizedInstance> =
+            mono_instances_from_attrs.into_iter().collect();
+        monomorphized_instances.sort();
+
         let model = SemanticModel {
             tick_period_us: self.tick_period_us,
             systick_hz: self.systick_hz,
@@ -356,6 +444,7 @@ impl Analyzer {
             tasks: self.tasks,
             isrs: self.isrs,
             spawned_tasks: self.spawned_tasks,
+            monomorphized_instances,
             soft_yielding_in_coro: self.soft_yielding_in_coro,
             soft_yielding_in_noyield: self.soft_yielding_in_noyield,
             dual_specialized_fns: self.dual_specialized_fns,
@@ -508,14 +597,21 @@ impl Analyzer {
             let mut visiting = BTreeSet::new();
             if self.has_value_cycle(&name, &name, &mut visiting) {
                 let span = self.structs[&name].span;
-                self.emit(Diagnostic::new(
-                    DiagnosticKind::InvalidOperation,
-                    span,
-                    format!(
-                        "recursive struct '{}' has infinite size without indirection",
-                        name
-                    ),
-                ));
+                let file = self.struct_files.get(&name).cloned().flatten();
+                self.current_instantiation_note =
+                    self.mono_instantiation_notes.get(&name).cloned();
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        span,
+                        format!(
+                            "recursive struct '{}' has infinite size without indirection",
+                            name
+                        ),
+                    )
+                    .with_file(file),
+                );
+                self.current_instantiation_note = None;
             }
         }
     }
@@ -645,6 +741,8 @@ impl Analyzer {
         self.builtin_svd_consts.remove(&c.name.name);
 
         let ty = self.resolve_type(&c.ty);
+        self.raw_const_exprs
+            .insert(c.name.name.clone(), (c.value.clone(), ty.clone()));
         let int_value = match &c.value.kind {
             ExprKind::Literal(Literal::Int(v)) => Some(*v),
             _ => None,
@@ -668,6 +766,8 @@ impl Analyzer {
                     c.name.name, ty, val.ty
                 ),
             ));
+        } else {
+            self.check_f32_coercion_expr(&c.value, &ty);
         }
 
         self.consts.insert(
@@ -679,6 +779,193 @@ impl Analyzer {
                 span: c.span,
             },
         );
+    }
+
+    fn evaluate_all_const_int_values(&mut self) {
+        let names: Vec<String> = self.consts.keys().cloned().collect();
+        for name in names {
+            let mut visiting = BTreeSet::new();
+            if let Some(v) = self.eval_named_const_i128(&name, &mut visiting) {
+                if let Ok(u) = u64::try_from(v) {
+                    if let Some(info) = self.consts.get_mut(&name) {
+                        info.int_value = Some(u);
+                    }
+                }
+            }
+        }
+    }
+
+    fn eval_named_const_i128(
+        &self,
+        name: &str,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<i128> {
+        let (expr, ty) = self.raw_const_exprs.get(name)?;
+        if !visiting.insert(name.to_string()) {
+            return None;
+        }
+        let raw = self.eval_const_expr_i128(expr, visiting);
+        visiting.remove(name);
+        let val = raw?;
+        if let Ty::Prim(p) = ty {
+            if p.is_integer() {
+                return Some(crate::monomorphize::truncate_int_prim(val, *p));
+            }
+        }
+        Some(val)
+    }
+
+    fn infer_const_prim_ty(&self, expr: &Expr) -> Option<PrimType> {
+        match &expr.kind {
+            ExprKind::Ident(id) => match self.consts.get(&id.name).map(|c| &c.ty) {
+                Some(Ty::Prim(p)) if p.is_integer() => Some(*p),
+                _ => None,
+            },
+            ExprKind::Cast { ty, .. } => match &ty.kind {
+                TypeKind::Prim(p) if p.is_integer() => Some(*p),
+                TypeKind::Named(id) => PrimType::from_name(&id.name).filter(|p| p.is_integer()),
+                _ => None,
+            },
+            ExprKind::Unary { expr: inner, .. } => self.infer_const_prim_ty(inner),
+            ExprKind::Binary { lhs, rhs, .. } => self
+                .infer_const_prim_ty(lhs)
+                .or_else(|| self.infer_const_prim_ty(rhs)),
+            _ => None,
+        }
+    }
+
+    fn eval_const_expr_i128(
+        &self,
+        expr: &Expr,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<i128> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Int(v)) => Some(*v as i128),
+            ExprKind::Ident(id) => self.eval_named_const_i128(&id.name, visiting).or_else(|| {
+                self.consts
+                    .get(&id.name)
+                    .and_then(|c| c.int_value)
+                    .map(|u| u as i128)
+            }),
+            ExprKind::Cast { expr: inner, ty } => {
+                let v = self.eval_const_expr_i128(inner, visiting)?;
+                let target_prim = match &ty.kind {
+                    TypeKind::Prim(p) if p.is_integer() => Some(*p),
+                    TypeKind::Named(id) => PrimType::from_name(&id.name).filter(|p| p.is_integer()),
+                    _ => None,
+                }?;
+                Some(crate::monomorphize::truncate_int_prim(v, target_prim))
+            }
+            ExprKind::Unary { op, expr: inner } => {
+                let v = self.eval_const_expr_i128(inner, visiting)?;
+                match op {
+                    UnaryOp::Neg => {
+                        let neg = v.checked_neg()?;
+                        if let Some(p) = self.infer_const_prim_ty(inner) {
+                            if p.is_signed() {
+                                return Some(crate::monomorphize::truncate_int_prim(neg, p));
+                            }
+                        }
+                        Some(neg)
+                    }
+                    UnaryOp::BitNot => {
+                        let inv = !v;
+                        if let Some(p) = self.infer_const_prim_ty(inner) {
+                            Some(crate::monomorphize::truncate_int_prim(inv, p))
+                        } else {
+                            Some(inv)
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = self.eval_const_expr_i128(lhs, visiting)?;
+                let r = self.eval_const_expr_i128(rhs, visiting)?;
+                match op {
+                    BinaryOp::Add => l.checked_add(r),
+                    BinaryOp::Sub => l.checked_sub(r),
+                    BinaryOp::Mul => l.checked_mul(r),
+                    BinaryOp::Div if r != 0 => l.checked_div(r),
+                    BinaryOp::Rem if r != 0 => l.checked_rem(r),
+                    BinaryOp::BitOr => Some(l | r),
+                    BinaryOp::BitAnd => Some(l & r),
+                    BinaryOp::BitXor => Some(l ^ r),
+                    BinaryOp::Shl => u32::try_from(r).ok().and_then(|sh| l.checked_shl(sh)),
+                    BinaryOp::Shr => u32::try_from(r).ok().and_then(|sh| l.checked_shr(sh)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn check_f32_coercion_expr(&mut self, expr: &Expr, target_ty: &Ty) {
+        match target_ty {
+            Ty::Prim(PrimType::F32) => match &expr.kind {
+                ExprKind::Literal(Literal::Float { bits, suffix: None }) => {
+                    if !(f64::from_bits(*bits) as f32).is_finite()
+                        && self
+                            .f32_overflow_reported_spans
+                            .insert((expr.span.start, expr.span.end))
+                    {
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::TypeMismatch,
+                                expr.span,
+                                "float literal out of finite 'f32' range",
+                            )
+                            .with_note(
+                                "use `f64` for double-precision exponents above ~3.40e38, or write an explicit `(f32)` cast if saturation to infinity is intended",
+                            ),
+                        );
+                    }
+                }
+                ExprKind::Unary {
+                    op: UnaryOp::Neg,
+                    expr: inner,
+                } => self.check_f32_coercion_expr(inner, target_ty),
+                ExprKind::Binary {
+                    op:
+                        BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::Rem,
+                    lhs,
+                    rhs,
+                } => {
+                    self.check_f32_coercion_expr(lhs, target_ty);
+                    self.check_f32_coercion_expr(rhs, target_ty);
+                }
+                ExprKind::Or {
+                    expr: a,
+                    fallback: b,
+                } => {
+                    self.check_f32_coercion_expr(a, target_ty);
+                    self.check_f32_coercion_expr(b, target_ty);
+                }
+                ExprKind::Catch { expr: a, clause } => {
+                    self.check_f32_coercion_expr(a, target_ty);
+                    if let Some(Stmt {
+                        kind: StmtKind::Expr(tail),
+                        ..
+                    }) = clause.body.stmts.last()
+                    {
+                        self.check_f32_coercion_expr(tail, target_ty);
+                    }
+                }
+                _ => {}
+            },
+            Ty::Array { elem, .. } | Ty::Slice(elem) => {
+                if let ExprKind::ArrayLit(elems) = &expr.kind {
+                    for e in elems {
+                        self.check_f32_coercion_expr(e, elem);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn collect_os_primitive(&mut self, item_attrs: &[Attr], p: &OsPrimitiveDecl) {
@@ -710,6 +997,8 @@ impl Analyzer {
                                 p.name.name, val.ty, elem
                             ),
                         ));
+                    } else {
+                        self.check_f32_coercion_expr(init_expr, elem);
                     }
                 }
                 other => {
@@ -961,13 +1250,14 @@ impl Analyzer {
                 }
                 let hint = if let Some(z_ty) = suggest_foreign_type_name(&ident.name) {
                     format!(
-                        "did you mean Zev built-in type `{}`? (Zev uses explicit fixed-width types: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `usize`, `bool`, `u16be`, `u32le`, `[]u8`)",
+                        "did you mean Zev built-in type `{}`? (Zev uses explicit fixed-width types: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `usize`, `bool`, `u16be`, `u32le`, `[]u8`)",
                         z_ty
                     )
                 } else {
                     let prim_names = [
                         "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
-                        "u16be", "u16le", "u32be", "u32le", "u64be", "u64le", "bool", "void",
+                        "f32", "f64", "u16be", "u16le", "u32be", "u32le", "u64be", "u64le",
+                        "bool", "void",
                     ];
                     let candidates = prim_names
                         .into_iter()
@@ -976,7 +1266,7 @@ impl Analyzer {
                     if let Some(best) = closest_match(&ident.name, candidates, 2) {
                         format!("did you mean type `{}`?", best)
                     } else {
-                        "built-in Zev types: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `usize`, `bool`, `void`, `u16be`, `u32le`, `[]T`, `*T`".to_string()
+                        "built-in Zev types: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `usize`, `bool`, `void`, `u16be`, `u32le`, `[]T`, `*T`".to_string()
                     }
                 };
                 self.emit(
@@ -1012,9 +1302,60 @@ impl Analyzer {
                 ));
                 Ty::Error
             }
+            TypeKind::Generic { base, .. } => {
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::GenericInstantiationError,
+                    te.span,
+                    format!("unmonomorphized generic type '{}'", base.name),
+                ));
+                Ty::Error
+            }
+            TypeKind::GenericPath { path, .. } => {
+                let joined = path
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::GenericInstantiationError,
+                    te.span,
+                    format!("unmonomorphized generic type '{}'", joined),
+                ));
+                Ty::Error
+            }
             TypeKind::Slice(elem) => Ty::Slice(Box::new(self.resolve_type(elem))),
             TypeKind::Array { elem, len } => {
-                if *len == 0 {
+                let resolved_len = match len {
+                    ArrayLen::Fixed(n) => *n,
+                    ArrayLen::Expr(expr) => match &expr.kind {
+                        ExprKind::Literal(Literal::Int(v)) => *v as usize,
+                        ExprKind::Ident(id) => self
+                            .consts
+                            .get(&id.name)
+                            .and_then(|c| c.int_value)
+                            .map(|v| v as usize)
+                            .unwrap_or_else(|| {
+                                self.emit(Diagnostic::new(
+                                    DiagnosticKind::GenericInstantiationError,
+                                    expr.span,
+                                    format!(
+                                        "array length '{}' is not a compile-time constant 'usize'",
+                                        id.name
+                                    ),
+                                ));
+                                1
+                            }),
+                        _ => {
+                            self.emit(Diagnostic::new(
+                                DiagnosticKind::GenericInstantiationError,
+                                expr.span,
+                                "array length must be a compile-time constant 'usize'",
+                            ));
+                            1
+                        }
+                    },
+                };
+                if resolved_len == 0 {
                     self.emit(Diagnostic::new(
                         DiagnosticKind::InvalidOperation,
                         te.span,
@@ -1023,7 +1364,7 @@ impl Analyzer {
                 }
                 Ty::Array {
                     elem: Box::new(self.resolve_type(elem)),
-                    len: *len,
+                    len: resolved_len,
                 }
             }
             TypeKind::Ptr(inner) => Ty::Ptr(Box::new(self.resolve_type(inner))),
@@ -1161,6 +1502,9 @@ impl Analyzer {
         let Some(fn_info) = self.functions.get(&f.name.name).cloned() else {
             return;
         };
+        let prev_note = self.current_instantiation_note.take();
+        self.current_instantiation_note =
+            self.mono_instantiation_notes.get(&f.name.name).cloned();
         let force_noyield = has_attr_noyield(item_attrs) || has_attr_noyield(&f.attrs);
         let mut checker = BodyChecker::new(
             self,
@@ -1190,6 +1534,7 @@ impl Analyzer {
                 ),
             ));
         }
+        self.current_instantiation_note = prev_note;
 
         self.fn_boot_steps.insert(f.name.name.clone(), boot_steps);
         if let Some(info) = self.functions.get_mut(&f.name.name) {
@@ -1788,6 +2133,7 @@ struct BodyChecker<'a> {
     boot_steps: Vec<BootStep>,
     return_param_origins: BTreeSet<usize>,
     recorded_boosts: Vec<PriorityBoostSite>,
+    proven_infallible_spans: BTreeSet<(u32, u32)>,
     last_struct_lit_fields: BTreeMap<(u32, u32), BTreeMap<String, Provenance>>,
     /// Tracks lexical scope depths at loop entry and outer variables carrying DMA leases read inside the loop.
     loop_entry_depths: Vec<u32>,
@@ -1819,6 +2165,7 @@ impl<'a> BodyChecker<'a> {
             boot_steps: Vec::new(),
             return_param_origins: BTreeSet::new(),
             recorded_boosts: Vec::new(),
+            proven_infallible_spans: BTreeSet::new(),
             last_struct_lit_fields: BTreeMap::new(),
             loop_entry_depths: Vec::new(),
             loop_outer_reads: Vec::new(),
@@ -2140,6 +2487,8 @@ impl<'a> BodyChecker<'a> {
                                 name.name, resolved_ty, val.ty
                             ),
                         ));
+                    } else {
+                        self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
                     }
                     if resolved_ty.contains_reference(&self.sema.structs)
                         || resolved_ty.contains_fn_ptr(&self.sema.structs)
@@ -2175,7 +2524,7 @@ impl<'a> BodyChecker<'a> {
 
             StmtKind::Assign { target, op, value } => {
                 let rhs = self.check_expr_infallible(value);
-                self.check_assignment(target, *op, rhs, stmt.span);
+                self.check_assignment(target, *op, value, rhs, stmt.span);
                 false
             }
 
@@ -2249,6 +2598,8 @@ impl<'a> BodyChecker<'a> {
                                         val.ty, ret_ty
                                     ),
                                 ));
+                            } else {
+                                self.sema.check_f32_coercion_expr(e, ret_ty);
                             }
                             if ret_ty.contains_reference(&self.sema.structs) {
                                 if val.prov.has_non_returning_origin() {
@@ -2406,17 +2757,22 @@ impl<'a> BodyChecker<'a> {
                                         pv.ty, ret_ty
                                     ),
                                 ));
-                            } else if ret_ty.contains_reference(&self.sema.structs)
-                                && pv.prov.has_non_returning_origin()
-                            {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::ReturnLocalReference,
-                                    pv.span,
-                                    format!(
-                                        "cannot return partial-progress value of type '{}' referencing local variable or DMA lease",
-                                        ret_ty
-                                    ),
-                                ));
+                            } else {
+                                if let Some(p_expr) = partial {
+                                    self.sema.check_f32_coercion_expr(p_expr, ret_ty);
+                                }
+                                if ret_ty.contains_reference(&self.sema.structs)
+                                    && pv.prov.has_non_returning_origin()
+                                {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::ReturnLocalReference,
+                                        pv.span,
+                                        format!(
+                                            "cannot return partial-progress value of type '{}' referencing local variable or DMA lease",
+                                            ret_ty
+                                        ),
+                                    ));
+                                }
                             }
                         }
                         (ResolvedErrorSpec::Untyped, None, Some(_)) => {
@@ -2867,6 +3223,8 @@ impl<'a> BodyChecker<'a> {
                         SwitchPat::Literal(lit, pat_span) => {
                             let lit_ty = match lit {
                                 Literal::Int(_) => Ty::IntLit,
+                                Literal::Float { suffix: Some(p), .. } => Ty::Prim(*p),
+                                Literal::Float { suffix: None, .. } => Ty::FloatLit,
                                 Literal::Bool(_) => Ty::bool(),
                                 Literal::Duration(d) => {
                                     self.sema.validate_duration(d);
@@ -3271,6 +3629,8 @@ impl<'a> BodyChecker<'a> {
                             param.ty
                         ),
                     ));
+                } else {
+                    self.sema.check_f32_coercion_expr(&arg.value, &param.ty);
                 }
                 if param.ty.contains_reference(&self.sema.structs) {
                     if val.prov.has_non_returning_origin() {
@@ -3314,7 +3674,14 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    fn check_assignment(&mut self, target: &Expr, op: AssignOp, rhs: ExprVal, stmt_span: Span) {
+    fn check_assignment(
+        &mut self,
+        target: &Expr,
+        op: AssignOp,
+        value_expr: &Expr,
+        rhs: ExprVal,
+        stmt_span: Span,
+    ) {
         match &target.kind {
             ExprKind::Ident(ident) => {
                 if self.sema.consts.contains_key(&ident.name)
@@ -3367,7 +3734,7 @@ impl<'a> BodyChecker<'a> {
                 // If compound assignment (`+=`, etc.), first validate reading `ident`.
                 if op != AssignOp::Assign {
                     let cur = self.check_expr_infallible(target);
-                    self.check_compound_op_types(op, &cur.ty, &rhs.ty, stmt_span);
+                    self.check_compound_op_types(op, &cur.ty, value_expr, &rhs.ty, stmt_span);
                     return;
                 }
 
@@ -3393,6 +3760,8 @@ impl<'a> BodyChecker<'a> {
                             rhs.ty, ident.name, var_info.ty
                         ),
                     ));
+                } else {
+                    self.sema.check_f32_coercion_expr(value_expr, &var_info.ty);
                 }
 
                 if var_info.ty.contains_reference(&self.sema.structs)
@@ -3485,9 +3854,11 @@ impl<'a> BodyChecker<'a> {
                                 rhs.ty, struct_name, field.name, field_ty
                             ),
                         ));
+                    } else {
+                        self.sema.check_f32_coercion_expr(value_expr, &field_ty);
                     }
                 } else {
-                    self.check_compound_op_types(op, &field_ty, &rhs.ty, stmt_span);
+                    self.check_compound_op_types(op, &field_ty, value_expr, &rhs.ty, stmt_span);
                 }
 
                 if field_ty.contains_reference(&self.sema.structs)
@@ -3558,9 +3929,11 @@ impl<'a> BodyChecker<'a> {
                                 rhs.ty, pointee_ty
                             ),
                         ));
+                    } else {
+                        self.sema.check_f32_coercion_expr(value_expr, pointee_ty);
                     }
                 } else {
-                    self.check_compound_op_types(op, pointee_ty, &rhs.ty, stmt_span);
+                    self.check_compound_op_types(op, pointee_ty, value_expr, &rhs.ty, stmt_span);
                 }
                 if pointee_ty.contains_reference(&self.sema.structs) {
                     let dest_depth = pv.prov.pointee_depth.unwrap_or(0);
@@ -3615,9 +3988,11 @@ impl<'a> BodyChecker<'a> {
                                 rhs.ty, elem_ty
                             ),
                         ));
+                    } else {
+                        self.sema.check_f32_coercion_expr(value_expr, &elem_ty);
                     }
                 } else {
-                    self.check_compound_op_types(op, &elem_ty, &rhs.ty, stmt_span);
+                    self.check_compound_op_types(op, &elem_ty, value_expr, &rhs.ty, stmt_span);
                 }
                 if elem_ty.contains_reference(&self.sema.structs) {
                     if let Some(root_name) = root_ident_of(seq_expr) {
@@ -3647,21 +4022,40 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    fn check_compound_op_types(&mut self, op: AssignOp, lhs: &Ty, rhs: &Ty, span: Span) {
+    fn check_compound_op_types(
+        &mut self,
+        op: AssignOp,
+        lhs: &Ty,
+        rhs_expr: &Expr,
+        rhs: &Ty,
+        span: Span,
+    ) {
         if lhs.is_error() || rhs.is_error() {
             return;
         }
-        if !lhs.is_integer() || !rhs.is_integer() {
+        let float_arith_ok = matches!(
+            op,
+            AssignOp::AddAssign
+                | AssignOp::SubAssign
+                | AssignOp::MulAssign
+                | AssignOp::DivAssign
+                | AssignOp::RemAssign
+        ) && lhs.is_float()
+            && rhs.is_float()
+            && rhs.is_assignable_to(lhs);
+        if !(lhs.is_integer() && rhs.is_integer()) && !float_arith_ok {
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::TypeMismatch,
                 span,
                 format!(
-                    "compound assignment '{}' requires integer operands, found '{}' and '{}'",
+                    "compound assignment '{}' requires compatible numeric operands, found '{}' and '{}'",
                     op.as_str(),
                     lhs,
                     rhs
                 ),
             ));
+        } else if float_arith_ok {
+            self.sema.check_f32_coercion_expr(rhs_expr, lhs);
         }
     }
 
@@ -3672,6 +4066,13 @@ impl<'a> BodyChecker<'a> {
     fn check_expr_infallible(&mut self, expr: &Expr) -> ExprVal {
         let mut val = self.check_expr_raw(expr);
         if val.error_spec.is_fallible() {
+            if self
+                .proven_infallible_spans
+                .remove(&(expr.span.start, expr.span.end))
+            {
+                val.error_spec = ResolvedErrorSpec::None;
+                return val;
+            }
             let note = match (&val.error_spec, val.ty.is_void()) {
                 (ResolvedErrorSpec::Typed(err_ty), false) => format!(
                     "unwrap with `expr or <fallback>` (e.g. `{} x = expr or default_val;`) or `expr catch ({} err) {{ ... }}` / `expr catch ({} err, {} partial) {{ ... }}`",
@@ -3704,6 +4105,10 @@ impl<'a> BodyChecker<'a> {
         match &expr.kind {
             ExprKind::Literal(lit) => match lit {
                 Literal::Int(_) => ExprVal::scalar(Ty::IntLit, expr.span),
+                Literal::Float {
+                    suffix: Some(p), ..
+                } => ExprVal::scalar(Ty::Prim(*p), expr.span),
+                Literal::Float { suffix: None, .. } => ExprVal::scalar(Ty::FloatLit, expr.span),
                 Literal::Bool(_) => ExprVal::scalar(Ty::bool(), expr.span),
                 Literal::String(_) => ExprVal::scalar(Ty::Str, expr.span),
                 Literal::Duration(dur) => {
@@ -3723,6 +4128,14 @@ impl<'a> BodyChecker<'a> {
             ExprKind::Cast { expr: inner, ty } => {
                 let iv = self.check_expr_infallible(inner);
                 let target_ty = self.sema.resolve_type(ty);
+                if !iv.ty.is_error() && !target_ty.is_error() && !is_valid_cast(&iv.ty, &target_ty)
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        expr.span,
+                        format!("cannot cast value of type '{}' to '{}'", iv.ty, target_ty),
+                    ));
+                }
                 let mut prov = iv.prov;
                 if !target_ty.contains_reference(&self.sema.structs)
                     && !target_ty.contains_fn_ptr(&self.sema.structs)
@@ -3740,7 +4153,20 @@ impl<'a> BodyChecker<'a> {
 
             ExprKind::Field { target, field } => self.check_field_expr(target, field, expr.span),
 
-            ExprKind::Call { callee, args } => self.check_call_expr(callee, args, expr.span),
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                if !generic_args.is_empty() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::GenericInstantiationError,
+                        expr.span,
+                        "unmonomorphized generic call arguments",
+                    ));
+                }
+                self.check_call_expr(callee, args, expr.span)
+            }
 
             ExprKind::MethodCall {
                 receiver,
@@ -3864,7 +4290,18 @@ impl<'a> BodyChecker<'a> {
                 }
             }
 
-            ExprKind::StructLit { name, fields } => {
+            ExprKind::StructLit {
+                name,
+                generic_args,
+                fields,
+            } => {
+                if !generic_args.is_empty() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::GenericInstantiationError,
+                        expr.span,
+                        format!("unmonomorphized generic struct literal '{}'", name.name),
+                    ));
+                }
                 let Some(st_info) = self.sema.structs.get(&name.name).cloned() else {
                     let struct_names: Vec<&str> = self.sema.structs.keys().map(String::as_str).collect();
                     let mut diag = Diagnostic::new(
@@ -3908,6 +4345,8 @@ impl<'a> BodyChecker<'a> {
                                     name.name, fi.name.name, decl_field.ty, fv.ty
                                 ),
                             ));
+                        } else {
+                            self.sema.check_f32_coercion_expr(&fi.value, &decl_field.ty);
                         }
                         if decl_field.ty.contains_reference(&self.sema.structs)
                             || decl_field.ty.contains_fn_ptr(&self.sema.structs)
@@ -3969,6 +4408,9 @@ impl<'a> BodyChecker<'a> {
                         Some(cur) if matches!(cur, Ty::IntLit) && ev.ty.is_integer() => {
                             elem_ty = Some(ev.ty);
                         }
+                        Some(cur) if matches!(cur, Ty::FloatLit) && ev.ty.is_float() => {
+                            elem_ty = Some(ev.ty);
+                        }
                         Some(cur) => {
                             if !ev.ty.is_assignable_to(cur) {
                                 self.sema.emit(Diagnostic::new(
@@ -3983,10 +4425,12 @@ impl<'a> BodyChecker<'a> {
                         }
                     }
                 }
-                let final_elem = match elem_ty.unwrap_or(Ty::Error) {
-                    Ty::IntLit => Ty::u8(),
-                    other => other,
-                };
+                let final_elem = elem_ty.unwrap_or(Ty::Error);
+                if final_elem == Ty::f32() {
+                    for e in elems {
+                        self.sema.check_f32_coercion_expr(e, &final_elem);
+                    }
+                }
                 ExprVal {
                     ty: Ty::Array {
                         elem: Box::new(final_elem),
@@ -3999,11 +4443,29 @@ impl<'a> BodyChecker<'a> {
                 }
             }
 
+            ExprKind::FormatString(parts) => {
+                let _ = self.check_format_string(parts);
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        expr.span,
+                        "zero-heap format string 'f\"...\"' cannot allocate a standalone string value",
+                    )
+                    .with_note(
+                        "pass `f\"...\"` directly into a sink: `println(f\"...\");`, `print(f\"...\");`, or `fmt_buf(dst, f\"...\")`",
+                    ),
+                );
+                ExprVal::error(expr.span)
+            }
+
             ExprKind::Or {
                 expr: inner,
                 fallback,
             } => {
                 let iv = self.check_expr_raw(inner);
+                let _ = self
+                    .proven_infallible_spans
+                    .remove(&(inner.span.start, inner.span.end));
                 if !iv.error_spec.is_fallible() && !iv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidOrFallback,
@@ -4022,11 +4484,15 @@ impl<'a> BodyChecker<'a> {
                         ),
                     ));
                 }
-                let res_ty = if matches!(iv.ty, Ty::IntLit) {
+                let res_ty = if matches!(iv.ty, Ty::IntLit | Ty::FloatLit) {
                     fv.ty.clone()
                 } else {
                     iv.ty.clone()
                 };
+                if res_ty == Ty::f32() {
+                    self.sema.check_f32_coercion_expr(inner, &res_ty);
+                    self.sema.check_f32_coercion_expr(fallback, &res_ty);
+                }
                 let prov = if res_ty.contains_reference(&self.sema.structs) {
                     iv.prov.merge(&fv.prov)
                 } else {
@@ -4325,11 +4791,11 @@ impl<'a> BodyChecker<'a> {
 
             UnaryOp::Neg => {
                 let iv = self.check_expr_infallible(inner);
-                if !iv.ty.is_integer() && !iv.ty.is_error() {
+                if !iv.ty.is_numeric() && !iv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("unary '-' requires an integer, found '{}'", iv.ty),
+                        format!("unary '-' requires an integer or float, found '{}'", iv.ty),
                     ));
                 }
                 let out_ty = match iv.ty {
@@ -4366,9 +4832,11 @@ impl<'a> BodyChecker<'a> {
             }
 
             BinaryOp::Eq | BinaryOp::Ne => {
+                let unified_float = unify_float_arith(&lv.ty, &rv.ty);
                 let compat = lv.ty.is_assignable_to(&rv.ty)
                     || rv.ty.is_assignable_to(&lv.ty)
-                    || (lv.ty.is_integer() && rv.ty.is_integer());
+                    || (lv.ty.is_integer() && rv.ty.is_integer())
+                    || unified_float.is_some();
                 if !compat {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -4380,32 +4848,61 @@ impl<'a> BodyChecker<'a> {
                             op.as_str()
                         ),
                     ));
+                } else if unified_float == Some(Ty::f32()) {
+                    self.sema.check_f32_coercion_expr(lhs, &Ty::f32());
+                    self.sema.check_f32_coercion_expr(rhs, &Ty::f32());
                 }
                 ExprVal::scalar(Ty::bool(), span)
             }
 
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-                if !lv.ty.is_integer() || !rv.ty.is_integer() {
+                let unified_float = unify_float_arith(&lv.ty, &rv.ty);
+                let valid_cmp = (lv.ty.is_integer() && rv.ty.is_integer())
+                    || unified_float.is_some();
+                if !valid_cmp {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
                         format!(
-                            "comparison '{}' requires integer operands, found '{}' and '{}'",
+                            "comparison '{}' requires matching numeric operands, found '{}' and '{}'",
                             op.as_str(),
                             lv.ty,
                             rv.ty
                         ),
                     ));
+                } else if unified_float == Some(Ty::f32()) {
+                    self.sema.check_f32_coercion_expr(lhs, &Ty::f32());
+                    self.sema.check_f32_coercion_expr(rhs, &Ty::f32());
                 }
                 ExprVal::scalar(Ty::bool(), span)
             }
 
-            BinaryOp::Add
-            | BinaryOp::Sub
-            | BinaryOp::Mul
-            | BinaryOp::Div
-            | BinaryOp::Rem
-            | BinaryOp::BitOr
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
+                if lv.ty.is_integer() && rv.ty.is_integer() {
+                    let res_ty = unify_integer_arith(&lv.ty, &rv.ty);
+                    ExprVal::scalar(res_ty, span)
+                } else if let Some(float_ty) = unify_float_arith(&lv.ty, &rv.ty) {
+                    if float_ty == Ty::f32() {
+                        self.sema.check_f32_coercion_expr(lhs, &Ty::f32());
+                        self.sema.check_f32_coercion_expr(rhs, &Ty::f32());
+                    }
+                    ExprVal::scalar(float_ty, span)
+                } else {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "operator '{}' requires matching integer or float operands, found '{}' and '{}'",
+                            op.as_str(),
+                            lv.ty,
+                            rv.ty
+                        ),
+                    ));
+                    ExprVal::error(span)
+                }
+            }
+
+            BinaryOp::BitOr
             | BinaryOp::BitAnd
             | BinaryOp::BitXor
             | BinaryOp::Shl
@@ -4673,6 +5170,8 @@ impl<'a> BodyChecker<'a> {
                                     expected
                                 ),
                             ));
+                        } else {
+                            self.sema.check_f32_coercion_expr(&arg.value, expected);
                         }
                     }
                 }
@@ -4756,6 +5255,8 @@ impl<'a> BodyChecker<'a> {
                             param.ty
                         ),
                     ));
+                } else {
+                    self.sema.check_f32_coercion_expr(&arg.value, &param.ty);
                 }
             }
 
@@ -4935,33 +5436,39 @@ impl<'a> BodyChecker<'a> {
                             DiagnosticKind::TypeMismatch,
                             span,
                             format!(
-                                "'{}' expects 1 string argument (`*u8` or string literal), found {}",
+                                "'{}' expects 1 argument (`*u8`, string literal, or `f\"...\"` format string), found {}",
                                 name,
                                 args.len()
                             ),
                         )
                         .with_note(format!(
-                            "pass a string literal like `{}(\"boot ok\");` or use `sys.log_kv(\"val=\", x);` to print numeric values",
-                            name
+                            "pass `{}(f\"val={{x}}\");` or `{}(\"boot ok\");`",
+                            name, name
                         )),
                     );
                     for a in args {
-                        let _ = self.check_expr_infallible(&a.value);
+                        if let ExprKind::FormatString(parts) = &a.value.kind {
+                            let _ = self.check_format_string(parts);
+                        } else {
+                            let _ = self.check_expr_infallible(&a.value);
+                        }
                     }
+                } else if let ExprKind::FormatString(parts) = &args[0].value.kind {
+                    let _ = self.check_format_string(parts);
                 } else {
                     let av = self.check_expr_infallible(&args[0].value);
-                    if !is_string_arg_ty(&av.ty) && !av.ty.is_error() {
+                    if !is_print_arg_ty(&av.ty) && !av.ty.is_error() {
                         self.sema.emit(
                             Diagnostic::new(
                                 DiagnosticKind::TypeMismatch,
                                 args[0].span,
                                 format!(
-                                    "'{}' expects a string (`*u8` or string literal), found '{}'",
+                                    "'{}' expects a string or byte slice (`*u8`, `[]u8`, string literal, or `f\"...\"`), found '{}'",
                                     name, av.ty
                                 ),
                             )
                             .with_note(format!(
-                                "use `sys.log_kv(\"val=\", expr);` (signed) or `sys.log_hex(\"val=\", expr);` (hex) to print numbers, or pass a string literal to `{}(\"...\")`",
+                                "use `{}(f\"val={{expr}}\");`, `sys.log_kv(\"val=\", expr);`, or `sys.log_hex(\"val=\", expr);` to print values",
                                 name
                             )),
                         );
@@ -4969,6 +5476,8 @@ impl<'a> BodyChecker<'a> {
                 }
                 Some(ExprVal::scalar(Ty::void(), span))
             }
+
+            "fmt_buf" => Some(self.check_fmt_buf_call(args, span)),
 
             "assert" => {
                 if args.len() != 1 {
@@ -5139,6 +5648,86 @@ impl<'a> BodyChecker<'a> {
                     .or_else(|| root_ident_of(receiver))
                     .unwrap_or_else(|| "<anon_endpoint>".to_string());
                 self.check_os_primitive_method(&os_prim, &source_key, method, args, span)
+            }
+
+            Ty::Struct(struct_name) => {
+                if let Some(FieldInfo {
+                    ty: Ty::FnPtr { params, ret },
+                    ..
+                }) = self
+                    .sema
+                    .structs
+                    .get(&struct_name)
+                    .and_then(|s| s.field(&method.name))
+                    .cloned()
+                {
+                    let field_prov = if let Some(root) = root_ident_of(receiver) {
+                        if let Some(v) = self.lookup_local(&root) {
+                            v.field_prov
+                                .get(&method.name)
+                                .cloned()
+                                .unwrap_or_else(|| rv.prov.clone())
+                        } else {
+                            rv.prov.clone()
+                        }
+                    } else {
+                        rv.prov.clone()
+                    };
+                    if args.len() != params.len() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "function pointer field '{}.{}' expects {} argument(s), found {}",
+                                struct_name,
+                                method.name,
+                                params.len(),
+                                args.len()
+                            ),
+                        ));
+                    }
+                    for (i, arg) in args.iter().enumerate() {
+                        let av = self.check_expr_infallible(&arg.value);
+                        if let Some(expected) = params.get(i) {
+                            if !av.ty.is_assignable_to(expected) {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    arg.span,
+                                    format!(
+                                        "argument {} to '{}.{}' has type '{}', expected '{}'",
+                                        i + 1,
+                                        struct_name,
+                                        method.name,
+                                        av.ty,
+                                        expected
+                                    ),
+                                ));
+                            } else {
+                                self.sema.check_f32_coercion_expr(&arg.value, expected);
+                            }
+                        }
+                    }
+                    for cb_target in &field_prov.fn_callbacks {
+                        self.sema.call_graph.add_edge(CallEdge {
+                            caller: self.caller_key.clone(),
+                            caller_kind: self.caller_kind,
+                            callee: cb_target.clone(),
+                            span,
+                            ctx: self.call_context(),
+                        });
+                    }
+                    return ExprVal::scalar(*ret, span);
+                }
+
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::UndefinedSymbol,
+                    method.span,
+                    format!("type '{}' has no method '{}'", struct_name, method.name),
+                ));
+                for a in args {
+                    let _ = self.check_expr_infallible(&a.value);
+                }
+                ExprVal::error(span)
             }
 
             other => {
@@ -5486,7 +6075,7 @@ impl<'a> BodyChecker<'a> {
                     }
                 }
             } else {
-                pos_vals.push((av, a.span));
+                pos_vals.push((av, a.value.clone(), a.span));
             }
         }
 
@@ -5708,7 +6297,7 @@ impl<'a> BodyChecker<'a> {
     fn expect_positional_arity(
         &mut self,
         method: &str,
-        pos_vals: &[(ExprVal, Span)],
+        pos_vals: &[(ExprVal, Expr, Span)],
         expected: usize,
         span: Span,
     ) {
@@ -5729,7 +6318,7 @@ impl<'a> BodyChecker<'a> {
     fn expect_single_elem(
         &mut self,
         method: &str,
-        pos_vals: &[(ExprVal, Span)],
+        pos_vals: &[(ExprVal, Expr, Span)],
         elem: &Ty,
         span: Span,
     ) {
@@ -5746,7 +6335,7 @@ impl<'a> BodyChecker<'a> {
             ));
             return;
         }
-        let (val, arg_span) = &pos_vals[0];
+        let (val, arg_expr, arg_span) = &pos_vals[0];
         if !val.ty.is_assignable_to(elem) {
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::TypeMismatch,
@@ -5756,6 +6345,8 @@ impl<'a> BodyChecker<'a> {
                     method, val.ty, elem
                 ),
             ));
+        } else {
+            self.sema.check_f32_coercion_expr(arg_expr, elem);
         }
     }
 
@@ -5788,6 +6379,9 @@ impl<'a> BodyChecker<'a> {
         span: Span,
     ) -> ExprVal {
         let iv = self.check_expr_raw(inner);
+        let _ = self
+            .proven_infallible_spans
+            .remove(&(inner.span.start, inner.span.end));
 
         if !iv.error_spec.is_fallible() && !iv.ty.is_error() {
             self.sema.emit(Diagnostic::new(
@@ -5966,6 +6560,12 @@ impl<'a> BodyChecker<'a> {
                                 iv.ty, iv.ty
                             )),
                         );
+                    } else if let Some(Stmt {
+                        kind: StmtKind::Expr(last_expr),
+                        ..
+                    }) = clause.body.stmts.last()
+                    {
+                        self.sema.check_f32_coercion_expr(last_expr, &iv.ty);
                     }
                     merged_prov = merged_prov.merge(&tv.prov);
                 } else {
@@ -5998,6 +6598,588 @@ impl<'a> BodyChecker<'a> {
             span,
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Zero-Heap `f"..."` Format Verification & `E0028` Static Fit Proof
+    // ─────────────────────────────────────────────────────────────────────────
+
+    fn check_fmt_buf_call(&mut self, args: &[CallArg], span: Span) -> ExprVal {
+        let ret_slice_ty = Ty::Slice(Box::new(Ty::u8()));
+        let fmt_err_spec = ResolvedErrorSpec::Typed(Ty::Enum("FmtErr".to_string()));
+
+        if args.len() != 2 {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                span,
+                format!(
+                    "'fmt_buf' expects 2 arguments (dst, f\"...\"), found {}",
+                    args.len()
+                ),
+            ));
+            for a in args {
+                if let ExprKind::FormatString(parts) = &a.value.kind {
+                    let _ = self.check_format_string(parts);
+                } else {
+                    let _ = self.check_expr_infallible(&a.value);
+                }
+            }
+            self.proven_infallible_spans.insert((span.start, span.end));
+            return ExprVal {
+                ty: ret_slice_ty,
+                error_spec: fmt_err_spec,
+                prov: Provenance::pure_static(),
+                endpoint_name: None,
+                span,
+            };
+        }
+
+        let dst_expr = &args[0].value;
+        let dv = self.check_expr_infallible(dst_expr);
+        let is_valid_dst = match &dv.ty {
+            Ty::Slice(elem) | Ty::Array { elem, .. } => **elem == Ty::u8(),
+            Ty::Ptr(inner) => match &**inner {
+                Ty::Slice(elem) | Ty::Array { elem, .. } => **elem == Ty::u8(),
+                _ => false,
+            },
+            Ty::Error => true,
+            _ => false,
+        };
+        if !is_valid_dst {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                args[0].span,
+                format!(
+                    "'fmt_buf' destination must be '[]u8', '[N]u8', or '*[N]u8', found '{}'",
+                    dv.ty
+                ),
+            ));
+        }
+
+        let mut ret_prov = dv.prov.clone();
+        if matches!(dv.ty, Ty::Array { .. }) {
+            if let Some(root) = root_ident_of(dst_expr) {
+                if let Some(var) = self.lookup_local(&root) {
+                    ret_prov = ret_prov.merge(&Provenance::addr_of_local(&var.name, var.decl_depth));
+                }
+            }
+        }
+        let mut dst_alias_prov = ret_prov.clone();
+        if let Some(root) = root_ident_of(dst_expr) {
+            if let Some(var) = self.lookup_local(&root) {
+                if var.ty.contains_reference(&self.sema.structs)
+                    || matches!(var.ty, Ty::Array { .. })
+                {
+                    dst_alias_prov = dst_alias_prov
+                        .merge(&Provenance::addr_of_local(&var.name, var.decl_depth));
+                }
+            }
+        }
+
+        let worst_len = if let ExprKind::FormatString(parts) = &args[1].value.kind {
+            self.check_format_string_with_dst(parts, Some(&dst_alias_prov))
+        } else {
+            let _ = self.check_expr_infallible(&args[1].value);
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                args[1].span,
+                "'fmt_buf' second argument must be an 'f\"...\"' format string",
+            ));
+            None
+        };
+
+        if let (Some(cap), Some(worst)) = (self.static_dst_capacity(dst_expr, &dv.ty), worst_len) {
+            if worst > cap {
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::FormatBufferTooSmall,
+                        span,
+                        format!(
+                            "format string worst-case length ({} bytes) exceeds destination buffer capacity ({} bytes)",
+                            worst, cap
+                        ),
+                    )
+                    .with_note(format!(
+                        "increase the destination buffer to at least `[{}]u8`, or format into a `[]u8` slice and handle truncation with `catch (FmtErr err, []u8 clamped) {{ ... }}`",
+                        worst
+                    )),
+                );
+                self.proven_infallible_spans.insert((span.start, span.end));
+            } else {
+                // Worst-case length is statically proven to fit inside `cap`!
+                self.proven_infallible_spans.insert((span.start, span.end));
+            }
+        }
+
+        ExprVal {
+            ty: ret_slice_ty,
+            error_spec: fmt_err_spec,
+            prov: ret_prov,
+            endpoint_name: None,
+            span,
+        }
+    }
+
+    fn static_dst_capacity(&self, dst_expr: &Expr, dst_ty: &Ty) -> Option<usize> {
+        if matches!(&dst_expr.kind, ExprKind::Slice { .. }) {
+            return self.structural_u8_capacity(dst_expr);
+        }
+
+        match dst_ty {
+            Ty::Array { elem, len } if **elem == Ty::u8() => Some(*len),
+            Ty::Ptr(inner) => match &**inner {
+                Ty::Array { elem, len } if **elem == Ty::u8() => Some(*len),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn structural_u8_capacity(&self, expr: &Expr) -> Option<usize> {
+        if let ExprKind::Slice { target, start, end } = &expr.kind {
+            let base_cap = self.structural_u8_capacity(target)?;
+            let s_raw = match start {
+                None => 0usize,
+                Some(s) => self.eval_const_usize_expr(s)?,
+            };
+            let e_raw = match end {
+                None => base_cap,
+                Some(e) => self.eval_const_usize_expr(e)?,
+            };
+            let e = e_raw.min(base_cap);
+            let s = s_raw.min(e);
+            return Some(e - s);
+        }
+
+        match self.structural_expr_ty(expr)? {
+            Ty::Array { elem, len } if *elem == Ty::u8() => Some(len),
+            Ty::Ptr(inner) => match *inner {
+                Ty::Array { elem, len } if *elem == Ty::u8() => Some(len),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn structural_expr_ty(&self, expr: &Expr) -> Option<Ty> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                if let Some(var) = self.lookup_local(&id.name) {
+                    return Some(var.ty.clone());
+                }
+                if let Some(c) = self.sema.consts.get(&id.name) {
+                    return Some(c.ty.clone());
+                }
+                None
+            }
+            ExprKind::Field { target, field } => {
+                let base_ty = match self.structural_expr_ty(target)? {
+                    Ty::Ptr(inner) => *inner,
+                    other => other,
+                };
+                if let Ty::Struct(st_name) = base_ty {
+                    return self
+                        .sema
+                        .structs
+                        .get(&st_name)
+                        .and_then(|st| st.field(&field.name))
+                        .map(|f| f.ty.clone());
+                }
+                None
+            }
+            ExprKind::Index { target, .. } => match self.structural_expr_ty(target)? {
+                Ty::Array { elem, .. } | Ty::Slice(elem) => Some(*elem),
+                Ty::Ptr(inner) => match *inner {
+                    Ty::Array { elem, .. } | Ty::Slice(elem) => Some(*elem),
+                    _ => None,
+                },
+                _ => None,
+            },
+            ExprKind::Slice { target, .. } => match self.structural_expr_ty(target)? {
+                Ty::Array { elem, .. } | Ty::Slice(elem) => Some(Ty::Slice(elem)),
+                Ty::Ptr(inner) => match *inner {
+                    Ty::Array { elem, .. } | Ty::Slice(elem) => Some(Ty::Slice(elem)),
+                    _ => None,
+                },
+                _ => None,
+            },
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                expr: inner,
+            } => match self.structural_expr_ty(inner)? {
+                Ty::Ptr(pointee) => Some(*pointee),
+                _ => None,
+            },
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                expr: inner,
+            } => Some(Ty::Ptr(Box::new(self.structural_expr_ty(inner)?))),
+            _ => None,
+        }
+    }
+
+    fn eval_const_usize_expr(&self, expr: &Expr) -> Option<usize> {
+        self.sema
+            .eval_const_expr_i128(expr, &mut BTreeSet::new())
+            .and_then(|v| usize::try_from(v).ok())
+    }
+
+    /// Typecheck all holes in an `f"..."` format string and compute its exact worst-case byte width
+    /// (`Some(bytes)` when every hole is statically bounded, or `None` when any hole is a dynamic slice/string).
+    fn check_format_string(&mut self, parts: &[FormatPart]) -> Option<usize> {
+        self.check_format_string_with_dst(parts, None)
+    }
+
+    fn check_format_string_with_dst(
+        &mut self,
+        parts: &[FormatPart],
+        alias_dst: Option<&Provenance>,
+    ) -> Option<usize> {
+        let mut worst_total: Option<usize> = Some(0);
+        for part in parts {
+            match part {
+                FormatPart::Literal(s) => {
+                    let byte_len = zev_ast::decoded_string_byte_len(s);
+                    worst_total = worst_total.and_then(|acc| acc.checked_add(byte_len));
+                }
+                FormatPart::Hole {
+                    expr,
+                    spec,
+                    span: hole_span,
+                } => {
+                    let hv = self.check_expr_infallible(expr);
+                    if let Some(dst_prov) = alias_dst {
+                        if !hv.ty.is_error()
+                            && (hv.ty.contains_reference(&self.sema.structs)
+                                || matches!(hv.ty, Ty::Array { .. }))
+                        {
+                            let mut hole_prov = hv.prov.clone();
+                            if let Some(root) = root_ident_of(expr) {
+                                if let Some(var) = self.lookup_local(&root) {
+                                    if var.ty.contains_reference(&self.sema.structs)
+                                        || matches!(var.ty, Ty::Array { .. })
+                                    {
+                                        hole_prov = hole_prov.merge(&Provenance::addr_of_local(
+                                            &var.name,
+                                            var.decl_depth,
+                                        ));
+                                    }
+                                }
+                            }
+                            if !dst_prov.local_origins.is_disjoint(&hole_prov.local_origins)
+                                || !dst_prov.param_origins.is_disjoint(&hole_prov.param_origins)
+                            {
+                                self.sema.emit(
+                                    Diagnostic::new(
+                                        DiagnosticKind::InvalidOperation,
+                                        *hole_span,
+                                        "cannot format slice/buffer into the same destination buffer in 'fmt_buf' (in-place aliasing would corrupt output)",
+                                    )
+                                    .with_note(
+                                        "format into a separate `[N]u8` scratch buffer first, then copy or use the resulting slice",
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    let hw = self.check_format_hole(expr, &hv.ty, *spec, *hole_span);
+                    worst_total = match (worst_total, hw) {
+                        (Some(acc), Some(w)) => acc.checked_add(w),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        worst_total
+    }
+
+    fn check_format_hole(
+        &mut self,
+        expr: &Expr,
+        ty: &Ty,
+        spec: FormatSpec,
+        span: Span,
+    ) -> Option<usize> {
+        if ty.is_error() {
+            return None;
+        }
+
+        // 1. String literal hole (`"ok"`).
+        if let ExprKind::Literal(Literal::String(s)) = &expr.kind {
+            return match spec {
+                FormatSpec::Default | FormatSpec::Debug => {
+                    Some(zev_ast::decoded_string_byte_len(s))
+                }
+                _ => {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        "numeric format specifier cannot be applied to a string literal",
+                    ));
+                    None
+                }
+            };
+        }
+
+        // 2. Boolean (`true` / `false` -> max 5 bytes).
+        if ty.is_bool() {
+            return match spec {
+                FormatSpec::Default | FormatSpec::Debug => Some(5),
+                _ => {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        "numeric format specifier cannot be applied to 'bool'",
+                    ));
+                    None
+                }
+            };
+        }
+
+        // 3. Integers (`u8`..`u64`, `i8`..`i64`, `usize`, `isize`, endian ints, `IntLit`).
+        if ty.is_integer() {
+            let int_prim = match ty {
+                Ty::Prim(p) => *p,
+                Ty::IntLit => match &expr.kind {
+                    ExprKind::Literal(Literal::Int(v)) if *v > i32::MAX as u64 => PrimType::U64,
+                    _ => PrimType::I32,
+                },
+                _ => PrimType::I32,
+            };
+            return match spec {
+                FormatSpec::Default | FormatSpec::Debug => Some(int_decimal_worst_case(int_prim)),
+                FormatSpec::Hex { width, .. } => {
+                    let w = width.unwrap_or(0) as usize;
+                    Some(int_hex_worst_case(int_prim).max(w))
+                }
+                FormatSpec::Bin { width } => {
+                    let w = width.unwrap_or(0) as usize;
+                    Some(int_bin_worst_case(int_prim).max(w))
+                }
+                FormatSpec::Fixed { .. } | FormatSpec::Sci { .. } => {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "floating-point format specifier requires 'f32' or 'f64', found '{}'",
+                            ty
+                        ),
+                    ));
+                    None
+                }
+            };
+        }
+
+        // 4. Floating-point (`f32`, `f64`, `FloatLit`).
+        if ty.is_float() {
+            let is_f32 = matches!(ty, Ty::Prim(PrimType::F32));
+            return match spec {
+                FormatSpec::Default | FormatSpec::Debug => Some(14),
+                FormatSpec::Fixed { precision: p } => {
+                    if p > 9 {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "unsupported float format precision '.{}'; supported float precision is 0..=9",
+                                p
+                            ),
+                        ));
+                        None
+                    } else {
+                        Some(if p == 0 { 11 } else { 12 + p as usize })
+                    }
+                }
+                FormatSpec::Sci { precision } => {
+                    let p_u8 = precision.unwrap_or(2);
+                    if p_u8 > 9 {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "unsupported scientific float format precision '.{}e'; supported float precision is 0..=9",
+                                p_u8
+                            ),
+                        ));
+                        None
+                    } else {
+                        let p = p_u8 as usize;
+                        Some(if is_f32 { 9 + p } else { 10 + p })
+                    }
+                }
+                FormatSpec::Hex { .. } | FormatSpec::Bin { .. } => {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "hex/binary format specifier requires an integer type, found '{}'",
+                            ty
+                        ),
+                    ));
+                    None
+                }
+            };
+        }
+
+        // 5. Enum variant names (`{err}` or `{err:?}`), bounded by `<EnumName>(?)` fallback.
+        if let Ty::Enum(enum_name) = ty {
+            return match spec {
+                FormatSpec::Default | FormatSpec::Debug => {
+                    self.sema.enums.get(enum_name).map(|en| {
+                        let variants_max = en.variants.iter().map(|v| v.len()).max().unwrap_or(0);
+                        variants_max.max(enum_name.len() + 3)
+                    })
+                }
+                _ => {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "numeric format specifier cannot be applied to enum '{}'",
+                            enum_name
+                        ),
+                    ));
+                    None
+                }
+            };
+        }
+
+        // 6. Byte strings/slices, structs under `:?`, and uniform pointer addresses under `:?`.
+        match (ty, spec) {
+            (Ty::Str, FormatSpec::Default | FormatSpec::Debug) => None,
+            (Ty::Slice(elem), FormatSpec::Default) if **elem == Ty::u8() => None,
+            (Ty::Ptr(inner), FormatSpec::Default)
+                if matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>
+            {
+                None
+            }
+            (Ty::Array { elem, len }, FormatSpec::Default) if **elem == Ty::u8() => Some(*len),
+
+            (Ty::Struct(st_name), FormatSpec::Debug) => {
+                let mut visiting = BTreeSet::new();
+                self.debug_worst_case_ty(&Ty::Struct(st_name.clone()), span, &mut visiting)
+            }
+            (Ty::Ptr(_), FormatSpec::Debug) => Some(18),
+            (Ty::Struct(st_name), FormatSpec::Default) => {
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "struct '{}' requires debug specifier '{{expr:?}}' or explicit field formatting",
+                            st_name
+                        ),
+                    )
+                    .with_note(format!(
+                        "use `{{val:?}}` for compile-time struct debug expansion or format fields explicitly (`f\"{{val.field}}\"`)"
+                    )),
+                );
+                None
+            }
+            (Ty::Slice(_) | Ty::Array { .. }, FormatSpec::Debug) => {
+                let mut visiting = BTreeSet::new();
+                self.debug_worst_case_ty(ty, span, &mut visiting)
+            }
+            _ => {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!(
+                        "type '{}' cannot be formatted with specifier '{:?}' in 'f\"...\"'",
+                        ty, spec
+                    ),
+                ));
+                None
+            }
+        }
+    }
+
+    fn debug_worst_case_ty(
+        &mut self,
+        ty: &Ty,
+        span: Span,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<usize> {
+        match ty {
+            Ty::Error => None,
+            Ty::Prim(PrimType::Bool) => Some(5),
+            Ty::Prim(p) if p.is_integer() => Some(int_decimal_worst_case(*p)),
+            Ty::Prim(p) if p.is_float() => Some(14),
+            Ty::IntLit => Some(11),
+            Ty::FloatLit => Some(14),
+            Ty::Str => None,
+            Ty::Enum(en_name) => self.sema.enums.get(en_name).map(|en| {
+                let variants_max = en.variants.iter().map(|v| v.len()).max().unwrap_or(0);
+                variants_max.max(en_name.len() + 3)
+            }),
+            Ty::Struct(st_name) => {
+                if !visiting.insert(st_name.clone()) {
+                    return None;
+                }
+                let Some(st_info) = self.sema.structs.get(st_name).cloned() else {
+                    visiting.remove(st_name);
+                    return None;
+                };
+                if st_info.fields.is_empty() {
+                    visiting.remove(st_name);
+                    // `"Name { }"` (matches `zev-mir` `expand_struct_debug_be`)
+                    return Some(st_name.len() + 4);
+                }
+                // `"Name { f1: <v1>, f2: <v2> }"`
+                let mut acc: Option<usize> = Some(st_name.len() + 3); // `"Name { "`
+                for (i, field) in st_info.fields.iter().enumerate() {
+                    if i > 0 {
+                        acc = acc.and_then(|a| a.checked_add(2)); // `", "`
+                    }
+                    acc = acc.and_then(|a| a.checked_add(field.name.len() + 2)); // `"field: "`
+                    let fw = self.debug_worst_case_ty(&field.ty, span, visiting);
+                    acc = match (acc, fw) {
+                        (Some(a), Some(w)) => a.checked_add(w),
+                        _ => None,
+                    };
+                }
+                visiting.remove(st_name);
+                acc.and_then(|a| a.checked_add(2)) // `" }"`
+            }
+            Ty::Slice(elem) => {
+                if matches!(&**elem, Ty::Struct(_) | Ty::Slice(_) | Ty::Array { .. }) {
+                    self.sema.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "dynamic slice '{}' of composite elements cannot be formatted with ':?'",
+                                ty
+                            ),
+                        )
+                        .with_note(
+                            "iterate over the slice explicitly (`for (Elem x in slice) { println(f\"{x:?}\"); }`) or format a fixed-size `[N]T` array",
+                        ),
+                    );
+                    return None;
+                }
+                let _ = self.debug_worst_case_ty(elem, span, visiting);
+                None
+            }
+            Ty::Array { elem, len } => {
+                let ew = self.debug_worst_case_ty(elem, span, visiting)?;
+                let items = ew.checked_mul(*len)?;
+                let seps = len.saturating_sub(1).checked_mul(2)?;
+                items.checked_add(seps)?.checked_add(2)
+            }
+            Ty::Ptr(_) => {
+                // Pointer addresses formatted uniformly as hex (`0x` + up to 16 hex digits).
+                Some(18)
+            }
+            other => {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!("field/element of type '{}' cannot be formatted with ':?'", other),
+                ));
+                None
+            }
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -6009,6 +7191,11 @@ const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_s
 fn is_string_arg_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Str)
         || matches!(ty, Ty::Ptr(inner) if matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)))
+}
+
+fn is_print_arg_ty(ty: &Ty) -> bool {
+    is_string_arg_ty(ty)
+        || matches!(ty, Ty::Slice(inner) | Ty::Array { elem: inner, .. } if **inner == Ty::u8())
 }
 
 fn has_attr_dma_safe(attrs: &[Attr]) -> bool {
@@ -6038,6 +7225,112 @@ fn root_ident_of(expr: &Expr) -> Option<String> {
             expr: inner,
         } => root_ident_of(inner),
         _ => None,
+    }
+}
+
+fn extract_monomorphized_attr(attrs: &[Attr]) -> Option<String> {
+    for a in attrs {
+        if let AttrKind::Custom {
+            name,
+            arg: Some(sig),
+        } = &a.kind
+        {
+            if name == "monomorphized" {
+                return Some(sig.clone());
+            }
+        }
+    }
+    None
+}
+
+fn extract_instantiated_from_attr(attrs: &[Attr]) -> Option<String> {
+    for a in attrs {
+        if let AttrKind::Custom {
+            name,
+            arg: Some(note),
+        } = &a.kind
+        {
+            if name == "instantiated_from" {
+                return Some(note.clone());
+            }
+        }
+    }
+    None
+}
+
+fn is_valid_cast(src: &Ty, dst: &Ty) -> bool {
+    if src == dst {
+        return true;
+    }
+    match (src, dst) {
+        // Any numeric <-> numeric (`int <-> int`, `int <-> float`, `f32 <-> f64`).
+        (a, b) if a.is_numeric() && b.is_numeric() => true,
+        // `bool` -> integer or float.
+        (Ty::Prim(PrimType::Bool), b) if b.is_numeric() => true,
+        // `enum` -> integer.
+        (Ty::Enum(_), b) if b.is_integer() => true,
+        // Pointer <-> pointer or pointer <-> integer / hardware peripheral.
+        (Ty::Ptr(_) | Ty::HwPeripheral(_), Ty::Ptr(_)) => true,
+        (Ty::Ptr(_) | Ty::HwPeripheral(_), b) if b.is_integer() => true,
+        (a, Ty::Ptr(_) | Ty::HwPeripheral(_)) if a.is_integer() => true,
+        (Ty::Str, Ty::Ptr(inner))
+            if inner.is_void() || matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>
+        {
+            true
+        }
+        (Ty::FnPtr { .. }, Ty::Ptr(inner)) if inner.is_void() => true,
+        _ => false,
+    }
+}
+
+fn unify_float_arith(lhs: &Ty, rhs: &Ty) -> Option<Ty> {
+    match (lhs, rhs) {
+        (Ty::FloatLit, Ty::FloatLit) => Some(Ty::FloatLit),
+        (Ty::FloatLit, Ty::Prim(PrimType::F32)) | (Ty::Prim(PrimType::F32), Ty::FloatLit) => {
+            Some(Ty::f32())
+        }
+        (Ty::FloatLit, Ty::Prim(PrimType::F64)) | (Ty::Prim(PrimType::F64), Ty::FloatLit) => {
+            Some(Ty::f64())
+        }
+        (Ty::Prim(PrimType::F32), Ty::Prim(PrimType::F32)) => Some(Ty::f32()),
+        (Ty::Prim(PrimType::F64), Ty::Prim(PrimType::F64)) => Some(Ty::f64()),
+        _ => None,
+    }
+}
+
+const fn int_decimal_worst_case(p: PrimType) -> usize {
+    match p {
+        PrimType::U8 => 3,
+        PrimType::I8 => 4,
+        PrimType::U16 | PrimType::U16Be | PrimType::U16Le => 5,
+        PrimType::I16 => 6,
+        PrimType::U32 | PrimType::U32Be | PrimType::U32Le => 10,
+        PrimType::I32 => 11,
+        PrimType::U64
+        | PrimType::U64Be
+        | PrimType::U64Le
+        | PrimType::Usize
+        | PrimType::I64
+        | PrimType::Isize => 20,
+        _ => 11,
+    }
+}
+
+const fn int_hex_worst_case(p: PrimType) -> usize {
+    match p {
+        PrimType::U8 | PrimType::I8 => 2,
+        PrimType::U16 | PrimType::U16Be | PrimType::U16Le | PrimType::I16 => 4,
+        PrimType::U32 | PrimType::U32Be | PrimType::U32Le | PrimType::I32 => 8,
+        _ => 16,
+    }
+}
+
+const fn int_bin_worst_case(p: PrimType) -> usize {
+    match p {
+        PrimType::U8 | PrimType::I8 => 8,
+        PrimType::U16 | PrimType::U16Be | PrimType::U16Le | PrimType::I16 => 16,
+        PrimType::U32 | PrimType::U32Be | PrimType::U32Le | PrimType::I32 => 32,
+        _ => 64,
     }
 }
 

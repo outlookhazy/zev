@@ -109,6 +109,7 @@ mod tests {
                 "-Werror",
                 "-g",
                 "-fsanitize=address,undefined",
+                "-fno-sanitize-recover=all",
                 &c_path,
                 "-o",
                 &bin_path,
@@ -124,6 +125,8 @@ mod tests {
         }
 
         let run_out = Command::new(&bin_path)
+            .env("ASAN_OPTIONS", "detect_stack_use_after_return=1")
+            .env("UBSAN_OPTIONS", "halt_on_error=1:print_stacktrace=1")
             .output()
             .expect("execute compiled simulation binary");
         if !run_out.status.success() {
@@ -134,7 +137,9 @@ mod tests {
                 String::from_utf8_lossy(&run_out.stderr)
             );
         }
-        String::from_utf8_lossy(&run_out.stdout).to_string()
+        let stdout = String::from_utf8_lossy(&run_out.stdout).to_string();
+        let _ = fs::remove_dir_all(&dir);
+        stdout
     }
 
     #[test]
@@ -148,6 +153,7 @@ mod tests {
             kind: ItemKind::Struct(StructDecl {
                 is_packed: true,
                 name: id("CmdFrame"),
+                generic_params: vec![],
                 fields: vec![
                     StructField {
                         ty: ty_prim(PrimType::U8),
@@ -378,6 +384,7 @@ mod tests {
                 attrs: vec![],
                 is_extern_c: false,
                 name: id("crc16"),
+                generic_params: vec![],
                 params: vec![Param {
                     ty: TypeExpr::new(TypeKind::Slice(Box::new(ty_prim(PrimType::U8))), sp),
                     name: id("buf"),
@@ -455,6 +462,7 @@ mod tests {
                 attrs: vec![],
                 is_extern_c: false,
                 name: id("parse_setpoint"),
+                generic_params: vec![],
                 params: vec![Param {
                     ty: TypeExpr::new(TypeKind::Slice(Box::new(ty_prim(PrimType::U8))), sp),
                     name: id("buf"),
@@ -545,6 +553,7 @@ mod tests {
                                         lhs: Box::new(Expr::new(
                                             ExprKind::Call {
                                                 callee: Box::new(expr_id("crc16")),
+                                                generic_args: vec![],
                                                 args: vec![CallArg::positional(Expr::new(
                                                     ExprKind::Slice {
                                                         target: Box::new(expr_id("buf")),
@@ -605,6 +614,7 @@ mod tests {
                 attrs: vec![],
                 is_extern_c: true,
                 name: id("c_query_running_prio"),
+                generic_params: vec![],
                 params: vec![],
                 is_variadic: false,
                 ret_type: ty_prim(PrimType::U32),
@@ -620,6 +630,7 @@ mod tests {
                 attrs: vec![],
                 is_extern_c: false,
                 name: id("save_fault_record"),
+                generic_params: vec![],
                 params: vec![Param {
                     ty: ty_prim(PrimType::U32),
                     name: id("bad_cnt"),
@@ -642,6 +653,7 @@ mod tests {
                             StmtKind::Expr(Expr::new(
                                 ExprKind::Call {
                                     callee: Box::new(expr_id("delay")),
+                                    generic_args: vec![],
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Literal(Literal::Duration(dur_ms(1))),
                                         sp,
@@ -665,6 +677,7 @@ mod tests {
                                                     callee: Box::new(expr_id(
                                                         "c_query_running_prio",
                                                     )),
+                                                    generic_args: vec![],
                                                     args: vec![],
                                                 },
                                                 sp,
@@ -700,6 +713,7 @@ mod tests {
                 attrs: vec![],
                 is_extern_c: false,
                 name: id("scrub_flash_crc"),
+                generic_params: vec![],
                 params: vec![],
                 is_variadic: false,
                 ret_type: ty_prim(PrimType::Void),
@@ -957,6 +971,7 @@ mod tests {
                                                             callee: Box::new(expr_id(
                                                                 "parse_setpoint",
                                                             )),
+                                                            generic_args: vec![],
                                                             args: vec![CallArg::positional(
                                                                 expr_id("half"),
                                                             )],
@@ -1045,6 +1060,7 @@ mod tests {
                 attrs: vec![],
                 is_extern_c: false,
                 name: id("main"),
+                generic_params: vec![],
                 params: vec![],
                 is_variadic: false,
                 ret_type: ty_prim(PrimType::Void),
@@ -1086,6 +1102,7 @@ mod tests {
                             StmtKind::Expr(Expr::new(
                                 ExprKind::Call {
                                     callee: Box::new(expr_id("set_priority")),
+                                    generic_args: vec![],
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Priority(Priority::Low),
                                         sp,
@@ -1180,6 +1197,7 @@ mod tests {
                                                                                     "save_fault_record",
                                                                                 ),
                                                                             ),
+                                                                            generic_args: vec![],
                                                                             args: vec![
                                                                                 CallArg::positional(
                                                                                     expr_id(
@@ -1229,6 +1247,7 @@ mod tests {
                                                                         callee: Box::new(expr_id(
                                                                             "scrub_flash_crc",
                                                                         )),
+                                                                        generic_args: vec![],
                                                                         args: vec![],
                                                                     },
                                                                     sp,
@@ -1376,6 +1395,7 @@ int main(void) {
                     attrs: vec![],
                     is_extern_c: false,
                     name: id("read_stream"),
+                    generic_params: vec![],
                     params: vec![],
                     is_variadic: false,
                     ret_type: ty_prim(PrimType::Usize),
@@ -1413,6 +1433,7 @@ int main(void) {
                     attrs: vec![],
                     is_extern_c: false,
                     name: id("main"),
+                    generic_params: vec![],
                     params: vec![],
                     is_variadic: false,
                     ret_type: ty_prim(PrimType::Void),
@@ -1427,6 +1448,7 @@ int main(void) {
                                         expr: Box::new(Expr::new(
                                             ExprKind::Call {
                                                 callee: Box::new(expr_id("read_stream")),
+                                                generic_args: vec![],
                                                 args: vec![],
                                             },
                                             sp,
@@ -1859,6 +1881,7 @@ fn main() {
             String::from_utf8_lossy(&fs_out.stderr),
             c_src
         );
+        let _ = fs::remove_dir_all(&fs_dir);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2623,5 +2646,914 @@ int main(void) {
 "#;
         let stdout = compile_and_run_clang_sanitized("wave1_soft_spec", &c_code, Some(driver));
         assert!(stdout.contains("WAVE1_SOFT_SPECIALIZATION_OK"));
+    }
+
+    #[test]
+    fn wave2_f32_f64_arithmetic_remainder_casts_and_yield_hoisting() {
+        let src = r#"
+watch<f32> pid_out_f32 = 0.0f32;
+watch<f64> rem_out_f64 = 0.0;
+watch<i32> cast_out_i32 = 0;
+
+f32 clamp_f32(f32 x, f32 lo, f32 hi) {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+}
+
+task pid_worker() {
+    f32 integral = 1.25f32;
+    f64 accum64 = 10.5;
+    u32 step = 0;
+
+    loop every 1ms {
+        f32 err = (f32)(step + 1) * 1.5f32;
+        integral += err * 0.5f32;
+        integral = clamp_f32(integral, -100.0f32, 100.0f32);
+
+        f32 mod32 = integral % 1.0f32;
+        f64 wide = (f64)integral + accum64;
+        wide %= 3.25;
+        f64 neg_rem = (-7.5) % 2.0;
+
+        delay(1ms);
+
+        pid_out_f32.publish(integral + mod32);
+        rem_out_f64.publish(wide + neg_rem);
+        cast_out_i32.publish((i32)(integral * 4.0f32));
+
+        step += 1;
+        if (step >= 2) {
+            sys.exit(0);
+        }
+    }
+}
+
+fn main() {
+    spawn pid_worker() @critical;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave2 floats");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave2 floats");
+
+        // Verify `integral` (f32) and `wide` (f64) are hoisted across `delay(1ms)`!
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "pid_worker")
+            .expect("pid_worker blueprint");
+        assert!(
+            bp.vars
+                .iter()
+                .any(|v| v.name == "integral" && v.ty == zev_mir::MirType::F32 && v.hoisted),
+            "f32 `integral` must be hoisted across yield"
+        );
+        assert!(
+            bp.vars
+                .iter()
+                .any(|v| v.name == "wide" && v.ty == zev_mir::MirType::F64 && v.hoisted),
+            "f64 `wide` must be hoisted across yield"
+        );
+
+        let c_code = emit_c(&mir);
+        assert!(
+            !c_code.contains("<math.h>"),
+            "Freestanding C99 float support must not depend on <math.h> / -lm"
+        );
+        assert_freestanding_compiles("wave2_floats", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_advance_ms(10);
+
+    float pid = syn_watch_f32_read(&pid_out_f32);
+    double rem = syn_watch_f64_read(&rem_out_f64);
+    int32_t ci = syn_watch_i32_read(&cast_out_i32);
+
+    /* step 0: err=1.5 -> integral=1.25+0.75=2.0
+       step 1: err=3.0 -> integral=2.0+1.5=3.5, mod32=3.5%1.0=0.5 -> pid=4.0f
+       wide = (3.5 + 10.5) % 3.25 = 14.0 % 3.25 = 1.0; neg_rem = (-7.5) % 2.0 = -1.5 -> rem = -0.5
+       cast_out_i32 = (int32_t)(3.5f * 4.0f) = 14 */
+    if (pid < 3.999f || pid > 4.001f) {
+        fprintf(stderr, "Expected pid == 4.0, got %.6f\n", (double)pid);
+        return 1;
+    }
+    if (rem < -0.5001 || rem > -0.4999) {
+        fprintf(stderr, "Expected rem == -0.5, got %.6f\n", rem);
+        return 2;
+    }
+    if (ci != 14) {
+        fprintf(stderr, "Expected cast_out_i32 == 14, got %d\n", ci);
+        return 3;
+    }
+    printf("WAVE2_FLOATS_OK pid=%.2f rem=%.2f ci=%d\n", (double)pid, rem, ci);
+    return 0;
+}
+"#;
+        let stdout = compile_and_run_clang_sanitized("wave2_floats", &c_code, Some(driver));
+        assert!(stdout.contains("WAVE2_FLOATS_OK"), "stdout: {stdout}");
+    }
+
+    #[test]
+    fn wave2_zero_heap_format_strings_arduino_floats_sci_debug_and_enums() {
+        // 1. Verify `:e` formatter is omitted when `:e` is NOT used, and unformatted enums omit lookup tables!
+        let src_no_sci = r#"
+enum Mode { Idle, Armed, Fault }
+enum UnformattedSecret { HiddenA, HiddenB }
+
+fn main() {
+    Mode m = Mode::Armed;
+    f32 v = 3.14159f32;
+    println(f"mode={m} v={v}");
+}
+"#;
+        let prog_no_sci = zev_parser::parse_str(src_no_sci).expect("parse no_sci");
+        let mir_no_sci = zev_mir::lower_program(&prog_no_sci).expect("lower no_sci");
+        assert_eq!(mir_no_sci.formatted_enums, vec!["Mode".to_string()]);
+        let c_no_sci = emit_c(&mir_no_sci);
+        assert!(
+            !c_no_sci.contains("syn_fmt_float_sci"),
+            "syn_fmt_float_sci must be omitted when `:e` is unused"
+        );
+        assert!(c_no_sci.contains("syn_enum_name_Mode"));
+        assert!(
+            !c_no_sci.contains("syn_enum_name_UnformattedSecret"),
+            "Unformatted enum must NOT emit `.rodata` name table"
+        );
+        assert_freestanding_compiles("wave2_fmt_no_sci", &c_no_sci);
+
+        // 2. Full live execution of fixed floats, Arduino edge cases, `:e`, hex/bin/pad, `{pkt:?}`, `{arr:?}`, and enum names!
+        let src = r#"
+enum Mode { Idle, Armed, Fault }
+
+struct Vec2 {
+    f32 x;
+    f32 y;
+}
+
+struct TelemetryPkt {
+    u16 id;
+    Mode mode;
+    Vec2 pos;
+}
+
+fn main() {
+    f64 huge = 1.0e200;
+    f64 pos_inf = huge * huge;
+    f64 neg_inf = -pos_inf;
+    f64 nan_val = pos_inf - pos_inf;
+    f64 big_ovf = 1.0e12;
+    f64 neg_ovf = -1.0e12;
+    f64 neg_zero = -0.0;
+
+    println(f"FIXED:{3.14159}:{2.5:.0}:{-2.5:.0}:{1.996:.2}:{neg_zero}");
+    println(f"EDGE:{nan_val}:{pos_inf}:{neg_inf}:{big_ovf}:{neg_ovf}");
+    println(f"SCI:{1234.5:e}:{-0.0045:.3e}:{9.999:.2e}:{0.0:e}");
+
+    u16 reg = 0x00AB;
+    i8 neg_byte = -1;
+    u8 bits = 0b0010_1101;
+    bool ok = true;
+    println(f"INT:0x{reg:04x}:0x{reg:04X}:0x{neg_byte:02x}:0b{bits:08b}:{ok}:{!ok}");
+
+    TelemetryPkt pkt = TelemetryPkt {
+        id: 7,
+        mode: Mode::Armed,
+        pos: Vec2 { x: 1.5f32, y: -2.25f32 },
+    };
+    [3]i32 samples = [-10, 0, 25];
+    println(f"DBG:{pkt:?} arr={samples:?}");
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse wave2 fmt");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave2 fmt");
+        let c_code = emit_c(&mir);
+        assert!(c_code.contains("syn_fmt_float_sci"));
+        assert_freestanding_compiles("wave2_fmt_full", &c_code);
+
+        let stdout = compile_and_run_clang_sanitized("wave2_fmt_full", &c_code, None);
+        assert!(
+            stdout.contains("FIXED:3.14:3:-3:2.00:0.00\n"),
+            "Unexpected FIXED line in stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("EDGE:nan:inf:-inf:ovf:-ovf\n"),
+            "Unexpected EDGE line in stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("SCI:1.23e+03:-4.500e-03:1.00e+01:0.00e+00\n"),
+            "Unexpected SCI line in stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("INT:0x00ab:0x00AB:0xff:0b00101101:true:false\n"),
+            "Unexpected INT line in stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("DBG:TelemetryPkt { id: 7, mode: Armed, pos: Vec2 { x: 1.50, y: -2.25 } } arr=[-10, 0, 25]\n"),
+            "Unexpected DBG line in stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn wave2_fmt_buf_exact_fit_yield_hoisting_and_clamped_truncation() {
+        let src = r#"
+enum Mode { Idle, Active }
+
+task logger() {
+    [32]u8 ok_buf;
+    Mode m = Mode::Active;
+    f32 v = 12.34f32;
+    []u8 msg = fmt_buf(ok_buf, f"m={m} v={v:.1}") catch {
+        sys.exit(2);
+    };
+
+    // Hold `msg` ([]u8 slice into `ok_buf`) live across a yield!
+    // Liveness alias tracking MUST hoist `ok_buf` into `_f` so ASan sees zero stack-use-after-return!
+    delay(1ms);
+    println(msg);
+
+    // Overflow test into a 6-byte dynamic subslice: must trigger FmtErr::Truncated AND clamp partial slice!
+    [16]u8 small_backing;
+    []u8 small = small_backing[0..6];
+    []u8 res = fmt_buf(small, f"voltage={v:.2}") catch (FmtErr err, []u8 clamped) {
+        println(f"ERR:{err}:{clamped}:{clamped.len}");
+        sys.exit(0);
+    };
+    println(res);
+    sys.exit(3);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    spawn logger() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse fmt_buf test");
+        let mir = zev_mir::lower_program(&prog).expect("lower fmt_buf test");
+
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "logger")
+            .expect("logger blueprint");
+        assert!(
+            bp.vars.iter().any(|v| v.name == "ok_buf" && v.hoisted),
+            "`ok_buf` backing `msg` slice across `delay(1ms)` MUST be hoisted into task frame!"
+        );
+
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave2_fmt_buf", &c_code);
+
+        let stdout = compile_and_run_clang_sanitized("wave2_fmt_buf", &c_code, None);
+        assert!(
+            stdout.contains("m=Active v=12.3\n"),
+            "Expected exact-fit post-yield slice output, got:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("ERR:Truncated:voltag:6\n"),
+            "Expected clamped 6-byte Truncated partial slice, got:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn wave2_monomorphized_metadata_ram_report_and_unmonomorphized_skip() {
+        let sp = Span::dummy();
+        let mono_attr = |sig: &str| Attr {
+            kind: AttrKind::Custom {
+                name: "monomorphized".to_string(),
+                arg: Some(sig.to_string()),
+            },
+            span: sp,
+        };
+
+        let mut prog = zev_parser::parse_str(
+            r#"
+// Unmonomorphized templates (defensively skipped if passed directly to zev-mir)
+struct FixedVec<T, usize N> {
+    [N]T data;
+    usize len;
+}
+
+T clamp<T>(T x, T lo, T hi) {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+}
+
+struct FixedVec__f32_4 {
+    [4]f32 data;
+    usize len;
+}
+
+f32 clamp__f32(f32 x, f32 lo, f32 hi) {
+    if (x < lo) { return lo; }
+    if (x > hi) { return hi; }
+    return x;
+}
+
+fn main() {
+    FixedVec__f32_4 v = FixedVec__f32_4 {
+        data: [1.0f32, 2.0f32, 3.0f32, 4.0f32],
+        len: 4,
+    };
+    f32 c = clamp__f32(v.data[3] * 3.0f32, 0.0f32, 9.5f32);
+    println(f"MONO:len={v.len} c={c:.2}");
+}
+"#,
+        )
+        .expect("parse mono test");
+
+        // Attach `@monomorphized(...)` metadata attributes just as `zev-sema` monomorphizer stamps them
+        for item in &mut prog.items {
+            match &item.kind {
+                ItemKind::Struct(sd) if sd.name.name == "FixedVec__f32_4" => {
+                    item.attrs.push(mono_attr("FixedVec<f32, 4>"));
+                }
+                ItemKind::Fn(fd) if fd.name.name == "clamp__f32" => {
+                    item.attrs.push(mono_attr("clamp<f32>"));
+                }
+                _ => {}
+            }
+        }
+
+        let mir = zev_mir::lower_program(&prog).expect("lower mono test");
+        assert_eq!(mir.monomorphized_instances.len(), 2);
+        assert_eq!(mir.ram_report.monomorphized_instances.len(), 2);
+
+        let st_inst = mir
+            .ram_report
+            .monomorphized_instances
+            .iter()
+            .find(|m| m.mangled_name == "FixedVec__f32_4")
+            .expect("FixedVec__f32_4 metadata");
+        assert_eq!(st_inst.signature, "FixedVec<f32, 4>");
+        assert_eq!(st_inst.size_32, 20); // 4*4 + 4
+        assert_eq!(st_inst.size_64, 24); // 4*4 + 8
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("7. Monomorphized Generic Instantiations")
+                && table.contains("FixedVec<f32, 4>")
+                && table.contains("clamp<f32>"),
+            "Expected Section 7 in RamReport table:\n{table}"
+        );
+
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave2_mono", &c_code);
+        let stdout = compile_and_run_clang_sanitized("wave2_mono", &c_code, None);
+        assert!(stdout.contains("MONO:len=4 c=9.50\n"), "stdout:\n{stdout}");
+    }
+
+    #[test]
+    fn wave2_bare_fmt_buf_proven_fit_without_or_or_catch() {
+        let src = r#"
+usize slice_len_helper([]u8 s) {
+    return s.len;
+}
+
+fn direct_bare_check(u32 x) {
+    [64]u8 b1;
+    []u8 s1 = fmt_buf(b1, f"x={x}");
+    println(s1);
+    println(fmt_buf(b1, f"inline={x:04x}"));
+    usize n = slice_len_helper(fmt_buf(b1, f"arg={x}"));
+    usize m = fmt_buf(b1, f"len={x}").len;
+    println(f"lens={n}:{m}");
+}
+
+task bare_task() {
+    [64]u8 tbuf;
+    f32 v = 7.25f32;
+    []u8 s = fmt_buf(tbuf, f"task_v={v:.2}");
+    delay(1ms);
+    println(s);
+
+    [64]u8 tbuf2;
+    s = fmt_buf(tbuf2, f"reassigned={v:.1}");
+    println(s);
+
+    [4]u8 tiny;
+    [8]u8 fb = [79, 86, 70, 33, 0, 0, 0, 0];
+    []u8 with_or = fmt_buf(tiny[0..4], f"overflow={v:.2}") or fb[0..4];
+    println(with_or);
+
+    sys.exit(0);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    direct_bare_check(42);
+    spawn bare_task() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse bare fmt_buf");
+        let mir = zev_mir::lower_program(&prog).expect("lower bare fmt_buf");
+
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "bare_task")
+            .expect("bare_task blueprint");
+        assert!(
+            bp.vars.iter().any(|v| v.name == "tbuf" && v.hoisted),
+            "`tbuf` backing bare `fmt_buf` slice across `delay(1ms)` MUST be hoisted into `_f`!"
+        );
+
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave2_bare_fmt_buf", &c_code);
+        let stdout = compile_and_run_clang_sanitized("wave2_bare_fmt_buf", &c_code, None);
+        assert!(stdout.contains("x=42\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("inline=002a\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("lens=6:6\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("task_v=7.25\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("reassigned=7.3\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("OVF!\n"), "stdout:\n{stdout}");
+    }
+
+    #[test]
+    fn wave2_topological_struct_and_array_dependency_ordering() {
+        // Intentionally declare outer monomorphized/nested structs BEFORE inner structs AND
+        // declare `LateSample` AFTER functions/structs that embed `[3]LateSample` and `[]LateSample`!
+        let src = r#"
+struct FixedVec__FixedVec__u8_2_2 {
+    [2]FixedVec__u8_2 data;
+    usize len;
+}
+
+struct OuterHolder {
+    [2]MiddleNode nodes;
+    LateSample direct_sample;
+    OuterHolder *self_next;
+}
+
+struct MiddleNode {
+    LateSample sample;
+}
+
+struct FixedVec__u8_2 {
+    [2]u8 data;
+    usize len;
+}
+
+struct LateSample {
+    u16 code;
+    f32 val;
+}
+
+u16 sum_late_slice([]LateSample sl) {
+    u16 acc = 0;
+    for (usize i in 0..sl.len) {
+        acc += sl[i].code;
+    }
+    return acc;
+}
+
+fn main() {
+    FixedVec__u8_2 r0 = FixedVec__u8_2 { data: [3, 4], len: 2 };
+    FixedVec__u8_2 r1 = FixedVec__u8_2 { data: [5, 6], len: 2 };
+    FixedVec__FixedVec__u8_2_2 mat = FixedVec__FixedVec__u8_2_2 {
+        data: [r0, r1],
+        len: 2,
+    };
+
+    LateSample s0 = LateSample { code: 10, val: 1.25f32 };
+    LateSample s1 = LateSample { code: 20, val: 2.50f32 };
+    LateSample s2 = LateSample { code: 30, val: 3.75f32 };
+    [3]LateSample samples = [s0, s1, s2];
+    []LateSample sub = samples[0..3][1..3];
+
+    OuterHolder h0;
+    OuterHolder h = OuterHolder {
+        nodes: [MiddleNode { sample: s0 }, MiddleNode { sample: s2 }],
+        direct_sample: s1,
+        self_next: &h0,
+    };
+
+    u32 mat_sum = (u32)mat.data[0].data[1] + (u32)mat.data[1].data[0];
+    u16 sub_sum = sum_late_slice(sub);
+    println(f"TOPO:mat={mat_sum} sub={sub_sum} h={h.nodes[1].sample.val:.2}");
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse topo struct+array test");
+        let mir = zev_mir::lower_program(&prog).expect("lower topo struct+array test");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave2_topo_structs_arrays", &c_code);
+        let stdout = compile_and_run_clang_sanitized("wave2_topo_structs_arrays", &c_code, None);
+        assert!(
+            stdout.contains("TOPO:mat=9 sub=50 h=3.75\n"),
+            "stdout:\n{stdout}"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Stage R2-B Cross-Review Regression Suite (H11, H12, H2, M3, H7, H9, M4, M5, M6, M15)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wave2_r2b_h11_coroutine_buffer_hoisting_across_yields_asan() {
+        let src = r#"
+struct MsgView {
+    []u8 body;
+}
+
+fn log_after_delay([]u8 msg) {
+    delay(2ms);
+    println(f"CHILD:{msg}");
+}
+
+task h11_worker() {
+    u32 tag = 123;
+
+    // 1. Slice passed as argument to yielding child function `log_after_delay(s)`
+    [16]u8 buf1;
+    []u8 s = fmt_buf(buf1, f"hello={tag}");
+    log_after_delay(s);
+
+    // 2. Backing array wrapped inside a struct literal `MsgView` live across `delay(2ms)`
+    [16]u8 buf2;
+    MsgView mv = MsgView {
+        body: fmt_buf(buf2, f"wrap={tag + 333}"),
+    };
+    delay(2ms);
+    println(f"VIEW:{mv.body}");
+
+    // 3. Pointer taken to slice element (`&sl3[2]`) live across `delay(2ms)`
+    [8]u8 buf3 = [10, 20, 30, 40, 50, 60, 70, 80];
+    []u8 sl3 = buf3[1..6];
+    u8 *elem_ptr = &sl3[2];
+    delay(2ms);
+    println(f"DEREF:{*elem_ptr}");
+
+    sys.exit(0);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    spawn h11_worker() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse H11 test");
+        let mir = zev_mir::lower_program(&prog).expect("lower H11 test");
+
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "h11_worker")
+            .expect("h11_worker blueprint");
+        for bname in ["buf1", "buf2", "buf3"] {
+            assert!(
+                bp.vars.iter().any(|v| v.name == bname && v.hoisted),
+                "H11 regression: `{bname}` MUST be hoisted into `_f` across yield points!"
+            );
+        }
+
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave2_r2b_h11", &c_code);
+        let stdout = compile_and_run_clang_sanitized("wave2_r2b_h11", &c_code, None);
+        assert!(stdout.contains("CHILD:hello=123\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("VIEW:wrap=456\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("DEREF:40\n"), "stdout:\n{stdout}");
+    }
+
+    #[test]
+    fn wave2_r2b_h12_fallible_or_chains_catch_and_from_bytes_fmt_buf() {
+        let src = r#"
+enum ChainErr {
+    FirstErr = 1,
+    SecondErr = 2,
+}
+
+packed struct WireHdr {
+    u16be magic;
+    u16le ver;
+}
+
+watch<u32> side_effects = 0;
+
+[]u8 fallback_slice([]u8 fb) {
+    side_effects.publish(side_effects.read() + 1);
+    return fb;
+}
+
+u32 direct_step(u32 which) error ChainErr {
+    if (which == 1) {
+        error FirstErr, 101;
+    }
+    if (which == 2) {
+        error SecondErr, 202;
+    }
+    return 777;
+}
+
+u32 coro_step(u32 which) error ChainErr {
+    delay(1ms);
+    if (which == 1) {
+        error FirstErr, 111;
+    }
+    if (which == 2) {
+        error SecondErr, 222;
+    }
+    return 888;
+}
+
+fn run_direct_h12() {
+    [4]u8 s1;
+    [4]u8 s2;
+    [8]u8 ok_buf;
+    [4]u8 fb = [70, 65, 76, 76];
+
+    // Nested fallible `(a or b) or c` where BOTH `a` and `b` fail -> reaches `c` ("FALL")
+    []u8 r1 = (fmt_buf(s1[0..4], f"overflow_one") or fmt_buf(s2[0..4], f"overflow_two")) or fallback_slice(fb[0..4]);
+    println(f"D_OR1:{r1}:{side_effects.read()}");
+
+    // Nested fallible `(a or b) or c` where `a` fails and `b` succeeds -> short-circuits `c`!
+    []u8 r2 = (fmt_buf(s1[0..4], f"overflow_one") or fmt_buf(ok_buf[0..8], f"MID_OK")) or fallback_slice(fb[0..4]);
+    println(f"D_OR2:{r2}:{side_effects.read()}");
+
+    // `(a or b) catch (e, partial)` where BOTH fail -> catches `SecondErr` + `202`!
+    u32 c1 = (direct_step(1) or direct_step(2)) catch (ChainErr e, u32 part) {
+        println(f"D_CATCH:{e}:{part}");
+        part + 1000
+    };
+    println(f"D_CVAL:{c1}");
+
+    // `Struct.from_bytes(fmt_buf(...))` unwraps `.val` cleanly!
+    [4]u8 hbuf;
+    WireHdr hdr = WireHdr.from_bytes(fmt_buf(hbuf, f"\x12\x34\x05\x00")) or WireHdr { magic: 0, ver: 0 };
+    println(f"D_HDR:0x{hdr.magic:04x}:{hdr.ver}");
+}
+
+task h12_task() {
+    [4]u8 s1;
+    [4]u8 s2;
+    [4]u8 fb = [84, 70, 66, 33];
+    []u8 tr = (fmt_buf(s1[0..4], f"overflow_one") or fmt_buf(s2[0..4], f"overflow_two")) or fb[0..4];
+    println(f"T_OR:{tr}");
+
+    u32 tc = (coro_step(1) or coro_step(2)) catch (ChainErr e, u32 part) {
+        println(f"T_CATCH:{e}:{part}");
+        part + 2000
+    };
+    println(f"T_CVAL:{tc}");
+
+    sys.exit(0);
+    loop {
+        delay(1s);
+    }
+}
+
+fn main() {
+    run_direct_h12();
+    spawn h12_task() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse H12 test");
+        let mir = zev_mir::lower_program(&prog).expect("lower H12 test");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave2_r2b_h12", &c_code);
+        let stdout = compile_and_run_clang_sanitized("wave2_r2b_h12", &c_code, None);
+        assert!(stdout.contains("D_OR1:FALL:1\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("D_OR2:MID_OK:1\n"), "stdout:\n{stdout}");
+        assert!(
+            stdout.contains("D_CATCH:SecondErr:202\n") && stdout.contains("D_CVAL:1202\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(stdout.contains("D_HDR:0x1234:5\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("T_OR:TFB!\n"), "stdout:\n{stdout}");
+        assert!(
+            stdout.contains("T_CATCH:SecondErr:222\n") && stdout.contains("T_CVAL:2222\n"),
+            "stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn wave2_r2b_h2_m3_pointer_hex_self_ref_struct_fixed_arrays_and_enum_slices() {
+        let src = r#"
+enum NavMode {
+    Idle = 0,
+    Cruise = 1,
+    Rtl = 2,
+}
+
+struct Node {
+    u32 val;
+    Node *next;
+}
+
+struct SamplePt {
+    u16 k;
+    f32 v;
+}
+
+struct Batch {
+    [2]SamplePt items;
+}
+
+fn main() {
+    // 1. Self-referential struct with null & non-null pointers (zero stack overflow, zero null-deref!)
+    Node n0 = Node { val: 7, next: 0 as *Node };
+    Node n1 = Node { val: 9, next: &n0 };
+    Node *null_np = 0 as *Node;
+    println(f"N0:{n0:?}");
+    println(f"N1:{n1:?}");
+    println(f"NP:{null_np:?}");
+
+    // 2. DebugSlice of pointers `[2]*u32` -> uniform `0x<lowercase hex>`
+    u32 target = 42;
+    [2]*u32 ptrs = [0 as *u32, &target];
+    println(f"PTRS:{ptrs:?}");
+
+    // 3. Enum ONLY formatted via `[3]NavMode` `{modes:?}` -> emits `syn_enum_name_NavMode`!
+    [3]NavMode modes = [NavMode::Idle, NavMode::Cruise, NavMode::Rtl];
+    println(f"MODES:{modes:?}");
+
+    // 4. Fixed-size array of structs & 2D fixed array unrolled under `{:?}`!
+    Batch b = Batch {
+        items: [
+            SamplePt { k: 1, v: 2.5f32 },
+            SamplePt { k: 3, v: -1.25f32 },
+        ],
+    };
+    [2][2]u16 grid = [[10, 20], [30, 40]];
+    println(f"BATCH:{b:?}");
+    println(f"GRID:{grid:?}");
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse H2/M3 test");
+        let mir = zev_mir::lower_program(&prog).expect("lower H2/M3 test");
+        let c_code = emit_c(&mir);
+        assert!(c_code.contains("syn_enum_name_NavMode"));
+        assert_freestanding_compiles("wave2_r2b_h2_m3", &c_code);
+
+        let stdout = compile_and_run_clang_sanitized("wave2_r2b_h2_m3", &c_code, None);
+        assert!(
+            stdout.contains("N0:Node { val: 7, next: 0x0 }\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("N1:Node { val: 9, next: 0x"),
+            "stdout:\n{stdout}"
+        );
+        assert!(stdout.contains("NP:0x0\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("PTRS:[0x0, 0x"), "stdout:\n{stdout}");
+        assert!(
+            stdout.contains("MODES:[Idle, Cruise, Rtl]\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("BATCH:Batch { items: [SamplePt { k: 1, v: 2.50 }, SamplePt { k: 3, v: -1.25 }] }\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("GRID:[[10, 20], [30, 40]]\n"),
+            "stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn wave2_r2b_h7_h9_m4_m5_m6_m15_saturating_casts_raw_bytes_sci_overlap_and_fnptr() {
+        let src = r#"
+const f64 CF_A = 1.5;
+const f64 CF_B = 2.5;
+const bool C_LT = CF_A < CF_B;
+const bool C_EQ = CF_A == CF_B;
+const i32 C_I32 = 7.9 as i32;
+const u32 C_U32_HI = 3000000000.0 as u32;
+
+watch<i32> w_cast = (9.75 as i32);
+watch<u32> g_hook_hits = 0;
+
+extern "C" fn c_register_and_fire(fn() -> void cb);
+
+struct BoxFn {
+    fn(u32) -> u32 cb;
+}
+
+fn on_c_hook() {
+    g_hook_hits.publish(g_hook_hits.read() + 10);
+}
+
+u32 triple_plus_one(u32 x) {
+    return x * 3 + 1;
+}
+
+u32 apply_cb(fn(u32) -> u32 f, u32 v) {
+    return f(v);
+}
+
+u32 sum_nested_slices([][]u32 rows) {
+    return rows[0][1] + rows[1][0];
+}
+
+fn main() {
+    f64 rt0 = sys.now_ms() as f64;
+    f32 rt0_f32 = sys.now_ms() as f32;
+
+    // H6 + H7 + H8: Saturating float-to-integer casts (runtime + compile-time consts, 0 UBSan!)
+    u32 u32_rt = (3000000000.0 + rt0) as u32;
+    u64 u64_rt = (10000000000000000000.0 + rt0) as u64;
+    u32 u32_ct = (3000000000.0) as u32;
+    i32 sat_hi = (1.0e20 + rt0) as i32;
+    i32 sat_lo = (-1.0e20 + rt0) as i32;
+    i32 sat_ct = (1.0e20) as i32;
+    u8 sat_u8 = (300.0f32 + rt0_f32) as u8;
+    i8 sat_i8 = (-200.0f32 + rt0_f32) as i8;
+    u32 neg_u32 = (-1.5f32 + rt0_f32) as u32;
+    f64 nan_v = rt0 / rt0;
+    i32 nan_i32 = nan_v as i32;
+    u64 nan_u64 = nan_v as u64;
+
+    println(f"H6:{u32_rt}:{u64_rt}:{u32_ct}");
+    println(f"H7:{sat_hi}:{sat_lo}:{sat_ct}:{sat_u8}:{sat_i8}:{neg_u32}:{nan_i32}:{nan_u64}");
+    println(f"H8:{C_LT}:{C_EQ}:{C_I32}:{C_U32_HI}:{w_cast.read()}");
+
+    // H9: Raw byte escapes `\x80..\xFF` + octal boundary safety (`\xFFabc`)
+    [2]u8 raw_buf;
+    []u8 raw_sl = fmt_buf(raw_buf, f"\xFF\xAA");
+    [4]u8 cat_buf;
+    []u8 cat_sl = fmt_buf(cat_buf, f"\xFFabc");
+    println(f"H9:{raw_sl.len}:0x{raw_sl[0]:02x}:0x{raw_sl[1]:02x}:{cat_sl.len}:0x{cat_sl[0]:02x}:{cat_sl[1]}");
+
+    // M4: Nested slices `[][]u32`
+    [2]u32 r0 = [11, 22];
+    [2]u32 r1 = [33, 44];
+    [2][]u32 row_arr = [r0[0..2], r1[0..2]];
+    [][]u32 mat = row_arr[0..2];
+    println(f"M4:{sum_nested_slices(mat)}");
+
+    // M5: Overlapping `fmt_buf` (`dst < src` and `dst > src` via `memmove`, 0 ASan `memcpy-param-overlap`!)
+    [8]u8 ov1 = [65, 66, 67, 68, 69, 0, 0, 0];
+    []u8 ov1_in = ov1[1..5];
+    []u8 ov1_out = fmt_buf(ov1, f"{ov1_in}");
+    [8]u8 ov2 = [65, 66, 67, 68, 0, 0, 0, 0];
+    []u8 ov2_in = ov2[0..4];
+    []u8 ov2_out = fmt_buf(ov2, f"x{ov2_in}");
+    println(f"M5:{ov1_out}:{ov2_out}");
+
+    // M6 + L-Fmt: Drift-free subnormal/tiny scientific formatting & negative-zero rounding suppression
+    f64 d1 = 9.95e-306;
+    f64 d2 = 1.25e-307;
+    f64 nz_sci = -0.0;
+    f64 tiny_neg = -0.0001;
+    f64 subhalf_neg = -0.4;
+    println(f"M6:{d1:.1e}:{d2:.1e}:{nz_sci:e}:{tiny_neg:.2}:{subhalf_neg:.0}");
+
+    // M15: `FnPtr` in `extern "C"`, struct fields (`BoxFn`), and direct indirect calls!
+    c_register_and_fire(on_c_hook);
+    BoxFn bf = BoxFn { cb: triple_plus_one };
+    u32 r_param = apply_cb(bf.cb, 10);
+    u32 r_field = bf.cb(20);
+    println(f"M15:{g_hook_hits.read()}:{r_param}:{r_field}");
+}
+"#;
+        let driver_c = r#"
+void c_register_and_fire(void (*cb)(void)) {
+    if (cb != NULL) {
+        cb();
+    }
+}
+
+int main(void) {
+    syn_boot_init();
+    return g_syn_sim_exit_code;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse H7/H9/M4/M5/M6/M15 test");
+        let mir = zev_mir::lower_program(&prog).expect("lower H7/H9/M4/M5/M6/M15 test");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("wave2_r2b_combined", &c_code);
+
+        let stdout =
+            compile_and_run_clang_sanitized("wave2_r2b_combined", &c_code, Some(driver_c));
+        assert!(
+            stdout.contains("H6:3000000000:10000000000000000000:3000000000\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("H7:2147483647:-2147483648:2147483647:255:-128:0:0:0\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("H8:true:false:7:3000000000:9\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("H9:2:0xff:0xaa:4:0xff:97\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(stdout.contains("M4:55\n"), "stdout:\n{stdout}");
+        assert!(stdout.contains("M5:BCDE:xxBCD\n"), "stdout:\n{stdout}");
+        assert!(
+            stdout.contains("M6:1.0e-305:1.3e-307:0.00e+00:0.00:0\n"),
+            "stdout:\n{stdout}"
+        );
+        assert!(stdout.contains("M15:10:31:61\n"), "stdout:\n{stdout}");
     }
 }

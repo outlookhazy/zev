@@ -76,9 +76,10 @@ COMMANDS:
 CHECK OPTIONS:
     --json                                  Emit structured machine-readable JSON diagnostics
 
-LLVM OPTIMIZATION OPTIONS (emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6):
+LLVM OPTIMIZATION & TARGET OPTIONS (emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6):
     -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default -O2; raw on emit-llvm)
     --opt-level <O0|O1|O2|O3|Os|Oz>         Explicit long-form optimization level selector
+    --target <cortex-m3|esp32c6|host>       Target triple selector (`emit-llvm` only; default `cortex-m3`)
 
 RUN & RUN-QEMU OPTIONS:
     --sanitize                              Compile C99 host binary with -fsanitize=address,undefined (`run` only)

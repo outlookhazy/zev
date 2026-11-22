@@ -12,7 +12,7 @@ build:
 doc:
 	$(ZEVC) doc >/dev/null
 	$(ZEVC) doc --list >/dev/null
-	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 E0001 E0008 E0017 E0024; do \
+	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029; do \
 		$(ZEVC) doc $$q >/dev/null || exit 1; \
 	done
 	@echo "OK (zevc doc primer, 8 topics, and error explainers verified)"

@@ -19,6 +19,7 @@ pub use ram::{
     DualSpecializedFnRam, FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign, SpawnedTaskRam,
     TargetAbi, VarRamInfo,
 };
+pub use zev_ast::{decoded_string_byte_len, decoded_string_bytes};
 
 #[cfg(test)]
 mod tests {
@@ -163,7 +164,7 @@ mod tests {
             attrs: vec![],
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false,
+                is_extern_c: false, generic_params: vec![],
                 name: id("adc_read_rpm"),
                 params: vec![Param {
                     ty: ty_prim(PrimType::U8),
@@ -177,7 +178,7 @@ mod tests {
                     vec![
                         Stmt::new(
                             StmtKind::Expr(Expr::new(
-                                ExprKind::Call {
+                                ExprKind::Call { generic_args: vec![],
                                     callee: Box::new(expr_id("delay")),
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Literal(Literal::Duration(dur_ms(1))),
@@ -202,7 +203,7 @@ mod tests {
             attrs: vec![],
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false,
+                is_extern_c: false, generic_params: vec![],
                 name: id("pi_step"),
                 params: vec![
                     Param {
@@ -238,7 +239,7 @@ mod tests {
             attrs: vec![],
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false,
+                is_extern_c: false, generic_params: vec![],
                 name: id("save_fault_record"),
                 params: vec![Param {
                     ty: ty_prim(PrimType::U32),
@@ -268,7 +269,7 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Expr(Expr::new(
-                                ExprKind::Call {
+                                ExprKind::Call { generic_args: vec![],
                                     callee: Box::new(expr_id("delay")),
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Literal(Literal::Duration(dur_ms(2))),
@@ -300,7 +301,7 @@ mod tests {
             attrs: vec![],
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false,
+                is_extern_c: false, generic_params: vec![],
                 name: id("scrub_flash_crc"),
                 params: vec![],
                 is_variadic: false,
@@ -441,7 +442,7 @@ mod tests {
                                                 ty: ty_prim(PrimType::U16),
                                                 name: id("actual"),
                                                 init: Some(Expr::new(
-                                                    ExprKind::Call {
+                                                    ExprKind::Call { generic_args: vec![],
                                                         callee: Box::new(expr_id("adc_read_rpm")),
                                                         args: vec![CallArg::positional(expr_id(
                                                             "pwm_ch",
@@ -461,7 +462,7 @@ mod tests {
                                                                 ty: ty_prim(PrimType::U16),
                                                                 name: id("duty"),
                                                                 init: Some(Expr::new(
-                                                                    ExprKind::Call {
+                                                                    ExprKind::Call { generic_args: vec![],
                                                                         callee: Box::new(expr_id(
                                                                             "pi_step",
                                                                         )),
@@ -623,7 +624,7 @@ mod tests {
             attrs: vec![],
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false,
+                is_extern_c: false, generic_params: vec![],
                 name: id("main"),
                 params: vec![],
                 is_variadic: false,
@@ -673,7 +674,7 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Expr(Expr::new(
-                                ExprKind::Call {
+                                ExprKind::Call { generic_args: vec![],
                                     callee: Box::new(expr_id("set_priority")),
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Priority(Priority::Low),
@@ -747,7 +748,7 @@ mod tests {
                                                         body: Block::new(
                                                             vec![Stmt::new(
                                                                 StmtKind::Expr(Expr::new(
-                                                                    ExprKind::Call {
+                                                                    ExprKind::Call { generic_args: vec![],
                                                                         callee: Box::new(expr_id(
                                                                             "save_fault_record",
                                                                         )),
@@ -795,7 +796,7 @@ mod tests {
                                                         body: Block::new(
                                                             vec![Stmt::new(
                                                                 StmtKind::Expr(Expr::new(
-                                                                    ExprKind::Call {
+                                                                    ExprKind::Call { generic_args: vec![],
                                                                         callee: Box::new(expr_id(
                                                                             "scrub_flash_crc",
                                                                         )),
@@ -979,7 +980,7 @@ mod tests {
                     attrs: vec![],
                     kind: ItemKind::Fn(FnDecl {
                         attrs: vec![],
-                        is_extern_c: false,
+                        is_extern_c: false, generic_params: vec![],
                         name: id("decode"),
                         params: vec![Param {
                             ty: ty_prim(PrimType::U8),
@@ -1065,7 +1066,7 @@ mod tests {
                     attrs: vec![],
                     kind: ItemKind::Fn(FnDecl {
                         attrs: vec![],
-                        is_extern_c: false,
+                        is_extern_c: false, generic_params: vec![],
                         name: id("caller"),
                         params: vec![],
                         is_variadic: false,
@@ -1088,7 +1089,7 @@ mod tests {
                                         init: Some(Expr::new(
                                             ExprKind::Catch {
                                                 expr: Box::new(Expr::new(
-                                                    ExprKind::Call {
+                                                    ExprKind::Call { generic_args: vec![],
                                                         callee: Box::new(expr_id("decode")),
                                                         args: vec![CallArg::positional(expr_int(
                                                             99,
@@ -1295,7 +1296,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("init_pair"),
                     params: vec![
                         Param {
@@ -1351,7 +1352,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("setup_bus"),
                     params: vec![Param {
                         ty: ty_prim(PrimType::Bool),
@@ -1365,7 +1366,7 @@ mod tests {
                         vec![
                             Stmt::new(
                                 StmtKind::Expr(Expr::new(
-                                    ExprKind::Call {
+                                    ExprKind::Call { generic_args: vec![],
                                         callee: Box::new(expr_id("init_pair")),
                                         args: vec![
                                             CallArg::positional(addr_of("w0")),
@@ -1407,7 +1408,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("main"),
                     params: vec![],
                     is_variadic: false,
@@ -1416,7 +1417,7 @@ mod tests {
                     body: Some(Block::new(
                         vec![Stmt::new(
                             StmtKind::Expr(Expr::new(
-                                ExprKind::Call {
+                                ExprKind::Call { generic_args: vec![],
                                     callee: Box::new(expr_id("setup_bus")),
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Literal(Literal::Bool(true)),
@@ -1487,7 +1488,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("leaf_soft"),
                     params: vec![Param {
                         ty: ty_prim(PrimType::U32),
@@ -1523,7 +1524,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("shared_soft"),
                     params: vec![Param {
                         ty: ty_prim(PrimType::U32),
@@ -1556,7 +1557,7 @@ mod tests {
                                                 target: expr_id("acc"),
                                                 op: AssignOp::AddAssign,
                                                 value: Expr::new(
-                                                    ExprKind::Call {
+                                                    ExprKind::Call { generic_args: vec![],
                                                         callee: Box::new(expr_id("leaf_soft")),
                                                         args: vec![CallArg::positional(expr_id(
                                                             "i",
@@ -1585,7 +1586,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("noyield_only_soft"),
                     params: vec![Param {
                         ty: ty_prim(PrimType::U32),
@@ -1624,7 +1625,7 @@ mod tests {
                                                 ty: ty_prim(PrimType::U32),
                                                 name: id("a"),
                                                 init: Some(Expr::new(
-                                                    ExprKind::Call {
+                                                    ExprKind::Call { generic_args: vec![],
                                                         callee: Box::new(expr_id("shared_soft")),
                                                         args: vec![CallArg::positional(expr_int(
                                                             3,
@@ -1646,7 +1647,7 @@ mod tests {
                                                                 ExprKind::Binary {
                                                                     op: BinaryOp::Add,
                                                                     lhs: Box::new(Expr::new(
-                                                                        ExprKind::Call {
+                                                                        ExprKind::Call { generic_args: vec![],
                                                                             callee: Box::new(
                                                                                 expr_id(
                                                                                     "shared_soft",
@@ -1661,7 +1662,7 @@ mod tests {
                                                                         sp,
                                                                     )),
                                                                     rhs: Box::new(Expr::new(
-                                                                        ExprKind::Call {
+                                                                        ExprKind::Call { generic_args: vec![],
                                                                             callee: Box::new(
                                                                                 expr_id(
                                                                                     "noyield_only_soft",
@@ -1702,7 +1703,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("main"),
                     params: vec![],
                     is_variadic: false,
@@ -1880,7 +1881,7 @@ mod tests {
                 attrs: vec![],
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false,
+                    is_extern_c: false, generic_params: vec![],
                     name: id("main"),
                     params: vec![],
                     is_variadic: false,
@@ -1945,5 +1946,514 @@ mod tests {
             has_every_latch_vars_hoisted,
             "EveryLatch next_deadline_var and period_var must both be hoisted"
         );
+    }
+
+    #[test]
+    fn wave2_floats_generics_metadata_and_zero_heap_format_in_mir() {
+        let sp = Span::dummy();
+        let mono_attr = |sig: &str| Attr {
+            kind: AttrKind::Custom {
+                name: "monomorphized".to_string(),
+                arg: Some(sig.to_string()),
+            },
+            span: sp,
+        };
+
+        let items = vec![
+            // Unmonomorphized template struct -> must be defensively skipped!
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Struct(StructDecl {
+                    is_packed: false,
+                    name: id("FixedVec"),
+                    generic_params: vec![GenericParam {
+                        name: id("T"),
+                        kind: GenericParamKind::Type,
+                        span: sp,
+                    }],
+                    fields: vec![],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // Monomorphized struct instance `@monomorphized("FixedVec<f32, 4>")`
+            Item {
+                attrs: vec![mono_attr("FixedVec<f32, 4>")],
+                kind: ItemKind::Struct(StructDecl {
+                    is_packed: false,
+                    name: id("FixedVec__f32_4"),
+                    generic_params: vec![],
+                    fields: vec![
+                        StructField {
+                            ty: TypeExpr::new(
+                                TypeKind::Array {
+                                    elem: Box::new(ty_prim(PrimType::F32)),
+                                    len: ArrayLen::Fixed(4),
+                                },
+                                sp,
+                            ),
+                            name: id("buf"),
+                            span: sp,
+                        },
+                        StructField {
+                            ty: ty_prim(PrimType::Usize),
+                            name: id("len"),
+                            span: sp,
+                        },
+                    ],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // Struct for `{pkt:?}` compile-time debug expansion
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Struct(StructDecl {
+                    is_packed: false,
+                    name: id("SensorPkt"),
+                    generic_params: vec![],
+                    fields: vec![
+                        StructField {
+                            ty: ty_prim(PrimType::U8),
+                            name: id("id"),
+                            span: sp,
+                        },
+                        StructField {
+                            ty: ty_prim(PrimType::F32),
+                            name: id("temp"),
+                            span: sp,
+                        },
+                    ],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // Two enums: `BusErr` (formatted) and `UnusedEnum` (NOT formatted -> must NOT be in `formatted_enums`)
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Enum(EnumDecl {
+                    name: id("BusErr"),
+                    variants: vec![EnumVariant {
+                        name: id("BadCrc"),
+                        discriminant: None,
+                        span: sp,
+                    }],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Enum(EnumDecl {
+                    name: id("UnusedEnum"),
+                    variants: vec![EnumVariant {
+                        name: id("Silent"),
+                        discriminant: None,
+                        span: sp,
+                    }],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // Monomorphized fn `@monomorphized("clamp<f32>")`
+            Item {
+                attrs: vec![mono_attr("clamp<f32>")],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("clamp__f32"),
+                    generic_params: vec![],
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::F32),
+                        name: id("v"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::F32),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(StmtKind::Return(Some(expr_id("v"))), sp)],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // Task holding hoisted `f32` + `f64` across `delay(1ms)` and formatting `{pkt:?}`, `{err}`, `fmt_buf`
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Task(TaskDecl {
+                    attrs: vec![],
+                    name: id("telem"),
+                    params: vec![],
+                    body: Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::F32),
+                                    name: id("acc32"),
+                                    init: Some(Expr::new(
+                                        ExprKind::Literal(Literal::float_from_f64(
+                                            1.25,
+                                            Some(PrimType::F32),
+                                        )),
+                                        sp,
+                                    )),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::F64),
+                                    name: id("acc64"),
+                                    init: Some(Expr::new(
+                                        ExprKind::Literal(Literal::float_from_f64(2.5, None)),
+                                        sp,
+                                    )),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::LoopEvery {
+                                    period: Box::new(Expr::new(
+                                        ExprKind::Literal(Literal::Duration(dur_ms(5))),
+                                        sp,
+                                    )),
+                                    body: Block::new(
+                                        vec![
+                                            Stmt::new(
+                                                StmtKind::Expr(Expr::new(
+                                                    ExprKind::Call {
+                                                        callee: Box::new(expr_id("delay")),
+                                                        generic_args: vec![],
+                                                        args: vec![CallArg::positional(Expr::new(
+                                                            ExprKind::Literal(Literal::Duration(
+                                                                dur_ms(1),
+                                                            )),
+                                                            sp,
+                                                        ))],
+                                                    },
+                                                    sp,
+                                                )),
+                                                sp,
+                                            ),
+                                            Stmt::new(
+                                                StmtKind::Assign {
+                                                    target: expr_id("acc32"),
+                                                    op: AssignOp::AddAssign,
+                                                    value: Expr::new(
+                                                        ExprKind::Call {
+                                                            callee: Box::new(expr_id("clamp__f32")),
+                                                            generic_args: vec![],
+                                                            args: vec![CallArg::positional(
+                                                                Expr::new(
+                                                                    ExprKind::Cast {
+                                                                        expr: Box::new(expr_id(
+                                                                            "acc64",
+                                                                        )),
+                                                                        ty: ty_prim(PrimType::F32),
+                                                                    },
+                                                                    sp,
+                                                                ),
+                                                            )],
+                                                        },
+                                                        sp,
+                                                    ),
+                                                },
+                                                sp,
+                                            ),
+                                            Stmt::new(
+                                                StmtKind::VarDecl {
+                                                    ty: ty_named("SensorPkt"),
+                                                    name: id("pkt"),
+                                                    init: Some(Expr::new(
+                                                        ExprKind::StructLit {
+                                                            name: id("SensorPkt"),
+                                                            generic_args: vec![],
+                                                            fields: vec![
+                                                                FieldInit {
+                                                                    name: id("id"),
+                                                                    value: expr_int(7),
+                                                                    span: sp,
+                                                                },
+                                                                FieldInit {
+                                                                    name: id("temp"),
+                                                                    value: expr_id("acc32"),
+                                                                    span: sp,
+                                                                },
+                                                            ],
+                                                        },
+                                                        sp,
+                                                    )),
+                                                },
+                                                sp,
+                                            ),
+                                            Stmt::new(
+                                                StmtKind::Expr(Expr::new(
+                                                    ExprKind::Call {
+                                                        callee: Box::new(expr_id("println")),
+                                                        generic_args: vec![],
+                                                        args: vec![CallArg::positional(Expr::new(
+                                                            ExprKind::FormatString(vec![
+                                                                FormatPart::Literal(
+                                                                    "err=".to_string(),
+                                                                ),
+                                                                FormatPart::Hole {
+                                                                    expr: Box::new(expr_id(
+                                                                        "BadCrc",
+                                                                    )),
+                                                                    spec: FormatSpec::Default,
+                                                                    span: sp,
+                                                                },
+                                                                FormatPart::Literal(
+                                                                    " pkt=".to_string(),
+                                                                ),
+                                                                FormatPart::Hole {
+                                                                    expr: Box::new(expr_id("pkt")),
+                                                                    spec: FormatSpec::Debug,
+                                                                    span: sp,
+                                                                },
+                                                            ]),
+                                                            sp,
+                                                        ))],
+                                                    },
+                                                    sp,
+                                                )),
+                                                sp,
+                                            ),
+                                        ],
+                                        sp,
+                                    ),
+                                },
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("main"),
+                    generic_params: vec![],
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Spawn(SpawnStmt {
+                                task: id("telem"),
+                                args: vec![],
+                                priority: Some(Priority::Normal),
+                                core: None,
+                                span: sp,
+                            }),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let prog = Program::new(items, sp);
+        let mir = lower_program(&prog).expect("lower wave2 mir test");
+
+        // 1. Unmonomorphized template `FixedVec` skipped; concrete `FixedVec__f32_4` kept!
+        assert!(mir.structs.iter().all(|s| s.name != "FixedVec"));
+        assert!(mir.structs.iter().any(|s| s.name == "FixedVec__f32_4"));
+
+        // 2. Pre-registered `FmtErr { Truncated = 0 }`
+        assert!(mir.enums.iter().any(|e| e.name == "FmtErr"));
+
+        // 3. `formatted_enums` contains ONLY `BusErr`, NOT `UnusedEnum` or `FmtErr`!
+        assert_eq!(mir.formatted_enums, vec!["BusErr".to_string()]);
+
+        // 4. `acc32` (4 B) and `acc64` (8 B) hoisted into `telem` coroutine frame
+        let bp = mir.task_blueprints.iter().find(|b| b.name == "telem").unwrap();
+        let acc32 = bp.vars.iter().find(|v| v.name == "acc32").unwrap();
+        let acc64 = bp.vars.iter().find(|v| v.name == "acc64").unwrap();
+        assert!(acc32.hoisted && acc32.ty == MirType::F32);
+        assert!(acc64.hoisted && acc64.ty == MirType::F64);
+
+        // 5. `{pkt:?}` expanded into literal `"SensorPkt { id: "` + field chunks + `" }"`!
+        let has_expanded_debug = bp.blocks.iter().any(|blk| {
+            blk.stmts.iter().any(|s| match s {
+                MirStmt::PrintFmt { chunks, newline: true } => chunks.iter().any(|c| {
+                    matches!(c, MirFmtChunk::Literal(lit) if lit.contains("SensorPkt { id: "))
+                }),
+                _ => false,
+            })
+        });
+        assert!(has_expanded_debug, "expected compile-time struct debug expansion");
+
+        // 6. Monomorphized instances populated & rendered in Section 7 of `RamReport`
+        assert_eq!(mir.monomorphized_instances.len(), 2);
+        let st_inst = mir
+            .monomorphized_instances
+            .iter()
+            .find(|m| m.mangled_name == "FixedVec__f32_4")
+            .unwrap();
+        assert_eq!(st_inst.size_32, 20); // 4 * 4B f32 + 4B usize
+        assert_eq!(st_inst.size_64, 24); // 4 * 4B f32 + 8B usize
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("7. Monomorphized Generic Instantiations")
+                && table.contains("FixedVec<f32, 4>")
+                && table.contains("clamp<f32>"),
+            "table:\n{table}"
+        );
+    }
+
+    #[test]
+    fn wave2_r2b_self_ref_debug_and_enum_slice_scanning_in_mir() {
+        let sp = Span::dummy();
+        let items = vec![
+            // enum NavMode { Idle = 0, Cruise = 1 } (ONLY formatted via `[2]NavMode` `{modes:?}`!)
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Enum(EnumDecl {
+                    name: id("NavMode"),
+                    variants: vec![
+                        EnumVariant {
+                            name: id("Idle"),
+                            discriminant: Some(0),
+                            span: sp,
+                        },
+                        EnumVariant {
+                            name: id("Cruise"),
+                            discriminant: Some(1),
+                            span: sp,
+                        },
+                    ],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // Self-referential struct Node { u32 val; Node *next; }
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Struct(StructDecl {
+                    is_packed: false,
+                    name: id("Node"),
+                    generic_params: vec![],
+                    fields: vec![
+                        StructField {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("val"),
+                            span: sp,
+                        },
+                        StructField {
+                            ty: TypeExpr::new(
+                                TypeKind::Ptr(Box::new(TypeExpr::new(
+                                    TypeKind::Named(id("Node")),
+                                    sp,
+                                ))),
+                                sp,
+                            ),
+                            name: id("next"),
+                            span: sp,
+                        },
+                    ],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // fn main() { Node n; [2]NavMode modes; println(f"{n:?} {modes:?}"); }
+            Item {
+                attrs: vec![],
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("main"),
+                    generic_params: vec![],
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: TypeExpr::new(TypeKind::Named(id("Node")), sp),
+                                    name: id("n"),
+                                    init: None,
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: TypeExpr::new(
+                                        TypeKind::Array {
+                                            elem: Box::new(TypeExpr::new(
+                                                TypeKind::Named(id("NavMode")),
+                                                sp,
+                                            )),
+                                            len: ArrayLen::Fixed(2),
+                                        },
+                                        sp,
+                                    ),
+                                    name: id("modes"),
+                                    init: None,
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(Expr::new(
+                                    ExprKind::Call {
+                                        callee: Box::new(expr_id("println")),
+                                        generic_args: vec![],
+                                        args: vec![CallArg::positional(Expr::new(
+                                            ExprKind::FormatString(vec![
+                                                FormatPart::Hole {
+                                                    expr: Box::new(expr_id("n")),
+                                                    spec: FormatSpec::Debug,
+                                                    span: sp,
+                                                },
+                                                FormatPart::Literal(" ".to_string()),
+                                                FormatPart::Hole {
+                                                    expr: Box::new(expr_id("modes")),
+                                                    spec: FormatSpec::Debug,
+                                                    span: sp,
+                                                },
+                                            ]),
+                                            sp,
+                                        ))],
+                                    },
+                                    sp,
+                                )),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let prog = Program::new(items, sp);
+        let mir = lower_program(&prog).expect("lower self-ref Node + [2]NavMode debug");
+
+        // M3: `NavMode` formatted only via `[2]NavMode` `DebugSlice` MUST be recorded in `formatted_enums`!
+        assert_eq!(mir.formatted_enums, vec!["NavMode".to_string()]);
+
+        // H2: `Node { val: ..., next: 0x... }` formats `next` as `"0x"` + hex integer without auto-dereferencing `Node *`!
+        let has_ptr_hex = mir.boot.steps.iter().any(|st| match st {
+            MirBootStep::Stmt(MirStmt::PrintFmt { chunks, .. }) => chunks.iter().any(|c| {
+                matches!(c, MirFmtChunk::Literal(s) if s.contains("next: 0x"))
+            }),
+            _ => false,
+        });
+        assert!(has_ptr_hex, "expected `next: 0x` hex pointer formatting on self-referential Node");
     }
 }

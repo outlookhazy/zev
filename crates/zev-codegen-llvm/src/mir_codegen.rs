@@ -14,14 +14,14 @@ use std::fmt::Write;
 
 use zev_mir::{
     BlockId, MirAssignOp, MirBinOp, MirBlock, MirBootStep, MirCallDst, MirChildCallSlot,
-    MirErrorSpec, MirExpr, MirExprKind, MirExternFn, MirFnBody, MirFunction, MirIntrinsicOp,
-    MirIsr, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget,
-    MirStmt, MirStruct, MirSwitchPattern, MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp,
-    MirVar, MirYieldKind, VarId, VarRole,
+    MirErrorSpec, MirExpr, MirExprKind, MirExternFn, MirFloatFmt, MirFmtChunk, MirFnBody,
+    MirFunction, MirIntFmt, MirIntrinsicOp, MirIsr, MirModule, MirPlace, MirPrimKind,
+    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern,
+    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
 };
 
 use crate::nvic::{NvicMap, emit_cortex_m_startup_ir, preferred_nvic_irq, sanitize_ident};
-use crate::runtime_ir::emit_kernel_runtime_ir;
+use crate::runtime_ir::{RuntimeIrFeatures, emit_kernel_runtime_ir_with_features};
 use crate::toolchain::{CodegenError, CodegenOptions, TargetArch};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -33,6 +33,7 @@ struct StructInfo {
     decl: MirStruct,
     llvm_name: String,
     byte_size: usize,
+    align: usize,
     field_indices: HashMap<String, (usize, MirType)>,
 }
 
@@ -77,12 +78,14 @@ struct ModuleCtx<'a> {
     enum_variants: HashMap<(String, String), i64>,
     bare_variants: HashMap<String, i64>,
     consts: HashMap<String, i128>,
+    float_consts: HashMap<String, u64>,
     fn_sigs: HashMap<String, FnLlvmSig>,
     extern_sigs: HashMap<String, ExternLlvmSig>,
     fn_frames: HashMap<String, CoroutineFrameLayout>,
     bp_frames: HashMap<String, CoroutineFrameLayout>,
     prim_globals: HashMap<String, MirPrimKind>,
     distinct_prims: BTreeMap<String, MirPrimKind>,
+    rt_features: RuntimeIrFeatures,
     strings: Vec<String>,
     string_dedup: HashMap<String, usize>,
 }
@@ -116,6 +119,7 @@ pub fn emit_llvm_ir_with_options(
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
     let nvic = NvicMap::from_isr_names(module.isrs.iter().map(|i| i.name.as_str()));
+    let rt_features = scan_module_runtime_features(module);
     let mut ctx = ModuleCtx {
         module,
         opts,
@@ -125,12 +129,14 @@ pub fn emit_llvm_ir_with_options(
         enum_variants: HashMap::new(),
         bare_variants: HashMap::new(),
         consts: HashMap::new(),
+        float_consts: HashMap::new(),
         fn_sigs: HashMap::new(),
         extern_sigs: HashMap::new(),
         fn_frames: HashMap::new(),
         bp_frames: HashMap::new(),
         prim_globals: HashMap::new(),
         distinct_prims: BTreeMap::new(),
+        rt_features,
         strings: Vec::new(),
         string_dedup: HashMap::new(),
     };
@@ -139,8 +145,8 @@ pub fn emit_llvm_ir_with_options(
 
     let mut out = String::with_capacity(64 * 1024);
 
-    // 1. Target header + cooperative OS kernel & HAL
-    emit_kernel_runtime_ir(&mut out, module.spawned_tasks.len(), opts);
+    // 1. Target header + cooperative OS kernel & HAL (emitting soft-float & fmt helpers on demand)
+    emit_kernel_runtime_ir_with_features(&mut out, module.spawned_tasks.len(), opts, rt_features);
 
     // 2. Cortex-M3 vector table, ESP32-C6 Direct-Boot entry, or host `main` entry wrapper
     match opts.target {
@@ -169,8 +175,9 @@ pub fn emit_llvm_ir_with_options(
     // 5. Coroutine frame struct types + static task/boot frame globals
     ctx.emit_coroutine_frame_globals_ir(&mut out);
 
-    // 6. Struct `FromBytes` helpers
+    // 6. Struct `FromBytes` helpers + on-demand `formatted_enums` `.rodata` lookup helpers
     ctx.emit_from_bytes_helpers_ir(&mut out);
+    ctx.emit_formatted_enum_names_ir(&mut out);
 
     // 7. `extern "C"` declarations + synthesized bare-metal `@syn_*` intrinsics
     ctx.emit_extern_fns_ir(&mut out);
@@ -252,6 +259,406 @@ entry:
     );
 }
 
+fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
+    let mut feat = RuntimeIrFeatures {
+        uses_i64: false,
+        uses_floats: false,
+        uses_fmt: false,
+        uses_fmt_float_sci: false,
+    };
+
+    fn scan_ty(ty: &MirType, feat: &mut RuntimeIrFeatures) {
+        match ty {
+            MirType::F32 | MirType::F64 => feat.uses_floats = true,
+            MirType::U64 | MirType::I64 | MirType::EndianInt { bits: 64, .. } => {
+                feat.uses_i64 = true;
+            }
+            MirType::Ptr(inner) | MirType::Slice(inner) => scan_ty(inner, feat),
+            MirType::FnPtr { params, ret } => {
+                for p in params {
+                    scan_ty(p, feat);
+                }
+                scan_ty(ret, feat);
+            }
+            MirType::Array { elem, .. } => scan_ty(elem, feat),
+            MirType::Result { ok, err } => {
+                scan_ty(ok, feat);
+                if let Some(e) = err {
+                    scan_ty(e, feat);
+                }
+            }
+            MirType::Primitive(pk) => match pk {
+                MirPrimKind::Signal => {}
+                MirPrimKind::Watch { elem }
+                | MirPrimKind::Inbox { elem, .. }
+                | MirPrimKind::PingPong { elem, .. }
+                | MirPrimKind::Lease { elem, .. } => scan_ty(elem, feat),
+            },
+            _ => {}
+        }
+    }
+
+    fn scan_prim_target(t: &MirPrimTarget, feat: &mut RuntimeIrFeatures) {
+        match t {
+            MirPrimTarget::Global(_) => {}
+            MirPrimTarget::PtrExpr(expr) => scan_expr(expr, feat),
+        }
+    }
+
+    fn scan_place(p: &MirPlace, feat: &mut RuntimeIrFeatures) {
+        match p {
+            MirPlace::Var(_) => {}
+            MirPlace::Deref(expr, ty) => {
+                scan_ty(ty, feat);
+                scan_expr(expr, feat);
+            }
+            MirPlace::Field { base, field_ty, .. } => {
+                scan_ty(field_ty, feat);
+                scan_place(base, feat);
+            }
+            MirPlace::Index {
+                base,
+                index,
+                elem_ty,
+                ..
+            } => {
+                scan_ty(elem_ty, feat);
+                scan_place(base, feat);
+                scan_expr(index, feat);
+            }
+        }
+    }
+
+    fn scan_expr(e: &MirExpr, feat: &mut RuntimeIrFeatures) {
+        scan_ty(&e.ty, feat);
+        match &e.kind {
+            MirExprKind::FloatLit(_) => feat.uses_floats = true,
+            MirExprKind::Unary { expr: sub, .. } => scan_expr(sub, feat),
+            MirExprKind::AddrOfPlace(place) => scan_place(place, feat),
+            MirExprKind::Binary { lhs, rhs, .. } => {
+                scan_expr(lhs, feat);
+                scan_expr(rhs, feat);
+            }
+            MirExprKind::Cast {
+                expr: sub,
+                target_ty,
+            } => {
+                scan_ty(target_ty, feat);
+                scan_expr(sub, feat);
+            }
+            MirExprKind::StructLit { fields, .. } => {
+                for (_, fe, ft) in fields {
+                    scan_ty(ft, feat);
+                    scan_expr(fe, feat);
+                }
+            }
+            MirExprKind::ArrayLit { elems, elem_ty } => {
+                scan_ty(elem_ty, feat);
+                for el in elems {
+                    scan_expr(el, feat);
+                }
+            }
+            MirExprKind::FieldAccess {
+                base, raw_field_ty, ..
+            } => {
+                scan_ty(raw_field_ty, feat);
+                scan_expr(base, feat);
+            }
+            MirExprKind::SliceLen(sub) | MirExprKind::FromBytes { slice: sub, .. } => {
+                scan_expr(sub, feat);
+            }
+            MirExprKind::Index { base, index, .. } => {
+                scan_expr(base, feat);
+                scan_expr(index, feat);
+            }
+            MirExprKind::SubSlice {
+                base,
+                start,
+                end,
+                elem_ty,
+                ..
+            } => {
+                scan_ty(elem_ty, feat);
+                scan_expr(base, feat);
+                scan_expr(start, feat);
+                scan_expr(end, feat);
+            }
+            MirExprKind::ArrayToSlice {
+                array_place,
+                elem_ty,
+                ..
+            } => {
+                scan_ty(elem_ty, feat);
+                scan_place(array_place, feat);
+            }
+            MirExprKind::CallDirect { args, .. } => {
+                for a in args {
+                    scan_expr(a, feat);
+                }
+            }
+            MirExprKind::PrimRead(prop) => match &**prop {
+                MirPrimReadOp::WatchRead { target, elem_ty }
+                | MirPrimReadOp::InboxTryRecv { target, elem_ty, .. }
+                | MirPrimReadOp::InboxLen { target, elem_ty, .. }
+                | MirPrimReadOp::InboxIsEmpty { target, elem_ty, .. }
+                | MirPrimReadOp::InboxIsFull { target, elem_ty, .. } => {
+                    scan_prim_target(target, feat);
+                    scan_ty(elem_ty, feat);
+                }
+                MirPrimReadOp::InboxTrySend {
+                    target,
+                    elem_ty,
+                    value,
+                    ..
+                } => {
+                    scan_prim_target(target, feat);
+                    scan_ty(elem_ty, feat);
+                    scan_expr(value, feat);
+                }
+                MirPrimReadOp::SignalIsSet { target } | MirPrimReadOp::SignalTryWait { target } => {
+                    scan_prim_target(target, feat);
+                }
+            },
+            _ => {}
+        }
+    }
+
+    fn scan_fmt_chunks(chunks: &[MirFmtChunk], feat: &mut RuntimeIrFeatures) {
+        feat.uses_fmt = true;
+        for ch in chunks {
+            match ch {
+                MirFmtChunk::Literal(_) => {}
+                MirFmtChunk::Int { value, bits, .. } => {
+                    if *bits == 64 {
+                        feat.uses_i64 = true;
+                    }
+                    scan_expr(value, feat);
+                }
+                MirFmtChunk::Float { value, fmt, .. } => {
+                    feat.uses_floats = true;
+                    if matches!(fmt, MirFloatFmt::Sci { .. }) {
+                        feat.uses_fmt_float_sci = true;
+                    }
+                    scan_expr(value, feat);
+                }
+                MirFmtChunk::Bool(v) | MirFmtChunk::Str(v) | MirFmtChunk::Bytes(v) => {
+                    scan_expr(v, feat);
+                }
+                MirFmtChunk::EnumName { value, .. } => scan_expr(value, feat),
+                MirFmtChunk::DebugSlice { elem_ty, slice } => {
+                    scan_ty(elem_ty, feat);
+                    scan_expr(slice, feat);
+                }
+            }
+        }
+    }
+
+    fn scan_stmts(stmts: &[MirStmt], feat: &mut RuntimeIrFeatures) {
+        for s in stmts {
+            match s {
+                MirStmt::Assign { target, value, .. } => {
+                    scan_place(target, feat);
+                    scan_expr(value, feat);
+                }
+                MirStmt::Expr(value) => scan_expr(value, feat),
+                MirStmt::PrimOp(pop) => match pop {
+                    MirPrimNonBlockingOp::WatchPublish {
+                        target,
+                        elem_ty,
+                        value,
+                    }
+                    | MirPrimNonBlockingOp::InboxPost {
+                        target,
+                        elem_ty,
+                        value,
+                        ..
+                    } => {
+                        scan_prim_target(target, feat);
+                        scan_ty(elem_ty, feat);
+                        scan_expr(value, feat);
+                    }
+                    MirPrimNonBlockingOp::SignalNotify { target, .. }
+                    | MirPrimNonBlockingOp::SignalClear { target } => {
+                        scan_prim_target(target, feat);
+                    }
+                    MirPrimNonBlockingOp::PingPongFlip {
+                        target, elem_ty, ..
+                    }
+                    | MirPrimNonBlockingOp::PingPongSetActive {
+                        target, elem_ty, ..
+                    }
+                    | MirPrimNonBlockingOp::LeaseComplete {
+                        target, elem_ty, ..
+                    }
+                    | MirPrimNonBlockingOp::LeaseSetActive {
+                        target, elem_ty, ..
+                    } => {
+                        scan_prim_target(target, feat);
+                        scan_ty(elem_ty, feat);
+                    }
+                },
+                MirStmt::Intrinsic(iop) => match iop {
+                    MirIntrinsicOp::UseSystick { hz } => scan_expr(hz, feat),
+                    MirIntrinsicOp::SysOp { args, .. } | MirIntrinsicOp::HwOp { args, .. } => {
+                        for a in args {
+                            scan_expr(a, feat);
+                        }
+                    }
+                    MirIntrinsicOp::SetPriority { .. } => {}
+                },
+                MirStmt::If {
+                    cond,
+                    then_body,
+                    else_body,
+                } => {
+                    scan_expr(cond, feat);
+                    scan_stmts(then_body, feat);
+                    scan_stmts(else_body, feat);
+                }
+                MirStmt::While { cond, body } => {
+                    scan_expr(cond, feat);
+                    scan_stmts(body, feat);
+                }
+                MirStmt::Switch {
+                    discr,
+                    arms,
+                    default,
+                } => {
+                    scan_expr(discr, feat);
+                    for (_, ab) in arms {
+                        scan_stmts(ab, feat);
+                    }
+                    scan_stmts(default, feat);
+                }
+                MirStmt::Return(Some(e)) => scan_expr(e, feat),
+                MirStmt::Error { reason, partial } => {
+                    if let Some(r) = reason {
+                        scan_expr(r, feat);
+                    }
+                    if let Some(p) = partial {
+                        scan_expr(p, feat);
+                    }
+                }
+                MirStmt::SpawnActivate { args, .. } => {
+                    for a in args {
+                        scan_expr(a, feat);
+                    }
+                }
+                MirStmt::PrintFmt { chunks, .. } => scan_fmt_chunks(chunks, feat),
+                MirStmt::FmtBuf { buf, chunks, .. } => {
+                    scan_expr(buf, feat);
+                    scan_fmt_chunks(chunks, feat);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_blocks(blocks: &[MirBlock], feat: &mut RuntimeIrFeatures) {
+        for b in blocks {
+            scan_stmts(&b.stmts, feat);
+            match &b.terminator {
+                MirTerminator::Branch { cond, .. } => scan_expr(cond, feat),
+                MirTerminator::Switch { discr, .. } => scan_expr(discr, feat),
+                MirTerminator::Return(Some(e)) => scan_expr(e, feat),
+                MirTerminator::Error { reason, partial } => {
+                    if let Some(r) = reason {
+                        scan_expr(r, feat);
+                    }
+                    if let Some(p) = partial {
+                        scan_expr(p, feat);
+                    }
+                }
+                MirTerminator::Yield(yk) => match yk {
+                    MirYieldKind::CallYielding { args, .. } => {
+                        for a in args {
+                            scan_expr(a, feat);
+                        }
+                    }
+                    MirYieldKind::InboxRecv {
+                        target, elem_ty, ..
+                    }
+                    | MirYieldKind::InboxSend {
+                        target, elem_ty, ..
+                    }
+                    | MirYieldKind::PingPongWaitChunk {
+                        target, elem_ty, ..
+                    }
+                    | MirYieldKind::LeaseWaitChunk {
+                        target, elem_ty, ..
+                    } => {
+                        scan_prim_target(target, feat);
+                        scan_ty(elem_ty, feat);
+                    }
+                    MirYieldKind::SignalWait { target, .. } => scan_prim_target(target, feat),
+                    MirYieldKind::EveryLatch { .. }
+                    | MirYieldKind::DelayPoll { .. }
+                    | MirYieldKind::ShareCheckpoint { .. }
+                    | MirYieldKind::PollChild { .. } => {}
+                },
+                MirTerminator::Goto(_) | MirTerminator::Return(None) => {}
+            }
+        }
+    }
+
+    for c in &module.consts {
+        scan_expr(&c.init, &mut feat);
+    }
+    for s in &module.structs {
+        for f in &s.fields {
+            scan_ty(&f.ty, &mut feat);
+        }
+    }
+    for p in &module.primitives {
+        scan_ty(&MirType::Primitive(p.kind.clone()), &mut feat);
+        if let Some(init) = &p.init {
+            scan_expr(init, &mut feat);
+        }
+    }
+    for ext in &module.extern_fns {
+        scan_ty(&ext.ret_ty, &mut feat);
+        for (_, pt) in &ext.params {
+            scan_ty(pt, &mut feat);
+        }
+    }
+    for isr in &module.isrs {
+        for v in &isr.vars {
+            scan_ty(&v.ty, &mut feat);
+        }
+        scan_stmts(&isr.body, &mut feat);
+    }
+    for func in &module.functions {
+        scan_ty(&func.ret_ty, &mut feat);
+        for v in &func.vars {
+            scan_ty(&v.ty, &mut feat);
+        }
+        match &func.body {
+            MirFnBody::Direct(stmts) => scan_stmts(stmts, &mut feat),
+            MirFnBody::Coroutine { blocks, .. } => scan_blocks(blocks, &mut feat),
+        }
+    }
+    for bp in &module.task_blueprints {
+        for v in &bp.vars {
+            scan_ty(&v.ty, &mut feat);
+        }
+        scan_blocks(&bp.blocks, &mut feat);
+    }
+    for v in &module.boot.vars {
+        scan_ty(&v.ty, &mut feat);
+    }
+    for step in &module.boot.steps {
+        match step {
+            MirBootStep::Stmt(s) => scan_stmts(std::slice::from_ref(s), &mut feat),
+            MirBootStep::RunYieldingFn { args, .. } | MirBootStep::SpawnActivate { args, .. } => {
+                for a in args {
+                    scan_expr(a, &mut feat);
+                }
+            }
+        }
+    }
+    feat
+}
+
 impl<'a> ModuleCtx<'a> {
     fn prepare(&mut self) -> Result<(), CodegenError> {
         // Enums
@@ -265,8 +672,13 @@ impl<'a> ModuleCtx<'a> {
 
         // Consts
         for c in &self.module.consts {
-            let v = self.eval_const_int(&c.init);
-            self.consts.insert(c.name.clone(), v);
+            if c.init.ty.is_float() {
+                let bits = self.eval_const_float_bits(&c.init);
+                self.float_consts.insert(c.name.clone(), bits);
+            } else {
+                let v = self.eval_const_int(&c.init);
+                self.consts.insert(c.name.clone(), v);
+            }
         }
 
         // Structs in topological order
@@ -417,6 +829,7 @@ impl<'a> ModuleCtx<'a> {
                 decl: decl.clone(),
                 llvm_name,
                 byte_size: offset.max(1),
+                align: if decl.packed { 1 } else { max_align.max(1) },
                 field_indices,
             },
         );
@@ -559,10 +972,13 @@ impl<'a> ModuleCtx<'a> {
             MirType::U16 | MirType::I16 | MirType::EndianInt { bits: 16, .. } => (2, 2),
             MirType::U32
             | MirType::I32
+            | MirType::F32
             | MirType::EndianInt { bits: 32, .. }
             | MirType::Enum(_)
             | MirType::HwPeripheral(_) => (4, 4),
-            MirType::U64 | MirType::I64 | MirType::EndianInt { bits: 64, .. } => (8, 8),
+            MirType::U64 | MirType::I64 | MirType::F64 | MirType::EndianInt { bits: 64, .. } => {
+                (8, 8)
+            }
             MirType::EndianInt { .. } => (4, 4),
             MirType::Usize
             | MirType::Isize
@@ -576,8 +992,7 @@ impl<'a> ModuleCtx<'a> {
             }
             MirType::Struct(name) => {
                 if let Some(si) = self.structs.get(name) {
-                    let al = if si.decl.packed { 1 } else { 4 };
-                    (si.byte_size, al)
+                    (si.byte_size, si.align)
                 } else {
                     (4, 4)
                 }
@@ -626,6 +1041,8 @@ impl<'a> ModuleCtx<'a> {
             | MirType::Enum(_)
             | MirType::HwPeripheral(_) => "i32".to_string(),
             MirType::U64 | MirType::I64 | MirType::EndianInt { bits: 64, .. } => "i64".to_string(),
+            MirType::F32 => "float".to_string(),
+            MirType::F64 => "double".to_string(),
             MirType::EndianInt { .. } => "i32".to_string(),
             MirType::Usize | MirType::Isize => self.opts.target.usize_llvm_ty().to_string(),
             MirType::Ptr(_) | MirType::FnPtr { .. } | MirType::Str => "ptr".to_string(),
@@ -682,6 +1099,19 @@ impl<'a> ModuleCtx<'a> {
                 }
             }
             MirExprKind::Binary { op, lhs, rhs } => {
+                if lhs.ty.is_float() || rhs.ty.is_float() {
+                    let lf = f64::from_bits(self.eval_const_float_bits(lhs));
+                    let rf = f64::from_bits(self.eval_const_float_bits(rhs));
+                    return match op {
+                        MirBinOp::Eq => i128::from(lf == rf),
+                        MirBinOp::Ne => i128::from(lf != rf),
+                        MirBinOp::Lt => i128::from(lf < rf),
+                        MirBinOp::Le => i128::from(lf <= rf),
+                        MirBinOp::Gt => i128::from(lf > rf),
+                        MirBinOp::Ge => i128::from(lf >= rf),
+                        _ => 0,
+                    };
+                }
                 let l = self.eval_const_int(lhs);
                 let r = self.eval_const_int(rhs);
                 match op {
@@ -717,8 +1147,73 @@ impl<'a> ModuleCtx<'a> {
                     MirBinOp::LogicalOr => i128::from(l != 0 || r != 0),
                 }
             }
-            MirExprKind::Cast { expr: sub, .. } => self.eval_const_int(sub),
+            MirExprKind::Cast {
+                expr: sub,
+                target_ty,
+            } => {
+                let ptr_bits = self.opts.target.ptr_bits();
+                if *target_ty == MirType::Bool {
+                    if sub.ty.is_float() {
+                        let f = f64::from_bits(self.eval_const_float_bits(sub));
+                        return i128::from(f != 0.0);
+                    }
+                    return i128::from(self.eval_const_int(sub) != 0);
+                }
+                if sub.ty.is_float() {
+                    let raw = f64::from_bits(self.eval_const_float_bits(sub));
+                    let f = if sub.ty == MirType::F32 {
+                        (raw as f32) as f64
+                    } else {
+                        raw
+                    };
+                    return saturating_float_to_int_i128(f, target_ty, ptr_bits);
+                }
+                mask_int_to_target_i128(self.eval_const_int(sub), target_ty, ptr_bits)
+            }
             _ => 0,
+        }
+    }
+
+    fn eval_const_float_bits(&self, expr: &MirExpr) -> u64 {
+        let raw_f = match &expr.kind {
+            MirExprKind::FloatLit(bits) => f64::from_bits(*bits),
+            MirExprKind::IntLit(v) => *v as f64,
+            MirExprKind::ConstRef(name) => self
+                .float_consts
+                .get(name)
+                .copied()
+                .map(f64::from_bits)
+                .or_else(|| self.consts.get(name).copied().map(|v| v as f64))
+                .unwrap_or(0.0),
+            MirExprKind::Unary {
+                op: MirUnaryOp::Neg,
+                expr: sub,
+            } => -f64::from_bits(self.eval_const_float_bits(sub)),
+            MirExprKind::Binary { op, lhs, rhs } => {
+                let l = f64::from_bits(self.eval_const_float_bits(lhs));
+                let r = f64::from_bits(self.eval_const_float_bits(rhs));
+                match op {
+                    MirBinOp::Add => l + r,
+                    MirBinOp::Sub => l - r,
+                    MirBinOp::Mul => l * r,
+                    MirBinOp::Div => l / r,
+                    MirBinOp::Rem => l % r,
+                    _ => 0.0,
+                }
+            }
+            MirExprKind::Cast { expr: sub, .. } => {
+                if sub.ty.is_float() {
+                    f64::from_bits(self.eval_const_float_bits(sub))
+                } else {
+                    self.eval_const_int(sub) as f64
+                }
+            }
+            _ => 0.0,
+        };
+        if expr.ty == MirType::F32 {
+            ((raw_f as f32) as f64).to_bits()
+        } else {
+            raw_f.to_bits()
         }
     }
 
@@ -780,6 +1275,47 @@ ok_bb:
         }
     }
 
+    fn emit_formatted_enum_names_ir(&mut self, out: &mut String) {
+        if self.module.formatted_enums.is_empty() {
+            return;
+        }
+        let fn_sz = self.opts.fn_size_attrs().to_string();
+        let formatted: Vec<String> = self.module.formatted_enums.clone();
+        let _ = writeln!(out, "; ── On-Demand Enum Variant-Name `.rodata` Lookup Helpers ──");
+        for ename in &formatted {
+            let Some(en) = self.module.enums.iter().find(|e| &e.name == ename).cloned() else {
+                continue;
+            };
+            let eid = sanitize_ident(&en.name);
+            let unk_idx = self.intern_string(&format!("{}(?)", en.name));
+            let mut seen_discs = BTreeSet::new();
+            let mut arms: Vec<(i64, usize)> = Vec::new();
+            for (vname, disc) in &en.variants {
+                if seen_discs.insert(*disc) {
+                    let sidx = self.intern_string(vname);
+                    arms.push((*disc, sidx));
+                }
+            }
+            let _ = writeln!(
+                out,
+                "define ptr @__syn_enum_name_{eid}(i32 %v) nounwind{fn_sz} {{"
+            );
+            let _ = writeln!(out, "entry:");
+            let _ = writeln!(out, "  switch i32 %v, label %def [");
+            for (idx, (disc, _)) in arms.iter().enumerate() {
+                let _ = writeln!(out, "    i32 {disc}, label %arm_{idx}");
+            }
+            let _ = writeln!(out, "  ]");
+            for (idx, (_, sidx)) in arms.iter().enumerate() {
+                let _ = writeln!(out, "arm_{idx}:");
+                let _ = writeln!(out, "  ret ptr @.str.{sidx}");
+            }
+            let _ = writeln!(out, "def:");
+            let _ = writeln!(out, "  ret ptr @.str.{unk_idx}");
+            let _ = writeln!(out, "}}\n");
+        }
+    }
+
     fn emit_primitives_ir(&self, out: &mut String) {
         if self.distinct_prims.is_empty() && self.module.primitives.is_empty() {
             return;
@@ -831,9 +1367,22 @@ ok_bb:
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
+                    let watch_align = if matches!(elem.as_ref(), MirType::F64 | MirType::U64 | MirType::I64) {
+                        align.max(8)
+                    } else {
+                        align
+                    };
                     if let Some(init_expr) = &p.init {
-                        let iv = self.eval_const_int(init_expr);
-                        if matches!(
+                        if matches!(elem.as_ref(), MirType::F32 | MirType::F64) {
+                            let mut fbits = self.eval_const_float_bits(init_expr);
+                            if **elem == MirType::F32 {
+                                fbits = ((f64::from_bits(fbits) as f32) as f64).to_bits();
+                            }
+                            let _ = writeln!(
+                                out,
+                                "{gsym} = global {pty} {{ {ety} 0x{fbits:016X}, i32 0 }}, align {watch_align}"
+                            );
+                        } else if matches!(
                             elem.as_ref(),
                             MirType::Bool
                                 | MirType::U8
@@ -847,17 +1396,22 @@ ok_bb:
                                 | MirType::Usize
                                 | MirType::Enum(_)
                         ) {
+                            let iv = self.eval_const_int(init_expr);
                             let _ = writeln!(
                                 out,
-                                "{gsym} = global {pty} {{ {ety} {iv}, i32 0 }}, align {align}"
+                                "{gsym} = global {pty} {{ {ety} {iv}, i32 0 }}, align {watch_align}"
                             );
                         } else {
-                            let _ =
-                                writeln!(out, "{gsym} = global {pty} zeroinitializer, align {align}");
+                            let _ = writeln!(
+                                out,
+                                "{gsym} = global {pty} zeroinitializer, align {watch_align}"
+                            );
                         }
                     } else {
-                        let _ =
-                            writeln!(out, "{gsym} = global {pty} zeroinitializer, align {align}");
+                        let _ = writeln!(
+                            out,
+                            "{gsym} = global {pty} zeroinitializer, align {watch_align}"
+                        );
                     }
                 }
                 MirPrimKind::Inbox { .. } => {
@@ -1854,10 +2408,10 @@ entry:
         }
         let _ = writeln!(out, "; ── Pooled String Constants (Flash .rodata) ──");
         for (idx, s) in self.strings.iter().enumerate() {
-            let bytes = s.as_bytes();
+            let bytes = zev_ast::decoded_string_bytes(s);
             let len = bytes.len() + 1;
             let mut esc = String::new();
-            for &b in bytes {
+            for &b in &bytes {
                 if (0x20..=0x7E).contains(&b) && b != b'"' && b != b'\\' {
                     esc.push(b as char);
                 } else {
@@ -1870,6 +2424,50 @@ entry:
                 "@.str.{idx} = private unnamed_addr constant [{len} x i8] c\"{esc}\", align 1"
             );
         }
+    }
+}
+
+fn target_int_signed_and_bits(target_ty: &MirType, ptr_bits: u32) -> Option<(bool, u32)> {
+    match target_ty.host_value_type() {
+        MirType::U8 => Some((false, 8)),
+        MirType::I8 => Some((true, 8)),
+        MirType::U16 => Some((false, 16)),
+        MirType::I16 => Some((true, 16)),
+        MirType::U32 => Some((false, 32)),
+        MirType::I32 | MirType::Enum(_) => Some((true, 32)),
+        MirType::U64 => Some((false, 64)),
+        MirType::I64 => Some((true, 64)),
+        MirType::Usize | MirType::Ptr(_) | MirType::FnPtr { .. } => Some((false, ptr_bits)),
+        MirType::Isize => Some((true, ptr_bits)),
+        _ => None,
+    }
+}
+
+fn saturating_float_to_int_i128(f: f64, target_ty: &MirType, ptr_bits: u32) -> i128 {
+    match target_int_signed_and_bits(target_ty, ptr_bits) {
+        Some((false, 8)) => (f as u8) as i128,
+        Some((true, 8)) => (f as i8) as i128,
+        Some((false, 16)) => (f as u16) as i128,
+        Some((true, 16)) => (f as i16) as i128,
+        Some((false, 32)) => (f as u32) as i128,
+        Some((true, 32)) => (f as i32) as i128,
+        Some((false, 64)) => (f as u64) as i128,
+        Some((true, 64)) => (f as i64) as i128,
+        _ => (f as i32) as i128,
+    }
+}
+
+fn mask_int_to_target_i128(v: i128, target_ty: &MirType, ptr_bits: u32) -> i128 {
+    match target_int_signed_and_bits(target_ty, ptr_bits) {
+        Some((false, 8)) => (v as u8) as i128,
+        Some((true, 8)) => (v as i8) as i128,
+        Some((false, 16)) => (v as u16) as i128,
+        Some((true, 16)) => (v as i16) as i128,
+        Some((false, 32)) => (v as u32) as i128,
+        Some((true, 32)) => (v as i32) as i128,
+        Some((false, 64)) => (v as u64) as i128,
+        Some((true, 64)) => (v as i64) as i128,
+        _ => v,
     }
 }
 
@@ -2044,6 +2642,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.start_block("entry");
         self.emit_line("%__crit_pm = alloca i32, align 4");
         self.emit_line("store i32 0, ptr %__crit_pm, align 4");
+        if self.ctx.rt_features.uses_fmt {
+            self.emit_line("%__fmt_sink = alloca %SynFmtSink, align 4");
+        }
         for v in &self.vars.clone() {
             if let Some(coro) = &self.coroutine {
                 if coro.hoisted_var_gep.contains_key(&v.id) {
@@ -2051,12 +2652,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
             }
             let lty = self.ctx.llvm_ty(&v.ty);
-            self.emit_line(format!("%v_{} = alloca {lty}, align 4", v.id.0));
-            self.emit_line(format!("store {lty} zeroinitializer, ptr %v_{}, align 4", v.id.0));
+            let al = if lty == "double" || lty == "i64" { 8 } else { 4 };
+            self.emit_line(format!("%v_{} = alloca {lty}, align {al}", v.id.0));
+            self.emit_line(format!("store {lty} zeroinitializer, ptr %v_{}, align {al}", v.id.0));
         }
         for (idx, &vid) in param_vids.iter().enumerate() {
             let lty = self.ctx.llvm_ty(&self.vars[vid.0].ty);
-            self.emit_line(format!("store {lty} %arg{idx}, ptr %v_{}, align 4", vid.0));
+            let al = if lty == "double" || lty == "i64" { 8 } else { 4 };
+            self.emit_line(format!("store {lty} %arg{idx}, ptr %v_{}, align {al}", vid.0));
         }
     }
 
@@ -2078,6 +2681,53 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     fn coerce(&mut self, val: SsaVal, dst_ty: &str, signed: bool) -> SsaVal {
         if val.ty == dst_ty {
             return val;
+        }
+        if val.ty == "float" && dst_ty == "double" {
+            let t = self.next_tmp();
+            self.emit_line(format!("{t} = fpext float {} to double", val.repr));
+            return SsaVal::new("double", t);
+        }
+        if val.ty == "double" && dst_ty == "float" {
+            let t = self.next_tmp();
+            self.emit_line(format!("{t} = fptrunc double {} to float", val.repr));
+            return SsaVal::new("float", t);
+        }
+        if (val.ty == "float" || val.ty == "double") && dst_ty.starts_with('i') {
+            if dst_ty == "i1" {
+                let t = self.next_tmp();
+                self.emit_line(format!("{t} = fcmp une {} {}, 0.0", val.ty, val.repr));
+                return SsaVal::new("i1", t);
+            }
+            let int_ty = match dst_ty {
+                "i8" | "i16" | "i32" | "i64" => dst_ty,
+                _ => "i32",
+            };
+            let f_sfx = if val.ty == "float" { "f32" } else { "f64" };
+            let intr = if signed { "fptosi.sat" } else { "fptoui.sat" };
+            let ti = self.next_tmp();
+            self.emit_line(format!(
+                "{ti} = call {int_ty} @llvm.{intr}.{int_ty}.{f_sfx}({} {})",
+                val.ty, val.repr
+            ));
+            return SsaVal::new(int_ty, ti);
+        }
+        if val.ty.starts_with('i') && (dst_ty == "float" || dst_ty == "double") {
+            let sb = llvm_int_bits(&val.ty);
+            let widened = if sb < 32 {
+                let wop = if signed && sb > 1 { "sext" } else { "zext" };
+                let wt = self.next_tmp();
+                self.emit_line(format!("{wt} = {wop} {} {} to i32", val.ty, val.repr));
+                SsaVal::new("i32", wt)
+            } else {
+                val
+            };
+            let fop = if signed && sb > 1 { "sitofp" } else { "uitofp" };
+            let tf = self.next_tmp();
+            self.emit_line(format!(
+                "{tf} = {fop} {} {} to {dst_ty}",
+                widened.ty, widened.repr
+            ));
+            return SsaVal::new(dst_ty, tf);
         }
         if dst_ty == "ptr" && val.ty.starts_with('i') {
             let t = self.next_tmp();
@@ -2101,7 +2751,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             return SsaVal::new(dst_ty, t);
         }
-        if !dst_ty.starts_with('i') && dst_ty != "ptr" && dst_ty != "void" {
+        if !dst_ty.starts_with('i')
+            && dst_ty != "ptr"
+            && dst_ty != "void"
+            && dst_ty != "float"
+            && dst_ty != "double"
+        {
             return SsaVal::new(dst_ty, "zeroinitializer");
         }
         val
@@ -2114,6 +2769,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let t = self.next_tmp();
         if val.ty == "ptr" {
             self.emit_line(format!("{t} = icmp ne ptr {}, null", val.repr));
+        } else if val.ty == "float" || val.ty == "double" {
+            self.emit_line(format!("{t} = fcmp une {} {}, 0.0", val.ty, val.repr));
         } else {
             self.emit_line(format!("{t} = icmp ne {} {}, 0", val.ty, val.repr));
         }
@@ -3365,6 +4022,435 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirStmt::SpawnActivate { slot_id, args } => {
                 self.emit_boot_spawn_activate(*slot_id, args)?;
             }
+            MirStmt::PrintFmt { chunks, newline } => {
+                self.emit_line("call void @__syn_fmt_init_uart(ptr %__fmt_sink)");
+                for ch in chunks {
+                    self.emit_fmt_chunk("%__fmt_sink", ch)?;
+                }
+                if *newline {
+                    self.emit_line("call void @__syn_fmt_putc(ptr %__fmt_sink, i8 10)");
+                }
+            }
+            MirStmt::FmtBuf {
+                dst_res,
+                buf,
+                chunks,
+            } => {
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let sl_ty = format!("{{ ptr, {usize_ty} }}");
+                let bv = self.emit_expr(buf)?;
+                let bptr = self.next_tmp();
+                let blen = self.next_tmp();
+                self.emit_line(format!("{bptr} = extractvalue {sl_ty} {}, 0", bv.repr));
+                self.emit_line(format!("{blen} = extractvalue {sl_ty} {}, 1", bv.repr));
+                let cap32 = self.coerce(SsaVal::new(&usize_ty, blen), "i32", false);
+                self.emit_line(format!(
+                    "call void @__syn_fmt_init_buf(ptr %__fmt_sink, ptr {bptr}, i32 {})",
+                    cap32.repr
+                ));
+                for ch in chunks {
+                    self.emit_fmt_chunk("%__fmt_sink", ch)?;
+                }
+                let wp = self.next_tmp();
+                let tp = self.next_tmp();
+                let written = self.next_tmp();
+                let trunc = self.next_tmp();
+                let is_tr = self.next_tmp();
+                let out_len32 = self.next_tmp();
+                self.emit_line(format!(
+                    "{wp} = getelementptr inbounds %SynFmtSink, ptr %__fmt_sink, i32 0, i32 2"
+                ));
+                self.emit_line(format!(
+                    "{tp} = getelementptr inbounds %SynFmtSink, ptr %__fmt_sink, i32 0, i32 3"
+                ));
+                self.emit_line(format!("{written} = load i32, ptr {wp}, align 4"));
+                self.emit_line(format!("{trunc} = load i8, ptr {tp}, align 1"));
+                self.emit_line(format!("{is_tr} = icmp ne i8 {trunc}, 0"));
+                self.emit_line(format!(
+                    "{out_len32} = select i1 {is_tr}, i32 {}, i32 {written}",
+                    cap32.repr
+                ));
+                let out_len_u = self.coerce(SsaVal::new("i32", out_len32), &usize_ty, false);
+                let s0 = self.next_tmp();
+                let s1 = self.next_tmp();
+                self.emit_line(format!("{s0} = insertvalue {sl_ty} poison, ptr {bptr}, 0"));
+                self.emit_line(format!(
+                    "{s1} = insertvalue {sl_ty} {s0}, {usize_ty} {}, 1",
+                    out_len_u.repr
+                ));
+                let err_tag = self.next_tmp();
+                self.emit_line(format!("{err_tag} = select i1 {is_tr}, i32 1, i32 0"));
+                let rty = self.ctx.llvm_ty(&self.vars[dst_res.0].ty);
+                let r0 = self.next_tmp();
+                let r1 = self.next_tmp();
+                self.emit_line(format!("{r0} = insertvalue {rty} poison, {sl_ty} {s1}, 0"));
+                self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 {err_tag}, 1"));
+                let dp = self.var_ptr(*dst_res);
+                self.emit_line(format!("store {rty} {r1}, ptr {dp}, align 4"));
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_fmt_chunk(&mut self, sink: &str, ch: &MirFmtChunk) -> Result<(), CodegenError> {
+        let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+        match ch {
+            MirFmtChunk::Literal(s) => {
+                let bytes = zev_ast::decoded_string_bytes(s);
+                if bytes.is_empty() {
+                    return Ok(());
+                }
+                if bytes.len() == 1 {
+                    let b = bytes[0] as i8;
+                    self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 {b})"));
+                } else {
+                    let idx = self.ctx.intern_string(s);
+                    let slen = bytes.len() as i32;
+                    self.emit_line(format!(
+                        "call void @__syn_fmt_bytes(ptr {sink}, ptr @.str.{idx}, i32 {slen})"
+                    ));
+                }
+            }
+            MirFmtChunk::Int {
+                value,
+                signed,
+                bits,
+                fmt,
+            } => {
+                let vv = self.emit_expr(value)?;
+                match fmt {
+                    MirIntFmt::Dec => {
+                        let is64 = *bits == 64
+                            || (*bits == 0 && self.ctx.opts.target.ptr_bits() == 64);
+                        if is64 {
+                            let v64 = self.coerce(vv, "i64", *signed);
+                            let fn_sym = if *signed {
+                                "@__syn_fmt_i64_dec"
+                            } else {
+                                "@__syn_fmt_u64_dec"
+                            };
+                            self.emit_line(format!(
+                                "call void {fn_sym}(ptr {sink}, i64 {})",
+                                v64.repr
+                            ));
+                        } else {
+                            let v32 = self.coerce(vv, "i32", *signed);
+                            let fn_sym = if *signed {
+                                "@__syn_fmt_i32_dec"
+                            } else {
+                                "@__syn_fmt_u32_dec"
+                            };
+                            self.emit_line(format!(
+                                "call void {fn_sym}(ptr {sink}, i32 {})",
+                                v32.repr
+                            ));
+                        }
+                    }
+                    MirIntFmt::Hex {
+                        upper,
+                        zero_pad_width,
+                    } => {
+                        let narrow_ty = match *bits {
+                            8 => "i8",
+                            16 => "i16",
+                            32 => "i32",
+                            64 => "i64",
+                            _ => usize_ty.as_str(),
+                        };
+                        let nv = self.coerce(vv, narrow_ty, false);
+                        let up = i32::from(*upper);
+                        let w = i32::from(*zero_pad_width);
+                        if narrow_ty == "i64" {
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u64_hex(ptr {sink}, i64 {}, i8 {up}, i32 {w})",
+                                nv.repr
+                            ));
+                        } else {
+                            let u32v = self.coerce(nv, "i32", false);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u32_hex(ptr {sink}, i32 {}, i8 {up}, i32 {w})",
+                                u32v.repr
+                            ));
+                        }
+                    }
+                    MirIntFmt::Bin { zero_pad_width } => {
+                        let narrow_ty = match *bits {
+                            8 => "i8",
+                            16 => "i16",
+                            32 => "i32",
+                            64 => "i64",
+                            _ => usize_ty.as_str(),
+                        };
+                        let nv = self.coerce(vv, narrow_ty, false);
+                        let w = i32::from(*zero_pad_width);
+                        if narrow_ty == "i64" {
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u64_bin(ptr {sink}, i64 {}, i32 {w})",
+                                nv.repr
+                            ));
+                        } else {
+                            let u32v = self.coerce(nv, "i32", false);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u32_bin(ptr {sink}, i32 {}, i32 {w})",
+                                u32v.repr
+                            ));
+                        }
+                    }
+                }
+            }
+            MirFmtChunk::Float { value, is_f64, fmt } => {
+                let vv = self.emit_expr(value)?;
+                match fmt {
+                    MirFloatFmt::Fixed { precision } => {
+                        let p = i32::from(*precision);
+                        if *is_f64 {
+                            let dv = self.coerce(vv, "double", true);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_f64_fixed(ptr {sink}, double {}, i32 {p})",
+                                dv.repr
+                            ));
+                        } else {
+                            let fv = self.coerce(vv, "float", true);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_f32_fixed(ptr {sink}, float {}, i32 {p})",
+                                fv.repr
+                            ));
+                        }
+                    }
+                    MirFloatFmt::Sci { precision } => {
+                        let p = i32::from(*precision);
+                        if *is_f64 {
+                            let dv = self.coerce(vv, "double", true);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_f64_sci(ptr {sink}, double {}, i32 {p})",
+                                dv.repr
+                            ));
+                        } else {
+                            let fv = self.coerce(vv, "float", true);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_f32_sci(ptr {sink}, float {}, i32 {p})",
+                                fv.repr
+                            ));
+                        }
+                    }
+                }
+            }
+            MirFmtChunk::Bool(value) => {
+                let vv = self.emit_expr(value)?;
+                let b1 = self.to_i1(vv);
+                let b8 = self.next_tmp();
+                self.emit_line(format!("{b8} = zext i1 {b1} to i8"));
+                self.emit_line(format!("call void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
+            }
+            MirFmtChunk::Str(value) => {
+                let vv = self.emit_expr(value)?;
+                let p = self.coerce_str_ptr(vv);
+                self.emit_line(format!(
+                    "call void @__syn_fmt_cstr(ptr {sink}, ptr {})",
+                    p.repr
+                ));
+            }
+            MirFmtChunk::Bytes(value) => {
+                let sl_ty = format!("{{ ptr, {usize_ty} }}");
+                let sv = self.emit_expr(value)?;
+                let dp = self.next_tmp();
+                let dl = self.next_tmp();
+                self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", sv.repr));
+                self.emit_line(format!("{dl} = extractvalue {sl_ty} {}, 1", sv.repr));
+                let dl32 = self.coerce(SsaVal::new(&usize_ty, dl), "i32", false);
+                self.emit_line(format!(
+                    "call void @__syn_fmt_bytes(ptr {sink}, ptr {dp}, i32 {})",
+                    dl32.repr
+                ));
+            }
+            MirFmtChunk::EnumName { enum_name, value } => {
+                let vv = self.emit_expr(value)?;
+                let v32 = self.coerce(vv, "i32", true);
+                let eid = sanitize_ident(enum_name);
+                let np = self.next_tmp();
+                self.emit_line(format!(
+                    "{np} = call ptr @__syn_enum_name_{eid}(i32 {})",
+                    v32.repr
+                ));
+                self.emit_line(format!("call void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
+            }
+            MirFmtChunk::DebugSlice { elem_ty, slice } => {
+                let sl_ty = format!("{{ ptr, {usize_ty} }}");
+                let sv = self.emit_expr(slice)?;
+                let raw_slice_elem_ty = match &slice.ty {
+                    MirType::Slice(inner) => (**inner).clone(),
+                    _ => elem_ty.clone(),
+                };
+                let el_lty = self.ctx.llvm_ty(&raw_slice_elem_ty);
+                let dp = self.next_tmp();
+                let dl = self.next_tmp();
+                self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", sv.repr));
+                self.emit_line(format!("{dl} = extractvalue {sl_ty} {}, 1", sv.repr));
+                self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 91)"));
+
+                let idx_slot = self.next_tmp();
+                self.emit_line(format!("{idx_slot} = alloca {usize_ty}, align 4"));
+                self.emit_line(format!("store {usize_ty} 0, ptr {idx_slot}, align 4"));
+
+                let cond_lbl = self.next_label("dsl_cond");
+                let body_lbl = self.next_label("dsl_body");
+                let sep_lbl = self.next_label("dsl_sep");
+                let val_lbl = self.next_label("dsl_val");
+                let end_lbl = self.next_label("dsl_end");
+                let sep_idx = self.ctx.intern_string(", ");
+
+                self.emit_term(format!("br label %{cond_lbl}"));
+                self.start_block(&cond_lbl);
+                let idx_v = self.next_tmp();
+                let more = self.next_tmp();
+                self.emit_line(format!("{idx_v} = load {usize_ty}, ptr {idx_slot}, align 4"));
+                self.emit_line(format!("{more} = icmp ult {usize_ty} {idx_v}, {dl}"));
+                self.emit_term(format!("br i1 {more}, label %{body_lbl}, label %{end_lbl}"));
+
+                self.start_block(&body_lbl);
+                let gt0 = self.next_tmp();
+                self.emit_line(format!("{gt0} = icmp ugt {usize_ty} {idx_v}, 0"));
+                self.emit_term(format!("br i1 {gt0}, label %{sep_lbl}, label %{val_lbl}"));
+
+                self.start_block(&sep_lbl);
+                self.emit_line(format!(
+                    "call void @__syn_fmt_bytes(ptr {sink}, ptr @.str.{sep_idx}, i32 2)"
+                ));
+                self.emit_term(format!("br label %{val_lbl}"));
+
+                self.start_block(&val_lbl);
+                let ep = self.next_tmp();
+                self.emit_line(format!(
+                    "{ep} = getelementptr {el_lty}, ptr {dp}, {usize_ty} {idx_v}"
+                ));
+                let ev = self.load_from_place_ptr(&ep, &raw_slice_elem_ty, false);
+                match elem_ty {
+                    MirType::Bool => {
+                        let b1 = self.to_i1(ev);
+                        let b8 = self.next_tmp();
+                        self.emit_line(format!("{b8} = zext i1 {b1} to i8"));
+                        self.emit_line(format!("call void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
+                    }
+                    MirType::F32 => {
+                        let fv = self.coerce(ev, "float", true);
+                        self.emit_line(format!(
+                            "call void @__syn_fmt_f32_fixed(ptr {sink}, float {}, i32 2)",
+                            fv.repr
+                        ));
+                    }
+                    MirType::F64 => {
+                        let dv = self.coerce(ev, "double", true);
+                        self.emit_line(format!(
+                            "call void @__syn_fmt_f64_fixed(ptr {sink}, double {}, i32 2)",
+                            dv.repr
+                        ));
+                    }
+                    MirType::Enum(ename) => {
+                        let v32 = self.coerce(ev, "i32", true);
+                        let eid = sanitize_ident(ename);
+                        let np = self.next_tmp();
+                        self.emit_line(format!(
+                            "{np} = call ptr @__syn_enum_name_{eid}(i32 {})",
+                            v32.repr
+                        ));
+                        self.emit_line(format!("call void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
+                    }
+                    MirType::Str => {
+                        let p = self.coerce_str_ptr(ev);
+                        self.emit_line(format!(
+                            "call void @__syn_fmt_cstr(ptr {sink}, ptr {})",
+                            p.repr
+                        ));
+                    }
+                    MirType::Ptr(_) => {
+                        self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 48)"));
+                        self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 120)"));
+                        if self.ctx.opts.target.ptr_bits() == 64 {
+                            let addr64 = self.coerce(ev, "i64", false);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u64_hex(ptr {sink}, i64 {}, i8 0, i32 1)",
+                                addr64.repr
+                            ));
+                        } else {
+                            let addr32 = self.coerce(ev, "i32", false);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u32_hex(ptr {sink}, i32 {}, i8 0, i32 1)",
+                                addr32.repr
+                            ));
+                        }
+                    }
+                    MirType::Slice(inner) if **inner == MirType::U8 => {
+                        let sp = self.next_tmp();
+                        let sln = self.next_tmp();
+                        self.emit_line(format!("{sp} = extractvalue {sl_ty} {}, 0", ev.repr));
+                        self.emit_line(format!("{sln} = extractvalue {sl_ty} {}, 1", ev.repr));
+                        let sln32 = self.coerce(SsaVal::new(&usize_ty, sln), "i32", false);
+                        self.emit_line(format!(
+                            "call void @__syn_fmt_bytes(ptr {sink}, ptr {sp}, i32 {})",
+                            sln32.repr
+                        ));
+                    }
+                    MirType::I64 => {
+                        let v64 = self.coerce(ev, "i64", true);
+                        self.emit_line(format!(
+                            "call void @__syn_fmt_i64_dec(ptr {sink}, i64 {})",
+                            v64.repr
+                        ));
+                    }
+                    MirType::U64 => {
+                        let v64 = self.coerce(ev, "i64", false);
+                        self.emit_line(format!(
+                            "call void @__syn_fmt_u64_dec(ptr {sink}, i64 {})",
+                            v64.repr
+                        ));
+                    }
+                    MirType::I8
+                    | MirType::I16
+                    | MirType::I32
+                    | MirType::Isize
+                    | MirType::EndianInt { signed: true, .. } => {
+                        if matches!(elem_ty, MirType::Isize)
+                            && self.ctx.opts.target.ptr_bits() == 64
+                        {
+                            let v64 = self.coerce(ev, "i64", true);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_i64_dec(ptr {sink}, i64 {})",
+                                v64.repr
+                            ));
+                        } else {
+                            let v32 = self.coerce(ev, "i32", true);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_i32_dec(ptr {sink}, i32 {})",
+                                v32.repr
+                            ));
+                        }
+                    }
+                    _ => {
+                        if matches!(elem_ty, MirType::Usize)
+                            && self.ctx.opts.target.ptr_bits() == 64
+                        {
+                            let v64 = self.coerce(ev, "i64", false);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u64_dec(ptr {sink}, i64 {})",
+                                v64.repr
+                            ));
+                        } else {
+                            let v32 = self.coerce(ev, "i32", false);
+                            self.emit_line(format!(
+                                "call void @__syn_fmt_u32_dec(ptr {sink}, i32 {})",
+                                v32.repr
+                            ));
+                        }
+                    }
+                }
+                let idx_next = self.next_tmp();
+                self.emit_line(format!("{idx_next} = add {usize_ty} {idx_v}, 1"));
+                self.emit_line(format!("store {usize_ty} {idx_next}, ptr {idx_slot}, align 4"));
+                self.emit_term(format!("br label %{cond_lbl}"));
+
+                self.start_block(&end_lbl);
+                self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 93)"));
+            }
         }
         Ok(())
     }
@@ -3378,6 +4464,19 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     ) -> SsaVal {
         let t = self.next_tmp();
         let ty = &lhs.ty;
+        if ty == "float" || ty == "double" {
+            let finst = match op {
+                MirAssignOp::Assign => unreachable!(),
+                MirAssignOp::AddAssign => "fadd",
+                MirAssignOp::SubAssign => "fsub",
+                MirAssignOp::MulAssign => "fmul",
+                MirAssignOp::DivAssign => "fdiv",
+                MirAssignOp::RemAssign => "frem",
+                _ => "fadd",
+            };
+            self.emit_line(format!("{t} = {finst} {ty} {}, {}", lhs.repr, rhs.repr));
+            return SsaVal::new(ty, t);
+        }
         let inst = match op {
             MirAssignOp::Assign => unreachable!(),
             MirAssignOp::AddAssign => "add",
@@ -3825,15 +4924,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
     }
 
-    fn load_from_place_ptr(&mut self, ptr: &str, raw_ty: &MirType, packed: bool) -> SsaVal {
+    fn load_from_place_ptr(&mut self, ptr: &str, raw_ty: &MirType, _packed: bool) -> SsaVal {
         let lty = self.ctx.llvm_ty(raw_ty);
-        let align = if packed || matches!(raw_ty, MirType::EndianInt { .. }) {
-            1
-        } else {
-            1
-        };
+        // `align 1` keeps unaligned `packed struct` / wire-cast pointer loads fault-safe while
+        // `llc` folds known-aligned stack/frame accesses to natural load instructions.
         let raw = self.next_tmp();
-        self.emit_line(format!("{raw} = load {lty}, ptr {ptr}, align {align}"));
+        self.emit_line(format!("{raw} = load {lty}, ptr {ptr}, align 1"));
         if let MirType::EndianInt {
             bits,
             big_endian: true,
@@ -3909,17 +5005,41 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     }
                 } else if dst_lty == "void" {
                     Ok(SsaVal::new("void", "0"))
+                } else if dst_lty == "float" {
+                    let fb = ((*v as f32) as f64).to_bits();
+                    Ok(SsaVal::new("float", format!("0x{fb:016X}")))
+                } else if dst_lty == "double" {
+                    let db = (*v as f64).to_bits();
+                    Ok(SsaVal::new("double", format!("0x{db:016X}")))
                 } else if !dst_lty.starts_with('i') {
                     Ok(SsaVal::new(dst_lty, "zeroinitializer"))
                 } else {
                     Ok(SsaVal::new(dst_lty, format!("{v}")))
                 }
             }
+            MirExprKind::FloatLit(bits) => {
+                let target_fty = if dst_lty == "float" || expr.ty == MirType::F32 {
+                    "float"
+                } else {
+                    "double"
+                };
+                let norm_bits = if target_fty == "float" {
+                    let f = f64::from_bits(*bits) as f32;
+                    if f.is_nan() {
+                        0x7FF8_0000_0000_0000u64
+                    } else {
+                        (f as f64).to_bits()
+                    }
+                } else {
+                    *bits
+                };
+                Ok(SsaVal::new(target_fty, format!("0x{norm_bits:016X}")))
+            }
             MirExprKind::BoolLit(b) => Ok(SsaVal::new("i8", if *b { "1" } else { "0" })),
             MirExprKind::TicksLit(t) => Ok(SsaVal::new(dst_lty, format!("{t}"))),
             MirExprKind::StringLit(s) => {
                 let idx = self.ctx.intern_string(s);
-                let slen = s.len();
+                let slen = zev_ast::decoded_string_byte_len(s);
                 if matches!(expr.ty, MirType::Slice(_)) {
                     let usize_ty = self.ctx.opts.target.usize_llvm_ty();
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
@@ -3950,8 +5070,34 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(SsaVal::new("i32", format!("{disc}")))
             }
             MirExprKind::ConstRef(name) => {
-                let v = self.ctx.consts.get(name).copied().unwrap_or(1);
-                Ok(SsaVal::new(dst_lty, format!("{v}")))
+                if expr.ty.is_float() || dst_lty == "float" || dst_lty == "double" {
+                    let raw = self
+                        .ctx
+                        .float_consts
+                        .get(name)
+                        .copied()
+                        .or_else(|| self.ctx.consts.get(name).copied().map(|v| (v as f64).to_bits()))
+                        .unwrap_or(0);
+                    let target_fty = if dst_lty == "float" || expr.ty == MirType::F32 {
+                        "float"
+                    } else {
+                        "double"
+                    };
+                    let norm = if target_fty == "float" {
+                        let f = f64::from_bits(raw) as f32;
+                        if f.is_nan() {
+                            0x7FF8_0000_0000_0000u64
+                        } else {
+                            (f as f64).to_bits()
+                        }
+                    } else {
+                        raw
+                    };
+                    Ok(SsaVal::new(target_fty, format!("0x{norm:016X}")))
+                } else {
+                    let v = self.ctx.consts.get(name).copied().unwrap_or(1);
+                    Ok(SsaVal::new(dst_lty, format!("{v}")))
+                }
             }
             MirExprKind::GlobalPrimAddr(name) => {
                 Ok(SsaVal::new("ptr", format!("@__syn_prim_{}", sanitize_ident(name))))
@@ -3992,7 +5138,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     MirUnaryOp::Neg => {
                         let sc = self.coerce(sv, &dst_lty, true);
                         let t = self.next_tmp();
-                        self.emit_line(format!("{t} = sub {dst_lty} 0, {}", sc.repr));
+                        if dst_lty == "float" || dst_lty == "double" {
+                            self.emit_line(format!("{t} = fneg {dst_lty} {}", sc.repr));
+                        } else {
+                            self.emit_line(format!("{t} = sub {dst_lty} 0, {}", sc.repr));
+                        }
                         Ok(SsaVal::new(dst_lty, t))
                     }
                     MirUnaryOp::Not => {
@@ -4021,8 +5171,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 target_ty,
             } => {
                 let sv = self.emit_expr(sub)?;
+                if *target_ty == MirType::Bool {
+                    let i1v = self.to_i1(sv);
+                    let b8 = self.next_tmp();
+                    self.emit_line(format!("{b8} = zext i1 {i1v} to i8"));
+                    return Ok(SsaVal::new("i8", b8));
+                }
                 let t_lty = self.ctx.llvm_ty(&target_ty.host_value_type());
-                let signed = !sub.ty.is_unsigned();
+                let signed = if sub.ty.is_float() {
+                    !target_ty.is_unsigned()
+                } else {
+                    !sub.ty.is_unsigned()
+                };
                 Ok(self.coerce(sv, &t_lty, signed))
             }
             MirExprKind::StructLit {
@@ -4552,6 +5712,47 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         args: &[MirExpr],
         ret_mir_ty: &MirType,
     ) -> Result<SsaVal, CodegenError> {
+        // Indirect call through a local/parameter/temp `MirVar` of `MirType::FnPtr`
+        if callee != "assert" {
+            if let Some((vid, params, ret)) =
+                self.vars.iter().rev().find_map(|v| match &v.ty {
+                    MirType::FnPtr { params, ret } if v.name == callee => {
+                        Some((v.id, params.clone(), (**ret).clone()))
+                    }
+                    _ => None,
+                })
+            {
+                let fp_ty = MirType::FnPtr {
+                    params: params.clone(),
+                    ret: Box::new(ret.clone()),
+                };
+                let fp_addr = self.var_ptr(vid);
+                let fp_val = self.load_from_place_ptr(&fp_addr, &fp_ty, false);
+                let fp_ptr = self.coerce(fp_val, "ptr", false);
+                let ret_lty = self.ctx.llvm_ty(&ret.host_value_type());
+                let mut call_args = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    let av = self.emit_expr(a)?;
+                    if let Some(pty_mir) = params.get(i) {
+                        let pty = self.ctx.llvm_ty(&pty_mir.host_value_type());
+                        let c = self.coerce(av, &pty, !a.ty.is_unsigned());
+                        call_args.push(format!("{} {}", c.ty, c.repr));
+                    } else {
+                        call_args.push(format!("{} {}", av.ty, av.repr));
+                    }
+                }
+                let joined = call_args.join(", ");
+                if ret.is_void() || ret_lty == "void" {
+                    self.emit_line(format!("call void {}({joined})", fp_ptr.repr));
+                    return Ok(SsaVal::new("void", "0"));
+                } else {
+                    let r = self.next_tmp();
+                    self.emit_line(format!("{r} = call {ret_lty} {}({joined})", fp_ptr.repr));
+                    return Ok(SsaVal::new(ret_lty, r));
+                }
+            }
+        }
+
         if !is_extern_c {
             if let Some(sig) = self.ctx.fn_sigs.get(callee).cloned() {
                 let mut call_args = Vec::new();
@@ -4722,6 +5923,70 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
         let lv = self.emit_expr(lhs)?;
         let rv = self.emit_expr(rhs)?;
+        let is_fp = lhs.ty.is_float()
+            || rhs.ty.is_float()
+            || lv.ty == "float"
+            || lv.ty == "double"
+            || rv.ty == "float"
+            || rv.ty == "double";
+
+        if is_fp {
+            let res_lty = self.ctx.llvm_ty(&res_ty.host_value_type());
+            let common_fty = if lv.ty == "double"
+                || rv.ty == "double"
+                || lhs.ty == MirType::F64
+                || rhs.ty == MirType::F64
+                || res_lty == "double"
+            {
+                "double"
+            } else {
+                "float"
+            };
+            let lc = self.coerce(lv, common_fty, !lhs.ty.is_unsigned());
+            let rc = self.coerce(rv, common_fty, !rhs.ty.is_unsigned());
+
+            let is_cmp = matches!(
+                op,
+                MirBinOp::Eq
+                    | MirBinOp::Ne
+                    | MirBinOp::Lt
+                    | MirBinOp::Le
+                    | MirBinOp::Gt
+                    | MirBinOp::Ge
+            );
+            if is_cmp {
+                let fpred = match op {
+                    MirBinOp::Eq => "oeq",
+                    MirBinOp::Ne => "une",
+                    MirBinOp::Lt => "olt",
+                    MirBinOp::Le => "ole",
+                    MirBinOp::Gt => "ogt",
+                    MirBinOp::Ge => "oge",
+                    _ => unreachable!(),
+                };
+                let cmp = self.next_tmp();
+                let b8 = self.next_tmp();
+                self.emit_line(format!(
+                    "{cmp} = fcmp {fpred} {common_fty} {}, {}",
+                    lc.repr, rc.repr
+                ));
+                self.emit_line(format!("{b8} = zext i1 {cmp} to i8"));
+                return Ok(SsaVal::new("i8", b8));
+            }
+
+            let finst = match op {
+                MirBinOp::Add => "fadd",
+                MirBinOp::Sub => "fsub",
+                MirBinOp::Mul => "fmul",
+                MirBinOp::Div => "fdiv",
+                MirBinOp::Rem => "frem",
+                _ => "fadd",
+            };
+            let t = self.next_tmp();
+            self.emit_line(format!("{t} = {finst} {common_fty} {}, {}", lc.repr, rc.repr));
+            return Ok(self.coerce(SsaVal::new(common_fty, t), &res_lty, true));
+        }
+
         let signed = !lhs.ty.is_unsigned() || !rhs.ty.is_unsigned();
 
         // Pick common operand type

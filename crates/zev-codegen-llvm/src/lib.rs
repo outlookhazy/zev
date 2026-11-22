@@ -956,49 +956,55 @@ mod tests {
             }
 
             task inbody_periodic() {
-                u32 p = compute_period_ms(2);
+                u32 p = compute_period_ms(4);
                 loop every p {
                     u32 next = inbody_runs.read() + 1;
                     inbody_runs.publish(next);
                     if (next == 1) {
-                        /* Stall in-body past 4 full 10ms periods (t=0 -> t=45ms)! */
+                        /* Stall in-body past 4 full 20ms periods (t=0 -> t=85ms)! */
                         noyield {
-                            while (sys.now_ms() < 45) {}
+                            while (sys.now_ms() < 85) {}
                         }
                     }
                 }
             }
 
             task sleep_periodic() {
-                loop every 10ms {
+                loop every 20ms {
                     sleep_runs.publish(sleep_runs.read() + 1);
                 }
             }
 
             task critical_staller() {
-                delay(51ms);
-                u32 ib_at_51 = inbody_runs.read();
+                /* Wait at @low until inbody_periodic completes:
+                 * iter 1 (t=0..85ms) + iter 2 resynced (t=85ms) + iter 3 on grid (t=100ms) == 3! */
+                while (inbody_runs.read() < 3) {
+                    delay(2ms);
+                }
+                u32 ib_before = inbody_runs.read();
                 u32 sb_before = sleep_runs.read();
+                u32 t_start = sys.now_ms();
+                u32 stall_until = t_start + 85;
 
-                /* Both 10ms tasks are parked sleeping when @critical stalls CPU past 4 periods (51ms -> 92ms)! */
+                /* Elevate to @critical and stall CPU past 4 full 20ms periods while peers sleep! */
+                set_priority(@critical);
                 noyield {
-                    while (sys.now_ms() < 92) {}
+                    while (sys.now_ms() < stall_until) {}
                 }
 
-                /* Yield for 1ms (t=92ms -> t=93ms, well before the next 100ms grid boundary!):
-                 * Each 10ms task MUST run EXACTLY 1 resynced pass (zero catch-up bursts!). */
-                delay(1ms);
+                /* Drop back to @low and yield immediately: each 20ms peer runs 1 resynced pass (zero bursts)! */
+                set_priority(@low);
+                checkpoint();
+
                 u32 ib_after = inbody_runs.read();
                 u32 sb_after = sleep_runs.read();
 
-                sys.log_kv("ib_at_52=", ib_at_51 as i32);
+                sys.log_kv("ib_before=", ib_before as i32);
                 sys.log_kv("ib_after=", ib_after as i32);
                 sys.log_kv("sb_delta=", (sb_after - sb_before) as i32);
 
-                /* At t=51ms: iter 1 (t=0..45ms) + iter 2 resynced (t=45ms) + iter 3 on grid (t=50ms) == 3 (NOT 6!) */
-                assert(ib_at_51 == 3);
-                /* After 41ms sleep stall (51ms -> 92ms), both tasks ran 1 resynced pass, NOT 4! */
-                assert(ib_after == ib_at_51 + 1);
+                assert(ib_before == 3);
+                assert(ib_after == 4);
                 assert(sb_after == sb_before + 1);
 
                 sys.exit(0);
@@ -1006,7 +1012,7 @@ mod tests {
 
             fn main() {
                 sys.use_systick(12_000_000);
-                spawn critical_staller() @critical;
+                spawn critical_staller() @low;
                 spawn inbody_periodic() @high;
                 spawn sleep_periodic() @normal;
             }
@@ -1028,7 +1034,7 @@ mod tests {
         assert!(res.build.audit.is_zero_heap_freestanding());
         assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
         let out = &res.exec.stdout;
-        assert!(out.contains("ib_at_52=3\n"), "out={out}");
+        assert!(out.contains("ib_before=3\n"), "out={out}");
         assert!(out.contains("ib_after=4\n"), "out={out}");
         assert!(out.contains("sb_delta=1\n"), "out={out}");
     }
@@ -1075,17 +1081,23 @@ mod tests {
             }
 
             task driver() {
-                delay(2ms);
+                while (actor_state.read() == 0) {
+                    delay(2ms);
+                }
                 u32 init_st = actor_state.read();
                 actor_q.send(AddWork);
-                delay(2ms);
+                while (actor_state.read() == 510) {
+                    delay(2ms);
+                }
                 u32 work1_st = actor_state.read();
                 u32 work1_prio = last_turn_prio.read();
 
                 /* Fire NVIC EXTI2 -> posts TriggerRestart with boost: @critical */
                 syn_nvic_pend_irq(2);
                 restart_ack.wait();
-                delay(2ms);
+                while (actor_state.read() != 510) {
+                    delay(2ms);
+                }
 
                 u32 boosted_prio = last_turn_prio.read();
                 u32 defers_after = actor_defers.read();
@@ -1093,7 +1105,9 @@ mod tests {
 
                 /* Send another unboosted AddWork to prove @low priority (3) was restored on restart! */
                 actor_q.send(AddWork);
-                delay(2ms);
+                while (actor_state.read() == 510) {
+                    delay(2ms);
+                }
                 u32 restored_prio = last_turn_prio.read();
                 u32 work2_st = actor_state.read();
 
@@ -1684,5 +1698,683 @@ mod tests {
         assert!(out.contains("after_seed=77\n"), "out={out}");
         assert!(out.contains("after_local=0\n"), "out={out}");
         assert!(out.contains("defer_ran=10\n"), "out={out}");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Section 6.2 Wave 2 — Bare-Metal Floats, Generics & Zero-Heap Formatting
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn wave2_f32_f64_arithmetic_remainder_casts_and_yield_hoisting_in_qemu() {
+        let src = r#"
+            watch<f32> pid_out_f32 = 0.0f32;
+            watch<f64> rem_out_f64 = 0.0;
+            watch<i32> cast_out_i32 = 0;
+
+            f32 clamp_f32(f32 x, f32 lo, f32 hi) {
+                if (x < lo) { return lo; }
+                if (x > hi) { return hi; }
+                return x;
+            }
+
+            task pid_worker() {
+                f32 integral = 1.25f32;
+                f64 accum64 = 10.5;
+                u32 step = 0;
+
+                loop every 1ms {
+                    f32 err = ((step + 1) as f32) * 1.5f32;
+                    integral += err * 0.5f32;
+                    integral = clamp_f32(integral, -100.0f32, 100.0f32);
+
+                    f32 mod32 = integral % 1.0f32;
+                    f64 wide = (integral as f64) + accum64;
+                    wide %= 3.25;
+                    f64 neg_rem = (-7.5) % 2.0;
+
+                    delay(1ms);
+
+                    pid_out_f32.publish(integral + mod32);
+                    rem_out_f64.publish(wide + neg_rem);
+                    cast_out_i32.publish((integral * 4.0f32) as i32);
+
+                    step += 1;
+                    if (step >= 2) {
+                        println(f"PID:pid={pid_out_f32.read():.2} rem={rem_out_f64.read():.2} ci={cast_out_i32.read()}");
+                        sys.exit(0);
+                    }
+                }
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn pid_worker() @critical;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave2 floats");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave2 floats");
+
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "pid_worker")
+            .expect("pid_worker blueprint");
+        assert!(
+            bp.vars
+                .iter()
+                .any(|v| v.name == "integral" && v.ty == zev_mir::MirType::F32 && v.hoisted),
+            "f32 `integral` must be hoisted across yield"
+        );
+        assert!(
+            bp.vars
+                .iter()
+                .any(|v| v.name == "wide" && v.ty == zev_mir::MirType::F64 && v.hoisted),
+            "f64 `wide` must be hoisted across yield"
+        );
+
+        let dir = test_out_dir();
+        let esp_img = build_esp32c6_image(
+            &mir,
+            &dir.join("wave2_floats_esp32c6.elf"),
+            &dir.join("wave2_floats_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 wave2 floats image");
+        verify_ll_with_opt(&esp_img.elf.ll_path).expect("opt verify ESP32-C6 wave2 floats");
+        assert!(esp_img.elf.audit.is_zero_heap_freestanding());
+
+        let out_elf = dir.join("wave2_floats_cm3.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave2 floats in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify Cortex-M3 wave2 floats");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("PID:pid=4.00 rem=-0.50 ci=14\n"),
+            "stdout={}",
+            res.exec.stdout
+        );
+    }
+
+    #[test]
+    fn wave2_zero_heap_format_strings_gc_sections_sci_debug_and_enums_in_qemu() {
+        let dir = test_out_dir();
+
+        // 1. Verify `:e` scientific float symbols are dead-stripped to 0B by `ld.lld --gc-sections`
+        //    when `:e` is NOT used, and unformatted enums emit zero `.rodata` lookup helpers!
+        let src_no_sci = r#"
+            enum Mode { Idle, Armed, Fault }
+            enum UnformattedSecret { HiddenA, HiddenB }
+
+            fn main() {
+                Mode m = Mode::Armed;
+                f32 v = 3.14159f32;
+                println(f"mode={m} v={v}");
+                sys.exit(0);
+            }
+        "#;
+        let prog_no_sci = zev_parser::parse_str(src_no_sci).expect("parse no_sci");
+        let mir_no_sci = zev_mir::lower_program(&prog_no_sci).expect("lower no_sci");
+        assert_eq!(mir_no_sci.formatted_enums, vec!["Mode".to_string()]);
+
+        let ll_no_sci = emit_llvm_ir(&mir_no_sci).expect("emit no_sci ll");
+        assert!(ll_no_sci.contains("@__syn_enum_name_Mode"));
+        assert!(
+            !ll_no_sci.contains("@__syn_enum_name_UnformattedSecret"),
+            "Unformatted enum must NOT emit `.rodata` name table"
+        );
+        assert!(
+            !ll_no_sci.contains("@__syn_fmt_f64_sci")
+                && !ll_no_sci.contains("@__syn_fmt_f32_sci"),
+            "Fixed-only float formatting must not emit `:e` IR helpers"
+        );
+
+        let res_no_sci = run_qemu_cortex_m(
+            &mir_no_sci,
+            &dir.join("wave2_no_sci_cm3.elf"),
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run no_sci in QEMU");
+        assert_eq!(res_no_sci.exec.exit_code, 0);
+        assert!(res_no_sci.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res_no_sci.exec.stdout, "mode=Armed v=3.14\n");
+        assert!(
+            !res_no_sci
+                .build
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s.contains("fmt_f64_sci") || s.contains("fmt_f32_sci")),
+            "expected `ld.lld --gc-sections` to strip `:e` formatters completely when unused; syms={:?}",
+            res_no_sci.build.audit.defined_symbols
+        );
+
+        let esp_no_sci = build_esp32c6_image(
+            &mir_no_sci,
+            &dir.join("wave2_no_sci_esp32c6.elf"),
+            &dir.join("wave2_no_sci_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 no_sci");
+        assert!(esp_no_sci.elf.audit.is_zero_heap_freestanding());
+        assert!(
+            !esp_no_sci
+                .elf
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s.contains("fmt_f64_sci") || s.contains("fmt_f32_sci")),
+            "expected ESP32-C6 `ld.lld --gc-sections` to strip `:e` formatters completely when unused"
+        );
+
+        // 2. Full live execution of fixed floats, Arduino edge cases, `:e`, hex/bin/pad, `{pkt:?}`, `{arr:?}`, and enum names!
+        let src_full = r#"
+            enum Mode { Idle, Armed, Fault }
+
+            struct Vec2 {
+                f32 x;
+                f32 y;
+            }
+
+            struct TelemetryPkt {
+                u16 id;
+                Mode mode;
+                Vec2 pos;
+            }
+
+            fn main() {
+                f64 huge = 1.0e200;
+                f64 pos_inf = huge * huge;
+                f64 neg_inf = -pos_inf;
+                f64 nan_val = pos_inf - pos_inf;
+                f64 big_ovf = 1.0e12;
+                f64 neg_ovf = -1.0e12;
+                f64 neg_zero = -0.0;
+
+                println(f"FIXED:{3.14159}:{2.5:.0}:{-2.5:.0}:{1.996:.2}:{neg_zero}");
+                println(f"EDGE:{nan_val}:{pos_inf}:{neg_inf}:{big_ovf}:{neg_ovf}");
+                println(f"SCI:{1234.5:e}:{-0.0045:.3e}:{9.999:.2e}:{0.0:e}");
+
+                u16 reg = 0x00AB;
+                i8 neg_byte = -1;
+                u8 bits = 0b0010_1101;
+                bool ok = true;
+                println(f"INT:0x{reg:04x}:0x{reg:04X}:0x{neg_byte:02x}:0b{bits:08b}:{ok}:{!ok}");
+
+                TelemetryPkt pkt = TelemetryPkt {
+                    id: 7,
+                    mode: Mode::Armed,
+                    pos: Vec2 { x: 1.5f32, y: -2.25f32 },
+                };
+                [3]i32 samples = [-10, 0, 25];
+                println(f"DBG:{pkt:?} arr={samples:?}");
+                sys.exit(0);
+            }
+        "#;
+        let prog_full = zev_parser::parse_str(src_full).expect("parse wave2 fmt full");
+        let mir_full = zev_mir::lower_program(&prog_full).expect("lower wave2 fmt full");
+
+        let esp_full = build_esp32c6_image(
+            &mir_full,
+            &dir.join("wave2_fmt_full_esp32c6.elf"),
+            &dir.join("wave2_fmt_full_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 wave2 fmt full");
+        verify_ll_with_opt(&esp_full.elf.ll_path).expect("opt verify ESP32-C6 wave2 fmt full");
+        assert!(esp_full.elf.audit.is_zero_heap_freestanding());
+        assert!(
+            esp_full
+                .elf
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_fmt_f64_sci"),
+            "expected `__syn_fmt_f64_sci` symbol present when `:e` IS used"
+        );
+
+        let res_full = run_qemu_cortex_m(
+            &mir_full,
+            &dir.join("wave2_fmt_full_cm3.elf"),
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave2 fmt full in QEMU");
+        verify_ll_with_opt(&res_full.build.ll_path).expect("opt verify Cortex-M3 wave2 fmt full");
+        assert!(res_full.build.audit.is_zero_heap_freestanding());
+        assert!(
+            res_full
+                .build
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_fmt_f64_sci"),
+            "expected `__syn_fmt_f64_sci` symbol present on Cortex-M3 when `:e` IS used"
+        );
+        assert_eq!(res_full.exec.exit_code, 0, "stdout={}", res_full.exec.stdout);
+        let out = &res_full.exec.stdout;
+        assert!(out.contains("FIXED:3.14:3:-3:2.00:0.00\n"), "out={out}");
+        assert!(out.contains("EDGE:nan:inf:-inf:ovf:-ovf\n"), "out={out}");
+        assert!(out.contains("SCI:1.23e+03:-4.500e-03:1.00e+01:0.00e+00\n"), "out={out}");
+        assert!(out.contains("INT:0x00ab:0x00AB:0xff:0b00101101:true:false\n"), "out={out}");
+        assert!(
+            out.contains("DBG:TelemetryPkt { id: 7, mode: Armed, pos: Vec2 { x: 1.50, y: -2.25 } } arr=[-10, 0, 25]\n"),
+            "out={out}"
+        );
+    }
+
+    #[test]
+    fn wave2_fmt_buf_exact_fit_yield_hoisting_and_clamped_truncation_in_qemu() {
+        let src = r#"
+            enum Mode { Idle, Active }
+
+            task logger() {
+                [32]u8 ok_buf;
+                Mode m = Mode::Active;
+                f32 v = 12.34f32;
+                []u8 msg = fmt_buf(ok_buf, f"m={m} v={v:.1}") catch {
+                    sys.exit(2);
+                };
+
+                delay(1ms);
+                println(f"OK:{msg}");
+
+                [16]u8 small_backing;
+                []u8 small = small_backing[0..6];
+                []u8 res = fmt_buf(small, f"voltage={v:.2}") catch (FmtErr err, []u8 clamped) {
+                    println(f"ERR:{err}:{clamped}:{clamped.len}");
+                    sys.exit(0);
+                };
+                println(f"UNEXPECTED:{res}");
+                sys.exit(3);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn logger() @normal;
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave2 fmt_buf");
+        let mir = zev_mir::lower_program(&prog).expect("lower wave2 fmt_buf");
+
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "logger")
+            .expect("logger blueprint");
+        assert!(
+            bp.vars.iter().any(|v| v.name == "ok_buf" && v.hoisted),
+            "`ok_buf` backing `msg` slice across `delay(1ms)` MUST be hoisted into task frame"
+        );
+
+        let out_elf = test_out_dir().join("wave2_fmt_buf_cm3.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &out_elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run wave2 fmt_buf in QEMU");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave2 fmt_buf");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        let out = &res.exec.stdout;
+        assert!(out.contains("OK:m=Active v=12.3\n"), "out={out}");
+        assert!(out.contains("ERR:Truncated:voltag:6\n"), "out={out}");
+    }
+
+    #[test]
+    fn wave2_monomorphized_structs_fns_and_ram_report_in_qemu() {
+        let src = r#"
+            const usize VEC_CAP = 4;
+
+            struct FixedVec<T, usize N> {
+                [N]T data;
+                usize len;
+            }
+
+            T clamp<T>(T x, T lo, T hi) {
+                if (x < lo) { return lo; }
+                if (x > hi) { return hi; }
+                return x;
+            }
+
+            fn main() {
+                FixedVec<f32, VEC_CAP> v = FixedVec<f32, VEC_CAP> {
+                    data: [1.0f32, 2.0f32, 3.0f32, 4.0f32],
+                    len: 4,
+                };
+                FixedVec<i32, 2> iv = FixedVec<i32, 2> {
+                    data: [-50, 120],
+                    len: 2,
+                };
+                f32 cf = clamp(v.data[3] * 3.0f32, 0.0f32, 9.5f32);
+                i32 ci = clamp::<i32>(iv.data[0], -20, 20);
+                println(f"MONO:len={v.len} cf={cf:.2} ci={ci}");
+                sys.exit(0);
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave2 generics");
+        let (mono_progs, sema_model) = zev_sema::analyze_and_monomorphize_programs(
+            &[prog],
+            &zev_sema::AnalyzeOptions::default(),
+        )
+        .into_result()
+        .expect("sema + monomorphize wave2 generics");
+
+        assert_eq!(sema_model.monomorphized_instances.len(), 4);
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower monomorphized wave2 generics");
+        assert_eq!(mir.monomorphized_instances.len(), 4);
+
+        let table = mir.ram_report.format_table();
+        assert!(
+            table.contains("7. Monomorphized Generic Instantiations")
+                && table.contains("FixedVec<f32, 4>")
+                && table.contains("FixedVec__f32__4")
+                && table.contains("FixedVec<i32, 2>")
+                && table.contains("FixedVec__i32__2")
+                && table.contains("clamp<f32>")
+                && table.contains("clamp__f32")
+                && table.contains("clamp<i32>")
+                && table.contains("clamp__i32"),
+            "table:\n{table}"
+        );
+
+        let dir = test_out_dir();
+        let esp_img = build_esp32c6_image(
+            &mir,
+            &dir.join("wave2_mono_esp32c6.elf"),
+            &dir.join("wave2_mono_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 wave2 mono");
+        assert!(esp_img.elf.audit.is_zero_heap_freestanding());
+
+        for level in ["-O2", "-Oz"] {
+            let mut opts = CodegenOptions::default();
+            opts.opt_level = level.to_string();
+            let tag = level.trim_start_matches('-');
+            let res = run_qemu_cortex_m(
+                &mir,
+                &dir.join(format!("wave2_mono_{tag}.elf")),
+                &opts,
+                &QemuRunOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("wave2 mono failed at {level}: {e}"));
+            verify_ll_with_opt(&res.build.ll_path).expect("opt verify wave2 mono");
+            assert!(res.build.audit.is_zero_heap_freestanding());
+            assert_eq!(res.exec.exit_code, 0);
+            assert_eq!(res.exec.stdout, "MONO:len=4 cf=9.50 ci=-20\n");
+        }
+    }
+
+    #[test]
+    fn wave2_review_fixes_sat_casts_const_float_raw_bytes_empty_fmt_buf_and_place_scan_in_qemu() {
+        let dir = test_out_dir();
+
+        // Part 1 (M1): Float expression appearing ONLY inside `MirPlace::Index` must pull in soft-float shims.
+        let src_place_only = r#"
+            fn main() {
+                u32 arr[4] = [0, 0, 0, 0];
+                arr[((sys.now_ms() as f32) + 1.5f32) as usize] = 99;
+                if (arr[1] == 99) {
+                    sys.exit(0);
+                }
+                sys.exit(1);
+            }
+        "#;
+        let prog_p = zev_parser::parse_str(src_place_only).expect("parse place_only");
+        zev_sema::analyze_program(&prog_p).expect("sema place_only");
+        let mir_p = zev_mir::lower_program(&prog_p).expect("mir place_only");
+
+        let esp_p = build_esp32c6_image(
+            &mir_p,
+            &dir.join("wave2_r2_place_esp32c6.elf"),
+            &dir.join("wave2_r2_place_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 place_only");
+        assert!(esp_p.elf.audit.is_zero_heap_freestanding());
+
+        let res_p = run_qemu_cortex_m(
+            &mir_p,
+            &dir.join("wave2_r2_place_cm3.elf"),
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run Cortex-M3 place_only");
+        assert!(res_p.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res_p.exec.exit_code, 0);
+
+        // Part 2 (H6, H7, H8, H9, H13, H2/M3, L-Fmt): Full sema -> mir -> QEMU (-O0 & -O2) + ESP32-C6 parity!
+        let src = r#"
+            const f64 CF_A = 1.5;
+            const f64 CF_B = 2.5;
+            const bool C_LT = CF_A < CF_B;
+            const bool C_EQ = CF_A == CF_B;
+            const i32 C_I32 = 7.9 as i32;
+            const u32 C_U32_HI = 3000000000.0 as u32;
+
+            watch<i32> w_cast = (9.75 as i32);
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                f64 rt0 = sys.now_ms() as f64;
+                f32 rt0_f32 = sys.now_ms() as f32;
+
+                // H6: Unsigned float-to-int casts in [2^31..2^32-1] and [2^63..2^64-1]
+                u32 u32_rt = (3000000000.0 + rt0) as u32;
+                u64 u64_rt = (10000000000000000000.0 + rt0) as u64;
+                u32 u32_ct = (3000000000.0) as u32;
+
+                // H7: Saturating out-of-range, narrow, negative-to-unsigned, and NaN casts (0 poison!)
+                i32 sat_hi = (1.0e20 + rt0) as i32;
+                i32 sat_lo = (-1.0e20 + rt0) as i32;
+                i32 sat_ct = (1.0e20) as i32;
+                u8  sat_u8 = (300.0f32 + rt0_f32) as u8;
+                i8  sat_i8 = (-200.0f32 + rt0_f32) as i8;
+                u32 neg_u32 = (-1.5f32 + rt0_f32) as u32;
+                f64 nan_v = rt0 / rt0;
+                i32 nan_i32 = nan_v as i32;
+                u64 nan_u64 = nan_v as u64;
+
+                println(f"H6:{u32_rt}:{u64_rt}:{u32_ct}");
+                println(f"H7:{sat_hi}:{sat_lo}:{sat_ct}:{sat_u8}:{sat_i8}:{neg_u32}:{nan_i32}:{nan_u64}");
+                println(f"H8:{C_LT}:{C_EQ}:{C_I32}:{C_U32_HI}:{w_cast.read()}");
+
+                // H9: Raw byte escapes \x80..\xFF (`len == 2`, exact bytes 0xFF, 0xAA)
+                [2]u8 raw_buf;
+                []u8 raw_sl = fmt_buf(raw_buf, f"\xFF\xAA");
+                println(f"H9:{raw_sl.len}:0x{raw_sl[0]:02x}:0x{raw_sl[1]:02x}");
+
+                // H13: Zero-init empty []u8 (`ptr == null, len == 0`) in fmt_buf must NEVER write to UART0
+                []u8 empty_dst;
+                []u8 empty_res = fmt_buf(empty_dst, f"LEAK_SECRET") catch (FmtErr err, []u8 clamped) {
+                    println(f"H13:{err}:{clamped.len}");
+                    clamped
+                };
+                assert(empty_res.len == 0);
+
+                // H2/M3: DebugSlice of pointers formats uniformly as 0x<lowercase hex>
+                u32 target_val = 42;
+                [2]*u32 ptrs = [0 as *u32, &target_val];
+                println(f"PTRS:{ptrs:?}");
+
+                // L-Fmt + M6: Negative values rounding to zero suppress leading '-', and deep subnormal/extreme `:e` matches C99
+                f64 tiny_neg = -0.0001;
+                f64 subhalf_neg = -0.4;
+                println(f"NEGZ:{tiny_neg:.2}:{subhalf_neg:.0}:{9.95e-306:.1e}:{1.25e-307:.1e}");
+
+                sys.exit(0);
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse wave2 r2");
+        zev_sema::analyze_program(&prog).expect("sema wave2 r2");
+        let mir = zev_mir::lower_program(&prog).expect("mir wave2 r2");
+
+        let esp_img = build_esp32c6_image(
+            &mir,
+            &dir.join("wave2_r2_esp32c6.elf"),
+            &dir.join("wave2_r2_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 wave2 r2");
+        verify_ll_with_opt(&esp_img.elf.ll_path).expect("opt verify ESP32-C6 wave2 r2");
+        assert!(esp_img.elf.audit.is_zero_heap_freestanding());
+
+        for level in ["-O0", "-O2"] {
+            let mut opts = CodegenOptions::default();
+            opts.opt_level = level.to_string();
+            let tag = level.trim_start_matches('-');
+            let res = run_qemu_cortex_m(
+                &mir,
+                &dir.join(format!("wave2_r2_cm3_{tag}.elf")),
+                &opts,
+                &QemuRunOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("wave2 r2 failed at {level}: {e}"));
+            verify_ll_with_opt(&res.build.ll_path).expect("opt verify Cortex-M3 wave2 r2");
+            assert!(res.build.audit.is_zero_heap_freestanding());
+            assert_eq!(res.exec.exit_code, 0, "level={level} out={}", res.exec.stdout);
+
+            let out = &res.exec.stdout;
+            assert!(
+                !out.contains("LEAK_SECRET"),
+                "H13 regression: zero-init `[]u8` leaked to UART0 at {level}: {out}"
+            );
+            assert!(
+                out.contains("H6:3000000000:10000000000000000000:3000000000\n"),
+                "level={level} out={out}"
+            );
+            assert!(
+                out.contains("H7:2147483647:-2147483648:2147483647:255:-128:0:0:0\n"),
+                "level={level} out={out}"
+            );
+            assert!(
+                out.contains("H8:true:false:7:3000000000:9\n"),
+                "level={level} out={out}"
+            );
+            assert!(
+                out.contains("H9:2:0xff:0xaa\n"),
+                "level={level} out={out}"
+            );
+            assert!(
+                out.contains("H13:Truncated:0\n"),
+                "level={level} out={out}"
+            );
+            assert!(
+                out.contains("PTRS:[0x0, 0x200"),
+                "expected 0x-prefixed lowercase hex pointers in DebugSlice at {level}: {out}"
+            );
+            assert!(
+                out.contains("NEGZ:0.00:0:1.0e-305:1.3e-307\n"),
+                "level={level} out={out}"
+            );
+        }
+    }
+
+    #[test]
+    fn wave2_fnptr_indirect_calls_and_thumb2_large_text_no_function_sections_in_qemu() {
+        let dir = test_out_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let src = r#"
+            watch<u32> hook_acc = 0;
+
+            struct BoxFn<F> {
+                F cb;
+            }
+
+            u32 add10(u32 x) {
+                return x + 10;
+            }
+
+            f32 scale2(f32 x) {
+                return x * 2.0f32;
+            }
+
+            fn bump_hook(u32 delta) {
+                hook_acc.publish(hook_acc.read() + delta);
+            }
+
+            f32 apply_f32(fn(f32) -> f32 op, f32 v) {
+                return op(v);
+            }
+
+            fn main() {
+                sys.use_systick(12_000_000);
+                BoxFn<fn(u32) -> u32> bf = BoxFn<fn(u32) -> u32> { cb: add10 };
+                BoxFn<fn(u32) -> void> vf = BoxFn<fn(u32) -> void> { cb: bump_hook };
+
+                u32 r_paren = (bf.cb)(32);
+                u32 r_field = bf.cb(32);
+                (vf.cb)(5);
+                vf.cb(7);
+                f32 rf = apply_f32(scale2, 3.5f32);
+
+                println(f"FNPTR:{r_paren}:{r_field}:{hook_acc.read()}:{rf:.2}");
+                sys.exit(0);
+            }
+        "#;
+
+        let prog = zev_parser::parse_str(src).expect("parse fnptr indirect test");
+        let (mono_progs, _) = zev_sema::analyze_and_monomorphize_programs(
+            &[prog],
+            &zev_sema::AnalyzeOptions::default(),
+        )
+        .into_result()
+        .expect("sema + monomorphize fnptr indirect test");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("mir fnptr indirect test");
+
+        // 1. Verify raw `emit_llvm_ir` (> 4 KB `.text` with soft-float + fmt) assembles cleanly via
+        //    `/bin/llc -mtriple=thumbv7m-none-eabi -mcpu=cortex-m3 -filetype=obj` WITHOUT `--function-sections`!
+        let raw_ll = emit_llvm_ir(&mir).expect("emit raw thumbv7m IR");
+        let raw_ll_path = dir.join("fnptr_no_fsec.ll");
+        let raw_obj_path = dir.join("fnptr_no_fsec.o");
+        std::fs::write(&raw_ll_path, &raw_ll).unwrap();
+        let llc_out = Command::new("/bin/llc")
+            .arg("-mtriple=thumbv7m-none-eabi")
+            .arg("-mcpu=cortex-m3")
+            .arg("-filetype=obj")
+            .arg(&raw_ll_path)
+            .arg("-o")
+            .arg(&raw_obj_path)
+            .output()
+            .expect("invoke /bin/llc without --function-sections");
+        assert!(
+            llc_out.status.success(),
+            "llc without --function-sections failed:\n{}",
+            String::from_utf8_lossy(&llc_out.stderr)
+        );
+
+        // 2. Verify ESP32-C6 Direct-Boot build & Cortex-M3 QEMU execution at `-O0` and `-O2`
+        let esp_img = build_esp32c6_image(
+            &mir,
+            &dir.join("wave2_fnptr_esp32c6.elf"),
+            &dir.join("wave2_fnptr_esp32c6.bin"),
+        )
+        .expect("build ESP32-C6 fnptr image");
+        assert!(esp_img.elf.audit.is_zero_heap_freestanding());
+
+        for level in ["-O0", "-O2"] {
+            let mut opts = CodegenOptions::default();
+            opts.opt_level = level.to_string();
+            let tag = level.trim_start_matches('-');
+            let res = run_qemu_cortex_m(
+                &mir,
+                &dir.join(format!("wave2_fnptr_cm3_{tag}.elf")),
+                &opts,
+                &QemuRunOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("fnptr QEMU run failed at {level}: {e}"));
+            verify_ll_with_opt(&res.build.ll_path).expect("opt verify fnptr .ll");
+            assert!(res.build.audit.is_zero_heap_freestanding());
+            assert_eq!(res.exec.exit_code, 0, "level={level} out={}", res.exec.stdout);
+            assert_eq!(res.exec.stdout, "FNPTR:42:42:12:7.00\n", "level={level}");
+        }
     }
 }

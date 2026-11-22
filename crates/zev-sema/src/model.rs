@@ -154,6 +154,38 @@ pub struct ConstInfo {
     pub span: Span,
 }
 
+/// Kind of monomorphized generic declaration (`struct` or `fn`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MonomorphizedKind {
+    Struct,
+    Fn,
+}
+
+impl MonomorphizedKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Struct => "struct",
+            Self::Fn => "fn",
+        }
+    }
+}
+
+impl std::fmt::Display for MonomorphizedKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Concrete instantiation produced by monomorphizing a generic `struct` or `fn`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MonomorphizedInstance {
+    pub kind: MonomorphizedKind,
+    /// Human-readable instantiated signature (e.g. `"FixedVec<u32, 16>"` or `"clamp<f32>"`).
+    pub signature: String,
+    /// Deterministic mangled identifier (e.g. `"FixedVec__u32_16"` or `"clamp__f32"`).
+    pub mangled_name: String,
+}
+
 /// Complete validated semantic model of a `.zev` compilation unit (single- or multi-file).
 #[derive(Clone, Debug)]
 pub struct SemanticModel {
@@ -179,6 +211,8 @@ pub struct SemanticModel {
     pub isrs: BTreeMap<String, IsrInfo>,
     /// Static task instances allocated across all `spawn` sites in boot-tree order.
     pub spawned_tasks: Vec<SpawnedTaskInstance>,
+    /// Concrete generic `struct` and `fn` instantiations (deduplicated & sorted).
+    pub monomorphized_instances: Vec<MonomorphizedInstance>,
     /// `SoftYielding` functions reachable in normal cooperative coroutine execution (outside `noyield`).
     pub soft_yielding_in_coro: BTreeSet<String>,
     /// `SoftYielding` functions reachable inside `noyield { ... }` (compiled as stack-only clones).

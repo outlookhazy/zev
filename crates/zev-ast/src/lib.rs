@@ -3,11 +3,13 @@
 //! Covers all v0 constructs from `DESIGN_V0.md` and `examples/motor_controller.zev`:
 //! - Module imports (`import chip.stm32g4 as hw;`)
 //! - Attributes & priorities (`@dma_safe`, `@manual_yield`, `@critical`, `@high`, `@normal`, `@low`, `@core(N)`)
-//! - Wire-exact `packed struct`, `struct`, and `enum` declarations with endian primitives (`u16be`, `u32le`, etc.)
+//! - Wire-exact `packed struct`, `struct`, and `enum` declarations with endian & float primitives (`u16be`, `u32le`, `f32`, `f64`, etc.)
+//! - Monomorphized `<T>` & `<T, usize N>` bounded generics on `struct`s and `fn`s, plus `[N]T` generic array lengths
 //! - Static OS & DMA primitives (`signal`, `watch<T>`, `inbox<T, N>`, `ping_pong<T, N>`, `lease<T, N>`)
 //! - Constants (`const`) and raw globals (parsed so `zev-sema` can reject illegal mutable globals cleanly)
 //! - Execution items: `fn` (with dual-exit `error` / `error ErrType` and `extern "C"`), `task` blueprints, and `isr` handlers
 //! - Cooperative & atomic control flow: `loop every <period>`, `loop`, `while`, `for (T x in ...)`, `defer`, `restart;`, `noyield`, `critical`, `checkpoint()`, `spawn`, `switch`
+//! - Zero-heap `f"..."` format strings with compile-time resolved [`FormatSpec`]s
 //! - Dual-exit error handling: `error;`, `error E;`, `error E, partial;`, postfix `or`, and postfix `catch`
 
 use std::fmt;
@@ -173,7 +175,7 @@ pub enum AttrKind {
 // Types & OS Primitive Endpoints
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Built-in scalar and wire-endian primitive types.
+/// Built-in scalar, floating-point, and wire-endian primitive types.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum PrimType {
     U8,
@@ -186,6 +188,8 @@ pub enum PrimType {
     I32,
     I64,
     Isize,
+    F32,
+    F64,
     U16Be,
     U16Le,
     U32Be,
@@ -209,6 +213,8 @@ impl PrimType {
             "i32" => Some(Self::I32),
             "i64" => Some(Self::I64),
             "isize" => Some(Self::Isize),
+            "f32" => Some(Self::F32),
+            "f64" => Some(Self::F64),
             "u16be" => Some(Self::U16Be),
             "u16le" => Some(Self::U16Le),
             "u32be" => Some(Self::U32Be),
@@ -233,6 +239,8 @@ impl PrimType {
             Self::I32 => "i32",
             Self::I64 => "i64",
             Self::Isize => "isize",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
             Self::U16Be => "u16be",
             Self::U16Le => "u16le",
             Self::U32Be => "u32be",
@@ -244,14 +252,28 @@ impl PrimType {
         }
     }
 
+    pub const fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F64)
+    }
+
     pub const fn is_integer(self) -> bool {
-        !matches!(self, Self::Bool | Self::Void)
+        !matches!(self, Self::F32 | Self::F64 | Self::Bool | Self::Void)
+    }
+
+    pub const fn is_numeric(self) -> bool {
+        self.is_integer() || self.is_float()
     }
 
     pub const fn is_signed(self) -> bool {
         matches!(
             self,
-            Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::Isize
+            Self::I8
+                | Self::I16
+                | Self::I32
+                | Self::I64
+                | Self::Isize
+                | Self::F32
+                | Self::F64
         )
     }
 
@@ -272,8 +294,8 @@ impl PrimType {
             Self::Void => 0,
             Self::Bool | Self::U8 | Self::I8 => 1,
             Self::U16 | Self::I16 | Self::U16Be | Self::U16Le => 2,
-            Self::U32 | Self::I32 | Self::U32Be | Self::U32Le => 4,
-            Self::U64 | Self::I64 | Self::U64Be | Self::U64Le => 8,
+            Self::U32 | Self::I32 | Self::F32 | Self::U32Be | Self::U32Le => 4,
+            Self::U64 | Self::I64 | Self::F64 | Self::U64Be | Self::U64Le => 8,
             Self::Usize | Self::Isize => ptr_bytes,
         }
     }
@@ -336,19 +358,71 @@ impl TypeExpr {
     }
 }
 
+/// Kind of a compile-time monomorphized generic parameter (`<T>` or `<T, usize N>`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GenericParamKind {
+    /// Type parameter (`T` in `struct FixedVec<T, usize N>` or `T clamp<T>(...)`).
+    Type,
+    /// Constant `usize` bound parameter (`usize N` in `struct FixedVec<T, usize N>`).
+    ConstUsize,
+}
+
+/// A generic parameter declared on a `struct` or `fn`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GenericParam {
+    pub name: Ident,
+    pub kind: GenericParamKind,
+    pub span: Span,
+}
+
+/// A generic argument supplied to a generic `struct` or `fn` (`<u32, 16>`, `<T, N>`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GenericArg {
+    Type(TypeExpr),
+    Const(Expr),
+}
+
+/// Fixed-size array bound (`[16]u8` or generic/const `[N]T`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArrayLen {
+    /// Literal `usize` bound (`[16]u8`).
+    Fixed(usize),
+    /// Symbolic generic `usize` parameter or constant expression (`[N]T`, `[N + 1]u8`).
+    Expr(Box<Expr>),
+}
+
+impl ArrayLen {
+    pub const fn as_fixed(&self) -> Option<usize> {
+        match self {
+            Self::Fixed(n) => Some(*n),
+            Self::Expr(_) => None,
+        }
+    }
+}
+
 /// Variants of [`TypeExpr`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeKind {
-    /// Scalar / endian built-in (`u8`, `u16be`, `i32`, `bool`, `void`, ...).
+    /// Scalar / float / endian built-in (`u8`, `f32`, `u16be`, `i32`, `bool`, `void`, ...).
     Prim(PrimType),
-    /// Unqualified user-defined type (`CmdFrame`, `ParseErr`, `SupEvent`).
+    /// Unqualified user-defined type or generic type parameter (`CmdFrame`, `ParseErr`, `T`).
     Named(Ident),
     /// Module-qualified type path (`hw.Usart`, `chip.stm32g4.DmaChannel`).
     Path(Vec<Ident>),
+    /// Generic type instantiation (`FixedVec<u32, 16>`, `FixedVec<T, N>`).
+    Generic {
+        base: Ident,
+        args: Vec<GenericArg>,
+    },
+    /// Module-qualified generic type instantiation (`col.FixedVec<u32, 16>`).
+    GenericPath {
+        path: Vec<Ident>,
+        args: Vec<GenericArg>,
+    },
     /// Fat slice `[]T` (`ptr` + `len`).
     Slice(Box<TypeExpr>),
-    /// Fixed-size array `[N]T` or `T[N]`.
-    Array { elem: Box<TypeExpr>, len: usize },
+    /// Fixed-size array `[16]u8`, `[N]T`, or `T[N]`.
+    Array { elem: Box<TypeExpr>, len: ArrayLen },
     /// Raw / endpoint pointer `*T` or `T*` (e.g. `watch<u16> *target_rpm`, `*u8`).
     Ptr(Box<TypeExpr>),
     /// Scheduler-aware OS primitive (`watch<u16>`, `ping_pong<u8, 64>`, `inbox<E, 8>`, ...).
@@ -423,11 +497,12 @@ pub struct ImportDecl {
     pub span: Span,
 }
 
-/// `[packed] struct Name { Type field; ... }`
+/// `[packed] struct Name[<T, usize N>] { Type field; ... }`
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StructDecl {
     pub is_packed: bool,
     pub name: Ident,
+    pub generic_params: Vec<GenericParam>,
     pub fields: Vec<StructField>,
     pub span: Span,
 }
@@ -498,6 +573,7 @@ pub struct FnDecl {
     pub attrs: Vec<Attr>,
     pub is_extern_c: bool,
     pub name: Ident,
+    pub generic_params: Vec<GenericParam>,
     pub params: Vec<Param>,
     pub is_variadic: bool,
     pub ret_type: TypeExpr,
@@ -786,9 +862,10 @@ pub enum ExprKind {
         target: Box<Expr>,
         field: Ident,
     },
-    /// Direct function call (`parse_setpoint(half)`, `pi_step(target, actual, &integral)`).
+    /// Direct function call (`parse_setpoint(half)`, `clamp<f32>(v, 0.0, 1.0)`).
     Call {
         callee: Box<Expr>,
+        generic_args: Vec<GenericArg>,
         args: Vec<CallArg>,
     },
     /// Method or associated-function call (`rx_dma.wait_chunk()`, `CmdFrame.from_bytes(buf[0..5])`,
@@ -809,13 +886,16 @@ pub enum ExprKind {
         start: Option<Box<Expr>>,
         end: Option<Box<Expr>>,
     },
-    /// Struct literal (`ByteReader { buf: half, pos: 0 }`).
+    /// Struct literal (`ByteReader { buf: half, pos: 0 }`, `FixedVec<u32, 4> { ... }`).
     StructLit {
         name: Ident,
+        generic_args: Vec<GenericArg>,
         fields: Vec<FieldInit>,
     },
     /// Fixed array literal (`[0x01, 0x00, 0x64]`).
     ArrayLit(Vec<Expr>),
+    /// Zero-heap compile-time unpacked `f"..."` format string (`f"temp={t:.2} pkt={pkt:?}"`).
+    FormatString(Vec<FormatPart>),
     /// Fallback error/timeout handler (`sup_inbox.recv(timeout: 5s) or IdleCheck`).
     Or {
         expr: Box<Expr>,
@@ -828,13 +908,108 @@ pub enum ExprKind {
     },
 }
 
-/// Literal values.
+/// Compile-time resolved format specifier inside an `f"..."` interpolation hole.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum FormatSpec {
+    /// `{x}` — default type-directed formatting.
+    #[default]
+    Default,
+    /// `{x:x}`, `{x:X}`, `{x:02x}`, `{x:04X}` — lower/upper hexadecimal with optional zero-padded width.
+    Hex { upper: bool, width: Option<u8> },
+    /// `{x:b}`, `{x:08b}` — binary with optional zero-padded width.
+    Bin { width: Option<u8> },
+    /// `{x:.2}`, `{x:.3}` — fixed-decimal formatting with `precision` fractional digits.
+    Fixed { precision: u8 },
+    /// `{x:e}`, `{x:.2e}` — scientific notation formatting (linked on demand for `--gc-sections`).
+    Sci { precision: Option<u8> },
+    /// `{pkt:?}` — compile-time struct/value debug expansion.
+    Debug,
+}
+
+/// Segment of a zero-heap `f"..."` format string (`ExprKind::FormatString`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FormatPart {
+    /// Static literal chunk (`{{` and `}}` already unescaped to `{` and `}`).
+    Literal(String),
+    /// `{expr}` or `{expr:spec}` interpolation hole.
+    Hole {
+        expr: Box<Expr>,
+        spec: FormatSpec,
+        span: Span,
+    },
+}
+
+/// Literal values.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Literal {
     Int(u64),
+    Float {
+        /// IEEE-754 `f64::to_bits()` representation of the parsed literal.
+        bits: u64,
+        /// Optional explicit float type suffix (`PrimType::F32` or `PrimType::F64`).
+        suffix: Option<PrimType>,
+    },
     Duration(DurationLit),
     Bool(bool),
     String(String),
+}
+
+impl Literal {
+    pub fn float_from_f64(value: f64, suffix: Option<PrimType>) -> Self {
+        Self::Float {
+            bits: value.to_bits(),
+            suffix,
+        }
+    }
+}
+
+/// Base of the Unicode BMP Private Use Area range (`U+E080..=U+E0FF`) used to preserve raw
+/// `\x80`..`\xFF` byte escapes inside `String` / `f"..."` literals without colliding with
+/// literal source UTF-8 characters (such as `'µ'` `U+00B5`).
+pub const RAW_BYTE_ESCAPE_PUA_BASE: u32 = 0xE000;
+
+/// Append a raw `\xHH` escaped `byte` into a Zev literal `String`.
+///
+/// - `0x00..=0x7F` are pushed directly as ASCII `char`s.
+/// - `0x80..=0xFF` are encoded into the BMP Private Use Area `U+E080..=U+E0FF` so
+///   [`decoded_string_bytes`] and [`decoded_string_byte_len`] recover the exact single byte
+///   without corrupting multi-byte UTF-8 source text.
+pub fn push_raw_byte_escape(s: &mut String, byte: u8) {
+    if byte <= 0x7F {
+        s.push(byte as char);
+    } else {
+        s.push(char::from_u32(RAW_BYTE_ESCAPE_PUA_BASE + byte as u32).unwrap());
+    }
+}
+
+/// Decode a Zev `String` or `FormatPart::Literal` into its exact target byte sequence,
+/// mapping `U+E080..=U+E0FF` raw-byte escapes back to single `0x80..=0xFF` bytes and
+/// emitting standard UTF-8 bytes for all other Unicode scalar values.
+pub fn decoded_string_bytes(s: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut utf8_buf = [0u8; 4];
+    for ch in s.chars() {
+        if ('\u{E080}'..='\u{E0FF}').contains(&ch) {
+            out.push(((ch as u32) - RAW_BYTE_ESCAPE_PUA_BASE) as u8);
+        } else {
+            out.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
+        }
+    }
+    out
+}
+
+/// Compute the exact decoded byte length of a Zev `String` or `FormatPart::Literal`
+/// (`decoded_string_bytes(s).len()` without allocating).
+pub fn decoded_string_byte_len(s: &str) -> usize {
+    let mut len = 0usize;
+    for ch in s.chars() {
+        if ('\u{E080}'..='\u{E0FF}').contains(&ch) {
+            len += 1;
+        } else {
+            len += ch.len_utf8();
+        }
+    }
+    len
 }
 
 /// Hardware/scheduler duration literal (`500us`, `1ms`, `5s`).
@@ -1138,5 +1313,81 @@ mod tests {
         assert!(matches!(loop_every.kind, StmtKind::LoopEvery { .. }));
         assert!(matches!(for_range.kind, StmtKind::ForRange { inclusive: true, .. }));
         assert!(matches!(for_each.kind, StmtKind::ForEach { .. }));
+    }
+
+    #[test]
+    fn wave2_floats_generics_and_format_strings() {
+        let sp = Span::dummy();
+        assert_eq!(PrimType::from_name("f32"), Some(PrimType::F32));
+        assert_eq!(PrimType::from_name("f64"), Some(PrimType::F64));
+        assert!(PrimType::F32.is_float());
+        assert!(PrimType::F64.is_float());
+        assert!(!PrimType::F32.is_integer());
+        assert!(!PrimType::F64.is_integer());
+        assert!(PrimType::F32.is_numeric());
+        assert!(PrimType::F32.is_signed());
+        assert_eq!(PrimType::F32.byte_size(4), 4);
+        assert_eq!(PrimType::F64.byte_size(4), 8);
+
+        let lit = Literal::float_from_f64(3.25, Some(PrimType::F32));
+        assert_eq!(
+            lit,
+            Literal::Float {
+                bits: 3.25_f64.to_bits(),
+                suffix: Some(PrimType::F32)
+            }
+        );
+
+        let gp_t = GenericParam {
+            name: Ident::dummy("T"),
+            kind: GenericParamKind::Type,
+            span: sp,
+        };
+        let gp_n = GenericParam {
+            name: Ident::dummy("N"),
+            kind: GenericParamKind::ConstUsize,
+            span: sp,
+        };
+        assert_eq!(gp_t.kind, GenericParamKind::Type);
+        assert_eq!(gp_n.kind, GenericParamKind::ConstUsize);
+
+        let arr_fixed = ArrayLen::Fixed(16);
+        let arr_sym = ArrayLen::Expr(Box::new(Expr::new(ExprKind::Ident(Ident::dummy("N")), sp)));
+        assert_eq!(arr_fixed.as_fixed(), Some(16));
+        assert_eq!(arr_sym.as_fixed(), None);
+
+        let fstr = Expr::new(
+            ExprKind::FormatString(vec![
+                FormatPart::Literal("temp=".to_owned()),
+                FormatPart::Hole {
+                    expr: Box::new(Expr::new(ExprKind::Ident(Ident::dummy("t")), sp)),
+                    spec: FormatSpec::Fixed { precision: 2 },
+                    span: sp,
+                },
+                FormatPart::Hole {
+                    expr: Box::new(Expr::new(ExprKind::Ident(Ident::dummy("pkt")), sp)),
+                    spec: FormatSpec::Debug,
+                    span: sp,
+                },
+            ]),
+            sp,
+        );
+        assert!(matches!(fstr.kind, ExprKind::FormatString(_)));
+    }
+
+    #[test]
+    fn raw_byte_escape_roundtrip_preserves_utf8_and_single_bytes() {
+        let mut s = String::new();
+        push_raw_byte_escape(&mut s, 0x00);
+        push_raw_byte_escape(&mut s, 0x7F);
+        s.push_str("5µs");
+        push_raw_byte_escape(&mut s, 0x80);
+        push_raw_byte_escape(&mut s, 0xAA);
+        push_raw_byte_escape(&mut s, 0xFF);
+
+        // 0x00, 0x7F, '5' (0x35), 'µ' ([0xC2, 0xB5]), 's' (0x73), 0x80, 0xAA, 0xFF
+        let expected = vec![0x00, 0x7F, b'5', 0xC2, 0xB5, b's', 0x80, 0xAA, 0xFF];
+        assert_eq!(decoded_string_bytes(&s), expected);
+        assert_eq!(decoded_string_byte_len(&s), expected.len());
     }
 }

@@ -7,10 +7,12 @@ use zev_ast::{PrimType, Span};
 /// Resolved semantic type representation used across `zev-sema` and `SemanticModel`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Ty {
-    /// Built-in scalar, boolean, wire-endian, or `void` primitive.
+    /// Built-in scalar, boolean, floating-point, wire-endian, or `void` primitive.
     Prim(PrimType),
     /// Untyped integer literal (`0`, `5`, `170_000_000`) before coercion to a concrete integer type.
     IntLit,
+    /// Unsuffixed floating-point literal (`0.0`, `3.14`, `1e-3`) defaulting to `f64` or coercing to contextual `f32`.
+    FloatLit,
     /// Duration literal (`1ms`, `500us`, `5s`).
     Duration,
     /// Scheduler priority literal (`@critical`, `@high`, `@normal`, `@low`).
@@ -218,6 +220,14 @@ impl Ty {
         Self::Prim(PrimType::U32)
     }
 
+    pub const fn f32() -> Self {
+        Self::Prim(PrimType::F32)
+    }
+
+    pub const fn f64() -> Self {
+        Self::Prim(PrimType::F64)
+    }
+
     pub const fn is_void(&self) -> bool {
         matches!(self, Self::Prim(PrimType::Void))
     }
@@ -232,6 +242,18 @@ impl Ty {
             Self::Prim(p) => p.is_integer(),
             _ => false,
         }
+    }
+
+    pub const fn is_float(&self) -> bool {
+        match self {
+            Self::FloatLit => true,
+            Self::Prim(p) => p.is_float(),
+            _ => false,
+        }
+    }
+
+    pub const fn is_numeric(&self) -> bool {
+        self.is_integer() || self.is_float()
     }
 
     pub const fn is_bool(&self) -> bool {
@@ -321,8 +343,12 @@ impl Ty {
             (Ty::IntLit, Ty::Prim(p)) if p.is_integer() => true,
             (Ty::Prim(p), Ty::IntLit) if p.is_integer() => true,
 
+            // Unsuffixed float literals coerce to `f32` or `f64`.
+            (Ty::FloatLit, Ty::Prim(PrimType::F32 | PrimType::F64)) => true,
+            (Ty::Prim(PrimType::F32 | PrimType::F64), Ty::FloatLit) => true,
+
             // Wire-endian types and fixed-width integers convert among integer types in C-style
-            // firmware expressions, while keeping strict separation from bool, enums, durations, and pointers.
+            // firmware expressions, while keeping strict separation from bool, floats, enums, durations, and pointers.
             (Ty::Prim(a), Ty::Prim(b)) if a.is_integer() && b.is_integer() => true,
 
             // Hardware peripheral handles (`hw.DMA1.CH5`, `hw.USART1`) can be passed to
@@ -336,8 +362,14 @@ impl Ty {
             }
             (Ty::IntLit, Ty::HwPeripheral(_)) => true,
 
-            // Fixed-array `[N]T` or pointer to `[N]T` coerces to slice `[]T` when element types match.
-            (Ty::Array { elem: a, .. }, Ty::Slice(b)) => a == b,
+            // Fixed-array `[N]T` coerces elementwise for literal arrays (`[1, 2]` -> `[2]u32`,
+            // `[0.5, 1.0]` -> `[2]f32`) and `[N]T` coerces to slice `[]T` when element types match.
+            (Ty::Array { elem: a, len: la }, Ty::Array { elem: b, len: lb }) => {
+                la == lb && a.is_assignable_to(b)
+            }
+            (Ty::Array { elem: a, .. }, Ty::Slice(b)) => {
+                a == b || (matches!(**a, Ty::IntLit | Ty::FloatLit) && a.is_assignable_to(b))
+            }
 
             // Any pointer `*T` coerces to opaque `*void` (e.g. for extern "C" or generic DMA helpers),
             // and string literals coerce to `*u8` / `*i8` / `[]u8` / `*void` for trace/C helpers.
@@ -377,6 +409,7 @@ impl Ty {
         match self {
             Self::Prim(p) => p.byte_size(ptr_bytes),
             Self::IntLit => 4,
+            Self::FloatLit => 8,
             Self::Duration => 8,
             Self::Priority | Self::Enum(_) => 1,
             Self::Str | Self::Slice(_) => ptr_bytes * 2,
@@ -415,6 +448,7 @@ impl fmt::Display for Ty {
         match self {
             Self::Prim(p) => write!(f, "{}", p),
             Self::IntLit => write!(f, "{{integer}}"),
+            Self::FloatLit => write!(f, "{{float}}"),
             Self::Duration => write!(f, "duration"),
             Self::Priority => write!(f, "priority"),
             Self::Str => write!(f, "str"),

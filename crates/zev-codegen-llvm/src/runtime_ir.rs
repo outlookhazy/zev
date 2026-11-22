@@ -10,12 +10,44 @@ use std::fmt::Write;
 
 use crate::toolchain::{CodegenOptions, TargetArch};
 
+/// Feature flags controlling on-demand emission of soft-float and formatting IR helpers.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeIrFeatures {
+    pub uses_i64: bool,
+    pub uses_floats: bool,
+    pub uses_fmt: bool,
+    pub uses_fmt_float_sci: bool,
+}
+
+impl RuntimeIrFeatures {
+    pub const fn all() -> Self {
+        Self {
+            uses_i64: true,
+            uses_floats: true,
+            uses_fmt: true,
+            uses_fmt_float_sci: true,
+        }
+    }
+}
+
 /// Emit target header, LLVM intrinsics, `%SynTask` layout, kernel globals, bare-metal HAL,
-/// and cooperative scheduler functions into `out`.
+/// and cooperative scheduler functions into `out` (with all runtime features enabled).
+#[allow(dead_code)]
 pub fn emit_kernel_runtime_ir(
     out: &mut String,
     task_slots: usize,
     opts: &CodegenOptions,
+) {
+    emit_kernel_runtime_ir_with_features(out, task_slots, opts, RuntimeIrFeatures::all());
+}
+
+/// Emit target header, LLVM intrinsics, `%SynTask` layout, kernel globals, bare-metal HAL,
+/// cooperative scheduler, and only the soft-float / formatting IR helpers required by `features`.
+pub fn emit_kernel_runtime_ir_with_features(
+    out: &mut String,
+    task_slots: usize,
+    opts: &CodegenOptions,
+    features: RuntimeIrFeatures,
 ) {
     let slots_alloc = task_slots.max(1);
     let max_ticks = opts.max_ticks as i32;
@@ -34,15 +66,50 @@ pub fn emit_kernel_runtime_ir(
     let _ = writeln!(out, "declare i64 @llvm.bswap.i64(i64) nounwind readnone");
     let _ = writeln!(
         out,
+        "declare i32 @llvm.ctlz.i32(i32, i1 immarg) nounwind readnone"
+    );
+    let _ = writeln!(
+        out,
+        "declare i64 @llvm.ctlz.i64(i64, i1 immarg) nounwind readnone"
+    );
+    let _ = writeln!(
+        out,
         "declare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg) nounwind"
     );
     let _ = writeln!(
         out,
         "declare void @llvm.memset.p0.i32(ptr noalias nocapture writeonly, i8, i32, i1 immarg) nounwind"
     );
+    if features.uses_floats {
+        for fty in ["f32", "f64"] {
+            let llvm_fty = if fty == "f32" { "float" } else { "double" };
+            for ity in ["i8", "i16", "i32", "i64"] {
+                let _ = writeln!(
+                    out,
+                    "declare {ity} @llvm.fptosi.sat.{ity}.{fty}({llvm_fty}) nounwind readnone"
+                );
+                let _ = writeln!(
+                    out,
+                    "declare {ity} @llvm.fptoui.sat.{ity}.{fty}({llvm_fty}) nounwind readnone"
+                );
+            }
+        }
+    }
     let _ = writeln!(out);
 
-    // %SynTask control block & scheduler globals
+    // %SynTask control block, %SynFmtSink, & scheduler globals
+    let _ = writeln!(
+        out,
+        r#"; ── Zero-Heap Stream / Bounded-Buffer Format Sink ──
+%SynFmtSink = type {{
+  ptr, ; 0: dst_ptr (bounded byte buffer when is_buf != 0)
+  i32, ; 1: cap     (capacity in bytes when is_buf != 0)
+  i32, ; 2: written (bytes written; clamped to <= cap when is_buf != 0)
+  i8,  ; 3: trunc   (1 if output exceeded cap, else 0)
+  i8   ; 4: is_buf  (0 => stream to @__syn_uart_putc; 1 => bounded byte buffer)
+}}
+"#
+    );
     let _ = writeln!(
         out,
         r#"; ── Cooperative Language-OS Task & Scheduler State (100% Static SRAM) ──
@@ -88,7 +155,20 @@ pub fn emit_kernel_runtime_ir(
     }
 
     emit_freestanding_mem_builtins_ir(out, opts.target);
+    if features.uses_i64 || features.uses_floats || features.uses_fmt {
+        emit_freestanding_int64_divmod_ir(out, opts.target);
+    }
+    if features.uses_floats || features.uses_fmt_float_sci {
+        emit_freestanding_soft_float_ir(out, opts.target);
+    }
     emit_portable_uart_format_ir(out, sz);
+    if features.uses_fmt {
+        emit_zero_heap_fmt_ir(
+            out,
+            features.uses_floats || features.uses_fmt_float_sci,
+            features.uses_fmt_float_sci,
+        );
+    }
     emit_scheduler_core_ir(out, opts.target, sz);
 
     let _ = writeln!(out, "attributes #98 = {{ noreturn nounwind \"no-builtins\" }}");
@@ -276,7 +356,7 @@ entry:
   br i1 %ok, label %exit_zero, label %exit_nonzero
 exit_zero:
   ; ARM semihosting SYS_EXIT (0x18) + ADP_Stopped_ApplicationExit (0x20026) -> QEMU exit 0
-  call void asm sideeffect "mov r0, #0x18\0Aldr r1, =0x20026\0Abkpt #0xab", "~{{r0}},~{{r1}},~{{memory}}"()
+  call void asm sideeffect "mov r0, #0x18\0Amovw r1, #0x0026\0Amovt r1, #0x0002\0Abkpt #0xab", "~{{r0}},~{{r1}},~{{memory}}"()
   unreachable
 exit_nonzero:
   call void asm sideeffect "mov r0, #0x18\0Amov r1, #1\0Abkpt #0xab", "~{{r0}},~{{r1}},~{{memory}}"()
@@ -1159,4 +1239,2414 @@ clean_exit:
 }}
 "#
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Freestanding 64-Bit Integer Div/Mod & IEEE-754 Soft-Float ABI Shims (#99)
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn emit_freestanding_int64_divmod_ir(out: &mut String, target: TargetArch) {
+    out.push_str(
+        r#"; ── Freestanding 64-Bit Integer Division / Modulo Shims (#99 = "no-builtins") ──
+define weak i64 @__syn_udivrem64(i64 %n, i64 %d, ptr %rem_out) #99 {
+entry:
+  %dz = icmp eq i64 %d, 0
+  br i1 %dz, label %div_zero, label %loop_init
+div_zero:
+  %ro_nn0 = icmp ne ptr %rem_out, null
+  br i1 %ro_nn0, label %store_z, label %ret_z
+store_z:
+  store i64 0, ptr %rem_out, align 8
+  br label %ret_z
+ret_z:
+  ret i64 0
+loop_init:
+  br label %loop
+loop:
+  %step = phi i64 [ 0, %loop_init ], [ %step_next, %loop_body ]
+  %q = phi i64 [ 0, %loop_init ], [ %q_next, %loop_body ]
+  %r = phi i64 [ 0, %loop_init ], [ %r_next, %loop_body ]
+  %done = icmp uge i64 %step, 64
+  br i1 %done, label %finish, label %loop_body
+loop_body:
+  %bit = sub i64 63, %step
+  %r_sh = shl i64 %r, 1
+  %nb = lshr i64 %n, %bit
+  %nb1 = and i64 %nb, 1
+  %r_cur = or i64 %r_sh, %nb1
+  %ge = icmp uge i64 %r_cur, %d
+  %r_sub = sub i64 %r_cur, %d
+  %r_next = select i1 %ge, i64 %r_sub, i64 %r_cur
+  %qbit = shl i64 1, %bit
+  %q_or = or i64 %q, %qbit
+  %q_next = select i1 %ge, i64 %q_or, i64 %q
+  %step_next = add i64 %step, 1
+  br label %loop
+finish:
+  %ro_nn = icmp ne ptr %rem_out, null
+  br i1 %ro_nn, label %store_r, label %ret_q
+store_r:
+  store i64 %r, ptr %rem_out, align 8
+  br label %ret_q
+ret_q:
+  ret i64 %q
+}
+
+define weak i64 @__udivdi3(i64 %a, i64 %b) #99 {
+entry:
+  %q = call i64 @__syn_udivrem64(i64 %a, i64 %b, ptr null)
+  ret i64 %q
+}
+
+define weak i64 @__umoddi3(i64 %a, i64 %b) #99 {
+entry:
+  %rem = alloca i64, align 8
+  store i64 0, ptr %rem, align 8
+  %q = call i64 @__syn_udivrem64(i64 %a, i64 %b, ptr %rem)
+  %r = load i64, ptr %rem, align 8
+  ret i64 %r
+}
+
+define weak i64 @__divdi3(i64 %a, i64 %b) #99 {
+entry:
+  %sa = icmp slt i64 %a, 0
+  %sb = icmp slt i64 %b, 0
+  %na = sub i64 0, %a
+  %nb = sub i64 0, %b
+  %ua = select i1 %sa, i64 %na, i64 %a
+  %ub = select i1 %sb, i64 %nb, i64 %b
+  %uq = call i64 @__syn_udivrem64(i64 %ua, i64 %ub, ptr null)
+  %neg = xor i1 %sa, %sb
+  %nq = sub i64 0, %uq
+  %res = select i1 %neg, i64 %nq, i64 %uq
+  ret i64 %res
+}
+
+define weak i64 @__moddi3(i64 %a, i64 %b) #99 {
+entry:
+  %rem = alloca i64, align 8
+  store i64 0, ptr %rem, align 8
+  %sa = icmp slt i64 %a, 0
+  %sb = icmp slt i64 %b, 0
+  %na = sub i64 0, %a
+  %nb = sub i64 0, %b
+  %ua = select i1 %sa, i64 %na, i64 %a
+  %ub = select i1 %sb, i64 %nb, i64 %b
+  %uq = call i64 @__syn_udivrem64(i64 %ua, i64 %ub, ptr %rem)
+  %ur = load i64, ptr %rem, align 8
+  %nr = sub i64 0, %ur
+  %res = select i1 %sa, i64 %nr, i64 %ur
+  ret i64 %res
+}
+"#,
+    );
+
+    if target == TargetArch::Thumbv7mNoneEabi {
+        out.push_str(
+            r#"define weak { i64, i64 } @__aeabi_uldivmod(i64 %n, i64 %d) #99 {
+entry:
+  %rem = alloca i64, align 8
+  store i64 0, ptr %rem, align 8
+  %q = call i64 @__syn_udivrem64(i64 %n, i64 %d, ptr %rem)
+  %r = load i64, ptr %rem, align 8
+  %p0 = insertvalue { i64, i64 } poison, i64 %q, 0
+  %p1 = insertvalue { i64, i64 } %p0, i64 %r, 1
+  ret { i64, i64 } %p1
+}
+
+define weak { i64, i64 } @__aeabi_ldivmod(i64 %a, i64 %b) #99 {
+entry:
+  %rem = alloca i64, align 8
+  store i64 0, ptr %rem, align 8
+  %sa = icmp slt i64 %a, 0
+  %sb = icmp slt i64 %b, 0
+  %na = sub i64 0, %a
+  %nb = sub i64 0, %b
+  %ua = select i1 %sa, i64 %na, i64 %a
+  %ub = select i1 %sb, i64 %nb, i64 %b
+  %uq = call i64 @__syn_udivrem64(i64 %ua, i64 %ub, ptr %rem)
+  %ur = load i64, ptr %rem, align 8
+  %neg_q = xor i1 %sa, %sb
+  %nq = sub i64 0, %uq
+  %q = select i1 %neg_q, i64 %nq, i64 %uq
+  %nr = sub i64 0, %ur
+  %r = select i1 %sa, i64 %nr, i64 %ur
+  %p0 = insertvalue { i64, i64 } poison, i64 %q, 0
+  %p1 = insertvalue { i64, i64 } %p0, i64 %r, 1
+  ret { i64, i64 } %p1
+}
+"#,
+        );
+    }
+    out.push('\n');
+}
+
+fn emit_freestanding_soft_float_ir(out: &mut String, target: TargetArch) {
+    out.push_str(
+        r#"; ── Freestanding IEEE-754 Soft-Float Core & GNU ABI Shims (#99 = "no-builtins") ──
+define weak { i64, i32 } @__syn_norm_sig64(i64 %sig, i32 %exp_at_target, i32 %target_bit) #99 {
+entry:
+  %lz64 = call i64 @llvm.ctlz.i64(i64 %sig, i1 true)
+  %lz = trunc i64 %lz64 to i32
+  %msb = sub i32 63, %lz
+  %gt = icmp sgt i32 %msb, %target_bit
+  br i1 %gt, label %shr_bb, label %chk_lt
+shr_bb:
+  %rsh = sub i32 %msb, %target_bit
+  %rsh64 = zext i32 %rsh to i64
+  %one_sh = shl i64 1, %rsh64
+  %mask = sub i64 %one_sh, 1
+  %rem_bits = and i64 %sig, %mask
+  %has_st = icmp ne i64 %rem_bits, 0
+  %st = zext i1 %has_st to i64
+  %shifted = lshr i64 %sig, %rsh64
+  %sn_r = or i64 %shifted, %st
+  %en_r = add i32 %exp_at_target, %rsh
+  %pr0 = insertvalue { i64, i32 } poison, i64 %sn_r, 0
+  %pr1 = insertvalue { i64, i32 } %pr0, i32 %en_r, 1
+  ret { i64, i32 } %pr1
+chk_lt:
+  %lt = icmp slt i32 %msb, %target_bit
+  br i1 %lt, label %shl_bb, label %exact_bb
+shl_bb:
+  %lsh = sub i32 %target_bit, %msb
+  %lsh64 = zext i32 %lsh to i64
+  %sn_l = shl i64 %sig, %lsh64
+  %en_l = sub i32 %exp_at_target, %lsh
+  %pl0 = insertvalue { i64, i32 } poison, i64 %sn_l, 0
+  %pl1 = insertvalue { i64, i32 } %pl0, i32 %en_l, 1
+  ret { i64, i32 } %pl1
+exact_bb:
+  %pe0 = insertvalue { i64, i32 } poison, i64 %sig, 0
+  %pe1 = insertvalue { i64, i32 } %pe0, i32 %exp_at_target, 1
+  ret { i64, i32 } %pe1
+}
+
+define weak { i32, i32, i64 } @__syn_unpack_f32(i32 %u) #99 {
+entry:
+  %s = lshr i32 %u, 31
+  %es = lshr i32 %u, 23
+  %e_raw = and i32 %es, 255
+  %f_raw = and i32 %u, 8388607
+  %is_sub = icmp eq i32 %e_raw, 0
+  br i1 %is_sub, label %sub_bb, label %norm_bb
+sub_bb:
+  %lz = call i32 @llvm.ctlz.i32(i32 %f_raw, i1 true)
+  %sh = sub i32 %lz, 8
+  %s24_sub32 = shl i32 %f_raw, %sh
+  %s24_sub = zext i32 %s24_sub32 to i64
+  %eb_sub = sub i32 1, %sh
+  %r0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
+  %r1 = insertvalue { i32, i32, i64 } %r0, i32 %eb_sub, 1
+  %r2 = insertvalue { i32, i32, i64 } %r1, i64 %s24_sub, 2
+  ret { i32, i32, i64 } %r2
+norm_bb:
+  %s24_n32 = or i32 %f_raw, 8388608
+  %s24_n = zext i32 %s24_n32 to i64
+  %n0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
+  %n1 = insertvalue { i32, i32, i64 } %n0, i32 %e_raw, 1
+  %n2 = insertvalue { i32, i32, i64 } %n1, i64 %s24_n, 2
+  ret { i32, i32, i64 } %n2
+}
+
+define weak { i32, i32, i64 } @__syn_unpack_f64(i64 %u) #99 {
+entry:
+  %s64 = lshr i64 %u, 63
+  %s = trunc i64 %s64 to i32
+  %es = lshr i64 %u, 52
+  %e64 = and i64 %es, 2047
+  %e_raw = trunc i64 %e64 to i32
+  %f_raw = and i64 %u, 4503599627370495
+  %is_sub = icmp eq i32 %e_raw, 0
+  br i1 %is_sub, label %sub_bb, label %norm_bb
+sub_bb:
+  %lz64 = call i64 @llvm.ctlz.i64(i64 %f_raw, i1 true)
+  %lz = trunc i64 %lz64 to i32
+  %sh = sub i32 %lz, 11
+  %sh64 = zext i32 %sh to i64
+  %s53_sub = shl i64 %f_raw, %sh64
+  %eb_sub = sub i32 1, %sh
+  %r0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
+  %r1 = insertvalue { i32, i32, i64 } %r0, i32 %eb_sub, 1
+  %r2 = insertvalue { i32, i32, i64 } %r1, i64 %s53_sub, 2
+  ret { i32, i32, i64 } %r2
+norm_bb:
+  %s53_n = or i64 %f_raw, 4503599627370496
+  %n0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
+  %n1 = insertvalue { i32, i32, i64 } %n0, i32 %e_raw, 1
+  %n2 = insertvalue { i32, i32, i64 } %n1, i64 %s53_n, 2
+  ret { i32, i32, i64 } %n2
+}
+
+define weak float @__syn_pack_f32(i32 %sign, i32 %exp, i64 %sig26) #99 {
+entry:
+  %sbit = shl i32 %sign, 31
+  %is_z = icmp eq i64 %sig26, 0
+  br i1 %is_z, label %ret_zero, label %chk_sub
+ret_zero:
+  %fz = bitcast i32 %sbit to float
+  ret float %fz
+chk_sub:
+  %le0 = icmp sle i32 %exp, 0
+  br i1 %le0, label %sub_shift, label %round_bb
+sub_shift:
+  %sh = sub i32 1, %exp
+  %too_small = icmp sge i32 %sh, 29
+  br i1 %too_small, label %ret_zero, label %do_sub_shift
+do_sub_shift:
+  %sh64 = zext i32 %sh to i64
+  %m1 = shl i64 1, %sh64
+  %mask = sub i64 %m1, 1
+  %rem_b = and i64 %sig26, %mask
+  %st_nz = icmp ne i64 %rem_b, 0
+  %st = zext i1 %st_nz to i64
+  %s_shr = lshr i64 %sig26, %sh64
+  %sig_sub = or i64 %s_shr, %st
+  br label %round_bb
+round_bb:
+  %e_work = phi i32 [ %exp, %chk_sub ], [ 0, %do_sub_shift ]
+  %s_work = phi i64 [ %sig26, %chk_sub ], [ %sig_sub, %do_sub_shift ]
+  %grs = and i64 %s_work, 7
+  %main64 = lshr i64 %s_work, 3
+  %main = trunc i64 %main64 to i32
+  %lsb = and i32 %main, 1
+  %gt4 = icmp ugt i64 %grs, 4
+  %eq4 = icmp eq i64 %grs, 4
+  %odd = icmp ne i32 %lsb, 0
+  %tie = and i1 %eq4, %odd
+  %do_inc = or i1 %gt4, %tie
+  %inc = zext i1 %do_inc to i32
+  %mr = add i32 %main, %inc
+  %is_ew0 = icmp eq i32 %e_work, 0
+  br i1 %is_ew0, label %pack_sub, label %pack_norm
+pack_sub:
+  %sub_carry = icmp uge i32 %mr, 8388608
+  %e_sf = select i1 %sub_carry, i32 1, i32 0
+  %f_sf = and i32 %mr, 8388607
+  %es_sh = shl i32 %e_sf, 23
+  %u_sf0 = or i32 %sbit, %es_sh
+  %u_sf1 = or i32 %u_sf0, %f_sf
+  %f_sub_out = bitcast i32 %u_sf1 to float
+  ret float %f_sub_out
+pack_norm:
+  %norm_carry = icmp uge i32 %mr, 16777216
+  %mr_shr = lshr i32 %mr, 1
+  %mr2 = select i1 %norm_carry, i32 %mr_shr, i32 %mr
+  %e_inc = add i32 %e_work, 1
+  %e2 = select i1 %norm_carry, i32 %e_inc, i32 %e_work
+  %is_ovf = icmp sge i32 %e2, 255
+  br i1 %is_ovf, label %ret_inf, label %ret_fin
+ret_inf:
+  %u_inf = or i32 %sbit, 2139095040
+  %f_inf = bitcast i32 %u_inf to float
+  ret float %f_inf
+ret_fin:
+  %frac = and i32 %mr2, 8388607
+  %e_sh = shl i32 %e2, 23
+  %u0 = or i32 %sbit, %e_sh
+  %u1 = or i32 %u0, %frac
+  %f_fin = bitcast i32 %u1 to float
+  ret float %f_fin
+}
+
+define weak double @__syn_pack_f64(i32 %sign, i32 %exp, i64 %sig55) #99 {
+entry:
+  %sign64 = zext i32 %sign to i64
+  %sbit = shl i64 %sign64, 63
+  %is_z = icmp eq i64 %sig55, 0
+  br i1 %is_z, label %ret_zero, label %chk_sub
+ret_zero:
+  %dz = bitcast i64 %sbit to double
+  ret double %dz
+chk_sub:
+  %le0 = icmp sle i32 %exp, 0
+  br i1 %le0, label %sub_shift, label %round_bb
+sub_shift:
+  %sh = sub i32 1, %exp
+  %too_small = icmp sge i32 %sh, 58
+  br i1 %too_small, label %ret_zero, label %do_sub_shift
+do_sub_shift:
+  %sh64 = zext i32 %sh to i64
+  %m1 = shl i64 1, %sh64
+  %mask = sub i64 %m1, 1
+  %rem_b = and i64 %sig55, %mask
+  %st_nz = icmp ne i64 %rem_b, 0
+  %st = zext i1 %st_nz to i64
+  %s_shr = lshr i64 %sig55, %sh64
+  %sig_sub = or i64 %s_shr, %st
+  br label %round_bb
+round_bb:
+  %e_work = phi i32 [ %exp, %chk_sub ], [ 0, %do_sub_shift ]
+  %s_work = phi i64 [ %sig55, %chk_sub ], [ %sig_sub, %do_sub_shift ]
+  %grs = and i64 %s_work, 7
+  %main = lshr i64 %s_work, 3
+  %lsb = and i64 %main, 1
+  %gt4 = icmp ugt i64 %grs, 4
+  %eq4 = icmp eq i64 %grs, 4
+  %odd = icmp ne i64 %lsb, 0
+  %tie = and i1 %eq4, %odd
+  %do_inc = or i1 %gt4, %tie
+  %inc = zext i1 %do_inc to i64
+  %mr = add i64 %main, %inc
+  %is_ew0 = icmp eq i32 %e_work, 0
+  br i1 %is_ew0, label %pack_sub, label %pack_norm
+pack_sub:
+  %sub_carry = icmp uge i64 %mr, 4503599627370496
+  %e_sf = select i1 %sub_carry, i64 1, i64 0
+  %f_sf = and i64 %mr, 4503599627370495
+  %es_sh = shl i64 %e_sf, 52
+  %u_sf0 = or i64 %sbit, %es_sh
+  %u_sf1 = or i64 %u_sf0, %f_sf
+  %d_sub_out = bitcast i64 %u_sf1 to double
+  ret double %d_sub_out
+pack_norm:
+  %norm_carry = icmp uge i64 %mr, 9007199254740992
+  %mr_shr = lshr i64 %mr, 1
+  %mr2 = select i1 %norm_carry, i64 %mr_shr, i64 %mr
+  %e_inc = add i32 %e_work, 1
+  %e2 = select i1 %norm_carry, i32 %e_inc, i32 %e_work
+  %is_ovf = icmp sge i32 %e2, 2047
+  br i1 %is_ovf, label %ret_inf, label %ret_fin
+ret_inf:
+  %u_inf = or i64 %sbit, 9218868437227405312
+  %d_inf = bitcast i64 %u_inf to double
+  ret double %d_inf
+ret_fin:
+  %frac = and i64 %mr2, 4503599627370495
+  %e2_64 = zext i32 %e2 to i64
+  %e_sh = shl i64 %e2_64, 52
+  %u0 = or i64 %sbit, %e_sh
+  %u1 = or i64 %u0, %frac
+  %d_fin = bitcast i64 %u1 to double
+  ret double %d_fin
+}
+
+; ── f32 Arithmetic (__addsf3, __subsf3, __mulsf3, __divsf3, fmodf) ──
+define weak float @__addsf3(float %a, float %b) #99 {
+entry:
+  %ua = bitcast float %a to i32
+  %ub = bitcast float %b to i32
+  %aa = and i32 %ua, 2147483647
+  %ab = and i32 %ub, 2147483647
+  %nan_a = icmp ugt i32 %aa, 2139095040
+  %nan_b = icmp ugt i32 %ab, 2139095040
+  %any_nan = or i1 %nan_a, %nan_b
+  br i1 %any_nan, label %ret_nan, label %chk_inf
+ret_nan:
+  %fnan = bitcast i32 2143289344 to float
+  ret float %fnan
+chk_inf:
+  %inf_a = icmp eq i32 %aa, 2139095040
+  %inf_b = icmp eq i32 %ab, 2139095040
+  br i1 %inf_a, label %on_inf_a, label %chk_inf_b
+on_inf_a:
+  br i1 %inf_b, label %both_inf, label %ret_a
+both_inf:
+  %xors = xor i32 %ua, %ub
+  %opp_inf = icmp slt i32 %xors, 0
+  br i1 %opp_inf, label %ret_nan, label %ret_a
+ret_a:
+  ret float %a
+chk_inf_b:
+  br i1 %inf_b, label %ret_b, label %chk_zero
+ret_b:
+  ret float %b
+chk_zero:
+  %za = icmp eq i32 %aa, 0
+  %zb = icmp eq i32 %ab, 0
+  br i1 %za, label %on_za, label %chk_zb
+on_za:
+  br i1 %zb, label %both_zero, label %ret_b
+both_zero:
+  %both_neg = and i32 %ua, %ub
+  %s_bz = and i32 %both_neg, -2147483648
+  %fz = bitcast i32 %s_bz to float
+  ret float %fz
+chk_zb:
+  br i1 %zb, label %ret_a, label %finite_add
+finite_add:
+  %upa = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ua)
+  %upb = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ub)
+  %sa0 = extractvalue { i32, i32, i64 } %upa, 0
+  %ea0 = extractvalue { i32, i32, i64 } %upa, 1
+  %ma0 = extractvalue { i32, i32, i64 } %upa, 2
+  %sb0 = extractvalue { i32, i32, i64 } %upb, 0
+  %eb0 = extractvalue { i32, i32, i64 } %upb, 1
+  %mb0 = extractvalue { i32, i32, i64 } %upb, 2
+  %ma26 = shl i64 %ma0, 3
+  %mb26 = shl i64 %mb0, 3
+  %elt = icmp slt i32 %ea0, %eb0
+  %eeq = icmp eq i32 %ea0, %eb0
+  %mlt = icmp ult i64 %ma26, %mb26
+  %tie_lt = and i1 %eeq, %mlt
+  %swap = or i1 %elt, %tie_lt
+  %sa = select i1 %swap, i32 %sb0, i32 %sa0
+  %ea = select i1 %swap, i32 %eb0, i32 %ea0
+  %ma = select i1 %swap, i64 %mb26, i64 %ma26
+  %sb = select i1 %swap, i32 %sa0, i32 %sb0
+  %eb = select i1 %swap, i32 %ea0, i32 %eb0
+  %mb = select i1 %swap, i64 %ma26, i64 %mb26
+  %de = sub i32 %ea, %eb
+  %de0 = icmp eq i32 %de, 0
+  br i1 %de0, label %aligned_bb, label %chk_huge_de
+chk_huge_de:
+  %huge = icmp sge i32 %de, 31
+  br i1 %huge, label %aligned_sticky_only, label %align_shift
+aligned_sticky_only:
+  br label %aligned_bb
+align_shift:
+  %de64 = zext i32 %de to i64
+  %m1 = shl i64 1, %de64
+  %msk = sub i64 %m1, 1
+  %rb = and i64 %mb, %msk
+  %st_b = icmp ne i64 %rb, 0
+  %st64 = zext i1 %st_b to i64
+  %mb_shr = lshr i64 %mb, %de64
+  %mb_al = or i64 %mb_shr, %st64
+  br label %aligned_bb
+aligned_bb:
+  %mb_fin = phi i64 [ %mb, %finite_add ], [ 1, %aligned_sticky_only ], [ %mb_al, %align_shift ]
+  %same_s = icmp eq i32 %sa, %sb
+  br i1 %same_s, label %do_sum, label %do_diff
+do_sum:
+  %sum = add i64 %ma, %mb_fin
+  %ns = call { i64, i32 } @__syn_norm_sig64(i64 %sum, i32 %ea, i32 26)
+  %sn_s = extractvalue { i64, i32 } %ns, 0
+  %en_s = extractvalue { i64, i32 } %ns, 1
+  %res_s = call float @__syn_pack_f32(i32 %sa, i32 %en_s, i64 %sn_s)
+  ret float %res_s
+do_diff:
+  %diff = sub i64 %ma, %mb_fin
+  %is_dz = icmp eq i64 %diff, 0
+  br i1 %is_dz, label %ret_pos_zero, label %norm_diff
+ret_pos_zero:
+  ret float 0.0
+norm_diff:
+  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %diff, i32 %ea, i32 26)
+  %sn_d = extractvalue { i64, i32 } %nd, 0
+  %en_d = extractvalue { i64, i32 } %nd, 1
+  %res_d = call float @__syn_pack_f32(i32 %sa, i32 %en_d, i64 %sn_d)
+  ret float %res_d
+}
+
+define weak float @__subsf3(float %a, float %b) #99 {
+entry:
+  %ub = bitcast float %b to i32
+  %ub_neg = xor i32 %ub, -2147483648
+  %nb = bitcast i32 %ub_neg to float
+  %r = call float @__addsf3(float %a, float %nb)
+  ret float %r
+}
+
+define weak float @__mulsf3(float %a, float %b) #99 {
+entry:
+  %ua = bitcast float %a to i32
+  %ub = bitcast float %b to i32
+  %aa = and i32 %ua, 2147483647
+  %ab = and i32 %ub, 2147483647
+  %sa = lshr i32 %ua, 31
+  %sb = lshr i32 %ub, 31
+  %sr = xor i32 %sa, %sb
+  %sbit = shl i32 %sr, 31
+  %nan_a = icmp ugt i32 %aa, 2139095040
+  %nan_b = icmp ugt i32 %ab, 2139095040
+  %any_nan = or i1 %nan_a, %nan_b
+  br i1 %any_nan, label %ret_nan, label %chk_special
+ret_nan:
+  %fnan = bitcast i32 2143289344 to float
+  ret float %fnan
+chk_special:
+  %inf_a = icmp eq i32 %aa, 2139095040
+  %inf_b = icmp eq i32 %ab, 2139095040
+  %za = icmp eq i32 %aa, 0
+  %zb = icmp eq i32 %ab, 0
+  %iz1 = and i1 %inf_a, %zb
+  %iz2 = and i1 %za, %inf_b
+  %bad = or i1 %iz1, %iz2
+  br i1 %bad, label %ret_nan, label %chk_inf
+chk_inf:
+  %any_inf = or i1 %inf_a, %inf_b
+  br i1 %any_inf, label %ret_inf, label %chk_zero
+ret_inf:
+  %uinf = or i32 %sbit, 2139095040
+  %finf = bitcast i32 %uinf to float
+  ret float %finf
+chk_zero:
+  %any_z = or i1 %za, %zb
+  br i1 %any_z, label %ret_zero, label %finite_mul
+ret_zero:
+  %fz = bitcast i32 %sbit to float
+  ret float %fz
+finite_mul:
+  %upa = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ua)
+  %upb = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ub)
+  %ea = extractvalue { i32, i32, i64 } %upa, 1
+  %ma = extractvalue { i32, i32, i64 } %upa, 2
+  %eb = extractvalue { i32, i32, i64 } %upb, 1
+  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %prod = mul i64 %ma, %mb
+  %esum = add i32 %ea, %eb
+  %ebase = sub i32 %esum, 147
+  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %prod, i32 %ebase, i32 26)
+  %sn = extractvalue { i64, i32 } %nm, 0
+  %en = extractvalue { i64, i32 } %nm, 1
+  %res = call float @__syn_pack_f32(i32 %sr, i32 %en, i64 %sn)
+  ret float %res
+}
+
+define weak float @__divsf3(float %a, float %b) #99 {
+entry:
+  %ua = bitcast float %a to i32
+  %ub = bitcast float %b to i32
+  %aa = and i32 %ua, 2147483647
+  %ab = and i32 %ub, 2147483647
+  %sa = lshr i32 %ua, 31
+  %sb = lshr i32 %ub, 31
+  %sr = xor i32 %sa, %sb
+  %sbit = shl i32 %sr, 31
+  %nan_a = icmp ugt i32 %aa, 2139095040
+  %nan_b = icmp ugt i32 %ab, 2139095040
+  %any_nan = or i1 %nan_a, %nan_b
+  br i1 %any_nan, label %ret_nan, label %chk_special
+ret_nan:
+  %fnan = bitcast i32 2143289344 to float
+  ret float %fnan
+chk_special:
+  %inf_a = icmp eq i32 %aa, 2139095040
+  %inf_b = icmp eq i32 %ab, 2139095040
+  %za = icmp eq i32 %aa, 0
+  %zb = icmp eq i32 %ab, 0
+  %ii = and i1 %inf_a, %inf_b
+  %zz = and i1 %za, %zb
+  %bad = or i1 %ii, %zz
+  br i1 %bad, label %ret_nan, label %chk_inf_out
+chk_inf_out:
+  %to_inf = or i1 %inf_a, %zb
+  br i1 %to_inf, label %ret_inf, label %chk_zero_out
+ret_inf:
+  %uinf = or i32 %sbit, 2139095040
+  %finf = bitcast i32 %uinf to float
+  ret float %finf
+chk_zero_out:
+  %to_z = or i1 %za, %inf_b
+  br i1 %to_z, label %ret_zero, label %finite_div
+ret_zero:
+  %fz = bitcast i32 %sbit to float
+  ret float %fz
+finite_div:
+  %rem = alloca i64, align 8
+  store i64 0, ptr %rem, align 8
+  %upa = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ua)
+  %upb = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ub)
+  %ea = extractvalue { i32, i32, i64 } %upa, 1
+  %ma = extractvalue { i32, i32, i64 } %upa, 2
+  %eb = extractvalue { i32, i32, i64 } %upb, 1
+  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %num = shl i64 %ma, 27
+  %q = call i64 @__syn_udivrem64(i64 %num, i64 %mb, ptr %rem)
+  %rv = load i64, ptr %rem, align 8
+  %r_nz = icmp ne i64 %rv, 0
+  %st = zext i1 %r_nz to i64
+  %qs = or i64 %q, %st
+  %ediff = sub i32 %ea, %eb
+  %ebase = add i32 %ediff, 126
+  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %qs, i32 %ebase, i32 26)
+  %sn = extractvalue { i64, i32 } %nd, 0
+  %en = extractvalue { i64, i32 } %nd, 1
+  %res = call float @__syn_pack_f32(i32 %sr, i32 %en, i64 %sn)
+  ret float %res
+}
+
+; ── f32 <-> f64 Conversions (__extendsfdf2, __truncdfsf2) ──
+define weak double @__extendsfdf2(float %a) #99 {
+entry:
+  %u = bitcast float %a to i32
+  %aa = and i32 %u, 2147483647
+  %s = lshr i32 %u, 31
+  %s64 = zext i32 %s to i64
+  %sbit = shl i64 %s64, 63
+  %is_z = icmp eq i32 %aa, 0
+  br i1 %is_z, label %ret_z, label %chk_nan
+ret_z:
+  %dz = bitcast i64 %sbit to double
+  ret double %dz
+chk_nan:
+  %is_nan = icmp ugt i32 %aa, 2139095040
+  br i1 %is_nan, label %ret_nan, label %chk_inf
+ret_nan:
+  %dnan = bitcast i64 9221120237041090560 to double
+  ret double %dnan
+chk_inf:
+  %is_inf = icmp eq i32 %aa, 2139095040
+  br i1 %is_inf, label %ret_inf, label %finite
+ret_inf:
+  %uinf = or i64 %sbit, 9218868437227405312
+  %dinf = bitcast i64 %uinf to double
+  ret double %dinf
+finite:
+  %up = call { i32, i32, i64 } @__syn_unpack_f32(i32 %u)
+  %eb = extractvalue { i32, i32, i64 } %up, 1
+  %s24 = extractvalue { i32, i32, i64 } %up, 2
+  %ed = add i32 %eb, 896
+  %ed64 = zext i32 %ed to i64
+  %ebits = shl i64 %ed64, 52
+  %f23 = and i64 %s24, 8388607
+  %fbits = shl i64 %f23, 29
+  %u0 = or i64 %sbit, %ebits
+  %u1 = or i64 %u0, %fbits
+  %dfin = bitcast i64 %u1 to double
+  ret double %dfin
+}
+
+define weak float @__truncdfsf2(double %a) #99 {
+entry:
+  %u = bitcast double %a to i64
+  %aa = and i64 %u, 9223372036854775807
+  %s64 = lshr i64 %u, 63
+  %s = trunc i64 %s64 to i32
+  %sbit = shl i32 %s, 31
+  %is_z = icmp eq i64 %aa, 0
+  br i1 %is_z, label %ret_z, label %chk_nan
+ret_z:
+  %fz = bitcast i32 %sbit to float
+  ret float %fz
+chk_nan:
+  %is_nan = icmp ugt i64 %aa, 9218868437227405312
+  br i1 %is_nan, label %ret_nan, label %chk_inf
+ret_nan:
+  %fnan = bitcast i32 2143289344 to float
+  ret float %fnan
+chk_inf:
+  %is_inf = icmp eq i64 %aa, 9218868437227405312
+  br i1 %is_inf, label %ret_inf, label %finite
+ret_inf:
+  %uinf = or i32 %sbit, 2139095040
+  %finf = bitcast i32 %uinf to float
+  ret float %finf
+finite:
+  %up = call { i32, i32, i64 } @__syn_unpack_f64(i64 %u)
+  %eb = extractvalue { i32, i32, i64 } %up, 1
+  %s53 = extractvalue { i32, i32, i64 } %up, 2
+  %rem = and i64 %s53, 67108863
+  %has_st = icmp ne i64 %rem, 0
+  %st = zext i1 %has_st to i64
+  %shr = lshr i64 %s53, 26
+  %sig26 = or i64 %shr, %st
+  %ef = sub i32 %eb, 896
+  %res = call float @__syn_pack_f32(i32 %s, i32 %ef, i64 %sig26)
+  ret float %res
+}
+
+; ── f64 Arithmetic (__adddf3, __subdf3, __muldf3, __divdf3, fmod, fmodf) ──
+define weak double @__adddf3(double %a, double %b) #99 {
+entry:
+  %ua = bitcast double %a to i64
+  %ub = bitcast double %b to i64
+  %aa = and i64 %ua, 9223372036854775807
+  %ab = and i64 %ub, 9223372036854775807
+  %nan_a = icmp ugt i64 %aa, 9218868437227405312
+  %nan_b = icmp ugt i64 %ab, 9218868437227405312
+  %any_nan = or i1 %nan_a, %nan_b
+  br i1 %any_nan, label %ret_nan, label %chk_inf
+ret_nan:
+  %dnan = bitcast i64 9221120237041090560 to double
+  ret double %dnan
+chk_inf:
+  %inf_a = icmp eq i64 %aa, 9218868437227405312
+  %inf_b = icmp eq i64 %ab, 9218868437227405312
+  br i1 %inf_a, label %on_inf_a, label %chk_inf_b
+on_inf_a:
+  br i1 %inf_b, label %both_inf, label %ret_a
+both_inf:
+  %xors = xor i64 %ua, %ub
+  %opp_inf = icmp slt i64 %xors, 0
+  br i1 %opp_inf, label %ret_nan, label %ret_a
+ret_a:
+  ret double %a
+chk_inf_b:
+  br i1 %inf_b, label %ret_b, label %chk_zero
+ret_b:
+  ret double %b
+chk_zero:
+  %za = icmp eq i64 %aa, 0
+  %zb = icmp eq i64 %ab, 0
+  br i1 %za, label %on_za, label %chk_zb
+on_za:
+  br i1 %zb, label %both_zero, label %ret_b
+both_zero:
+  %both_neg = and i64 %ua, %ub
+  %s_bz = and i64 %both_neg, -9223372036854775808
+  %dz = bitcast i64 %s_bz to double
+  ret double %dz
+chk_zb:
+  br i1 %zb, label %ret_a, label %finite_add
+finite_add:
+  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
+  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
+  %sa0 = extractvalue { i32, i32, i64 } %upa, 0
+  %ea0 = extractvalue { i32, i32, i64 } %upa, 1
+  %ma0 = extractvalue { i32, i32, i64 } %upa, 2
+  %sb0 = extractvalue { i32, i32, i64 } %upb, 0
+  %eb0 = extractvalue { i32, i32, i64 } %upb, 1
+  %mb0 = extractvalue { i32, i32, i64 } %upb, 2
+  %ma55 = shl i64 %ma0, 3
+  %mb55 = shl i64 %mb0, 3
+  %elt = icmp slt i32 %ea0, %eb0
+  %eeq = icmp eq i32 %ea0, %eb0
+  %mlt = icmp ult i64 %ma55, %mb55
+  %tie_lt = and i1 %eeq, %mlt
+  %swap = or i1 %elt, %tie_lt
+  %sa = select i1 %swap, i32 %sb0, i32 %sa0
+  %ea = select i1 %swap, i32 %eb0, i32 %ea0
+  %ma = select i1 %swap, i64 %mb55, i64 %ma55
+  %sb = select i1 %swap, i32 %sa0, i32 %sb0
+  %eb = select i1 %swap, i32 %ea0, i32 %eb0
+  %mb = select i1 %swap, i64 %ma55, i64 %mb55
+  %de = sub i32 %ea, %eb
+  %de0 = icmp eq i32 %de, 0
+  br i1 %de0, label %aligned_bb, label %chk_huge_de
+chk_huge_de:
+  %huge = icmp sge i32 %de, 60
+  br i1 %huge, label %aligned_sticky_only, label %align_shift
+aligned_sticky_only:
+  br label %aligned_bb
+align_shift:
+  %de64 = zext i32 %de to i64
+  %m1 = shl i64 1, %de64
+  %msk = sub i64 %m1, 1
+  %rb = and i64 %mb, %msk
+  %st_b = icmp ne i64 %rb, 0
+  %st64 = zext i1 %st_b to i64
+  %mb_shr = lshr i64 %mb, %de64
+  %mb_al = or i64 %mb_shr, %st64
+  br label %aligned_bb
+aligned_bb:
+  %mb_fin = phi i64 [ %mb, %finite_add ], [ 1, %aligned_sticky_only ], [ %mb_al, %align_shift ]
+  %same_s = icmp eq i32 %sa, %sb
+  br i1 %same_s, label %do_sum, label %do_diff
+do_sum:
+  %sum = add i64 %ma, %mb_fin
+  %ns = call { i64, i32 } @__syn_norm_sig64(i64 %sum, i32 %ea, i32 55)
+  %sn_s = extractvalue { i64, i32 } %ns, 0
+  %en_s = extractvalue { i64, i32 } %ns, 1
+  %res_s = call double @__syn_pack_f64(i32 %sa, i32 %en_s, i64 %sn_s)
+  ret double %res_s
+do_diff:
+  %diff = sub i64 %ma, %mb_fin
+  %is_dz = icmp eq i64 %diff, 0
+  br i1 %is_dz, label %ret_pos_zero, label %norm_diff
+ret_pos_zero:
+  ret double 0.0
+norm_diff:
+  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %diff, i32 %ea, i32 55)
+  %sn_d = extractvalue { i64, i32 } %nd, 0
+  %en_d = extractvalue { i64, i32 } %nd, 1
+  %res_d = call double @__syn_pack_f64(i32 %sa, i32 %en_d, i64 %sn_d)
+  ret double %res_d
+}
+
+define weak double @__subdf3(double %a, double %b) #99 {
+entry:
+  %ub = bitcast double %b to i64
+  %ub_neg = xor i64 %ub, -9223372036854775808
+  %nb = bitcast i64 %ub_neg to double
+  %r = call double @__adddf3(double %a, double %nb)
+  ret double %r
+}
+
+define weak double @__muldf3(double %a, double %b) #99 {
+entry:
+  %ua = bitcast double %a to i64
+  %ub = bitcast double %b to i64
+  %aa = and i64 %ua, 9223372036854775807
+  %ab = and i64 %ub, 9223372036854775807
+  %sa64 = lshr i64 %ua, 63
+  %sb64 = lshr i64 %ub, 63
+  %sr64 = xor i64 %sa64, %sb64
+  %sr = trunc i64 %sr64 to i32
+  %sbit = shl i64 %sr64, 63
+  %nan_a = icmp ugt i64 %aa, 9218868437227405312
+  %nan_b = icmp ugt i64 %ab, 9218868437227405312
+  %any_nan = or i1 %nan_a, %nan_b
+  br i1 %any_nan, label %ret_nan, label %chk_special
+ret_nan:
+  %dnan = bitcast i64 9221120237041090560 to double
+  ret double %dnan
+chk_special:
+  %inf_a = icmp eq i64 %aa, 9218868437227405312
+  %inf_b = icmp eq i64 %ab, 9218868437227405312
+  %za = icmp eq i64 %aa, 0
+  %zb = icmp eq i64 %ab, 0
+  %iz1 = and i1 %inf_a, %zb
+  %iz2 = and i1 %za, %inf_b
+  %bad = or i1 %iz1, %iz2
+  br i1 %bad, label %ret_nan, label %chk_inf
+chk_inf:
+  %any_inf = or i1 %inf_a, %inf_b
+  br i1 %any_inf, label %ret_inf, label %chk_zero
+ret_inf:
+  %uinf = or i64 %sbit, 9218868437227405312
+  %dinf = bitcast i64 %uinf to double
+  ret double %dinf
+chk_zero:
+  %any_z = or i1 %za, %zb
+  br i1 %any_z, label %ret_zero, label %finite_mul
+ret_zero:
+  %dz = bitcast i64 %sbit to double
+  ret double %dz
+finite_mul:
+  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
+  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
+  %ea = extractvalue { i32, i32, i64 } %upa, 1
+  %ma = extractvalue { i32, i32, i64 } %upa, 2
+  %eb = extractvalue { i32, i32, i64 } %upb, 1
+  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %ma128 = zext i64 %ma to i128
+  %mb128 = zext i64 %mb to i128
+  %prod = mul i128 %ma128, %mb128
+  %low49 = and i128 %prod, 562949953421311
+  %has_st = icmp ne i128 %low49, 0
+  %st = zext i1 %has_st to i64
+  %psh = lshr i128 %prod, 49
+  %p64_raw = trunc i128 %psh to i64
+  %p64 = or i64 %p64_raw, %st
+  %esum = add i32 %ea, %eb
+  %ebase = sub i32 %esum, 1023
+  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %p64, i32 %ebase, i32 55)
+  %sn = extractvalue { i64, i32 } %nm, 0
+  %en = extractvalue { i64, i32 } %nm, 1
+  %res = call double @__syn_pack_f64(i32 %sr, i32 %en, i64 %sn)
+  ret double %res
+}
+
+define weak double @__divdf3(double %a, double %b) #99 {
+entry:
+  %ua = bitcast double %a to i64
+  %ub = bitcast double %b to i64
+  %aa = and i64 %ua, 9223372036854775807
+  %ab = and i64 %ub, 9223372036854775807
+  %sa64 = lshr i64 %ua, 63
+  %sb64 = lshr i64 %ub, 63
+  %sr64 = xor i64 %sa64, %sb64
+  %sr = trunc i64 %sr64 to i32
+  %sbit = shl i64 %sr64, 63
+  %nan_a = icmp ugt i64 %aa, 9218868437227405312
+  %nan_b = icmp ugt i64 %ab, 9218868437227405312
+  %any_nan = or i1 %nan_a, %nan_b
+  br i1 %any_nan, label %ret_nan, label %chk_special
+ret_nan:
+  %dnan = bitcast i64 9221120237041090560 to double
+  ret double %dnan
+chk_special:
+  %inf_a = icmp eq i64 %aa, 9218868437227405312
+  %inf_b = icmp eq i64 %ab, 9218868437227405312
+  %za = icmp eq i64 %aa, 0
+  %zb = icmp eq i64 %ab, 0
+  %ii = and i1 %inf_a, %inf_b
+  %zz = and i1 %za, %zb
+  %bad = or i1 %ii, %zz
+  br i1 %bad, label %ret_nan, label %chk_inf_out
+chk_inf_out:
+  %to_inf = or i1 %inf_a, %zb
+  br i1 %to_inf, label %ret_inf, label %chk_zero_out
+ret_inf:
+  %uinf = or i64 %sbit, 9218868437227405312
+  %dinf = bitcast i64 %uinf to double
+  ret double %dinf
+chk_zero_out:
+  %to_z = or i1 %za, %inf_b
+  br i1 %to_z, label %ret_zero, label %finite_div
+ret_zero:
+  %dz = bitcast i64 %sbit to double
+  ret double %dz
+finite_div:
+  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
+  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
+  %ea = extractvalue { i32, i32, i64 } %upa, 1
+  %ma = extractvalue { i32, i32, i64 } %upa, 2
+  %eb = extractvalue { i32, i32, i64 } %upb, 1
+  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  br label %dloop
+dloop:
+  %k = phi i64 [ 56, %finite_div ], [ %k_next, %dbody ]
+  %q = phi i64 [ 0, %finite_div ], [ %q_next, %dbody ]
+  %r = phi i64 [ %ma, %finite_div ], [ %r_for_next, %dbody ]
+  %done = icmp slt i64 %k, 0
+  br i1 %done, label %dfinish, label %dbody
+dbody:
+  %ge = icmp uge i64 %r, %mb
+  %r_sub = sub i64 %r, %mb
+  %r_rem = select i1 %ge, i64 %r_sub, i64 %r
+  %qbit = shl i64 1, %k
+  %q_or = or i64 %q, %qbit
+  %q_next = select i1 %ge, i64 %q_or, i64 %q
+  %is_last = icmp eq i64 %k, 0
+  %r_sh = shl i64 %r_rem, 1
+  %r_for_next = select i1 %is_last, i64 %r_rem, i64 %r_sh
+  %k_next = sub i64 %k, 1
+  br label %dloop
+dfinish:
+  %r_nz = icmp ne i64 %r, 0
+  %st = zext i1 %r_nz to i64
+  %qs = or i64 %q, %st
+  %ediff = sub i32 %ea, %eb
+  %ebase = add i32 %ediff, 1022
+  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %qs, i32 %ebase, i32 55)
+  %sn = extractvalue { i64, i32 } %nd, 0
+  %en = extractvalue { i64, i32 } %nd, 1
+  %res = call double @__syn_pack_f64(i32 %sr, i32 %en, i64 %sn)
+  ret double %res
+}
+
+define weak double @__syn_fmod_f64(double %a, double %b) #99 {
+entry:
+  %ua = bitcast double %a to i64
+  %ub = bitcast double %b to i64
+  %aa = and i64 %ua, 9223372036854775807
+  %ab = and i64 %ub, 9223372036854775807
+  %sbit = and i64 %ua, -9223372036854775808
+  %nan_a = icmp ugt i64 %aa, 9218868437227405312
+  %nan_b = icmp ugt i64 %ab, 9218868437227405312
+  %inf_a = icmp eq i64 %aa, 9218868437227405312
+  %zb = icmp eq i64 %ab, 0
+  %bad0 = or i1 %nan_a, %nan_b
+  %bad1 = or i1 %inf_a, %zb
+  %bad = or i1 %bad0, %bad1
+  br i1 %bad, label %ret_nan, label %chk_trivial
+ret_nan:
+  %dnan = bitcast i64 9221120237041090560 to double
+  ret double %dnan
+chk_trivial:
+  %za = icmp eq i64 %aa, 0
+  %inf_b = icmp eq i64 %ab, 9218868437227405312
+  %lt_mag = icmp ult i64 %aa, %ab
+  %triv0 = or i1 %za, %inf_b
+  %triv = or i1 %triv0, %lt_mag
+  br i1 %triv, label %ret_a, label %do_rem
+ret_a:
+  ret double %a
+do_rem:
+  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
+  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
+  %sa = extractvalue { i32, i32, i64 } %upa, 0
+  %ea = extractvalue { i32, i32, i64 } %upa, 1
+  %ma = extractvalue { i32, i32, i64 } %upa, 2
+  %eb = extractvalue { i32, i32, i64 } %upb, 1
+  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %steps = sub i32 %ea, %eb
+  br label %rloop
+rloop:
+  %i = phi i32 [ 0, %do_rem ], [ %inext, %rbody ]
+  %r = phi i64 [ %ma, %do_rem ], [ %r_next, %rbody ]
+  %done = icmp sgt i32 %i, %steps
+  br i1 %done, label %rfinish, label %rbody
+rbody:
+  %ge = icmp uge i64 %r, %mb
+  %r_sub = sub i64 %r, %mb
+  %r_cur = select i1 %ge, i64 %r_sub, i64 %r
+  %more = icmp slt i32 %i, %steps
+  %r_sh = shl i64 %r_cur, 1
+  %r_next = select i1 %more, i64 %r_sh, i64 %r_cur
+  %inext = add i32 %i, 1
+  br label %rloop
+rfinish:
+  %rz = icmp eq i64 %r, 0
+  br i1 %rz, label %ret_szero, label %pack_rem
+ret_szero:
+  %dz = bitcast i64 %sbit to double
+  ret double %dz
+pack_rem:
+  %r55 = shl i64 %r, 3
+  %nr = call { i64, i32 } @__syn_norm_sig64(i64 %r55, i32 %eb, i32 55)
+  %sn = extractvalue { i64, i32 } %nr, 0
+  %en = extractvalue { i64, i32 } %nr, 1
+  %res = call double @__syn_pack_f64(i32 %sa, i32 %en, i64 %sn)
+  ret double %res
+}
+
+define weak double @fmod(double %a, double %b) #99 {
+entry:
+  %r = call double @__syn_fmod_f64(double %a, double %b)
+  ret double %r
+}
+
+define weak float @fmodf(float %a, float %b) #99 {
+entry:
+  %da = call double @__extendsfdf2(float %a)
+  %db = call double @__extendsfdf2(float %b)
+  %dr = call double @__syn_fmod_f64(double %da, double %db)
+  %fr = call float @__truncdfsf2(double %dr)
+  ret float %fr
+}
+
+; ── Integer <-> Float Conversions (i32/u32/i64/u64 <-> f32/f64) ──
+define weak float @__syn_u64_to_f32(i32 %sign, i64 %mag) #99 {
+entry:
+  %iz = icmp eq i64 %mag, 0
+  br i1 %iz, label %ret_z, label %conv
+ret_z:
+  ret float 0.0
+conv:
+  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %mag, i32 153, i32 26)
+  %sn = extractvalue { i64, i32 } %nm, 0
+  %en = extractvalue { i64, i32 } %nm, 1
+  %res = call float @__syn_pack_f32(i32 %sign, i32 %en, i64 %sn)
+  ret float %res
+}
+
+define weak double @__syn_u64_to_f64(i32 %sign, i64 %mag) #99 {
+entry:
+  %iz = icmp eq i64 %mag, 0
+  br i1 %iz, label %ret_z, label %conv
+ret_z:
+  ret double 0.0
+conv:
+  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %mag, i32 1078, i32 55)
+  %sn = extractvalue { i64, i32 } %nm, 0
+  %en = extractvalue { i64, i32 } %nm, 1
+  %res = call double @__syn_pack_f64(i32 %sign, i32 %en, i64 %sn)
+  ret double %res
+}
+
+define weak float @__floatsisf(i32 %a) #99 {
+entry:
+  %neg = icmp slt i32 %a, 0
+  %s = zext i1 %neg to i32
+  %na = sub i32 0, %a
+  %ua = select i1 %neg, i32 %na, i32 %a
+  %u64 = zext i32 %ua to i64
+  %r = call float @__syn_u64_to_f32(i32 %s, i64 %u64)
+  ret float %r
+}
+
+define weak float @__floatunsisf(i32 %a) #99 {
+entry:
+  %u64 = zext i32 %a to i64
+  %r = call float @__syn_u64_to_f32(i32 0, i64 %u64)
+  ret float %r
+}
+
+define weak float @__floatdisf(i64 %a) #99 {
+entry:
+  %neg = icmp slt i64 %a, 0
+  %s = zext i1 %neg to i32
+  %na = sub i64 0, %a
+  %ua = select i1 %neg, i64 %na, i64 %a
+  %r = call float @__syn_u64_to_f32(i32 %s, i64 %ua)
+  ret float %r
+}
+
+define weak float @__floatundisf(i64 %a) #99 {
+entry:
+  %r = call float @__syn_u64_to_f32(i32 0, i64 %a)
+  ret float %r
+}
+
+define weak double @__floatsidf(i32 %a) #99 {
+entry:
+  %neg = icmp slt i32 %a, 0
+  %s = zext i1 %neg to i32
+  %na = sub i32 0, %a
+  %ua = select i1 %neg, i32 %na, i32 %a
+  %u64 = zext i32 %ua to i64
+  %r = call double @__syn_u64_to_f64(i32 %s, i64 %u64)
+  ret double %r
+}
+
+define weak double @__floatunsidf(i32 %a) #99 {
+entry:
+  %u64 = zext i32 %a to i64
+  %r = call double @__syn_u64_to_f64(i32 0, i64 %u64)
+  ret double %r
+}
+
+define weak double @__floatdidf(i64 %a) #99 {
+entry:
+  %neg = icmp slt i64 %a, 0
+  %s = zext i1 %neg to i32
+  %na = sub i64 0, %a
+  %ua = select i1 %neg, i64 %na, i64 %a
+  %r = call double @__syn_u64_to_f64(i32 %s, i64 %ua)
+  ret double %r
+}
+
+define weak double @__floatundidf(i64 %a) #99 {
+entry:
+  %r = call double @__syn_u64_to_f64(i32 0, i64 %a)
+  ret double %r
+}
+
+define weak i64 @__syn_f64_to_u64_sat(double %x, ptr %neg_out, ptr %nan_out) #99 {
+entry:
+  %u = bitcast double %x to i64
+  %s64 = lshr i64 %u, 63
+  %s8 = trunc i64 %s64 to i8
+  store i8 %s8, ptr %neg_out, align 1
+  %aa = and i64 %u, 9223372036854775807
+  %is_nan = icmp ugt i64 %aa, 9218868437227405312
+  br i1 %is_nan, label %on_nan, label %not_nan
+on_nan:
+  store i8 1, ptr %nan_out, align 1
+  ret i64 0
+not_nan:
+  store i8 0, ptr %nan_out, align 1
+  %es = lshr i64 %aa, 52
+  %exp = trunc i64 %es to i32
+  %lt1 = icmp slt i32 %exp, 1023
+  br i1 %lt1, label %ret_z, label %chk_ovf
+ret_z:
+  ret i64 0
+chk_ovf:
+  %e = sub i32 %exp, 1023
+  %ge64 = icmp sge i32 %e, 64
+  br i1 %ge64, label %ret_max, label %extract_mag
+ret_max:
+  ret i64 -1
+extract_mag:
+  %frac = and i64 %u, 4503599627370495
+  %sig = or i64 %frac, 4503599627370496
+  %ge52 = icmp sge i32 %e, 52
+  br i1 %ge52, label %shl_bb, label %shr_bb
+shl_bb:
+  %lsh = sub i32 %e, 52
+  %lsh64 = zext i32 %lsh to i64
+  %ml = shl i64 %sig, %lsh64
+  ret i64 %ml
+shr_bb:
+  %rsh = sub i32 52, %e
+  %rsh64 = zext i32 %rsh to i64
+  %mr = lshr i64 %sig, %rsh64
+  ret i64 %mr
+}
+
+define weak i64 @__fixunsdfdi(double %x) #99 {
+entry:
+  %neg = alloca i8, align 1
+  %nan = alloca i8, align 1
+  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %nv = load i8, ptr %neg, align 1
+  %nn = load i8, ptr %nan, align 1
+  %bad = or i8 %nv, %nn
+  %is_bad = icmp ne i8 %bad, 0
+  %res = select i1 %is_bad, i64 0, i64 %m
+  ret i64 %res
+}
+
+define weak i64 @__fixdfdi(double %x) #99 {
+entry:
+  %neg = alloca i8, align 1
+  %nan = alloca i8, align 1
+  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %nn = load i8, ptr %nan, align 1
+  %is_nan = icmp ne i8 %nn, 0
+  br i1 %is_nan, label %ret_z, label %chk_sign
+ret_z:
+  ret i64 0
+chk_sign:
+  %nv = load i8, ptr %neg, align 1
+  %is_neg = icmp ne i8 %nv, 0
+  br i1 %is_neg, label %neg_bb, label %pos_bb
+pos_bb:
+  %ov_p = icmp ugt i64 %m, 9223372036854775807
+  %rp = select i1 %ov_p, i64 9223372036854775807, i64 %m
+  ret i64 %rp
+neg_bb:
+  %ov_n = icmp uge i64 %m, -9223372036854775808
+  %nm = sub i64 0, %m
+  %rn = select i1 %ov_n, i64 -9223372036854775808, i64 %nm
+  ret i64 %rn
+}
+
+define weak i32 @__fixunsdfsi(double %x) #99 {
+entry:
+  %neg = alloca i8, align 1
+  %nan = alloca i8, align 1
+  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %nv = load i8, ptr %neg, align 1
+  %nn = load i8, ptr %nan, align 1
+  %bad = or i8 %nv, %nn
+  %is_bad = icmp ne i8 %bad, 0
+  br i1 %is_bad, label %ret_z, label %clamp_u32
+ret_z:
+  ret i32 0
+clamp_u32:
+  %ov = icmp ugt i64 %m, 4294967295
+  %tr = trunc i64 %m to i32
+  %res = select i1 %ov, i32 -1, i32 %tr
+  ret i32 %res
+}
+
+define weak i32 @__fixdfsi(double %x) #99 {
+entry:
+  %neg = alloca i8, align 1
+  %nan = alloca i8, align 1
+  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %nn = load i8, ptr %nan, align 1
+  %is_nan = icmp ne i8 %nn, 0
+  br i1 %is_nan, label %ret_z, label %chk_sign
+ret_z:
+  ret i32 0
+chk_sign:
+  %nv = load i8, ptr %neg, align 1
+  %is_neg = icmp ne i8 %nv, 0
+  br i1 %is_neg, label %neg_bb, label %pos_bb
+pos_bb:
+  %ov_p = icmp ugt i64 %m, 2147483647
+  %tr_p = trunc i64 %m to i32
+  %rp = select i1 %ov_p, i32 2147483647, i32 %tr_p
+  ret i32 %rp
+neg_bb:
+  %ov_n = icmp uge i64 %m, 2147483648
+  %tr_n = trunc i64 %m to i32
+  %nm = sub i32 0, %tr_n
+  %rn = select i1 %ov_n, i32 -2147483648, i32 %nm
+  ret i32 %rn
+}
+
+define weak i32 @__fixsfsi(float %x) #99 {
+entry:
+  %d = call double @__extendsfdf2(float %x)
+  %r = call i32 @__fixdfsi(double %d)
+  ret i32 %r
+}
+
+define weak i32 @__fixunssfsi(float %x) #99 {
+entry:
+  %d = call double @__extendsfdf2(float %x)
+  %r = call i32 @__fixunsdfsi(double %d)
+  ret i32 %r
+}
+
+define weak i64 @__fixsfdi(float %x) #99 {
+entry:
+  %d = call double @__extendsfdf2(float %x)
+  %r = call i64 @__fixdfdi(double %d)
+  ret i64 %r
+}
+
+define weak i64 @__fixunssfdi(float %x) #99 {
+entry:
+  %d = call double @__extendsfdf2(float %x)
+  %r = call i64 @__fixunsdfdi(double %d)
+  ret i64 %r
+}
+
+; ── IEEE-754 Soft-Float Comparisons (GNU __*sf2 / __*df2) ──
+define weak i32 @__syn_cmp_f32(float %a, float %b, i32 %nan_res) #99 {
+entry:
+  %ua = bitcast float %a to i32
+  %ub = bitcast float %b to i32
+  %aa = and i32 %ua, 2147483647
+  %ab = and i32 %ub, 2147483647
+  %na = icmp ugt i32 %aa, 2139095040
+  %nb = icmp ugt i32 %ab, 2139095040
+  %unn = or i1 %na, %nb
+  br i1 %unn, label %ret_nan, label %chk_zero
+ret_nan:
+  ret i32 %nan_res
+chk_zero:
+  %orz = or i32 %aa, %ab
+  %both_z = icmp eq i32 %orz, 0
+  %same_bits = icmp eq i32 %ua, %ub
+  %eq = or i1 %both_z, %same_bits
+  br i1 %eq, label %ret_eq, label %chk_signs
+ret_eq:
+  ret i32 0
+chk_signs:
+  %sa = icmp slt i32 %ua, 0
+  %sb = icmp slt i32 %ub, 0
+  %diff_s = xor i1 %sa, %sb
+  br i1 %diff_s, label %opp_s, label %same_s
+opp_s:
+  %ro = select i1 %sa, i32 -1, i32 1
+  ret i32 %ro
+same_s:
+  %mag_lt = icmp ult i32 %aa, %ab
+  %lt = xor i1 %mag_lt, %sa
+  %rs = select i1 %lt, i32 -1, i32 1
+  ret i32 %rs
+}
+
+define weak i32 @__syn_cmp_f64(double %a, double %b, i32 %nan_res) #99 {
+entry:
+  %ua = bitcast double %a to i64
+  %ub = bitcast double %b to i64
+  %aa = and i64 %ua, 9223372036854775807
+  %ab = and i64 %ub, 9223372036854775807
+  %na = icmp ugt i64 %aa, 9218868437227405312
+  %nb = icmp ugt i64 %ab, 9218868437227405312
+  %unn = or i1 %na, %nb
+  br i1 %unn, label %ret_nan, label %chk_zero
+ret_nan:
+  ret i32 %nan_res
+chk_zero:
+  %orz = or i64 %aa, %ab
+  %both_z = icmp eq i64 %orz, 0
+  %same_bits = icmp eq i64 %ua, %ub
+  %eq = or i1 %both_z, %same_bits
+  br i1 %eq, label %ret_eq, label %chk_signs
+ret_eq:
+  ret i32 0
+chk_signs:
+  %sa = icmp slt i64 %ua, 0
+  %sb = icmp slt i64 %ub, 0
+  %diff_s = xor i1 %sa, %sb
+  br i1 %diff_s, label %opp_s, label %same_s
+opp_s:
+  %ro = select i1 %sa, i32 -1, i32 1
+  ret i32 %ro
+same_s:
+  %mag_lt = icmp ult i64 %aa, %ab
+  %lt = xor i1 %mag_lt, %sa
+  %rs = select i1 %lt, i32 -1, i32 1
+  ret i32 %rs
+}
+
+define weak i32 @__unordsf2(float %a, float %b) #99 {
+entry:
+  %ua = bitcast float %a to i32
+  %ub = bitcast float %b to i32
+  %aa = and i32 %ua, 2147483647
+  %ab = and i32 %ub, 2147483647
+  %na = icmp ugt i32 %aa, 2139095040
+  %nb = icmp ugt i32 %ab, 2139095040
+  %u = or i1 %na, %nb
+  %r = zext i1 %u to i32
+  ret i32 %r
+}
+
+define weak i32 @__eqsf2(float %a, float %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__nesf2(float %a, float %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__ltsf2(float %a, float %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__lesf2(float %a, float %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__gtsf2(float %a, float %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
+  ret i32 %r
+}
+define weak i32 @__gesf2(float %a, float %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
+  ret i32 %r
+}
+
+define weak i32 @__unorddf2(double %a, double %b) #99 {
+entry:
+  %ua = bitcast double %a to i64
+  %ub = bitcast double %b to i64
+  %aa = and i64 %ua, 9223372036854775807
+  %ab = and i64 %ub, 9223372036854775807
+  %na = icmp ugt i64 %aa, 9218868437227405312
+  %nb = icmp ugt i64 %ab, 9218868437227405312
+  %u = or i1 %na, %nb
+  %r = zext i1 %u to i32
+  ret i32 %r
+}
+
+define weak i32 @__eqdf2(double %a, double %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__nedf2(double %a, double %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__ltdf2(double %a, double %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__ledf2(double %a, double %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  ret i32 %r
+}
+define weak i32 @__gtdf2(double %a, double %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
+  ret i32 %r
+}
+define weak i32 @__gedf2(double %a, double %b) #99 {
+entry:
+  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
+  ret i32 %r
+}
+"#,
+    );
+
+    if target == TargetArch::Thumbv7mNoneEabi {
+        out.push_str(
+            r#"; ── ARM RTABI (__aeabi_f* / __aeabi_d*) Soft-Float Shims ──
+define weak float @__aeabi_fadd(float %a, float %b) #99 {
+entry:
+  %r = call float @__addsf3(float %a, float %b)
+  ret float %r
+}
+define weak float @__aeabi_fsub(float %a, float %b) #99 {
+entry:
+  %r = call float @__subsf3(float %a, float %b)
+  ret float %r
+}
+define weak float @__aeabi_frsub(float %a, float %b) #99 {
+entry:
+  %r = call float @__subsf3(float %b, float %a)
+  ret float %r
+}
+define weak float @__aeabi_fmul(float %a, float %b) #99 {
+entry:
+  %r = call float @__mulsf3(float %a, float %b)
+  ret float %r
+}
+define weak float @__aeabi_fdiv(float %a, float %b) #99 {
+entry:
+  %r = call float @__divsf3(float %a, float %b)
+  ret float %r
+}
+define weak i32 @__aeabi_f2iz(float %x) #99 {
+entry:
+  %r = call i32 @__fixsfsi(float %x)
+  ret i32 %r
+}
+define weak i32 @__aeabi_f2uiz(float %x) #99 {
+entry:
+  %r = call i32 @__fixunssfsi(float %x)
+  ret i32 %r
+}
+define weak i64 @__aeabi_f2lz(float %x) #99 {
+entry:
+  %r = call i64 @__fixsfdi(float %x)
+  ret i64 %r
+}
+define weak i64 @__aeabi_f2ulz(float %x) #99 {
+entry:
+  %r = call i64 @__fixunssfdi(float %x)
+  ret i64 %r
+}
+define weak float @__aeabi_i2f(i32 %x) #99 {
+entry:
+  %r = call float @__floatsisf(i32 %x)
+  ret float %r
+}
+define weak float @__aeabi_ui2f(i32 %x) #99 {
+entry:
+  %r = call float @__floatunsisf(i32 %x)
+  ret float %r
+}
+define weak float @__aeabi_l2f(i64 %x) #99 {
+entry:
+  %r = call float @__floatdisf(i64 %x)
+  ret float %r
+}
+define weak float @__aeabi_ul2f(i64 %x) #99 {
+entry:
+  %r = call float @__floatundisf(i64 %x)
+  ret float %r
+}
+define weak i32 @__aeabi_fcmpeq(float %a, float %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  %ok = icmp eq i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_fcmplt(float %a, float %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  %ok = icmp slt i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_fcmple(float %a, float %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  %ok = icmp sle i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_fcmpgt(float %a, float %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
+  %ok = icmp sgt i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_fcmpge(float %a, float %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
+  %ok = icmp sge i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_fcmpun(float %a, float %b) #99 {
+entry:
+  %r = call i32 @__unordsf2(float %a, float %b)
+  ret i32 %r
+}
+
+define weak double @__aeabi_f2d(float %a) #99 {
+entry:
+  %r = call double @__extendsfdf2(float %a)
+  ret double %r
+}
+define weak float @__aeabi_d2f(double %a) #99 {
+entry:
+  %r = call float @__truncdfsf2(double %a)
+  ret float %r
+}
+define weak double @__aeabi_dadd(double %a, double %b) #99 {
+entry:
+  %r = call double @__adddf3(double %a, double %b)
+  ret double %r
+}
+define weak double @__aeabi_dsub(double %a, double %b) #99 {
+entry:
+  %r = call double @__subdf3(double %a, double %b)
+  ret double %r
+}
+define weak double @__aeabi_drsub(double %a, double %b) #99 {
+entry:
+  %r = call double @__subdf3(double %b, double %a)
+  ret double %r
+}
+define weak double @__aeabi_dmul(double %a, double %b) #99 {
+entry:
+  %r = call double @__muldf3(double %a, double %b)
+  ret double %r
+}
+define weak double @__aeabi_ddiv(double %a, double %b) #99 {
+entry:
+  %r = call double @__divdf3(double %a, double %b)
+  ret double %r
+}
+define weak i32 @__aeabi_d2iz(double %x) #99 {
+entry:
+  %r = call i32 @__fixdfsi(double %x)
+  ret i32 %r
+}
+define weak i32 @__aeabi_d2uiz(double %x) #99 {
+entry:
+  %r = call i32 @__fixunsdfsi(double %x)
+  ret i32 %r
+}
+define weak i64 @__aeabi_d2lz(double %x) #99 {
+entry:
+  %r = call i64 @__fixdfdi(double %x)
+  ret i64 %r
+}
+define weak i64 @__aeabi_d2ulz(double %x) #99 {
+entry:
+  %r = call i64 @__fixunsdfdi(double %x)
+  ret i64 %r
+}
+define weak double @__aeabi_i2d(i32 %x) #99 {
+entry:
+  %r = call double @__floatsidf(i32 %x)
+  ret double %r
+}
+define weak double @__aeabi_ui2d(i32 %x) #99 {
+entry:
+  %r = call double @__floatunsidf(i32 %x)
+  ret double %r
+}
+define weak double @__aeabi_l2d(i64 %x) #99 {
+entry:
+  %r = call double @__floatdidf(i64 %x)
+  ret double %r
+}
+define weak double @__aeabi_ul2d(i64 %x) #99 {
+entry:
+  %r = call double @__floatundidf(i64 %x)
+  ret double %r
+}
+define weak i32 @__aeabi_dcmpeq(double %a, double %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  %ok = icmp eq i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_dcmplt(double %a, double %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  %ok = icmp slt i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_dcmple(double %a, double %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  %ok = icmp sle i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_dcmpgt(double %a, double %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
+  %ok = icmp sgt i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_dcmpge(double %a, double %b) #99 {
+entry:
+  %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
+  %ok = icmp sge i32 %c, 0
+  %r = zext i1 %ok to i32
+  ret i32 %r
+}
+define weak i32 @__aeabi_dcmpun(double %a, double %b) #99 {
+entry:
+  %r = call i32 @__unorddf2(double %a, double %b)
+  ret i32 %r
+}
+"#,
+        );
+    }
+    out.push('\n');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Freestanding Zero-Heap Stream & Bounded-Buffer (`fmt_buf`) Formatters
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn emit_zero_heap_fmt_ir(out: &mut String, emit_float_fixed: bool, emit_float_sci: bool) {
+    out.push_str(
+        r#"; ── Freestanding Zero-Heap Format Sink & Tiered Formatters (ld.lld --gc-sections) ──
+@.syn_fmt_str_true = weak unnamed_addr constant [5 x i8] c"true\00", align 1
+@.syn_fmt_str_false = weak unnamed_addr constant [6 x i8] c"false\00", align 1
+@.syn_fmt_str_nan = weak unnamed_addr constant [4 x i8] c"nan\00", align 1
+@.syn_fmt_str_inf = weak unnamed_addr constant [4 x i8] c"inf\00", align 1
+@.syn_fmt_str_ovf = weak unnamed_addr constant [4 x i8] c"ovf\00", align 1
+@.syn_fmt_pow10_u64 = weak unnamed_addr constant [10 x i64] [
+  i64 1,
+  i64 10,
+  i64 100,
+  i64 1000,
+  i64 10000,
+  i64 100000,
+  i64 1000000,
+  i64 10000000,
+  i64 100000000,
+  i64 1000000000
+], align 8
+
+define weak void @__syn_fmt_init_uart(ptr %sink) #99 {
+entry:
+  store %SynFmtSink zeroinitializer, ptr %sink, align 4
+  ret void
+}
+
+define weak void @__syn_fmt_init_buf(ptr %sink, ptr %dst, i32 %cap) #99 {
+entry:
+  %c_neg = icmp slt i32 %cap, 0
+  %c_nonneg = select i1 %c_neg, i32 0, i32 %cap
+  %dst_null = icmp eq ptr %dst, null
+  %c_safe = select i1 %dst_null, i32 0, i32 %c_nonneg
+  %p0 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 0
+  %p1 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 1
+  %p2 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 2
+  %p3 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3
+  %p4 = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 4
+  store ptr %dst, ptr %p0, align 4
+  store i32 %c_safe, ptr %p1, align 4
+  store i32 0, ptr %p2, align 4
+  store i8 0, ptr %p3, align 1
+  store i8 1, ptr %p4, align 1
+  ret void
+}
+
+define weak void @__syn_fmt_putc(ptr %sink, i8 %ch) noinline #99 {
+entry:
+  %ib_ptr = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 4
+  %ib = load i8, ptr %ib_ptr, align 1
+  %wp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 2
+  %w = load i32, ptr %wp, align 4
+  %is_uart = icmp eq i8 %ib, 0
+  br i1 %is_uart, label %to_uart, label %to_buf
+to_uart:
+  call void @__syn_uart_putc(i8 %ch)
+  %wu = add i32 %w, 1
+  store i32 %wu, ptr %wp, align 4
+  ret void
+to_buf:
+  %cp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 1
+  %cap = load i32, ptr %cp, align 4
+  %fit = icmp slt i32 %w, %cap
+  br i1 %fit, label %write_byte, label %mark_trunc
+write_byte:
+  %dp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 0
+  %dst = load ptr, ptr %dp, align 4
+  %out_p = getelementptr i8, ptr %dst, i32 %w
+  store i8 %ch, ptr %out_p, align 1
+  %wb = add i32 %w, 1
+  store i32 %wb, ptr %wp, align 4
+  ret void
+mark_trunc:
+  %tp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3
+  store i8 1, ptr %tp, align 1
+  ret void
+}
+
+define weak void @__syn_fmt_bytes(ptr %sink, ptr %data, i32 %len) noinline #99 {
+entry:
+  %isnull = icmp eq ptr %data, null
+  %le0 = icmp sle i32 %len, 0
+  %skip = or i1 %isnull, %le0
+  br i1 %skip, label %done, label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %inext, %body ]
+  %end = icmp sge i32 %i, %len
+  br i1 %end, label %done, label %body
+body:
+  %bp = getelementptr i8, ptr %data, i32 %i
+  %b = load i8, ptr %bp, align 1
+  call void @__syn_fmt_putc(ptr %sink, i8 %b)
+  %inext = add i32 %i, 1
+  br label %loop
+done:
+  ret void
+}
+
+define weak void @__syn_fmt_cstr(ptr %sink, ptr %cstr) noinline #99 {
+entry:
+  %isnull = icmp eq ptr %cstr, null
+  br i1 %isnull, label %done, label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %inext, %body ]
+  %bp = getelementptr i8, ptr %cstr, i32 %i
+  %b = load i8, ptr %bp, align 1
+  %is_nul = icmp eq i8 %b, 0
+  br i1 %is_nul, label %done, label %body
+body:
+  call void @__syn_fmt_putc(ptr %sink, i8 %b)
+  %inext = add i32 %i, 1
+  br label %loop
+done:
+  ret void
+}
+
+define weak void @__syn_fmt_bool(ptr %sink, i8 %val) noinline #99 {
+entry:
+  %nz = icmp ne i8 %val, 0
+  %s = select i1 %nz, ptr @.syn_fmt_str_true, ptr @.syn_fmt_str_false
+  call void @__syn_fmt_cstr(ptr %sink, ptr %s)
+  ret void
+}
+
+define weak void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 %min_width) noinline #99 {
+entry:
+  %buf = alloca [12 x i8], align 1
+  %w_neg = icmp slt i32 %min_width, 1
+  %w0 = select i1 %w_neg, i32 1, i32 %min_width
+  %w_hi = icmp sgt i32 %w0, 12
+  %w_clamped = select i1 %w_hi, i32 12, i32 %w0
+  br label %eloop
+eloop:
+  %v = phi i32 [ %val, %entry ], [ %q, %eloop_cont ]
+  %len = phi i32 [ 0, %entry ], [ %len1, %eloop_cont ]
+  %rem = urem i32 %v, 10
+  %q = udiv i32 %v, 10
+  %d32 = add i32 %rem, 48
+  %d8 = trunc i32 %d32 to i8
+  %sp = getelementptr inbounds [12 x i8], ptr %buf, i32 0, i32 %len
+  store i8 %d8, ptr %sp, align 1
+  %len1 = add i32 %len, 1
+  %more = icmp ne i32 %q, 0
+  br i1 %more, label %eloop_cont, label %pad_init
+eloop_cont:
+  br label %eloop
+pad_init:
+  %pad_cnt = sub i32 %w_clamped, %len1
+  br label %pad_loop
+pad_loop:
+  %p = phi i32 [ %pad_cnt, %pad_init ], [ %p_next, %pad_body ]
+  %pdone = icmp sle i32 %p, 0
+  br i1 %pdone, label %emit_init, label %pad_body
+pad_body:
+  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  %p_next = sub i32 %p, 1
+  br label %pad_loop
+emit_init:
+  br label %emit_loop
+emit_loop:
+  %idx = phi i32 [ %len1, %emit_init ], [ %idx_prev, %emit_body ]
+  %edone = icmp eq i32 %idx, 0
+  br i1 %edone, label %done, label %emit_body
+emit_body:
+  %idx_prev = sub i32 %idx, 1
+  %cp = getelementptr inbounds [12 x i8], ptr %buf, i32 0, i32 %idx_prev
+  %ch = load i8, ptr %cp, align 1
+  call void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  br label %emit_loop
+done:
+  ret void
+}
+
+define weak void @__syn_fmt_u32_dec(ptr %sink, i32 %val) noinline #99 {
+entry:
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 1)
+  ret void
+}
+
+define weak void @__syn_fmt_i32_dec(ptr %sink, i32 %val) noinline #99 {
+entry:
+  %neg = icmp slt i32 %val, 0
+  br i1 %neg, label %do_neg, label %do_pos
+do_neg:
+  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  %abs = sub i32 0, %val
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %abs, i32 1)
+  ret void
+do_pos:
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 1)
+  ret void
+}
+
+define weak void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 %min_width) noinline #99 {
+entry:
+  %buf = alloca [24 x i8], align 1
+  %rem_slot = alloca i64, align 8
+  %w_neg = icmp slt i32 %min_width, 1
+  %w0 = select i1 %w_neg, i32 1, i32 %min_width
+  %w_hi = icmp sgt i32 %w0, 20
+  %w_clamped = select i1 %w_hi, i32 20, i32 %w0
+  br label %eloop
+eloop:
+  %v = phi i64 [ %val, %entry ], [ %q, %eloop_cont ]
+  %len = phi i32 [ 0, %entry ], [ %len1, %eloop_cont ]
+  %q = call i64 @__syn_udivrem64(i64 %v, i64 10, ptr %rem_slot)
+  %rem64 = load i64, ptr %rem_slot, align 8
+  %d64 = add i64 %rem64, 48
+  %d8 = trunc i64 %d64 to i8
+  %sp = getelementptr inbounds [24 x i8], ptr %buf, i32 0, i32 %len
+  store i8 %d8, ptr %sp, align 1
+  %len1 = add i32 %len, 1
+  %more = icmp ne i64 %q, 0
+  br i1 %more, label %eloop_cont, label %pad_init
+eloop_cont:
+  br label %eloop
+pad_init:
+  %pad_cnt = sub i32 %w_clamped, %len1
+  br label %pad_loop
+pad_loop:
+  %p = phi i32 [ %pad_cnt, %pad_init ], [ %p_next, %pad_body ]
+  %pdone = icmp sle i32 %p, 0
+  br i1 %pdone, label %emit_init, label %pad_body
+pad_body:
+  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  %p_next = sub i32 %p, 1
+  br label %pad_loop
+emit_init:
+  br label %emit_loop
+emit_loop:
+  %idx = phi i32 [ %len1, %emit_init ], [ %idx_prev, %emit_body ]
+  %edone = icmp eq i32 %idx, 0
+  br i1 %edone, label %done, label %emit_body
+emit_body:
+  %idx_prev = sub i32 %idx, 1
+  %cp = getelementptr inbounds [24 x i8], ptr %buf, i32 0, i32 %idx_prev
+  %ch = load i8, ptr %cp, align 1
+  call void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  br label %emit_loop
+done:
+  ret void
+}
+
+define weak void @__syn_fmt_u64_dec(ptr %sink, i64 %val) noinline #99 {
+entry:
+  call void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 1)
+  ret void
+}
+
+define weak void @__syn_fmt_i64_dec(ptr %sink, i64 %val) noinline #99 {
+entry:
+  %neg = icmp slt i64 %val, 0
+  br i1 %neg, label %do_neg, label %do_pos
+do_neg:
+  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  %abs = sub i64 0, %val
+  call void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %abs, i32 1)
+  ret void
+do_pos:
+  call void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 1)
+  ret void
+}
+
+define weak void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 %shift_bits, i8 %upper, i32 %min_width) noinline #99 {
+entry:
+  %buf = alloca [64 x i8], align 1
+  %w_neg = icmp slt i32 %min_width, 1
+  %w0 = select i1 %w_neg, i32 1, i32 %min_width
+  %w_hi = icmp sgt i32 %w0, 64
+  %w_clamped = select i1 %w_hi, i32 64, i32 %w0
+  %sh64 = zext i32 %shift_bits to i64
+  %m1 = shl i64 1, %sh64
+  %mask = sub i64 %m1, 1
+  %is_up = icmp ne i8 %upper, 0
+  %a_off = select i1 %is_up, i64 55, i64 87
+  br label %eloop
+eloop:
+  %v = phi i64 [ %val, %entry ], [ %q, %eloop_cont ]
+  %len = phi i32 [ 0, %entry ], [ %len1, %eloop_cont ]
+  %dig = and i64 %v, %mask
+  %q = lshr i64 %v, %sh64
+  %is_af = icmp uge i64 %dig, 10
+  %c_09 = add i64 %dig, 48
+  %c_af = add i64 %dig, %a_off
+  %c64 = select i1 %is_af, i64 %c_af, i64 %c_09
+  %c8 = trunc i64 %c64 to i8
+  %sp = getelementptr inbounds [64 x i8], ptr %buf, i32 0, i32 %len
+  store i8 %c8, ptr %sp, align 1
+  %len1 = add i32 %len, 1
+  %more = icmp ne i64 %q, 0
+  br i1 %more, label %eloop_cont, label %pad_init
+eloop_cont:
+  br label %eloop
+pad_init:
+  %pad_cnt = sub i32 %w_clamped, %len1
+  br label %pad_loop
+pad_loop:
+  %p = phi i32 [ %pad_cnt, %pad_init ], [ %p_next, %pad_body ]
+  %pdone = icmp sle i32 %p, 0
+  br i1 %pdone, label %emit_init, label %pad_body
+pad_body:
+  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  %p_next = sub i32 %p, 1
+  br label %pad_loop
+emit_init:
+  br label %emit_loop
+emit_loop:
+  %idx = phi i32 [ %len1, %emit_init ], [ %idx_prev, %emit_body ]
+  %edone = icmp eq i32 %idx, 0
+  br i1 %edone, label %done, label %emit_body
+emit_body:
+  %idx_prev = sub i32 %idx, 1
+  %cp = getelementptr inbounds [64 x i8], ptr %buf, i32 0, i32 %idx_prev
+  %ch = load i8, ptr %cp, align 1
+  call void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  br label %emit_loop
+done:
+  ret void
+}
+
+define weak void @__syn_fmt_u64_hex(ptr %sink, i64 %val, i8 %upper, i32 %min_width) noinline #99 {
+entry:
+  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 4, i8 %upper, i32 %min_width)
+  ret void
+}
+
+define weak void @__syn_fmt_u32_hex(ptr %sink, i32 %val, i8 %upper, i32 %min_width) noinline #99 {
+entry:
+  %v64 = zext i32 %val to i64
+  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %v64, i32 4, i8 %upper, i32 %min_width)
+  ret void
+}
+
+define weak void @__syn_fmt_u64_bin(ptr %sink, i64 %val, i32 %min_width) noinline #99 {
+entry:
+  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 1, i8 0, i32 %min_width)
+  ret void
+}
+
+define weak void @__syn_fmt_u32_bin(ptr %sink, i32 %val, i32 %min_width) noinline #99 {
+entry:
+  %v64 = zext i32 %val to i64
+  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %v64, i32 1, i8 0, i32 %min_width)
+  ret void
+}
+"#,
+    );
+
+    if emit_float_fixed || emit_float_sci {
+        out.push_str(
+            r#"; ── Arduino-Style Fixed-Decimal Float Formatter (Pure Integer/Bit Math, Zero Soft-Float/Libm) ──
+define weak void @__syn_fmt_f64_fixed(ptr %sink, double %val, i32 %prec) noinline #99 {
+entry:
+  %bits = bitcast double %val to i64
+  %abs_bits = and i64 %bits, 9223372036854775807
+  %neg_bit = icmp slt i64 %bits, 0
+  %is_nan = icmp ugt i64 %abs_bits, 9218868437227405312
+  br i1 %is_nan, label %on_nan, label %chk_inf
+on_nan:
+  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_nan)
+  ret void
+chk_inf:
+  %is_inf = icmp eq i64 %abs_bits, 9218868437227405312
+  br i1 %is_inf, label %on_inf, label %chk_ovf
+on_inf:
+  br i1 %neg_bit, label %inf_neg, label %inf_pos
+inf_neg:
+  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %inf_pos
+inf_pos:
+  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_inf)
+  ret void
+chk_ovf:
+  ; Arduino overflow threshold: fabs(val) > 4294967040.0 (0x41EFFFFFE0000000 = 4751297606339002368)
+  %is_ovf = icmp ugt i64 %abs_bits, 4751297606339002368
+  br i1 %is_ovf, label %on_ovf, label %clamp_prec
+on_ovf:
+  br i1 %neg_bit, label %ovf_neg, label %ovf_pos
+ovf_neg:
+  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %ovf_pos
+ovf_pos:
+  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_ovf)
+  ret void
+clamp_prec:
+  %p_def = icmp slt i32 %prec, 0
+  %p0 = select i1 %p_def, i32 2, i32 %prec
+  %p_hi = icmp sgt i32 %p0, 9
+  %p = select i1 %p_hi, i32 9, i32 %p0
+  %sp = getelementptr inbounds [10 x i64], ptr @.syn_fmt_pow10_u64, i32 0, i32 %p
+  %scale = load i64, ptr %sp, align 8
+  %nz = icmp ne i64 %abs_bits, 0
+  br i1 %nz, label %compute_scaled, label %emit_parts_zero
+emit_parts_zero:
+  br label %emit_parts
+compute_scaled:
+  %es = lshr i64 %abs_bits, 52
+  %exp = trunc i64 %es to i32
+  %frac = and i64 %abs_bits, 4503599627370495
+  %is_sub = icmp eq i32 %exp, 0
+  %sig_norm = or i64 %frac, 4503599627370496
+  %sig53 = select i1 %is_sub, i64 %frac, i64 %sig_norm
+  %eff_exp = select i1 %is_sub, i32 1, i32 %exp
+  ; For abs_val <= 4294967040.0, eff_exp <= 1054, so rsh = 1075 - eff_exp >= 21 always!
+  %rsh = sub i32 1075, %eff_exp
+  %tiny = icmp sge i32 %rsh, 85
+  br i1 %tiny, label %emit_parts_zero, label %do_shift_round
+do_shift_round:
+  %sig128 = zext i64 %sig53 to i128
+  %sc128 = zext i64 %scale to i128
+  %prod = mul i128 %sig128, %sc128
+  %rsh_m1 = sub i32 %rsh, 1
+  %rsh_m1_128 = zext i32 %rsh_m1 to i128
+  %half = shl i128 1, %rsh_m1_128
+  %rounded128 = add i128 %prod, %half
+  %rsh128 = zext i32 %rsh to i128
+  %tot128 = lshr i128 %rounded128, %rsh128
+  %tot64 = trunc i128 %tot128 to i64
+  %rem_slot = alloca i64, align 8
+  %ipart = call i64 @__syn_udivrem64(i64 %tot64, i64 %scale, ptr %rem_slot)
+  %fpart = load i64, ptr %rem_slot, align 8
+  br label %emit_parts
+emit_parts:
+  %int_v = phi i64 [ 0, %emit_parts_zero ], [ %ipart, %do_shift_round ]
+  %frac_v = phi i64 [ 0, %emit_parts_zero ], [ %fpart, %do_shift_round ]
+  ; Emit '-' iff rounded result is non-zero (so -0.0 and -0.0001:.2 both format as "0.00")
+  %any_nz = or i64 %int_v, %frac_v
+  %res_nz = icmp ne i64 %any_nz, 0
+  %emit_minus = and i1 %neg_bit, %res_nz
+  br i1 %emit_minus, label %put_minus, label %emit_int
+put_minus:
+  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %emit_int
+emit_int:
+  %i32_part = trunc i64 %int_v to i32
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %i32_part, i32 1)
+  %has_p = icmp sgt i32 %p, 0
+  br i1 %has_p, label %emit_frac, label %done
+emit_frac:
+  call void @__syn_fmt_putc(ptr %sink, i8 46)
+  %f32_part = trunc i64 %frac_v to i32
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %f32_part, i32 %p)
+  br label %done
+done:
+  ret void
+}
+
+define weak void @__syn_fmt_f32_fixed(ptr %sink, float %val, i32 %prec) noinline #99 {
+entry:
+  %d = call double @__extendsfdf2(float %val)
+  call void @__syn_fmt_f64_fixed(ptr %sink, double %d, i32 %prec)
+  ret void
+}
+"#,
+        );
+    }
+
+    if emit_float_sci {
+        out.push_str(
+            r#"; ── Standalone Scientific `:e` Float Formatters (Pure 64-Bit Mantissa Math, Dead-Stripped by --gc-sections) ──
+define weak void @__syn_sci_mul_u32(ptr %pm, ptr %pe2, i32 %k) noinline #99 {
+entry:
+  %m = load i64, ptr %pm, align 8
+  %e2 = load i32, ptr %pe2, align 4
+  %m128 = zext i64 %m to i128
+  %k128 = zext i32 %k to i128
+  %prod = mul i128 %m128, %k128
+  %hi128 = lshr i128 %prod, 64
+  %p_hi = trunc i128 %hi128 to i64
+  %lz_hi = call i64 @llvm.ctlz.i64(i64 %p_hi, i1 false)
+  %lz32 = trunc i64 %lz_hi to i32
+  %top_bits = sub i32 64, %lz32
+  %tb128 = zext i32 %top_bits to i128
+  %norm128 = lshr i128 %prod, %tb128
+  %norm0 = trunc i128 %norm128 to i64
+  %p_lo = trunc i128 %prod to i64
+  %tb64 = zext i32 %top_bits to i64
+  %m1 = shl i64 1, %tb64
+  %mask = sub i64 %m1, 1
+  %rem = and i64 %p_lo, %mask
+  %tbm1 = sub i64 %tb64, 1
+  %half = shl i64 1, %tbm1
+  %gt = icmp ugt i64 %rem, %half
+  %eq = icmp eq i64 %rem, %half
+  %lsb = and i64 %norm0, 1
+  %odd = icmp ne i64 %lsb, 0
+  %tie = and i1 %eq, %odd
+  %do_rnd = or i1 %gt, %tie
+  %norm_inc = add i64 %norm0, 1
+  %ovf = icmp eq i64 %norm_inc, 0
+  %norm_r = select i1 %ovf, i64 -9223372036854775808, i64 %norm_inc
+  %tb_inc = add i32 %top_bits, 1
+  %tb_r = select i1 %ovf, i32 %tb_inc, i32 %top_bits
+  %norm = select i1 %do_rnd, i64 %norm_r, i64 %norm0
+  %tb_fin = select i1 %do_rnd, i32 %tb_r, i32 %top_bits
+  %e2_next = add i32 %e2, %tb_fin
+  store i64 %norm, ptr %pm, align 8
+  store i32 %e2_next, ptr %pe2, align 4
+  ret void
+}
+
+define weak void @__syn_sci_div_u32(ptr %pm, ptr %pe2, i32 %k) noinline #99 {
+entry:
+  %r_slot = alloca i64, align 8
+  %m = load i64, ptr %pm, align 8
+  %e2 = load i32, ptr %pe2, align 4
+  %lzk = call i32 @llvm.ctlz.i32(i32 %k, i1 false)
+  %kb = sub i32 32, %lzk
+  %k64 = zext i32 %k to i64
+  %sh_kn = sub i32 64, %kb
+  %sh_kn64 = zext i32 %sh_kn to i64
+  %k_norm = shl i64 %k64, %sh_kn64
+  %ge_kn = icmp uge i64 %m, %k_norm
+  %kbm1 = sub i32 %kb, 1
+  %sh0 = select i1 %ge_kn, i32 %kbm1, i32 %kb
+  %rsh_top = sub i32 64, %sh0
+  %rsh_top64 = zext i32 %rsh_top to i64
+  %sh64 = zext i32 %sh0 to i64
+  %top = lshr i64 %m, %rsh_top64
+  %rest = shl i64 %m, %sh64
+  %top_sh = shl i64 %top, 32
+  %rest_hi = lshr i64 %rest, 32
+  %d1 = or i64 %top_sh, %rest_hi
+  %q_hi = call i64 @__syn_udivrem64(i64 %d1, i64 %k64, ptr %r_slot)
+  %r1 = load i64, ptr %r_slot, align 8
+  %r1_sh = shl i64 %r1, 32
+  %rest_lo = and i64 %rest, 4294967295
+  %d0 = or i64 %r1_sh, %rest_lo
+  %q_lo = call i64 @__syn_udivrem64(i64 %d0, i64 %k64, ptr %r_slot)
+  %rem = load i64, ptr %r_slot, align 8
+  %q_hi_sh = shl i64 %q_hi, 32
+  %q0 = or i64 %q_hi_sh, %q_lo
+  %rem2 = shl i64 %rem, 1
+  %gt = icmp ugt i64 %rem2, %k64
+  %eq = icmp eq i64 %rem2, %k64
+  %lsb = and i64 %q0, 1
+  %odd = icmp ne i64 %lsb, 0
+  %tie = and i1 %eq, %odd
+  %do_rnd = or i1 %gt, %tie
+  %q_inc = add i64 %q0, 1
+  %ovf = icmp eq i64 %q_inc, 0
+  %q_r = select i1 %ovf, i64 -9223372036854775808, i64 %q_inc
+  %sh_dec = sub i32 %sh0, 1
+  %sh_r = select i1 %ovf, i32 %sh_dec, i32 %sh0
+  %q = select i1 %do_rnd, i64 %q_r, i64 %q0
+  %sh_fin = select i1 %do_rnd, i32 %sh_r, i32 %sh0
+  %e2_next = sub i32 %e2, %sh_fin
+  store i64 %q, ptr %pm, align 8
+  store i32 %e2_next, ptr %pe2, align 4
+  ret void
+}
+
+define weak void @__syn_fmt_f64_sci(ptr %sink, double %val, i32 %prec) noinline #99 {
+entry:
+  %m_slot = alloca i64, align 8
+  %e2_slot = alloca i32, align 4
+  %rem_slot = alloca i64, align 8
+  %bits = bitcast double %val to i64
+  %abs_bits = and i64 %bits, 9223372036854775807
+  %neg_bit = icmp slt i64 %bits, 0
+  %is_nan = icmp ugt i64 %abs_bits, 9218868437227405312
+  br i1 %is_nan, label %on_nan, label %chk_inf
+on_nan:
+  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_nan)
+  ret void
+chk_inf:
+  %is_inf = icmp eq i64 %abs_bits, 9218868437227405312
+  br i1 %is_inf, label %on_inf, label %prep
+on_inf:
+  br i1 %neg_bit, label %inf_neg, label %inf_pos
+inf_neg:
+  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %inf_pos
+inf_pos:
+  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_inf)
+  ret void
+prep:
+  %p_def = icmp slt i32 %prec, 0
+  %p0 = select i1 %p_def, i32 2, i32 %prec
+  %p_hi = icmp sgt i32 %p0, 9
+  %p = select i1 %p_hi, i32 9, i32 %p0
+  %nz = icmp ne i64 %abs_bits, 0
+  br i1 %nz, label %chk_neg, label %on_zero
+on_zero:
+  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  %zp = icmp sgt i32 %p, 0
+  br i1 %zp, label %z_dot, label %z_exp
+z_dot:
+  call void @__syn_fmt_putc(ptr %sink, i8 46)
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 0, i32 %p)
+  br label %z_exp
+z_exp:
+  call void @__syn_fmt_putc(ptr %sink, i8 101)
+  call void @__syn_fmt_putc(ptr %sink, i8 43)
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 0, i32 2)
+  ret void
+chk_neg:
+  br i1 %neg_bit, label %put_minus, label %unpack
+put_minus:
+  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %unpack
+unpack:
+  %es = lshr i64 %abs_bits, 52
+  %raw_exp = trunc i64 %es to i32
+  %raw_frac = and i64 %abs_bits, 4503599627370495
+  %is_sub = icmp eq i32 %raw_exp, 0
+  br i1 %is_sub, label %unpack_sub, label %unpack_norm
+unpack_sub:
+  %lz = call i64 @llvm.ctlz.i64(i64 %raw_frac, i1 false)
+  %m_sub = shl i64 %raw_frac, %lz
+  %lz32 = trunc i64 %lz to i32
+  %e2_sub = sub i32 -1074, %lz32
+  store i64 %m_sub, ptr %m_slot, align 8
+  store i32 %e2_sub, ptr %e2_slot, align 4
+  br label %big9_loop
+unpack_norm:
+  %sig53 = or i64 %raw_frac, 4503599627370496
+  %m_norm = shl i64 %sig53, 11
+  %e2_norm = sub i32 %raw_exp, 1086
+  store i64 %m_norm, ptr %m_slot, align 8
+  store i32 %e2_norm, ptr %e2_slot, align 4
+  br label %big9_loop
+big9_loop:
+  %exp_b9 = phi i32 [ 0, %unpack_sub ], [ 0, %unpack_norm ], [ %exp_b9_next, %big9_body ]
+  %e2_b9 = load i32, ptr %e2_slot, align 4
+  %ge_b9 = icmp sge i32 %e2_b9, -33
+  br i1 %ge_b9, label %big9_body, label %sml9_loop
+big9_body:
+  call void @__syn_sci_div_u32(ptr %m_slot, ptr %e2_slot, i32 1000000000)
+  %exp_b9_next = add i32 %exp_b9, 9
+  br label %big9_loop
+sml9_loop:
+  %exp_s9 = phi i32 [ %exp_b9, %big9_loop ], [ %exp_s9_next, %sml9_body ]
+  %e2_s9 = load i32, ptr %e2_slot, align 4
+  %le_s9 = icmp sle i32 %e2_s9, -94
+  br i1 %le_s9, label %sml9_body, label %big1_loop
+sml9_body:
+  call void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 1000000000)
+  %exp_s9_next = sub i32 %exp_s9, 9
+  br label %sml9_loop
+big1_loop:
+  %exp_b1 = phi i32 [ %exp_s9, %sml9_loop ], [ %exp_b1_next, %big1_body ]
+  %e2_b1 = load i32, ptr %e2_slot, align 4
+  %m_b1 = load i64, ptr %m_slot, align 8
+  %gt_m60 = icmp sgt i32 %e2_b1, -60
+  %eq_m60 = icmp eq i32 %e2_b1, -60
+  %ge_10 = icmp uge i64 %m_b1, -6917529027641081856
+  %eq_ge = and i1 %eq_m60, %ge_10
+  %do_b1 = or i1 %gt_m60, %eq_ge
+  br i1 %do_b1, label %big1_body, label %sml1_loop
+big1_body:
+  call void @__syn_sci_div_u32(ptr %m_slot, ptr %e2_slot, i32 10)
+  %exp_b1_next = add i32 %exp_b1, 1
+  br label %big1_loop
+sml1_loop:
+  %exp_s1 = phi i32 [ %exp_b1, %big1_loop ], [ %exp_s1_next, %sml1_body ]
+  %e2_s1 = load i32, ptr %e2_slot, align 4
+  %lt_m63 = icmp slt i32 %e2_s1, -63
+  br i1 %lt_m63, label %sml1_body, label %scale_prec
+sml1_body:
+  call void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 10)
+  %exp_s1_next = sub i32 %exp_s1, 1
+  br label %sml1_loop
+scale_prec:
+  %sp = getelementptr inbounds [10 x i64], ptr @.syn_fmt_pow10_u64, i32 0, i32 %p
+  %scale = load i64, ptr %sp, align 8
+  %has_p0 = icmp sgt i32 %p, 0
+  br i1 %has_p0, label %do_scale_p, label %round_sci
+do_scale_p:
+  %scale32 = trunc i64 %scale to i32
+  call void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 %scale32)
+  br label %round_sci
+round_sci:
+  %m_fin = load i64, ptr %m_slot, align 8
+  %e2_fin = load i32, ptr %e2_slot, align 4
+  %rsh = sub i32 0, %e2_fin
+  %rsh64 = zext i32 %rsh to i64
+  %rshm1 = sub i64 %rsh64, 1
+  %half = shl i64 1, %rshm1
+  %m1_r = shl i64 1, %rsh64
+  %mask_r = sub i64 %m1_r, 1
+  %rem_r = and i64 %m_fin, %mask_r
+  %ge_half = icmp uge i64 %rem_r, %half
+  %inc_r = zext i1 %ge_half to i64
+  %q_r = lshr i64 %m_fin, %rsh64
+  %scaled0 = add i64 %q_r, %inc_r
+  %ten_scale = mul i64 %scale, 10
+  %carried = icmp uge i64 %scaled0, %ten_scale
+  %scaled = select i1 %carried, i64 %scale, i64 %scaled0
+  %exp_inc = add i32 %exp_s1, 1
+  %exp10 = select i1 %carried, i32 %exp_inc, i32 %exp_s1
+  %lead64 = call i64 @__syn_udivrem64(i64 %scaled, i64 %scale, ptr %rem_slot)
+  %frac64 = load i64, ptr %rem_slot, align 8
+  %lead_c = add i64 %lead64, 48
+  %lead8 = trunc i64 %lead_c to i8
+  call void @__syn_fmt_putc(ptr %sink, i8 %lead8)
+  %has_p = icmp sgt i32 %p, 0
+  br i1 %has_p, label %sci_frac, label %sci_exp
+sci_frac:
+  call void @__syn_fmt_putc(ptr %sink, i8 46)
+  %f32_part = trunc i64 %frac64 to i32
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %f32_part, i32 %p)
+  br label %sci_exp
+sci_exp:
+  call void @__syn_fmt_putc(ptr %sink, i8 101)
+  %eneg = icmp slt i32 %exp10, 0
+  %esign = select i1 %eneg, i8 45, i8 43
+  call void @__syn_fmt_putc(ptr %sink, i8 %esign)
+  %ne = sub i32 0, %exp10
+  %ae = select i1 %eneg, i32 %ne, i32 %exp10
+  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %ae, i32 2)
+  ret void
+}
+
+define weak void @__syn_fmt_f32_sci(ptr %sink, float %val, i32 %prec) noinline #99 {
+entry:
+  %d = call double @__extendsfdf2(float %val)
+  call void @__syn_fmt_f64_sci(ptr %sink, double %d, i32 %prec)
+  ret void
+}
+"#,
+        );
+    }
 }

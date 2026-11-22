@@ -6,9 +6,10 @@ use std::fmt::Write;
 
 use zev_mir::{
     BlockId, MirAssignOp, MirBinOp, MirBlock, MirBootStep, MirCallDst, MirChildCallSlot,
-    MirErrorSpec, MirExpr, MirExprKind, MirFnBody, MirFunction, MirIntrinsicOp, MirModule,
-    MirPlace, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirStmt,
-    MirSwitchPattern, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId,
+    MirErrorSpec, MirExpr, MirExprKind, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction,
+    MirIntFmt, MirIntrinsicOp, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
+    MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern, MirTerminator, MirType,
+    MirUnaryOp, MirVar, MirYieldKind, VarId,
 };
 
 use crate::runtime::c99_runtime_preamble;
@@ -48,11 +49,13 @@ struct C99Emitter<'a> {
     out: String,
     slices: BTreeMap<String, MirType>,
     arrays: BTreeMap<String, (MirType, usize)>,
+    fn_ptrs: BTreeMap<String, (Vec<MirType>, MirType)>,
     results: BTreeMap<String, (MirType, Option<MirType>)>,
     prims: BTreeMap<String, MirPrimKind>,
     fn_param_names: BTreeMap<String, Vec<(VarId, MirType)>>,
     task_param_names: BTreeMap<String, Vec<(VarId, MirType)>>,
     builtin_c_syms: BTreeSet<String>,
+    uses_float_sci: bool,
 }
 
 impl<'a> C99Emitter<'a> {
@@ -117,11 +120,13 @@ impl<'a> C99Emitter<'a> {
             out: String::with_capacity(32 * 1024),
             slices: BTreeMap::new(),
             arrays: BTreeMap::new(),
+            fn_ptrs: BTreeMap::new(),
             results: BTreeMap::new(),
             prims: BTreeMap::new(),
             fn_param_names,
             task_param_names,
             builtin_c_syms,
+            uses_float_sci: false,
         }
     }
 
@@ -131,6 +136,151 @@ impl<'a> C99Emitter<'a> {
         // 1. Embedded C99 cooperative kernel & simulation preamble
         self.out
             .push_str(&c99_runtime_preamble(self.opts.default_sim_max_ticks));
+        if self.uses_float_sci {
+            self.out.push_str(
+                r#"
+static SYN_UNUSED inline void syn_sci_mul_u32(uint64_t *pm, int32_t *pe2, uint32_t k) {
+    uint64_t m_lo = (*pm) & 0xFFFFFFFFULL;
+    uint64_t m_hi = (*pm) >> 32;
+    uint64_t p0 = m_lo * (uint64_t)k;
+    uint64_t p1 = m_hi * (uint64_t)k + (p0 >> 32);
+    uint32_t top_bits = 0U;
+    uint64_t tmp = p1 >> 32;
+    while (tmp != 0ULL) { top_bits++; tmp >>= 1; }
+    uint64_t full_lo = (p0 & 0xFFFFFFFFULL) | (p1 << 32);
+    uint64_t full_hi = p1 >> 32;
+    uint64_t norm = (full_lo >> top_bits) | (full_hi << (64U - top_bits));
+    uint64_t rem = full_lo & ((1ULL << top_bits) - 1ULL);
+    uint64_t half = 1ULL << (top_bits - 1U);
+    if (rem > half || (rem == half && (norm & 1ULL) != 0ULL)) {
+        norm += 1ULL;
+        if (norm == 0ULL) {
+            norm = 1ULL << 63;
+            top_bits += 1U;
+        }
+    }
+    *pm = norm;
+    *pe2 += (int32_t)top_bits;
+}
+
+static SYN_UNUSED inline void syn_sci_div_u32(uint64_t *pm, int32_t *pe2, uint32_t k) {
+    uint32_t kb = 0U;
+    uint32_t kt = k;
+    while (kt != 0U) { kb++; kt >>= 1; }
+    uint64_t k_norm = ((uint64_t)k) << (64U - kb);
+    uint32_t sh = ((*pm) >= k_norm) ? (kb - 1U) : kb;
+    uint64_t top = (*pm) >> (64U - sh);
+    uint64_t rest = (*pm) << sh;
+    uint64_t d1 = (top << 32) | (rest >> 32);
+    uint64_t q_hi = d1 / (uint64_t)k;
+    uint64_t r1 = d1 % (uint64_t)k;
+    uint64_t d0 = (r1 << 32) | (rest & 0xFFFFFFFFULL);
+    uint64_t q_lo = d0 / (uint64_t)k;
+    uint64_t rem = d0 % (uint64_t)k;
+    uint64_t q = (q_hi << 32) | q_lo;
+    if (rem * 2ULL > (uint64_t)k || (rem * 2ULL == (uint64_t)k && (q & 1ULL) != 0ULL)) {
+        q += 1ULL;
+        if (q == 0ULL) {
+            q = 1ULL << 63;
+            sh -= 1U;
+        }
+    }
+    *pm = q;
+    *pe2 -= (int32_t)sh;
+}
+
+static SYN_UNUSED void syn_fmt_float_sci(syn_fmt_sink_t *s, double val, uint8_t prec) {
+    static const uint64_t pow10_tbl[10] = {
+        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL,
+        100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL
+    };
+    uint64_t bits = syn_f64_to_bits(val);
+    uint64_t abs_bits = bits & 0x7FFFFFFFFFFFFFFFULL;
+    bool neg_bit = (bits >> 63) != 0ULL;
+    if (abs_bits > 0x7FF0000000000000ULL) {
+        syn_fmt_write(s, "nan", 3U);
+        return;
+    }
+    if (abs_bits == 0x7FF0000000000000ULL) {
+        if (neg_bit) { syn_fmt_write(s, "-inf", 4U); }
+        else         { syn_fmt_write(s, "inf", 3U); }
+        return;
+    }
+    uint8_t p = (prec > 9U) ? 9U : prec;
+    if (abs_bits == 0ULL) {
+        syn_fmt_putc(s, '0');
+        if (p > 0U) {
+            syn_fmt_putc(s, '.');
+            syn_fmt_u64_dec_pad(s, 0ULL, p);
+        }
+        syn_fmt_write(s, "e+00", 4U);
+        return;
+    }
+    if (neg_bit) {
+        syn_fmt_putc(s, '-');
+    }
+    uint32_t raw_exp = (uint32_t)(abs_bits >> 52);
+    uint64_t raw_frac = abs_bits & 0x000FFFFFFFFFFFFFULL;
+    uint64_t m = 0ULL;
+    int32_t e2 = 0;
+    if (raw_exp == 0U) {
+        m = raw_frac;
+        e2 = -1074;
+        while ((m & (1ULL << 63)) == 0ULL) {
+            m <<= 1;
+            e2 -= 1;
+        }
+    } else {
+        m = (raw_frac | (1ULL << 52)) << 11;
+        e2 = (int32_t)raw_exp - 1086;
+    }
+    int32_t exp10 = 0;
+    while (e2 + 63 >= 30) {
+        syn_sci_div_u32(&m, &e2, 1000000000U);
+        exp10 += 9;
+    }
+    while (e2 + 64 <= -30) {
+        syn_sci_mul_u32(&m, &e2, 1000000000U);
+        exp10 -= 9;
+    }
+    while (e2 > -60 || (e2 == -60 && m >= (10ULL << 60))) {
+        syn_sci_div_u32(&m, &e2, 10U);
+        exp10 += 1;
+    }
+    while (e2 < -63) {
+        syn_sci_mul_u32(&m, &e2, 10U);
+        exp10 -= 1;
+    }
+    uint64_t scale = pow10_tbl[p];
+    if (p > 0U) {
+        syn_sci_mul_u32(&m, &e2, (uint32_t)scale);
+    }
+    uint32_t rsh = (uint32_t)(-e2);
+    uint64_t half = 1ULL << (rsh - 1U);
+    uint64_t scaled = (m >> rsh) + (((m & ((1ULL << rsh) - 1ULL)) >= half) ? 1ULL : 0ULL);
+    if (scaled >= scale * 10ULL) {
+        scaled = scale;
+        exp10 += 1;
+    }
+    uint64_t lead = scaled / scale;
+    uint64_t frac = scaled % scale;
+    syn_fmt_putc(s, (char)('0' + (uint32_t)lead));
+    if (p > 0U) {
+        syn_fmt_putc(s, '.');
+        syn_fmt_u64_dec_pad(s, frac, p);
+    }
+    syn_fmt_putc(s, 'e');
+    if (exp10 < 0) {
+        syn_fmt_putc(s, '-');
+        exp10 = -exp10;
+    } else {
+        syn_fmt_putc(s, '+');
+    }
+    syn_fmt_u64_dec_pad(s, (uint64_t)(uint32_t)exp10, 2U);
+}
+"#,
+            );
+        }
         self.out.push_str(
             r#"
 #if !defined(SYN_FREESTANDING)
@@ -296,6 +446,8 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                     self.register_type(p);
                 }
                 self.register_type(ret);
+                self.fn_ptrs
+                    .insert(ty.mangle_name(), (params.clone(), *ret.clone()));
             }
             MirType::Result { ok, err } => {
                 self.register_type(ok);
@@ -344,6 +496,21 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirStmt::SpawnActivate { args, .. } => {
                 for a in args {
                     self.register_expr(a);
+                }
+            }
+            MirStmt::PrintFmt { chunks, .. } => {
+                for ch in chunks {
+                    self.register_fmt_chunk(ch);
+                }
+            }
+            MirStmt::FmtBuf { buf, chunks, .. } => {
+                self.register_expr(buf);
+                self.register_type(&MirType::Result {
+                    ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+                    err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
+                });
+                for ch in chunks {
+                    self.register_fmt_chunk(ch);
                 }
             }
             MirStmt::PrimOp(op) => match op {
@@ -663,6 +830,29 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
     // C Type Formatting Helpers
     // ─────────────────────────────────────────────────────────────────────────
 
+    fn register_fmt_chunk(&mut self, ch: &MirFmtChunk) {
+        match ch {
+            MirFmtChunk::Literal(_) => {}
+            MirFmtChunk::Float { value, fmt, .. } => {
+                if matches!(fmt, MirFloatFmt::Sci { .. }) {
+                    self.uses_float_sci = true;
+                }
+                self.register_expr(value);
+            }
+            MirFmtChunk::Int { value, .. }
+            | MirFmtChunk::Bool(value)
+            | MirFmtChunk::Str(value)
+            | MirFmtChunk::Bytes(value)
+            | MirFmtChunk::EnumName { value, .. } => {
+                self.register_expr(value);
+            }
+            MirFmtChunk::DebugSlice { elem_ty, slice } => {
+                self.register_type(elem_ty);
+                self.register_expr(slice);
+            }
+        }
+    }
+
     fn c_type(&self, ty: &MirType) -> String {
         match ty {
             MirType::Void => "void".to_string(),
@@ -677,6 +867,8 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirType::I64 => "int64_t".to_string(),
             MirType::Usize => "size_t".to_string(),
             MirType::Isize => "ptrdiff_t".to_string(),
+            MirType::F32 => "float".to_string(),
+            MirType::F64 => "double".to_string(),
             MirType::Str => "const char *".to_string(),
             MirType::EndianInt {
                 bits, big_endian, ..
@@ -697,20 +889,13 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirType::Ptr(inner) => format!("{} *", self.c_type(inner)),
             MirType::Primitive(pk) => format!("syn_{}_t", pk.mangle_name()),
             MirType::HwPeripheral(_) => "syn_hw_periph_t".to_string(),
-            MirType::FnPtr { params, ret } => {
-                let ps = if params.is_empty() {
-                    "void".to_string()
-                } else {
-                    params
-                        .iter()
-                        .map(|p| self.c_type(p))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                };
-                format!("{} (*)(${ps})", self.c_type(ret)).replace('$', "")
-            }
+            MirType::FnPtr { .. } => format!("syn_{}_t", ty.mangle_name()),
             MirType::Result { .. } => format!("syn_{}_t", ty.mangle_name()),
         }
+    }
+
+    fn c_decl(&self, ty: &MirType, ident: &str) -> String {
+        format!("{} {ident}", self.c_type(ty))
     }
 
     fn zero_init_expr(&self, ty: &MirType) -> String {
@@ -726,6 +911,8 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64 | MirType::Isize => {
                 format!("(({})0)", self.c_type(ty))
             }
+            MirType::F32 => "0.0f".to_string(),
+            MirType::F64 => "0.0".to_string(),
             MirType::Str | MirType::Ptr(_) | MirType::FnPtr { .. } => "NULL".to_string(),
             MirType::Enum(name) => format!("((syn_enum_{name})0)"),
             MirType::EndianInt {
@@ -769,9 +956,41 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 let _ = writeln!(self.out, "    syn_{}_{} = {}{}", en.name, vname, disc, comma);
             }
             let _ = writeln!(self.out, "}} syn_enum_{};\n", en.name);
+
+            // Emit `.rodata` variant-name lookup table ONLY for enums used in `f"..."` formatting!
+            if self.m.formatted_enums.iter().any(|fe| fe == &en.name) {
+                let _ = writeln!(
+                    self.out,
+                    "static SYN_UNUSED inline const char *syn_enum_name_{0}(syn_enum_{0} _v) {{\n    switch (_v) {{",
+                    en.name
+                );
+                let mut seen_discs = BTreeSet::new();
+                for (vname, disc) in &en.variants {
+                    if seen_discs.insert(*disc) {
+                        let _ = writeln!(
+                            self.out,
+                            "        case syn_{}_{}: return {};",
+                            en.name,
+                            vname,
+                            escape_c_string(vname)
+                        );
+                    }
+                }
+                let _ = writeln!(
+                    self.out,
+                    "        default: return {};\n    }}\n}}\n",
+                    escape_c_string(&format!("{}(?)", en.name))
+                );
+            }
         }
 
-        // Forward-declare structs
+        // Forward-declare structs, fixed-size arrays, slices, results, & primitives so pointer/fnptr/slice typedefs can reference any of them
+        let arrays_snapshot = self.arrays.clone();
+        let slices_snapshot = self.slices.clone();
+        let fn_ptrs_snapshot = self.fn_ptrs.clone();
+        let results_snapshot = self.results.clone();
+        let prims_snapshot = self.prims.clone();
+
         for st in &self.m.structs {
             let _ = writeln!(
                 self.out,
@@ -779,64 +998,108 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 st.name
             );
         }
-        if !self.m.structs.is_empty() {
+        for mangle in arrays_snapshot.keys() {
+            let _ = writeln!(
+                self.out,
+                "typedef struct syn_{0}_t syn_{0}_t;",
+                mangle
+            );
+        }
+        for mangle in slices_snapshot.keys() {
+            let _ = writeln!(
+                self.out,
+                "typedef struct syn_{0} syn_{0};",
+                mangle
+            );
+        }
+        for mangle in results_snapshot.keys() {
+            let _ = writeln!(
+                self.out,
+                "typedef struct syn_{0}_t syn_{0}_t;",
+                mangle
+            );
+        }
+        for mangle in prims_snapshot.keys() {
+            let _ = writeln!(
+                self.out,
+                "typedef struct syn_{0}_t syn_{0}_t;",
+                mangle
+            );
+        }
+        if !self.m.structs.is_empty()
+            || !arrays_snapshot.is_empty()
+            || !slices_snapshot.is_empty()
+            || !results_snapshot.is_empty()
+            || !prims_snapshot.is_empty()
+        {
             self.out.push('\n');
         }
 
-        // Emit non-u8 slice typedefs & subslice helpers (before structs that may embed slices!)
-        let slices_snapshot = self.slices.clone();
+        // Emit function-pointer typedefs in post-order DFS over nested FnPtr signatures
+        let mut emitted_fn_ptrs: BTreeSet<String> = BTreeSet::new();
+        for (mangle, (params, ret)) in &fn_ptrs_snapshot {
+            self.emit_fn_ptr_topo(mangle, params, ret, &fn_ptrs_snapshot, &mut emitted_fn_ptrs);
+        }
+        if !fn_ptrs_snapshot.is_empty() {
+            self.out.push('\n');
+        }
+
+        // Emit non-u8 slice struct bodies (inner-first so nested slices `[][]T` are clean)
+        let mut emitted_slices: BTreeSet<String> = BTreeSet::new();
         for (mangle, elem) in &slices_snapshot {
-            let ec = self.c_type(elem);
-            let _ = writeln!(
-                self.out,
-                "typedef struct {{\n    {ec} *ptr;\n    size_t len;\n}} syn_{mangle};\n"
+            self.emit_slice_topo(mangle, elem, &slices_snapshot, &mut emitted_slices);
+        }
+
+        // Joint topological emission over `{ struct bodies ∪ fixed-size array wrappers }` so every
+        // by-value dependency (`[N]SomeStruct`, `FixedVec<FixedVec<u8, 2>, 2>`, reverse-declared
+        // outer-before-inner structs) is defined before its dependent type!
+        let structs_by_name: BTreeMap<&str, &MirStruct> =
+            self.m.structs.iter().map(|s| (s.name.as_str(), s)).collect();
+        let mut emitted_structs: BTreeSet<String> = BTreeSet::new();
+        let mut emitted_arrays: BTreeSet<String> = BTreeSet::new();
+
+        for (mangle, (elem, len)) in &arrays_snapshot {
+            self.emit_array_topo(
+                mangle,
+                elem,
+                *len,
+                &structs_by_name,
+                &arrays_snapshot,
+                &mut emitted_structs,
+                &mut emitted_arrays,
             );
+        }
+        for st in &self.m.structs {
+            self.emit_struct_topo(
+                st,
+                &structs_by_name,
+                &arrays_snapshot,
+                &mut emitted_structs,
+                &mut emitted_arrays,
+            );
+        }
+
+        // Emit slice subslice helpers AFTER all struct/array bodies are complete (so `s.ptr + start` has complete sizeof!)
+        for (mangle, _) in &slices_snapshot {
             let _ = writeln!(
                 self.out,
                 "static SYN_UNUSED inline syn_{mangle} syn_sub_{mangle}(syn_{mangle} s, size_t start, size_t end) {{\n    if (start > s.len) {{ start = s.len; }}\n    if (end > s.len) {{ end = s.len; }}\n    if (end < start) {{ end = start; }}\n    syn_{mangle} out;\n    out.ptr = (s.ptr != NULL) ? (s.ptr + start) : NULL;\n    out.len = end - start;\n    return out;\n}}\n"
             );
         }
 
-        // Emit fixed-size array wrappers before structs that may embed arrays
-        let arrays_snapshot = self.arrays.clone();
-        for (mangle, (elem, len)) in &arrays_snapshot {
-            let ec = self.c_type(elem);
-            let n = (*len).max(1);
-            let _ = writeln!(
-                self.out,
-                "typedef struct {{\n    {ec} data[{n}];\n}} syn_{mangle}_t;\n"
-            );
-        }
-
-        // Emit struct definitions
-        for st in &self.m.structs {
-            let packed_attr = if st.packed { " SYN_PACKED" } else { "" };
-            let _ = writeln!(self.out, "struct{packed_attr} syn_struct_{} {{", st.name);
-            if st.fields.is_empty() {
-                self.out.push_str("    uint8_t _empty;\n");
-            } else {
-                for f in &st.fields {
-                    let fc = self.c_type(&f.ty);
-                    let _ = writeln!(self.out, "    {} {};", fc, c_ident(&f.name));
-                }
-            }
-            let _ = writeln!(self.out, "}};\n");
-        }
-
         // Emit dual-exit result envelopes (`{ bool is_err; [Err err;] [Val val;] }`)
-        let results_snapshot = self.results.clone();
         for (mangle, (ok_ty, err_ty_opt)) in &results_snapshot {
-            let _ = writeln!(self.out, "typedef struct {{");
+            let _ = writeln!(self.out, "struct syn_{mangle}_t {{");
             self.out.push_str("    bool is_err;\n");
             if let Some(et) = err_ty_opt {
                 if !et.is_void() {
-                    let _ = writeln!(self.out, "    {} err;", self.c_type(et));
+                    let _ = writeln!(self.out, "    {};", self.c_decl(et, "err"));
                 }
             }
             if !ok_ty.is_void() {
-                let _ = writeln!(self.out, "    {} val;", self.c_type(ok_ty));
+                let _ = writeln!(self.out, "    {};", self.c_decl(ok_ty, "val"));
             }
-            let _ = writeln!(self.out, "}} syn_{mangle}_t;\n");
+            let _ = writeln!(self.out, "}};\n");
         }
 
         // Emit `<Struct>_from_bytes(syn_slice_u8)` helpers
@@ -852,6 +1115,185 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 s = st.name
             );
         }
+    }
+
+    fn emit_fn_ptr_dep_topo(
+        &mut self,
+        ty: &MirType,
+        fn_ptrs_snapshot: &BTreeMap<String, (Vec<MirType>, MirType)>,
+        emitted_fn_ptrs: &mut BTreeSet<String>,
+    ) {
+        match ty {
+            MirType::FnPtr { params, ret } => {
+                let mangle = ty.mangle_name();
+                if let Some((ps, r)) = fn_ptrs_snapshot.get(&mangle) {
+                    self.emit_fn_ptr_topo(&mangle, ps, r, fn_ptrs_snapshot, emitted_fn_ptrs);
+                } else {
+                    self.emit_fn_ptr_topo(&mangle, params, ret, fn_ptrs_snapshot, emitted_fn_ptrs);
+                }
+            }
+            MirType::Ptr(inner) | MirType::Slice(inner) | MirType::Array { elem: inner, .. } => {
+                self.emit_fn_ptr_dep_topo(inner, fn_ptrs_snapshot, emitted_fn_ptrs);
+            }
+            MirType::Result { ok, err } => {
+                self.emit_fn_ptr_dep_topo(ok, fn_ptrs_snapshot, emitted_fn_ptrs);
+                if let Some(e) = err {
+                    self.emit_fn_ptr_dep_topo(e, fn_ptrs_snapshot, emitted_fn_ptrs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_fn_ptr_topo(
+        &mut self,
+        mangle: &str,
+        params: &[MirType],
+        ret: &MirType,
+        fn_ptrs_snapshot: &BTreeMap<String, (Vec<MirType>, MirType)>,
+        emitted_fn_ptrs: &mut BTreeSet<String>,
+    ) {
+        if !emitted_fn_ptrs.insert(mangle.to_string()) {
+            return;
+        }
+        for p in params {
+            self.emit_fn_ptr_dep_topo(p, fn_ptrs_snapshot, emitted_fn_ptrs);
+        }
+        self.emit_fn_ptr_dep_topo(ret, fn_ptrs_snapshot, emitted_fn_ptrs);
+        let ps = if params.is_empty() {
+            "void".to_string()
+        } else {
+            params
+                .iter()
+                .map(|p| self.c_type(p))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let rt = self.c_type(ret);
+        let _ = writeln!(self.out, "typedef {rt} (*syn_{mangle}_t)({ps});");
+    }
+
+    fn emit_slice_topo(
+        &mut self,
+        mangle: &str,
+        elem: &MirType,
+        slices_snapshot: &BTreeMap<String, MirType>,
+        emitted_slices: &mut BTreeSet<String>,
+    ) {
+        if !emitted_slices.insert(mangle.to_string()) {
+            return;
+        }
+        if let MirType::Slice(inner) = elem {
+            if **inner != MirType::U8 {
+                let child_mangle = elem.mangle_name();
+                if let Some(child_elem) = slices_snapshot.get(&child_mangle) {
+                    self.emit_slice_topo(&child_mangle, child_elem, slices_snapshot, emitted_slices);
+                }
+            }
+        }
+        let ec = self.c_type(elem);
+        let _ = writeln!(
+            self.out,
+            "struct syn_{mangle} {{\n    {ec} *ptr;\n    size_t len;\n}};\n"
+        );
+    }
+
+    fn emit_value_dep_topo(
+        &mut self,
+        ty: &MirType,
+        structs_by_name: &BTreeMap<&str, &MirStruct>,
+        arrays_snapshot: &BTreeMap<String, (MirType, usize)>,
+        emitted_structs: &mut BTreeSet<String>,
+        emitted_arrays: &mut BTreeSet<String>,
+    ) {
+        match ty {
+            MirType::Struct(sname) => {
+                if let Some(st) = structs_by_name.get(sname.as_str()).copied() {
+                    self.emit_struct_topo(
+                        st,
+                        structs_by_name,
+                        arrays_snapshot,
+                        emitted_structs,
+                        emitted_arrays,
+                    );
+                }
+            }
+            MirType::Array { elem, len } => {
+                let mangle = ty.mangle_name();
+                let (e_ty, arr_len) = arrays_snapshot
+                    .get(&mangle)
+                    .map(|(e, l)| (e, *l))
+                    .unwrap_or((elem.as_ref(), *len));
+                self.emit_array_topo(
+                    &mangle,
+                    e_ty,
+                    arr_len,
+                    structs_by_name,
+                    arrays_snapshot,
+                    emitted_structs,
+                    emitted_arrays,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn emit_array_topo(
+        &mut self,
+        mangle: &str,
+        elem: &MirType,
+        len: usize,
+        structs_by_name: &BTreeMap<&str, &MirStruct>,
+        arrays_snapshot: &BTreeMap<String, (MirType, usize)>,
+        emitted_structs: &mut BTreeSet<String>,
+        emitted_arrays: &mut BTreeSet<String>,
+    ) {
+        if !emitted_arrays.insert(mangle.to_string()) {
+            return;
+        }
+        self.emit_value_dep_topo(
+            elem,
+            structs_by_name,
+            arrays_snapshot,
+            emitted_structs,
+            emitted_arrays,
+        );
+        let ec = self.c_type(elem);
+        let n = len.max(1);
+        let _ = writeln!(self.out, "struct syn_{mangle}_t {{\n    {ec} data[{n}];\n}};\n");
+    }
+
+    fn emit_struct_topo(
+        &mut self,
+        st: &MirStruct,
+        structs_by_name: &BTreeMap<&str, &MirStruct>,
+        arrays_snapshot: &BTreeMap<String, (MirType, usize)>,
+        emitted_structs: &mut BTreeSet<String>,
+        emitted_arrays: &mut BTreeSet<String>,
+    ) {
+        if !emitted_structs.insert(st.name.clone()) {
+            return;
+        }
+        for f in &st.fields {
+            self.emit_value_dep_topo(
+                &f.ty,
+                structs_by_name,
+                arrays_snapshot,
+                emitted_structs,
+                emitted_arrays,
+            );
+        }
+        let packed_attr = if st.packed { " SYN_PACKED" } else { "" };
+        let _ = writeln!(self.out, "struct{packed_attr} syn_struct_{} {{", st.name);
+        if st.fields.is_empty() {
+            self.out.push_str("    uint8_t _empty;\n");
+        } else {
+            for f in &st.fields {
+                let fc = self.c_type(&f.ty);
+                let _ = writeln!(self.out, "    {} {};", fc, c_ident(&f.name));
+            }
+        }
+        let _ = writeln!(self.out, "}};\n");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -870,11 +1312,11 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             match pk {
                 MirPrimKind::Signal => {
                     self.out.push_str(
-                        r#"typedef struct {
+                        r#"struct syn_signal_t {
     syn_task_t *waiter;
     volatile bool flag;
     uint8_t boost_prio;
-} syn_signal_t;
+};
 
 static SYN_UNUSED inline bool syn_signal_is_ready(void *obj) {
     const syn_signal_t *s = (const syn_signal_t *)obj;
@@ -939,7 +1381,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     let ec = self.c_type(elem);
                     let _ = writeln!(
                         self.out,
-                        "typedef struct {{\n    {ec} value;\n    volatile uint32_t seq;\n}} syn_{mangle}_t;\n\nstatic SYN_UNUSED inline {ec} syn_{mangle}_read(const syn_{mangle}_t *w) {{\n    syn_enter_critical();\n    {ec} v = w->value;\n    syn_exit_critical();\n    return v;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_publish(syn_{mangle}_t *w, {ec} v) {{\n    syn_enter_critical();\n    w->value = v;\n    w->seq++;\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    {ec} value;\n    volatile uint32_t seq;\n}};\n\nstatic SYN_UNUSED inline {ec} syn_{mangle}_read(const syn_{mangle}_t *w) {{\n    syn_enter_critical();\n    {ec} v = w->value;\n    syn_exit_critical();\n    return v;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_publish(syn_{mangle}_t *w, {ec} v) {{\n    syn_enter_critical();\n    w->value = v;\n    w->seq++;\n    syn_exit_critical();\n}}\n"
                     );
                 }
                 MirPrimKind::Inbox { elem, cap } => {
@@ -952,7 +1394,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     .mangle_name();
                     let _ = writeln!(
                         self.out,
-                        "typedef struct {{\n    {ec} buf[{n}];\n    uint8_t boost_buf[{n}];\n    syn_task_t *rx_waiter;\n    syn_task_t *tx_waiter;\n    uint16_t head;\n    uint16_t tail;\n    volatile uint16_t count;\n}} syn_{mangle}_t;\n\nstatic SYN_UNUSED inline bool syn_{mangle}_rx_ready(void *obj) {{\n    const syn_{mangle}_t *q = (const syn_{mangle}_t *)obj;\n    return q != NULL && q->count > 0U;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_tx_ready(void *obj) {{\n    const syn_{mangle}_t *q = (const syn_{mangle}_t *)obj;\n    return q != NULL && q->count < {n}U;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_post(syn_{mangle}_t *q, {ec} item, uint8_t boost_prio) {{\n    syn_enter_critical();\n    if (q->count >= {n}U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    q->buf[q->tail] = item;\n    q->boost_buf[q->tail] = boost_prio;\n    q->tail = (uint16_t)((q->tail + 1U) % {n}U);\n    q->count++;\n    syn_task_t *rw = q->rx_waiter;\n    q->rx_waiter = NULL;\n    if (rw != NULL) {{\n        syn_task_wake_from_isr_or_task(rw, boost_prio);\n    }}\n    syn_exit_critical();\n    return true;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_pop(syn_{mangle}_t *q, syn_task_t *task, {ec} *out_item) {{\n    syn_enter_critical();\n    if (q->count == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    *out_item = q->buf[q->head];\n    uint8_t bp = q->boost_buf[q->head];\n    q->head = (uint16_t)((q->head + 1U) % {n}U);\n    q->count--;\n    if (q->rx_waiter == task) {{ q->rx_waiter = NULL; }}\n    syn_task_t *tw = q->tx_waiter;\n    q->tx_waiter = NULL;\n    if (tw != NULL) {{\n        syn_task_wake_from_isr_or_task(tw, SYN_NO_BOOST);\n    }}\n    syn_exit_critical();\n    if (task != NULL && bp < SYN_PRIO_LEVELS) {{\n        syn_task_apply_boost(task, bp);\n    }}\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_{mangle}_try_recv(syn_{mangle}_t *q) {{\n    {ec} _item;\n    if (syn_{mangle}_try_pop(q, g_syn_sched.running, &_item)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _item }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_rx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (q->count > 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    q->rx_waiter = task;\n    task->wait_check = syn_{mangle}_rx_ready;\n    task->wait_obj = q;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (q->rx_waiter == task) {{ q->rx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_tx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (q->count < {n}U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    q->tx_waiter = task;\n    task->wait_check = syn_{mangle}_tx_ready;\n    task->wait_obj = q;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_tx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (q->tx_waiter == task) {{ q->tx_waiter = NULL; }}\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    {ec} buf[{n}];\n    uint8_t boost_buf[{n}];\n    syn_task_t *rx_waiter;\n    syn_task_t *tx_waiter;\n    uint16_t head;\n    uint16_t tail;\n    volatile uint16_t count;\n}};\n\nstatic SYN_UNUSED inline bool syn_{mangle}_rx_ready(void *obj) {{\n    const syn_{mangle}_t *q = (const syn_{mangle}_t *)obj;\n    return q != NULL && q->count > 0U;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_tx_ready(void *obj) {{\n    const syn_{mangle}_t *q = (const syn_{mangle}_t *)obj;\n    return q != NULL && q->count < {n}U;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_post(syn_{mangle}_t *q, {ec} item, uint8_t boost_prio) {{\n    syn_enter_critical();\n    if (q->count >= {n}U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    q->buf[q->tail] = item;\n    q->boost_buf[q->tail] = boost_prio;\n    q->tail = (uint16_t)((q->tail + 1U) % {n}U);\n    q->count++;\n    syn_task_t *rw = q->rx_waiter;\n    q->rx_waiter = NULL;\n    if (rw != NULL) {{\n        syn_task_wake_from_isr_or_task(rw, boost_prio);\n    }}\n    syn_exit_critical();\n    return true;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_pop(syn_{mangle}_t *q, syn_task_t *task, {ec} *out_item) {{\n    syn_enter_critical();\n    if (q->count == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    *out_item = q->buf[q->head];\n    uint8_t bp = q->boost_buf[q->head];\n    q->head = (uint16_t)((q->head + 1U) % {n}U);\n    q->count--;\n    if (q->rx_waiter == task) {{ q->rx_waiter = NULL; }}\n    syn_task_t *tw = q->tx_waiter;\n    q->tx_waiter = NULL;\n    if (tw != NULL) {{\n        syn_task_wake_from_isr_or_task(tw, SYN_NO_BOOST);\n    }}\n    syn_exit_critical();\n    if (task != NULL && bp < SYN_PRIO_LEVELS) {{\n        syn_task_apply_boost(task, bp);\n    }}\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_{mangle}_try_recv(syn_{mangle}_t *q) {{\n    {ec} _item;\n    if (syn_{mangle}_try_pop(q, g_syn_sched.running, &_item)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _item }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_rx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (q->count > 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    q->rx_waiter = task;\n    task->wait_check = syn_{mangle}_rx_ready;\n    task->wait_obj = q;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (q->rx_waiter == task) {{ q->rx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_tx(syn_{mangle}_t *q, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (q->count < {n}U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    q->tx_waiter = task;\n    task->wait_check = syn_{mangle}_tx_ready;\n    task->wait_obj = q;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_tx(syn_{mangle}_t *q, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (q->tx_waiter == task) {{ q->tx_waiter = NULL; }}\n    syn_exit_critical();\n}}\n"
                     );
                 }
                 MirPrimKind::PingPong { elem, cap } => {
@@ -961,7 +1403,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     let n = (*cap).max(1);
                     let _ = writeln!(
                         self.out,
-                        "typedef struct {{\n    syn_pp_hdr_t hdr;\n    SYN_DMA_ALIGN {ec} buf[2][{n}];\n}} syn_{mangle}_t;\n\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *pp, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!pp->hdr.chunk_ready) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t ridx = pp->hdr.ready_idx;\n    uint16_t rlen = pp->hdr.ready_len;\n    pp->hdr.chunk_ready = false;\n    syn_exit_critical();\n    out_slice->ptr = &pp->buf[ridx][0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *pp, syn_task_t *task) {{\n    syn_enter_critical();\n    if (pp->hdr.chunk_ready) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    pp->hdr.waiter = task;\n    task->wait_check = syn_pp_hdr_is_ready;\n    task->wait_obj = &pp->hdr;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    syn_pp_hdr_t hdr;\n    SYN_DMA_ALIGN {ec} buf[2][{n}];\n}};\n\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *pp, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!pp->hdr.chunk_ready) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t ridx = pp->hdr.ready_idx;\n    uint16_t rlen = pp->hdr.ready_len;\n    pp->hdr.chunk_ready = false;\n    syn_exit_critical();\n    out_slice->ptr = &pp->buf[ridx][0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *pp, syn_task_t *task) {{\n    syn_enter_critical();\n    if (pp->hdr.chunk_ready) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    pp->hdr.waiter = task;\n    task->wait_check = syn_pp_hdr_is_ready;\n    task->wait_obj = &pp->hdr;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
                     );
                 }
                 MirPrimKind::Lease { elem, cap } => {
@@ -970,7 +1412,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     let n = (*cap).max(1);
                     let _ = writeln!(
                         self.out,
-                        "typedef struct {{\n    SYN_DMA_ALIGN {ec} buf[{n}];\n    syn_task_t *waiter;\n    uint32_t sleep_lock_bit;\n    volatile uint16_t len;\n    volatile bool leased;\n    volatile bool ready;\n}} syn_{mangle}_t;\n\nstatic SYN_UNUSED inline bool syn_{mangle}_is_ready(void *obj) {{\n    const syn_{mangle}_t *l = (const syn_{mangle}_t *)obj;\n    return l != NULL && l->ready;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_set_active(syn_{mangle}_t *l, bool active) {{\n    l->leased = active;\n    if (active) {{ syn_sleep_lock_dma(l->sleep_lock_bit); }}\n    else {{ syn_sleep_unlock_dma(l->sleep_lock_bit); }}\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_complete(syn_{mangle}_t *l) {{\n    syn_enter_critical();\n    if (l->len == 0U) {{ l->len = {n}U; }}\n    l->ready = true;\n    syn_task_t *w = l->waiter;\n    l->waiter = NULL;\n    if (w != NULL) {{ syn_task_wake_from_isr_or_task(w, SYN_NO_BOOST); }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *l, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!l->ready) {{ syn_exit_critical(); return false; }}\n    uint16_t rlen = l->len;\n    l->ready = false;\n    l->len = 0U;\n    syn_exit_critical();\n    out_slice->ptr = &l->buf[0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *l, syn_task_t *task) {{\n    syn_enter_critical();\n    if (l->ready) {{ task->state = SYN_TASK_READY; task->sched_flags |= SYN_FLAG_MORE; syn_exit_critical(); return; }}\n    l->waiter = task;\n    task->wait_check = syn_{mangle}_is_ready;\n    task->wait_obj = l;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    SYN_DMA_ALIGN {ec} buf[{n}];\n    syn_task_t *waiter;\n    uint32_t sleep_lock_bit;\n    volatile uint16_t len;\n    volatile bool leased;\n    volatile bool ready;\n}};\n\nstatic SYN_UNUSED inline bool syn_{mangle}_is_ready(void *obj) {{\n    const syn_{mangle}_t *l = (const syn_{mangle}_t *)obj;\n    return l != NULL && l->ready;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_set_active(syn_{mangle}_t *l, bool active) {{\n    l->leased = active;\n    if (active) {{ syn_sleep_lock_dma(l->sleep_lock_bit); }}\n    else {{ syn_sleep_unlock_dma(l->sleep_lock_bit); }}\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_complete(syn_{mangle}_t *l) {{\n    syn_enter_critical();\n    if (l->len == 0U) {{ l->len = {n}U; }}\n    l->ready = true;\n    syn_task_t *w = l->waiter;\n    l->waiter = NULL;\n    if (w != NULL) {{ syn_task_wake_from_isr_or_task(w, SYN_NO_BOOST); }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *l, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!l->ready) {{ syn_exit_critical(); return false; }}\n    uint16_t rlen = l->len;\n    l->ready = false;\n    l->len = 0U;\n    syn_exit_critical();\n    out_slice->ptr = &l->buf[0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *l, syn_task_t *task) {{\n    syn_enter_critical();\n    if (l->ready) {{ task->state = SYN_TASK_READY; task->sched_flags |= SYN_FLAG_MORE; syn_exit_critical(); return; }}\n    l->waiter = task;\n    task->wait_check = syn_{mangle}_is_ready;\n    task->wait_obj = l;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
                     );
                 }
             }
@@ -986,7 +1428,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             self.out.push_str("/* ── Immutable Global Constants ─────────────────────────────────────────── */\n\n");
             for c in &self.m.consts {
                 let ct = self.c_type(&c.ty);
-                let val = self.fmt_expr(&c.init, &[]);
+                let val = self.fmt_const_init_expr(&c.init);
                 // `#undef` first if it collided with a default hardware bit macro like `MOTOR_EN`
                 if matches!(c.name.as_str(), "MOTOR_EN" | "HALF_TRANSFER" | "FULL_TRANSFER") {
                     let _ = writeln!(self.out, "#undef {}", c.name);
@@ -1005,7 +1447,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 match &p.kind {
                     MirPrimKind::Watch { elem } => {
                         let init_str = match &p.init {
-                            Some(ie) => self.fmt_expr(ie, &[]),
+                            Some(ie) => self.fmt_const_init_expr(ie),
                             None => self.zero_init_expr(elem),
                         };
                         let _ = writeln!(
@@ -1059,7 +1501,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             let mut params: Vec<String> = ef
                 .params
                 .iter()
-                .map(|(pn, pt)| format!("{} {}", self.c_type(pt), c_ident(pn)))
+                .map(|(pn, pt)| self.c_decl(pt, &c_ident(pn)))
                 .collect();
             if ef.variadic {
                 params.push("...".to_string());
@@ -1962,6 +2404,20 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 }
                 let lhs = self.fmt_place_raw(target, vars);
                 let rhs = self.fmt_expr(value, vars);
+                if *op == MirAssignOp::RemAssign && value.ty.is_float() {
+                    let fty = value.ty.host_value_type();
+                    let fn_name = if fty == MirType::F32 {
+                        "syn_fmod_f32"
+                    } else {
+                        "syn_fmod_f64"
+                    };
+                    let c_ty = self.c_type(&fty);
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}{{ {c_ty} *_rem_p = &({lhs}); *_rem_p = {fn_name}(*_rem_p, {rhs}); }}"
+                    );
+                    return;
+                }
                 let op_str = assign_op_str(*op);
                 let _ = writeln!(self.out, "{pad}{lhs} {op_str} {rhs};");
             }
@@ -1996,6 +2452,45 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             }
             MirStmt::SpawnActivate { slot_id, args } => {
                 self.emit_spawn_activation(*slot_id, args, vars, &pad);
+            }
+            MirStmt::PrintFmt { chunks, newline } => {
+                let _ = writeln!(self.out, "{pad}{{");
+                let _ = writeln!(
+                    self.out,
+                    "{pad}    syn_fmt_sink_t _sink = {{ .dst = NULL, .cap = 0U, .pos = 0U, .truncated = false, .is_buf = false }};"
+                );
+                self.emit_fmt_chunks("_sink", chunks, vars, indent + 1);
+                if *newline {
+                    let _ = writeln!(self.out, "{pad}    syn_fmt_putc(&_sink, '\\n');");
+                }
+                let _ = writeln!(
+                    self.out,
+                    "#if !defined(SYN_FREESTANDING)\n{pad}    fflush(stdout);\n#endif\n{pad}}}"
+                );
+            }
+            MirStmt::FmtBuf {
+                dst_res,
+                buf,
+                chunks,
+            } => {
+                let buf_s = self.fmt_expr(buf, vars);
+                let dst_s = self.var_ref(*dst_res, vars);
+                let res_c = self.c_type(&vars[dst_res.0].ty);
+                let _ = writeln!(self.out, "{pad}{{");
+                let _ = writeln!(self.out, "{pad}    syn_slice_u8 _fbuf = {buf_s};");
+                let _ = writeln!(
+                    self.out,
+                    "{pad}    syn_fmt_sink_t _sink = {{ .dst = _fbuf.ptr, .cap = _fbuf.len, .pos = 0U, .truncated = false, .is_buf = true }};"
+                );
+                self.emit_fmt_chunks("_sink", chunks, vars, indent + 1);
+                let _ = writeln!(
+                    self.out,
+                    "{pad}    syn_slice_u8 _written = {{ .ptr = _fbuf.ptr, .len = _sink.pos }};"
+                );
+                let _ = writeln!(
+                    self.out,
+                    "{pad}    if (_sink.truncated) {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = true, .err = syn_FmtErr_Truncated, .val = _written }};\n{pad}    }} else {{\n{pad}        {dst_s} = ({res_c}){{ .is_err = false, .val = _written }};\n{pad}    }}\n{pad}}}"
+                );
             }
             MirStmt::EnterCritical => {
                 let _ = writeln!(self.out, "{pad}syn_enter_critical();");
@@ -2490,6 +2985,9 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     format!("(({ct}){v}LL)")
                 }
             }
+            MirExprKind::FloatLit(bits) => {
+                format_c99_float_lit(*bits, expr.ty.host_value_type() == MirType::F32)
+            }
             MirExprKind::BoolLit(b) => {
                 if *b {
                     "true".to_string()
@@ -2533,8 +3031,24 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             MirExprKind::Binary { op, lhs, rhs } => {
                 let l = self.fmt_expr(lhs, vars);
                 let mut r = self.fmt_expr(rhs, vars);
-                // Prevent any `-Wsign-compare` if signedness differs
-                if lhs.ty.is_unsigned() != rhs.ty.is_unsigned() && !lhs.ty.is_void() {
+                if *op == MirBinOp::Rem && (lhs.ty.is_float() || rhs.ty.is_float()) {
+                    if lhs.ty.host_value_type() == MirType::F32 {
+                        return format!("syn_fmod_f32({l}, {r})");
+                    }
+                    return format!("syn_fmod_f64({l}, {r})");
+                }
+                if *op == MirBinOp::Div && (lhs.ty.is_float() || rhs.ty.is_float()) {
+                    if lhs.ty.host_value_type() == MirType::F32 {
+                        return format!("syn_fdiv_f32({l}, {r})");
+                    }
+                    return format!("syn_fdiv_f64({l}, {r})");
+                }
+                // Prevent any `-Wsign-compare` if signedness differs on integer operands
+                if !lhs.ty.is_float()
+                    && !rhs.ty.is_float()
+                    && lhs.ty.is_unsigned() != rhs.ty.is_unsigned()
+                    && !lhs.ty.is_void()
+                {
                     let lct = self.c_type(&lhs.ty.host_value_type());
                     r = format!("(({lct})({r}))");
                 }
@@ -2545,8 +3059,28 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 expr: inner,
                 target_ty,
             } => {
-                let ct = self.c_type(&target_ty.host_value_type());
-                format!("(({ct})({}))", self.fmt_expr(inner, vars))
+                let sub = self.fmt_expr(inner, vars);
+                let host_target = target_ty.host_value_type();
+                if inner.ty.is_float() {
+                    let sat_fn = match host_target {
+                        MirType::U8 => Some("syn_f64_to_u8_sat"),
+                        MirType::I8 => Some("syn_f64_to_i8_sat"),
+                        MirType::U16 => Some("syn_f64_to_u16_sat"),
+                        MirType::I16 => Some("syn_f64_to_i16_sat"),
+                        MirType::U32 => Some("syn_f64_to_u32_sat"),
+                        MirType::I32 => Some("syn_f64_to_i32_sat"),
+                        MirType::U64 => Some("syn_f64_to_u64_sat"),
+                        MirType::I64 => Some("syn_f64_to_i64_sat"),
+                        MirType::Usize => Some("syn_f64_to_usize_sat"),
+                        MirType::Isize => Some("syn_f64_to_isize_sat"),
+                        _ => None,
+                    };
+                    if let Some(fname) = sat_fn {
+                        return format!("{fname}((double)({sub}))");
+                    }
+                }
+                let ct = self.c_type(&host_target);
+                format!("(({ct})({sub}))")
             }
             MirExprKind::StructLit {
                 struct_name,
@@ -2719,6 +3253,12 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 let cname = if *is_extern_c {
                     if callee == "assert" {
                         "syn_builtin_assert".to_string()
+                    } else if let Some(v) = vars
+                        .iter()
+                        .rev()
+                        .find(|v| v.name == *callee && matches!(v.ty, MirType::FnPtr { .. }))
+                    {
+                        self.var_ref(v.id, vars)
                     } else {
                         callee.clone()
                     }
@@ -2731,6 +3271,295 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             MirExprKind::ResultErr(vid) => format!("({}.err)", self.var_ref(*vid, vars)),
             MirExprKind::ResultVal(vid) => format!("({}.val)", self.var_ref(*vid, vars)),
             MirExprKind::NowTicks => "syn_now_ms()".to_string(),
+        }
+    }
+
+    fn fmt_const_init_expr(&self, expr: &MirExpr) -> String {
+        if let Some(cv) = self.eval_const_val(expr, 0) {
+            return match cv {
+                ConstInitVal::Bool(b) => {
+                    if b {
+                        "true".to_string()
+                    } else {
+                        "false".to_string()
+                    }
+                }
+                ConstInitVal::Float(f) => {
+                    format_c99_float_lit(f.to_bits(), expr.ty.host_value_type() == MirType::F32)
+                }
+                ConstInitVal::Int(v) => {
+                    let ct = self.c_type(&expr.ty.host_value_type());
+                    if expr.ty.is_unsigned() {
+                        format!("(({ct}){}ULL)", v as u128 as u64)
+                    } else {
+                        let sv = v as i64;
+                        if sv == i64::MIN {
+                            format!("(({ct})INT64_MIN)")
+                        } else {
+                            format!("(({ct}){sv}LL)")
+                        }
+                    }
+                }
+            };
+        }
+        match &expr.kind {
+            MirExprKind::StructLit {
+                struct_name,
+                fields,
+                ..
+            } => {
+                if fields.is_empty() {
+                    return format!("((syn_struct_{struct_name}){{ ._empty = 0U }})");
+                }
+                let fs: Vec<String> = fields
+                    .iter()
+                    .map(|(fname, fval, raw_fty)| {
+                        let vstr = self.fmt_const_init_expr(fval);
+                        let wrapped = match raw_fty {
+                            MirType::EndianInt {
+                                bits, big_endian, ..
+                            } => {
+                                let end = if *big_endian { "be" } else { "le" };
+                                format!("syn_make_u{bits}{end}((uint{bits}_t)({vstr}))")
+                            }
+                            _ => vstr,
+                        };
+                        format!(".{} = {wrapped}", c_ident(fname))
+                    })
+                    .collect();
+                format!("((syn_struct_{struct_name}){{ {} }})", fs.join(", "))
+            }
+            MirExprKind::ArrayLit { elems, .. } => {
+                let ct = self.c_type(&expr.ty);
+                if elems.is_empty() {
+                    format!("(({ct}){{ .data = {{ 0 }} }})")
+                } else {
+                    let es: Vec<String> = elems
+                        .iter()
+                        .map(|e| self.fmt_const_init_expr(e))
+                        .collect();
+                    format!("(({ct}){{ .data = {{ {} }} }})", es.join(", "))
+                }
+            }
+            _ => self.fmt_expr(expr, &[]),
+        }
+    }
+
+    fn eval_const_val(&self, expr: &MirExpr, depth: usize) -> Option<ConstInitVal> {
+        if depth > 32 {
+            return None;
+        }
+        let norm_float = |f: f64, ty: &MirType| -> f64 {
+            if ty.host_value_type() == MirType::F32 {
+                (f as f32) as f64
+            } else {
+                f
+            }
+        };
+        let trunc_int = |v: i128, ty: &MirType| -> i128 {
+            match ty.host_value_type() {
+                MirType::U8 => (v as u8) as i128,
+                MirType::I8 => (v as i8) as i128,
+                MirType::U16 => (v as u16) as i128,
+                MirType::I16 => (v as i16) as i128,
+                MirType::U32 => (v as u32) as i128,
+                MirType::I32 => (v as i32) as i128,
+                MirType::U64 | MirType::Usize => (v as u64) as i128,
+                MirType::I64 | MirType::Isize => (v as i64) as i128,
+                _ => v,
+            }
+        };
+        match &expr.kind {
+            MirExprKind::IntLit(v) => Some(ConstInitVal::Int(trunc_int(*v, &expr.ty))),
+            MirExprKind::TicksLit(t) => Some(ConstInitVal::Int(*t as i128)),
+            MirExprKind::FloatLit(bits) => {
+                Some(ConstInitVal::Float(norm_float(f64::from_bits(*bits), &expr.ty)))
+            }
+            MirExprKind::BoolLit(b) => Some(ConstInitVal::Bool(*b)),
+            MirExprKind::ConstRef(name) => {
+                let c = self.m.consts.iter().find(|c| c.name == *name)?;
+                self.eval_const_val(&c.init, depth + 1)
+            }
+            MirExprKind::Unary { op, expr: inner } => {
+                let sub = self.eval_const_val(inner, depth + 1)?;
+                match (op, sub) {
+                    (MirUnaryOp::Neg, ConstInitVal::Int(v)) => {
+                        Some(ConstInitVal::Int(trunc_int(v.wrapping_neg(), &expr.ty)))
+                    }
+                    (MirUnaryOp::Neg, ConstInitVal::Float(f)) => {
+                        Some(ConstInitVal::Float(norm_float(-f, &expr.ty)))
+                    }
+                    (MirUnaryOp::Not, ConstInitVal::Bool(b)) => Some(ConstInitVal::Bool(!b)),
+                    (MirUnaryOp::BitNot, ConstInitVal::Int(v)) => {
+                        Some(ConstInitVal::Int(trunc_int(!v, &expr.ty)))
+                    }
+                    _ => None,
+                }
+            }
+            MirExprKind::Cast {
+                expr: inner,
+                target_ty,
+            } => {
+                let sub = self.eval_const_val(inner, depth + 1)?;
+                let ht = target_ty.host_value_type();
+                match sub {
+                    ConstInitVal::Float(f) => match ht {
+                        MirType::F32 | MirType::F64 => Some(ConstInitVal::Float(norm_float(f, &ht))),
+                        MirType::U8 => Some(ConstInitVal::Int((f as u8) as i128)),
+                        MirType::I8 => Some(ConstInitVal::Int((f as i8) as i128)),
+                        MirType::U16 => Some(ConstInitVal::Int((f as u16) as i128)),
+                        MirType::I16 => Some(ConstInitVal::Int((f as i16) as i128)),
+                        MirType::U32 => Some(ConstInitVal::Int((f as u32) as i128)),
+                        MirType::I32 => Some(ConstInitVal::Int((f as i32) as i128)),
+                        MirType::U64 | MirType::Usize => {
+                            Some(ConstInitVal::Int((f as u64) as i128))
+                        }
+                        MirType::I64 | MirType::Isize => {
+                            Some(ConstInitVal::Int((f as i64) as i128))
+                        }
+                        _ => None,
+                    },
+                    ConstInitVal::Int(v) => match ht {
+                        MirType::F32 | MirType::F64 => {
+                            let fv = if inner.ty.is_unsigned() {
+                                (v as u128) as f64
+                            } else {
+                                v as f64
+                            };
+                            Some(ConstInitVal::Float(norm_float(fv, &ht)))
+                        }
+                        MirType::Bool => Some(ConstInitVal::Bool(v != 0)),
+                        MirType::U8
+                        | MirType::I8
+                        | MirType::U16
+                        | MirType::I16
+                        | MirType::U32
+                        | MirType::I32
+                        | MirType::U64
+                        | MirType::I64
+                        | MirType::Usize
+                        | MirType::Isize => Some(ConstInitVal::Int(trunc_int(v, &ht))),
+                        _ => None,
+                    },
+                    ConstInitVal::Bool(b) => match ht {
+                        MirType::Bool => Some(ConstInitVal::Bool(b)),
+                        MirType::U8
+                        | MirType::I8
+                        | MirType::U16
+                        | MirType::I16
+                        | MirType::U32
+                        | MirType::I32
+                        | MirType::U64
+                        | MirType::I64
+                        | MirType::Usize
+                        | MirType::Isize => Some(ConstInitVal::Int(if b { 1 } else { 0 })),
+                        _ => None,
+                    },
+                }
+            }
+            MirExprKind::Binary { op, lhs, rhs } => {
+                let lv = self.eval_const_val(lhs, depth + 1)?;
+                let rv = self.eval_const_val(rhs, depth + 1)?;
+                match (lv, rv) {
+                    (ConstInitVal::Float(a), ConstInitVal::Float(b)) => match op {
+                        MirBinOp::Add => Some(ConstInitVal::Float(norm_float(a + b, &expr.ty))),
+                        MirBinOp::Sub => Some(ConstInitVal::Float(norm_float(a - b, &expr.ty))),
+                        MirBinOp::Mul => Some(ConstInitVal::Float(norm_float(a * b, &expr.ty))),
+                        MirBinOp::Div => Some(ConstInitVal::Float(norm_float(a / b, &expr.ty))),
+                        MirBinOp::Rem => Some(ConstInitVal::Float(norm_float(a % b, &expr.ty))),
+                        MirBinOp::Eq => Some(ConstInitVal::Bool(a == b)),
+                        MirBinOp::Ne => Some(ConstInitVal::Bool(a != b)),
+                        MirBinOp::Lt => Some(ConstInitVal::Bool(a < b)),
+                        MirBinOp::Le => Some(ConstInitVal::Bool(a <= b)),
+                        MirBinOp::Gt => Some(ConstInitVal::Bool(a > b)),
+                        MirBinOp::Ge => Some(ConstInitVal::Bool(a >= b)),
+                        _ => None,
+                    },
+                    (ConstInitVal::Bool(a), ConstInitVal::Bool(b)) => match op {
+                        MirBinOp::LogicalAnd => Some(ConstInitVal::Bool(a && b)),
+                        MirBinOp::LogicalOr => Some(ConstInitVal::Bool(a || b)),
+                        MirBinOp::Eq => Some(ConstInitVal::Bool(a == b)),
+                        MirBinOp::Ne => Some(ConstInitVal::Bool(a != b)),
+                        _ => None,
+                    },
+                    (ConstInitVal::Int(a), ConstInitVal::Int(b)) => {
+                        let uns = lhs.ty.is_unsigned() && rhs.ty.is_unsigned();
+                        match op {
+                            MirBinOp::Add => {
+                                Some(ConstInitVal::Int(trunc_int(a.wrapping_add(b), &expr.ty)))
+                            }
+                            MirBinOp::Sub => {
+                                Some(ConstInitVal::Int(trunc_int(a.wrapping_sub(b), &expr.ty)))
+                            }
+                            MirBinOp::Mul => {
+                                Some(ConstInitVal::Int(trunc_int(a.wrapping_mul(b), &expr.ty)))
+                            }
+                            MirBinOp::Div if b != 0 => {
+                                let q = if uns {
+                                    ((a as u128) / (b as u128)) as i128
+                                } else {
+                                    a.wrapping_div(b)
+                                };
+                                Some(ConstInitVal::Int(trunc_int(q, &expr.ty)))
+                            }
+                            MirBinOp::Rem if b != 0 => {
+                                let r = if uns {
+                                    ((a as u128) % (b as u128)) as i128
+                                } else {
+                                    a.wrapping_rem(b)
+                                };
+                                Some(ConstInitVal::Int(trunc_int(r, &expr.ty)))
+                            }
+                            MirBinOp::BitOr => {
+                                Some(ConstInitVal::Int(trunc_int(a | b, &expr.ty)))
+                            }
+                            MirBinOp::BitAnd => {
+                                Some(ConstInitVal::Int(trunc_int(a & b, &expr.ty)))
+                            }
+                            MirBinOp::BitXor => {
+                                Some(ConstInitVal::Int(trunc_int(a ^ b, &expr.ty)))
+                            }
+                            MirBinOp::Shl => Some(ConstInitVal::Int(trunc_int(
+                                a.wrapping_shl(b as u32),
+                                &expr.ty,
+                            ))),
+                            MirBinOp::Shr => {
+                                let s = if uns {
+                                    ((a as u128).wrapping_shr(b as u32)) as i128
+                                } else {
+                                    a.wrapping_shr(b as u32)
+                                };
+                                Some(ConstInitVal::Int(trunc_int(s, &expr.ty)))
+                            }
+                            MirBinOp::Eq => Some(ConstInitVal::Bool(a == b)),
+                            MirBinOp::Ne => Some(ConstInitVal::Bool(a != b)),
+                            MirBinOp::Lt => Some(ConstInitVal::Bool(if uns {
+                                (a as u128) < (b as u128)
+                            } else {
+                                a < b
+                            })),
+                            MirBinOp::Le => Some(ConstInitVal::Bool(if uns {
+                                (a as u128) <= (b as u128)
+                            } else {
+                                a <= b
+                            })),
+                            MirBinOp::Gt => Some(ConstInitVal::Bool(if uns {
+                                (a as u128) > (b as u128)
+                            } else {
+                                a > b
+                            })),
+                            MirBinOp::Ge => Some(ConstInitVal::Bool(if uns {
+                                (a as u128) >= (b as u128)
+                            } else {
+                                a >= b
+                            })),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 
@@ -2872,6 +3701,258 @@ int main(void) {
             bp = sp.blueprint_name,
             fields = init_fields.join(", ")
         );
+    }
+
+    fn emit_fmt_chunks(
+        &mut self,
+        sink_var: &str,
+        chunks: &[MirFmtChunk],
+        vars: &[MirVar],
+        indent: usize,
+    ) {
+        let pad = "    ".repeat(indent);
+        for ch in chunks {
+            match ch {
+                MirFmtChunk::Literal(s) => {
+                    let byte_len = zev_mir::decoded_string_byte_len(s);
+                    if byte_len > 0 {
+                        let _ = writeln!(
+                            self.out,
+                            "{pad}syn_fmt_write(&{sink_var}, {}, {byte_len}U);",
+                            escape_c_string(s)
+                        );
+                    }
+                }
+                MirFmtChunk::Int {
+                    value,
+                    signed,
+                    bits,
+                    fmt,
+                } => {
+                    let v = self.fmt_expr(value, vars);
+                    match fmt {
+                        MirIntFmt::Dec => {
+                            if *signed {
+                                let _ = writeln!(
+                                    self.out,
+                                    "{pad}syn_fmt_i64_dec(&{sink_var}, (int64_t)({v}));"
+                                );
+                            } else {
+                                let _ = writeln!(
+                                    self.out,
+                                    "{pad}syn_fmt_u64_dec(&{sink_var}, (uint64_t)({v}));"
+                                );
+                            }
+                        }
+                        MirIntFmt::Hex {
+                            upper,
+                            zero_pad_width,
+                        } => {
+                            let ucast = match *bits {
+                                8 => format!("(uint64_t)(uint8_t)({v})"),
+                                16 => format!("(uint64_t)(uint16_t)({v})"),
+                                32 => format!("(uint64_t)(uint32_t)({v})"),
+                                64 => format!("(uint64_t)({v})"),
+                                _ => format!("(uint64_t)(size_t)({v})"),
+                            };
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}syn_fmt_u64_hex(&{sink_var}, {ucast}, {upper}, {zero_pad_width}U);"
+                            );
+                        }
+                        MirIntFmt::Bin { zero_pad_width } => {
+                            let ucast = match *bits {
+                                8 => format!("(uint64_t)(uint8_t)({v})"),
+                                16 => format!("(uint64_t)(uint16_t)({v})"),
+                                32 => format!("(uint64_t)(uint32_t)({v})"),
+                                64 => format!("(uint64_t)({v})"),
+                                _ => format!("(uint64_t)(size_t)({v})"),
+                            };
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}syn_fmt_u64_bin(&{sink_var}, {ucast}, {zero_pad_width}U);"
+                            );
+                        }
+                    }
+                }
+                MirFmtChunk::Float { value, fmt, .. } => {
+                    let v = self.fmt_expr(value, vars);
+                    match fmt {
+                        MirFloatFmt::Fixed { precision } => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}syn_fmt_float_fixed(&{sink_var}, (double)({v}), {precision}U);"
+                            );
+                        }
+                        MirFloatFmt::Sci { precision } => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}syn_fmt_float_sci(&{sink_var}, (double)({v}), {precision}U);"
+                            );
+                        }
+                    }
+                }
+                MirFmtChunk::Bool(value) => {
+                    let v = self.fmt_expr(value, vars);
+                    let _ = writeln!(self.out, "{pad}syn_fmt_bool(&{sink_var}, (bool)({v}));");
+                }
+                MirFmtChunk::Str(value) => {
+                    let v = self.fmt_expr(value, vars);
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}syn_fmt_cstr(&{sink_var}, (const char *)({v}));"
+                    );
+                }
+                MirFmtChunk::Bytes(value) => {
+                    let v = self.fmt_expr(value, vars);
+                    let _ = writeln!(self.out, "{pad}syn_fmt_bytes(&{sink_var}, {v});");
+                }
+                MirFmtChunk::EnumName { enum_name, value } => {
+                    let v = self.fmt_expr(value, vars);
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}syn_fmt_cstr(&{sink_var}, syn_enum_name_{enum_name}({v}));"
+                    );
+                }
+                MirFmtChunk::DebugSlice { elem_ty, slice } => {
+                    let sl_c = self.c_type(&slice.ty);
+                    let sl_v = self.fmt_expr(slice, vars);
+                    let raw_elem = match &slice.ty {
+                        MirType::Slice(inner) => match inner.as_ref() {
+                            MirType::EndianInt {
+                                bits,
+                                big_endian,
+                                signed,
+                            } => {
+                                let end = if *big_endian { "be" } else { "le" };
+                                if *signed {
+                                    format!("((int{bits}_t)syn_load_u{bits}{end}(_dsl.ptr[_di]))")
+                                } else {
+                                    format!("syn_load_u{bits}{end}(_dsl.ptr[_di])")
+                                }
+                            }
+                            _ => "_dsl.ptr[_di]".to_string(),
+                        },
+                        _ => "_dsl.ptr[_di]".to_string(),
+                    };
+                    let _ = writeln!(self.out, "{pad}{{");
+                    let _ = writeln!(self.out, "{pad}    {sl_c} _dsl = {sl_v};");
+                    let _ = writeln!(self.out, "{pad}    syn_fmt_putc(&{sink_var}, '[');");
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}    for (size_t _di = 0U; _di < _dsl.len; _di++) {{"
+                    );
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}        if (_di > 0U) {{ syn_fmt_write(&{sink_var}, \", \", 2U); }}"
+                    );
+                    match elem_ty {
+                        MirType::Bool => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_bool(&{sink_var}, (bool)({raw_elem}));"
+                            );
+                        }
+                        MirType::F32 | MirType::F64 => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_float_fixed(&{sink_var}, (double)({raw_elem}), 2U);"
+                            );
+                        }
+                        MirType::Enum(ename) => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_cstr(&{sink_var}, syn_enum_name_{ename}({raw_elem}));"
+                            );
+                        }
+                        MirType::Str => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_cstr(&{sink_var}, (const char *)({raw_elem}));"
+                            );
+                        }
+                        MirType::Ptr(_) | MirType::FnPtr { .. } => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_write(&{sink_var}, \"0x\", 2U);\n{pad}        syn_fmt_u64_hex(&{sink_var}, (uint64_t)(uintptr_t)({raw_elem}), false, 0U);"
+                            );
+                        }
+                        MirType::Slice(inner) if **inner == MirType::U8 => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_bytes(&{sink_var}, {raw_elem});"
+                            );
+                        }
+                        MirType::I8
+                        | MirType::I16
+                        | MirType::I32
+                        | MirType::I64
+                        | MirType::Isize => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_i64_dec(&{sink_var}, (int64_t)({raw_elem}));"
+                            );
+                        }
+                        _ => {
+                            let _ = writeln!(
+                                self.out,
+                                "{pad}        syn_fmt_u64_dec(&{sink_var}, (uint64_t)({raw_elem}));"
+                            );
+                        }
+                    }
+                    let _ = writeln!(self.out, "{pad}    }}");
+                    let _ = writeln!(self.out, "{pad}    syn_fmt_putc(&{sink_var}, ']');");
+                    let _ = writeln!(self.out, "{pad}}}");
+                }
+            }
+        }
+    }
+}
+
+fn format_c99_float_lit(bits: u64, is_f32: bool) -> String {
+    if is_f32 {
+        let f32_bits = (f64::from_bits(bits) as f32).to_bits();
+        let neg = (f32_bits >> 31) != 0;
+        let sign = if neg { "-" } else { "" };
+        let exp_bits = ((f32_bits >> 23) & 0xFF) as i32;
+        let mant = f32_bits & 0x007F_FFFFu32;
+        if exp_bits == 0xFF {
+            if mant == 0 {
+                format!("({sign}__builtin_inff())")
+            } else {
+                format!("({sign}__builtin_nanf(\"\"))")
+            }
+        } else if exp_bits == 0 {
+            if mant == 0 {
+                format!("({sign}0x0.0p+0f)")
+            } else {
+                format!("({sign}0x0.{:06x}p-126f)", mant << 1)
+            }
+        } else {
+            let exp = exp_bits - 127;
+            format!("({sign}0x1.{:06x}p{exp:+}f)", mant << 1)
+        }
+    } else {
+        let neg = (bits >> 63) != 0;
+        let sign = if neg { "-" } else { "" };
+        let exp_bits = ((bits >> 52) & 0x7FF) as i32;
+        let mant = bits & 0x000F_FFFF_FFFF_FFFFu64;
+        if exp_bits == 0x7FF {
+            if mant == 0 {
+                format!("({sign}__builtin_inf())")
+            } else {
+                format!("({sign}__builtin_nan(\"\"))")
+            }
+        } else if exp_bits == 0 {
+            if mant == 0 {
+                format!("({sign}0x0.0p+0)")
+            } else {
+                format!("({sign}0x0.{mant:013x}p-1022)")
+            }
+        } else {
+            let exp = exp_bits - 1023;
+            format!("({sign}0x1.{mant:013x}p{exp:+})")
+        }
     }
 }
 
@@ -3016,19 +4097,27 @@ fn strip_outer_parens(s: &str) -> &str {
     s
 }
 
+#[derive(Clone, Copy)]
+enum ConstInitVal {
+    Int(i128),
+    Float(f64),
+    Bool(bool),
+}
+
 fn escape_c_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let bytes = zev_mir::decoded_string_bytes(s);
+    let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
-            c => {
-                let _ = write!(out, "\\x{:02x}", c as u32);
+    for b in bytes {
+        match b {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7E => out.push(b as char),
+            other => {
+                let _ = write!(out, "\\{:03o}", other);
             }
         }
     }

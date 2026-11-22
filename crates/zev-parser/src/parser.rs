@@ -1,5 +1,7 @@
+use std::collections::BTreeSet;
+
 use crate::error::ParseError;
-use crate::token::{Token, TokenKind};
+use crate::token::{LexedFormatPart, Token, TokenKind};
 use zev_ast::*;
 
 #[derive(Copy, Clone)]
@@ -19,18 +21,233 @@ pub struct Parser<'a> {
     pending_gt: Option<Span>,
     /// Disambiguates `Foo { a: 1 }` struct literals vs `{ ... }` body blocks after unparenthesized conditions.
     allow_struct_lit: bool,
+    /// Optional whole-program set of declared generic `struct` and `fn` names across all input files.
+    known_generics: Option<&'a BTreeSet<String>>,
+    /// Top-level generic `struct` and `fn` names declared in this file.
+    local_generics: BTreeSet<String>,
+    /// Top-level value bindings (`const`, OS primitives, and global variables) declared in this file.
+    top_level_values: BTreeSet<String>,
+    /// Module alias names bound by `import a.b as alias;` (or `import m;`).
+    import_aliases: BTreeSet<String>,
+    /// Active lexical value scopes inside `fn` / `task` / `isr` bodies.
+    value_scopes: Vec<BTreeSet<String>>,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(source: &'a str, filename: Option<&'a str>, tokens: Vec<Token>) -> Self {
-        Self {
+        Self::new_with_generics(source, filename, tokens, None)
+    }
+
+    pub fn new_with_generics(
+        source: &'a str,
+        filename: Option<&'a str>,
+        tokens: Vec<Token>,
+        known_generics: Option<&'a BTreeSet<String>>,
+    ) -> Self {
+        let mut p = Self {
             source,
             filename,
             tokens,
             pos: 0,
             pending_gt: None,
             allow_struct_lit: true,
+            known_generics,
+            local_generics: BTreeSet::new(),
+            top_level_values: BTreeSet::new(),
+            import_aliases: BTreeSet::new(),
+            value_scopes: Vec::new(),
+        };
+        p.prescan_top_level();
+        p
+    }
+
+    fn new_hole_subparser(&self, tokens: Vec<Token>) -> Parser<'a> {
+        Parser {
+            source: self.source,
+            filename: self.filename,
+            tokens,
+            pos: 0,
+            pending_gt: None,
+            allow_struct_lit: true,
+            known_generics: self.known_generics,
+            local_generics: self.local_generics.clone(),
+            top_level_values: self.top_level_values.clone(),
+            import_aliases: self.import_aliases.clone(),
+            value_scopes: self.value_scopes.clone(),
         }
+    }
+
+    pub(crate) fn collect_declared_generics(source: &str, tokens: Vec<Token>) -> BTreeSet<String> {
+        let p = Parser::new(source, None, tokens);
+        p.local_generics
+    }
+
+    fn prescan_top_level(&mut self) {
+        let saved = self.save();
+        self.pos = 0;
+        self.pending_gt = None;
+        self.allow_struct_lit = true;
+
+        while !self.at(&TokenKind::Eof) {
+            let iter_start = self.pos;
+            let _ = self.parse_attrs();
+            while self.eat(&TokenKind::KwPub) || self.eat(&TokenKind::KwStatic) {}
+
+            match self.peek_kind() {
+                TokenKind::Eof => break,
+                TokenKind::KwImport => {
+                    if let Ok(imp) = self.parse_import() {
+                        if let Some(alias) = imp.alias {
+                            self.import_aliases.insert(alias.name);
+                        } else if let Some(last) = imp.path.last() {
+                            self.import_aliases.insert(last.name.clone());
+                        }
+                    } else {
+                        self.prescan_skip_until_semi_depth0();
+                    }
+                }
+                TokenKind::KwPacked | TokenKind::KwStruct => {
+                    let _ = self.eat(&TokenKind::KwPacked);
+                    let _ = self.eat(&TokenKind::KwStruct);
+                    if let TokenKind::Ident(name) = self.peek_kind() {
+                        self.bump();
+                        if self.at(&TokenKind::Lt) {
+                            self.local_generics.insert(name);
+                        }
+                    }
+                    self.prescan_skip_item();
+                }
+                TokenKind::KwEnum | TokenKind::KwTask | TokenKind::KwIsr => {
+                    self.prescan_skip_item();
+                }
+                TokenKind::KwConst => {
+                    self.bump();
+                    if let Ok((_, name)) = self.parse_field_or_param("prescan") {
+                        self.top_level_values.insert(name.name);
+                    }
+                    self.prescan_skip_until_semi_depth0();
+                }
+                TokenKind::KwExtern => {
+                    self.bump();
+                    if matches!(self.peek_kind(), TokenKind::String(_)) {
+                        self.bump();
+                    }
+                    self.prescan_skip_item();
+                }
+                TokenKind::KwFn => {
+                    self.bump();
+                    let is_std = matches!(self.peek_kind(), TokenKind::Ident(_))
+                        && matches!(self.peek_n_kind(1), TokenKind::LParen | TokenKind::Lt);
+                    if is_std {
+                        if let TokenKind::Ident(name) = self.bump().kind {
+                            if self.at(&TokenKind::Lt) {
+                                self.local_generics.insert(name);
+                            }
+                        }
+                    } else if let Ok((_, name)) = self.parse_typed_declarator("prescan") {
+                        if self.at(&TokenKind::Lt) {
+                            self.local_generics.insert(name.name);
+                        }
+                    }
+                    self.prescan_skip_item();
+                }
+                _ => {
+                    if let Ok((_, name)) = self.parse_typed_declarator("prescan") {
+                        if self.at(&TokenKind::Lt) {
+                            self.local_generics.insert(name.name);
+                            self.prescan_skip_item();
+                        } else if self.at(&TokenKind::LParen) {
+                            self.prescan_skip_item();
+                        } else {
+                            self.top_level_values.insert(name.name);
+                            self.prescan_skip_until_semi_depth0();
+                        }
+                    } else {
+                        self.prescan_skip_item();
+                    }
+                }
+            }
+
+            if self.pos <= iter_start && !self.at(&TokenKind::Eof) {
+                self.bump();
+            }
+        }
+
+        self.restore(saved);
+    }
+
+    fn prescan_skip_until_semi_depth0(&mut self) {
+        self.pending_gt = None;
+        let mut brace_depth = 0usize;
+        while !self.at(&TokenKind::Eof) {
+            match self.bump().kind {
+                TokenKind::LBrace => {
+                    brace_depth += 1;
+                }
+                TokenKind::RBrace => {
+                    if brace_depth == 0 {
+                        break;
+                    }
+                    brace_depth -= 1;
+                }
+                TokenKind::Semi if brace_depth == 0 => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn prescan_skip_item(&mut self) {
+        self.pending_gt = None;
+        let mut brace_depth = 0usize;
+        while !self.at(&TokenKind::Eof) {
+            match self.bump().kind {
+                TokenKind::LBrace => {
+                    brace_depth += 1;
+                }
+                TokenKind::RBrace => {
+                    if brace_depth <= 1 {
+                        let _ = self.eat(&TokenKind::Semi);
+                        break;
+                    }
+                    brace_depth -= 1;
+                }
+                TokenKind::Semi if brace_depth == 0 => {
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn push_value_scope(&mut self) {
+        self.value_scopes.push(BTreeSet::new());
+    }
+
+    fn pop_value_scope(&mut self) {
+        let _ = self.value_scopes.pop();
+    }
+
+    fn record_local_value(&mut self, name: &str) {
+        if let Some(scope) = self.value_scopes.last_mut() {
+            scope.insert(name.to_owned());
+        }
+    }
+
+    fn is_value_name(&self, name: &str) -> bool {
+        self.top_level_values.contains(name)
+            || self.value_scopes.iter().rev().any(|s| s.contains(name))
+    }
+
+    fn can_speculate_bare_generic_call(&self, name: &str) -> bool {
+        if self.is_value_name(name) {
+            return false;
+        }
+        if let Some(known) = self.known_generics {
+            return known.contains(name);
+        }
+        true
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -611,7 +828,7 @@ impl<'a> Parser<'a> {
                 let (ty, name) = self.parse_typed_declarator("top-level declaration")?;
                 self.check_generic_lifetime_after_decl_name()?;
 
-                if self.at(&TokenKind::LParen) {
+                if self.at(&TokenKind::LParen) || self.at(&TokenKind::Lt) {
                     let f = self.finish_fn_after_name(attrs.clone(), false, ty, name, first_span)?;
                     let span = f.span;
                     out.push(Item {
@@ -771,7 +988,7 @@ impl<'a> Parser<'a> {
         let is_packed = self.eat(&TokenKind::KwPacked);
         self.expect(&TokenKind::KwStruct)?;
         let name = self.parse_ident()?;
-        self.check_generic_lifetime_after_decl_name()?;
+        let generic_params = self.parse_optional_generic_params()?;
         self.expect(&TokenKind::LBrace)?;
 
         let mut fields = Vec::new();
@@ -813,6 +1030,7 @@ impl<'a> Parser<'a> {
         Ok(StructDecl {
             is_packed,
             name,
+            generic_params,
             fields,
             span: start.merge(end),
         })
@@ -981,7 +1199,7 @@ impl<'a> Parser<'a> {
         }
 
         let name = self.parse_ident()?;
-        self.check_generic_lifetime_after_decl_name()?;
+        let generic_params = self.parse_optional_generic_params()?;
         let (params, is_variadic) = self.parse_param_list()?;
 
         if self.at(&TokenKind::Arrow) {
@@ -1003,12 +1221,19 @@ impl<'a> Parser<'a> {
 
         let ret_type = TypeExpr::void(fn_tok.span);
         let error_spec = self.parse_optional_error_spec()?;
-        let (body, end_span) = self.parse_fn_body(is_extern_c, &name)?;
+        self.push_value_scope();
+        for p in &params {
+            self.record_local_value(&p.name.name);
+        }
+        let body_res = self.parse_fn_body(is_extern_c, &name);
+        self.pop_value_scope();
+        let (body, end_span) = body_res?;
 
         Ok(FnDecl {
             attrs,
             is_extern_c,
             name,
+            generic_params,
             params,
             is_variadic,
             ret_type,
@@ -1026,7 +1251,7 @@ impl<'a> Parser<'a> {
         name: Ident,
         first_span: Span,
     ) -> Result<FnDecl, ParseError> {
-        self.check_generic_lifetime_after_decl_name()?;
+        let generic_params = self.parse_optional_generic_params()?;
         let (params, is_variadic) = self.parse_param_list()?;
 
         if self.at(&TokenKind::Arrow) {
@@ -1040,12 +1265,19 @@ impl<'a> Parser<'a> {
         }
 
         let error_spec = self.parse_optional_error_spec()?;
-        let (body, end_span) = self.parse_fn_body(is_extern_c, &name)?;
+        self.push_value_scope();
+        for p in &params {
+            self.record_local_value(&p.name.name);
+        }
+        let body_res = self.parse_fn_body(is_extern_c, &name);
+        self.pop_value_scope();
+        let (body, end_span) = body_res?;
 
         Ok(FnDecl {
             attrs,
             is_extern_c,
             name,
+            generic_params,
             params,
             is_variadic,
             ret_type,
@@ -1053,6 +1285,209 @@ impl<'a> Parser<'a> {
             body,
             span: first_span.merge(end_span),
         })
+    }
+
+    /// Parse optional `<T>` / `<T, usize N>` generic declaration parameters on `struct` or `fn`.
+    fn parse_optional_generic_params(&mut self) -> Result<Vec<GenericParam>, ParseError> {
+        if !self.at(&TokenKind::Lt) {
+            return Ok(Vec::new());
+        }
+        self.check_generic_lifetime_after_decl_name()?;
+        let lt_tok = self.expect(&TokenKind::Lt)?;
+
+        if self.at(&TokenKind::Gt) || self.at(&TokenKind::Shr) {
+            let gt_span = self.expect_type_gt()?;
+            return Err(self
+                .err_at("empty generic parameter list `<>`", lt_tok.span.merge(gt_span))
+                .with_doc_topic("syntax"));
+        }
+
+        let mut params = Vec::new();
+        while !self.at(&TokenKind::Gt) && !self.at(&TokenKind::Shr) && !self.at(&TokenKind::Eof) {
+            let p_start = self.peek_span();
+            if let TokenKind::Lifetime(ref lt) = self.peek_kind() {
+                return Err(self.trap_p0009_lifetime(lt, p_start));
+            }
+            if self.eat(&TokenKind::KwConst) {
+                // Guide Rust `<const N: usize>` habits cleanly to Zev `<usize N>`
+                if matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "usize")
+                    && matches!(self.peek_n_kind(1), TokenKind::Ident(_))
+                {
+                    self.bump(); // `usize`
+                    let name = self.parse_ident()?;
+                    params.push(GenericParam {
+                        span: p_start.merge(name.span),
+                        name,
+                        kind: GenericParamKind::ConstUsize,
+                    });
+                } else {
+                    let name = self.parse_ident()?;
+                    return Err(self
+                        .err_at(
+                            format!("Rust-style `const {}` generic parameter is written `usize {}` in Zev", name.name, name.name),
+                            p_start.merge(self.peek_span()),
+                        )
+                        .with_code("P0002")
+                        .with_doc_topic("syntax")
+                        .with_hint(format!("write `<T, usize {}>` instead of `<T, const {}: usize>`", name.name, name.name)));
+                }
+            } else if matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "usize")
+                && matches!(self.peek_n_kind(1), TokenKind::Ident(_))
+            {
+                self.bump(); // `usize`
+                let name = self.parse_ident()?;
+                params.push(GenericParam {
+                    span: p_start.merge(name.span),
+                    name,
+                    kind: GenericParamKind::ConstUsize,
+                });
+            } else {
+                let name = self.parse_ident()?;
+                if self.at(&TokenKind::Colon) {
+                    let colon = self.bump();
+                    return Err(self
+                        .err_at(
+                            format!("`: ...` bounds on generic parameter `{}` are not supported in Zev", name.name),
+                            name.span.merge(colon.span),
+                        )
+                        .with_doc_topic("syntax")
+                        .with_hint("Zev monomorphized generics omit trait hierarchies; write `<T>` or `<T, usize N>`"));
+                }
+                params.push(GenericParam {
+                    span: name.span,
+                    name,
+                    kind: GenericParamKind::Type,
+                });
+            }
+
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        self.expect_type_gt()?;
+        Ok(params)
+    }
+
+    /// Parse `<Arg1, Arg2, ...>` generic arguments (splitting `>>` cleanly via `expect_type_gt`).
+    fn parse_generic_args(&mut self) -> Result<(Vec<GenericArg>, Span), ParseError> {
+        self.check_generic_lifetime_after_decl_name()?;
+        let lt_tok = self.expect(&TokenKind::Lt)?;
+
+        if self.at(&TokenKind::Gt) || self.at(&TokenKind::Shr) {
+            let gt_span = self.expect_type_gt()?;
+            return Err(self
+                .err_at("empty generic argument list `<>`", lt_tok.span.merge(gt_span))
+                .with_doc_topic("syntax"));
+        }
+
+        let mut args = Vec::new();
+        while !self.at(&TokenKind::Gt) && !self.at(&TokenKind::Shr) && !self.at(&TokenKind::Eof) {
+            args.push(self.parse_generic_arg()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        let gt_span = self.expect_type_gt()?;
+        Ok((args, gt_span))
+    }
+
+    fn parse_generic_arg(&mut self) -> Result<GenericArg, ParseError> {
+        if let TokenKind::Lifetime(ref lt) = self.peek_kind() {
+            return Err(self.trap_p0009_lifetime(lt, self.peek_span()));
+        }
+
+        let cp = self.save();
+        match self.parse_type() {
+            Ok(ty)
+                if self.at(&TokenKind::Comma)
+                    || self.at(&TokenKind::Gt)
+                    || self.at(&TokenKind::Shr) =>
+            {
+                return Ok(GenericArg::Type(ty));
+            }
+            Err(e) if e.code.is_some() => {
+                return Err(e);
+            }
+            _ => {
+                self.restore(cp);
+            }
+        }
+
+        let expr = self.parse_generic_const_expr()?;
+        Ok(GenericArg::Const(expr))
+    }
+
+    /// Parse a constant expression inside `<...>` generic arguments, supporting `|`, `^`, `&`,
+    /// `<<` (`TokenKind::Shl`), `+`, `-`, `*`, `/`, `%`, casts, and unary ops while stopping
+    /// cleanly before closing `>` and `>>` (`TokenKind::Shr`).
+    fn parse_generic_const_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_generic_bitxor_expr()?;
+        while self.eat(&TokenKind::Pipe) {
+            let rhs = self.parse_generic_bitxor_expr()?;
+            let span = lhs.span.merge(rhs.span);
+            lhs = Expr::new(
+                ExprKind::Binary {
+                    op: BinaryOp::BitOr,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            );
+        }
+        Ok(lhs)
+    }
+
+    fn parse_generic_bitxor_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_generic_bitand_expr()?;
+        while self.eat(&TokenKind::Caret) {
+            let rhs = self.parse_generic_bitand_expr()?;
+            let span = lhs.span.merge(rhs.span);
+            lhs = Expr::new(
+                ExprKind::Binary {
+                    op: BinaryOp::BitXor,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            );
+        }
+        Ok(lhs)
+    }
+
+    fn parse_generic_bitand_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_generic_shl_expr()?;
+        while self.eat(&TokenKind::Amp) {
+            let rhs = self.parse_generic_shl_expr()?;
+            let span = lhs.span.merge(rhs.span);
+            lhs = Expr::new(
+                ExprKind::Binary {
+                    op: BinaryOp::BitAnd,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            );
+        }
+        Ok(lhs)
+    }
+
+    fn parse_generic_shl_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut lhs = self.parse_additive_expr()?;
+        while self.eat(&TokenKind::Shl) {
+            let rhs = self.parse_additive_expr()?;
+            let span = lhs.span.merge(rhs.span);
+            lhs = Expr::new(
+                ExprKind::Binary {
+                    op: BinaryOp::Shl,
+                    lhs: Box::new(lhs),
+                    rhs: Box::new(rhs),
+                },
+                span,
+            );
+        }
+        Ok(lhs)
     }
 
     /// Best-effort read of a foreign type token sequence solely for formatting a 1-shot rewrite hint.
@@ -1141,7 +1576,13 @@ impl<'a> Parser<'a> {
                 .with_doc_topic("tasks")
                 .with_hint("remove `-> ...`; tasks communicate outputs via `watch<T>` or `inbox<T, N>` parameters"));
         }
-        let body = self.parse_block()?;
+        self.push_value_scope();
+        for p in &params {
+            self.record_local_value(&p.name.name);
+        }
+        let body_res = self.parse_block();
+        self.pop_value_scope();
+        let body = body_res?;
         let span = first_span.merge(body.span);
         Ok(TaskDecl {
             attrs,
@@ -1158,7 +1599,10 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::LParen) {
             self.expect(&TokenKind::RParen)?;
         }
-        let body = self.parse_block()?;
+        self.push_value_scope();
+        let body_res = self.parse_block();
+        self.pop_value_scope();
+        let body = body_res?;
         let span = first_span.merge(body.span);
         Ok(IsrDecl {
             attrs,
@@ -1265,8 +1709,7 @@ impl<'a> Parser<'a> {
                     let span = start.merge(elem.span);
                     TypeExpr::new(TypeKind::Slice(Box::new(elem)), span)
                 } else {
-                    let len = self.parse_usize_literal("array length")?;
-                    // Also trap Rust `[u8; 4]` if `;` appears inside `[...]`? Wait: `[4]u8` has Int first!
+                    let len = self.parse_array_len()?;
                     self.expect(&TokenKind::RBracket)?;
                     let elem = self.parse_type()?;
                     let span = start.merge(elem.span);
@@ -1382,17 +1825,41 @@ impl<'a> Parser<'a> {
                             let first_id = self.parse_ident()?;
                             // Trap `Reader<'a>` lifetime argument on user type
                             self.check_generic_lifetime_after_decl_name()?;
-                            if self.at(&TokenKind::Dot) || self.at(&TokenKind::ColonColon) {
-                                let mut segs = vec![first_id];
-                                while self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon)
-                                {
-                                    segs.push(self.parse_ident()?);
+
+                            let mut segs = vec![first_id];
+                            while self.at(&TokenKind::Dot)
+                                || (self.at(&TokenKind::ColonColon)
+                                    && self.peek_n_kind(1) != TokenKind::Lt)
+                            {
+                                self.bump();
+                                segs.push(self.parse_ident()?);
+                            }
+
+                            let has_generic_args = self.at(&TokenKind::Lt)
+                                || (self.at(&TokenKind::ColonColon)
+                                    && self.peek_n_kind(1) == TokenKind::Lt);
+                            if has_generic_args {
+                                let _ = self.eat(&TokenKind::ColonColon);
+                                let (args, gt_span) = self.parse_generic_args()?;
+                                if segs.len() == 1 {
+                                    let base = segs.pop().unwrap();
+                                    TypeExpr::new(
+                                        TypeKind::Generic { base, args },
+                                        start.merge(gt_span),
+                                    )
+                                } else {
+                                    TypeExpr::new(
+                                        TypeKind::GenericPath { path: segs, args },
+                                        start.merge(gt_span),
+                                    )
                                 }
+                            } else if segs.len() > 1 {
                                 let end = segs.last().unwrap().span;
                                 TypeExpr::new(TypeKind::Path(segs), start.merge(end))
                             } else {
-                                let span = first_id.span;
-                                TypeExpr::new(TypeKind::Named(first_id), span)
+                                let only = segs.pop().unwrap();
+                                let span = only.span;
+                                TypeExpr::new(TypeKind::Named(only), span)
                             }
                         }
                     }
@@ -1420,7 +1887,7 @@ impl<'a> Parser<'a> {
                     let span = ty.span.merge(self.prev_span());
                     ty = TypeExpr::new(TypeKind::Slice(Box::new(ty)), span);
                 } else {
-                    let len = self.parse_usize_literal("array length")?;
+                    let len = self.parse_array_len()?;
                     let rb = self.expect(&TokenKind::RBracket)?;
                     let span = ty.span.merge(rb.span);
                     ty = TypeExpr::new(
@@ -1517,7 +1984,7 @@ impl<'a> Parser<'a> {
                 let span = ty.span.merge(self.prev_span());
                 ty = TypeExpr::new(TypeKind::Slice(Box::new(ty)), span);
             } else {
-                let len = self.parse_usize_literal("array length")?;
+                let len = self.parse_array_len()?;
                 let rb = self.expect(&TokenKind::RBracket)?;
                 let span = ty.span.merge(rb.span);
                 ty = TypeExpr::new(
@@ -1583,6 +2050,22 @@ impl<'a> Parser<'a> {
         self.parse_typed_declarator(context)
     }
 
+    /// Parse a concrete `[16]` (`ArrayLen::Fixed(16)`) or symbolic/const `[N]` (`ArrayLen::Expr(...)`) array bound.
+    fn parse_array_len(&mut self) -> Result<ArrayLen, ParseError> {
+        if matches!(self.peek_kind(), TokenKind::Int(_))
+            && self.peek_n_kind(1) == TokenKind::RBracket
+        {
+            let n = self.parse_usize_literal("array length")?;
+            Ok(ArrayLen::Fixed(n))
+        } else {
+            let prev_allow = self.allow_struct_lit;
+            self.allow_struct_lit = true;
+            let expr = self.parse_expr();
+            self.allow_struct_lit = prev_allow;
+            Ok(ArrayLen::Expr(Box::new(expr?)))
+        }
+    }
+
     fn parse_usize_literal(&mut self, context: &str) -> Result<usize, ParseError> {
         let tok = self.peek_token();
         match tok.kind {
@@ -1620,12 +2103,21 @@ impl<'a> Parser<'a> {
         let lb = self.expect(&TokenKind::LBrace)?;
         let prev_allow = self.allow_struct_lit;
         self.allow_struct_lit = true;
+        self.push_value_scope();
 
         let mut stmts = Vec::new();
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
-            stmts.push(self.parse_stmt_in_block(allow_tail_expr)?);
+            match self.parse_stmt_in_block(allow_tail_expr) {
+                Ok(stmt) => stmts.push(stmt),
+                Err(e) => {
+                    self.pop_value_scope();
+                    self.allow_struct_lit = prev_allow;
+                    return Err(e);
+                }
+            }
         }
 
+        self.pop_value_scope();
         self.allow_struct_lit = prev_allow;
         let rb = self.expect(&TokenKind::RBrace)?;
         Ok(Block::new(stmts, lb.span.merge(rb.span)))
@@ -1648,6 +2140,17 @@ impl<'a> Parser<'a> {
             TokenKind::KwTry => return Err(self.trap_p0007("`try`", cur_span)),
             TokenKind::KwStatic => return Err(self.trap_p0010("static", cur_span)),
             TokenKind::KwPub => return Err(self.trap_p0010("pub", cur_span)),
+            TokenKind::KwConst => {
+                return Err(self
+                    .err_at(
+                        "block-local `const` declarations are not supported; declare `const` items at module top level",
+                        cur_span,
+                    )
+                    .with_doc_topic("syntax")
+                    .with_hint(
+                        "move `const Type NAME = ...;` to module top level, or omit `const` for a local variable (`Type name = ...;`)",
+                    ));
+            }
             TokenKind::Lifetime(ref lt) => return Err(self.trap_p0009_lifetime(lt, cur_span)),
 
             // ── Standard Zev statements ──
@@ -1823,6 +2326,7 @@ impl<'a> Parser<'a> {
                         None
                     };
                     let semi = self.expect(&TokenKind::Semi)?;
+                    self.record_local_value(&name.name);
                     return Ok(Stmt::with_attrs(
                         attrs,
                         StmtKind::VarDecl { ty, name, init },
@@ -2140,7 +2644,11 @@ impl<'a> Parser<'a> {
             };
             self.allow_struct_lit = prev_allow;
             self.expect(&TokenKind::RParen)?;
-            let body = self.parse_block()?;
+            self.push_value_scope();
+            self.record_local_value(&var_name.name);
+            let body_res = self.parse_block();
+            self.pop_value_scope();
+            let body = body_res?;
             let span = start.merge(body.span);
             Ok(Stmt::with_attrs(
                 attrs,
@@ -2157,7 +2665,11 @@ impl<'a> Parser<'a> {
         } else {
             self.allow_struct_lit = prev_allow;
             self.expect(&TokenKind::RParen)?;
-            let body = self.parse_block()?;
+            self.push_value_scope();
+            self.record_local_value(&var_name.name);
+            let body_res = self.parse_block();
+            self.pop_value_scope();
+            let body = body_res?;
             let span = start.merge(body.span);
             Ok(Stmt::with_attrs(
                 attrs,
@@ -2816,8 +3328,10 @@ impl<'a> Parser<'a> {
             self.peek_kind(),
             TokenKind::Ident(_)
                 | TokenKind::Int(_)
+                | TokenKind::FloatLit { .. }
                 | TokenKind::Duration(_, _)
                 | TokenKind::String(_)
+                | TokenKind::FormatString(_)
                 | TokenKind::KwTrue
                 | TokenKind::KwFalse
                 | TokenKind::LParen
@@ -2834,7 +3348,12 @@ impl<'a> Parser<'a> {
 
         loop {
             match self.peek_kind() {
-                TokenKind::Dot | TokenKind::Arrow => {
+                TokenKind::Dot
+                | TokenKind::Arrow
+                | TokenKind::ColonColon
+                    if !(self.at(&TokenKind::ColonColon)
+                        && self.peek_n_kind(1) == TokenKind::Lt) =>
+                {
                     let dot_tok = self.bump();
                     let field = self.parse_word_ident("field or method name")?;
                     // Trap `.await` (`P0003`) and `.match` (`P0005`)
@@ -2845,7 +3364,43 @@ impl<'a> Parser<'a> {
                         return Err(self.trap_p0005(dot_tok.span.merge(field.span)));
                     }
 
-                    if self.at(&TokenKind::LParen) {
+                    // Support module-qualified generic function calls (`mod.clamp<f32>(...)` ONLY when `mod`
+                    // is an `import` alias so struct field comparisons `s.a < b, c > (d + 1)` never speculate;
+                    // `::` turbofish works unconditionally).
+                    let allow_bare_lt = match dot_tok.kind {
+                        TokenKind::Dot => matches!(
+                            &expr.kind,
+                            ExprKind::Ident(id)
+                                if !self.is_value_name(&id.name)
+                                    && self.import_aliases.contains(&id.name)
+                        ),
+                        TokenKind::ColonColon => self
+                            .known_generics
+                            .map_or(true, |set| set.contains(&field.name)),
+                        _ => false,
+                    };
+                    if let Some(generic_args) =
+                        self.try_parse_call_only_generic_args(allow_bare_lt)?
+                    {
+                        let args = self.parse_call_args()?;
+                        let callee_span = expr.span.merge(field.span);
+                        let callee = Expr::new(
+                            ExprKind::Field {
+                                target: Box::new(expr),
+                                field,
+                            },
+                            callee_span,
+                        );
+                        let span = callee_span.merge(self.prev_span());
+                        expr = Expr::new(
+                            ExprKind::Call {
+                                callee: Box::new(callee),
+                                generic_args,
+                                args,
+                            },
+                            span,
+                        );
+                    } else if self.at(&TokenKind::LParen) {
                         let args = self.parse_call_args()?;
                         let span = expr.span.merge(self.prev_span());
                         expr = Expr::new(
@@ -2873,6 +3428,7 @@ impl<'a> Parser<'a> {
                     expr = Expr::new(
                         ExprKind::Call {
                             callee: Box::new(expr),
+                            generic_args: Vec::new(),
                             args,
                         },
                         span,
@@ -2901,6 +3457,39 @@ impl<'a> Parser<'a> {
         }
 
         Ok(expr)
+    }
+
+    /// Parse turbofish `::<Args>` unconditionally, or speculatively parse `<Args>` ONLY when
+    /// `allow_bare_lt` holds and `<Args>` is immediately followed by `(`.
+    fn try_parse_call_only_generic_args(
+        &mut self,
+        allow_bare_lt: bool,
+    ) -> Result<Option<Vec<GenericArg>>, ParseError> {
+        if self.at(&TokenKind::ColonColon) && self.peek_n_kind(1) == TokenKind::Lt {
+            self.bump(); // `::`
+            let (args, _) = self.parse_generic_args()?;
+            if !self.at(&TokenKind::LParen) {
+                return Err(self
+                    .err_at(
+                        format!("expected `(` after `::<...>` generic arguments, found {}", self.peek_kind()),
+                        self.peek_span(),
+                    )
+                    .with_doc_topic("syntax"));
+            }
+            return Ok(Some(args));
+        }
+
+        if allow_bare_lt && self.at(&TokenKind::Lt) {
+            let cp = self.save();
+            if let Ok((args, _)) = self.parse_generic_args() {
+                if self.pending_gt.is_none() && self.at(&TokenKind::LParen) {
+                    return Ok(Some(args));
+                }
+            }
+            self.restore(cp);
+        }
+
+        Ok(None)
     }
 
     fn parse_call_args(&mut self) -> Result<Vec<CallArg>, ParseError> {
@@ -3028,7 +3617,16 @@ impl<'a> Parser<'a> {
             self.expect(&TokenKind::RParen)?;
         }
 
-        let body = self.parse_catch_block()?;
+        self.push_value_scope();
+        if let Some(ref ep) = err_param {
+            self.record_local_value(&ep.name.name);
+        }
+        if let Some(ref pp) = partial_param {
+            self.record_local_value(&pp.name.name);
+        }
+        let body_res = self.parse_catch_block();
+        self.pop_value_scope();
+        let body = body_res?;
         let span = catch_tok.span.merge(body.span);
         Ok(CatchClause {
             err_param,
@@ -3044,6 +3642,13 @@ impl<'a> Parser<'a> {
             TokenKind::Int(n) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Literal(Literal::Int(n)), tok.span))
+            }
+            TokenKind::FloatLit { bits, suffix } => {
+                self.bump();
+                Ok(Expr::new(
+                    ExprKind::Literal(Literal::Float { bits, suffix }),
+                    tok.span,
+                ))
             }
             TokenKind::Duration(value, unit) => {
                 self.bump();
@@ -3067,6 +3672,10 @@ impl<'a> Parser<'a> {
             TokenKind::String(s) => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Literal(Literal::String(s)), tok.span))
+            }
+            TokenKind::FormatString(parts) => {
+                self.bump();
+                self.parse_format_string_expr(parts, tok.span)
             }
             TokenKind::At => {
                 let attr = self.parse_attr()?;
@@ -3109,12 +3718,86 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(_) => {
                 let ident = self.parse_ident()?;
-                if self.allow_struct_lit && self.looks_like_struct_lit_body() {
-                    self.parse_struct_lit(ident)
-                } else {
-                    let span = ident.span;
-                    Ok(Expr::new(ExprKind::Ident(ident), span))
+                let start = ident.span;
+
+                // 1. Explicit turbofish `clamp::<f32>(...)` or `FixedVec::<u32, 4> { ... }`
+                if self.at(&TokenKind::ColonColon) && self.peek_n_kind(1) == TokenKind::Lt {
+                    self.bump(); // `::`
+                    let (generic_args, _) = self.parse_generic_args()?;
+                    if self.at(&TokenKind::LParen) {
+                        let args = self.parse_call_args()?;
+                        let span = start.merge(self.prev_span());
+                        return Ok(Expr::new(
+                            ExprKind::Call {
+                                callee: Box::new(Expr::new(ExprKind::Ident(ident), start)),
+                                generic_args,
+                                args,
+                            },
+                            span,
+                        ));
+                    } else if self.allow_struct_lit && self.looks_like_struct_lit_body() {
+                        return self.parse_struct_lit(ident, generic_args);
+                    } else {
+                        return Err(self
+                            .err_at(
+                                format!(
+                                    "expected `(` or `{{ ... }}` after `::<...>` generic arguments, found {}",
+                                    self.peek_kind()
+                                ),
+                                self.peek_span(),
+                            )
+                            .with_doc_topic("syntax"));
+                    }
                 }
+
+                // 2. Speculative `clamp<f32>(...)` or `FixedVec<u32, 4> { ... }`
+                //    Skipped immediately for value bindings (`value_scopes` / `top_level_values`) and,
+                //    for bare `<...>(...)` calls, when `known_generics` is provided and excludes `ident`.
+                if self.at(&TokenKind::Lt) && !self.is_value_name(&ident.name) {
+                    let cp = self.save();
+                    if let Ok((generic_args, _)) = self.parse_generic_args() {
+                        if self.pending_gt.is_none() {
+                            if self.at(&TokenKind::LParen)
+                                && self.can_speculate_bare_generic_call(&ident.name)
+                            {
+                                let args = self.parse_call_args()?;
+                                let span = start.merge(self.prev_span());
+                                return Ok(Expr::new(
+                                    ExprKind::Call {
+                                        callee: Box::new(Expr::new(ExprKind::Ident(ident), start)),
+                                        generic_args,
+                                        args,
+                                    },
+                                    span,
+                                ));
+                            } else if self.allow_struct_lit && self.looks_like_struct_lit_body() {
+                                return self.parse_struct_lit(ident, generic_args);
+                            }
+                        }
+                    }
+                    self.restore(cp);
+                }
+
+                if self.allow_struct_lit && self.looks_like_struct_lit_body() {
+                    self.parse_struct_lit(ident, Vec::new())
+                } else {
+                    Ok(Expr::new(ExprKind::Ident(ident), start))
+                }
+            }
+            TokenKind::Dot
+                if matches!(
+                    self.peek_n_kind(1),
+                    TokenKind::Int(_) | TokenKind::FloatLit { .. }
+                ) =>
+            {
+                let dot_tok = self.bump();
+                let num_tok = self.bump();
+                Err(self
+                    .err_at(
+                        "malformed float literal: leading digit is required before decimal point (e.g. `0.5`)",
+                        dot_tok.span.merge(num_tok.span),
+                    )
+                    .with_doc_topic("syntax"))
             }
             TokenKind::KwError if self.peek_n_kind(1) == TokenKind::Dot => {
                 // Zig `error.Variant` used in an expression (`P0007`)
@@ -3133,6 +3816,47 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn parse_format_string_expr(
+        &mut self,
+        lexed_parts: Vec<LexedFormatPart>,
+        span: Span,
+    ) -> Result<Expr, ParseError> {
+        let mut parts = Vec::with_capacity(lexed_parts.len());
+        for lp in lexed_parts {
+            match lp {
+                LexedFormatPart::Literal(s) => {
+                    parts.push(FormatPart::Literal(s));
+                }
+                LexedFormatPart::Hole {
+                    tokens,
+                    spec,
+                    span: hole_span,
+                } => {
+                    let mut sub_parser = self.new_hole_subparser(tokens);
+                    let expr = sub_parser.parse_expr()?;
+                    if !sub_parser.at(&TokenKind::Eof) {
+                        let extra = sub_parser.peek_token();
+                        return Err(self
+                            .err_at(
+                                format!(
+                                    "unexpected {} inside format string hole",
+                                    extra.kind
+                                ),
+                                extra.span,
+                            )
+                            .with_doc_topic("syntax"));
+                    }
+                    parts.push(FormatPart::Hole {
+                        expr: Box::new(expr),
+                        spec,
+                        span: hole_span,
+                    });
+                }
+            }
+        }
+        Ok(Expr::new(ExprKind::FormatString(parts), span))
+    }
+
     fn looks_like_struct_lit_body(&self) -> bool {
         if !self.at(&TokenKind::LBrace) {
             return false;
@@ -3148,7 +3872,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_struct_lit(&mut self, name: Ident) -> Result<Expr, ParseError> {
+    fn parse_struct_lit(
+        &mut self,
+        name: Ident,
+        generic_args: Vec<GenericArg>,
+    ) -> Result<Expr, ParseError> {
         let start = name.span;
         self.expect(&TokenKind::LBrace)?;
         let prev_allow = self.allow_struct_lit;
@@ -3181,7 +3909,11 @@ impl<'a> Parser<'a> {
         self.allow_struct_lit = prev_allow;
         let rb = self.expect(&TokenKind::RBrace)?;
         Ok(Expr::new(
-            ExprKind::StructLit { name, fields },
+            ExprKind::StructLit {
+                name,
+                generic_args,
+                fields,
+            },
             start.merge(rb.span),
         ))
     }

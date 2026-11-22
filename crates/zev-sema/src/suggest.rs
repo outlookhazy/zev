@@ -87,6 +87,8 @@ pub fn suggest_foreign_type_name(name: &str) -> Option<&'static str> {
         "int64_t" | "llong" => Some("i64"),
         "size_t" | "uintptr_t" => Some("usize"),
         "ssize_t" | "ptrdiff_t" | "intptr_t" => Some("isize"),
+        "float" | "float32" => Some("f32"),
+        "double" | "float64" => Some("f64"),
         "boolean" | "Bool" | "_Bool" => Some("bool"),
         "String" | "string" | "str" => Some("[]u8"),
         "u16_be" | "be16" => Some("u16be"),

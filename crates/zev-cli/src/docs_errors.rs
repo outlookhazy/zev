@@ -1,4 +1,4 @@
-//! Complete structured error explainers (`P0001`..`P0012` and `E0001`..`E0027`) for `zevc doc`.
+//! Complete structured error explainers (`P0001`..`P0012` and `E0001`..`E0029`) for `zevc doc`.
 
 pub struct ErrorDoc {
     pub code: &'static str,
@@ -1105,6 +1105,86 @@ fn start_bus(watch<u32> *out, u32 step) {
 fn main() {
     start_bus(&bus1_ticks, 1);
     start_bus(&bus2_ticks, 2);
+}",
+    },
+    ErrorDoc {
+        code: "E0028",
+        summary: "Static worst-case `fmt_buf(dst, f\"...\")` output exceeds known fixed `[N]u8` buffer capacity",
+        topic: "runtime",
+        why: "When `dst` in `fmt_buf(dst, f\"...\")` has a statically known byte capacity (`[N]u8`, `*[N]u8`, `dst[..]`, or constant `dst[a..b]`) and every `{...}` hole has a bounded maximum width (e.g. `u32` decimal `10 B`, `i32` `11 B`, `f32` `:.2` `14 B`, `enum` max variant length), `zevc` proves worst-case buffer fit at compile time (`worst <= cap` needs no `or`/`catch`!). Either size `dst` to fit the worst-case bound, or pass a runtime-sized `[]u8` slice and handle `FmtErr::Truncated` with `catch (FmtErr err, []u8 clamped)`.",
+        bad_zev: "\
+fn main() {
+    u8 dst[8];
+    u32 rpm = 1800;
+    []u8 line = fmt_buf(dst, f\"rpm={rpm}\");
+    if (line.len > 0) {
+        return;
+    }
+}",
+        good_zev: "\
+fn write_tagged([]u8 dyn_tag) {
+    // 1. Statically proven fit (\"rpm=\" 4 B + u32 max 10 B = 14 B <= 16 B): zero `catch` needed!
+    u8 line_buf[16];
+    u32 rpm = 1800;
+    []u8 ok_line = fmt_buf(line_buf, f\"rpm={rpm}\");
+
+    // 2. Runtime `[]u8` slice hole: recovers partial clamped slice on `FmtErr::Truncated`!
+    u8 tag_buf[12];
+    []u8 tagged = fmt_buf(tag_buf, f\"tag={dyn_tag}\") catch (FmtErr err, []u8 clamped) {
+        clamped
+    };
+    if (ok_line.len + tagged.len > 0) {
+        return;
+    }
+}
+
+fn main() {
+    u8 raw[4] = [65, 66, 67, 68];
+    write_tagged(raw[0..4]);
+}",
+    },
+    ErrorDoc {
+        code: "E0029",
+        summary: "Invalid generic instantiation (arity/kind mismatch, non-const `usize` bound, uninferable type, or cycle)",
+        topic: "syntax",
+        why: "Zev monomorphizes `<T>` and `<T, usize N>` `struct`s and `fn`s before MIR lowering (reporting concrete Flash instantiations in `zevc ram` and `zevc check --json`) without C++ overloading or vtables. Every instantiation must match declared type vs `usize` const parameter kinds/arity, supply compile-time constant `usize` bounds (integer literals or `const` items, never runtime locals), have inferable or explicit type arguments, and stay non-recursive.",
+        bad_zev: "\
+struct FixedVec<T, usize N> {
+    [N]T data;
+    usize len;
+}
+
+fn main() {
+    usize runtime_cap = 8;
+    FixedVec<u16, runtime_cap> bad_vec;
+}",
+        good_zev: "\
+const usize RING_CAP = 4;
+
+struct FixedVec<T, usize N> {
+    [N]T data;
+    usize len;
+}
+
+T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
+
+fn main() {
+    FixedVec<u16, RING_CAP> samples = FixedVec<u16, RING_CAP> {
+        data: [100, 200, 300, 400],
+        len: 4
+    };
+    f32 duty = clamp<f32>(1.25f32, 0.0f32, 1.0f32);
+    if (samples.len == 4 && duty <= 1.0f32) {
+        return;
+    }
 }",
     },
 ];

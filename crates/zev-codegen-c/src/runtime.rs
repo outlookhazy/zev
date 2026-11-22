@@ -129,6 +129,345 @@ static SYN_UNUSED inline syn_slice_u8 syn_subslice_u8(syn_slice_u8 s, size_t sta
     return out;
 }}
 
+/* ── Freestanding IEEE-754 Float Helpers & Zero-Heap Stream/Buf Formatters ── */
+
+static SYN_UNUSED inline double syn_bits_to_f64(uint64_t u) {{
+    double d;
+    memcpy(&d, &u, sizeof(d));
+    return d;
+}}
+static SYN_UNUSED inline uint64_t syn_f64_to_bits(double d) {{
+    uint64_t u;
+    memcpy(&u, &d, sizeof(u));
+    return u;
+}}
+static SYN_UNUSED inline bool syn_isnan_f64(double d) {{
+    return (syn_f64_to_bits(d) & 0x7FFFFFFFFFFFFFFFULL) > 0x7FF0000000000000ULL;
+}}
+static SYN_UNUSED inline bool syn_isinf_f64(double d) {{
+    return (syn_f64_to_bits(d) & 0x7FFFFFFFFFFFFFFFULL) == 0x7FF0000000000000ULL;
+}}
+static SYN_UNUSED inline double syn_fmod_f64(double x, double y) {{
+    uint64_t ux = syn_f64_to_bits(x);
+    uint64_t uy = syn_f64_to_bits(y);
+    uint64_t sx = ux & 0x8000000000000000ULL;
+    uint64_t ax = ux & 0x7FFFFFFFFFFFFFFFULL;
+    uint64_t ay = uy & 0x7FFFFFFFFFFFFFFFULL;
+    if (ay == 0ULL || ax >= 0x7FF0000000000000ULL || ay > 0x7FF0000000000000ULL) {{
+        return syn_bits_to_f64(0x7FF8000000000000ULL);
+    }}
+    if (ax < ay) {{ return x; }}
+    if (ax == ay) {{ return syn_bits_to_f64(sx); }}
+    int32_t ex = (int32_t)(ax >> 52);
+    int32_t ey = (int32_t)(ay >> 52);
+    uint64_t mx = ax & 0x000FFFFFFFFFFFFFULL;
+    uint64_t my = ay & 0x000FFFFFFFFFFFFFULL;
+    if (ex == 0) {{
+        ex = 1;
+        while ((mx & (1ULL << 52)) == 0ULL) {{ mx <<= 1; ex--; }}
+    }} else {{
+        mx |= (1ULL << 52);
+    }}
+    if (ey == 0) {{
+        ey = 1;
+        while ((my & (1ULL << 52)) == 0ULL) {{ my <<= 1; ey--; }}
+    }} else {{
+        my |= (1ULL << 52);
+    }}
+    while (ex > ey) {{
+        if (mx >= my) {{ mx -= my; }}
+        mx <<= 1;
+        ex--;
+    }}
+    if (mx >= my) {{ mx -= my; }}
+    if (mx == 0ULL) {{ return syn_bits_to_f64(sx); }}
+    while ((mx & (1ULL << 52)) == 0ULL) {{
+        mx <<= 1;
+        ex--;
+    }}
+    if (ex > 0) {{
+        mx &= 0x000FFFFFFFFFFFFFULL;
+        return syn_bits_to_f64(sx | ((uint64_t)ex << 52) | mx);
+    }}
+    int32_t shift = 1 - ex;
+    if (shift >= 64) {{ return syn_bits_to_f64(sx); }}
+    mx >>= (uint32_t)shift;
+    return syn_bits_to_f64(sx | mx);
+}}
+static SYN_UNUSED inline float syn_fmod_f32(float x, float y) {{
+    return (float)syn_fmod_f64((double)x, (double)y);
+}}
+
+static SYN_UNUSED inline bool syn_f64_is_nan(double x) {{
+    return (syn_f64_to_bits(x) & 0x7FFFFFFFFFFFFFFFULL) > 0x7FF0000000000000ULL;
+}}
+
+static SYN_UNUSED inline double syn_fdiv_f64(double x, double y) {{
+    uint64_t by = syn_f64_to_bits(y);
+    if ((by & 0x7FFFFFFFFFFFFFFFULL) == 0ULL) {{
+        uint64_t bx = syn_f64_to_bits(x);
+        uint64_t ax = bx & 0x7FFFFFFFFFFFFFFFULL;
+        if (ax == 0ULL || ax > 0x7FF0000000000000ULL) {{
+            return syn_bits_to_f64(0x7FF8000000000000ULL);
+        }}
+        return syn_bits_to_f64(((bx ^ by) & 0x8000000000000000ULL) | 0x7FF0000000000000ULL);
+    }}
+    return x / y;
+}}
+static SYN_UNUSED inline float syn_fdiv_f32(float x, float y) {{
+    return (float)syn_fdiv_f64((double)x, (double)y);
+}}
+
+static SYN_UNUSED inline uint64_t syn_f64_to_u64_sat(double x) {{
+    if (syn_f64_is_nan(x) || x <= 0.0) {{ return 0ULL; }}
+    if (x >= 0x1.0p+64) {{ return UINT64_MAX; }}
+    return (uint64_t)x;
+}}
+static SYN_UNUSED inline int64_t syn_f64_to_i64_sat(double x) {{
+    if (syn_f64_is_nan(x)) {{ return 0LL; }}
+    if (x <= -0x1.0p+63) {{ return INT64_MIN; }}
+    if (x >= 0x1.0p+63) {{ return INT64_MAX; }}
+    return (int64_t)x;
+}}
+static SYN_UNUSED inline uint32_t syn_f64_to_u32_sat(double x) {{
+    if (syn_f64_is_nan(x) || x <= 0.0) {{ return 0U; }}
+    if (x >= 4294967295.0) {{ return UINT32_MAX; }}
+    return (uint32_t)x;
+}}
+static SYN_UNUSED inline int32_t syn_f64_to_i32_sat(double x) {{
+    if (syn_f64_is_nan(x)) {{ return 0; }}
+    if (x <= -2147483648.0) {{ return INT32_MIN; }}
+    if (x >= 2147483647.0) {{ return INT32_MAX; }}
+    return (int32_t)x;
+}}
+static SYN_UNUSED inline uint16_t syn_f64_to_u16_sat(double x) {{
+    if (syn_f64_is_nan(x) || x <= 0.0) {{ return 0U; }}
+    if (x >= 65535.0) {{ return UINT16_MAX; }}
+    return (uint16_t)x;
+}}
+static SYN_UNUSED inline int16_t syn_f64_to_i16_sat(double x) {{
+    if (syn_f64_is_nan(x)) {{ return 0; }}
+    if (x <= -32768.0) {{ return INT16_MIN; }}
+    if (x >= 32767.0) {{ return INT16_MAX; }}
+    return (int16_t)x;
+}}
+static SYN_UNUSED inline uint8_t syn_f64_to_u8_sat(double x) {{
+    if (syn_f64_is_nan(x) || x <= 0.0) {{ return 0U; }}
+    if (x >= 255.0) {{ return UINT8_MAX; }}
+    return (uint8_t)x;
+}}
+static SYN_UNUSED inline int8_t syn_f64_to_i8_sat(double x) {{
+    if (syn_f64_is_nan(x)) {{ return 0; }}
+    if (x <= -128.0) {{ return INT8_MIN; }}
+    if (x >= 127.0) {{ return INT8_MAX; }}
+    return (int8_t)x;
+}}
+static SYN_UNUSED inline size_t syn_f64_to_usize_sat(double x) {{
+#if SIZE_MAX > 0xFFFFFFFFULL
+    return (size_t)syn_f64_to_u64_sat(x);
+#else
+    return (size_t)syn_f64_to_u32_sat(x);
+#endif
+}}
+static SYN_UNUSED inline ptrdiff_t syn_f64_to_isize_sat(double x) {{
+#if PTRDIFF_MAX > 0x7FFFFFFFLL
+    return (ptrdiff_t)syn_f64_to_i64_sat(x);
+#else
+    return (ptrdiff_t)syn_f64_to_i32_sat(x);
+#endif
+}}
+
+typedef struct {{
+    uint8_t *dst;
+    size_t cap;
+    size_t pos;
+    bool truncated;
+    bool is_buf;
+}} syn_fmt_sink_t;
+
+static SYN_UNUSED inline void syn_fmt_write(syn_fmt_sink_t *s, const void *data, size_t len) {{
+    if (len == 0U) {{ return; }}
+    if (s->is_buf) {{
+        size_t avail = (s->dst != NULL && s->pos < s->cap) ? (s->cap - s->pos) : 0U;
+        size_t n = (len <= avail) ? len : avail;
+        if (n > 0U && data != NULL) {{
+            memmove(s->dst + s->pos, data, n);
+            s->pos += n;
+        }}
+        if (n < len) {{
+            s->truncated = true;
+        }}
+    }} else {{
+#if !defined(SYN_FREESTANDING)
+        if (data != NULL) {{
+            (void)fwrite(data, 1U, len, stdout);
+        }}
+#else
+        (void)data;
+#endif
+    }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_putc(syn_fmt_sink_t *s, char ch) {{
+    syn_fmt_write(s, &ch, 1U);
+}}
+
+static SYN_UNUSED inline void syn_fmt_cstr(syn_fmt_sink_t *s, const char *cstr) {{
+    if (cstr == NULL) {{ return; }}
+    size_t n = 0U;
+    while (cstr[n] != '\0') {{ n++; }}
+    syn_fmt_write(s, cstr, n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_bytes(syn_fmt_sink_t *s, syn_slice_u8 sl) {{
+    if (sl.ptr != NULL && sl.len > 0U) {{
+        syn_fmt_write(s, sl.ptr, sl.len);
+    }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_bool(syn_fmt_sink_t *s, bool v) {{
+    if (v) {{ syn_fmt_write(s, "true", 4U); }}
+    else   {{ syn_fmt_write(s, "false", 5U); }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_dec_pad(syn_fmt_sink_t *s, uint64_t v, uint8_t min_width) {{
+    char tmp[20];
+    size_t n = 0U;
+    do {{
+        tmp[19U - n] = (char)('0' + (v % 10ULL));
+        v /= 10ULL;
+        n++;
+    }} while (v > 0ULL && n < 20U);
+    size_t target_w = (min_width > 20U) ? 20U : (size_t)min_width;
+    while (n < target_w) {{
+        tmp[19U - n] = '0';
+        n++;
+    }}
+    syn_fmt_write(s, &tmp[20U - n], n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_dec(syn_fmt_sink_t *s, uint64_t v) {{
+    syn_fmt_u64_dec_pad(s, v, 1U);
+}}
+
+static SYN_UNUSED inline void syn_fmt_i64_dec(syn_fmt_sink_t *s, int64_t v) {{
+    if (v < 0) {{
+        syn_fmt_putc(s, '-');
+        uint64_t mag = (uint64_t)(0ULL - (uint64_t)v);
+        syn_fmt_u64_dec(s, mag);
+    }} else {{
+        syn_fmt_u64_dec(s, (uint64_t)v);
+    }}
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_hex(syn_fmt_sink_t *s, uint64_t v, bool upper, uint8_t pad_width) {{
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    char tmp[64];
+    size_t n = 0U;
+    do {{
+        tmp[63U - n] = digits[(size_t)(v & 0xFULL)];
+        v >>= 4;
+        n++;
+    }} while (v > 0ULL && n < 64U);
+    size_t target_w = (pad_width > 64U) ? 64U : (size_t)pad_width;
+    while (n < target_w) {{
+        tmp[63U - n] = '0';
+        n++;
+    }}
+    syn_fmt_write(s, &tmp[64U - n], n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_u64_bin(syn_fmt_sink_t *s, uint64_t v, uint8_t pad_width) {{
+    char tmp[64];
+    size_t n = 0U;
+    do {{
+        tmp[63U - n] = (char)('0' + (v & 1ULL));
+        v >>= 1;
+        n++;
+    }} while (v > 0ULL && n < 64U);
+    size_t target_w = (pad_width > 64U) ? 64U : (size_t)pad_width;
+    while (n < target_w) {{
+        tmp[63U - n] = '0';
+        n++;
+    }}
+    syn_fmt_write(s, &tmp[64U - n], n);
+}}
+
+static SYN_UNUSED inline void syn_fmt_float_fixed(syn_fmt_sink_t *s, double val, uint8_t prec) {{
+    static const uint64_t pow10_tbl[10] = {{
+        1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL,
+        100000ULL, 1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL
+    }};
+    uint64_t bits = syn_f64_to_bits(val);
+    uint64_t abs_bits = bits & 0x7FFFFFFFFFFFFFFFULL;
+    bool neg_bit = (bits >> 63) != 0ULL;
+    if (abs_bits > 0x7FF0000000000000ULL) {{
+        syn_fmt_write(s, "nan", 3U);
+        return;
+    }}
+    if (abs_bits == 0x7FF0000000000000ULL) {{
+        if (neg_bit) {{ syn_fmt_write(s, "-inf", 4U); }}
+        else         {{ syn_fmt_write(s, "inf", 3U); }}
+        return;
+    }}
+    /* Arduino overflow threshold: fabs(val) > 4294967040.0 (0x41EFFFFFE0000000) */
+    if (abs_bits > 0x41EFFFFFE0000000ULL) {{
+        if (neg_bit) {{ syn_fmt_write(s, "-ovf", 4U); }}
+        else         {{ syn_fmt_write(s, "ovf", 3U); }}
+        return;
+    }}
+    uint8_t p = (prec > 9U) ? 9U : prec;
+    uint64_t scale = pow10_tbl[p];
+    uint64_t int_part = 0ULL;
+    uint64_t frac_part = 0ULL;
+    if (abs_bits != 0ULL) {{
+        uint32_t exp = (uint32_t)(abs_bits >> 52);
+        uint64_t frac = abs_bits & 0x000FFFFFFFFFFFFFULL;
+        uint64_t sig53 = (exp == 0U) ? frac : (frac | (1ULL << 52));
+        uint32_t eff_exp = (exp == 0U) ? 1U : exp;
+        /* For abs_val <= 4294967040.0, eff_exp <= 1054, so rsh = 1075 - eff_exp >= 21 */
+        uint32_t rsh = 1075U - eff_exp;
+        if (rsh < 85U) {{
+            uint64_t a_lo = sig53 & 0xFFFFFFFFULL;
+            uint64_t a_hi = sig53 >> 32;
+            uint64_t m0 = a_lo * scale;
+            uint64_t m1 = a_hi * scale + (m0 >> 32);
+            uint64_t p_lo = (m0 & 0xFFFFFFFFULL) | (m1 << 32);
+            uint64_t p_hi = m1 >> 32;
+
+            uint32_t hm1 = rsh - 1U;
+            uint64_t r_lo = p_lo;
+            uint64_t r_hi = p_hi;
+            if (hm1 < 64U) {{
+                uint64_t h_lo = 1ULL << hm1;
+                r_lo = p_lo + h_lo;
+                if (r_lo < p_lo) {{ r_hi += 1ULL; }}
+            }} else {{
+                r_hi += 1ULL << (hm1 - 64U);
+            }}
+
+            uint64_t tot64 = 0ULL;
+            if (rsh < 64U) {{
+                tot64 = (r_lo >> rsh) | (r_hi << (64U - rsh));
+            }} else if (rsh == 64U) {{
+                tot64 = r_hi;
+            }} else {{
+                tot64 = r_hi >> (rsh - 64U);
+            }}
+            int_part = tot64 / scale;
+            frac_part = tot64 % scale;
+        }}
+    }}
+    if (neg_bit && (int_part != 0ULL || frac_part != 0ULL)) {{
+        syn_fmt_putc(s, '-');
+    }}
+    syn_fmt_u64_dec(s, int_part);
+    if (p > 0U) {{
+        syn_fmt_putc(s, '.');
+        syn_fmt_u64_dec_pad(s, frac_part, p);
+    }}
+}}
+
 /* ── Critical Section, Clock, & Low-Power Sleep Coordinator ─────────────── */
 
 typedef enum {{

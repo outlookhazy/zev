@@ -1,5 +1,5 @@
 use std::fmt;
-use zev_ast::{DurationUnit, Span};
+use zev_ast::{DurationUnit, FormatSpec, PrimType, Span};
 
 /// A lexical token paired with its [`Span`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -14,14 +14,32 @@ impl Token {
     }
 }
 
+/// Pre-tokenized segment of a zero-heap `f"..."` format string literal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LexedFormatPart {
+    /// Static unescaped string chunk (`{{` -> `{`, `}}` -> `}`).
+    Literal(String),
+    /// `{expr[:spec]}` interpolation hole with exact file-relative expression tokens.
+    Hole {
+        tokens: Vec<Token>,
+        spec: FormatSpec,
+        span: Span,
+    },
+}
+
 /// Lexical token kinds for `.zev`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     // ── Identifiers & Literals ──
     Ident(String),
     Int(u64),
+    FloatLit {
+        bits: u64,
+        suffix: Option<PrimType>,
+    },
     Duration(u64, DurationUnit),
     String(String),
+    FormatString(Vec<LexedFormatPart>),
     /// Foreign Rust-style lifetime token `'a` / `'static` (trapped as `P0009`).
     Lifetime(String),
 
@@ -234,8 +252,16 @@ impl fmt::Display for TokenKind {
         match self {
             Self::Ident(s) => write!(f, "identifier `{s}`"),
             Self::Int(n) => write!(f, "integer `{n}`"),
+            Self::FloatLit { bits, suffix } => {
+                let val = f64::from_bits(*bits);
+                match suffix {
+                    Some(s) => write!(f, "float `{val}{}`", s.as_str()),
+                    None => write!(f, "float `{val}`"),
+                }
+            }
             Self::Duration(n, u) => write!(f, "duration `{n}{}`", u.as_str()),
             Self::String(s) => write!(f, "string literal {s:?}"),
+            Self::FormatString(_) => f.write_str("format string `f\"...\"`"),
             Self::Lifetime(lt) => write!(f, "lifetime `'{lt}`"),
             Self::LParen => f.write_str("`(`"),
             Self::RParen => f.write_str("`)`"),

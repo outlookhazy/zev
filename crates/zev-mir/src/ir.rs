@@ -60,6 +60,8 @@ pub enum MirType {
     I64,
     Usize,
     Isize,
+    F32,
+    F64,
     Str,
     /// Wire-endian integer field/value (`u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le`).
     EndianInt {
@@ -124,6 +126,28 @@ impl MirType {
         )
     }
 
+    pub fn is_float(&self) -> bool {
+        matches!(self.host_value_type(), MirType::F32 | MirType::F64)
+    }
+
+    pub fn is_numeric(&self) -> bool {
+        matches!(
+            self.host_value_type(),
+            MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64
+                | MirType::Usize
+                | MirType::I8
+                | MirType::I16
+                | MirType::I32
+                | MirType::I64
+                | MirType::Isize
+                | MirType::F32
+                | MirType::F64
+        )
+    }
+
     /// Short canonical identifier used for mangling helper types (`syn_slice_u8`, `syn_watch_u16`).
     pub fn mangle_name(&self) -> String {
         match self {
@@ -139,6 +163,8 @@ impl MirType {
             MirType::I64 => "i64".to_string(),
             MirType::Usize => "usize".to_string(),
             MirType::Isize => "isize".to_string(),
+            MirType::F32 => "f32".to_string(),
+            MirType::F64 => "f64".to_string(),
             MirType::Str => "str".to_string(),
             MirType::EndianInt {
                 bits,
@@ -155,7 +181,14 @@ impl MirType {
             MirType::Ptr(inner) => format!("ptr_{}", inner.mangle_name()),
             MirType::Primitive(pk) => pk.mangle_name(),
             MirType::HwPeripheral(_) => "hw_periph".to_string(),
-            MirType::FnPtr { .. } => "fnptr".to_string(),
+            MirType::FnPtr { params, ret } => {
+                if params.is_empty() {
+                    format!("fnptr_void_ret_{}", ret.mangle_name())
+                } else {
+                    let ps: Vec<String> = params.iter().map(|p| p.mangle_name()).collect();
+                    format!("fnptr_{}_ret_{}", ps.join("_"), ret.mangle_name())
+                }
+            }
             MirType::Result { ok, err } => match err {
                 Some(e) => format!("res_{}_err_{}", ok.mangle_name(), e.mangle_name()),
                 None => format!("res_{}_err_bool", ok.mangle_name()),
@@ -178,6 +211,8 @@ impl MirType {
             MirType::I64 => "i64".to_string(),
             MirType::Usize => "usize".to_string(),
             MirType::Isize => "isize".to_string(),
+            MirType::F32 => "f32".to_string(),
+            MirType::F64 => "f64".to_string(),
             MirType::Str => "str".to_string(),
             MirType::EndianInt {
                 bits,
@@ -434,6 +469,81 @@ pub enum MirStmt {
     SpawnActivate {
         slot_id: usize,
         args: Vec<MirExpr>,
+    },
+    /// Zero-heap compile-time unpacked `print(f"...")` / `println(f"...")` stream output.
+    PrintFmt {
+        chunks: Vec<MirFmtChunk>,
+        newline: bool,
+    },
+    /// Zero-heap bounded buffer formatting `fmt_buf(dst, f"...") -> []u8 error FmtErr`.
+    ///
+    /// Writes unpacked `chunks` into `buf` (`MirType::Slice(U8)`) and stores dual-exit
+    /// `Result { ok: Slice(U8), err: Some(Enum("FmtErr")) }` into `dst_res` (`is_err = false, val = written_slice`
+    /// on fit; `is_err = true, err = FmtErr::Truncated (0), val = clamped_slice` on overflow).
+    FmtBuf {
+        dst_res: VarId,
+        buf: MirExpr,
+        chunks: Vec<MirFmtChunk>,
+    },
+}
+
+/// Integer radix and zero-padding format mode for [`MirFmtChunk::Int`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirIntFmt {
+    /// Base-10 decimal (`{x}`).
+    Dec,
+    /// Base-16 hexadecimal (`{x:x}`, `{x:X}`, `{x:04x}`, `{x:08X}`).
+    Hex { upper: bool, zero_pad_width: u8 },
+    /// Base-2 binary (`{x:b}`, `{x:08b}`).
+    Bin { zero_pad_width: u8 },
+}
+
+/// Floating-point format mode for [`MirFmtChunk::Float`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirFloatFmt {
+    /// Compact Arduino-style fixed-decimal formatter (`{x}` => `precision: 2`, `{x:.3}` => `precision: 3`).
+    Fixed { precision: u8 },
+    /// On-demand scientific notation formatter (`{x:e}` => `precision: 2`, `{x:.3e}` => `precision: 3`).
+    /// Emitted in a separate function so `ld.lld --gc-sections` strips it to `0 B` when unused.
+    Sci { precision: u8 },
+}
+
+/// Compile-time unpacked zero-heap formatting chunk (`f"..."`).
+///
+/// Struct `{pkt:?}` holes are flattened into `Literal` + field chunks during MIR lowering
+/// so codegen backends require zero runtime struct reflection.
+#[derive(Debug, Clone)]
+pub enum MirFmtChunk {
+    /// Static literal string segment (`"temp="`, `"Packet { op: "`, `" }"`).
+    Literal(String),
+    /// Integer value (`bits`: `8`, `16`, `32`, `64`, or `0` for target-sized `usize`/`isize`).
+    Int {
+        value: MirExpr,
+        signed: bool,
+        bits: u8,
+        fmt: MirIntFmt,
+    },
+    /// Floating-point value (`MirType::F32` when `!is_f64`, `MirType::F64` when `is_f64`).
+    Float {
+        value: MirExpr,
+        is_f64: bool,
+        fmt: MirFloatFmt,
+    },
+    /// Boolean value (`"true"` or `"false"`).
+    Bool(MirExpr),
+    /// Null-terminated string literal or `*u8` pointer.
+    Str(MirExpr),
+    /// Raw `[]u8` byte slice written verbatim (`{slice}`).
+    Bytes(MirExpr),
+    /// Enum variant name (`f"{err}"` -> `"BadCrc"`). `enum_name` is also recorded in `MirModule.formatted_enums`.
+    EnumName {
+        enum_name: String,
+        value: MirExpr,
+    },
+    /// Debug-formatted primitive slice `[e0, e1, ...]` (`{slice:?}` or `{arr:?}`).
+    DebugSlice {
+        elem_ty: MirType,
+        slice: MirExpr,
     },
 }
 
@@ -754,6 +864,8 @@ impl MirExpr {
 #[derive(Debug, Clone)]
 pub enum MirExprKind {
     IntLit(i128),
+    /// IEEE-754 `f64::to_bits()` representation of a float literal (`MirExpr.ty` is `MirType::F32` or `MirType::F64`).
+    FloatLit(u64),
     BoolLit(bool),
     StringLit(String),
     /// Duration already lowered to ticks (`1ms` -> `1`, `5s` -> `5000` on `1ms` tick).
@@ -1013,6 +1125,36 @@ pub struct MirBootSequence {
     pub boot_yielding_callees: Vec<String>,
 }
 
+/// Kind of a monomorphized generic declaration (`struct` or `fn`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MonomorphizedItemKind {
+    Struct,
+    Fn,
+}
+
+impl MonomorphizedItemKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MonomorphizedItemKind::Struct => "struct",
+            MonomorphizedItemKind::Fn => "fn",
+        }
+    }
+}
+
+/// Concrete monomorphized generic instantiation recorded in `MirModule` and `RamReport`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonomorphizedMirItem {
+    pub kind: MonomorphizedItemKind,
+    /// Human-readable instantiation signature (e.g. `"FixedVec<u32, 16>"` or `"clamp<f32>"`).
+    pub signature: String,
+    /// Concrete mangled symbol name (e.g. `"FixedVec__u32_16"` or `"clamp__f32"`).
+    pub mangled_name: String,
+    /// Static struct byte size (for `Struct`) or packed coroutine frame byte size (for yielding `Fn`; `0` for direct `Fn`) on 32-bit MCU ABI.
+    pub size_32: usize,
+    /// Static struct byte size (for `Struct`) or packed coroutine frame byte size (for yielding `Fn`; `0` for direct `Fn`) on 64-bit host ABI.
+    pub size_64: usize,
+}
+
 /// Complete lowered MIR module ready for RAM reporting and C99/LLVM backend emission.
 #[derive(Debug, Clone)]
 pub struct MirModule {
@@ -1029,6 +1171,9 @@ pub struct MirModule {
     pub task_blueprints: Vec<MirTaskBlueprint>,
     pub spawned_tasks: Vec<MirSpawnInstance>,
     pub dual_specialized_fns: Vec<String>,
+    pub monomorphized_instances: Vec<MonomorphizedMirItem>,
+    /// Sorted list of enum names referenced by `MirFmtChunk::EnumName` (for on-demand `.rodata` variant-name tables).
+    pub formatted_enums: Vec<String>,
     pub boot: MirBootSequence,
     pub ram_report: RamReport,
 }
