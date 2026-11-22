@@ -61,6 +61,7 @@ pub mmio PcrRegs {
     @rw u32 systimer_conf  @ 0x54;
     @rw u32 saradc_conf    @ 0x80;
     @rw u32 tsens_clk_conf @ 0x88;
+    @rw u32 gdma_conf      @ 0xBC;
 }
 
 pub mmio ApbSaradcRegs {
@@ -113,6 +114,45 @@ pub mmio RmtMemRegs {
     @rw [48]u32 ch0 @ 0x00;
 }
 
+pub mmio GdmaRegs {
+    @ro  u32 in_int_raw_ch0          @ 0x00;
+    @ro  u32 in_int_st_ch0           @ 0x04;
+    @rw  u32 in_int_ena_ch0          @ 0x08;
+    @w1c u32 in_int_clr_ch0          @ 0x0C;
+    @ro  u32 out_int_raw_ch0         @ 0x30;
+    @ro  u32 out_int_st_ch0          @ 0x34;
+    @rw  u32 out_int_ena_ch0         @ 0x38;
+    @w1c u32 out_int_clr_ch0         @ 0x3C;
+    @rw  u32 misc_conf               @ 0x64;
+    @rw  u32 in_conf0_ch0            @ 0x70;
+    @rw  u32 in_conf1_ch0            @ 0x74;
+    @ro  u32 infifo_status_ch0       @ 0x78;
+    @rw  u32 in_link_ch0             @ 0x80;
+    @ro  u32 in_suc_eof_des_addr_ch0 @ 0x88;
+    @rw  u32 in_peri_sel_ch0         @ 0xA0;
+    @rw  u32 out_conf0_ch0           @ 0xD0;
+    @rw  u32 out_conf1_ch0           @ 0xD4;
+    @rw  u32 out_link_ch0            @ 0xE0;
+    @ro  u32 out_eof_des_addr_ch0    @ 0xE8;
+    @rw  u32 out_peri_sel_ch0        @ 0x100;
+}
+
+pub mmio Spi2Regs {
+    @rw  u32     cmd         @ 0x00;
+    @rw  u32     addr        @ 0x04;
+    @rw  u32     ctrl        @ 0x08;
+    @rw  u32     clock       @ 0x0C;
+    @rw  u32     user        @ 0x10;
+    @rw  u32     user1       @ 0x14;
+    @rw  u32     user2       @ 0x18;
+    @rw  u32     ms_dlen     @ 0x1C;
+    @rw  u32     misc        @ 0x20;
+    @rw  u32     dma_conf    @ 0x30;
+    @rw  u32     dma_int_ena @ 0x34;
+    @w1c u32     dma_int_clr @ 0x38;
+    @rw  [16]u32 data_buf    @ 0x98;
+}
+
 pub mmio GPIO       : GpioRegs      @ 0x6009_1000;
 pub mmio IO_MUX     : IoMuxRegs     @ 0x6009_0000;
 pub mmio PCR        : PcrRegs       @ 0x6009_6000;
@@ -122,6 +162,8 @@ pub mmio SYSTIMER   : SystimerRegs  @ 0x6000_A000;
 pub mmio APB_SARADC : ApbSaradcRegs @ 0x6000_E000;
 pub mmio USB_DEVICE : UsbDeviceRegs @ 0x6000_F000;
 pub mmio INTMTX     : IntmtxRegs    @ 0x6001_0000;
+pub mmio GDMA       : GdmaRegs      @ 0x6008_0000;
+pub mmio SPI2       : Spi2Regs      @ 0x6008_1000;
 pub mmio INTPRI      : IntpriRegs     @ 0x600C_5000;
 pub mmio PLIC_MX     : PlicMxRegs     @ 0x2000_1000;
 pub mmio MODEM_SYSCON : ModemSysconRegs @ 0x600A_9800;
@@ -138,6 +180,9 @@ pub irq IRQ_UART0            = 43;
 pub irq IRQ_USB_DEVICE       = 48;
 pub irq IRQ_RMT              = 49;
 pub irq IRQ_SYSTIMER_TARGET0 = 57;
+pub irq IRQ_GDMA_IN_CH0      = 66;
+pub irq IRQ_GDMA_OUT_CH0     = 69;
+pub irq IRQ_GSPI2            = 72;
 
 pub const u32 PIN_RGB_LED      = 8;
 pub const u32 PIN_BOOT_BTN     = 9;

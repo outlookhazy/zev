@@ -195,3 +195,38 @@ pub fn usb_tx_write_byte(u8 b) {
 pub fn usb_tx_flush() {
     hw.USB_DEVICE.ep1_conf = 1;
 }
+
+pub fn init_gdma_ch0() {
+    hw.PCR.gdma_conf = 3;
+    hw.PCR.gdma_conf = 1;
+    hw.GDMA.misc_conf = 1 << 3;
+    hw.GDMA.in_int_clr_ch0 = 0x7F;
+    hw.GDMA.out_int_clr_ch0 = 0x3F;
+    hw.GDMA.in_int_ena_ch0 = 2;
+}
+
+pub fn start_gdma_m2m_ch0(usize tx_desc_addr, usize rx_desc_addr) {
+    // Reset RX & TX channel 0 state machines and clear stale interrupt flags.
+    hw.GDMA.in_conf0_ch0 = 1;
+    hw.GDMA.in_conf0_ch0 = 0;
+    hw.GDMA.out_conf0_ch0 = 1;
+    hw.GDMA.out_conf0_ch0 = 0;
+    hw.GDMA.in_int_clr_ch0 = 0x7F;
+    hw.GDMA.out_int_clr_ch0 = 0x3F;
+
+    hw.GDMA.in_conf1_ch0 = 1 << 12;
+    hw.GDMA.out_conf1_ch0 = 1 << 12;
+    hw.GDMA.out_conf0_ch0 = (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5);
+    hw.GDMA.out_peri_sel_ch0 = 1;
+    hw.GDMA.in_peri_sel_ch0 = 1;
+    hw.GDMA.in_conf0_ch0 = (1 << 2) | (1 << 3) | (1 << 4);
+    hw.GDMA.in_int_ena_ch0 = 2;
+
+    // Start RX before TX so the M2M trigger never misses the initial burst.
+    hw.GDMA.in_link_ch0 = ((rx_desc_addr as u32) & 0x000F_FFFF) | (1 << 20) | (1 << 22);
+    hw.GDMA.out_link_ch0 = ((tx_desc_addr as u32) & 0x000F_FFFF) | (1 << 21);
+}
+
+pub fn clear_gdma_rx_ch0_irq() {
+    hw.GDMA.in_int_clr_ch0 = 0x7F;
+}

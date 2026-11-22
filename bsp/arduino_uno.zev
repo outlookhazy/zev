@@ -114,3 +114,38 @@ pub u16 read_mcu_vcc_mv() {
     }
     return (1125300u32 / (raw as u32)) as u16;
 }
+
+pub fn spi_master_start_byte(u8 first_byte) {
+    // Mask PB5 PCINT so hardware SCK edges do not fire PCINT0 during SPI clocking.
+    hw.PCMSK_REGS.pcmsk0 = hw.PCMSK_REGS.pcmsk0 & (~hw.BIT_PB5_LED);
+    hw.PORTB.port = hw.PORTB.port | hw.BIT_PB2_SS;
+    hw.PORTB.ddr = hw.PORTB.ddr | hw.BIT_PB2_SS | hw.BIT_PB3_MOSI | hw.BIT_PB5_LED;
+
+    // Clear any stale SPIF flag by reading SPSR followed by SPDR.
+    u8 st = hw.SPI_REGS.spsr;
+    u8 dr = hw.SPI_REGS.spdr;
+    u8 _clr = st ^ dr;
+
+    // Enable SPI Master + SPIE at fosc/16 (SPR0 = 1).
+    hw.SPI_REGS.spcr = hw.BIT_SPIE | hw.BIT_SPE | hw.BIT_MSTR | 1;
+    hw.SPI_REGS.spdr = first_byte;
+}
+
+pub u8 spi_transfer_read() {
+    u8 st = hw.SPI_REGS.spsr;
+    u8 b = hw.SPI_REGS.spdr;
+    if ((st & 0x80) == 0) {
+        return b;
+    }
+    return b;
+}
+
+pub fn spi_transfer_next(u8 b) {
+    hw.SPI_REGS.spdr = b;
+}
+
+pub fn spi_master_finish() {
+    hw.SPI_REGS.spcr = 0;
+    hw.PCIFR.pcifr = hw.BIT_PCIE0;
+    hw.PCMSK_REGS.pcmsk0 = hw.PCMSK_REGS.pcmsk0 | hw.BIT_PB5_LED;
+}

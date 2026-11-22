@@ -20,3 +20,23 @@ pub BusStats stats_zero() {
         errors: 0,
     };
 }
+
+pub struct StatusCell<T> {
+    *watch<T> state;
+}
+
+pub fn publish_cell<T>(*StatusCell<T> c, T val) {
+    c.state.publish(val);
+}
+
+pub T read_cell<T>(*StatusCell<T> c) {
+    return c.state.read();
+}
+
+pub fn publish_stats(*watch<BusStats> w, BusStats st) {
+    w.publish(st);
+}
+
+pub BusStats read_stats(*watch<BusStats> w) {
+    return w.read();
+}

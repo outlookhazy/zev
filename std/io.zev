@@ -111,3 +111,12 @@ pub u32 parse_u32([]u8 s) error IoErr {
     }
     return acc;
 }
+
+pub struct DuplexStream {
+    *byte_ring rx;
+    *byte_ring tx;
+}
+
+pub usize stream_write(*DuplexStream s, []u8 data) {
+    return s.tx.push(data);
+}
