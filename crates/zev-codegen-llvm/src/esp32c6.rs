@@ -141,13 +141,19 @@ entry:
 
 define void @__syn_esp32c6_hw_init() nounwind{sz} {{
 entry:
-  ; 1. Enable SYSTIMER clock gate in PCR_SYSTIMER_CONF_REG (0x60096054 = 1611227220): set bit 0, clear rst bit 1
+  ; 1. Disable HP_APM, LP_APM0, and LP_APM access-path PMS filters so non-CPU bus masters (e.g. GDMA)
+  ;    can read/write HP-SRAM in Direct-Boot mode without TEE blocks (matches esp-hal pre_init).
+  store volatile i32 0, ptr inttoptr (i32 1611239620 to ptr), align 4
+  store volatile i32 0, ptr inttoptr (i32 1611241668 to ptr), align 4
+  store volatile i32 0, ptr inttoptr (i32 1611348164 to ptr), align 4
+
+  ; 2. Enable SYSTIMER clock gate in PCR_SYSTIMER_CONF_REG (0x60096054 = 1611227220): set bit 0, clear rst bit 1
   %pcr = load volatile i32, ptr inttoptr (i32 1611227220 to ptr), align 4
   %pcr1 = or i32 %pcr, 1
   %pcr2 = and i32 %pcr1, -3
   store volatile i32 %pcr2, ptr inttoptr (i32 1611227220 to ptr), align 4
 
-  ; 2. Enable SYSTIMER_CLK_EN (bit 31) | SYSTIMER_TIMER_UNIT0_WORK_EN (bit 30) = 0xC0000000 at 0x6000A000 (1610653696)
+  ; 3. Enable SYSTIMER_CLK_EN (bit 31) | SYSTIMER_TIMER_UNIT0_WORK_EN (bit 30) = 0xC0000000 at 0x6000A000 (1610653696)
   %st_old = load volatile i32, ptr inttoptr (i32 1610653696 to ptr), align 4
   %st_new = or i32 %st_old, -1073741824
   store volatile i32 %st_new, ptr inttoptr (i32 1610653696 to ptr), align 4

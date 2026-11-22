@@ -2,7 +2,7 @@
 //!
 //! Designed so an AI coding agent or embedded systems engineer can learn idiomatic Zev
 //! in 1 tool call (`zevc doc`), drill into focused ~60-line topic guides (`zevc doc <topic>`),
-//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0012`, `E0001`..`E0033`).
+//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0013`, `E0001`..`E0034`).
 
 use crate::docs_errors::{ErrorDoc, ERROR_DOCS};
 use std::fmt::Write;
@@ -30,7 +30,7 @@ CORE MENTAL MODEL (5 RULES):
      `HardBlocking` (`wait_chunk`, `recv`, `send`, `wait`, `delay`). `critical { ... }` masks IRQs.
   4. Strict Task/ISR Isolation: Zero mutable raw globals. Cross-task/ISR state goes exclusively
      through static primitives: `watch<T>`, unified `inbox<T, N>` (`.post`, `.send`, `.recv`),
-     `signal`, `ping_pong<T, N>`, and `lease<T, N>` (with optional ISR `boost: @critical`).
+     `signal`, `byte_ring<N>`, `@dma_safe ping_pong<T, N>`, and `@dma_safe pool<T, K>` + `Lease<T>`.
   5. Dual-Exit Errors, `defer` & Zero-Heap `f\"...\"`: Normal exit `return val;`, failure `error [E [, v]];`,
      handled via `or <val>` / `catch (...)`. `println(...)`, `fmt_buf`, & `fmt_ring` use 0 heap.
 
@@ -56,13 +56,13 @@ SHARDED TOPIC GUIDES (`zevc doc <topic>`):
   zevc doc tasks        Boot-Tree `spawn`, immortal `task` + `restart;`, `loop every <period_expr>`
   zevc doc yielding     3-tier effects (`SoftYielding` dual-spec), `noyield`, `critical`, `isr`, FFI
   zevc doc primitives   `inbox`, `watch`, `signal`, `byte_ring<N>`, `*byte_ring`/`*inbox<T>` views, subsystems
-  zevc doc dma          `@dma_safe ping_pong`, `lease`, zero-`'a` scope/lease rules, sleep locks
+  zevc doc dma          `@dma_safe pool<T, K>`, `Lease<T>`, `dma_slot<T>`, `ping_pong`, sleep locks
   zevc doc runtime      Zero-heap `f\"...\"` (`fmt_buf`/`fmt_ring`), `import`/`pub`, typed `mmio`, `irq.attach`
   zevc doc targets      `zevc check [--json]`, `ram --target`, `import-svd`, `run`, `run-qemu`, ESP32-C6, AVR
 
 ERROR CODE EXPLAINERS (`zevc doc <code>` or `zevc doc --list`):
-  Parser Traps   : P0001..P0012  (instant rewrites for `let`, `->`, `async`, `for(;;)`, bare `every`, `chan`)
-  Static Verifier: E0001..E0033  (isolation, 3-tier yields, DMA, `modules`/`pub`, `mmio`, `irq.attach`, `state`)
+  Parser Traps   : P0001..P0013  (instant rewrites for `let`, `->`, `async`, `for(;;)`, bare `every`, `chan`, `lease`)
+  Static Verifier: E0001..E0034  (isolation, 3-tier yields, DMA/linear `Lease<T>`, `modules`, `mmio`, `irq.attach`, `state`)
 ================================================================================
 ";
 
@@ -337,11 +337,13 @@ values or static scheduler-aware OS primitives at module scope and pass pointers
 | `inbox<T, N> q;` | Unified bounded queue | `q.post(v [, boost: @prio])`, `q.try_send(v) -> bool`, `q.try_recv()` | `q.send(v [, timeout: d])`, `q.recv([timeout: d]) -> T` |
 | `byte_ring<N> r;` | Lock-free SPSC stream / BipBuffer | `r.push(s [, boost:])`, `r.push_byte(b [, boost:])`, `r.grant_write(n)`, `r.commit_write(n [, boost:])`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
 | `signal s;` | Lightweight wakeup | `s.notify([boost: @prio])`, `s.try_wait() -> bool`, `s.clear()` | `s.wait([timeout: d])` |
+| `@dma_safe pool<T, K> p;` | Zero-copy `O(1)` slab (`K<=32`) | `p.try_alloc() -> Lease<T> error`, `p.avail()`, `p.in_use()` | `p.alloc([timeout: d]) -> Lease<T>` |
+| `dma_slot<T> s;` | Cross-IRQ `Lease<T>` slot | `s.park(l)`, `s.take() -> Lease<T> error`, `s.release([boost:])`, `s.addr()` | *(park across IRQ/DMA transfer)* |
 
-Inspection helpers `.len()`, `.is_empty()`, `.is_full()` work on both `inbox<T, N>` and `byte_ring<N>` (plus `.cap()` and `.free_space()` on `byte_ring<N>`), while stale `read_slice()`, `wait_read()`, or `grant_write()` slices after `consume()` / `pop()` / `commit_write()` are caught at compile time (`E0011`).
+Inspection helpers `.len()`, `.is_empty()`, `.is_full()` work on both `inbox<T, N>` and `byte_ring<N>` (plus `.cap()` and `.free_space()` on `byte_ring<N>`), while stale `read_slice()`, `wait_read()`, `grant_write()`, or `Lease.get()` slices/pointers are caught at compile time (`E0011`).
 
-## 2. Subsystem `struct`s & Capacity-Erased Views (`*byte_ring`, `*inbox<T>`)
-Group a driver's RX/TX rings, queues, or flags inside a module-level `struct` instantiated as a static primitive:
+## 2. Subsystem `struct`s, Views (`*byte_ring`, `*inbox<T>`, `*watch<T>`) & Singleton Folding
+Group a driver's RX/TX rings, pools, slots, queues, or flags inside a module-level `struct` instantiated as a static primitive:
 ```zev
 struct SerialPort {
     byte_ring<64> rx;
@@ -353,8 +355,8 @@ SerialPort usb_serial;
 fn flush_tx(*byte_ring tx) { /* ... works for byte_ring<64>, byte_ring<128>, etc. ... */ }
 fn push_evt(*inbox<u32> q, u32 ev) { q.try_send(ev); }
 ```
-- `*byte_ring` and `*inbox<T>` are two-word fat capacity-erased views (no dynamic vtables, no `<usize N>` code duplication on Flash).
-- Whole-program visibility optimization automatically strips unread `watch<T>` cells (`0 B` `.bss`, keeping side effects in `.publish(expr)`) and elides IRQ critical sections (`irq_mask_elided`) when a primitive or view family is never accessed from an `isr`.
+- `*byte_ring`, `*inbox<T>`, and `*watch<T>` bundle cleanly into reusable non-subsystem helper structs (`DuplexStream`, `StatusCell<T>`) with zero dynamic vtables and zero `<usize N>` code duplication on Flash.
+- Whole-program visibility optimization automatically constant-folds singleton subsystem/task pointers (`instance_count == 1`), strips unread `watch<T>` cells (`0 B` `.bss`, keeping side effects in `.publish(expr)`), and elides IRQ critical sections (`irq_mask_elided`) when a primitive or view family is never accessed from an `isr`.
 
 ## 3. ISR Priority Elevation (`boost: @critical`) & Sequential Dispatch
 An `isr` can wake a low-priority supervisor at elevated priority for a single turn; priority
@@ -393,49 +395,45 @@ fn main() {
     TopicDoc {
         name: "dma",
         aliases: &[
-            "ping_pong", "pingpong", "lease", "slices", "lifetimes", "provenance", "sleep",
-            "wakelock",
+            "ping_pong", "pingpong", "lease", "pool", "dma_slot", "slices", "lifetimes",
+            "provenance", "sleep", "wakelock",
         ],
-        summary: "Zero-copy `@dma_safe ping_pong` & `lease`, zero-`'a` scope/lease safety, sleep clamping",
+        summary: "Zero-copy `@dma_safe pool<T, K>` + linear `Lease<T>`, `dma_slot<T>`, `ping_pong`, sleep clamping",
         body: "\
 # Zev Topic Guide: `dma`
 
-## 1. Zero-Copy Circular DMA (`@dma_safe ping_pong<T, N>` & `lease<T, N>`)
-- `@dma_safe ping_pong<u8, 64> uart_dma;` allocates aligned contiguous `2 * N` static double buffers:
-  - In `isr`: `uart_dma.flip();` swaps active/ready halves in O(1) and wakes the waiting task.
-  - In `task`: `[]u8 half = uart_dma.wait_chunk();` yields until a half-buffer is ready and lends a
-    zero-copy `[]u8` slice directly into the quiescent half.
-- `@dma_safe lease<u8, 16> spi_buf;`: single-buffer lend via `.wait_chunk()` and `.release()` / `.complete()`.
-- **Automatic Sleep Clamping**: While a `@dma_safe` `ping_pong` or `lease` transfer is active, the
-  synthesized kernel automatically clamps tickless idle sleep depth from `DEEP` to `LIGHT` so DMA
-  and peripheral clocks stay alive!
+## 1. Zero-Copy Pools (`@dma_safe pool<T, K>`, `Lease<T>`, `dma_slot<T>`) & Circular `ping_pong<T, N>`
+- `@dma_safe pool<Frame, 4> net_pool;` allocates an IRQ-safe `O(1)` `u32` bitmap slab (`1 <= K <= 32`)
+  whose `@dma_safe` slots align to 32-byte cache lines (`DEEP -> LIGHT` sleep clamping while leased):
+  - Acquire a move-only handle via `Lease<Frame> b = net_pool.try_alloc() catch { ... };` (or blocking `net_pool.alloc([timeout:])`).
+  - Borrow its payload pointer via `b.get()` (`*Frame`) and address via `b.addr()` (`usize`).
+  - Linear ownership (`E0034`): `b` must be moved once into `.release([boost:])`, `defer b.release();`, `slot.park(b)`, or `inbox.post(b)`/`send(b)` (full-queue `inbox.post` and busy `dma_slot.park` auto-recycle `b`!).
+  - Standalone `lease<T, N>` is retired (`P0013`); keep `@dma_safe ping_pong<u8, 64>` for contiguous `2 * N` circular DMA (`.flip()` in `isr`, `.wait_chunk()` in `task`).
 
-## 2. Zero-`'a` Scope-Depth & Lease Provenance Rules (`E0008`..`E0011`)
+## 2. Zero-`'a` Scope-Depth & Lease Provenance Rules (`E0008`..`E0011`, `E0034`)
 Zev requires **zero `'a` lifetime annotations**—`zev-sema` tracks origin depth and lease generation
 (including across `for (u8 b in half)` loops):
 - **ALLOWED**: Bounds-clamped sub-slicing (`half[0..5]`), wrapping in local structs (`ByteReader{ buf: half, pos: 0 }`),
   bounded `for (u8 b in half)` iteration, and passing slices/wrappers **downward** into helper functions.
-- **REJECTED (`E0008`)**: Assigning an inner-scope slice/pointer/wrapper into an outer-scope variable.
-- **REJECTED (`E0009`)**: Returning `&local` or a local `wait_chunk()` slice upward out of a function.
-- **REJECTED (`E0011`)**: Reading `half` (or any wrapper/sub-slice derived from it) AFTER a second
-  `uart_dma.wait_chunk()` swaps the double buffer!
+- **REJECTED (`E0008`/`E0009`)**: Escaping an inner-scope slice/`b.get()` pointer upward or to an outer scope.
+- **REJECTED (`E0011`)**: Reading `half` (or a `b.get()` pointer) AFTER a second `wait_chunk()` or moving/releasing `b`!
 
 ```zev
-@dma_safe ping_pong<u8, 64> uart1_dma;
-watch<u16> motor1_rpm = 0;
+@dma_safe pool<Frame, 4> tx_pool;
+dma_slot<Frame>          tx_inflight;
+inbox<Lease<Frame>, 4>   done_q;
 
-isr DMA1_CH5 {
-    uart1_dma.flip();
+isr dma_done_isr(*dma_slot<Frame> slot, *inbox<Lease<Frame>, 4> done) {
+    Lease<Frame> f = slot.take() catch { return; };
+    done.post(f, boost: @critical);     // Auto-recycles if queue is full!
 }
 
-task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
-    loop {
-        []u8 half = rx_dma.wait_chunk();
-        if (half.len >= 2) {
-            u16 val = ((half[0] as u16) * 256) | (half[1] as u16);
-            out_rpm.publish(val);     // Copy decoded scalars out before next `wait_chunk()`!
-        }
-    }
+task net_worker() {
+    Lease<Frame> buf = tx_pool.try_alloc() catch { sys.exit(1); };
+    buf.get().len = 32;
+    tx_inflight.park(buf) catch { return; };
+    Lease<Frame> done = done_q.recv();
+    done.release();
 }
 ```
 ",
@@ -523,7 +521,7 @@ zevc check --json app.zev             # Structured JSON diagnostics + dual-spec 
 ## 2. SVD Hardware Generation & Static SRAM + Stack Proofs (`zevc import-svd`, `zevc ram`)
 Generate typed `.zev` `pub mmio` layouts, peripheral base addresses, and `pub irq` tokens directly
 from any vendor CMSIS-SVD file, inspect exact 32-bit/64-bit `.bss`/ISR `state`/union RAM budgets
-(with automatic dead-`watch` stripping & IRQ-mask elision telemetry), or run a hardware single-stack +
+(with singleton constant-folding `[singleton -> folded]`, dead-`watch` stripping & IRQ-mask elision telemetry), or run a hardware single-stack +
 `.bss` high-water proof (`--target <cortex-m3|esp32c6|avr>` using LLVM `.stack_sizes` / AVR disassembly):
 ```bash
 zevc import-svd vendor/STM32G474.svd -o chip/stm32g474.zev
@@ -642,7 +640,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
     }
 
     Err(format!(
-        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0012 / E0001..E0033 codes)"
+        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0013 / E0001..E0034 codes)"
     ))
 }
 
@@ -656,15 +654,15 @@ mod tests {
         assert!(primer.contains("ROSETTA STONE"));
         assert!(primer.contains("zevc doc syntax"));
         assert!(primer.contains("zevc doc runtime"));
-        assert!(primer.contains("P0001..P0012"));
-        assert!(primer.contains("E0001..E0033"));
+        assert!(primer.contains("P0001..P0013"));
+        assert!(primer.contains("E0001..E0034"));
 
         let list = lookup_doc(None, true).unwrap();
         assert!(list.contains("runtime"));
         assert!(list.contains("P0001"));
-        assert!(list.contains("P0012"));
+        assert!(list.contains("P0013"));
         assert!(list.contains("E0001"));
-        assert!(list.contains("E0033"));
+        assert!(list.contains("E0034"));
     }
 
     #[test]
@@ -677,6 +675,8 @@ mod tests {
             "yielding",
             "primitives",
             "dma",
+            "pool",
+            "dma_slot",
             "runtime",
             "targets",
             "generics",

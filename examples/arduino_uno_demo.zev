@@ -17,9 +17,18 @@ struct SerialPort {
     byte_ring<80> tx;
 }
 
-inbox<u32, 8> t1_inbox;
-watch<u32>    pad_edges = 0;
-SerialPort    uart_port;
+struct SpiBurst {
+    [4]u8 tx;
+    [4]u8 rx;
+    u8    idx;
+}
+
+inbox<u32, 8>            t1_inbox;
+watch<u32>               pad_edges = 0;
+SerialPort               uart_port;
+@dma_safe pool<SpiBurst, 2> spi_pool;
+dma_slot<SpiBurst>       spi_inflight;
+inbox<Lease<SpiBurst>, 2> spi_done_q;
 
 isr timer1_isr(*inbox<u32, 8> q, *hw.TifrRegs tifr) {
     state u32 seq = 0;
@@ -56,6 +65,31 @@ isr pcint_isr_b(*watch<u32> w) {
     state u32 count = 0;
     count += 1;
     w.publish(count);
+}
+
+isr spi_stc_isr(*dma_slot<SpiBurst> inflight, *inbox<Lease<SpiBurst>, 2> done_q) {
+    state u32 spi_irqs = 0;
+    spi_irqs += 1;
+    Lease<SpiBurst> b = inflight.take() catch {
+        return;
+    };
+    u8 rx_b = bsp.spi_transfer_read();
+    *SpiBurst bp = b.get();
+    usize idx = bp.idx as usize;
+    if (idx < 4) {
+        bp.rx[idx] = rx_b;
+    }
+    u8 next_idx = bp.idx + 1u8;
+    bp.idx = next_idx;
+    if (next_idx < 4u8) {
+        bsp.spi_transfer_next(bp.tx[next_idx as usize]);
+        inflight.park(b) catch {
+            return;
+        };
+    } else {
+        bsp.spi_master_finish();
+        done_q.post(b, boost: @critical);
+    }
 }
 
 fn kick_uart_tx(*byte_ring tx) {
@@ -121,6 +155,55 @@ task serial_cmd_worker(*SerialPort port, *watch<u32> edges_w) {
                 if (wn > 0) {
                     kick_uart_tx(tx);
                 }
+            } else if (ch == 'd' || ch == 'D') {
+                cmds += 1;
+                u8 prev_led = bsp.read_led();
+                Lease<SpiBurst> job = spi_pool.try_alloc() catch {
+                    usize wn = fmt_ring(tx, f"[DMA UNO] SPI err=pool_empty cmds={cmds}\r\n") catch { 0 };
+                    if (wn > 0) {
+                        kick_uart_tx(tx);
+                    }
+                    continue;
+                };
+                *SpiBurst jp = job.get();
+                jp.tx[0] = 0xA5u8;
+                jp.tx[1] = 0x5Au8;
+                jp.tx[2] = (cmds & 0xFF) as u8;
+                jp.tx[3] = 0x3Cu8;
+                jp.idx = 0u8;
+                spi_inflight.park(job) catch {
+                    usize wn = fmt_ring(tx, f"[DMA UNO] SPI err=slot_busy cmds={cmds}\r\n") catch { 0 };
+                    if (wn > 0) {
+                        kick_uart_tx(tx);
+                    }
+                    continue;
+                };
+                bsp.spi_master_start_byte(0xA5u8);
+                Lease<SpiBurst> done = spi_done_q.recv(timeout: 50ms) catch {
+                    bsp.spi_master_finish();
+                    bool dropped = spi_inflight.release();
+                    if (prev_led != 0) {
+                        hw.PORTB.port = hw.PORTB.port | hw.BIT_PB5_LED;
+                    } else {
+                        hw.PORTB.port = hw.PORTB.port & (~hw.BIT_PB5_LED);
+                    }
+                    usize wn = fmt_ring(tx, f"[DMA UNO] SPI err=timeout dropped={dropped} cmds={cmds}\r\n") catch { 0 };
+                    if (wn > 0) {
+                        kick_uart_tx(tx);
+                    }
+                    continue;
+                };
+                bool ok = done.get().idx == 4u8;
+                done.release();
+                if (prev_led != 0) {
+                    hw.PORTB.port = hw.PORTB.port | hw.BIT_PB5_LED;
+                } else {
+                    hw.PORTB.port = hw.PORTB.port & (~hw.BIT_PB5_LED);
+                }
+                usize wn = fmt_ring(tx, f"[DMA UNO] SPI ok={ok} bytes=4 pool_avail={spi_pool.avail()} cmds={cmds}\r\n") catch { 0 };
+                if (wn > 0) {
+                    kick_uart_tx(tx);
+                }
             }
         }
         rx.consume(n);
@@ -135,6 +218,7 @@ fn main() {
     hw.IRQ_PCINT0.attach_shared(pcint_isr_b(&pad_edges));
     hw.IRQ_USART_RX.attach(uart_rx_isr(&uart_port.rx, hw.USART0));
     hw.IRQ_USART_UDRE.attach(uart_tx_isr(&uart_port.tx, hw.USART0));
+    hw.IRQ_SPI_STC.attach(spi_stc_isr(&spi_inflight, &spi_done_q));
     bsp.enable_led_pcint();
     bsp.start_timer1_ctc(15624);
     bsp.enable_uart_rx_irq();

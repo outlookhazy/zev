@@ -197,8 +197,12 @@ pub fn usb_tx_flush() {
 }
 
 pub fn init_gdma_ch0() {
+    hw.HP_APM.func_ctrl = 0;
+    hw.LP_APM0.func_ctrl = 0;
+    hw.LP_APM.func_ctrl = 0;
     hw.PCR.gdma_conf = 3;
     hw.PCR.gdma_conf = 1;
+    hw.GDMA.misc_conf = (1 << 3) | 1;
     hw.GDMA.misc_conf = 1 << 3;
     hw.GDMA.in_int_clr_ch0 = 0x7F;
     hw.GDMA.out_int_clr_ch0 = 0x3F;
@@ -222,9 +226,13 @@ pub fn start_gdma_m2m_ch0(usize tx_desc_addr, usize rx_desc_addr) {
     hw.GDMA.in_conf0_ch0 = (1 << 2) | (1 << 3) | (1 << 4);
     hw.GDMA.in_int_ena_ch0 = 2;
 
-    // Start RX before TX so the M2M trigger never misses the initial burst.
-    hw.GDMA.in_link_ch0 = ((rx_desc_addr as u32) & 0x000F_FFFF) | (1 << 20) | (1 << 22);
-    hw.GDMA.out_link_ch0 = ((tx_desc_addr as u32) & 0x000F_FFFF) | (1 << 21);
+    // Latch descriptor addresses before asserting START; start RX before TX.
+    u32 rx_a = (rx_desc_addr as u32) & 0x000F_FFFF;
+    u32 tx_a = (tx_desc_addr as u32) & 0x000F_FFFF;
+    hw.GDMA.in_link_ch0 = rx_a | (1 << 20);
+    hw.GDMA.in_link_ch0 = rx_a | (1 << 20) | (1 << 22);
+    hw.GDMA.out_link_ch0 = tx_a;
+    hw.GDMA.out_link_ch0 = tx_a | (1 << 21);
 }
 
 pub fn clear_gdma_rx_ch0_irq() {

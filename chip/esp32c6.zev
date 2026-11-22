@@ -102,6 +102,10 @@ pub mmio EfuseRegs {
     @ro u32 rd_sys_part1_data4 @ 0x6C;
 }
 
+pub mmio ApmRegs {
+    @rw u32 func_ctrl @ 0xC4;
+}
+
 pub mmio RmtRegs {
     @rw  u32 ch0conf0    @ 0x10;
     @ro  u32 int_raw     @ 0x38;
@@ -171,6 +175,9 @@ pub mmio MODEM_LPCON  : ModemLpconRegs  @ 0x600A_F000;
 pub mmio I2C_ANA_MST  : I2cAnaMstRegs   @ 0x600A_F800;
 pub mmio PMU          : PmuRegs         @ 0x600B_0000;
 pub mmio EFUSE        : EfuseRegs       @ 0x600B_0800;
+pub mmio HP_APM       : ApmRegs         @ 0x6009_9000;
+pub mmio LP_APM0      : ApmRegs         @ 0x6009_9800;
+pub mmio LP_APM       : ApmRegs         @ 0x600B_3800;
 
 // Peripheral interrupt matrix source IDs (ESP-IDF esp32c6/include/soc/interrupts.h)
 pub irq IRQ_FROM_CPU0        = 22;

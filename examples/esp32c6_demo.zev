@@ -14,6 +14,7 @@ import chip.esp32c6 as hw;
 import bsp.esp32c6_pico as bsp;
 import std.fmt as fmt;
 import std.io as io;
+import std.bus as bus;
 
 const u32 PALETTE_LEN = 5;
 
@@ -22,6 +23,13 @@ enum SupEvent { ButtonPressed, Heartbeat }
 struct SerialPort {
     byte_ring<64>  rx;
     byte_ring<128> tx;
+}
+
+struct GdmaBlock {
+    [3]u32 tx_desc;
+    [3]u32 rx_desc;
+    [32]u8 src;
+    [32]u8 dst;
 }
 
 struct FixedVec<T, usize N> {
@@ -35,12 +43,15 @@ struct LedSample {
 }
 
 // ── Static Zero-Heap Language-OS Endpoints (HP-SRAM `0x40800000`) ───────────
-watch<u32>            palette_offset = 0;
-watch<u32>            active_slot    = 0;
-watch<u32>            active_color   = 0;
-watch<u32>            diag_signature = 0;
-inbox<SupEvent, 8>    sup_inbox;
-SerialPort            usb_serial;
+watch<u32>               palette_offset = 0;
+watch<u32>               active_slot    = 0;
+watch<u32>               active_color   = 0;
+watch<u32>               diag_signature = 0;
+inbox<SupEvent, 8>       sup_inbox;
+SerialPort               usb_serial;
+@dma_safe pool<GdmaBlock, 4> gdma_pool;
+dma_slot<GdmaBlock>      gdma_inflight;
+inbox<Lease<GdmaBlock>, 4> gdma_done_q;
 
 // ── Synthesized RISC-V `INTMTX` + `mtvec` IRQ Handlers ──────────────────────
 isr gpio_btn_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
@@ -48,6 +59,16 @@ isr gpio_btn_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
     irq_edges += 1;
     gpio.status_w1tc = 1 << bsp.PIN_BOOT_BTN;
     sup.post(ButtonPressed, boost: @critical);
+}
+
+isr gdma_rx_isr(*dma_slot<GdmaBlock> inflight, *inbox<Lease<GdmaBlock>, 4> done_q) {
+    state u32 gdma_irqs = 0;
+    gdma_irqs += 1;
+    bsp.clear_gdma_rx_ch0_irq();
+    Lease<GdmaBlock> blk = inflight.take() catch {
+        return;
+    };
+    done_q.post(blk, boost: @critical);
 }
 
 isr usb_rx_isr(*byte_ring rx, *hw.UsbDeviceRegs usb) {
@@ -250,8 +271,63 @@ task usb_cmd_worker(
                 i32 cal = bsp.read_temp_calib_tenths_c();
                 u8 dac = bsp.read_tsens_dac();
                 f32 die_c = bsp.read_die_temp_c();
-                u32 slot = slot_w.read();
+                bus.StatusCell<u32> slot_cell = bus.StatusCell<u32> { state: slot_w };
+                u32 slot = bus.read_cell<u32>(&slot_cell);
                 usize wn = fmt_ring(tx, f"[SENS ESP32-C6] die_temp={die_c:.1}C raw={raw} cal={cal} dac={dac} slot={slot} cmds={cmds}\n") catch { 0 };
+                if (wn > 0) {
+                    flush_tx_ring(tx);
+                }
+            } else if (ch == 'd' || ch == 'D') {
+                cmds += 1;
+                Lease<GdmaBlock> blk = gdma_pool.try_alloc() catch {
+                    usize wn = fmt_ring(tx, f"[DMA ESP32-C6] GDMA ch0 err=pool_empty cmds={cmds}\n") catch { 0 };
+                    if (wn > 0) {
+                        flush_tx_ring(tx);
+                    }
+                    continue;
+                };
+                *GdmaBlock bp = blk.get();
+                usize base = blk.addr();
+                u8 seed = (cmds & 0xFF) as u8;
+                for (usize j in 0..32) {
+                    bp.src[j] = seed ^ ((j as u8) * 7u8 + 0x5Au8);
+                    bp.dst[j] = 0u8;
+                }
+                bp.tx_desc[0] = 32u32 | (32u32 << 12) | (1u32 << 30) | (1u32 << 31);
+                bp.tx_desc[1] = (base + 24) as u32;
+                bp.tx_desc[2] = 0u32;
+                bp.rx_desc[0] = 32u32 | (1u32 << 31);
+                bp.rx_desc[1] = (base + 56) as u32;
+                bp.rx_desc[2] = 0u32;
+                gdma_inflight.park(blk) catch {
+                    usize wn = fmt_ring(tx, f"[DMA ESP32-C6] GDMA ch0 err=slot_busy cmds={cmds}\n") catch { 0 };
+                    if (wn > 0) {
+                        flush_tx_ring(tx);
+                    }
+                    continue;
+                };
+                bsp.start_gdma_m2m_ch0(base, base + 12);
+                Lease<GdmaBlock> done = gdma_done_q.recv(timeout: 100ms) catch {
+                    bool dropped = gdma_inflight.release();
+                    usize wn = fmt_ring(tx, f"[DMA ESP32-C6] GDMA ch0 err=timeout dropped={dropped} cmds={cmds}\n") catch { 0 };
+                    if (wn > 0) {
+                        flush_tx_ring(tx);
+                    }
+                    continue;
+                };
+                bool ok = true;
+                u32 rx_w0 = done.get().rx_desc[0];
+                u32 rx_len = (rx_w0 >> 12) & 0xFFF;
+                if ((rx_w0 & (1u32 << 31)) != 0 || rx_len != 32u32) {
+                    ok = false;
+                }
+                for (usize j in 0..32) {
+                    if (done.get().dst[j] != done.get().src[j]) {
+                        ok = false;
+                    }
+                }
+                done.release();
+                usize wn = fmt_ring(tx, f"[DMA ESP32-C6] GDMA ch0 ok={ok} len=32 pool_avail={gdma_pool.avail()} cmds={cmds}\n") catch { 0 };
                 if (wn > 0) {
                     flush_tx_ring(tx);
                 }
@@ -272,8 +348,10 @@ task usb_cmd_worker(
 fn main() {
     bsp.init_board_gpio();
     bsp.init_temp_sensor();
+    bsp.init_gdma_ch0();
     hw.IRQ_GPIO.attach(gpio_btn_isr(&sup_inbox, hw.GPIO));
     hw.IRQ_USB_DEVICE.attach(usb_rx_isr(&usb_serial.rx, hw.USB_DEVICE));
+    hw.IRQ_GDMA_IN_CH0.attach(gdma_rx_isr(&gdma_inflight, &gdma_done_q));
     bsp.enable_usb_rx_irq();
 
     // Immediate visual boot confirmation on GPIO8 WS2812B RGB LED

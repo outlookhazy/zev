@@ -244,6 +244,14 @@ mod tests {
                 && disasm.contains("60006"),
             "expected RV vector table at 0x40800000 and pure-.zev RMT (0x60006...) WS2812B driver in disasm:\n{disasm}"
         );
+        assert!(
+            img.elf
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_vec_irq_66"),
+            "expected GDMA CH0 IRQ vector __syn_vec_irq_66 in ESP32-C6 ELF symbols"
+        );
     }
 
     #[test]
@@ -3571,6 +3579,7 @@ fn main() {
             "__syn_avr_systick_isr",
             "__syn_avr_vec_3",
             "__syn_avr_vec_11",
+            "__syn_avr_vec_17",
             "__syn_avr_vec_18",
             "__syn_avr_vec_19",
         ] {
