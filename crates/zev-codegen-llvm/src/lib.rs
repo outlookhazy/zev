@@ -4595,4 +4595,130 @@ fn main() {
         compile_ll_to_obj(&host_ll_path, &host_obj_path, &host_opts)
             .expect("llc x86_64 compile view_bundle + pool/lease");
     }
+
+    #[test]
+    fn singleton_subsystem_task_folding_arm_avr_esp32c6_and_multi_instance_preserves_codegen() {
+        // 1. ARM Cortex-M3 QEMU run: singleton subsystem + `*byte_ring` view + `restart;` + uniform fn
+        let arm_src = r#"
+struct SerialPort {
+    byte_ring<16> rx;
+    watch<u32>    seq_num;
+}
+
+SerialPort usb_port;
+watch<u32> step_w = 0;
+watch<u32> out_w  = 0;
+
+fn record_seq(*SerialPort p, u32 mult, *watch<u32> dst) {
+    u32 next = p.seq_num.read() + 1;
+    p.seq_num.publish(next);
+    dst.publish(next * mult);
+}
+
+task usb_worker(*SerialPort p, u32 scale, *watch<u32> out) {
+    *byte_ring rx = &p.rx;
+    []u8 chunk = rx.wait_read(timeout: 30ms) catch { sys.exit(1); };
+    u32 b0 = chunk[0] as u32;
+    rx.consume(chunk.len);
+    if (step_w.read() == 0) {
+        step_w.publish(1);
+        restart;
+    }
+    record_seq(p, scale, out);
+    println(f"SINGLETON_OK b0={b0} seq={p.seq_num.read()} out={out.read()} scale={scale}");
+    sys.exit(0);
+}
+
+task feeder(*byte_ring tx) {
+    sys.delay(2ms);
+    tx.push("A", boost: @critical);
+    sys.delay(5ms);
+    tx.push("B", boost: @critical);
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    spawn usb_worker(&usb_port, 10, &out_w) @normal;
+    spawn feeder(&usb_port.rx) @high;
+}
+"#;
+        let (arm_mir, arm_ll, arm_res) =
+            run_zev_cortex_m_qemu("singleton_fold_arm_qemu", arm_src);
+        assert_all_allocas_in_entry(&arm_ll);
+        assert!(
+            arm_mir.visibility.singleton_subsystems.contains("usb_port"),
+            "usb_port should be marked singleton: {:?}",
+            arm_mir.visibility.singleton_subsystems
+        );
+        assert!(
+            arm_mir.visibility.singleton_bytes_saved_32 > 0,
+            "expected > 0 singleton bytes saved on Cortex-M3"
+        );
+        assert!(
+            arm_res
+                .exec
+                .stdout
+                .contains("SINGLETON_OK b0=66 seq=1 out=10 scale=10"),
+            "unexpected ARM QEMU output:\n{}",
+            arm_res.exec.stdout
+        );
+
+        let dir = test_out_dir();
+
+        // 2. ESP32-C6 (`riscv32imac`): `usb_serial` & `usb_cmd_worker` fold cleanly and ELF/.bin build passes
+        let esp_mir = compile_example_mir(&[repo_root().join("examples/esp32c6_demo.zev")]);
+        assert!(esp_mir.visibility.singleton_subsystems.contains("usb_serial"));
+        let esp_usb_folded = esp_mir
+            .visibility
+            .folded_task_vars
+            .get("usb_cmd_worker")
+            .expect("usb_cmd_worker should have folded singleton vars");
+        for expected_var in ["port", "slot_w", "color_w", "sup", "rx", "tx"] {
+            assert!(
+                esp_usb_folded.iter().any(|v| v == expected_var),
+                "expected {expected_var} in esp32c6 usb_cmd_worker folded vars: {esp_usb_folded:?}"
+            );
+        }
+        let esp_elf = dir.join("esp32c6_singleton_check.elf");
+        let esp_bin = dir.join("esp32c6_singleton_check.bin");
+        let esp_img = build_esp32c6_image(&esp_mir, &esp_elf, &esp_bin)
+            .unwrap_or_else(|e| panic!("ESP32-C6 singleton build failed: {e}"));
+        assert!(esp_img.elf.audit.is_zero_heap_freestanding());
+        verify_ll_with_opt(&esp_img.elf.ll_path)
+            .expect("LLVM opt -passes=verify failed on esp32c6_demo after singleton folding");
+
+        // 3. ATmega328P AVR: `uart_port` & `serial_cmd_worker` fold cleanly and AVR ELF/.bin build passes
+        let avr_mir = compile_example_mir(&[repo_root().join("examples/arduino_uno_demo.zev")]);
+        assert!(avr_mir.visibility.singleton_subsystems.contains("uart_port"));
+        let avr_folded = avr_mir
+            .visibility
+            .folded_task_vars
+            .get("serial_cmd_worker")
+            .expect("serial_cmd_worker should have folded singleton vars");
+        for expected_var in ["port", "edges_w", "rx", "tx"] {
+            assert!(
+                avr_folded.iter().any(|v| v == expected_var),
+                "expected {expected_var} in AVR serial_cmd_worker folded vars: {avr_folded:?}"
+            );
+        }
+        let avr_elf = dir.join("avr_singleton_check.elf");
+        let avr_bin = dir.join("avr_singleton_check.bin");
+        let avr_img = build_avr_uno_image(&avr_mir, &avr_elf, &avr_bin)
+            .unwrap_or_else(|e| panic!("AVR singleton build failed: {e}"));
+        assert!(avr_img.elf.audit.is_zero_heap_freestanding());
+        verify_ll_with_opt(&avr_img.elf.ll_path)
+            .expect("LLVM opt -passes=verify failed on arduino_uno_demo after singleton folding");
+
+        // 4. Multi-instance negative check (`motor_controller.zev`): multi-spawned tasks stay un-folded
+        let motor_mir = compile_example_mir(&[
+            repo_root().join("examples/motor_controller.zev"),
+            repo_root().join("examples/motor_support.zev"),
+        ]);
+        assert!(!motor_mir.visibility.folded_task_vars.contains_key("motor_control"));
+        assert!(!motor_mir.visibility.folded_task_vars.contains_key("fieldbus_listener"));
+        let motor_ll = emit_llvm_ir_with_options(&motor_mir, &CodegenOptions::default())
+            .expect("emit LLVM IR for motor_controller");
+        assert!(motor_ll.contains("motor_control"));
+    }
 }

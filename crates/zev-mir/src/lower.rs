@@ -1077,6 +1077,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         ram_report: RamReport::default(),
     };
 
+    crate::opt::fold_singletons(&mut module);
     let vis = crate::opt::analyze_visibility(&module);
     for p in &mut module.primitives {
         p.dead_stripped = vis.can_strip_bss(&p.name);
