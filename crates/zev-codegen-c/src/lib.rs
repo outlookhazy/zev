@@ -3603,4 +3603,1336 @@ int main(void) {
         );
         assert!(stdout.contains("M15:10:31:61\n"), "stdout:\n{stdout}");
     }
+
+    fn w1_ptr(inner: TypeExpr) -> TypeExpr {
+        TypeExpr::new(TypeKind::Ptr(Box::new(inner)), Span::dummy())
+    }
+
+    fn w1_arr(elem: TypeExpr, len: usize) -> TypeExpr {
+        TypeExpr::new(
+            TypeKind::Array {
+                elem: Box::new(elem),
+                len: ArrayLen::Fixed(len),
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_field(target: Expr, field: &str) -> Expr {
+        Expr::new(
+            ExprKind::Field {
+                target: Box::new(target),
+                field: id(field),
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_idx(target: Expr, index: Expr) -> Expr {
+        Expr::new(
+            ExprKind::Index {
+                target: Box::new(target),
+                index: Box::new(index),
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_call(callee: &str, args: Vec<Expr>) -> Expr {
+        Expr::new(
+            ExprKind::Call {
+                callee: Box::new(expr_id(callee)),
+                generic_args: vec![],
+                args: args.into_iter().map(CallArg::positional).collect(),
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_method(receiver: Expr, method: &str, args: Vec<Expr>) -> Expr {
+        Expr::new(
+            ExprKind::MethodCall {
+                receiver: Box::new(receiver),
+                method: id(method),
+                args: args.into_iter().map(CallArg::positional).collect(),
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_addrof(inner: Expr) -> Expr {
+        Expr::new(
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                expr: Box::new(inner),
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_bin(op: BinaryOp, lhs: Expr, rhs: Expr) -> Expr {
+        Expr::new(
+            ExprKind::Binary {
+                op,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_cast(inner: Expr, ty: TypeExpr) -> Expr {
+        Expr::new(
+            ExprKind::Cast {
+                expr: Box::new(inner),
+                ty,
+            },
+            Span::dummy(),
+        )
+    }
+
+    fn w1_print_line(parts: Vec<FormatPart>) -> Stmt {
+        let sp = Span::dummy();
+        Stmt::new(
+            StmtKind::Expr(w1_call(
+                "println",
+                vec![Expr::new(ExprKind::FormatString(parts), sp)],
+            )),
+            sp,
+        )
+    }
+
+    #[test]
+    fn wave1_c99_mmio_widths_arrays_clamp_inline_and_rmw_single_eval() {
+        let sp = Span::dummy();
+        let items = vec![
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Mmio(MmioDecl {
+                    name: id("UartRegs"),
+                    kind: MmioDeclKind::Layout {
+                        regs: vec![
+                            MmioRegDecl {
+                                access: MmioAccess::Rw,
+                                ty: ty_prim(PrimType::U8),
+                                name: id("ctrl"),
+                                offset: expr_int(0x00),
+                                span: sp,
+                            },
+                            MmioRegDecl {
+                                access: MmioAccess::Rw,
+                                ty: ty_prim(PrimType::U16),
+                                name: id("sr"),
+                                offset: expr_int(0x02),
+                                span: sp,
+                            },
+                            MmioRegDecl {
+                                access: MmioAccess::Rw,
+                                ty: ty_prim(PrimType::U32),
+                                name: id("cr"),
+                                offset: expr_int(0x04),
+                                span: sp,
+                            },
+                            MmioRegDecl {
+                                access: MmioAccess::Rw,
+                                ty: w1_arr(ty_prim(PrimType::U16), 4),
+                                name: id("arr"),
+                                offset: expr_int(0x08),
+                                span: sp,
+                            },
+                            MmioRegDecl {
+                                access: MmioAccess::W1c,
+                                ty: ty_prim(PrimType::U32),
+                                name: id("icr"),
+                                offset: expr_int(0x10),
+                                span: sp,
+                            },
+                        ],
+                    },
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Mmio(MmioDecl {
+                    name: id("UART1"),
+                    kind: MmioDeclKind::Instance {
+                        layout: ty_named("UartRegs"),
+                        base_addr: expr_int(0x4001_1000),
+                    },
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Mmio(MmioDecl {
+                    name: id("SysCfg"),
+                    kind: MmioDeclKind::Inline {
+                        base_addr: expr_int(0x4000_0000),
+                        regs: vec![MmioRegDecl {
+                            access: MmioAccess::Rw,
+                            ty: ty_prim(PrimType::U32),
+                            name: id("mode"),
+                            offset: expr_int(0x00),
+                            span: sp,
+                        }],
+                    },
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("bump_idx"),
+                    generic_params: vec![],
+                    params: vec![Param {
+                        ty: w1_ptr(ty_prim(PrimType::U32)),
+                        name: id("calls"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Usize),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: Expr::new(
+                                        ExprKind::Unary {
+                                            op: UnaryOp::Deref,
+                                            expr: Box::new(expr_id("calls")),
+                                        },
+                                        sp,
+                                    ),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_int(1),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(StmtKind::Return(Some(expr_int(2))), sp),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("exercise_mmio"),
+                    generic_params: vec![],
+                    params: vec![Param {
+                        ty: w1_ptr(ty_named("UartRegs")),
+                        name: id("r"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::U32),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("r"), "ctrl"),
+                                    op: AssignOp::Assign,
+                                    value: expr_int(0x5A),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("r"), "ctrl"),
+                                    op: AssignOp::BitOrAssign,
+                                    value: expr_int(0x05),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("r"), "sr"),
+                                    op: AssignOp::Assign,
+                                    value: expr_int(0x1234),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("r"), "sr"),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_int(0x0010),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("r"), "cr"),
+                                    op: AssignOp::Assign,
+                                    value: expr_int(0xDEAD_BEE0),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("r"), "cr"),
+                                    op: AssignOp::BitOrAssign,
+                                    value: expr_int(0x0F),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("SysCfg"), "mode"),
+                                    op: AssignOp::Assign,
+                                    value: expr_int(42),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("r"), "icr"),
+                                    op: AssignOp::Assign,
+                                    value: expr_int(0xABCD),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("calls"),
+                                    init: Some(expr_int(0)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_idx(w1_field(expr_id("r"), "arr"), expr_int(0)),
+                                    op: AssignOp::Assign,
+                                    value: expr_int(100),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_idx(w1_field(expr_id("r"), "arr"), expr_int(2)),
+                                    op: AssignOp::Assign,
+                                    value: expr_int(0x10),
+                                },
+                                sp,
+                            ),
+                            // Side-effecting index in compound RMW must run ONCE!
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_idx(
+                                        w1_field(expr_id("r"), "arr"),
+                                        w1_call("bump_idx", vec![w1_addrof(expr_id("calls"))]),
+                                    ),
+                                    op: AssignOp::BitOrAssign,
+                                    value: expr_int(0x05),
+                                },
+                                sp,
+                            ),
+                            // Out-of-bounds runtime array index clamps safely to index 0 under host sim ASan!
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::Usize),
+                                    name: id("oob"),
+                                    init: Some(expr_int(99)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_idx(w1_field(expr_id("r"), "arr"), expr_id("oob")),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_int(7),
+                                },
+                                sp,
+                            ),
+                            w1_print_line(vec![
+                                FormatPart::Literal("MMIO:".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_field(expr_id("r"), "ctrl")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_field(expr_id("r"), "sr")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":0x".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_field(expr_id("r"), "cr")),
+                                    spec: FormatSpec::Hex {
+                                        upper: true,
+                                        width: Some(8),
+                                    },
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_idx(
+                                        w1_field(expr_id("r"), "arr"),
+                                        expr_int(0),
+                                    )),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_idx(
+                                        w1_field(expr_id("r"), "arr"),
+                                        expr_int(2),
+                                    )),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_field(expr_id("SysCfg"), "mode")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_field(expr_id("r"), "icr")),
+                                    spec: FormatSpec::Hex {
+                                        upper: false,
+                                        width: Some(4),
+                                    },
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(expr_id("calls")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                            ]),
+                            Stmt::new(StmtKind::Return(Some(expr_id("calls"))), sp),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("main"),
+                    generic_params: vec![],
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Expr(w1_call(
+                                "exercise_mmio",
+                                vec![w1_addrof(expr_id("UART1"))],
+                            )),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let mir = lower_program(&Program::new(items, sp)).expect("lower C99 MMIO test");
+        let c_code = emit_c(&mir);
+        assert!(
+            c_code.contains("#define ZEV_MMIO_UART1 ((volatile uint8_t *)(uintptr_t)0x40011000UL)"),
+            "missing freestanding macro:\n{c_code}"
+        );
+        assert!(
+            c_code.contains("static SYN_UNUSED volatile uint8_t __zev_mmio_buf_UART1[20] __attribute__((aligned(4)));"),
+            "missing sim buffer:\n{c_code}"
+        );
+
+        assert_freestanding_compiles("wave1_mmio", &c_code);
+        let stdout = compile_and_run_clang_sanitized("wave1_mmio", &c_code, None);
+        // ctrl=0x5F=95, sr=0x1244=4676, cr=0xDEADBEEF, arr[0]=107, arr[2]=0x15=21, mode=42, icr=abcd, calls=1
+        assert!(
+            stdout.contains("MMIO:95:4676:0xDEADBEEF:107:21:42:abcd:1\n"),
+            "stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn wave1_c99_parameterized_isrs_isolated_state_shared_and_conditional_boot() {
+        let sp = Span::dummy();
+        let watch_u32_item = |name: &str| Item {
+            attrs: vec![],
+            is_pub: false,
+            kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                attrs: vec![],
+                ty: OsPrimitiveType::Watch {
+                    elem: Box::new(ty_prim(PrimType::U32)),
+                },
+                name: id(name),
+                init: Some(expr_int(0)),
+                span: sp,
+            }),
+            span: sp,
+        };
+
+        let items = vec![
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Struct(StructDecl {
+                    is_packed: false,
+                    name: id("AccState"),
+                    generic_params: vec![],
+                    fields: vec![
+                        StructField {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("total"),
+                            span: sp,
+                        },
+                        StructField {
+                            ty: ty_prim(PrimType::U16),
+                            name: id("hits"),
+                            span: sp,
+                        },
+                    ],
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Mmio(MmioDecl {
+                    name: id("PortRegs"),
+                    kind: MmioDeclKind::Layout {
+                        regs: vec![MmioRegDecl {
+                            access: MmioAccess::Rw,
+                            ty: ty_prim(PrimType::U32),
+                            name: id("dr"),
+                            offset: expr_int(0x00),
+                            span: sp,
+                        }],
+                    },
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Mmio(MmioDecl {
+                    name: id("PORTA"),
+                    kind: MmioDeclKind::Instance {
+                        layout: ty_named("PortRegs"),
+                        base_addr: expr_int(0x4800_0000),
+                    },
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Mmio(MmioDecl {
+                    name: id("PORTB"),
+                    kind: MmioDeclKind::Instance {
+                        layout: ty_named("PortRegs"),
+                        base_addr: expr_int(0x4800_0400),
+                    },
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Irq(IrqDecl {
+                    name: id("IRQ_PORTA"),
+                    number: expr_int(10),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Irq(IrqDecl {
+                    name: id("IRQ_PORTB"),
+                    number: expr_int(11),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Irq(IrqDecl {
+                    name: id("IRQ_SHARED"),
+                    number: expr_int(20),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Irq(IrqDecl {
+                    name: id("IRQ_COND_TRUE"),
+                    number: expr_int(30),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Irq(IrqDecl {
+                    name: id("IRQ_COND_UNSET"),
+                    number: expr_int(31),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Irq(IrqDecl {
+                    name: id("IRQ_SW"),
+                    number: expr_int(32),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Inbox {
+                        elem: Box::new(ty_prim(PrimType::U32)),
+                        cap: 8,
+                    },
+                    name: id("out_q"),
+                    init: None,
+                    span: sp,
+                }),
+                span: sp,
+            },
+            watch_u32_item("res_a"),
+            watch_u32_item("res_b"),
+            watch_u32_item("res_mode"),
+            watch_u32_item("res_sw"),
+            // isr port_isr(*PortRegs p, *inbox<u32, 8> q, u32 tag)
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Isr(IsrDecl {
+                    attrs: vec![],
+                    vector: id("port_isr"),
+                    params: vec![
+                        Param {
+                            ty: w1_ptr(ty_named("PortRegs")),
+                            name: id("p"),
+                            span: sp,
+                        },
+                        Param {
+                            ty: w1_ptr(TypeExpr::new(
+                                TypeKind::OsPrimitive(OsPrimitiveType::Inbox {
+                                    elem: Box::new(ty_prim(PrimType::U32)),
+                                    cap: 8,
+                                }),
+                                sp,
+                            )),
+                            name: id("q"),
+                            span: sp,
+                        },
+                        Param {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("tag"),
+                            span: sp,
+                        },
+                    ],
+                    body: Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::StateVar {
+                                    ty: ty_named("AccState"),
+                                    name: id("acc"),
+                                    init: Some(Expr::new(
+                                        ExprKind::StructLit {
+                                            module: None,
+                                            name: id("AccState"),
+                                            generic_args: vec![],
+                                            fields: vec![
+                                                FieldInit {
+                                                    name: id("total"),
+                                                    value: expr_int(100),
+                                                    span: sp,
+                                                },
+                                                FieldInit {
+                                                    name: id("hits"),
+                                                    value: expr_int(0),
+                                                    span: sp,
+                                                },
+                                            ],
+                                        },
+                                        sp,
+                                    )),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::StateVar {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("plain"),
+                                    init: Some(expr_int(1)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: w1_ptr(ty_prim(PrimType::U32)),
+                                    name: id("pp"),
+                                    init: Some(w1_addrof(expr_id("plain"))),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: Expr::new(
+                                        ExprKind::Unary {
+                                            op: UnaryOp::Deref,
+                                            expr: Box::new(expr_id("pp")),
+                                        },
+                                        sp,
+                                    ),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_int(1),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("acc"), "hits"),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_int(1),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("acc"), "total"),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_id("tag"),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: w1_field(expr_id("p"), "dr"),
+                                    op: AssignOp::Assign,
+                                    value: w1_field(expr_id("acc"), "total"),
+                                },
+                                sp,
+                            ),
+                            // q.post(tag * 1000 + (acc.hits as u32) * 10 + plain)
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("q"),
+                                    "post",
+                                    vec![w1_bin(
+                                        BinaryOp::Add,
+                                        w1_bin(BinaryOp::Mul, expr_id("tag"), expr_int(1000)),
+                                        w1_bin(
+                                            BinaryOp::Add,
+                                            w1_bin(
+                                                BinaryOp::Mul,
+                                                w1_cast(
+                                                    w1_field(expr_id("acc"), "hits"),
+                                                    ty_prim(PrimType::U32),
+                                                ),
+                                                expr_int(10),
+                                            ),
+                                            expr_id("plain"),
+                                        ),
+                                    )],
+                                )),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // isr shared_a(u32 v) / shared_b(u32 v) / mode_isr(u32 v) / sw_isr(u32 v)
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Isr(IsrDecl {
+                    attrs: vec![],
+                    vector: id("shared_a"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("v"),
+                        span: sp,
+                    }],
+                    body: Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::StateVar {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("s"),
+                                    init: Some(expr_int(0)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: expr_id("s"),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_id("v"),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("res_a"),
+                                    "set",
+                                    vec![expr_id("s")],
+                                )),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Isr(IsrDecl {
+                    attrs: vec![],
+                    vector: id("shared_b"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("v"),
+                        span: sp,
+                    }],
+                    body: Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::StateVar {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("s"),
+                                    init: Some(expr_int(10)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: expr_id("s"),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_id("v"),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("res_b"),
+                                    "set",
+                                    vec![expr_id("s")],
+                                )),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Isr(IsrDecl {
+                    attrs: vec![],
+                    vector: id("mode_isr"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("v"),
+                        span: sp,
+                    }],
+                    body: Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::StateVar {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("s"),
+                                    init: Some(expr_int(0)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Assign {
+                                    target: expr_id("s"),
+                                    op: AssignOp::AddAssign,
+                                    value: expr_id("v"),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("res_mode"),
+                                    "set",
+                                    vec![expr_id("s")],
+                                )),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Isr(IsrDecl {
+                    attrs: vec![],
+                    vector: id("sw_isr"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("v"),
+                        span: sp,
+                    }],
+                    body: Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Expr(w1_method(
+                                expr_id("res_sw"),
+                                "set",
+                                vec![expr_id("v")],
+                            )),
+                            sp,
+                        )],
+                        sp,
+                    ),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // fn bind_port(*PortRegs p, irq vec, u32 tag) { vec.attach(port_isr(p, &out_q, tag)); }
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("bind_port"),
+                    generic_params: vec![],
+                    params: vec![
+                        Param {
+                            ty: w1_ptr(ty_named("PortRegs")),
+                            name: id("p"),
+                            span: sp,
+                        },
+                        Param {
+                            ty: ty_named("irq"),
+                            name: id("vec"),
+                            span: sp,
+                        },
+                        Param {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("tag"),
+                            span: sp,
+                        },
+                    ],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Expr(w1_method(
+                                expr_id("vec"),
+                                "attach",
+                                vec![w1_call(
+                                    "port_isr",
+                                    vec![expr_id("p"), w1_addrof(expr_id("out_q")), expr_id("tag")],
+                                )],
+                            )),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            // fn main()
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    name: id("main"),
+                    generic_params: vec![],
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::Expr(w1_call(
+                                    "bind_port",
+                                    vec![w1_addrof(expr_id("PORTA")), expr_id("IRQ_PORTA"), expr_int(5)],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_call(
+                                    "bind_port",
+                                    vec![expr_id("PORTB"), expr_id("IRQ_PORTB"), expr_int(9)],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("IRQ_SHARED"),
+                                    "attach_shared",
+                                    vec![w1_call("shared_a", vec![expr_int(3)])],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("IRQ_SHARED"),
+                                    "attach_shared",
+                                    vec![w1_call("shared_b", vec![expr_int(4)])],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::If {
+                                    cond: Expr::new(ExprKind::Literal(Literal::Bool(true)), sp),
+                                    then_block: Block::new(
+                                        vec![Stmt::new(
+                                            StmtKind::Expr(w1_method(
+                                                expr_id("IRQ_COND_TRUE"),
+                                                "attach",
+                                                vec![w1_call("mode_isr", vec![expr_int(77)])],
+                                            )),
+                                            sp,
+                                        )],
+                                        sp,
+                                    ),
+                                    else_block: Some(Block::new(
+                                        vec![Stmt::new(
+                                            StmtKind::Expr(w1_method(
+                                                expr_id("IRQ_COND_TRUE"),
+                                                "attach",
+                                                vec![w1_call("mode_isr", vec![expr_int(88)])],
+                                            )),
+                                            sp,
+                                        )],
+                                        sp,
+                                    )),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::If {
+                                    cond: Expr::new(ExprKind::Literal(Literal::Bool(false)), sp),
+                                    then_block: Block::new(
+                                        vec![Stmt::new(
+                                            StmtKind::Expr(w1_method(
+                                                expr_id("IRQ_COND_UNSET"),
+                                                "attach",
+                                                vec![w1_call("mode_isr", vec![expr_int(99)])],
+                                            )),
+                                            sp,
+                                        )],
+                                        sp,
+                                    ),
+                                    else_block: None,
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("sel"),
+                                    init: Some(expr_int(2)),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Switch {
+                                    scrutinee: expr_id("sel"),
+                                    arms: vec![
+                                        SwitchArm {
+                                            pat: SwitchPat::Literal(Literal::Int(1), sp),
+                                            body: Block::new(
+                                                vec![Stmt::new(
+                                                    StmtKind::Expr(w1_method(
+                                                        expr_id("IRQ_SW"),
+                                                        "attach",
+                                                        vec![w1_call("sw_isr", vec![expr_int(111)])],
+                                                    )),
+                                                    sp,
+                                                )],
+                                                sp,
+                                            ),
+                                            span: sp,
+                                        },
+                                        SwitchArm {
+                                            pat: SwitchPat::Literal(Literal::Int(2), sp),
+                                            body: Block::new(
+                                                vec![Stmt::new(
+                                                    StmtKind::Expr(w1_method(
+                                                        expr_id("IRQ_SW"),
+                                                        "attach",
+                                                        vec![w1_call("sw_isr", vec![expr_int(222)])],
+                                                    )),
+                                                    sp,
+                                                )],
+                                                sp,
+                                            ),
+                                            span: sp,
+                                        },
+                                    ],
+                                },
+                                sp,
+                            ),
+                            // Pend IRQs!
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_PORTA")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_PORTA")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_PORTB")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_SHARED")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_SHARED")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_COND_TRUE")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_COND_UNSET")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(w1_method(
+                                    expr_id("sys"),
+                                    "pend_irq",
+                                    vec![expr_id("IRQ_SW")],
+                                )),
+                                sp,
+                            ),
+                            // Drain 3 messages from out_q and print state!
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("m0"),
+                                    init: Some(Expr::new(
+                                        ExprKind::Or {
+                                            expr: Box::new(w1_method(
+                                                expr_id("out_q"),
+                                                "try_recv",
+                                                vec![],
+                                            )),
+                                            fallback: Box::new(expr_int(0)),
+                                        },
+                                        sp,
+                                    )),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("m1"),
+                                    init: Some(Expr::new(
+                                        ExprKind::Or {
+                                            expr: Box::new(w1_method(
+                                                expr_id("out_q"),
+                                                "try_recv",
+                                                vec![],
+                                            )),
+                                            fallback: Box::new(expr_int(0)),
+                                        },
+                                        sp,
+                                    )),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("m2"),
+                                    init: Some(Expr::new(
+                                        ExprKind::Or {
+                                            expr: Box::new(w1_method(
+                                                expr_id("out_q"),
+                                                "try_recv",
+                                                vec![],
+                                            )),
+                                            fallback: Box::new(expr_int(0)),
+                                        },
+                                        sp,
+                                    )),
+                                },
+                                sp,
+                            ),
+                            w1_print_line(vec![
+                                FormatPart::Literal("ISR:".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_field(expr_id("PORTA"), "dr")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_field(expr_id("PORTB"), "dr")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(expr_id("m0")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(expr_id("m1")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(expr_id("m2")),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_method(expr_id("res_a"), "read", vec![])),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_method(expr_id("res_b"), "read", vec![])),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_method(expr_id("res_mode"), "read", vec![])),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                                FormatPart::Literal(":".to_string()),
+                                FormatPart::Hole {
+                                    expr: Box::new(w1_method(expr_id("res_sw"), "read", vec![])),
+                                    spec: FormatSpec::Default,
+                                    span: sp,
+                                },
+                            ]),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let mir = lower_program(&Program::new(items, sp)).expect("lower C99 ISR test");
+        assert!(mir.ram_report.mcu32.isr_state_bytes > 0);
+        assert!(mir.ram_report.format_table().contains("ISR Static State"));
+
+        let c_code = emit_c(&mir);
+        assert!(c_code.contains("static SYN_UNUSED void syn_isr_port_isr("));
+        assert!(c_code.contains("static SYN_UNUSED void __zev_irq_vec_20(void)"));
+        assert!(c_code.contains("static SYN_UNUSED uint8_t __zev_irq_sel_30 = 0U;"));
+
+        assert_freestanding_compiles("wave1_isr_boot_attach", &c_code);
+        let stdout = compile_and_run_clang_sanitized("wave1_isr_boot_attach", &c_code, None);
+        // PORTA.dr=110 (100+5+5), PORTB.dr=109 (100+9),
+        // m0=5012 (5*1000 + 1*10 + 2), m1=5023 (5*1000 + 2*10 + 3), m2=9012 (9*1000 + 1*10 + 2),
+        // res_a=6 (3+3), res_b=18 (10+4+4), res_mode=77, res_sw=222
+        assert!(
+            stdout.contains("ISR:110:109:5012:5023:9012:6:18:77:222\n"),
+            "stdout:\n{stdout}"
+        );
+    }
 }

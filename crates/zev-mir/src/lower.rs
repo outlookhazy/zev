@@ -6,20 +6,22 @@ use std::fmt;
 use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, DurationLit,
     ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec, IsrDecl, ItemKind, Literal,
-    OsPrimitiveType, PrimType, Priority, Program, Span, SpawnStmt, Stmt, StmtKind, SwitchPat,
-    TaskDecl, TypeExpr, TypeKind, UnaryOp,
+    MmioAccess, MmioDeclKind, MmioRegDecl, OsPrimitiveType, PrimType, Priority, Program, Span,
+    SpawnStmt, Stmt, StmtKind, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
 };
 
 use crate::ir::{
-    BlockId, MirAssignOp, MirBinOp, MirBlock, MirBootSequence, MirBootStep, MirCallDst,
-    MirChildCallSlot, MirConst, MirEnum, MirErrorSpec, MirExpr, MirExprKind, MirExternFn, MirField,
-    MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction, MirImport, MirIntFmt, MirIntrinsicOp, MirIsr,
-    MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget,
-    MirPrimitive, MirPriority, MirSpawnInstance, MirStmt, MirStruct, MirSwitchPattern,
-    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind,
-    MonomorphizedItemKind, MonomorphizedMirItem, VarId, VarRole,
+    BlockId, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootSequence, MirBootStep,
+    MirCallDst, MirChildCallSlot, MirConst, MirEnum, MirErrorSpec, MirExpr, MirExprKind,
+    MirExternFn, MirField, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction, MirImport, MirIntFmt,
+    MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl, MirIsrStateVar,
+    MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPlace, MirPrimKind,
+    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimitive, MirPriority,
+    MirSpawnInstance, MirStmt, MirStruct, MirSwitchPattern, MirTaskBlueprint, MirTerminator,
+    MirType, MirUnaryOp, MirVar, MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem,
+    VarId, VarRole,
 };
-use crate::liveness::{analyze_fn_frame, analyze_task_frame};
+use crate::liveness::{analyze_fn_frame, analyze_isr_frame, analyze_task_frame};
 use crate::ram::{populate_module_ram_report, RamReport};
 
 /// Error produced during AST -> MIR lowering if an invalid construct reaches MIR without `zev-sema`.
@@ -83,6 +85,10 @@ struct ModuleSymbols {
     enums: BTreeMap<String, Vec<(String, i64)>>,
     variant_to_enum: BTreeMap<String, (String, i64)>,
     structs: BTreeMap<String, MirStruct>,
+    mmio_layouts: BTreeMap<String, MirMmioLayout>,
+    mmio_instances: BTreeMap<String, MirMmioInstance>,
+    irqs: BTreeMap<String, u32>,
+    isrs: BTreeMap<String, Vec<MirType>>,
     consts: BTreeMap<String, MirType>,
     const_vals: BTreeMap<String, ConstVal>,
     primitives: BTreeMap<String, PrimInfo>,
@@ -94,6 +100,99 @@ struct ModuleSymbols {
 }
 
 impl ModuleSymbols {
+    fn candidate_module_names(&self, alias_or_mod: &str, item: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(path) = self.import_aliases.get(alias_or_mod) {
+            if let Some(last) = path.last() {
+                out.push(format!("{last}__{item}"));
+            }
+            out.push(format!("{}__{item}", path.join("_")));
+            out.push(format!("{}__{item}", path.join("__")));
+        }
+        out.push(format!("{alias_or_mod}__{item}"));
+        out.push(item.to_string());
+        out
+    }
+
+    fn resolve_mmio_layout_name(&self, te: &TypeExpr) -> Option<String> {
+        match &te.kind {
+            TypeKind::Named(id) => {
+                if self.mmio_layouts.contains_key(&id.name) {
+                    Some(id.name.clone())
+                } else if let Some(inst) = self.mmio_instances.get(&id.name) {
+                    Some(inst.layout.clone())
+                } else {
+                    None
+                }
+            }
+            TypeKind::Path(segs) if !segs.is_empty() => {
+                let joined_dunder = segs
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("__");
+                if self.mmio_layouts.contains_key(&joined_dunder) {
+                    return Some(joined_dunder);
+                }
+                if segs.len() == 2 {
+                    for cand in self.candidate_module_names(&segs[0].name, &segs[1].name) {
+                        if self.mmio_layouts.contains_key(&cand) {
+                            return Some(cand);
+                        }
+                        if let Some(inst) = self.mmio_instances.get(&cand) {
+                            return Some(inst.layout.clone());
+                        }
+                    }
+                }
+                let last = &segs.last().unwrap().name;
+                if self.mmio_layouts.contains_key(last) {
+                    Some(last.clone())
+                } else {
+                    self.mmio_instances.get(last).map(|i| i.layout.clone())
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_mmio_instance_field_be(
+        &self,
+        expr: &Expr,
+        scopes: &VarScopes,
+    ) -> Option<String> {
+        if let ExprKind::Field { target, field } = &expr.kind {
+            if let ExprKind::Ident(alias) = &target.kind {
+                if scopes.lookup(&alias.name).is_none()
+                    && (alias.name == "hw" || self.import_aliases.contains_key(&alias.name))
+                {
+                    for cand in self.candidate_module_names(&alias.name, &field.name) {
+                        if self.mmio_instances.contains_key(&cand) {
+                            return Some(cand);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn resolve_irq_field_be(&self, expr: &Expr, scopes: &VarScopes) -> Option<(String, u32)> {
+        if let ExprKind::Field { target, field } = &expr.kind {
+            if let ExprKind::Ident(alias) = &target.kind {
+                if scopes.lookup(&alias.name).is_none()
+                    && (alias.name == "hw" || self.import_aliases.contains_key(&alias.name))
+                {
+                    for cand in self.candidate_module_names(&alias.name, &field.name) {
+                        if let Some(&num) = self.irqs.get(&cand) {
+                            return Some((cand, num));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn resolve_type(&self, te: &TypeExpr) -> MirType {
         match &te.kind {
             TypeKind::Prim(pt) => convert_prim_type(*pt),
@@ -104,6 +203,9 @@ impl ModuleSymbols {
                 }
                 if n == "str" {
                     return MirType::Str;
+                }
+                if n == "irq" {
+                    return MirType::U32;
                 }
                 if self.enums.contains_key(n) {
                     MirType::Enum(id.name.clone())
@@ -123,6 +225,15 @@ impl ModuleSymbols {
                     }
                     if self.structs.contains_key(n) {
                         return MirType::Struct(n.clone());
+                    }
+                } else if joined.len() == 2 && self.import_aliases.contains_key(&joined[0]) {
+                    for cand in self.candidate_module_names(&joined[0], &joined[1]) {
+                        if self.enums.contains_key(&cand) {
+                            return MirType::Enum(cand);
+                        }
+                        if self.structs.contains_key(&cand) {
+                            return MirType::Struct(cand);
+                        }
                     }
                 }
                 MirType::HwPeripheral(joined.join("."))
@@ -153,7 +264,13 @@ impl ModuleSymbols {
                 let joined: Vec<String> = path.iter().map(|s| s.name.clone()).collect();
                 MirType::HwPeripheral(joined.join("."))
             }
-            TypeKind::Ptr(inner) => MirType::Ptr(Box::new(self.resolve_type(inner))),
+            TypeKind::Ptr(inner) => {
+                if let Some(layout) = self.resolve_mmio_layout_name(inner) {
+                    MirType::MmioPtr(layout)
+                } else {
+                    MirType::Ptr(Box::new(self.resolve_type(inner)))
+                }
+            }
             TypeKind::OsPrimitive(op) => MirType::Primitive(self.resolve_os_prim_type(op)),
             TypeKind::FnPtr { params, ret } => MirType::FnPtr {
                 params: params.iter().map(|p| self.resolve_type(p)).collect(),
@@ -317,6 +434,10 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         enums: BTreeMap::new(),
         variant_to_enum: BTreeMap::new(),
         structs: BTreeMap::new(),
+        mmio_layouts: BTreeMap::new(),
+        mmio_instances: BTreeMap::new(),
+        irqs: BTreeMap::new(),
+        isrs: BTreeMap::new(),
         consts: BTreeMap::new(),
         const_vals: BTreeMap::new(),
         primitives: BTreeMap::new(),
@@ -376,11 +497,98 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         });
     }
 
-    // Pre-seed constant values so `[CONST_N]T` inside Struct fields can evaluate `ArrayLen::Expr`.
+    // Pre-seed constant values (fixpoint loop so forward-referenced consts evaluate too)
+    // before `Mmio`, `Irq`, and `[CONST_N]T` inside Struct fields.
+    for _ in 0..program.items.len().max(1) {
+        let mut progress = false;
+        for item in &program.items {
+            if let ItemKind::Const(cd) = &item.kind {
+                if !syms.const_vals.contains_key(&cd.name.name) {
+                    if let Some(cv) = eval_const_expr(&cd.value, &syms) {
+                        syms.const_vals.insert(cd.name.name.clone(), cv);
+                        progress = true;
+                    }
+                }
+            }
+        }
+        if !progress {
+            break;
+        }
+    }
+
+    // Pass 1a.5: Lower `ItemKind::Irq` and `ItemKind::Mmio` (layouts & inline first, then instances).
     for item in &program.items {
-        if let ItemKind::Const(cd) = &item.kind {
-            if let Some(cv) = eval_const_expr(&cd.value, &syms) {
-                syms.const_vals.insert(cd.name.name.clone(), cv);
+        if let ItemKind::Irq(iq) = &item.kind {
+            let num = eval_const_u32(&iq.number, &syms, "IRQ number", iq.span)?;
+            syms.irqs.insert(iq.name.name.clone(), num);
+        }
+    }
+
+    let mut mir_mmio_layouts = Vec::new();
+    for item in &program.items {
+        if let ItemKind::Mmio(md) = &item.kind {
+            match &md.kind {
+                MmioDeclKind::Layout { regs } => {
+                    let (mir_regs, byte_size) = lower_mmio_regs(regs, &syms)?;
+                    let layout = MirMmioLayout {
+                        name: md.name.name.clone(),
+                        byte_size,
+                        regs: mir_regs,
+                    };
+                    syms.mmio_layouts.insert(md.name.name.clone(), layout.clone());
+                    mir_mmio_layouts.push(layout);
+                }
+                MmioDeclKind::Inline { regs, .. } => {
+                    let (mir_regs, byte_size) = lower_mmio_regs(regs, &syms)?;
+                    let layout = MirMmioLayout {
+                        name: md.name.name.clone(),
+                        byte_size,
+                        regs: mir_regs,
+                    };
+                    syms.mmio_layouts.insert(md.name.name.clone(), layout.clone());
+                    mir_mmio_layouts.push(layout);
+                }
+                MmioDeclKind::Instance { .. } => {}
+            }
+        }
+    }
+
+    let mut mir_mmio_instances = Vec::new();
+    for item in &program.items {
+        if let ItemKind::Mmio(md) = &item.kind {
+            match &md.kind {
+                MmioDeclKind::Instance { layout, base_addr } => {
+                    let layout_name = syms.resolve_mmio_layout_name(layout).ok_or_else(|| MirLowerError {
+                        message: format!(
+                            "unknown MMIO layout for instance `{}`",
+                            md.name.name
+                        ),
+                        span: md.span,
+                    })?;
+                    let byte_size = syms.mmio_layouts[&layout_name].byte_size;
+                    let addr = eval_const_u64(base_addr, &syms, "MMIO base address", md.span)?;
+                    let inst = MirMmioInstance {
+                        name: md.name.name.clone(),
+                        layout: layout_name,
+                        base_addr: addr,
+                        byte_size,
+                    };
+                    syms.mmio_instances.insert(md.name.name.clone(), inst.clone());
+                    mir_mmio_instances.push(inst);
+                }
+                MmioDeclKind::Inline { base_addr, .. } => {
+                    let byte_size = syms.mmio_layouts[&md.name.name].byte_size;
+                    let addr = eval_const_u64(base_addr, &syms, "MMIO base address", md.span)?;
+                    let inst = MirMmioInstance {
+                        name: md.name.name.clone(),
+                        layout: md.name.name.clone(),
+                        base_addr: addr,
+                        byte_size,
+                    };
+                    syms.mmio_instances.insert(md.name.name.clone(), inst.clone());
+                    mir_mmio_instances.push(inst);
+                }
+                MmioDeclKind::Layout { .. } => {}
             }
         }
     }
@@ -554,6 +762,9 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                 raw_task_decls.push(td);
             }
             ItemKind::Isr(id) => {
+                let params: Vec<MirType> =
+                    id.params.iter().map(|p| syms.resolve_type(&p.ty)).collect();
+                syms.isrs.insert(id.vector.name.clone(), params);
                 raw_isr_decls.push(id);
             }
             ItemKind::GlobalVar(gv) => {
@@ -629,19 +840,28 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         }
     }
 
-    // Pass 4: Lower ISRs (`noyield` direct statements).
+    // Pass 4: Lower ISRs (`noyield` direct statements, optional params & `state` vars).
     let mut mir_isrs = Vec::new();
     for id in raw_isr_decls {
         let mut dctx = DirectLowerCtx::new(&syms, MirType::Void, MirErrorSpec::None);
         dctx.in_noyield = true;
+        dctx.in_isr = true;
+        let mut param_ids = Vec::new();
+        for p in &id.params {
+            let pty = syms.resolve_type(&p.ty);
+            let vid = dctx.declare_var(&p.name.name, pty, VarRole::Param);
+            param_ids.push(vid);
+        }
         let body = dctx.lower_top_level_stmts(&id.body.stmts)?;
-        mir_isrs.push(MirIsr {
+        let mut mir_isr = MirIsr {
             name: id.vector.name.clone(),
-            params: Vec::new(),
-            state_vars: Vec::new(),
+            params: param_ids,
+            state_vars: dctx.isr_state_vars,
             vars: dctx.vars,
             body,
-        });
+        };
+        analyze_isr_frame(&mut mir_isr);
+        mir_isrs.push(mir_isr);
     }
 
     // Pass 5: Lower Functions (Direct non-yielding, Coroutine yielding, and `__noyield` SoftYielding clones).
@@ -751,15 +971,18 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         mir_blueprints.push(bp);
     }
 
-    // Pass 7: Lower `fn main()` into Sequential Boot + Static Spawn Slots + Optional Supervisor Task.
+    // Pass 7: Lower `fn main()` into Sequential Boot + Static Spawn Slots + IRQ Vectors + Optional Supervisor Task.
     let mut spawned_tasks = Vec::new();
+    let mut mir_irq_vectors = Vec::new();
     let boot = if let Some(md) = main_decl {
         lower_main_entry(
             md,
             &syms,
             &fn_decl_map,
+            &mir_isrs,
             &mut mir_blueprints,
             &mut spawned_tasks,
+            &mut mir_irq_vectors,
         )?
     } else {
         MirBootSequence {
@@ -782,12 +1005,12 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         consts: mir_consts,
         enums: mir_enums,
         structs: mir_structs,
-        mmio_layouts: Vec::new(),
-        mmio_instances: Vec::new(),
+        mmio_layouts: mir_mmio_layouts,
+        mmio_instances: mir_mmio_instances,
         primitives: mir_primitives,
         extern_fns: mir_extern_fns,
         isrs: mir_isrs,
-        irq_vectors: Vec::new(),
+        irq_vectors: mir_irq_vectors,
         functions: mir_functions,
         task_blueprints: mir_blueprints,
         spawned_tasks,
@@ -1232,7 +1455,7 @@ fn scan_stmts_effect(
                 if !in_noyield && !in_restricted {
                     *eff = (*eff).max(MirFnEffect::HardBlocking);
                 }
-                scan_expr_effect(caller, period, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, period, in_noyield, in_restricted, eff, spawns, edges);
                 scan_stmts_effect(
                     caller,
                     &body.stmts,
@@ -1270,7 +1493,7 @@ fn scan_stmts_effect(
                 );
             }
             StmtKind::While { cond, body } => {
-                scan_expr_effect(caller, cond, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, cond, in_noyield, in_restricted, eff, spawns, edges);
                 let is_while_true = matches!(cond.kind, ExprKind::Literal(Literal::Bool(true)));
                 if is_while_true && !in_noyield && !in_restricted {
                     let has_break = ast_block_has_break(body);
@@ -1294,8 +1517,8 @@ fn scan_stmts_effect(
             StmtKind::ForRange {
                 start, end, body, ..
             } => {
-                scan_expr_effect(caller, start, in_noyield, in_restricted, eff, edges);
-                scan_expr_effect(caller, end, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, start, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(caller, end, in_noyield, in_restricted, eff, spawns, edges);
                 scan_stmts_effect(
                     caller,
                     &body.stmts,
@@ -1308,7 +1531,7 @@ fn scan_stmts_effect(
                 );
             }
             StmtKind::ForEach { iter, body, .. } => {
-                scan_expr_effect(caller, iter, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, iter, in_noyield, in_restricted, eff, spawns, edges);
                 scan_stmts_effect(
                     caller,
                     &body.stmts,
@@ -1361,7 +1584,7 @@ fn scan_stmts_effect(
                 then_block,
                 else_block,
             } => {
-                scan_expr_effect(caller, cond, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, cond, in_noyield, in_restricted, eff, spawns, edges);
                 scan_stmts_effect(
                     caller,
                     &then_block.stmts,
@@ -1386,7 +1609,7 @@ fn scan_stmts_effect(
                 }
             }
             StmtKind::Switch { scrutinee, arms } => {
-                scan_expr_effect(caller, scrutinee, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, scrutinee, in_noyield, in_restricted, eff, spawns, edges);
                 for arm in arms {
                     scan_stmts_effect(
                         caller,
@@ -1415,24 +1638,24 @@ fn scan_stmts_effect(
             StmtKind::VarDecl { init: Some(e), .. }
             | StmtKind::Return(Some(e))
             | StmtKind::Expr(e) => {
-                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, spawns, edges);
             }
             StmtKind::Assign { target, value, .. } => {
-                scan_expr_effect(caller, target, in_noyield, in_restricted, eff, edges);
-                scan_expr_effect(caller, value, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, target, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(caller, value, in_noyield, in_restricted, eff, spawns, edges);
             }
             StmtKind::Error { reason, partial } => {
                 if let Some(r) = reason {
-                    scan_expr_effect(caller, r, in_noyield, in_restricted, eff, edges);
+                    scan_expr_effect(caller, r, in_noyield, in_restricted, eff, spawns, edges);
                 }
                 if let Some(p) = partial {
-                    scan_expr_effect(caller, p, in_noyield, in_restricted, eff, edges);
+                    scan_expr_effect(caller, p, in_noyield, in_restricted, eff, spawns, edges);
                 }
             }
             StmtKind::Spawn(sp) => {
                 *spawns = true;
                 for a in &sp.args {
-                    scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, edges);
+                    scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, spawns, edges);
                 }
             }
             StmtKind::VarDecl { init: None, .. }
@@ -1449,6 +1672,7 @@ fn scan_expr_effect(
     in_noyield: bool,
     in_restricted: bool,
     eff: &mut MirFnEffect,
+    spawns: &mut bool,
     edges: &mut Vec<RawCallEdge>,
 ) {
     match &expr.kind {
@@ -1475,9 +1699,9 @@ fn scan_expr_effect(
                     }
                 }
             }
-            scan_expr_effect(caller, callee, in_noyield, in_restricted, eff, edges);
+            scan_expr_effect(caller, callee, in_noyield, in_restricted, eff, spawns, edges);
             for a in args {
-                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, spawns, edges);
             }
         }
         ExprKind::MethodCall {
@@ -1486,6 +1710,9 @@ fn scan_expr_effect(
             args,
         } => {
             let m = method.name.as_str();
+            if matches!(m, "attach" | "attach_shared") {
+                *spawns = true;
+            }
             if matches!(
                 m,
                 "wait_chunk" | "recv" | "wait" | "send" | "delay" | "wait_change"
@@ -1494,15 +1721,15 @@ fn scan_expr_effect(
             {
                 *eff = (*eff).max(MirFnEffect::HardBlocking);
             }
-            scan_expr_effect(caller, receiver, in_noyield, in_restricted, eff, edges);
+            scan_expr_effect(caller, receiver, in_noyield, in_restricted, eff, spawns, edges);
             for a in args {
-                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, spawns, edges);
             }
         }
         ExprKind::Unary { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. }
         | ExprKind::Field { target: inner, .. } => {
-            scan_expr_effect(caller, inner, in_noyield, in_restricted, eff, edges);
+            scan_expr_effect(caller, inner, in_noyield, in_restricted, eff, spawns, edges);
         }
         ExprKind::Binary { lhs, rhs, .. }
         | ExprKind::Index {
@@ -1513,38 +1740,37 @@ fn scan_expr_effect(
             expr: lhs,
             fallback: rhs,
         } => {
-            scan_expr_effect(caller, lhs, in_noyield, in_restricted, eff, edges);
-            scan_expr_effect(caller, rhs, in_noyield, in_restricted, eff, edges);
+            scan_expr_effect(caller, lhs, in_noyield, in_restricted, eff, spawns, edges);
+            scan_expr_effect(caller, rhs, in_noyield, in_restricted, eff, spawns, edges);
         }
         ExprKind::Slice { target, start, end } => {
-            scan_expr_effect(caller, target, in_noyield, in_restricted, eff, edges);
+            scan_expr_effect(caller, target, in_noyield, in_restricted, eff, spawns, edges);
             if let Some(s) = start {
-                scan_expr_effect(caller, s, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, s, in_noyield, in_restricted, eff, spawns, edges);
             }
             if let Some(e) = end {
-                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, spawns, edges);
             }
         }
         ExprKind::StructLit { fields, .. } => {
             for f in fields {
-                scan_expr_effect(caller, &f.value, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, &f.value, in_noyield, in_restricted, eff, spawns, edges);
             }
         }
         ExprKind::ArrayLit(elems) => {
             for e in elems {
-                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, edges);
+                scan_expr_effect(caller, e, in_noyield, in_restricted, eff, spawns, edges);
             }
         }
         ExprKind::FormatString(parts) => {
             for part in parts {
                 if let FormatPart::Hole { expr: he, .. } = part {
-                    scan_expr_effect(caller, he, in_noyield, in_restricted, eff, edges);
+                    scan_expr_effect(caller, he, in_noyield, in_restricted, eff, spawns, edges);
                 }
             }
         }
         ExprKind::Catch { expr: inner, clause } => {
-            scan_expr_effect(caller, inner, in_noyield, in_restricted, eff, edges);
-            let mut dummy_sp = false;
+            scan_expr_effect(caller, inner, in_noyield, in_restricted, eff, spawns, edges);
             scan_stmts_effect(
                 caller,
                 &clause.body.stmts,
@@ -1552,7 +1778,7 @@ fn scan_expr_effect(
                 in_noyield,
                 in_restricted,
                 eff,
-                &mut dummy_sp,
+                spawns,
                 edges,
             );
         }
@@ -1639,7 +1865,14 @@ fn expr_contains_boot_spawn(expr: &Expr, syms: &ModuleSymbols) -> bool {
             expr_contains_boot_spawn(callee, syms)
                 || args.iter().any(|a| expr_contains_boot_spawn(&a.value, syms))
         }
-        ExprKind::MethodCall { receiver, args, .. } => {
+        ExprKind::MethodCall {
+            receiver,
+            method,
+            args,
+        } => {
+            if matches!(method.name.as_str(), "attach" | "attach_shared") {
+                return true;
+            }
             expr_contains_boot_spawn(receiver, syms)
                 || args.iter().any(|a| expr_contains_boot_spawn(&a.value, syms))
         }
@@ -1692,26 +1925,390 @@ fn detect_static_set_priority(stmts: &[Stmt]) -> Option<MirPriority> {
     None
 }
 
+struct BootIrqBindingRec {
+    branch_path: Vec<(usize, usize)>,
+    binding: MirIrqBinding,
+}
+
+struct BootIrqVectorAcc {
+    irq_name: String,
+    irq_num: u32,
+    is_shared: bool,
+    selector_symbol: Option<String>,
+    next_selector_val: u8,
+    branch_selectors: Vec<(Vec<(usize, usize)>, u8)>,
+    records: Vec<BootIrqBindingRec>,
+}
+
 struct BootSpawnState<'a> {
     fn_decls: &'a BTreeMap<String, &'a FnDecl>,
+    mir_isrs: &'a [MirIsr],
     spawned_tasks: &'a mut Vec<MirSpawnInstance>,
+    irq_vectors: &'a mut BTreeMap<u32, BootIrqVectorAcc>,
     bp_instance_counts: BTreeMap<String, usize>,
     provenance_stack: Vec<String>,
     branch_depth: usize,
+    branch_stack: Vec<(usize, usize)>,
+    next_branch_id: usize,
+    loop_depth: usize,
+    next_binding_id: usize,
+    irq_param_bindings: BTreeMap<String, (String, u32)>,
+}
+
+fn is_const_mir_expr(expr: &MirExpr) -> bool {
+    match &expr.kind {
+        MirExprKind::IntLit(_)
+        | MirExprKind::FloatLit(_)
+        | MirExprKind::BoolLit(_)
+        | MirExprKind::StringLit(_)
+        | MirExprKind::TicksLit(_)
+        | MirExprKind::EnumVariant { .. }
+        | MirExprKind::GlobalPrimAddr(_)
+        | MirExprKind::FnAddr(_)
+        | MirExprKind::MmioAddr(_)
+        | MirExprKind::ConstRef(_) => true,
+        MirExprKind::Unary { expr, .. } | MirExprKind::Cast { expr, .. } => {
+            is_const_mir_expr(expr)
+        }
+        MirExprKind::Binary { lhs, rhs, .. } => {
+            is_const_mir_expr(lhs) && is_const_mir_expr(rhs)
+        }
+        MirExprKind::StructLit { fields, .. } => {
+            fields.iter().all(|(_, e, _)| is_const_mir_expr(e))
+        }
+        MirExprKind::ArrayLit { elems, .. } => elems.iter().all(is_const_mir_expr),
+        _ => false,
+    }
+}
+
+fn resolve_boot_const_expr(expr: &MirExpr, env: &BTreeMap<VarId, MirExpr>) -> MirExpr {
+    match &expr.kind {
+        MirExprKind::Var(vid) => env.get(vid).cloned().unwrap_or_else(|| expr.clone()),
+        MirExprKind::Unary { op, expr: inner } => MirExpr::new(
+            MirExprKind::Unary {
+                op: *op,
+                expr: Box::new(resolve_boot_const_expr(inner, env)),
+            },
+            expr.ty.clone(),
+        ),
+        MirExprKind::Binary { op, lhs, rhs } => MirExpr::new(
+            MirExprKind::Binary {
+                op: *op,
+                lhs: Box::new(resolve_boot_const_expr(lhs, env)),
+                rhs: Box::new(resolve_boot_const_expr(rhs, env)),
+            },
+            expr.ty.clone(),
+        ),
+        MirExprKind::Cast {
+            expr: inner,
+            target_ty,
+        } => MirExpr::new(
+            MirExprKind::Cast {
+                expr: Box::new(resolve_boot_const_expr(inner, env)),
+                target_ty: target_ty.clone(),
+            },
+            expr.ty.clone(),
+        ),
+        MirExprKind::StructLit {
+            struct_name,
+            packed,
+            fields,
+        } => MirExpr::new(
+            MirExprKind::StructLit {
+                struct_name: struct_name.clone(),
+                packed: *packed,
+                fields: fields
+                    .iter()
+                    .map(|(k, v, t)| (k.clone(), resolve_boot_const_expr(v, env), t.clone()))
+                    .collect(),
+            },
+            expr.ty.clone(),
+        ),
+        MirExprKind::ArrayLit { elems, elem_ty } => MirExpr::new(
+            MirExprKind::ArrayLit {
+                elems: elems
+                    .iter()
+                    .map(|e| resolve_boot_const_expr(e, env))
+                    .collect(),
+                elem_ty: elem_ty.clone(),
+            },
+            expr.ty.clone(),
+        ),
+        _ => expr.clone(),
+    }
+}
+
+fn zero_init_expr(ty: &MirType, syms: &ModuleSymbols) -> MirExpr {
+    match ty {
+        MirType::Bool => MirExpr::new(MirExprKind::BoolLit(false), MirType::Bool),
+        MirType::F32 | MirType::F64 => MirExpr::new(MirExprKind::FloatLit(0), ty.clone()),
+        MirType::U8
+        | MirType::U16
+        | MirType::U32
+        | MirType::U64
+        | MirType::Usize
+        | MirType::I8
+        | MirType::I16
+        | MirType::I32
+        | MirType::I64
+        | MirType::Isize => MirExpr::new(MirExprKind::IntLit(0), ty.clone()),
+        MirType::EndianInt { .. } => {
+            MirExpr::new(MirExprKind::IntLit(0), ty.host_value_type())
+        }
+        MirType::Enum(name) => {
+            if let Some(en) = syms.enums.get(name) {
+                if let Some((first_name, _)) = en.first() {
+                    return MirExpr::new(
+                        MirExprKind::EnumVariant {
+                            enum_name: name.clone(),
+                            variant: first_name.clone(),
+                        },
+                        ty.clone(),
+                    );
+                }
+            }
+            MirExpr::new(MirExprKind::IntLit(0), ty.clone())
+        }
+        MirType::Array { elem, len } => {
+            let z = zero_init_expr(elem, syms);
+            MirExpr::new(
+                MirExprKind::ArrayLit {
+                    elems: std::iter::repeat(z).take(*len).collect(),
+                    elem_ty: (**elem).clone(),
+                },
+                ty.clone(),
+            )
+        }
+        MirType::Struct(name) => {
+            let (packed, fields) = syms
+                .structs
+                .get(name)
+                .map(|st| {
+                    (
+                        st.packed,
+                        st.fields
+                            .iter()
+                            .map(|f| (f.name.clone(), zero_init_expr(&f.ty, syms), f.ty.clone()))
+                            .collect(),
+                    )
+                })
+                .unwrap_or((false, Vec::new()));
+            MirExpr::new(
+                MirExprKind::StructLit {
+                    struct_name: name.clone(),
+                    packed,
+                    fields,
+                },
+                ty.clone(),
+            )
+        }
+        _ => MirExpr::new(MirExprKind::IntLit(0), ty.clone()),
+    }
+}
+
+fn place_root_var(place: &MirPlace) -> Option<VarId> {
+    match place {
+        MirPlace::Var(vid) => Some(*vid),
+        MirPlace::Field { base, .. } | MirPlace::Index { base, .. } => place_root_var(base),
+        MirPlace::Deref(_, _) => None,
+    }
+}
+
+fn paths_mutually_exclusive(a: &[(usize, usize)], b: &[(usize, usize)]) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .any(|((ba, aa), (bb, ab))| ba == bb && aa != ab)
+}
+
+impl<'a> BootSpawnState<'a> {
+    fn attach_irq(
+        &mut self,
+        irq_name: &str,
+        irq_num: u32,
+        is_shared: bool,
+        handler_name: &str,
+        baked_args: Vec<MirBakedArg>,
+        span: Span,
+    ) -> Result<Option<MirStmt>, MirLowerError> {
+        if self.loop_depth > 0 {
+            return Err(MirLowerError {
+                message: format!(
+                    "IRQ `.{}` cannot be called inside a loop",
+                    if is_shared { "attach_shared" } else { "attach" }
+                ),
+                span,
+            });
+        }
+        let isr_decl = self
+            .mir_isrs
+            .iter()
+            .find(|isr| isr.name == handler_name)
+            .ok_or_else(|| MirLowerError {
+                message: format!("unknown ISR handler `{handler_name}` in IRQ attachment"),
+                span,
+            })?;
+        if baked_args.len() != isr_decl.params.len() {
+            return Err(MirLowerError {
+                message: format!(
+                    "ISR `{handler_name}` expects {} argument(s), got {}",
+                    isr_decl.params.len(),
+                    baked_args.len()
+                ),
+                span,
+            });
+        }
+
+        let binding_id = self.next_binding_id;
+        self.next_binding_id += 1;
+        let state_vars: Vec<MirIsrStateVar> = isr_decl
+            .state_vars
+            .iter()
+            .map(|sv| MirIsrStateVar {
+                storage_symbol: format!(
+                    "__zev_isr_state_{}_{}",
+                    binding_id,
+                    sanitize_ident(&sv.name)
+                ),
+                var_name: sv.name.clone(),
+                ty: sv.ty.clone(),
+                init: sv.init.clone(),
+            })
+            .collect();
+
+        let acc = self
+            .irq_vectors
+            .entry(irq_num)
+            .or_insert_with(|| BootIrqVectorAcc {
+                irq_name: irq_name.to_string(),
+                irq_num,
+                is_shared,
+                selector_symbol: None,
+                next_selector_val: 1,
+                branch_selectors: Vec::new(),
+                records: Vec::new(),
+            });
+        if acc.is_shared != is_shared {
+            return Err(MirLowerError {
+                message: format!(
+                    "cannot mix `.attach` and `.attach_shared` on IRQ `{}` ({})",
+                    acc.irq_name, irq_num
+                ),
+                span,
+            });
+        }
+
+        let mut emit_sel_stmt = None;
+        let cond_selector = if !is_shared {
+            for rec in &acc.records {
+                if !paths_mutually_exclusive(&self.branch_stack, &rec.branch_path) {
+                    return Err(MirLowerError {
+                        message: format!(
+                            "conflicting `.attach` calls on IRQ `{}` ({}); use `.attach_shared` or mutually exclusive boot branches",
+                            acc.irq_name, irq_num
+                        ),
+                        span,
+                    });
+                }
+            }
+            if self.branch_depth > 0 {
+                let sel_sym = acc
+                    .selector_symbol
+                    .get_or_insert_with(|| format!("__zev_irq_sel_{irq_num}"))
+                    .clone();
+                let sel_val = acc.next_selector_val;
+                acc.next_selector_val =
+                    acc.next_selector_val
+                        .checked_add(1)
+                        .ok_or_else(|| MirLowerError {
+                            message: format!(
+                                "too many conditional `.attach` branches on IRQ `{irq_num}`"
+                            ),
+                            span,
+                        })?;
+                acc.branch_selectors
+                    .push((self.branch_stack.clone(), sel_val));
+                emit_sel_stmt = Some(MirStmt::SetIrqSelector {
+                    symbol: sel_sym.clone(),
+                    value: sel_val,
+                });
+                Some((sel_sym, sel_val))
+            } else {
+                None
+            }
+        } else if self.branch_depth > 0 {
+            if let Some((_, existing_val)) = acc
+                .branch_selectors
+                .iter()
+                .find(|(bp, _)| *bp == self.branch_stack)
+            {
+                let sel_sym = acc.selector_symbol.as_ref().unwrap().clone();
+                Some((sel_sym, *existing_val))
+            } else {
+                for (bp, _) in &acc.branch_selectors {
+                    if !paths_mutually_exclusive(&self.branch_stack, bp) {
+                        return Err(MirLowerError {
+                            message: format!(
+                                "conditional `.attach_shared` calls on IRQ `{}` ({}) must share the same branch or be mutually exclusive",
+                                acc.irq_name, irq_num
+                            ),
+                            span,
+                        });
+                    }
+                }
+                let sel_sym = acc
+                    .selector_symbol
+                    .get_or_insert_with(|| format!("__zev_irq_sel_{irq_num}"))
+                    .clone();
+                let sel_val = acc.next_selector_val;
+                acc.next_selector_val =
+                    acc.next_selector_val
+                        .checked_add(1)
+                        .ok_or_else(|| MirLowerError {
+                            message: format!(
+                                "too many conditional `.attach_shared` branches on IRQ `{irq_num}`"
+                            ),
+                            span,
+                        })?;
+                acc.branch_selectors
+                    .push((self.branch_stack.clone(), sel_val));
+                emit_sel_stmt = Some(MirStmt::SetIrqSelector {
+                    symbol: sel_sym.clone(),
+                    value: sel_val,
+                });
+                Some((sel_sym, sel_val))
+            }
+        } else {
+            None
+        };
+
+        acc.records.push(BootIrqBindingRec {
+            branch_path: self.branch_stack.clone(),
+            binding: MirIrqBinding {
+                binding_id,
+                isr_name: handler_name.to_string(),
+                baked_args,
+                state_vars,
+                cond_selector,
+            },
+        });
+        Ok(emit_sel_stmt)
+    }
 }
 
 fn lower_main_entry<'a>(
     md: &FnDecl,
     syms: &'a ModuleSymbols,
     fn_decls: &'a BTreeMap<String, &'a FnDecl>,
+    mir_isrs: &'a [MirIsr],
     blueprints: &mut Vec<MirTaskBlueprint>,
     spawned_tasks: &mut Vec<MirSpawnInstance>,
+    mir_irq_vectors: &mut Vec<MirIrqVector>,
 ) -> Result<MirBootSequence, MirLowerError> {
     let body = md.body.as_ref().unwrap();
     let stmts = &body.stmts;
     let manual_yield = has_attr_manual_yield(&md.attrs);
 
-    // Locate the last top-level boot statement containing a `spawn` (directly, conditionally, or via boot helper).
+    // Locate the last top-level boot statement containing a `spawn` or IRQ `.attach` (directly, conditionally, or via boot helper).
     let last_spawn_idx = stmts
         .iter()
         .rposition(|s| stmt_contains_boot_spawn(s, syms));
@@ -1736,6 +2333,7 @@ fn lower_main_entry<'a>(
 
     let mut boot_steps: Vec<MirBootStep> = Vec::new();
     let mut boot_yielding_callees: BTreeSet<String> = BTreeSet::new();
+    let mut irq_vectors_acc: BTreeMap<u32, BootIrqVectorAcc> = BTreeMap::new();
 
     let combined_boot_iter: Vec<&Stmt> = if tail_becomes_task {
         boot_slice.iter().collect()
@@ -1746,10 +2344,17 @@ fn lower_main_entry<'a>(
     let boot_vars = {
         let boot_state = BootSpawnState {
             fn_decls,
+            mir_isrs,
             spawned_tasks,
+            irq_vectors: &mut irq_vectors_acc,
             bp_instance_counts: BTreeMap::new(),
             provenance_stack: vec!["main".to_string()],
             branch_depth: 0,
+            branch_stack: Vec::new(),
+            next_branch_id: 0,
+            loop_depth: 0,
+            next_binding_id: 0,
+            irq_param_bindings: BTreeMap::new(),
         };
         let mut dctx = DirectLowerCtx::new_with_boot(
             syms,
@@ -1857,6 +2462,16 @@ fn lower_main_entry<'a>(
 
     let (boot_vars_vec, root_scope_map) = boot_vars;
 
+    for (_, acc) in irq_vectors_acc {
+        mir_irq_vectors.push(MirIrqVector {
+            irq_name: acc.irq_name,
+            irq_num: acc.irq_num,
+            is_shared: acc.is_shared,
+            selector_symbol: acc.selector_symbol,
+            bindings: acc.records.into_iter().map(|r| r.binding).collect(),
+        });
+    }
+
     if tail_becomes_task {
         // Forward any root `main` boot variables referenced inside `tail_slice` into `main` supervisor's frame!
         let mut tail_ident_refs = BTreeSet::new();
@@ -1939,9 +2554,14 @@ fn is_yielding_fn_callee(callee: &Expr, syms: &ModuleSymbols) -> bool {
 fn is_pure_boot_setup_stmt(stmt: &Stmt) -> bool {
     match &stmt.kind {
         StmtKind::Expr(Expr {
-            kind: ExprKind::MethodCall { receiver, .. },
+            kind: ExprKind::MethodCall {
+                receiver, method, ..
+            },
             ..
         }) => {
+            if matches!(method.name.as_str(), "attach" | "attach_shared") {
+                return true;
+            }
             if let ExprKind::Ident(id) = &receiver.kind {
                 id.name == "sys" || id.name == "hw"
             } else {
@@ -2172,6 +2792,144 @@ fn convert_bin_op(op: BinaryOp) -> MirBinOp {
     }
 }
 
+fn sanitize_ident(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
+fn eval_const_u32(
+    expr: &Expr,
+    syms: &ModuleSymbols,
+    what: &str,
+    span: Span,
+) -> Result<u32, MirLowerError> {
+    match eval_const_expr(expr, syms) {
+        Some(ConstVal::Int(v)) => u32::try_from(v).map_err(|_| MirLowerError {
+            message: format!("{what} `{v}` is out of `u32` range"),
+            span,
+        }),
+        _ => Err(MirLowerError {
+            message: format!("{what} must be a compile-time integer constant"),
+            span,
+        }),
+    }
+}
+
+fn eval_const_u64(
+    expr: &Expr,
+    syms: &ModuleSymbols,
+    what: &str,
+    span: Span,
+) -> Result<u64, MirLowerError> {
+    match eval_const_expr(expr, syms) {
+        Some(ConstVal::Int(v)) => u64::try_from(v).map_err(|_| MirLowerError {
+            message: format!("{what} `{v}` is out of `u64` range"),
+            span,
+        }),
+        _ => Err(MirLowerError {
+            message: format!("{what} must be a compile-time integer constant"),
+            span,
+        }),
+    }
+}
+
+fn mmio_elem_bits_from_type(ty: &TypeExpr, span: Span) -> Result<u8, MirLowerError> {
+    match &ty.kind {
+        TypeKind::Prim(PrimType::U8) => Ok(8),
+        TypeKind::Prim(PrimType::U16) => Ok(16),
+        TypeKind::Prim(PrimType::U32) => Ok(32),
+        TypeKind::Named(id) => match id.name.as_str() {
+            "u8" => Ok(8),
+            "u16" => Ok(16),
+            "u32" => Ok(32),
+            _ => Err(MirLowerError {
+                message: format!(
+                    "MMIO register element type `{}` must be `u8`, `u16`, or `u32`",
+                    id.name
+                ),
+                span,
+            }),
+        },
+        _ => Err(MirLowerError {
+            message: "MMIO register element type must be `u8`, `u16`, or `u32`".to_string(),
+            span,
+        }),
+    }
+}
+
+fn lower_mmio_regs(
+    regs: &[MmioRegDecl],
+    syms: &ModuleSymbols,
+) -> Result<(Vec<MirMmioReg>, usize), MirLowerError> {
+    let mut out = Vec::with_capacity(regs.len());
+    let mut byte_size = 0usize;
+    for r in regs {
+        let access = match r.access {
+            MmioAccess::Rw => MirMmioAccess::Rw,
+            MmioAccess::Ro => MirMmioAccess::Ro,
+            MmioAccess::Wo => MirMmioAccess::Wo,
+            MmioAccess::W1c => MirMmioAccess::W1c,
+        };
+        let (elem_bits, array_len) = match &r.ty.kind {
+            TypeKind::Array { elem, len } => {
+                let bits = mmio_elem_bits_from_type(elem, r.span)?;
+                let n = match len {
+                    ArrayLen::Fixed(n) => *n,
+                    ArrayLen::Expr(e) => match eval_const_expr(e, syms) {
+                        Some(ConstVal::Int(v)) if v > 0 => v as usize,
+                        _ => {
+                            return Err(MirLowerError {
+                                message: format!(
+                                    "MMIO register array `{}` length must be a positive constant",
+                                    r.name.name
+                                ),
+                                span: r.span,
+                            });
+                        }
+                    },
+                };
+                if n == 0 {
+                    return Err(MirLowerError {
+                        message: format!(
+                            "MMIO register array `{}` length must be greater than zero",
+                            r.name.name
+                        ),
+                        span: r.span,
+                    });
+                }
+                (bits, Some(n))
+            }
+            _ => (mmio_elem_bits_from_type(&r.ty, r.span)?, None),
+        };
+        let offset = eval_const_u32(&r.offset, syms, "MMIO register offset", r.span)?;
+        let reg_bytes = (elem_bits as usize / 8) * array_len.unwrap_or(1);
+        let end = (offset as usize).checked_add(reg_bytes).ok_or_else(|| MirLowerError {
+            message: format!("MMIO register `{}` offset overflow", r.name.name),
+            span: r.span,
+        })?;
+        if end > byte_size {
+            byte_size = end;
+        }
+        out.push(MirMmioReg {
+            name: r.name.name.clone(),
+            access,
+            elem_bits,
+            array_len,
+            offset,
+        });
+    }
+    Ok((out, byte_size))
+}
+
+fn mmio_elem_mir_type(elem_bits: u8) -> MirType {
+    match elem_bits {
+        8 => MirType::U8,
+        16 => MirType::U16,
+        _ => MirType::U32,
+    }
+}
+
 fn try_extract_hw_path(expr: &Expr, syms: &ModuleSymbols) -> Option<Vec<String>> {
     match &expr.kind {
         ExprKind::Ident(id) if syms.is_hw_root(&id.name) => Some(vec![id.name.clone()]),
@@ -2182,6 +2940,27 @@ fn try_extract_hw_path(expr: &Expr, syms: &ModuleSymbols) -> Option<Vec<String>>
         }
         _ => None,
     }
+}
+
+fn try_extract_hw_path_be<B: LowerBackend>(expr: &Expr, be: &B) -> Option<Vec<String>> {
+    let segs = try_extract_hw_path(expr, be.syms())?;
+    let root = segs.first()?;
+    if be.scopes().lookup(root).is_some() {
+        return None;
+    }
+    if segs.len() >= 2 {
+        let syms = be.syms();
+        for cand in syms.candidate_module_names(root, &segs[1]) {
+            if syms.mmio_instances.contains_key(&cand)
+                || syms.irqs.contains_key(&cand)
+                || syms.enums.contains_key(&cand)
+                || syms.consts.contains_key(&cand)
+            {
+                return None;
+            }
+        }
+    }
+    Some(segs)
 }
 
 fn find_named_arg<'a>(args: &'a [CallArg], name: &str) -> Option<&'a Expr> {
@@ -2260,6 +3039,23 @@ fn eval_const_expr(expr: &Expr, syms: &ModuleSymbols) -> Option<ConstVal> {
                 _ => None,
             }
         }
+        ExprKind::Field { target, field } => {
+            if let ExprKind::Ident(id) = &target.kind {
+                if let Some(variants) = syms.enums.get(&id.name) {
+                    if let Some((_, disc)) = variants.iter().find(|(vn, _)| vn == &field.name) {
+                        return Some(ConstVal::Int(*disc as i128));
+                    }
+                }
+                if syms.import_aliases.contains_key(&id.name) {
+                    for cand in syms.candidate_module_names(&id.name, &field.name) {
+                        if let Some(&cv) = syms.const_vals.get(&cand) {
+                            return Some(cv);
+                        }
+                    }
+                }
+            }
+            None
+        }
         _ => None,
     }
 }
@@ -2332,8 +3128,11 @@ struct DirectLowerCtx<'a> {
     defer_stack: Vec<Vec<Stmt>>,
     loop_defer_depths: Vec<usize>,
     boot_state: Option<BootSpawnState<'a>>,
+    boot_const_env: BTreeMap<VarId, MirExpr>,
     inlined_helper_stack: Vec<InlinedHelperFrame>,
     in_noyield: bool,
+    in_isr: bool,
+    isr_state_vars: Vec<MirIsrStateDecl>,
     pending_stmts: Vec<MirStmt>,
 }
 
@@ -2348,8 +3147,11 @@ impl<'a> DirectLowerCtx<'a> {
             defer_stack: vec![Vec::new()],
             loop_defer_depths: Vec::new(),
             boot_state: None,
+            boot_const_env: BTreeMap::new(),
             inlined_helper_stack: Vec::new(),
             in_noyield: false,
+            in_isr: false,
+            isr_state_vars: Vec::new(),
             pending_stmts: Vec::new(),
         }
     }
@@ -2369,8 +3171,11 @@ impl<'a> DirectLowerCtx<'a> {
             defer_stack: vec![Vec::new()],
             loop_defer_depths: Vec::new(),
             boot_state: Some(boot_state),
+            boot_const_env: BTreeMap::new(),
             inlined_helper_stack: Vec::new(),
             in_noyield: false,
+            in_isr: false,
+            isr_state_vars: Vec::new(),
             pending_stmts: Vec::new(),
         }
     }
@@ -2517,22 +3322,79 @@ impl<'a> DirectLowerCtx<'a> {
                 }
                 if let Some(ie) = init {
                     let val = self.lower_expr_with_stmts(ie, Some(&vty), &mut out)?;
+                    let coerced = coerce_expr_if_needed(val, &vty);
+                    if self.boot_state.is_some() {
+                        let resolved = resolve_boot_const_expr(&coerced, &self.boot_const_env);
+                        if is_const_mir_expr(&resolved) {
+                            self.boot_const_env.insert(vid, resolved);
+                        }
+                    }
                     out.push(MirStmt::Assign {
                         target: MirPlace::Var(vid),
                         op: MirAssignOp::Assign,
-                        value: coerce_expr_if_needed(val, &vty),
+                        value: coerced,
                     });
                 }
             }
-            StmtKind::StateVar { .. } => {}
-            StmtKind::Assign { target, op, value } => {
-                let (place, pty) = self.lower_place(target, &mut out)?;
-                let rhs = self.lower_expr_with_stmts(value, Some(&pty.host_value_type()), &mut out)?;
-                out.push(MirStmt::Assign {
-                    target: place,
-                    op: convert_assign_op(*op),
-                    value: coerce_expr_if_needed(rhs, &pty.host_value_type()),
+            StmtKind::StateVar { ty, name, init } => {
+                if !self.in_isr || self.scopes.frames.len() != 1 {
+                    return Err(MirLowerError {
+                        message: format!(
+                            "`state` variable `{}` may only be declared at the top level of an `isr` handler",
+                            name.name
+                        ),
+                        span: stmt.span,
+                    });
+                }
+                let vty = self.syms.resolve_type(ty);
+                let coerced_init = if let Some(ie) = init {
+                    let mut init_stmts = Vec::new();
+                    let val = self.lower_expr_with_stmts(ie, Some(&vty), &mut init_stmts)?;
+                    let coerced = coerce_expr_if_needed(val, &vty);
+                    if !init_stmts.is_empty() || !is_const_mir_expr(&coerced) {
+                        return Err(MirLowerError {
+                            message: format!(
+                                "`state` variable `{}` initializer must be a compile-time constant expression",
+                                name.name
+                            ),
+                            span: stmt.span,
+                        });
+                    }
+                    coerced
+                } else {
+                    zero_init_expr(&vty, self.syms)
+                };
+                let vid = self.declare_var(&name.name, vty.clone(), VarRole::IsrState);
+                self.isr_state_vars.push(MirIsrStateDecl {
+                    var_id: vid,
+                    name: name.name.clone(),
+                    ty: vty,
+                    init: coerced_init,
                 });
+            }
+            StmtKind::Assign { target, op, value } => {
+                let handled = {
+                    let mut be = DirectBackend {
+                        ctx: self,
+                        stmts: &mut out,
+                    };
+                    try_lower_mmio_assign_be(target, *op, value, &mut be)?
+                };
+                if !handled {
+                    let (place, pty) = self.lower_place(target, &mut out)?;
+                    if self.boot_state.is_some() {
+                        if let Some(vid) = place_root_var(&place) {
+                            self.boot_const_env.remove(&vid);
+                        }
+                    }
+                    let rhs =
+                        self.lower_expr_with_stmts(value, Some(&pty.host_value_type()), &mut out)?;
+                    out.push(MirStmt::Assign {
+                        target: place,
+                        op: convert_assign_op(*op),
+                        value: coerce_expr_if_needed(rhs, &pty.host_value_type()),
+                    });
+                }
             }
             StmtKind::Defer(inner) => {
                 if let Some(top) = self.defer_stack.last_mut() {
@@ -2637,16 +3499,27 @@ impl<'a> DirectLowerCtx<'a> {
                 else_block,
             } => {
                 let c = self.lower_expr_with_stmts(cond, Some(&MirType::Bool), &mut out)?;
-                if let Some(bs) = &mut self.boot_state {
+                let bid = self.boot_state.as_mut().map(|bs| {
+                    let id = bs.next_branch_id;
+                    bs.next_branch_id += 1;
                     bs.branch_depth += 1;
-                }
+                    bs.branch_stack.push((id, 0));
+                    id
+                });
                 let tb = self.lower_block_stmts(&then_block.stmts)?;
+                if let (Some(bs), Some(id)) = (&mut self.boot_state, bid) {
+                    bs.branch_stack.pop();
+                    bs.branch_stack.push((id, 1));
+                }
                 let eb = if let Some(elb) = else_block {
                     self.lower_block_stmts(&elb.stmts)?
                 } else {
                     Vec::new()
                 };
                 if let Some(bs) = &mut self.boot_state {
+                    if bid.is_some() {
+                        bs.branch_stack.pop();
+                    }
                     bs.branch_depth -= 1;
                 }
                 out.push(MirStmt::If {
@@ -2659,14 +3532,26 @@ impl<'a> DirectLowerCtx<'a> {
                 let c = self.lower_expr_with_stmts(cond, Some(&MirType::Bool), &mut out)?;
                 let loop_depth = self.defer_stack.len();
                 self.loop_defer_depths.push(loop_depth);
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth += 1;
+                }
                 let b = self.lower_block_stmts(&body.stmts)?;
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth -= 1;
+                }
                 self.loop_defer_depths.pop();
                 out.push(MirStmt::While { cond: c, body: b });
             }
             StmtKind::Loop { body } => {
                 let loop_depth = self.defer_stack.len();
                 self.loop_defer_depths.push(loop_depth);
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth += 1;
+                }
                 let b = self.lower_block_stmts(&body.stmts)?;
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth -= 1;
+                }
                 self.loop_defer_depths.pop();
                 out.push(MirStmt::While {
                     cond: MirExpr::new(MirExprKind::BoolLit(true), MirType::Bool),
@@ -2774,7 +3659,13 @@ impl<'a> DirectLowerCtx<'a> {
 
                 let loop_depth = self.defer_stack.len();
                 self.loop_defer_depths.push(loop_depth);
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth += 1;
+                }
                 let user_body = self.lower_block_stmts(&body.stmts)?;
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth -= 1;
+                }
                 self.loop_defer_depths.pop();
                 while_body.extend(user_body);
 
@@ -2895,7 +3786,13 @@ impl<'a> DirectLowerCtx<'a> {
 
                 let loop_depth = self.defer_stack.len();
                 self.loop_defer_depths.push(loop_depth);
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth += 1;
+                }
                 let user_body = self.lower_block_stmts(&body.stmts)?;
+                if let Some(bs) = &mut self.boot_state {
+                    bs.loop_depth -= 1;
+                }
                 self.loop_defer_depths.pop();
                 while_body.extend(user_body);
 
@@ -2937,13 +3834,22 @@ impl<'a> DirectLowerCtx<'a> {
             }
             StmtKind::Switch { scrutinee, arms } => {
                 let d = self.lower_expr_with_stmts(scrutinee, None, &mut out)?;
-                if let Some(bs) = &mut self.boot_state {
+                let bid = self.boot_state.as_mut().map(|bs| {
+                    let id = bs.next_branch_id;
+                    bs.next_branch_id += 1;
                     bs.branch_depth += 1;
-                }
+                    id
+                });
                 let mut mir_arms = Vec::new();
                 let mut default_body = Vec::new();
-                for arm in arms {
+                for (arm_idx, arm) in arms.iter().enumerate() {
+                    if let (Some(bs), Some(id)) = (&mut self.boot_state, bid) {
+                        bs.branch_stack.push((id, arm_idx));
+                    }
                     let body = self.lower_block_stmts(&arm.body.stmts)?;
+                    if let (Some(bs), Some(_)) = (&mut self.boot_state, bid) {
+                        bs.branch_stack.pop();
+                    }
                     if let Some(pat) = convert_switch_pat(&arm.pat, &d.ty, self.syms) {
                         mir_arms.push((pat, body));
                     } else {
@@ -2999,6 +3905,9 @@ impl<'a> DirectLowerCtx<'a> {
                         method: "exit".to_string(),
                         args: vec![code_expr],
                     }));
+                    return Ok(out);
+                }
+                if self.try_lower_irq_attach_stmt(e, &mut out)? {
                     return Ok(out);
                 }
                 if let Some(stmt_op) = self.try_lower_stmt_call(e, &mut out)? {
@@ -3182,7 +4091,15 @@ impl<'a> DirectLowerCtx<'a> {
                 span,
             });
         }
-        let bp_name = sp.task.name.clone();
+        let bp_name = if let Some(mod_id) = &sp.module {
+            self.syms
+                .candidate_module_names(&mod_id.name, &sp.task.name)
+                .into_iter()
+                .find(|c| self.syms.tasks.contains_key(c))
+                .unwrap_or_else(|| format!("{}.{}", mod_id.name, sp.task.name))
+        } else {
+            sp.task.name.clone()
+        };
         let param_tys = self.syms.tasks.get(&bp_name).cloned().unwrap_or_default();
         let mut lowered_args = Vec::new();
         for (idx, arg) in sp.args.iter().enumerate() {
@@ -3252,7 +4169,15 @@ impl<'a> DirectLowerCtx<'a> {
 
         // 1. Evaluate call arguments in the CALLER's lexical scope first!
         let mut lowered_args = Vec::new();
+        let mut irq_arg_bindings: Vec<(String, (String, u32))> = Vec::new();
         for (idx, a) in args.iter().enumerate() {
+            if let Some(p) = fd.params.get(idx) {
+                if let Some((iname, inum)) = self.try_resolve_irq_token(&a.value)? {
+                    irq_arg_bindings.push((p.name.name.clone(), (iname, inum)));
+                    lowered_args.push(MirExpr::new(MirExprKind::IntLit(inum as i128), MirType::U32));
+                    continue;
+                }
+            }
             let expected = sig.params.get(idx);
             let me = self.lower_expr_with_stmts(&a.value, expected, out)?;
             let coerced = match (&me.ty, expected, &me.kind) {
@@ -3303,6 +4228,10 @@ impl<'a> DirectLowerCtx<'a> {
             let pvid = self.declare_var(&p.name.name, pty.clone(), VarRole::CompilerTemp);
             self.scopes.insert(p.name.name.clone(), pvid);
             if let Some(arg_val) = lowered_args.get(idx).cloned() {
+                let resolved_arg = resolve_boot_const_expr(&arg_val, &self.boot_const_env);
+                if is_const_mir_expr(&resolved_arg) {
+                    self.boot_const_env.insert(pvid, resolved_arg);
+                }
                 out.push(MirStmt::Assign {
                     target: MirPlace::Var(pvid),
                     op: MirAssignOp::Assign,
@@ -3311,9 +4240,15 @@ impl<'a> DirectLowerCtx<'a> {
             }
         }
 
-        if let Some(bs) = &mut self.boot_state {
+        let prev_irq_bindings = if let Some(bs) = &mut self.boot_state {
             bs.provenance_stack.push(callee_name.to_string());
-        }
+            Some(std::mem::replace(
+                &mut bs.irq_param_bindings,
+                irq_arg_bindings.into_iter().collect(),
+            ))
+        } else {
+            None
+        };
         self.inlined_helper_stack.push(InlinedHelperFrame {
             ret_ty: sig.ret_ty.clone(),
             ret_val_var,
@@ -3321,13 +4256,16 @@ impl<'a> DirectLowerCtx<'a> {
             entry_defer_depth,
         });
 
-        let helper_stmts = self.lower_stmt_seq(&body_ast.stmts)?;
-        out.extend(helper_stmts);
+        let helper_res = self.lower_stmt_seq(&body_ast.stmts);
 
         self.inlined_helper_stack.pop();
         if let Some(bs) = &mut self.boot_state {
             bs.provenance_stack.pop();
+            if let Some(prev) = prev_irq_bindings {
+                bs.irq_param_bindings = prev;
+            }
         }
+        out.extend(helper_res?);
 
         let exit_defers = self.pop_and_lower_top_defer_scope()?;
         if !exit_defers.is_empty() {
@@ -3681,6 +4619,189 @@ impl<'a> DirectLowerCtx<'a> {
         };
         try_lower_nonblocking_call_or_method(expr, &mut be)
     }
+
+    fn try_resolve_irq_token(&self, expr: &Expr) -> Result<Option<(String, u32)>, MirLowerError> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                if let Some(bound) = self
+                    .boot_state
+                    .as_ref()
+                    .and_then(|bs| bs.irq_param_bindings.get(&id.name))
+                {
+                    return Ok(Some(bound.clone()));
+                }
+                if self.scopes.lookup(&id.name).is_none() {
+                    if let Some(&num) = self.syms.irqs.get(&id.name) {
+                        return Ok(Some((id.name.clone(), num)));
+                    }
+                }
+                Ok(None)
+            }
+            ExprKind::Field { .. } => Ok(self.syms.resolve_irq_field_be(expr, &self.scopes)),
+            _ => Ok(None),
+        }
+    }
+
+    fn lower_baked_isr_arg(
+        &mut self,
+        arg_expr: &Expr,
+        param_ty: &MirType,
+    ) -> Result<MirBakedArg, MirLowerError> {
+        if let Some((_, num)) = self.try_resolve_irq_token(arg_expr)? {
+            return Ok(MirBakedArg::Const(MirExpr::new(
+                MirExprKind::IntLit(num as i128),
+                MirType::U32,
+            )));
+        }
+        let mut arg_stmts = Vec::new();
+        let raw = self.lower_expr_with_stmts(arg_expr, Some(param_ty), &mut arg_stmts)?;
+        if !arg_stmts.is_empty() {
+            return Err(MirLowerError {
+                message: "ISR attachment argument must be statically known (no runtime side effects)"
+                    .to_string(),
+                span: arg_expr.span,
+            });
+        }
+        let resolved = resolve_boot_const_expr(&raw, &self.boot_const_env);
+        let coerced = coerce_expr_if_needed(resolved, param_ty);
+        match &coerced.kind {
+            MirExprKind::GlobalPrimAddr(name) => Ok(MirBakedArg::PrimAddr(name.clone())),
+            MirExprKind::MmioAddr(name) => Ok(MirBakedArg::MmioAddr(name.clone())),
+            _ if is_const_mir_expr(&coerced) => Ok(MirBakedArg::Const(coerced)),
+            _ => Err(MirLowerError {
+                message: "ISR attachment argument must be a compile-time constant, static `&primitive`, or `mmio` peripheral pointer"
+                    .to_string(),
+                span: arg_expr.span,
+            }),
+        }
+    }
+
+    fn try_lower_irq_attach_stmt(
+        &mut self,
+        expr: &Expr,
+        out: &mut Vec<MirStmt>,
+    ) -> Result<bool, MirLowerError> {
+        let ExprKind::MethodCall {
+            receiver,
+            method,
+            args,
+        } = &expr.kind
+        else {
+            return Ok(false);
+        };
+        if method.name != "attach" && method.name != "attach_shared" {
+            return Ok(false);
+        }
+        let is_shared = method.name == "attach_shared";
+
+        let Some((irq_name, irq_num)) = self.try_resolve_irq_token(receiver)? else {
+            return Ok(false);
+        };
+
+        if self.boot_state.is_none() {
+            return Err(MirLowerError {
+                message: format!(
+                    "IRQ `.{}` must be called inside `fn main()` boot sequence (or a boot helper called from `main()`)",
+                    method.name
+                ),
+                span: expr.span,
+            });
+        }
+
+        if args.len() != 1 {
+            return Err(MirLowerError {
+                message: format!(
+                    "IRQ `.{}` expects 1 ISR attachment argument, found {}",
+                    method.name,
+                    args.len()
+                ),
+                span: expr.span,
+            });
+        }
+
+        let (handler_name, call_args): (String, &[CallArg]) = match &args[0].value.kind {
+            ExprKind::Call {
+                callee,
+                args: cargs,
+                ..
+            } => {
+                let hname = match &callee.kind {
+                    ExprKind::Ident(id) => id.name.clone(),
+                    ExprKind::Field { target, field } => {
+                        if let ExprKind::Ident(alias) = &target.kind {
+                            self.syms
+                                .candidate_module_names(&alias.name, &field.name)
+                                .into_iter()
+                                .find(|c| self.syms.isrs.contains_key(c))
+                                .unwrap_or_else(|| format!("{}.{}", alias.name, field.name))
+                        } else {
+                            return Err(MirLowerError {
+                                message: format!("invalid ISR callee in IRQ `.{}`", method.name),
+                                span: callee.span,
+                            });
+                        }
+                    }
+                    _ => {
+                        return Err(MirLowerError {
+                            message: format!("invalid ISR callee in IRQ `.{}`", method.name),
+                            span: callee.span,
+                        });
+                    }
+                };
+                (hname, cargs.as_slice())
+            }
+            ExprKind::Ident(id) if self.syms.isrs.contains_key(&id.name) => {
+                (id.name.clone(), &[][..])
+            }
+            _ => {
+                return Err(MirLowerError {
+                    message: format!(
+                        "IRQ `.{}` argument must be an `isr` handler invocation like `my_isr(...)`",
+                        method.name
+                    ),
+                    span: args[0].value.span,
+                });
+            }
+        };
+
+        let isr_param_tys = self
+            .syms
+            .isrs
+            .get(&handler_name)
+            .cloned()
+            .ok_or_else(|| MirLowerError {
+                message: format!(
+                    "unknown ISR handler `{handler_name}` in IRQ `.{}`",
+                    method.name
+                ),
+                span: args[0].value.span,
+            })?;
+
+        if call_args.len() != isr_param_tys.len() {
+            return Err(MirLowerError {
+                message: format!(
+                    "ISR `{handler_name}` expects {} argument(s), got {}",
+                    isr_param_tys.len(),
+                    call_args.len()
+                ),
+                span: args[0].value.span,
+            });
+        }
+
+        let mut baked_args = Vec::with_capacity(call_args.len());
+        for (idx, carg) in call_args.iter().enumerate() {
+            let pty = &isr_param_tys[idx];
+            baked_args.push(self.lower_baked_isr_arg(&carg.value, pty)?);
+        }
+
+        let bs = self.boot_state.as_mut().unwrap();
+        if let Some(sel_stmt) =
+            bs.attach_irq(&irq_name, irq_num, is_shared, &handler_name, baked_args, expr.span)?
+        {
+            out.push(sel_stmt);
+        }
+        Ok(true)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3896,10 +5017,18 @@ impl<'a> CoroutineLowerCtx<'a> {
                     }
                 }
             }
-            StmtKind::StateVar { .. } => {}
+            StmtKind::StateVar { name, .. } => {
+                return Err(MirLowerError {
+                    message: format!(
+                        "`state` variable `{}` may only be declared at the top level of an `isr` handler",
+                        name.name
+                    ),
+                    span: stmt.span,
+                });
+            }
             StmtKind::Assign { target, op, value } => {
-                if *op == MirAssignOp::Assign.into_ast_check() {
-                    // handled uniformly below
+                if try_lower_mmio_assign_be(target, *op, value, self)? {
+                    return Ok(());
                 }
                 if matches!(op, AssignOp::Assign) {
                     if let ExprKind::Ident(id) = &target.kind {
@@ -4514,6 +5643,22 @@ impl<'a> CoroutineLowerCtx<'a> {
                 self.lower_scoped_block(b)?;
             }
             StmtKind::Expr(e) => {
+                if let ExprKind::MethodCall {
+                    receiver, method, ..
+                } = &e.kind
+                {
+                    if (method.name == "attach" || method.name == "attach_shared")
+                        && resolve_irq_token_be(receiver, self).is_some()
+                    {
+                        return Err(MirLowerError {
+                            message: format!(
+                                "IRQ `.{}` may only be called during `fn main()` boot sequence",
+                                method.name
+                            ),
+                            span: stmt.span,
+                        });
+                    }
+                }
                 if let Some(code_arg_opt) = extract_sys_exit_arg(e) {
                     self.emit_coroutine_sys_exit(code_arg_opt)?;
                     return Ok(());
@@ -4704,6 +5849,15 @@ impl<'a> CoroutineLowerCtx<'a> {
             ExprKind::Call { callee, args, .. } => {
                 if let ExprKind::Ident(id) = &callee.kind {
                     if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
+                        if sig.spawns_in_boot {
+                            return Err(MirLowerError {
+                                message: format!(
+                                    "boot helper `{}` (contains `spawn` or IRQ `.attach`) may only be called during `fn main()` boot",
+                                    id.name
+                                ),
+                                span: expr.span,
+                            });
+                        }
                         let yields_here = sig.is_yielding
                             && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
                         if yields_here && !sig.error_spec.has_error() {
@@ -4849,6 +6003,15 @@ impl<'a> CoroutineLowerCtx<'a> {
                         return Ok(true);
                     }
                     if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
+                        if sig.spawns_in_boot {
+                            return Err(MirLowerError {
+                                message: format!(
+                                    "boot helper `{}` (contains `spawn` or IRQ `.attach`) may only be called during `fn main()` boot",
+                                    id.name
+                                ),
+                                span: expr.span,
+                            });
+                        }
                         let yields_here = sig.is_yielding
                             && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
                         if yields_here {
@@ -5248,6 +6411,15 @@ impl<'a> CoroutineLowerCtx<'a> {
             ExprKind::Call { callee, args, .. } => {
                 if let ExprKind::Ident(id) = &callee.kind {
                     if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
+                        if sig.spawns_in_boot {
+                            return Err(MirLowerError {
+                                message: format!(
+                                    "boot helper `{}` (contains `spawn` or IRQ `.attach`) may only be called during `fn main()` boot",
+                                    id.name
+                                ),
+                                span: expr.span,
+                            });
+                        }
                         let yields_here = sig.is_yielding
                             && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
                         if yields_here {
@@ -5576,6 +6748,7 @@ trait LowerBackend {
     fn in_noyield(&self) -> bool;
     fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId;
     fn emit_stmt_be(&mut self, stmt: MirStmt);
+    fn invalidate_boot_const(&mut self, _vid: VarId) {}
     fn lower_sub(
         &mut self,
         expr: &Expr,
@@ -5607,6 +6780,11 @@ impl<'b, 'a> LowerBackend for DirectBackend<'b, 'a> {
     }
     fn emit_stmt_be(&mut self, stmt: MirStmt) {
         self.stmts.push(stmt);
+    }
+    fn invalidate_boot_const(&mut self, vid: VarId) {
+        if self.ctx.boot_state.is_some() {
+            self.ctx.boot_const_env.remove(&vid);
+        }
     }
     fn lower_sub(
         &mut self,
@@ -5651,14 +6829,323 @@ impl<'a> LowerBackend for CoroutineLowerCtx<'a> {
     }
 }
 
-trait AssignOpExt {
-    fn into_ast_check(self) -> AssignOp;
+fn resolve_irq_token_be<B: LowerBackend>(expr: &Expr, be: &B) -> Option<(String, u32)> {
+    match &expr.kind {
+        ExprKind::Ident(id) if be.scopes().lookup(&id.name).is_none() => be
+            .syms()
+            .irqs
+            .get(&id.name)
+            .map(|&n| (id.name.clone(), n)),
+        ExprKind::Field { .. } => be.syms().resolve_irq_field_be(expr, be.scopes()),
+        _ => None,
+    }
 }
 
-impl AssignOpExt for MirAssignOp {
-    fn into_ast_check(self) -> AssignOp {
-        AssignOp::Assign
+fn lookup_mmio_reg<'s>(
+    syms: &'s ModuleSymbols,
+    layout_name: &str,
+    reg_name: &str,
+    span: Span,
+) -> Result<&'s MirMmioReg, MirLowerError> {
+    let layout = syms
+        .mmio_layouts
+        .get(layout_name)
+        .ok_or_else(|| MirLowerError {
+            message: format!("unknown MMIO layout `{layout_name}`"),
+            span,
+        })?;
+    layout
+        .regs
+        .iter()
+        .find(|r| r.name == reg_name)
+        .ok_or_else(|| MirLowerError {
+            message: format!("MMIO layout `{layout_name}` has no register `{reg_name}`"),
+            span,
+        })
+}
+
+fn peek_expr_struct_type<B: LowerBackend>(expr: &Expr, be: &B) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(id) => be.scopes().lookup(&id.name).and_then(|vid| {
+            match &be.vars()[vid.0].ty {
+                MirType::Struct(n) => Some(n.clone()),
+                MirType::Ptr(inner) => match inner.as_ref() {
+                    MirType::Struct(n) => Some(n.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }),
+        ExprKind::Field { target, field } => {
+            let sname = peek_expr_struct_type(target, be)?;
+            let st = be.syms().structs.get(&sname)?;
+            let sf = st.fields.iter().find(|f| f.name == field.name)?;
+            match &sf.ty {
+                MirType::Struct(n) => Some(n.clone()),
+                MirType::Ptr(inner) => match inner.as_ref() {
+                    MirType::Struct(n) => Some(n.clone()),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
     }
+}
+
+fn peek_expr_mmio_layout<B: LowerBackend>(expr: &Expr, be: &B) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(id) => {
+            if let Some(vid) = be.scopes().lookup(&id.name) {
+                if let MirType::MmioPtr(layout) = &be.vars()[vid.0].ty {
+                    return Some(layout.clone());
+                }
+                return None;
+            }
+            be.syms()
+                .mmio_instances
+                .get(&id.name)
+                .map(|inst| inst.layout.clone())
+        }
+        ExprKind::Unary {
+            op: UnaryOp::AddrOf,
+            expr: inner,
+        } => match &inner.kind {
+            ExprKind::Ident(id) if be.scopes().lookup(&id.name).is_none() => be
+                .syms()
+                .mmio_instances
+                .get(&id.name)
+                .map(|inst| inst.layout.clone()),
+            ExprKind::Field { .. } => be
+                .syms()
+                .resolve_mmio_instance_field_be(inner, be.scopes())
+                .and_then(|inst| {
+                    be.syms()
+                        .mmio_instances
+                        .get(&inst)
+                        .map(|i| i.layout.clone())
+                }),
+            _ => None,
+        },
+        ExprKind::Field { target, field } => {
+            if let Some(inst) = be.syms().resolve_mmio_instance_field_be(expr, be.scopes()) {
+                return be
+                    .syms()
+                    .mmio_instances
+                    .get(&inst)
+                    .map(|i| i.layout.clone());
+            }
+            let sname = peek_expr_struct_type(target, be)?;
+            let st = be.syms().structs.get(&sname)?;
+            let sf = st.fields.iter().find(|f| f.name == field.name)?;
+            if let MirType::MmioPtr(layout) = &sf.ty {
+                Some(layout.clone())
+            } else {
+                None
+            }
+        }
+        ExprKind::Call { callee, .. } => {
+            if let ExprKind::Ident(id) = &callee.kind {
+                if let Some(sig) = be.syms().fns.get(&id.name) {
+                    if let MirType::MmioPtr(layout) = &sig.ret_ty {
+                        return Some(layout.clone());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn resolve_mmio_lvalue_be<B: LowerBackend>(
+    target: &Expr,
+    be: &mut B,
+) -> Result<Option<(MirExpr, MirMmioReg, Option<MirExpr>)>, MirLowerError> {
+    match &target.kind {
+        ExprKind::Field {
+            target: base_ast,
+            field: reg_ident,
+        } => {
+            if peek_expr_mmio_layout(base_ast, be).is_none() {
+                return Ok(None);
+            }
+            let base = be.lower_sub(base_ast, None)?;
+            let MirType::MmioPtr(layout_name) = &base.ty else {
+                return Err(MirLowerError {
+                    message: format!(
+                        "expected MMIO peripheral pointer for register `.{}`, found `{}`",
+                        reg_ident.name,
+                        base.ty.display_name()
+                    ),
+                    span: target.span,
+                });
+            };
+            let reg = lookup_mmio_reg(be.syms(), layout_name, &reg_ident.name, target.span)?.clone();
+            if reg.array_len.is_some() {
+                return Err(MirLowerError {
+                    message: format!(
+                        "MMIO register array `{}` on `{layout_name}` must be indexed (`[i]`)",
+                        reg.name
+                    ),
+                    span: target.span,
+                });
+            }
+            Ok(Some((base, reg, None)))
+        }
+        ExprKind::Index {
+            target: inner_field,
+            index: idx_ast,
+        } => {
+            let ExprKind::Field {
+                target: base_ast,
+                field: reg_ident,
+            } = &inner_field.kind
+            else {
+                return Ok(None);
+            };
+            if peek_expr_mmio_layout(base_ast, be).is_none() {
+                return Ok(None);
+            }
+            let base = be.lower_sub(base_ast, None)?;
+            let MirType::MmioPtr(layout_name) = &base.ty else {
+                return Err(MirLowerError {
+                    message: format!(
+                        "expected MMIO peripheral pointer for register `.{}`, found `{}`",
+                        reg_ident.name,
+                        base.ty.display_name()
+                    ),
+                    span: target.span,
+                });
+            };
+            let reg = lookup_mmio_reg(be.syms(), layout_name, &reg_ident.name, inner_field.span)?
+                .clone();
+            if reg.array_len.is_none() {
+                return Err(MirLowerError {
+                    message: format!(
+                        "MMIO scalar register `{}` on `{layout_name}` cannot be indexed",
+                        reg.name
+                    ),
+                    span: target.span,
+                });
+            }
+            let idx = be.lower_sub(idx_ast, Some(&MirType::Usize))?;
+            Ok(Some((base, reg, Some(idx))))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn compound_assign_to_binop(op: AssignOp) -> Option<MirBinOp> {
+    match op {
+        AssignOp::Assign => None,
+        AssignOp::AddAssign => Some(MirBinOp::Add),
+        AssignOp::SubAssign => Some(MirBinOp::Sub),
+        AssignOp::MulAssign => Some(MirBinOp::Mul),
+        AssignOp::DivAssign => Some(MirBinOp::Div),
+        AssignOp::RemAssign => Some(MirBinOp::Rem),
+        AssignOp::BitAndAssign => Some(MirBinOp::BitAnd),
+        AssignOp::BitOrAssign => Some(MirBinOp::BitOr),
+        AssignOp::BitXorAssign => Some(MirBinOp::BitXor),
+        AssignOp::ShlAssign => Some(MirBinOp::Shl),
+        AssignOp::ShrAssign => Some(MirBinOp::Shr),
+    }
+}
+
+fn try_lower_mmio_assign_be<B: LowerBackend>(
+    target: &Expr,
+    op: AssignOp,
+    value: &Expr,
+    be: &mut B,
+) -> Result<bool, MirLowerError> {
+    let Some((base, reg, index_opt)) = resolve_mmio_lvalue_be(target, be)? else {
+        return Ok(false);
+    };
+    let reg_ty = mmio_elem_mir_type(reg.elem_bits);
+    if op == AssignOp::Assign {
+        if reg.access == MirMmioAccess::Ro {
+            return Err(MirLowerError {
+                message: format!("cannot write to read-only `@ro` MMIO register `{}`", reg.name),
+                span: target.span,
+            });
+        }
+        let rhs_raw = be.lower_sub(value, Some(&reg_ty))?;
+        let rhs = coerce_expr_if_needed(rhs_raw, &reg_ty);
+        be.emit_stmt_be(MirStmt::MmioWrite {
+            base: Box::new(base),
+            offset: reg.offset,
+            elem_bits: reg.elem_bits,
+            index: index_opt.map(Box::new),
+            array_len: reg.array_len,
+            value: rhs,
+        });
+        return Ok(true);
+    }
+
+    if reg.access != MirMmioAccess::Rw {
+        return Err(MirLowerError {
+            message: format!(
+                "compound read-modify-write on MMIO register `{}` is only permitted on `@rw` registers (register is `{:?}`)",
+                reg.name, reg.access
+            ),
+            span: target.span,
+        });
+    }
+
+    // Evaluate base pointer and array index strictly once into CompilerTemp vars.
+    let base_ty = base.ty.clone();
+    let base_tmp = be.alloc_temp_be("mmio_base", base_ty.clone());
+    be.emit_stmt_be(MirStmt::Assign {
+        target: MirPlace::Var(base_tmp),
+        op: MirAssignOp::Assign,
+        value: base,
+    });
+    let base_ref = MirExpr::new(MirExprKind::Var(base_tmp), base_ty);
+
+    let idx_ref = if let Some(idx_expr) = index_opt {
+        let idx_tmp = be.alloc_temp_be("mmio_idx", MirType::Usize);
+        be.emit_stmt_be(MirStmt::Assign {
+            target: MirPlace::Var(idx_tmp),
+            op: MirAssignOp::Assign,
+            value: coerce_expr_if_needed(idx_expr, &MirType::Usize),
+        });
+        Some(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize))
+    } else {
+        None
+    };
+
+    let read_expr = MirExpr::new(
+        MirExprKind::MmioRead {
+            base: Box::new(base_ref.clone()),
+            offset: reg.offset,
+            elem_bits: reg.elem_bits,
+            index: idx_ref.clone().map(Box::new),
+            array_len: reg.array_len,
+        },
+        reg_ty.clone(),
+    );
+
+    let rhs_raw = be.lower_sub(value, Some(&reg_ty))?;
+    let rhs = coerce_expr_if_needed(rhs_raw, &reg_ty);
+    let bin_op = compound_assign_to_binop(op).unwrap();
+    let updated = MirExpr::new(
+        MirExprKind::Binary {
+            op: bin_op,
+            lhs: Box::new(read_expr),
+            rhs: Box::new(rhs),
+        },
+        reg_ty,
+    );
+
+    be.emit_stmt_be(MirStmt::MmioWrite {
+        base: Box::new(base_ref),
+        offset: reg.offset,
+        elem_bits: reg.elem_bits,
+        index: idx_ref.map(Box::new),
+        array_len: reg.array_len,
+        value: updated,
+    });
+    Ok(true)
 }
 
 fn ast_stmts_have_inbox_recv(stmts: &[Stmt]) -> bool {
@@ -5871,6 +7358,12 @@ fn lower_leaf_expr(
                     MirType::Ptr(Box::new(MirType::Primitive(pinfo.kind.clone()))),
                 ));
             }
+            if let Some(inst) = syms.mmio_instances.get(&id.name) {
+                return Ok(MirExpr::new(
+                    MirExprKind::MmioAddr(inst.name.clone()),
+                    MirType::MmioPtr(inst.layout.clone()),
+                ));
+            }
             if syms.fns.contains_key(&id.name) {
                 return Ok(MirExpr::new(
                     MirExprKind::FnAddr(id.name.clone()),
@@ -5900,20 +7393,40 @@ fn lower_common_expr<B: LowerBackend>(
             expr: inner,
         } => {
             if let ExprKind::Ident(id) = &inner.kind {
-                if let Some(pinfo) = be.syms().primitives.get(&id.name) {
-                    return Ok(MirExpr::new(
-                        MirExprKind::GlobalPrimAddr(id.name.clone()),
-                        MirType::Ptr(Box::new(MirType::Primitive(pinfo.kind.clone()))),
-                    ));
+                if be.scopes().lookup(&id.name).is_none() {
+                    if let Some(pinfo) = be.syms().primitives.get(&id.name) {
+                        return Ok(MirExpr::new(
+                            MirExprKind::GlobalPrimAddr(id.name.clone()),
+                            MirType::Ptr(Box::new(MirType::Primitive(pinfo.kind.clone()))),
+                        ));
+                    }
+                    if let Some(inst) = be.syms().mmio_instances.get(&id.name) {
+                        return Ok(MirExpr::new(
+                            MirExprKind::MmioAddr(inst.name.clone()),
+                            MirType::MmioPtr(inst.layout.clone()),
+                        ));
+                    }
+                    if be.syms().fns.contains_key(&id.name) {
+                        return Ok(MirExpr::new(
+                            MirExprKind::FnAddr(id.name.clone()),
+                            expected.cloned().unwrap_or(MirType::Usize),
+                        ));
+                    }
                 }
-                if be.syms().fns.contains_key(&id.name) {
-                    return Ok(MirExpr::new(
-                        MirExprKind::FnAddr(id.name.clone()),
-                        expected.cloned().unwrap_or(MirType::Usize),
-                    ));
-                }
+            } else if let Some(inst_name) = be
+                .syms()
+                .resolve_mmio_instance_field_be(inner, be.scopes())
+            {
+                let layout = be.syms().mmio_instances[&inst_name].layout.clone();
+                return Ok(MirExpr::new(
+                    MirExprKind::MmioAddr(inst_name),
+                    MirType::MmioPtr(layout),
+                ));
             }
             let (place, pty) = be.lower_place_be(inner)?;
+            if let Some(vid) = place_root_var(&place) {
+                be.invalidate_boot_const(vid);
+            }
             Ok(MirExpr::new(
                 MirExprKind::AddrOfPlace(Box::new(place)),
                 MirType::Ptr(Box::new(pty)),
@@ -5959,14 +7472,26 @@ fn lower_common_expr<B: LowerBackend>(
             ))
         }
         ExprKind::Field { target, field } => {
-            if let Some(hw_path) = try_extract_hw_path(expr, be.syms()) {
+            if let Some(inst_name) = be
+                .syms()
+                .resolve_mmio_instance_field_be(expr, be.scopes())
+            {
+                let layout = be.syms().mmio_instances[&inst_name].layout.clone();
+                return Ok(MirExpr::new(
+                    MirExprKind::MmioAddr(inst_name),
+                    MirType::MmioPtr(layout),
+                ));
+            }
+            if let Some(hw_path) = try_extract_hw_path_be(expr, be) {
                 return Ok(MirExpr::new(
                     MirExprKind::HwPeriphVal(hw_path.clone()),
                     MirType::HwPeripheral(hw_path.join(".")),
                 ));
             }
             if let ExprKind::Ident(id) = &target.kind {
-                if be.syms().enums.contains_key(&id.name) {
+                if be.scopes().lookup(&id.name).is_none()
+                    && be.syms().enums.contains_key(&id.name)
+                {
                     return Ok(MirExpr::new(
                         MirExprKind::EnumVariant {
                             enum_name: id.name.clone(),
@@ -5976,10 +7501,48 @@ fn lower_common_expr<B: LowerBackend>(
                     ));
                 }
             }
+            if field.name == "len" {
+                if let ExprKind::Field {
+                    target: mmio_base_ast,
+                    field: reg_ident,
+                } = &target.kind
+                {
+                    if let Some(layout_name) = peek_expr_mmio_layout(mmio_base_ast, be) {
+                        let _base = be.lower_sub(mmio_base_ast, None)?;
+                        let reg =
+                            lookup_mmio_reg(be.syms(), &layout_name, &reg_ident.name, target.span)?;
+                        if let Some(len) = reg.array_len {
+                            return Ok(MirExpr::new(MirExprKind::ArrayLen(len), MirType::Usize));
+                        }
+                    }
+                }
+            }
             let base = be.lower_sub(target, None)?;
             finish_field_access(base, &field.name, be.syms(), expr.span)
         }
         ExprKind::Index { target, index } => {
+            if let Some((base, reg, Some(idx))) = resolve_mmio_lvalue_be(expr, be)? {
+                if reg.access == MirMmioAccess::Wo {
+                    return Err(MirLowerError {
+                        message: format!(
+                            "cannot read write-only `@wo` MMIO register `{}`",
+                            reg.name
+                        ),
+                        span: expr.span,
+                    });
+                }
+                let reg_ty = mmio_elem_mir_type(reg.elem_bits);
+                return Ok(MirExpr::new(
+                    MirExprKind::MmioRead {
+                        base: Box::new(base),
+                        offset: reg.offset,
+                        elem_bits: reg.elem_bits,
+                        index: Some(Box::new(idx)),
+                        array_len: reg.array_len,
+                    },
+                    reg_ty,
+                ));
+            }
             let base = be.lower_sub(target, None)?;
             let idx = be.lower_sub(index, Some(&MirType::Usize))?;
             finish_index(base, idx, expr.span)
@@ -6037,8 +7600,22 @@ fn lower_common_expr<B: LowerBackend>(
                 MirType::Slice(Box::new(elem_ty)),
             ))
         }
-        ExprKind::StructLit { name, fields, .. } => {
-            let st = be.syms().structs.get(&name.name).cloned();
+        ExprKind::StructLit {
+            module,
+            name,
+            fields,
+            ..
+        } => {
+            let resolved_name = if let Some(mod_id) = module {
+                be.syms()
+                    .candidate_module_names(&mod_id.name, &name.name)
+                    .into_iter()
+                    .find(|c| be.syms().structs.contains_key(c))
+                    .unwrap_or_else(|| format!("{}.{}", mod_id.name, name.name))
+            } else {
+                name.name.clone()
+            };
+            let st = be.syms().structs.get(&resolved_name).cloned();
             let packed = st.as_ref().map_or(false, |s| s.packed);
             let mut mfields = Vec::new();
             for fi in fields {
@@ -6056,11 +7633,11 @@ fn lower_common_expr<B: LowerBackend>(
             }
             Ok(MirExpr::new(
                 MirExprKind::StructLit {
-                    struct_name: name.name.clone(),
+                    struct_name: resolved_name.clone(),
                     packed,
                     fields: mfields,
                 },
-                MirType::Struct(name.name.clone()),
+                MirType::Struct(resolved_name),
             ))
         }
         ExprKind::ArrayLit(elems) => {
@@ -6098,6 +7675,15 @@ fn lower_common_expr<B: LowerBackend>(
                     return Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void));
                 }
                 if let Some(sig) = be.syms().fns.get(&id.name).cloned() {
+                    if sig.spawns_in_boot {
+                        return Err(MirLowerError {
+                            message: format!(
+                                "boot helper `{}` (contains `spawn` or IRQ `.attach`) may only be called during `fn main()` boot",
+                                id.name
+                            ),
+                            span: expr.span,
+                        });
+                    }
                     for (idx, a) in args.iter().enumerate() {
                         let me = be.lower_sub(&a.value, sig.params.get(idx))?;
                         let coerced = match (&me.ty, sig.params.get(idx), &me.kind) {
@@ -6494,6 +8080,38 @@ fn finish_field_access(
             _ => {}
         }
     }
+    if let MirType::MmioPtr(layout_name) = &base.ty {
+        let reg = lookup_mmio_reg(syms, layout_name, field, span)?;
+        if reg.array_len.is_some() {
+            return Err(MirLowerError {
+                message: format!(
+                    "MMIO register array `{}` on `{layout_name}` must be indexed (`[i]`)",
+                    reg.name
+                ),
+                span,
+            });
+        }
+        if reg.access == MirMmioAccess::Wo {
+            return Err(MirLowerError {
+                message: format!(
+                    "cannot read write-only `@wo` MMIO register `{}` on `{layout_name}`",
+                    reg.name
+                ),
+                span,
+            });
+        }
+        let elem_ty = mmio_elem_mir_type(reg.elem_bits);
+        return Ok(MirExpr::new(
+            MirExprKind::MmioRead {
+                base: Box::new(base),
+                offset: reg.offset,
+                elem_bits: reg.elem_bits,
+                index: None,
+                array_len: None,
+            },
+            elem_ty,
+        ));
+    }
     let (sname, is_ptr) = match &base.ty {
         MirType::Struct(n) => (n.clone(), false),
         MirType::Ptr(inner) => match inner.as_ref() {
@@ -6594,7 +8212,7 @@ fn resolve_prim_receiver_be<B: LowerBackend>(
         }
         return Ok(None);
     }
-    if try_extract_hw_path(receiver, be.syms()).is_some() {
+    if try_extract_hw_path_be(receiver, be).is_some() {
         return Ok(None);
     }
     if let ExprKind::Field { .. } | ExprKind::Unary { op: UnaryOp::Deref, .. } = &receiver.kind {
@@ -6943,6 +8561,17 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                         };
                         return Ok(Some(MirStmt::Intrinsic(MirIntrinsicOp::UseSystick { hz })));
                     }
+                    if method.name == "pend_irq" && args.len() == 1 {
+                        if let Some((_, num)) = resolve_irq_token_be(&args[0].value, be) {
+                            return Ok(Some(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                                method: "pend_irq".to_string(),
+                                args: vec![MirExpr::new(
+                                    MirExprKind::IntLit(num as i128),
+                                    MirType::U32,
+                                )],
+                            })));
+                        }
+                    }
                     let mut largs = Vec::new();
                     for (idx, a) in args.iter().enumerate() {
                         let exp = match (method.name.as_str(), idx) {
@@ -6967,7 +8596,7 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
             }
 
             // 2. `hw.<PERIPH>.<method>(...)` SVD operations
-            if let Some(periph_path) = try_extract_hw_path(receiver, be.syms()) {
+            if let Some(periph_path) = try_extract_hw_path_be(receiver, be) {
                 if matches!(method.name.as_str(), "puts" | "print" | "write_str") {
                     if let Some(first) = first_positional_arg(args) {
                         if let Some(pfmt) = try_lower_print_arg_be(first, false, be)? {

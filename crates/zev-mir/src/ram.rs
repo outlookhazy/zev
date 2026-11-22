@@ -8,9 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::ir::{
-    MirChildCallSlot, MirFnBody, MirFunction, MirModule, MirPrimKind, MirPrimitive, MirPriority,
-    MirSpawnInstance, MirStruct, MirTaskBlueprint, MirType, MirVar, MonomorphizedItemKind,
-    MonomorphizedMirItem, VarRole,
+    MirChildCallSlot, MirFnBody, MirFunction, MirIrqVector, MirModule, MirPrimKind, MirPrimitive,
+    MirPriority, MirSpawnInstance, MirStruct, MirTaskBlueprint, MirType, MirVar,
+    MonomorphizedItemKind, MonomorphizedMirItem, VarRole,
 };
 
 /// Target data-model parameters for C/ABI struct layout calculation.
@@ -348,6 +348,14 @@ impl RamReport {
             self.mcu32.primitives_bytes,
             self.host64.primitives_bytes
         ));
+        if self.mcu32.isr_state_bytes > 0 || self.host64.isr_state_bytes > 0 {
+            out.push_str(&format!(
+                "  {:<34} {:>10} B {:>12} B\n",
+                "ISR Static State",
+                self.mcu32.isr_state_bytes,
+                self.host64.isr_state_bytes
+            ));
+        }
         out.push_str(&format!(
             "  {:<34} {:>10} B {:>12} B\n",
             "Scheduler + Sleep Coordinator",
@@ -371,6 +379,17 @@ impl RamReport {
             "  {:<34} {:>10} B {:>12} B\n",
             "Dynamic Heap Allocation", self.mcu32.heap_bytes, self.host64.heap_bytes
         ));
+
+        if !self.isr_states.is_empty() {
+            out.push_str("\n5. ISR Static State\n");
+            out.push_str("--------------------------------------------------------------------------------\n");
+            for (sym, ty_disp, b32, b64) in &self.isr_states {
+                out.push_str(&format!(
+                    "  {:<34} {:<18} {:>6} B (32b) / {:>6} B (64b)\n",
+                    sym, ty_disp, b32, b64
+                ));
+            }
+        }
 
         if !self.dual_specialized_fns.is_empty() {
             out.push_str("\n6. Dual-Specialized Functions\n");
@@ -637,6 +656,7 @@ pub fn compute_ram_report(
     blueprints: &[MirTaskBlueprint],
     spawned: &[MirSpawnInstance],
     primitives: &[MirPrimitive],
+    irq_vectors: &[MirIrqVector],
     boot_yielding_callees: &[String],
 ) -> RamReport {
     let ctx = LayoutCtx {
@@ -769,16 +789,32 @@ pub fn compute_ram_report(
         }
     }
 
+    let mut isr_states = Vec::new();
+    for vec in irq_vectors {
+        if let Some(sel_sym) = &vec.selector_symbol {
+            isr_states.push((sel_sym.clone(), "u8 (irq selector)".to_string(), 1, 1));
+        }
+        for b in &vec.bindings {
+            for sv in &b.state_vars {
+                let b32 = ctx.type_layout(&sv.ty, TargetAbi::Mcu32).size;
+                let b64 = ctx.type_layout(&sv.ty, TargetAbi::Host64).size;
+                isr_states.push((sv.storage_symbol.clone(), sv.ty.display_name(), b32, b64));
+            }
+        }
+    }
+
     let mcu32 = summarize_arch(
         &spawned_tasks,
         &prim_rams,
         &boot_frames,
+        &isr_states,
         TargetAbi::Mcu32,
     );
     let host64 = summarize_arch(
         &spawned_tasks,
         &prim_rams,
         &boot_frames,
+        &isr_states,
         TargetAbi::Host64,
     );
 
@@ -788,7 +824,7 @@ pub fn compute_ram_report(
         spawned_tasks,
         primitives: prim_rams,
         boot_frames,
-        isr_states: Vec::new(),
+        isr_states,
         dual_specialized_fns,
         monomorphized_instances: Vec::new(),
         mcu32,
@@ -800,6 +836,7 @@ fn summarize_arch(
     spawned: &[SpawnedTaskRam],
     prims: &[PrimitiveRam],
     boot_frames: &[(String, usize, usize)],
+    isr_states: &[(String, String, usize, usize)],
     abi: TargetAbi,
 ) -> ArchRamTotals {
     let task_frames_bytes: usize = spawned
@@ -832,11 +869,26 @@ fn summarize_arch(
             TargetAbi::Host64 => p.bytes_64,
         })
         .sum();
+    let isr_state_bytes: usize = isr_states
+        .iter()
+        .map(|(_, _, b32, b64)| match abi {
+            TargetAbi::Mcu32 => *b32,
+            TargetAbi::Host64 => *b64,
+        })
+        .sum();
     let sched = scheduler_bytes(abi);
-    let total_sram_bytes =
-        task_frames_bytes + boot_frames_bytes + tcb_table_bytes + primitives_bytes + sched;
-    let naive_total_sram_bytes =
-        naive_task_frames_bytes + boot_frames_bytes + tcb_table_bytes + primitives_bytes + sched;
+    let total_sram_bytes = task_frames_bytes
+        + boot_frames_bytes
+        + tcb_table_bytes
+        + primitives_bytes
+        + isr_state_bytes
+        + sched;
+    let naive_total_sram_bytes = naive_task_frames_bytes
+        + boot_frames_bytes
+        + tcb_table_bytes
+        + primitives_bytes
+        + isr_state_bytes
+        + sched;
 
     ArchRamTotals {
         task_frames_bytes,
@@ -845,7 +897,7 @@ fn summarize_arch(
         boot_frames_bytes,
         tcb_table_bytes,
         primitives_bytes,
-        isr_state_bytes: 0,
+        isr_state_bytes,
         scheduler_bytes: sched,
         total_sram_bytes,
         naive_total_sram_bytes,
@@ -1041,6 +1093,7 @@ pub fn populate_module_ram_report(module: &mut MirModule) {
         &module.task_blueprints,
         &module.spawned_tasks,
         &module.primitives,
+        &module.irq_vectors,
         &module.boot.boot_yielding_callees,
     );
     if !module.monomorphized_instances.is_empty() {

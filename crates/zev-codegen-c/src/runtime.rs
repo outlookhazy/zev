@@ -129,6 +129,81 @@ static SYN_UNUSED inline syn_slice_u8 syn_subslice_u8(syn_slice_u8 s, size_t sta
     return out;
 }}
 
+/* ── Typed MMIO Volatile Access Helpers ──────────────────────────────────── */
+
+static SYN_UNUSED inline uint8_t syn_mmio_read_u8(volatile uint8_t *base, uint32_t offset) {{
+    return *(volatile uint8_t *)(volatile void *)(base + offset);
+}}
+static SYN_UNUSED inline uint16_t syn_mmio_read_u16(volatile uint8_t *base, uint32_t offset) {{
+    return *(volatile uint16_t *)(volatile void *)(base + offset);
+}}
+static SYN_UNUSED inline uint32_t syn_mmio_read_u32(volatile uint8_t *base, uint32_t offset) {{
+    return *(volatile uint32_t *)(volatile void *)(base + offset);
+}}
+static SYN_UNUSED inline void syn_mmio_write_u8(volatile uint8_t *base, uint32_t offset, uint8_t val) {{
+    *(volatile uint8_t *)(volatile void *)(base + offset) = val;
+}}
+static SYN_UNUSED inline void syn_mmio_write_u16(volatile uint8_t *base, uint32_t offset, uint16_t val) {{
+    *(volatile uint16_t *)(volatile void *)(base + offset) = val;
+}}
+static SYN_UNUSED inline void syn_mmio_write_u32(volatile uint8_t *base, uint32_t offset, uint32_t val) {{
+    *(volatile uint32_t *)(volatile void *)(base + offset) = val;
+}}
+static SYN_UNUSED inline uint8_t syn_mmio_read_arr_u8(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len) {{
+    size_t safe_idx = idx;
+#if !defined(SYN_FREESTANDING)
+    safe_idx = (idx < arr_len) ? idx : 0U;
+#else
+    (void)arr_len;
+#endif
+    return *(volatile uint8_t *)(volatile void *)(base + offset + safe_idx);
+}}
+static SYN_UNUSED inline uint16_t syn_mmio_read_arr_u16(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len) {{
+    size_t safe_idx = idx;
+#if !defined(SYN_FREESTANDING)
+    safe_idx = (idx < arr_len) ? idx : 0U;
+#else
+    (void)arr_len;
+#endif
+    return *(volatile uint16_t *)(volatile void *)(base + offset + (safe_idx * 2U));
+}}
+static SYN_UNUSED inline uint32_t syn_mmio_read_arr_u32(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len) {{
+    size_t safe_idx = idx;
+#if !defined(SYN_FREESTANDING)
+    safe_idx = (idx < arr_len) ? idx : 0U;
+#else
+    (void)arr_len;
+#endif
+    return *(volatile uint32_t *)(volatile void *)(base + offset + (safe_idx * 4U));
+}}
+static SYN_UNUSED inline void syn_mmio_write_arr_u8(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len, uint8_t val) {{
+    size_t safe_idx = idx;
+#if !defined(SYN_FREESTANDING)
+    safe_idx = (idx < arr_len) ? idx : 0U;
+#else
+    (void)arr_len;
+#endif
+    *(volatile uint8_t *)(volatile void *)(base + offset + safe_idx) = val;
+}}
+static SYN_UNUSED inline void syn_mmio_write_arr_u16(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len, uint16_t val) {{
+    size_t safe_idx = idx;
+#if !defined(SYN_FREESTANDING)
+    safe_idx = (idx < arr_len) ? idx : 0U;
+#else
+    (void)arr_len;
+#endif
+    *(volatile uint16_t *)(volatile void *)(base + offset + (safe_idx * 2U)) = val;
+}}
+static SYN_UNUSED inline void syn_mmio_write_arr_u32(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len, uint32_t val) {{
+    size_t safe_idx = idx;
+#if !defined(SYN_FREESTANDING)
+    safe_idx = (idx < arr_len) ? idx : 0U;
+#else
+    (void)arr_len;
+#endif
+    *(volatile uint32_t *)(volatile void *)(base + offset + (safe_idx * 4U)) = val;
+}}
+
 /* ── Freestanding IEEE-754 Float Helpers & Zero-Heap Stream/Buf Formatters ── */
 
 static SYN_UNUSED inline double syn_bits_to_f64(uint64_t u) {{

@@ -6,10 +6,20 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::{
     BlockId, MirAssignOp, MirBlock, MirCallDst, MirChildCallSlot, MirExpr, MirExprKind,
-    MirFmtChunk, MirFnBody, MirFunction, MirPlace, MirPrimNonBlockingOp, MirPrimReadOp,
+    MirFmtChunk, MirFnBody, MirFunction, MirIsr, MirPlace, MirPrimNonBlockingOp, MirPrimReadOp,
     MirPrimTarget, MirStmt, MirTaskBlueprint, MirTerminator, MirType, MirVar, MirYieldKind, VarId,
     VarRole,
 };
+
+/// Record `addr_taken` flags on variables inside an ISR handler.
+pub fn analyze_isr_frame(isr: &mut MirIsr) {
+    for v in &mut isr.vars {
+        v.hoisted = false;
+    }
+    for s in &isr.body {
+        collect_addr_taken_stmt(s, &mut isr.vars);
+    }
+}
 
 /// Run variable hoisting and child-frame union packing on a task blueprint.
 pub fn analyze_task_frame(task: &mut MirTaskBlueprint) {
@@ -22,9 +32,12 @@ pub fn analyze_task_frame(task: &mut MirTaskBlueprint) {
 pub fn analyze_fn_frame(func: &mut MirFunction) {
     let param_set: BTreeSet<VarId> = func.params.iter().copied().collect();
     match &mut func.body {
-        MirFnBody::Direct(_) => {
+        MirFnBody::Direct(stmts) => {
             for v in &mut func.vars {
                 v.hoisted = false;
+            }
+            for s in stmts {
+                collect_addr_taken_stmt(s, &mut func.vars);
             }
         }
         MirFnBody::Coroutine {
@@ -613,7 +626,14 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
         | MirExprKind::FieldAccess { base: inner, .. }
+        | MirExprKind::FromBytes { slice: inner, .. }
         | MirExprKind::SliceLen(inner) => collect_addr_of_vars(inner, out),
+        MirExprKind::MmioRead { base, index, .. } => {
+            collect_addr_of_vars(base, out);
+            if let Some(idx) = index {
+                collect_addr_of_vars(idx, out);
+            }
+        }
         MirExprKind::Binary { lhs, rhs, .. } | MirExprKind::Index { base: lhs, index: rhs, .. } => {
             collect_addr_of_vars(lhs, out);
             collect_addr_of_vars(rhs, out);
@@ -786,12 +806,51 @@ fn collect_fmt_chunk_addr_of(chunk: &MirFmtChunk, out: &mut BTreeSet<VarId>) {
     }
 }
 
+fn collect_place_subexpr_addr_of_vars(place: &MirPlace, out: &mut BTreeSet<VarId>) {
+    match place {
+        MirPlace::Var(_) => {}
+        MirPlace::Field { base, .. } => collect_place_subexpr_addr_of_vars(base, out),
+        MirPlace::Index { base, index, .. } => {
+            collect_place_subexpr_addr_of_vars(base, out);
+            collect_addr_of_vars(index, out);
+        }
+        MirPlace::Deref(ptr_expr, _) => {
+            collect_addr_of_vars(ptr_expr, out);
+        }
+    }
+}
+
 fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
     let mut taken = BTreeSet::new();
     match stmt {
-        MirStmt::Assign { value, .. } | MirStmt::Expr(value) => {
+        MirStmt::Assign { target, value, .. } => {
+            collect_place_subexpr_addr_of_vars(target, &mut taken);
             collect_addr_of_vars(value, &mut taken);
         }
+        MirStmt::Expr(value) => {
+            collect_addr_of_vars(value, &mut taken);
+        }
+        MirStmt::MmioWrite {
+            base, index, value, ..
+        } => {
+            collect_addr_of_vars(base, &mut taken);
+            if let Some(idx) = index {
+                collect_addr_of_vars(idx, &mut taken);
+            }
+            collect_addr_of_vars(value, &mut taken);
+        }
+        MirStmt::Intrinsic(intr) => match intr {
+            crate::ir::MirIntrinsicOp::UseSystick { hz } => {
+                collect_addr_of_vars(hz, &mut taken);
+            }
+            crate::ir::MirIntrinsicOp::SetPriority { .. } => {}
+            crate::ir::MirIntrinsicOp::SysOp { args, .. }
+            | crate::ir::MirIntrinsicOp::HwOp { args, .. } => {
+                for a in args {
+                    collect_addr_of_vars(a, &mut taken);
+                }
+            }
+        },
         MirStmt::SpawnActivate { args, .. } => {
             for a in args {
                 collect_addr_of_vars(a, &mut taken);
