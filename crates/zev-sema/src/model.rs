@@ -171,6 +171,12 @@ pub struct IrqInfo {
 pub enum IrqBindingArg {
     /// Static OS/DMA primitive handle address (`&sup_inbox`).
     PrimAddr(String),
+    /// Static subsystem instance or nested primitive/subsystem field address (`&uart0`, `&uart0.rx`).
+    SubsystemPath {
+        root: String,
+        root_struct: String,
+        field_chain: Vec<(String, String)>,
+    },
     /// Static `mmio` peripheral instance base pointer (`USART1` / `&USART1`).
     MmioAddr(String),
     /// Compile-time constant scalar (`i128` integer value + resolved scalar type).
@@ -216,6 +222,16 @@ pub struct PrimitiveInfo {
     pub has_init: bool,
     /// True if active transfers on this primitive clamp sleep depth from `DEEP` to `LIGHT`.
     pub clamps_sleep_depth: bool,
+    pub span: Span,
+}
+
+/// Resolved static subsystem struct instance in global SRAM (`UartSubsys uart0;`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubsystemInfo {
+    pub name: String,
+    pub struct_name: String,
+    /// True if annotated `@dma_safe`.
+    pub dma_safe: bool,
     pub span: Span,
 }
 
@@ -275,6 +291,8 @@ pub struct SemanticModel {
     pub consts: BTreeMap<String, ConstInfo>,
     /// Top-level static OS & DMA primitive endpoints.
     pub primitives: BTreeMap<String, PrimitiveInfo>,
+    /// Top-level static subsystem struct instances.
+    pub subsystems: BTreeMap<String, SubsystemInfo>,
     /// Declared `fn` and `extern "C"` functions.
     pub functions: BTreeMap<String, FunctionInfo>,
     /// Declared `task` blueprints.

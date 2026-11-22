@@ -314,6 +314,8 @@ pub enum OsPrimitiveType {
     Signal,
     /// `inbox<T, N>` — unified bounded static queue of capacity `cap` (supports `.post()`, `.send()`, `.recv()`, `.try_recv()`).
     Inbox { elem: Box<TypeExpr>, cap: usize },
+    /// `*inbox<T>` — unsized pointer view over any `inbox<T, N>`.
+    InboxUnsized { elem: Box<TypeExpr> },
     /// `watch<T>` — single-writer, zero-lock latest-value cell.
     Watch { elem: Box<TypeExpr> },
     /// `ping_pong<T, N>` — double-buffered zero-copy DMA endpoint (`N` = half/buffer size).
@@ -322,17 +324,19 @@ pub enum OsPrimitiveType {
     Lease { elem: Box<TypeExpr>, cap: usize },
     /// `byte_ring<N>` — lock-free SPSC circular + BipBuffer byte ring of capacity `cap`.
     ByteRing { cap: usize },
+    /// `*byte_ring` — unsized pointer view over any `byte_ring<N>`.
+    ByteRingUnsized,
 }
 
 impl OsPrimitiveType {
     pub const fn kind_name(&self) -> &'static str {
         match self {
             Self::Signal => "signal",
-            Self::Inbox { .. } => "inbox",
+            Self::Inbox { .. } | Self::InboxUnsized { .. } => "inbox",
             Self::Watch { .. } => "watch",
             Self::PingPong { .. } => "ping_pong",
             Self::Lease { .. } => "lease",
-            Self::ByteRing { .. } => "byte_ring",
+            Self::ByteRing { .. } | Self::ByteRingUnsized => "byte_ring",
         }
     }
 }

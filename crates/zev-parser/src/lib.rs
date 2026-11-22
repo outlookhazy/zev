@@ -2122,4 +2122,63 @@ task worker(*byte_ring<64> rx) {
             other => panic!("expected Isr, got {other:?}"),
         }
     }
+
+    #[test]
+    fn parses_unsized_primitive_views_and_subsystem_decl() {
+        let src = r#"
+struct UartSubsys {
+    byte_ring<64> rx;
+    inbox<u8, 8> tx;
+}
+
+UartSubsys uart0;
+
+fn take_views(*byte_ring r, *inbox<u8> q, *inbox<watch<u8>> nested) {}
+
+fn main() {
+    byte_ring bare_r;
+    inbox<u8> bare_q;
+}
+"#;
+        let prog = parse_str(src).expect("unsized primitive views & subsystem decl must parse");
+        assert!(matches!(
+            &prog.items[1].kind,
+            ItemKind::GlobalVar(g) if g.name.as_str() == "uart0" && g.init.is_none()
+        ));
+        if let ItemKind::Fn(f) = &prog.items[2].kind {
+            assert!(matches!(
+                &f.params[0].ty.kind,
+                TypeKind::Ptr(inner) if matches!(inner.kind, TypeKind::OsPrimitive(OsPrimitiveType::ByteRingUnsized))
+            ));
+            assert!(matches!(
+                &f.params[1].ty.kind,
+                TypeKind::Ptr(inner) if matches!(inner.kind, TypeKind::OsPrimitive(OsPrimitiveType::InboxUnsized { .. }))
+            ));
+            assert!(matches!(
+                &f.params[2].ty.kind,
+                TypeKind::Ptr(inner) if matches!(
+                    &inner.kind,
+                    TypeKind::OsPrimitive(OsPrimitiveType::InboxUnsized { elem })
+                        if matches!(elem.kind, TypeKind::OsPrimitive(OsPrimitiveType::Watch { .. }))
+                )
+            ));
+        } else {
+            panic!("expected Fn take_views");
+        }
+        if let ItemKind::Fn(m) = &prog.items[3].kind {
+            let stmts = &m.body.as_ref().unwrap().stmts;
+            assert!(matches!(
+                &stmts[0].kind,
+                StmtKind::VarDecl { ty, init: None, .. }
+                    if matches!(ty.kind, TypeKind::OsPrimitive(OsPrimitiveType::ByteRingUnsized))
+            ));
+            assert!(matches!(
+                &stmts[1].kind,
+                StmtKind::VarDecl { ty, init: None, .. }
+                    if matches!(ty.kind, TypeKind::OsPrimitive(OsPrimitiveType::InboxUnsized { .. }))
+            ));
+        } else {
+            panic!("expected Fn main");
+        }
+    }
 }

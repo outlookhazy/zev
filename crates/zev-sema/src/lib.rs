@@ -28,7 +28,7 @@ pub use model::{
     ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo,
     IrqInfo, IsrInfo, IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo,
     MonomorphizedInstance, MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite,
-    SemanticModel, SpawnedTaskInstance, TaskInfo,
+    SemanticModel, SpawnedTaskInstance, SubsystemInfo, TaskInfo,
 };
 pub use modules::{
     LinkedModulesOutput, collect_import_aware_generic_names, load_and_link_modules,

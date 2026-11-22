@@ -3735,4 +3735,366 @@ fn main() {
             res.exec.stdout
         );
     }
+
+    fn run_zev_cortex_m_qemu(
+        test_name: &str,
+        src: &str,
+    ) -> (zev_mir::MirModule, String, crate::QemuRunResult) {
+        let prog = zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {test_name}: {e:?}"));
+        zev_sema::analyze_program(&prog)
+            .unwrap_or_else(|e| panic!("sema {test_name}: {e:?}"));
+        let mir = zev_mir::lower_program(&prog).unwrap_or_else(|e| panic!("lower {test_name}: {e:?}"));
+        let dir = test_out_dir();
+        let elf = dir.join(format!("{test_name}.elf"));
+        let res = run_qemu_cortex_m(
+            &mir,
+            &elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("run {test_name} QEMU: {e}"));
+        assert_eq!(res.exec.exit_code, 0, "{test_name} exit != 0; stdout={}", res.exec.stdout);
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        let ll = std::fs::read_to_string(&res.build.ll_path).expect("read generated .ll");
+        (mir, ll, res)
+    }
+
+    fn assert_all_allocas_in_entry(ll: &str) {
+        let mut in_fn = false;
+        let mut in_entry = false;
+        for line in ll.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("define ") {
+                in_fn = true;
+                in_entry = false;
+            } else if trimmed == "}" {
+                in_fn = false;
+                in_entry = false;
+            } else if in_fn && trimmed == "entry:" {
+                in_entry = true;
+            } else if in_fn && trimmed.ends_with(':') && !trimmed.contains(' ') {
+                in_entry = false;
+            } else if in_fn && trimmed.contains("= alloca ") && !in_entry {
+                panic!("non-entry alloca found in LLVM IR: {trimmed}");
+            }
+        }
+    }
+
+    #[test]
+    fn unsized_views_byte_ring_and_inbox_multi_cap_in_qemu_and_avr() {
+        let src = r#"
+struct ViewBundle {
+    *byte_ring ring;
+    *inbox<u32> q;
+}
+
+byte_ring<12> ring_a;
+byte_ring<24> ring_b;
+inbox<u32, 3> q_a;
+inbox<u32, 6> q_b;
+
+usize exercise_ring(*byte_ring r, u8 seed) {
+    usize cap = r.cap();
+    assert(r.is_empty());
+    assert(!r.is_full());
+    assert(r.free_space() == cap);
+    assert(r.push("ABC", boost: @high) == 3);
+    assert(r.push_byte(seed));
+    assert(r.len() == 4);
+
+    []u8 chunk = r.read_slice();
+    assert(chunk.len == 4);
+    assert(chunk[0] == 'A');
+    assert(chunk[3] == seed);
+    r.consume(2);
+    assert(r.len() == 2);
+
+    u8 popped[4];
+    usize npop = r.pop(popped);
+    assert(npop == 2);
+    assert(popped[0] == 'C');
+    assert(popped[1] == seed);
+    u8 pop_sentinel = r.try_pop_byte() catch { 0xEE };
+    assert(pop_sentinel == 0xEE);
+
+    []u8 dma = r.grant_write(3) catch { return 0; };
+    dma[0] = 'X';
+    dma[1] = 'Y';
+    dma[2] = 'Z';
+    r.commit_write(2, boost: @low);
+    assert(r.len() == 2);
+    u8 b0 = r.try_pop_byte() catch { return 0; };
+    assert(b0 == 'X');
+    r.clear();
+    assert(r.is_empty());
+    return cap;
+}
+
+usize exercise_inbox(*inbox<u32> q) {
+    usize cap = q.cap();
+    assert(q.is_empty());
+    assert(!q.is_full());
+    q.post(10);
+    assert(q.try_send(20, boost: @high));
+    assert(q.try_send(30));
+    assert(q.len() == 3);
+    if (cap == 3) {
+        assert(q.is_full());
+        assert(!q.try_send(40));
+    } else {
+        assert(!q.is_full());
+    }
+    u32 v1 = q.try_recv() catch { return 0; };
+    u32 v2 = q.try_recv() catch { return 0; };
+    u32 v3 = q.try_recv() catch { return 0; };
+    assert(v1 == 10 && v2 == 20 && v3 == 30);
+    u32 empty_sentinel = q.try_recv() catch { 9999 };
+    assert(empty_sentinel == 9999);
+    return cap;
+}
+
+task consumer_task(ViewBundle vb) {
+    set_priority(@low);
+    u8 i = 0;
+    while (i < 2) {
+        i += 1;
+        []u8 chunk = vb.ring.wait_read(timeout: 20ms) catch {
+            println("RING_TIMEOUT");
+            sys.exit(0);
+        };
+        println(f"QEMU_VIEW_RX len={chunk.len} b0={chunk[0]} prio={sys.current_prio()}");
+        vb.ring.consume(chunk.len);
+        u32 msg = vb.q.recv(timeout: 20ms) catch {
+            println("INBOX_TIMEOUT");
+            sys.exit(0);
+        };
+        println(f"QEMU_VIEW_MSG={msg}");
+    }
+    println("[PASS] VIEWS_QEMU_OK");
+    sys.exit(0);
+}
+
+task producer_task(*byte_ring r, *inbox<u32> q) {
+    sys.delay(2ms);
+    r.push("HI", boost: @critical);
+    q.send(77, timeout: 10ms) catch { loop { sys.delay(10ms); } };
+    sys.delay(3ms);
+    r.push("OK", boost: @high);
+    q.send(88, timeout: 10ms) catch { loop { sys.delay(10ms); } };
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    assert(exercise_ring(&ring_a, 99) == 12);
+    assert(exercise_ring(&ring_b, 42) == 24);
+    assert(exercise_inbox(&q_a) == 3);
+    assert(exercise_inbox(&q_b) == 6);
+    spawn consumer_task(ViewBundle{ ring: &ring_a, q: &q_a }) @low;
+    spawn producer_task(&ring_a, &q_a) @normal;
+}
+"#;
+        let (mir, ll, res) =
+            run_zev_cortex_m_qemu("unsized_views_multi_cap_qemu", src);
+        assert_all_allocas_in_entry(&ll);
+        assert!(
+            res.exec.stdout.contains("QEMU_VIEW_RX len=2 b0=72 prio=0"),
+            "stdout={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("QEMU_VIEW_MSG=77")
+                && res.exec.stdout.contains("QEMU_VIEW_MSG=88")
+                && res.exec.stdout.contains("[PASS] VIEWS_QEMU_OK"),
+            "stdout={}",
+            res.exec.stdout
+        );
+
+        // Verify ATmega328P AVR build + opt verify passes with zero non-entry allocas
+        let dir = test_out_dir();
+        let avr_img = build_avr_uno_image(
+            &mir,
+            &dir.join("unsized_views_avr.elf"),
+            &dir.join("unsized_views_avr.bin"),
+        )
+        .expect("AVR build unsized views");
+        verify_ll_with_opt(&avr_img.elf.ll_path).expect("LLVM verify AVR unsized views");
+        let avr_ll = std::fs::read_to_string(&avr_img.elf.ll_path).expect("read avr ll");
+        assert_all_allocas_in_entry(&avr_ll);
+        assert!(avr_img.elf.audit.is_zero_heap_freestanding());
+    }
+
+    #[test]
+    fn subsystem_structs_nested_isr_and_view_coercion_in_qemu() {
+        let src = r#"
+irq UartIrq = 4;
+
+struct Channel {
+    byte_ring<16> tx;
+    inbox<u16, 4> q;
+}
+
+struct UartSubsys {
+    byte_ring<12> rx;
+    Channel ch0;
+}
+
+struct SyncSubsys {
+    signal ready;
+}
+
+UartSubsys uart0;
+UartSubsys uart1;
+SyncSubsys sync_box;
+
+isr on_rx(*byte_ring r, *inbox<u16> q) {
+    r.push("AB", boost: @high);
+    q.post(1234, boost: @high);
+}
+
+fn check_channel(*Channel ch, u16 tag) {
+    assert(ch.tx.cap() == 16);
+    assert(ch.q.cap() == 4);
+    usize n = fmt_ring(&ch.tx, f"tag={tag}") catch { 0 };
+    assert(n > 0);
+}
+
+task subsys_worker(*UartSubsys drv) {
+    set_priority(@low);
+    sync_box.ready.wait();
+    assert(sys.current_prio() == 3);
+    check_channel(&drv.ch0, 7);
+    []u8 s = drv.rx.wait_read(timeout: 20ms) catch {
+        println("SUBSYS_RX_TO");
+        sys.exit(0);
+    };
+    println(f"QEMU_SUBSYS_RX len={s.len} b0={s[0]} prio={sys.current_prio()}");
+    drv.rx.consume(s.len);
+    u16 code = drv.ch0.q.recv(timeout: 20ms) catch {
+        println("SUBSYS_Q_TO");
+        sys.exit(0);
+    };
+    println(f"QEMU_SUBSYS_Q code={code}");
+    []u8 txs = drv.ch0.tx.read_slice();
+    println(f"QEMU_SUBSYS_TX len={txs.len} b0={txs[0]}");
+    drv.ch0.tx.consume(txs.len);
+    sys.exit(0);
+}
+
+task irq_driver() {
+    sys.delay(1ms);
+    sync_box.ready.notify();
+    sys.delay(2ms);
+    sys.pend_irq(4);
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    check_channel(&uart1.ch0, 9);
+    assert(uart1.ch0.tx.len() == 5);
+    UartIrq.attach(on_rx(&uart0.rx, &uart0.ch0.q));
+    spawn subsys_worker(&uart0) @low;
+    spawn irq_driver() @normal;
+}
+"#;
+        let (_mir, ll, res) =
+            run_zev_cortex_m_qemu("subsystem_structs_nested_isr_qemu", src);
+        assert_all_allocas_in_entry(&ll);
+        assert!(
+            ll.contains("@__zev_subsys_uart0 = internal global %struct.UartSubsys zeroinitializer")
+                && ll.contains("@__zev_subsys_uart1 = internal global %struct.UartSubsys zeroinitializer"),
+            "expected static subsystem globals in LLVM IR"
+        );
+        assert!(
+            !ll.contains("@__syn_from_bytes_UartSubsys") && !ll.contains("@__syn_from_bytes_Channel"),
+            "subsystem structs must not emit from_bytes helpers"
+        );
+        assert!(
+            res.exec.stdout.contains("QEMU_SUBSYS_RX len=2 b0=65 prio=1")
+                && res.exec.stdout.contains("QEMU_SUBSYS_Q code=1234")
+                && res.exec.stdout.contains("QEMU_SUBSYS_TX len=5 b0=116"),
+            "stdout={}",
+            res.exec.stdout
+        );
+    }
+
+    #[test]
+    fn fmt_ring_wrap_single_wake_boost_and_truncation_in_qemu() {
+        let src = r#"
+byte_ring<16> tx;
+signal sync;
+
+usize write_fmt_view(*byte_ring r, u16 v) error FmtErr {
+    return fmt_ring(r, f"V={v:04X}", boost: @high) catch (FmtErr e, usize pw) {
+        error e, pw;
+    };
+}
+
+task reader() {
+    set_priority(@low);
+    sync.notify();
+    []u8 cw = tx.wait_read(timeout: 20ms) catch {
+        println("FAIL_WAIT1");
+        sys.exit(0);
+    };
+    u32 prio = sys.current_prio();
+    usize cw_len = cw.len;
+    u8 first_b = cw[0];
+    assert(cw_len == 8);
+    tx.consume(cw_len);
+    println(f"QEMU_FMT_WAKE len={cw_len} b0={first_b} prio={prio}");
+
+    assert(tx.push("0123456789A") == 11);
+    u8 trash[10];
+    assert(tx.pop(trash) == 10);
+    usize w = write_fmt_view(&tx, 0x1A2B) catch { 0 };
+    assert(w == 6);
+
+    []u8 c1 = tx.read_slice();
+    usize c1_len = c1.len;
+    assert(c1_len == 6);
+    tx.consume(c1_len);
+    []u8 c2 = tx.read_slice();
+    assert(c2.len == 1);
+    u8 last_b = c2[0];
+    tx.consume(c2.len);
+    println(f"QEMU_FMT_WRAP c1len={c1_len} last={last_b}");
+
+    assert(tx.push("123456789012") == 12);
+    usize partial_w = fmt_ring(&tx, f"ABCD1234") catch (FmtErr e, usize pw) {
+        println(f"QEMU_FMT_TRUNC partial={pw} total_len={tx.len()}");
+        sys.exit(0);
+    };
+    println(f"UNEXPECTED_OK={partial_w}");
+    sys.exit(0);
+}
+
+task writer() {
+    sync.wait();
+    sys.delay(2ms);
+    u8 x = 0x2A;
+    u8 y = 7;
+    usize w = fmt_ring(&tx, f"X={x:02X} Y={y}", boost: @high) catch { 0 };
+    assert(w == 8);
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    spawn reader() @low;
+    spawn writer() @normal;
+}
+"#;
+        let (_mir, ll, res) =
+            run_zev_cortex_m_qemu("fmt_ring_wrap_trunc_qemu", src);
+        assert_all_allocas_in_entry(&ll);
+        assert!(
+            res.exec.stdout.contains("QEMU_FMT_WAKE len=8 b0=88 prio=1")
+                && res.exec.stdout.contains("QEMU_FMT_WRAP c1len=6 last=66")
+                && res.exec.stdout.contains("QEMU_FMT_TRUNC partial=4 total_len=16"),
+            "stdout={}",
+            res.exec.stdout
+        );
+    }
 }

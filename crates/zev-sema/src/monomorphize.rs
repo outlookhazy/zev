@@ -1200,6 +1200,9 @@ impl<'a> Monomorphizer<'a> {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
                 cap: *cap,
             },
+            OsPrimitiveType::InboxUnsized { elem } => OsPrimitiveType::InboxUnsized {
+                elem: Box::new(self.rewrite_type_expr(elem, env)),
+            },
             OsPrimitiveType::Watch { elem } => OsPrimitiveType::Watch {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
             },
@@ -1212,6 +1215,7 @@ impl<'a> Monomorphizer<'a> {
                 cap: *cap,
             },
             OsPrimitiveType::ByteRing { cap } => OsPrimitiveType::ByteRing { cap: *cap },
+            OsPrimitiveType::ByteRingUnsized => OsPrimitiveType::ByteRingUnsized,
         }
     }
 
@@ -1255,6 +1259,9 @@ impl<'a> Monomorphizer<'a> {
                 OsPrimitiveType::Inbox { elem, cap } => {
                     format!("_Ginbox_L_{}__{}_R_", self.format_mangled_type(elem), cap)
                 }
+                OsPrimitiveType::InboxUnsized { elem } => {
+                    format!("_Ginbox_L_{}_R_", self.format_mangled_type(elem))
+                }
                 OsPrimitiveType::PingPong { elem, cap } => {
                     format!(
                         "_Gping_0pong_L_{}__{}_R_",
@@ -1268,6 +1275,7 @@ impl<'a> Monomorphizer<'a> {
                 OsPrimitiveType::ByteRing { cap } => {
                     format!("_Gbyte_0ring_L_{}_R_", cap)
                 }
+                OsPrimitiveType::ByteRingUnsized => "byte_ring".to_string(),
             },
             TypeKind::FnPtr { params, ret } => {
                 let ps: Vec<String> = params.iter().map(|p| self.format_mangled_type(p)).collect();
@@ -1323,6 +1331,9 @@ impl<'a> Monomorphizer<'a> {
                 OsPrimitiveType::Inbox { elem, cap } => {
                     format!("inbox<{}, {}>", self.format_human_type(elem), cap)
                 }
+                OsPrimitiveType::InboxUnsized { elem } => {
+                    format!("inbox<{}>", self.format_human_type(elem))
+                }
                 OsPrimitiveType::PingPong { elem, cap } => {
                     format!("ping_pong<{}, {}>", self.format_human_type(elem), cap)
                 }
@@ -1332,6 +1343,7 @@ impl<'a> Monomorphizer<'a> {
                 OsPrimitiveType::ByteRing { cap } => {
                     format!("byte_ring<{}>", cap)
                 }
+                OsPrimitiveType::ByteRingUnsized => "byte_ring".to_string(),
             },
             TypeKind::FnPtr { params, ret } => {
                 let ps: Vec<String> = params.iter().map(|p| self.format_human_type(p)).collect();
@@ -2398,10 +2410,31 @@ impl<'a> Monomorphizer<'a> {
                                 "read" | "wait_change",
                             )
                             | (
-                                OsPrimitiveType::Inbox { elem, .. },
+                                OsPrimitiveType::Inbox { elem, .. }
+                                | OsPrimitiveType::InboxUnsized { elem },
                                 "recv" | "try_recv",
                             ) => {
                                 out_ty = InferTy::Concrete((**elem).clone());
+                            }
+                            (
+                                OsPrimitiveType::Inbox { .. }
+                                | OsPrimitiveType::InboxUnsized { .. },
+                                "len" | "cap",
+                            ) => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::Usize),
+                                    expr.span,
+                                ));
+                            }
+                            (
+                                OsPrimitiveType::Inbox { .. }
+                                | OsPrimitiveType::InboxUnsized { .. },
+                                "try_post" | "try_send" | "is_empty" | "is_full",
+                            ) => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::Bool),
+                                    expr.span,
+                                ));
                             }
                             (
                                 OsPrimitiveType::PingPong { elem, .. }
@@ -2414,7 +2447,8 @@ impl<'a> Monomorphizer<'a> {
                                 ));
                             }
                             (
-                                OsPrimitiveType::ByteRing { .. },
+                                OsPrimitiveType::ByteRing { .. }
+                                | OsPrimitiveType::ByteRingUnsized,
                                 "read_slice" | "wait_read" | "grant_write",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
@@ -2425,14 +2459,19 @@ impl<'a> Monomorphizer<'a> {
                                     expr.span,
                                 ));
                             }
-                            (OsPrimitiveType::ByteRing { .. }, "try_pop_byte") => {
+                            (
+                                OsPrimitiveType::ByteRing { .. }
+                                | OsPrimitiveType::ByteRingUnsized,
+                                "try_pop_byte",
+                            ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
                                     TypeKind::Prim(PrimType::U8),
                                     expr.span,
                                 ));
                             }
                             (
-                                OsPrimitiveType::ByteRing { .. },
+                                OsPrimitiveType::ByteRing { .. }
+                                | OsPrimitiveType::ByteRingUnsized,
                                 "push" | "pop" | "len" | "cap" | "free_space",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
@@ -2441,7 +2480,8 @@ impl<'a> Monomorphizer<'a> {
                                 ));
                             }
                             (
-                                OsPrimitiveType::ByteRing { .. },
+                                OsPrimitiveType::ByteRing { .. }
+                                | OsPrimitiveType::ByteRingUnsized,
                                 "push_byte" | "is_empty" | "is_full",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
@@ -2664,7 +2704,13 @@ impl<'a> Monomorphizer<'a> {
                         if self.non_generic_fn_rets.contains_key(&fn_id.name)
                             || matches!(
                                 fn_id.name.as_str(),
-                                "print" | "println" | "fmt_buf" | "assert" | "delay" | "checkpoint"
+                                "print"
+                                    | "println"
+                                    | "fmt_buf"
+                                    | "fmt_ring"
+                                    | "assert"
+                                    | "delay"
+                                    | "checkpoint"
                             )
                         {
                             format!(
@@ -2697,6 +2743,21 @@ impl<'a> Monomorphizer<'a> {
                         span,
                     ),
                     InferTy::Concrete(slice_u8),
+                );
+            }
+
+            if fn_id.name == "fmt_ring" {
+                let usize_ty = TypeExpr::new(TypeKind::Prim(PrimType::Usize), span);
+                return (
+                    Expr::new(
+                        ExprKind::Call {
+                            callee: Box::new(callee.clone()),
+                            generic_args: Vec::new(),
+                            args: r_args,
+                        },
+                        span,
+                    ),
+                    InferTy::Concrete(usize_ty),
                 );
             }
 
@@ -3157,6 +3218,9 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             OsPrimitiveType::Inbox { elem, cap } => {
                 format!("_Ginbox_L_{}__{}_R_", mangle_type_expr(elem), cap)
             }
+            OsPrimitiveType::InboxUnsized { elem } => {
+                format!("_Ginbox_L_{}_R_", mangle_type_expr(elem))
+            }
             OsPrimitiveType::PingPong { elem, cap } => {
                 format!("_Gping_0pong_L_{}__{}_R_", mangle_type_expr(elem), cap)
             }
@@ -3166,6 +3230,7 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             OsPrimitiveType::ByteRing { cap } => {
                 format!("_Gbyte_0ring_L_{}_R_", cap)
             }
+            OsPrimitiveType::ByteRingUnsized => "byte_ring".to_string(),
         },
         TypeKind::FnPtr { params, ret } => {
             let ps: Vec<String> = params.iter().map(mangle_type_expr).collect();

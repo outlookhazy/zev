@@ -16,10 +16,10 @@ use crate::ir::{
     MirExternFn, MirField, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction, MirImport, MirIntFmt,
     MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl, MirIsrStateVar,
     MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPlace, MirPrimKind,
-    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimitive, MirPriority,
-    MirSpawnInstance, MirStmt, MirStruct, MirSwitchPattern, MirSysQuery, MirTaskBlueprint,
-    MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, MonomorphizedItemKind,
-    MonomorphizedMirItem, VarId, VarRole,
+    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirPrimitive, MirPriority,
+    MirSpawnInstance, MirStmt, MirStruct, MirSubsystemGlobal, MirSwitchPattern, MirSysQuery,
+    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind,
+    MonomorphizedItemKind, MonomorphizedMirItem, VarId, VarRole,
 };
 use crate::liveness::{analyze_fn_frame, analyze_isr_frame, analyze_task_frame};
 use crate::ram::{populate_module_ram_report, RamReport};
@@ -92,6 +92,7 @@ struct ModuleSymbols {
     consts: BTreeMap<String, MirType>,
     const_vals: BTreeMap<String, ConstVal>,
     primitives: BTreeMap<String, PrimInfo>,
+    subsystems: BTreeMap<String, (String, bool)>,
     fns: BTreeMap<String, FnSig>,
     tasks: BTreeMap<String, Vec<MirType>>,
     soft_yielding_in_coro: BTreeSet<String>,
@@ -258,6 +259,18 @@ impl ModuleSymbols {
             TypeKind::Ptr(inner) => {
                 if let Some(layout) = self.resolve_mmio_layout_name(inner) {
                     MirType::MmioPtr(layout)
+                } else if let TypeKind::OsPrimitive(os) = &inner.kind {
+                    match os {
+                        OsPrimitiveType::ByteRingUnsized => {
+                            MirType::PrimView(MirPrimViewKind::ByteRing)
+                        }
+                        OsPrimitiveType::InboxUnsized { elem } => {
+                            MirType::PrimView(MirPrimViewKind::Inbox {
+                                elem: Box::new(self.resolve_type(elem)),
+                            })
+                        }
+                        _ => MirType::Ptr(Box::new(self.resolve_type(inner))),
+                    }
                 } else {
                     MirType::Ptr(Box::new(self.resolve_type(inner)))
                 }
@@ -280,6 +293,10 @@ impl ModuleSymbols {
                 elem: Box::new(self.resolve_type(elem)),
                 cap: *cap,
             },
+            OsPrimitiveType::InboxUnsized { elem } => MirPrimKind::Inbox {
+                elem: Box::new(self.resolve_type(elem)),
+                cap: 0,
+            },
             OsPrimitiveType::PingPong { elem, cap } => MirPrimKind::PingPong {
                 elem: Box::new(self.resolve_type(elem)),
                 cap: *cap,
@@ -289,6 +306,7 @@ impl ModuleSymbols {
                 cap: *cap,
             },
             OsPrimitiveType::ByteRing { cap } => MirPrimKind::ByteRing { cap: *cap },
+            OsPrimitiveType::ByteRingUnsized => MirPrimKind::ByteRing { cap: 0 },
         }
     }
 
@@ -429,6 +447,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         consts: BTreeMap::new(),
         const_vals: BTreeMap::new(),
         primitives: BTreeMap::new(),
+        subsystems: BTreeMap::new(),
         fns: BTreeMap::new(),
         tasks: BTreeMap::new(),
         soft_yielding_in_coro: BTreeSet::new(),
@@ -613,6 +632,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                 MirStruct {
                     name: sd.name.name.clone(),
                     packed: sd.is_packed,
+                    is_subsystem: false,
                     fields: Vec::new(),
                 },
             );
@@ -636,10 +656,34 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             let ms = MirStruct {
                 name: sd.name.name.clone(),
                 packed: sd.is_packed,
+                is_subsystem: false,
                 fields,
             };
             syms.structs.insert(sd.name.name.clone(), ms.clone());
             mir_structs.push(ms);
+        }
+    }
+    loop {
+        let mut changed = false;
+        for st in &mut mir_structs {
+            if st.is_subsystem {
+                continue;
+            }
+            let has_subsys = st.fields.iter().any(|f| match &f.ty {
+                MirType::Primitive(_) => true,
+                MirType::Struct(sub) => syms.structs.get(sub).is_some_and(|s| s.is_subsystem),
+                _ => false,
+            });
+            if has_subsys {
+                st.is_subsystem = true;
+                if let Some(entry) = syms.structs.get_mut(&st.name) {
+                    entry.is_subsystem = true;
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
@@ -650,6 +694,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
     let mut raw_task_decls: Vec<&TaskDecl> = Vec::new();
     let mut raw_isr_decls: Vec<&IsrDecl> = Vec::new();
     let mut mir_extern_fns: Vec<MirExternFn> = Vec::new();
+    let mut mir_subsystems: Vec<MirSubsystemGlobal> = Vec::new();
 
     for item in &program.items {
         match &item.kind {
@@ -756,6 +801,20 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                 raw_isr_decls.push(id);
             }
             ItemKind::GlobalVar(gv) => {
+                let gty = syms.resolve_type(&gv.ty);
+                if let MirType::Struct(sname) = &gty {
+                    if syms.structs.get(sname).is_some_and(|s| s.is_subsystem) {
+                        let dma_safe = has_attr_dma_safe(&item.attrs);
+                        syms.subsystems
+                            .insert(gv.name.name.clone(), (sname.clone(), dma_safe));
+                        mir_subsystems.push(MirSubsystemGlobal {
+                            name: gv.name.name.clone(),
+                            struct_name: sname.clone(),
+                            dma_safe,
+                        });
+                        continue;
+                    }
+                }
                 return Err(MirLowerError {
                     message: format!(
                         "mutable raw global `{}` is forbidden; use an OS primitive (`watch`, `inbox`, `signal`, `ping_pong`)",
@@ -996,6 +1055,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         mmio_layouts: mir_mmio_layouts,
         mmio_instances: mir_mmio_instances,
         primitives: mir_primitives,
+        subsystems: mir_subsystems,
         extern_fns: mir_extern_fns,
         isrs: mir_isrs,
         irq_vectors: mir_irq_vectors,
@@ -1943,6 +2003,14 @@ struct BootSpawnState<'a> {
     irq_param_bindings: BTreeMap<String, (String, u32)>,
 }
 
+fn is_const_mir_place(place: &MirPlace) -> bool {
+    match place {
+        MirPlace::Deref(inner, _) => is_const_mir_expr(inner),
+        MirPlace::Field { base, .. } => is_const_mir_place(base),
+        _ => false,
+    }
+}
+
 fn is_const_mir_expr(expr: &MirExpr) -> bool {
     match &expr.kind {
         MirExprKind::IntLit(_)
@@ -1952,9 +2020,12 @@ fn is_const_mir_expr(expr: &MirExpr) -> bool {
         | MirExprKind::TicksLit(_)
         | MirExprKind::EnumVariant { .. }
         | MirExprKind::GlobalPrimAddr(_)
+        | MirExprKind::SubsystemAddr(_)
         | MirExprKind::FnAddr(_)
         | MirExprKind::MmioAddr(_)
         | MirExprKind::ConstRef(_) => true,
+        MirExprKind::MakePrimView { ptr, .. } => is_const_mir_expr(ptr),
+        MirExprKind::AddrOfPlace(place) => is_const_mir_place(place),
         MirExprKind::Unary { expr, .. } | MirExprKind::Cast { expr, .. } => {
             is_const_mir_expr(expr)
         }
@@ -1969,9 +2040,54 @@ fn is_const_mir_expr(expr: &MirExpr) -> bool {
     }
 }
 
+fn resolve_boot_const_place(place: &MirPlace, env: &BTreeMap<VarId, MirExpr>) -> MirPlace {
+    match place {
+        MirPlace::Var(_) => place.clone(),
+        MirPlace::Deref(inner, ty) => {
+            MirPlace::Deref(Box::new(resolve_boot_const_expr(inner, env)), ty.clone())
+        }
+        MirPlace::Field {
+            base,
+            struct_name,
+            packed,
+            field,
+            field_ty,
+        } => MirPlace::Field {
+            base: Box::new(resolve_boot_const_place(base, env)),
+            struct_name: struct_name.clone(),
+            packed: *packed,
+            field: field.clone(),
+            field_ty: field_ty.clone(),
+        },
+        MirPlace::Index {
+            base,
+            index,
+            elem_ty,
+            is_slice,
+        } => MirPlace::Index {
+            base: Box::new(resolve_boot_const_place(base, env)),
+            index: Box::new(resolve_boot_const_expr(index, env)),
+            elem_ty: elem_ty.clone(),
+            is_slice: *is_slice,
+        },
+    }
+}
+
 fn resolve_boot_const_expr(expr: &MirExpr, env: &BTreeMap<VarId, MirExpr>) -> MirExpr {
     match &expr.kind {
         MirExprKind::Var(vid) => env.get(vid).cloned().unwrap_or_else(|| expr.clone()),
+        MirExprKind::MakePrimView { ptr, cap, kind } => MirExpr::new(
+            MirExprKind::MakePrimView {
+                ptr: Box::new(resolve_boot_const_expr(ptr, env)),
+                cap: *cap,
+                kind: kind.clone(),
+            },
+            expr.ty.clone(),
+        ),
+        MirExprKind::AddrOfPlace(place) => MirExpr::new(
+            MirExprKind::AddrOfPlace(Box::new(resolve_boot_const_place(place, env))),
+            expr.ty.clone(),
+        ),
         MirExprKind::Unary { op, expr: inner } => MirExpr::new(
             MirExprKind::Unary {
                 op: *op,
@@ -4604,12 +4720,49 @@ impl<'a> DirectLowerCtx<'a> {
         }
         let resolved = resolve_boot_const_expr(&raw, &self.boot_const_env);
         let coerced = coerce_expr_if_needed(resolved, param_ty);
-        match &coerced.kind {
+        let mut core = &coerced;
+        while let MirExprKind::MakePrimView { ptr, .. } = &core.kind {
+            core = ptr;
+        }
+        match &core.kind {
             MirExprKind::GlobalPrimAddr(name) => Ok(MirBakedArg::PrimAddr(name.clone())),
             MirExprKind::MmioAddr(name) => Ok(MirBakedArg::MmioAddr(name.clone())),
+            MirExprKind::SubsystemAddr(name) => {
+                let root_struct = self
+                    .syms
+                    .subsystems
+                    .get(name)
+                    .map(|(s, _)| s.clone())
+                    .unwrap_or_default();
+                Ok(MirBakedArg::SubsystemPath {
+                    root: name.clone(),
+                    root_struct,
+                    field_chain: Vec::new(),
+                })
+            }
+            MirExprKind::AddrOfPlace(place) => {
+                if let Some((root, chain)) = extract_subsystem_place_chain(place) {
+                    let root_struct = self
+                        .syms
+                        .subsystems
+                        .get(&root)
+                        .map(|(s, _)| s.clone())
+                        .unwrap_or_default();
+                    return Ok(MirBakedArg::SubsystemPath {
+                        root,
+                        root_struct,
+                        field_chain: chain,
+                    });
+                }
+                Err(MirLowerError {
+                    message: "ISR attachment argument must be a compile-time constant, static `&primitive`, `&subsystem`, or `mmio` peripheral pointer"
+                        .to_string(),
+                    span: arg_expr.span,
+                })
+            }
             _ if is_const_mir_expr(&coerced) => Ok(MirBakedArg::Const(coerced)),
             _ => Err(MirLowerError {
-                message: "ISR attachment argument must be a compile-time constant, static `&primitive`, or `mmio` peripheral pointer"
+                message: "ISR attachment argument must be a compile-time constant, static `&primitive`, `&subsystem`, or `mmio` peripheral pointer"
                     .to_string(),
                 span: arg_expr.span,
             }),
@@ -5818,8 +5971,53 @@ impl<'a> CoroutineLowerCtx<'a> {
                 args,
             } => {
                 let m = method.name.as_str();
-                if let Some((target, pkind)) = self.resolve_prim_receiver(receiver)? {
-                    match (m, pkind) {
+                if let Some(recv_kind) = resolve_prim_receiver_kind_be(receiver, self)? {
+                    match recv_kind {
+                        LoweredPrimReceiver::ByteRingView(view)
+                            if m == "wait_read" && find_named_arg(args, "timeout").is_none() =>
+                        {
+                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            let poll_bb = self.alloc_bb();
+                            let resume_bb = self.alloc_bb();
+                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                            self.seal_bb(
+                                MirTerminator::Yield(MirYieldKind::ByteRingViewWaitRead {
+                                    view,
+                                    timeout_deadline_var: None,
+                                    dst_val: Some(dst_vid),
+                                    dst_res: None,
+                                    poll_bb,
+                                    resume_bb,
+                                }),
+                                resume_bb,
+                                false,
+                            );
+                            return Ok(true);
+                        }
+                        LoweredPrimReceiver::InboxView(view, elem)
+                            if m == "recv" && find_named_arg(args, "timeout").is_none() =>
+                        {
+                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            let poll_bb = self.alloc_bb();
+                            let resume_bb = self.alloc_bb();
+                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                            self.seal_bb(
+                                MirTerminator::Yield(MirYieldKind::InboxViewRecv {
+                                    view,
+                                    elem_ty: elem,
+                                    timeout_deadline_var: None,
+                                    dst_val: Some(dst_vid),
+                                    dst_res: None,
+                                    poll_bb,
+                                    resume_bb,
+                                }),
+                                resume_bb,
+                                false,
+                            );
+                            return Ok(true);
+                        }
+                        LoweredPrimReceiver::Sized(target, pkind) => {
+                            match (m, pkind) {
                         ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
@@ -5900,6 +6098,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 false,
                             );
                             return Ok(true);
+                        }
+                        _ => {}
+                            }
                         }
                         _ => {}
                     }
@@ -5996,9 +6197,44 @@ impl<'a> CoroutineLowerCtx<'a> {
                         }
                     }
                 }
-                if let Some((target, pkind)) = self.resolve_prim_receiver(receiver)? {
-                    let m = method.name.as_str();
-                    match (m, pkind) {
+                let m = method.name.as_str();
+                if let Some(recv_kind) = resolve_prim_receiver_kind_be(receiver, self)? {
+                    match recv_kind {
+                        LoweredPrimReceiver::InboxView(view, elem)
+                            if m == "send" && find_named_arg(args, "timeout").is_none() =>
+                        {
+                            let vexpr = if let Some(first) = first_positional_arg(args) {
+                                let raw = self.lower_expr(first, Some(&elem))?;
+                                coerce_expr_if_needed(raw, &elem)
+                            } else {
+                                MirExpr::new(MirExprKind::IntLit(0), elem.clone())
+                            };
+                            let val_var = self.alloc_temp("inbox_tx", elem.clone());
+                            self.cur_stmts.push(MirStmt::Assign {
+                                target: MirPlace::Var(val_var),
+                                op: MirAssignOp::Assign,
+                                value: vexpr,
+                            });
+                            let poll_bb = self.alloc_bb();
+                            let resume_bb = self.alloc_bb();
+                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                            self.seal_bb(
+                                MirTerminator::Yield(MirYieldKind::InboxViewSend {
+                                    view,
+                                    elem_ty: elem,
+                                    val_var,
+                                    timeout_deadline_var: None,
+                                    dst_res: None,
+                                    poll_bb,
+                                    resume_bb,
+                                }),
+                                resume_bb,
+                                false,
+                            );
+                            return Ok(true);
+                        }
+                        LoweredPrimReceiver::Sized(target, pkind) => {
+                            match (m, pkind) {
                         ("send", MirPrimKind::Inbox { elem, cap })
                             if find_named_arg(args, "timeout").is_none() =>
                         {
@@ -6051,6 +6287,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 false,
                             );
                             return Ok(true);
+                        }
+                        _ => {}
+                            }
                         }
                         _ => {}
                     }
@@ -6142,13 +6381,6 @@ impl<'a> CoroutineLowerCtx<'a> {
             false,
         );
         Ok(())
-    }
-
-    fn resolve_prim_receiver(
-        &mut self,
-        receiver: &Expr,
-    ) -> Result<Option<(MirPrimTarget, MirPrimKind)>, MirLowerError> {
-        resolve_prim_receiver_be(receiver, self)
     }
 
     fn lower_expr(
@@ -6411,9 +6643,214 @@ impl<'a> CoroutineLowerCtx<'a> {
                 method,
                 args,
             } => {
-                if let Some((target, pkind)) = self.resolve_prim_receiver(receiver)? {
-                    let m = method.name.as_str();
-                    match (m, pkind) {
+                let m = method.name.as_str();
+                if let Some(recv_kind) = resolve_prim_receiver_kind_be(receiver, self)? {
+                    match recv_kind {
+                        LoweredPrimReceiver::InboxView(view, elem) => match m {
+                            "send" => {
+                                let vexpr = if let Some(first) = first_positional_arg(args) {
+                                    let raw = self.lower_expr(first, Some(&elem))?;
+                                    coerce_expr_if_needed(raw, &elem)
+                                } else {
+                                    MirExpr::new(MirExprKind::IntLit(0), elem.clone())
+                                };
+                                let val_var = self.alloc_temp("inbox_tx", elem.clone());
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(val_var),
+                                    op: MirAssignOp::Assign,
+                                    value: vexpr,
+                                });
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
+                                    let dl_var =
+                                        self.alloc_temp("inbox_tx_deadline", MirType::U32);
+                                    self.cur_stmts.push(MirStmt::Assign {
+                                        target: MirPlace::Var(dl_var),
+                                        op: MirAssignOp::Assign,
+                                        value: MirExpr::new(
+                                            MirExprKind::Binary {
+                                                op: MirBinOp::Add,
+                                                lhs: Box::new(MirExpr::new(
+                                                    MirExprKind::NowTicks,
+                                                    MirType::U32,
+                                                )),
+                                                rhs: Box::new(ticks),
+                                            },
+                                            MirType::U32,
+                                        ),
+                                    });
+                                    let rty = MirType::Result {
+                                        ok: Box::new(MirType::Void),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("inbox_tx_res", rty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                    self.seal_bb(
+                                        MirTerminator::Yield(MirYieldKind::InboxViewSend {
+                                            view,
+                                            elem_ty: elem,
+                                            val_var,
+                                            timeout_deadline_var: Some(dl_var),
+                                            dst_res: Some(dst_res),
+                                            poll_bb,
+                                            resume_bb,
+                                        }),
+                                        resume_bb,
+                                        false,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                    self.seal_bb(
+                                        MirTerminator::Yield(MirYieldKind::InboxViewSend {
+                                            view,
+                                            elem_ty: elem,
+                                            val_var,
+                                            timeout_deadline_var: None,
+                                            dst_res: None,
+                                            poll_bb,
+                                            resume_bb,
+                                        }),
+                                        resume_bb,
+                                        false,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void));
+                                }
+                            }
+                            "recv" => {
+                                self.cur_stmts.push(MirStmt::EndInboxTurn);
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
+                                    let dl_var = self.alloc_temp("inbox_deadline", MirType::U32);
+                                    self.cur_stmts.push(MirStmt::Assign {
+                                        target: MirPlace::Var(dl_var),
+                                        op: MirAssignOp::Assign,
+                                        value: MirExpr::new(
+                                            MirExprKind::Binary {
+                                                op: MirBinOp::Add,
+                                                lhs: Box::new(MirExpr::new(
+                                                    MirExprKind::NowTicks,
+                                                    MirType::U32,
+                                                )),
+                                                rhs: Box::new(ticks),
+                                            },
+                                            MirType::U32,
+                                        ),
+                                    });
+                                    let rty = MirType::Result {
+                                        ok: Box::new(elem.clone()),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("inbox_res", rty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                    self.seal_bb(
+                                        MirTerminator::Yield(MirYieldKind::InboxViewRecv {
+                                            view,
+                                            elem_ty: elem,
+                                            timeout_deadline_var: Some(dl_var),
+                                            dst_val: None,
+                                            dst_res: Some(dst_res),
+                                            poll_bb,
+                                            resume_bb,
+                                        }),
+                                        resume_bb,
+                                        false,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let dst_val = self.alloc_temp("inbox_val", elem.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                    self.seal_bb(
+                                        MirTerminator::Yield(MirYieldKind::InboxViewRecv {
+                                            view,
+                                            elem_ty: elem.clone(),
+                                            timeout_deadline_var: None,
+                                            dst_val: Some(dst_val),
+                                            dst_res: None,
+                                            poll_bb,
+                                            resume_bb,
+                                        }),
+                                        resume_bb,
+                                        false,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_val), elem));
+                                }
+                            }
+                            _ => {}
+                        },
+                        LoweredPrimReceiver::ByteRingView(view) if m == "wait_read" => {
+                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            let slice_ty = MirType::Slice(Box::new(MirType::U8));
+                            if let Some(texpr) = find_named_arg(args, "timeout") {
+                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
+                                let dl_var = self.alloc_temp("ring_deadline", MirType::U32);
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(dl_var),
+                                    op: MirAssignOp::Assign,
+                                    value: MirExpr::new(
+                                        MirExprKind::Binary {
+                                            op: MirBinOp::Add,
+                                            lhs: Box::new(MirExpr::new(
+                                                MirExprKind::NowTicks,
+                                                MirType::U32,
+                                            )),
+                                            rhs: Box::new(ticks),
+                                        },
+                                        MirType::U32,
+                                    ),
+                                });
+                                let rty = MirType::Result {
+                                    ok: Box::new(slice_ty),
+                                    err: None,
+                                };
+                                let dst_res = self.alloc_temp("ring_res", rty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::ByteRingViewWaitRead {
+                                        view,
+                                        timeout_deadline_var: Some(dl_var),
+                                        dst_val: None,
+                                        dst_res: Some(dst_res),
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
+                                    resume_bb,
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                            } else {
+                                let dst_val = self.alloc_temp("ring_chunk", slice_ty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::ByteRingViewWaitRead {
+                                        view,
+                                        timeout_deadline_var: None,
+                                        dst_val: Some(dst_val),
+                                        dst_res: None,
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
+                                    resume_bb,
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
+                            }
+                        }
+                        LoweredPrimReceiver::ByteRingView(_) => {}
+                        LoweredPrimReceiver::Sized(target, pkind) => {
+                            match (m, pkind) {
                         ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
                             let sty = MirType::Slice(elem.clone());
                             let dst_vid = self.alloc_temp("pp_chunk", sty.clone());
@@ -6703,6 +7140,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                             return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                         }
                         _ => {}
+                            }
+                        }
                     }
                 }
                 self.lower_non_yielding_expr(expr, expected)
@@ -7279,6 +7718,32 @@ fn unwrap_ok_result_expr(expr: MirExpr) -> MirExpr {
     expr
 }
 
+fn extract_subsystem_place_chain(place: &MirPlace) -> Option<(String, Vec<(String, String)>)> {
+    let mut rev = Vec::new();
+    let mut cur = place;
+    loop {
+        match cur {
+            MirPlace::Field {
+                base,
+                field,
+                field_ty,
+                ..
+            } => {
+                rev.push((field.clone(), field_ty.display_name()));
+                cur = base;
+            }
+            MirPlace::Deref(inner, _) => {
+                if let MirExprKind::SubsystemAddr(root) = &inner.kind {
+                    rev.reverse();
+                    return Some((root.clone(), rev));
+                }
+                return None;
+            }
+            _ => return None,
+        }
+    }
+}
+
 fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
     if &expr.ty == target_ty || target_ty.is_void() {
         return expr;
@@ -7288,6 +7753,41 @@ fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
         if **ok == *target_ty || ok.host_value_type() == host_target {
             return MirExpr::new(MirExprKind::ResultVal(*vid), ok.as_ref().clone());
         }
+    }
+    match (&expr.ty, target_ty) {
+        (MirType::Ptr(inner), MirType::PrimView(MirPrimViewKind::ByteRing))
+            if matches!(**inner, MirType::Primitive(MirPrimKind::ByteRing { .. })) =>
+        {
+            let cap = match **inner {
+                MirType::Primitive(MirPrimKind::ByteRing { cap }) => cap,
+                _ => 0,
+            };
+            return MirExpr::new(
+                MirExprKind::MakePrimView {
+                    ptr: Box::new(expr),
+                    cap,
+                    kind: MirPrimViewKind::ByteRing,
+                },
+                target_ty.clone(),
+            );
+        }
+        (MirType::Ptr(inner), MirType::PrimView(MirPrimViewKind::Inbox { elem }))
+            if matches!(**inner, MirType::Primitive(MirPrimKind::Inbox { .. })) =>
+        {
+            let cap = match &**inner {
+                MirType::Primitive(MirPrimKind::Inbox { cap, .. }) => *cap,
+                _ => 0,
+            };
+            return MirExpr::new(
+                MirExprKind::MakePrimView {
+                    ptr: Box::new(expr),
+                    cap,
+                    kind: MirPrimViewKind::Inbox { elem: elem.clone() },
+                },
+                target_ty.clone(),
+            );
+        }
+        _ => {}
     }
     match expr.kind {
         MirExprKind::IntLit(v) => {
@@ -7403,6 +7903,12 @@ fn lower_leaf_expr(
                     MirType::Ptr(Box::new(MirType::Primitive(pinfo.kind.clone()))),
                 ));
             }
+            if let Some((sname, _)) = syms.subsystems.get(&id.name) {
+                return Ok(MirExpr::new(
+                    MirExprKind::SubsystemAddr(id.name.clone()),
+                    MirType::Ptr(Box::new(MirType::Struct(sname.clone()))),
+                ));
+            }
             if let Some(inst) = syms.mmio_instances.get(&id.name) {
                 return Ok(MirExpr::new(
                     MirExprKind::MmioAddr(inst.name.clone()),
@@ -7443,6 +7949,12 @@ fn lower_common_expr<B: LowerBackend>(
                         return Ok(MirExpr::new(
                             MirExprKind::GlobalPrimAddr(id.name.clone()),
                             MirType::Ptr(Box::new(MirType::Primitive(pinfo.kind.clone()))),
+                        ));
+                    }
+                    if let Some((sname, _)) = be.syms().subsystems.get(&id.name) {
+                        return Ok(MirExpr::new(
+                            MirExprKind::SubsystemAddr(id.name.clone()),
+                            MirType::Ptr(Box::new(MirType::Struct(sname.clone()))),
                         ));
                     }
                     if let Some(inst) = be.syms().mmio_instances.get(&id.name) {
@@ -7728,6 +8240,9 @@ fn lower_common_expr<B: LowerBackend>(
                 if id.name == "fmt_buf" {
                     return lower_fmt_buf_call_be(args, expr.span, be);
                 }
+                if id.name == "fmt_ring" {
+                    return lower_fmt_ring_call_be(args, expr.span, be);
+                }
                 if matches!(id.name.as_str(), "now_ticks" | "now_ms") {
                     return Ok(MirExpr::new(MirExprKind::NowTicks, MirType::U32));
                 }
@@ -7883,8 +8398,18 @@ fn lower_common_expr<B: LowerBackend>(
                     }
                 }
             }
-            if let Some((target, pkind)) = resolve_prim_receiver_be(receiver, be)? {
-                return finish_prim_read_method(target, pkind, &method.name, args, expr.span, be);
+            if let Some(recv_kind) = resolve_prim_receiver_kind_be(receiver, be)? {
+                return match recv_kind {
+                    LoweredPrimReceiver::Sized(target, pkind) => {
+                        finish_prim_read_method(target, pkind, &method.name, args, expr.span, be)
+                    }
+                    LoweredPrimReceiver::ByteRingView(view) => {
+                        finish_byte_ring_view_read_method(view, &method.name, args, expr.span, be)
+                    }
+                    LoweredPrimReceiver::InboxView(view, elem) => {
+                        finish_inbox_view_read_method(view, elem, &method.name, args, expr.span, be)
+                    }
+                };
             }
             if let Ok(recv_me) = be.lower_sub(receiver, None) {
                 let (st_name_opt, is_ptr) = match &recv_me.ty {
@@ -8271,38 +8796,72 @@ fn finish_index(base: MirExpr, idx: MirExpr, span: Span) -> Result<MirExpr, MirL
     }
 }
 
-fn resolve_prim_receiver_be<B: LowerBackend>(
+enum LoweredPrimReceiver {
+    Sized(MirPrimTarget, MirPrimKind),
+    ByteRingView(MirExpr),
+    InboxView(MirExpr, MirType),
+}
+
+fn resolve_prim_receiver_kind_be<B: LowerBackend>(
     receiver: &Expr,
     be: &mut B,
-) -> Result<Option<(MirPrimTarget, MirPrimKind)>, MirLowerError> {
+) -> Result<Option<LoweredPrimReceiver>, MirLowerError> {
     if let ExprKind::Ident(id) = &receiver.kind {
         if let Some(pinfo) = be.syms().primitives.get(&id.name) {
-            return Ok(Some((
+            return Ok(Some(LoweredPrimReceiver::Sized(
                 MirPrimTarget::Global(id.name.clone()),
                 pinfo.kind.clone(),
             )));
         }
         if let Some(vid) = be.scopes().lookup(&id.name) {
             let vty = be.vars()[vid.0].ty.clone();
-            if let MirType::Ptr(inner) = vty.clone() {
-                if let MirType::Primitive(pk) = *inner {
-                    return Ok(Some((
-                        MirPrimTarget::PtrExpr(MirExpr::new(MirExprKind::Var(vid), vty)),
-                        pk,
-                    )));
+            let vexpr = MirExpr::new(MirExprKind::Var(vid), vty.clone());
+            match vty {
+                MirType::Ptr(inner) => {
+                    if let MirType::Primitive(pk) = *inner {
+                        return Ok(Some(LoweredPrimReceiver::Sized(
+                            MirPrimTarget::PtrExpr(vexpr),
+                            pk,
+                        )));
+                    }
                 }
+                MirType::PrimView(MirPrimViewKind::ByteRing) => {
+                    return Ok(Some(LoweredPrimReceiver::ByteRingView(vexpr)));
+                }
+                MirType::PrimView(MirPrimViewKind::Inbox { elem }) => {
+                    return Ok(Some(LoweredPrimReceiver::InboxView(vexpr, *elem)));
+                }
+                _ => {}
             }
         }
         return Ok(None);
     }
-    if let ExprKind::Field { .. } | ExprKind::Unary { op: UnaryOp::Deref, .. } = &receiver.kind {
+    if let ExprKind::Field { .. }
+    | ExprKind::Unary {
+        op: UnaryOp::Deref,
+        ..
+    }
+    | ExprKind::Index { .. }
+    | ExprKind::Call { .. }
+    | ExprKind::MethodCall { .. } = &receiver.kind
+    {
         if let Ok(rv) = be.lower_sub(receiver, None) {
             match &rv.ty {
                 MirType::Ptr(inner) => {
                     if let MirType::Primitive(pk) = inner.as_ref() {
                         let pk_c = pk.clone();
-                        return Ok(Some((MirPrimTarget::PtrExpr(rv), pk_c)));
+                        return Ok(Some(LoweredPrimReceiver::Sized(
+                            MirPrimTarget::PtrExpr(rv),
+                            pk_c,
+                        )));
                     }
+                }
+                MirType::PrimView(MirPrimViewKind::ByteRing) => {
+                    return Ok(Some(LoweredPrimReceiver::ByteRingView(rv)));
+                }
+                MirType::PrimView(MirPrimViewKind::Inbox { elem }) => {
+                    let elem_c = *elem.clone();
+                    return Ok(Some(LoweredPrimReceiver::InboxView(rv, elem_c)));
                 }
                 MirType::Primitive(pk) => {
                     let pk_c = pk.clone();
@@ -8311,7 +8870,10 @@ fn resolve_prim_receiver_be<B: LowerBackend>(
                             MirExprKind::AddrOfPlace(Box::new(place)),
                             MirType::Ptr(Box::new(pty)),
                         );
-                        return Ok(Some((MirPrimTarget::PtrExpr(ptr), pk_c)));
+                        return Ok(Some(LoweredPrimReceiver::Sized(
+                            MirPrimTarget::PtrExpr(ptr),
+                            pk_c,
+                        )));
                     }
                 }
                 _ => {}
@@ -8447,6 +9009,9 @@ fn finish_prim_read_method<B: LowerBackend>(
             })),
             MirType::Usize,
         )),
+        ("cap", MirPrimKind::Inbox { cap, .. }) => {
+            Ok(MirExpr::new(MirExprKind::IntLit(cap as i128), MirType::Usize))
+        }
         ("is_empty", MirPrimKind::Inbox { elem, cap }) => Ok(MirExpr::new(
             MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxIsEmpty {
                 target,
@@ -8597,6 +9162,188 @@ fn finish_prim_read_method<B: LowerBackend>(
         )),
         _ => Err(MirLowerError {
             message: format!("unknown primitive read method `.{method}()`"),
+            span,
+        }),
+    }
+}
+
+fn finish_inbox_view_read_method<B: LowerBackend>(
+    view: MirExpr,
+    elem_ty: MirType,
+    method: &str,
+    args: &[CallArg],
+    span: Span,
+    be: &mut B,
+) -> Result<MirExpr, MirLowerError> {
+    match method {
+        "try_recv" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewTryRecv {
+                view,
+                elem_ty: elem_ty.clone(),
+            })),
+            MirType::Result {
+                ok: Box::new(elem_ty),
+                err: None,
+            },
+        )),
+        "try_send" => {
+            let v = if let Some(first) = first_positional_arg(args) {
+                let raw = be.lower_sub(first, Some(&elem_ty))?;
+                coerce_expr_if_needed(raw, &elem_ty)
+            } else {
+                MirExpr::new(MirExprKind::IntLit(0), elem_ty.clone())
+            };
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewTrySend {
+                    view,
+                    elem_ty,
+                    value: Box::new(v),
+                    boost,
+                })),
+                MirType::Bool,
+            ))
+        }
+        "len" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewLen { view, elem_ty })),
+            MirType::Usize,
+        )),
+        "cap" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewCap { view, elem_ty })),
+            MirType::Usize,
+        )),
+        "is_empty" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewIsEmpty { view, elem_ty })),
+            MirType::Bool,
+        )),
+        "is_full" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewIsFull { view, elem_ty })),
+            MirType::Bool,
+        )),
+        _ => Err(MirLowerError {
+            message: format!("unknown `*inbox` view read method `.{method}()`"),
+            span,
+        }),
+    }
+}
+
+fn finish_byte_ring_view_read_method<B: LowerBackend>(
+    view: MirExpr,
+    method: &str,
+    args: &[CallArg],
+    span: Span,
+    be: &mut B,
+) -> Result<MirExpr, MirLowerError> {
+    match method {
+        "push" => {
+            let src = if let Some(first) = first_positional_arg(args) {
+                let mut s = lower_fmt_buf_dst_be(first, be)?;
+                if matches!(s.kind, MirExprKind::StringLit(_)) && s.ty == MirType::Str {
+                    s.ty = MirType::Slice(Box::new(MirType::U8));
+                }
+                s
+            } else {
+                MirExpr::new(
+                    MirExprKind::StringLit(String::new()),
+                    MirType::Slice(Box::new(MirType::U8)),
+                )
+            };
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewPush {
+                    view,
+                    src: Box::new(src),
+                    boost,
+                })),
+                MirType::Usize,
+            ))
+        }
+        "push_byte" => {
+            let b = if let Some(first) = first_positional_arg(args) {
+                let raw = be.lower_sub(first, Some(&MirType::U8))?;
+                coerce_expr_if_needed(raw, &MirType::U8)
+            } else {
+                MirExpr::new(MirExprKind::IntLit(0), MirType::U8)
+            };
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewPushByte {
+                    view,
+                    byte: Box::new(b),
+                    boost,
+                })),
+                MirType::Bool,
+            ))
+        }
+        "grant_write" => {
+            let len = if let Some(first) = first_positional_arg(args) {
+                let raw = be.lower_sub(first, Some(&MirType::Usize))?;
+                coerce_expr_if_needed(raw, &MirType::Usize)
+            } else {
+                MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
+            };
+            let slice_ty = MirType::Slice(Box::new(MirType::U8));
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewGrantWrite {
+                    view,
+                    len: Box::new(len),
+                })),
+                MirType::Result {
+                    ok: Box::new(slice_ty),
+                    err: None,
+                },
+            ))
+        }
+        "read_slice" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewReadSlice { view })),
+            MirType::Slice(Box::new(MirType::U8)),
+        )),
+        "pop" => {
+            let dst = if let Some(first) = first_positional_arg(args) {
+                lower_fmt_buf_dst_be(first, be)?
+            } else {
+                MirExpr::new(
+                    MirExprKind::StringLit(String::new()),
+                    MirType::Slice(Box::new(MirType::U8)),
+                )
+            };
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewPop {
+                    view,
+                    dst: Box::new(dst),
+                })),
+                MirType::Usize,
+            ))
+        }
+        "try_pop_byte" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewTryPopByte { view })),
+            MirType::Result {
+                ok: Box::new(MirType::U8),
+                err: None,
+            },
+        )),
+        "len" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewLen { view })),
+            MirType::Usize,
+        )),
+        "cap" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewCap { view })),
+            MirType::Usize,
+        )),
+        "free_space" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewFreeSpace { view })),
+            MirType::Usize,
+        )),
+        "is_empty" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewIsEmpty { view })),
+            MirType::Bool,
+        )),
+        "is_full" => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewIsFull { view })),
+            MirType::Bool,
+        )),
+        _ => Err(MirLowerError {
+            message: format!("unknown `*byte_ring` view read method `.{method}()`"),
             span,
         }),
     }
@@ -8802,9 +9549,64 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
             }
 
             // 2. Non-blocking OS & DMA primitive operations
-            if let Some((target, pkind)) = resolve_prim_receiver_be(receiver, be)? {
+            if let Some(recv_kind) = resolve_prim_receiver_kind_be(receiver, be)? {
                 let m = method.name.as_str();
-                match (m, pkind) {
+                match recv_kind {
+                    LoweredPrimReceiver::InboxView(view, elem) => {
+                        if matches!(m, "post" | "try_post") {
+                            let v = if let Some(first) = first_positional_arg(args) {
+                                be.lower_sub(first, Some(&elem))?
+                            } else {
+                                MirExpr::new(MirExprKind::IntLit(0), elem.clone())
+                            };
+                            let boost = extract_boost_arg(args);
+                            return Ok(Some(MirStmt::PrimOp(
+                                MirPrimNonBlockingOp::InboxViewPost {
+                                    view,
+                                    elem_ty: elem.clone(),
+                                    value: coerce_expr_if_needed(v, &elem),
+                                    boost,
+                                },
+                            )));
+                        }
+                    }
+                    LoweredPrimReceiver::ByteRingView(view) => match m {
+                        "consume" => {
+                            let len = if let Some(first) = first_positional_arg(args) {
+                                let raw = be.lower_sub(first, Some(&MirType::Usize))?;
+                                coerce_expr_if_needed(raw, &MirType::Usize)
+                            } else {
+                                MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
+                            };
+                            return Ok(Some(MirStmt::PrimOp(
+                                MirPrimNonBlockingOp::ByteRingViewConsume { view, len },
+                            )));
+                        }
+                        "commit_write" => {
+                            let len = if let Some(first) = first_positional_arg(args) {
+                                let raw = be.lower_sub(first, Some(&MirType::Usize))?;
+                                coerce_expr_if_needed(raw, &MirType::Usize)
+                            } else {
+                                MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
+                            };
+                            let boost = extract_boost_arg(args);
+                            return Ok(Some(MirStmt::PrimOp(
+                                MirPrimNonBlockingOp::ByteRingViewCommitWrite {
+                                    view,
+                                    len,
+                                    boost,
+                                },
+                            )));
+                        }
+                        "clear" => {
+                            return Ok(Some(MirStmt::PrimOp(
+                                MirPrimNonBlockingOp::ByteRingViewClear { view },
+                            )));
+                        }
+                        _ => {}
+                    },
+                    LoweredPrimReceiver::Sized(target, pkind) => {
+                        match (m, pkind) {
                     ("publish" | "write" | "set", MirPrimKind::Watch { elem }) => {
                         let v = if let Some(first) = first_positional_arg(args) {
                             be.lower_sub(first, Some(&elem))?
@@ -8933,6 +9735,8 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                         })));
                     }
                     _ => {}
+                        }
+                    }
                 }
             }
 
@@ -9127,6 +9931,53 @@ fn lower_fmt_buf_call_be<B: LowerBackend>(
         dst_res,
         buf: buf_slice,
         chunks,
+    });
+    Ok(MirExpr::new(MirExprKind::Var(dst_res), res_ty))
+}
+
+fn lower_fmt_ring_call_be<B: LowerBackend>(
+    args: &[CallArg],
+    span: Span,
+    be: &mut B,
+) -> Result<MirExpr, MirLowerError> {
+    let pos_args: Vec<&CallArg> = args.iter().filter(|a| a.name.is_none()).collect();
+    let ring_arg = pos_args.first().ok_or_else(|| MirLowerError {
+        message: "`fmt_ring` expects `(tx, f\"...\" [, boost: @prio])`".to_string(),
+        span,
+    })?;
+    let fmt_arg = pos_args.get(1).ok_or_else(|| MirLowerError {
+        message: "`fmt_ring` expects a second `f\"...\"` or value argument".to_string(),
+        span,
+    })?;
+    let raw_ring = be.lower_sub(&ring_arg.value, None)?;
+    let ring = coerce_expr_if_needed(raw_ring, &MirType::PrimView(MirPrimViewKind::ByteRing));
+    let boost = extract_boost_arg(args);
+    let chunks = match &fmt_arg.value.kind {
+        ExprKind::FormatString(parts) => lower_format_parts_be(parts, be)?,
+        ExprKind::Literal(Literal::String(s)) => {
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![MirFmtChunk::Literal(s.clone())]
+            }
+        }
+        _ => {
+            let v = be.lower_sub(&fmt_arg.value, None)?;
+            let mut out = Vec::new();
+            emit_fmt_value_be(v, FormatSpec::Default, fmt_arg.span, &mut out, be)?;
+            out
+        }
+    };
+    let res_ty = MirType::Result {
+        ok: Box::new(MirType::Usize),
+        err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
+    };
+    let dst_res = be.alloc_temp_be("fmt_ring_res", res_ty.clone());
+    be.emit_stmt_be(MirStmt::FmtRing {
+        dst_res,
+        ring,
+        chunks,
+        boost,
     });
     Ok(MirExpr::new(MirExprKind::Var(dst_res), res_ty))
 }
@@ -9464,7 +10315,9 @@ fn collect_formatted_enums(
 
 fn scan_stmt_formatted_enums(stmt: &MirStmt, out: &mut BTreeSet<String>) {
     match stmt {
-        MirStmt::PrintFmt { chunks, .. } | MirStmt::FmtBuf { chunks, .. } => {
+        MirStmt::PrintFmt { chunks, .. }
+        | MirStmt::FmtBuf { chunks, .. }
+        | MirStmt::FmtRing { chunks, .. } => {
             for ch in chunks {
                 match ch {
                     MirFmtChunk::EnumName { enum_name, .. }
