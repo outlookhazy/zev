@@ -291,6 +291,59 @@ fn print_avr_summary(res: &zev_codegen_llvm::AvrImageResult) {
     );
 }
 
+enum RamExecOutcome {
+    Output { text: String, within_budget: bool },
+    UsageErr(String),
+    CompileErr(String),
+}
+
+fn execute_ram_command(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+    target: Option<&str>,
+    opt_level: Option<&str>,
+) -> RamExecOutcome {
+    let llvm_opts = match target {
+        None => None,
+        Some(t) => match resolve_llvm_options(Some(t)) {
+            Ok(mut o) => {
+                if o.target == zev_codegen_llvm::TargetArch::HostX86_64Linux {
+                    return RamExecOutcome::UsageErr(format!(
+                        "unsupported `--target {t}` for `zevc ram` (expected `cortex-m3`, `esp32c6`, or `avr`)"
+                    ));
+                }
+                if let Some(lvl) = opt_level {
+                    o.opt_level = lvl.to_string();
+                }
+                Some(o)
+            }
+            Err(err) => return RamExecOutcome::UsageErr(err),
+        },
+    };
+    let (_, mir) = match compile_to_mir_with_includes(files, include_dirs) {
+        Ok(res) => res,
+        Err(err) => return RamExecOutcome::CompileErr(err),
+    };
+    let mut text = mir.ram_report.format_table();
+    if let Some(opts) = llvm_opts {
+        match zev_codegen_llvm::analyze_hardware_stack_high_water(&mir, &opts) {
+            Ok(proof) => {
+                text.push_str(&proof.format_table());
+                RamExecOutcome::Output {
+                    text,
+                    within_budget: proof.within_budget,
+                }
+            }
+            Err(err) => RamExecOutcome::CompileErr(format!("error: {err}")),
+        }
+    } else {
+        RamExecOutcome::Output {
+            text,
+            within_budget: true,
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let args = std::env::args().skip(1);
     let cmd = match parse_args(args) {
@@ -371,18 +424,34 @@ fn main() -> ExitCode {
         Command::Ram {
             files,
             include_dirs,
-        } => {
-            match compile_to_mir_with_includes(&files, &include_dirs) {
-            Ok((_, mir)) => {
-                print!("{}", mir.ram_report.format_table());
-                ExitCode::SUCCESS
+            target,
+            opt_level,
+        } => match execute_ram_command(
+            &files,
+            &include_dirs,
+            target.as_deref(),
+            opt_level.as_deref(),
+        ) {
+            RamExecOutcome::Output {
+                text,
+                within_budget,
+            } => {
+                print!("{text}");
+                if within_budget {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
+            RamExecOutcome::UsageErr(err) => {
+                eprintln!("error: {err}");
+                ExitCode::from(2)
+            }
+            RamExecOutcome::CompileErr(err) => {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-            }
-        }
+        },
         Command::EmitC {
             files,
             include_dirs,
@@ -1300,5 +1369,54 @@ fn main() {
         );
         let (_, mir) = compile_to_mir(&[demo_path]).expect("uno demo checks & lowers to MIR");
         assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
+    }
+
+    #[test]
+    fn ram_command_preserves_plain_output_and_prints_target_stack_proofs() {
+        let root = repo_root();
+        let cm3_path = root.join("examples/cortex_m_demo.zev");
+        let esp_path = root.join("examples/esp32c6_demo.zev");
+        let uno_path = root.join("examples/arduino_uno_demo.zev");
+
+        // 1. Plain `zevc ram` (target = None) matches `mir.ram_report.format_table()` identically
+        let (_, cm3_mir) = compile_to_mir(std::slice::from_ref(&cm3_path)).unwrap();
+        match execute_ram_command(std::slice::from_ref(&cm3_path), &[], None, None) {
+            RamExecOutcome::Output {
+                text,
+                within_budget,
+            } => {
+                assert!(within_budget);
+                assert_eq!(text, cm3_mir.ram_report.format_table());
+                assert!(!text.contains("HARDWARE SINGLE-STACK"));
+            }
+            _ => panic!("expected plain ram output"),
+        }
+
+        // 2. Targeted `zevc ram --target <cortex-m3|esp32c6|avr>` appends hardware proof and passes budget
+        for (path, tgt, budget_str) in [
+            (cm3_path, "cortex-m3", "65536 B"),
+            (esp_path, "esp32c6", "524288 B"),
+            (uno_path, "avr", "2048 B"),
+        ] {
+            match execute_ram_command(&[path], &[], Some(tgt), None) {
+                RamExecOutcome::Output {
+                    text,
+                    within_budget,
+                } => {
+                    assert!(within_budget, "expected within_budget for {tgt}:\n{text}");
+                    assert!(text.contains("STATIC ZERO-HEAP SRAM REPORT"));
+                    assert!(text.contains("HARDWARE SINGLE-STACK + .BSS HIGH-WATER PROOF"));
+                    assert!(text.contains(budget_str), "missing {budget_str} in:\n{text}");
+                    assert!(text.contains("PASS"));
+                }
+                _ => panic!("expected targeted ram output for {tgt}"),
+            }
+        }
+
+        // 3. `zevc ram --target host` is rejected as usage error
+        assert!(matches!(
+            execute_ram_command(&[root.join("examples/sim_demo.zev")], &[], Some("host"), None),
+            RamExecOutcome::UsageErr(_)
+        ));
     }
 }

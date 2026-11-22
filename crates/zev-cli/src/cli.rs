@@ -10,6 +10,8 @@ pub enum Command {
     Ram {
         files: Vec<PathBuf>,
         include_dirs: Vec<PathBuf>,
+        target: Option<String>,
+        opt_level: Option<String>,
     },
     EmitC {
         files: Vec<PathBuf>,
@@ -90,7 +92,7 @@ COMMANDS:
     doc [topic | code | --list]             Built-in Zev language primer, 8 topic guides & error explainers
     import-svd <chip.svd> [-o <out.zev>]    Convert a CMSIS-SVD XML description into Zev mmio/irq declarations
     check [--json] [-I <dir>] <files...>    Parse and statically verify .zev source files
-    ram [-I <dir>] <files...>               Print static zero-heap SRAM budget & coroutine frame report
+    ram [--target <t>] [OPT] [-I <dir>] <files...> Print static SRAM budget (+ optional HW stack proof)
     emit-c [-I <dir>] <files...> [-o <out>] Emit freestanding C99 source + synthesized cooperative kernel
     run [-I <dir>] <files...> [OPTIONS]     Compile emitted C99 via clang and run deterministic host simulation
     emit-llvm [OPT] <files...> [-o <out.ll>] Emit LLVM 23 IR (raw by default, or optimized via opt w/ -O1..-Oz)
@@ -108,10 +110,10 @@ MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build-elf, run-qem
 CHECK OPTIONS:
     --json                                  Emit structured machine-readable JSON diagnostics
 
-LLVM OPTIMIZATION & TARGET OPTIONS (emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr):
+LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr):
     -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default -O2; -Os on AVR; raw on emit-llvm)
     --opt-level <O0|O1|O2|O3|Os|Oz>         Explicit long-form optimization level selector
-    --target <cortex-m3|esp32c6|avr|host>   Target triple selector (`emit-llvm` only; default `cortex-m3`)
+    --target <cortex-m3|esp32c6|avr|host>   Target triple selector (`ram`: cortex-m3/esp32c6/avr; `emit-llvm`: +host)
 
 RUN & RUN-QEMU OPTIONS:
     --sanitize                              Compile C99 host binary with -fsanitize=address,undefined (`run` only)
@@ -153,13 +155,7 @@ where
         "doc" | "docs" | "explain" => parse_doc(&raw[1..]),
         "import-svd" => parse_import_svd(&raw[1..]),
         "check" => parse_check(&raw[1..]),
-        "ram" => match parse_file_list(&raw[1..], "ram")? {
-            Some((files, include_dirs)) => Ok(Command::Ram {
-                files,
-                include_dirs,
-            }),
-            None => Ok(Command::Help),
-        },
+        "ram" => parse_ram(&raw[1..]),
         "emit-c" => match parse_files_with_output(&raw[1..], "emit-c")? {
             Some((files, include_dirs, output)) => Ok(Command::EmitC {
                 files,
@@ -374,34 +370,65 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_file_list(
-    args: &[String],
-    subcmd: &str,
-) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>)>, String> {
+fn parse_ram(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
+    let mut target: Option<String> = None;
+    let mut opt_level: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, subcmd)? {
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "ram")? {
             i += 1;
             continue;
         }
-        if arg == "-h" || arg == "--help" {
-            return Ok(None);
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--target" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(
+                        "`--target` requires a target name (`cortex-m3`, `esp32c6`, or `avr`)"
+                            .to_string(),
+                    );
+                }
+                target = Some(args[i].clone());
+            }
+            "--opt-level" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(
+                        "`--opt-level` requires a level (`O0`, `O1`, `O2`, `O3`, `Os`, or `Oz`) for `zevc ram`"
+                            .to_string(),
+                    );
+                }
+                opt_level = Some(normalize_opt_level(&args[i])?);
+            }
+            _ if arg.starts_with("--target=") => {
+                target = Some(arg["--target=".len()..].to_string());
+            }
+            _ if arg.starts_with("--opt-level=") => {
+                opt_level = Some(normalize_opt_level(&arg["--opt-level=".len()..])?);
+            }
+            _ if is_short_opt_flag(arg) => {
+                opt_level = Some(normalize_opt_level(arg)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unexpected option `{arg}` for `zevc ram`"));
+            }
+            _ => files.push(PathBuf::from(arg)),
         }
-        if arg.starts_with('-') {
-            return Err(format!("unexpected option `{arg}` for `zevc {subcmd}`"));
-        }
-        files.push(PathBuf::from(arg));
         i += 1;
     }
     if files.is_empty() {
-        return Err(format!(
-            "`zevc {subcmd}` requires at least one `.zev` input file"
-        ));
+        return Err("`zevc ram` requires at least one `.zev` input file".to_string());
     }
-    Ok(Some((files, include_dirs)))
+    Ok(Command::Ram {
+        files,
+        include_dirs,
+        target,
+        opt_level,
+    })
 }
 
 fn parse_files_with_output(
@@ -836,8 +863,59 @@ mod tests {
                     PathBuf::from("examples/motor_support.zev"),
                 ],
                 include_dirs: vec![],
+                target: None,
+                opt_level: None,
             }
         );
+
+        assert_eq!(
+            parse_args([
+                "ram",
+                "--target",
+                "cortex-m3",
+                "-O2",
+                "examples/cortex_m_demo.zev",
+            ])
+            .unwrap(),
+            Command::Ram {
+                files: vec![PathBuf::from("examples/cortex_m_demo.zev")],
+                include_dirs: vec![],
+                target: Some("cortex-m3".to_string()),
+                opt_level: Some("-O2".to_string()),
+            }
+        );
+
+        assert_eq!(
+            parse_args([
+                "ram",
+                "--target=esp32c6",
+                "--opt-level=Oz",
+                "-I",
+                "libs",
+                "examples/esp32c6_demo.zev",
+            ])
+            .unwrap(),
+            Command::Ram {
+                files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
+                include_dirs: vec![PathBuf::from("libs")],
+                target: Some("esp32c6".to_string()),
+                opt_level: Some("-Oz".to_string()),
+            }
+        );
+
+        assert_eq!(
+            parse_args(["ram", "--target", "avr", "-Os", "examples/arduino_uno_demo.zev"]).unwrap(),
+            Command::Ram {
+                files: vec![PathBuf::from("examples/arduino_uno_demo.zev")],
+                include_dirs: vec![],
+                target: Some("avr".to_string()),
+                opt_level: Some("-Os".to_string()),
+            }
+        );
+
+        assert!(parse_args(["ram", "--target"]).is_err());
+        assert!(parse_args(["ram", "--opt-level"]).is_err());
+        assert!(parse_args(["ram", "-O4", "a.zev"]).is_err());
     }
 
     #[test]
@@ -1096,6 +1174,8 @@ mod tests {
             Command::Ram {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
+                target: None,
+                opt_level: None,
             }
         );
 

@@ -14,6 +14,7 @@ pub mod esp32c6;
 pub mod mir_codegen;
 pub mod nvic;
 pub mod runtime_ir;
+pub mod stack_sizes;
 pub mod toolchain;
 
 use std::path::Path;
@@ -21,6 +22,7 @@ use std::path::Path;
 pub use esp32c6::ESP32C6_DIRECT_BOOT_MAGIC;
 pub use mir_codegen::emit_llvm_ir_with_options;
 pub use nvic::NvicMap;
+pub use stack_sizes::{HardwareStackProof, analyze_hardware_stack_high_water};
 pub use toolchain::{
     AvrImageResult, CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
     Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, TargetArch,
@@ -3734,5 +3736,102 @@ fn main() {
             "stdout={}",
             res.exec.stdout
         );
+    }
+
+    #[test]
+    fn hardware_stack_high_water_proof_passes_on_cortex_m3_esp32c6_and_avr() {
+        // 1. ARM Cortex-M3 (`examples/cortex_m_demo.zev`, 65,536 B SRAM, 32 B NVIC frame)
+        let cm3_mir = compile_example_mir(&[repo_root().join("examples/cortex_m_demo.zev")]);
+        let cm3_proof =
+            analyze_hardware_stack_high_water(&cm3_mir, &CodegenOptions::default())
+                .expect("Cortex-M3 stack high-water proof");
+        println!("{}", cm3_proof.format_table());
+        assert_eq!(cm3_proof.sram_budget_bytes, 65_536);
+        assert_eq!(cm3_proof.isr_hw_overhead_bytes, 32);
+        assert!(cm3_proof.text_bytes > 0);
+        assert!(cm3_proof.static_sram_bytes > 0);
+        assert!(cm3_proof.boot_stack_bytes > 0);
+        assert!(cm3_proof.sched_task_stack_bytes > 0);
+        assert!(cm3_proof.worst_isr_stack_bytes >= 32);
+        assert_eq!(
+            cm3_proof.peak_stack_bytes,
+            cm3_proof.boot_stack_bytes.max(cm3_proof.sched_task_stack_bytes)
+                + cm3_proof.worst_isr_stack_bytes
+        );
+        assert_eq!(
+            cm3_proof.total_high_water_bytes,
+            cm3_proof.static_sram_bytes + cm3_proof.peak_stack_bytes
+        );
+        assert!(cm3_proof.within_budget);
+        assert!(!cm3_proof.has_cycle);
+        assert!(cm3_proof.format_table().contains("PASS"));
+
+        // 2. Espressif ESP32-C6 (`examples/esp32c6_demo.zev`, 524,288 B HP-SRAM, 64 B trap frame)
+        let esp_mir = compile_example_mir(&[repo_root().join("examples/esp32c6_demo.zev")]);
+        let esp_proof =
+            analyze_hardware_stack_high_water(&esp_mir, &CodegenOptions::esp32c6())
+                .expect("ESP32-C6 stack high-water proof");
+        println!("{}", esp_proof.format_table());
+        assert_eq!(esp_proof.sram_budget_bytes, 524_288);
+        assert_eq!(esp_proof.isr_hw_overhead_bytes, 64);
+        assert!(esp_proof.text_bytes > 0);
+        assert!(esp_proof.static_sram_bytes > 0);
+        assert!(esp_proof.boot_stack_bytes > 0);
+        assert!(esp_proof.sched_task_stack_bytes > 0);
+        assert!(esp_proof.worst_isr_stack_bytes >= 64);
+        assert_eq!(
+            esp_proof.total_high_water_bytes,
+            esp_proof.static_sram_bytes + esp_proof.peak_stack_bytes
+        );
+        assert!(esp_proof.within_budget);
+        assert!(!esp_proof.has_cycle);
+        assert!(esp_proof.format_table().contains("PASS"));
+
+        // 3. Microchip ATmega328P AVR (`examples/arduino_uno_demo.zev`, 2,048 B SRAM, 2 B IRQ vector push)
+        let uno_mir = compile_example_mir(&[repo_root().join("examples/arduino_uno_demo.zev")]);
+        let uno_proof =
+            analyze_hardware_stack_high_water(&uno_mir, &CodegenOptions::avr_uno())
+                .expect("ATmega328P AVR stack high-water proof");
+        println!("{}", uno_proof.format_table());
+        assert_eq!(uno_proof.sram_budget_bytes, 2_048);
+        assert_eq!(uno_proof.isr_hw_overhead_bytes, 2);
+        assert!(uno_proof.text_bytes > 0);
+        assert!(uno_proof.static_sram_bytes > 0);
+        assert!(uno_proof.boot_stack_bytes > 0);
+        assert!(uno_proof.sched_task_stack_bytes > 0);
+        assert!(uno_proof.worst_isr_stack_bytes > 2);
+        assert_eq!(
+            uno_proof.total_high_water_bytes,
+            uno_proof.static_sram_bytes + uno_proof.peak_stack_bytes
+        );
+        assert!(uno_proof.within_budget);
+        assert!(!uno_proof.has_cycle);
+        assert!(uno_proof.format_table().contains("PASS"));
+
+        // 4. Host target rejects hardware stack proof cleanly, and AVR >2048 B high-water fails `within_budget`
+        let mut host_opts = CodegenOptions::default();
+        host_opts.target = TargetArch::HostX86_64Linux;
+        assert!(analyze_hardware_stack_high_water(&cm3_mir, &host_opts).is_err());
+
+        let over_avr_src = r#"
+byte_ring<1900> huge_ring;
+task printer() {
+    loop every 50ms {
+        println(f"len={huge_ring.len()}");
+    }
+}
+fn main() {
+    huge_ring.push_byte(1);
+    spawn printer() @normal;
+}
+"#;
+        let over_prog = zev_parser::parse_str(over_avr_src).unwrap();
+        let over_mir = zev_mir::lower_program(&over_prog).unwrap();
+        let over_proof = analyze_hardware_stack_high_water(&over_mir, &CodegenOptions::avr_uno())
+            .expect("over-budget AVR ELF should still link and produce proof");
+        assert_eq!(over_proof.sram_budget_bytes, 2_048);
+        assert!(over_proof.total_high_water_bytes > 2_048);
+        assert!(!over_proof.within_budget);
+        assert!(over_proof.format_table().contains("FAIL"));
     }
 }
