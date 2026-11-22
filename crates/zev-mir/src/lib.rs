@@ -10,6 +10,7 @@
 pub mod ir;
 pub mod liveness;
 pub mod lower;
+pub mod opt;
 pub mod ram;
 
 pub use ir::*;
