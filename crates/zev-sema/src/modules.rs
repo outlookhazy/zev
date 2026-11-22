@@ -80,6 +80,219 @@ pub struct LinkedModulesOutput {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Debug)]
+enum ModuleLoc {
+    File(PathBuf),
+    Embedded(&'static str),
+    Ambiguous(PathBuf, PathBuf),
+    NotFound,
+}
+
+fn resolve_module_loc_in_dirs(
+    segments: &[String],
+    dot_path: &str,
+    candidate_dirs: &[PathBuf],
+) -> ModuleLoc {
+    if segments.is_empty() {
+        return ModuleLoc::NotFound;
+    }
+    let mut rel_file = PathBuf::new();
+    for seg in segments {
+        rel_file.push(seg);
+    }
+    let mut rel_mod = rel_file.clone();
+    rel_file.set_extension("zev");
+    rel_mod.push("mod.zev");
+
+    for dir in candidate_dirs {
+        let file_cand = dir.join(&rel_file);
+        let mod_cand = dir.join(&rel_mod);
+        let file_exists = file_cand.is_file();
+        let mod_exists = mod_cand.is_file();
+        if file_exists && mod_exists {
+            return ModuleLoc::Ambiguous(file_cand, mod_cand);
+        }
+        if file_exists {
+            return ModuleLoc::File(file_cand);
+        }
+        if mod_exists {
+            return ModuleLoc::File(mod_cand);
+        }
+    }
+
+    if let Some(src) = embedded_module_source(dot_path) {
+        return ModuleLoc::Embedded(src);
+    }
+    ModuleLoc::NotFound
+}
+
+fn search_dirs_for_file(
+    importer_file: Option<&Path>,
+    entry_dirs: &[PathBuf],
+    include_dirs: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push_unique = |p: PathBuf| {
+        let norm = normalize_abs(&p);
+        if !dirs.contains(&norm) {
+            dirs.push(norm);
+        }
+    };
+
+    let importer_dir = importer_file.and_then(|p| p.parent().map(normalize_abs));
+    if let Some(ref d) = importer_dir {
+        push_unique(d.clone());
+    }
+    for d in entry_dirs {
+        push_unique(d.clone());
+    }
+
+    let mut seeds = Vec::new();
+    if let Some(d) = importer_dir {
+        seeds.push(d);
+    }
+    for d in entry_dirs {
+        seeds.push(d.clone());
+    }
+    if seeds.is_empty() {
+        if let Ok(cwd) = std::env::current_dir() {
+            seeds.push(cwd);
+        }
+    }
+    for seed in seeds {
+        for anc in workspace_ancestors(&seed) {
+            push_unique(anc);
+        }
+    }
+
+    for inc in include_dirs {
+        push_unique(inc.clone());
+    }
+
+    dirs
+}
+
+fn lex_import_paths(source: &str) -> Vec<Vec<String>> {
+    let Ok(tokens) = zev_parser::lex(source) else {
+        return Vec::new();
+    };
+    let mut imports = Vec::new();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        match &tokens[i].kind {
+            zev_parser::TokenKind::LBrace => {
+                depth += 1;
+                i += 1;
+            }
+            zev_parser::TokenKind::RBrace => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            zev_parser::TokenKind::KwImport if depth == 0 => {
+                i += 1;
+                let mut segs = Vec::new();
+                if let Some(tok) = tokens.get(i) {
+                    if let zev_parser::TokenKind::Ident(s) = &tok.kind {
+                        segs.push(s.clone());
+                        i += 1;
+                        while i + 1 < tokens.len()
+                            && tokens[i].kind == zev_parser::TokenKind::Dot
+                        {
+                            if let zev_parser::TokenKind::Ident(next_seg) = &tokens[i + 1].kind {
+                                segs.push(next_seg.clone());
+                                i += 2;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !segs.is_empty() {
+                    imports.push(segs);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    imports
+}
+
+/// Collect declared generic `struct` and `fn` names across root `.zev` sources and all
+/// transitively imported `.zev` / embedded modules (`import a.b.c;`).
+pub fn collect_import_aware_generic_names(
+    roots: &[(&str, Option<&Path>)],
+    include_dirs: &[PathBuf],
+) -> BTreeSet<String> {
+    collect_import_aware_generic_names_with_entries(roots, &[], include_dirs)
+}
+
+fn collect_import_aware_generic_names_with_entries(
+    roots: &[(&str, Option<&Path>)],
+    extra_entry_dirs: &[PathBuf],
+    include_dirs: &[PathBuf],
+) -> BTreeSet<String> {
+    let mut entry_dirs = Vec::new();
+    for (_, path_opt) in roots {
+        if let Some(p) = path_opt {
+            if let Some(dir) = normalize_abs(p).parent().map(Path::to_path_buf) {
+                if !entry_dirs.contains(&dir) {
+                    entry_dirs.push(dir);
+                }
+            }
+        }
+    }
+    for dir in extra_entry_dirs {
+        let norm = normalize_abs(dir);
+        if !entry_dirs.contains(&norm) {
+            entry_dirs.push(norm);
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    let mut visited: BTreeSet<ModuleKey> = BTreeSet::new();
+    let mut worklist: Vec<(String, Option<PathBuf>)> = Vec::with_capacity(roots.len());
+
+    for (src, path_opt) in roots {
+        out.extend(zev_parser::collect_declared_generic_names(src));
+        let abs = path_opt.map(normalize_abs);
+        if let Some(ref p) = abs {
+            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            visited.insert(ModuleKey::File(canon));
+        }
+        worklist.push(((*src).to_owned(), abs));
+    }
+
+    while let Some((src, importer_file)) = worklist.pop() {
+        let dirs = search_dirs_for_file(importer_file.as_deref(), &entry_dirs, include_dirs);
+        for segs in lex_import_paths(&src) {
+            let dot_path = segs.join(".");
+            match resolve_module_loc_in_dirs(&segs, &dot_path, &dirs) {
+                ModuleLoc::File(cand) => {
+                    let canon = std::fs::canonicalize(&cand).unwrap_or_else(|_| cand.clone());
+                    let key = ModuleKey::File(canon);
+                    if visited.insert(key) {
+                        if let Ok(mod_src) = std::fs::read_to_string(&cand) {
+                            out.extend(zev_parser::collect_declared_generic_names(&mod_src));
+                            worklist.push((mod_src, Some(cand)));
+                        }
+                    }
+                }
+                ModuleLoc::Embedded(mod_src) => {
+                    let key = ModuleKey::Embedded(dot_path);
+                    if visited.insert(key) {
+                        out.extend(zev_parser::collect_declared_generic_names(mod_src));
+                        worklist.push((mod_src.to_owned(), None));
+                    }
+                }
+                ModuleLoc::Ambiguous(..) | ModuleLoc::NotFound => {}
+            }
+        }
+    }
+
+    out
+}
+
 /// Embedded fallback source lookup for built-in library modules when no disk override exists.
 pub fn embedded_module_source(dot_path: &str) -> Option<&'static str> {
     match dot_path {
@@ -211,6 +424,21 @@ impl ModuleLinker {
             .map(|(k, v)| (k.clone(), (v.dot_path.clone(), v.exports.clone())))
             .collect();
 
+        // Collect all private non-extern canonical symbol names so manual references like
+        // `secret_mod__private_fn` are rejected with `E0030` across all modules and root files.
+        let mut private_canonical_symbols: BTreeMap<String, String> = BTreeMap::new();
+        for key in &order {
+            if let Some(m) = self.loaded.get(key) {
+                for (orig, sym) in m.exports.types.iter().chain(m.exports.values.iter()) {
+                    if !sym.is_pub && !sym.is_extern_c {
+                        private_canonical_symbols
+                            .entry(sym.canonical_name.clone())
+                            .or_insert_with(|| format!("{}.{orig}", m.dot_path));
+                    }
+                }
+            }
+        }
+
         // Track `extern "C"` prototypes across all modules to deduplicate identical declarations
         // and reject conflicting signatures with `E0030`.
         let mut seen_extern_c: BTreeMap<String, (FnDecl, Option<String>)> = BTreeMap::new();
@@ -225,6 +453,7 @@ impl ModuleLinker {
                 &m.exports,
                 &m.imports,
                 &exports_by_key,
+                &private_canonical_symbols,
                 &mut self.display_names,
                 prog_idx,
                 m.file_display.as_str(),
@@ -262,6 +491,7 @@ impl ModuleLinker {
                 &empty_exports,
                 &imports,
                 &exports_by_key,
+                &private_canonical_symbols,
                 &mut self.display_names,
                 prog_idx,
                 file_label,
@@ -441,19 +671,30 @@ impl ModuleLinker {
             (None, None) => return false,
         };
 
-        let parsed = match zev_parser::parse_str_named(&source, &file_display) {
+        let known_generics = collect_import_aware_generic_names_with_entries(
+            &[(source.as_str(), disk_path)],
+            &self.entry_dirs,
+            &self.include_dirs,
+        );
+        let parsed = match zev_parser::parse_str_named_with_generics(
+            &source,
+            &file_display,
+            Some(&known_generics),
+        ) {
             Ok(p) => p,
-            Err(pe) => {
-                let mut d = Diagnostic::new(
-                    DiagnosticKind::ModuleError,
-                    pe.span,
-                    format!("syntax error while parsing module `{dot_path}`: {}", pe.message),
-                )
-                .with_file(Some(file_display));
-                if let Some(hint) = pe.hint {
-                    d = d.with_note(hint);
+            Err(errs) => {
+                for pe in errs {
+                    let mut d = Diagnostic::new(
+                        DiagnosticKind::ModuleError,
+                        pe.span,
+                        format!("syntax error while parsing module `{dot_path}`: {}", pe.message),
+                    )
+                    .with_file(Some(file_display.clone()));
+                    if let Some(hint) = pe.hint {
+                        d = d.with_note(hint);
+                    }
+                    self.diagnostics.push(d);
                 }
-                self.diagnostics.push(d);
                 return false;
             }
         };
@@ -492,24 +733,12 @@ impl ModuleLinker {
         import_span: Span,
         importer_label: Option<&str>,
     ) -> LocateResult {
-        if segments.is_empty() {
-            return LocateResult::NotFound;
-        }
-        let mut rel_file = PathBuf::new();
-        for seg in segments {
-            rel_file.push(&seg.name);
-        }
-        let mut rel_mod = rel_file.clone();
-        rel_file.set_extension("zev");
-        rel_mod.push("mod.zev");
-
+        let seg_names: Vec<String> = segments.iter().map(|s| s.name.clone()).collect();
         let candidate_dirs = self.search_dirs(importer_file);
-        for dir in candidate_dirs {
-            let file_cand = dir.join(&rel_file);
-            let mod_cand = dir.join(&rel_mod);
-            let file_exists = file_cand.is_file();
-            let mod_exists = mod_cand.is_file();
-            if file_exists && mod_exists {
+        match resolve_module_loc_in_dirs(&seg_names, dot_path, &candidate_dirs) {
+            ModuleLoc::File(p) => LocateResult::FoundFile(p),
+            ModuleLoc::Embedded(src) => LocateResult::FoundEmbedded(src),
+            ModuleLoc::Ambiguous(file_cand, mod_cand) => {
                 self.emit(
                     Diagnostic::new(
                         DiagnosticKind::ModuleError,
@@ -522,65 +751,14 @@ impl ModuleLinker {
                     ),
                     importer_label,
                 );
-                return LocateResult::Error;
+                LocateResult::Error
             }
-            if file_exists {
-                return LocateResult::FoundFile(file_cand);
-            }
-            if mod_exists {
-                return LocateResult::FoundFile(mod_cand);
-            }
+            ModuleLoc::NotFound => LocateResult::NotFound,
         }
-
-        if let Some(src) = embedded_module_source(dot_path) {
-            return LocateResult::FoundEmbedded(src);
-        }
-        LocateResult::NotFound
     }
 
     fn search_dirs(&self, importer_file: Option<&Path>) -> Vec<PathBuf> {
-        let mut dirs = Vec::new();
-        let mut push_unique = |p: PathBuf| {
-            let norm = normalize_abs(&p);
-            if !dirs.contains(&norm) {
-                dirs.push(norm);
-            }
-        };
-
-        // (1a) Importer's directory and root entry directories.
-        let importer_dir = importer_file.and_then(|p| p.parent().map(normalize_abs));
-        if let Some(ref d) = importer_dir {
-            push_unique(d.clone());
-        }
-        for d in &self.entry_dirs {
-            push_unique(d.clone());
-        }
-
-        // (1b) Workspace ancestors of importer/entry dirs (or cwd if in-memory `<input>`).
-        let mut seeds = Vec::new();
-        if let Some(d) = importer_dir {
-            seeds.push(d);
-        }
-        for d in &self.entry_dirs {
-            seeds.push(d.clone());
-        }
-        if seeds.is_empty() {
-            if let Ok(cwd) = std::env::current_dir() {
-                seeds.push(cwd);
-            }
-        }
-        for seed in seeds {
-            for anc in workspace_ancestors(&seed) {
-                push_unique(anc);
-            }
-        }
-
-        // (2) Explicit include directories (`-I` / `AnalyzeOptions.include_dirs`).
-        for inc in &self.include_dirs {
-            push_unique(inc.clone());
-        }
-
-        dirs
+        search_dirs_for_file(importer_file, &self.entry_dirs, &self.include_dirs)
     }
 }
 
@@ -838,6 +1016,7 @@ struct AstRewriter<'a> {
     self_exports: &'a ModuleExports,
     imports: &'a BTreeMap<String, ResolvedImport>,
     exports_by_key: &'a BTreeMap<ModuleKey, (String, ModuleExports)>,
+    private_canonical_symbols: &'a BTreeMap<String, String>,
     display_names: &'a mut BTreeMap<String, String>,
     prog_idx: usize,
     file_label: &'a str,
@@ -853,6 +1032,20 @@ impl<'a> AstRewriter<'a> {
             Diagnostic::new(DiagnosticKind::ModuleError, span, msg.into())
                 .with_file(Some(self.file_label.to_owned())),
         );
+    }
+
+    fn check_forged_private(&mut self, name: &str, span: Span) {
+        if self.in_local_scope(name) {
+            return;
+        }
+        if let Some(readable) = self.private_canonical_symbols.get(name) {
+            self.emit(
+                span,
+                format!(
+                    "cannot reference private symbol `{readable}` by internal name `{name}`; mark it `pub` and import the module"
+                ),
+            );
+        }
     }
 
     fn record_display_name(&mut self, canonical: &str, readable: String) {
@@ -960,6 +1153,7 @@ impl<'a> AstRewriter<'a> {
             TypeKind::Prim(p) => TypeKind::Prim(*p),
             TypeKind::Named(id) => {
                 if !self.generic_type_params.contains(&id.name) {
+                    self.check_forged_private(&id.name, id.span);
                     if let Some(can) = self.self_type_canonical(&id.name) {
                         TypeKind::Named(Ident::new(can.to_owned(), id.span))
                     } else {
@@ -996,6 +1190,7 @@ impl<'a> AstRewriter<'a> {
                             TypeKind::Path(segs.clone())
                         }
                     } else {
+                        self.check_forged_private(&first.name, first.span);
                         TypeKind::Path(segs.clone())
                     }
                 } else {
@@ -1003,6 +1198,7 @@ impl<'a> AstRewriter<'a> {
                 }
             }
             TypeKind::Generic { base, args } => {
+                self.check_forged_private(&base.name, base.span);
                 let new_args = args.iter().map(|a| self.rewrite_generic_arg(a)).collect();
                 let new_base = if let Some(can) = self.self_type_canonical(&base.name) {
                     Ident::new(can.to_owned(), base.span)
@@ -1044,6 +1240,7 @@ impl<'a> AstRewriter<'a> {
                             }
                         }
                     } else {
+                        self.check_forged_private(&first.name, first.span);
                         TypeKind::GenericPath {
                             path: path.clone(),
                             args: new_args,
@@ -1263,10 +1460,13 @@ impl<'a> AstRewriter<'a> {
                         );
                         (Some(mod_id.clone()), sp.task.clone())
                     }
-                } else if let Some(can) = self.self_value_canonical(&sp.task.name) {
-                    (None, Ident::new(can.to_owned(), sp.task.span))
                 } else {
-                    (None, sp.task.clone())
+                    self.check_forged_private(&sp.task.name, sp.task.span);
+                    if let Some(can) = self.self_value_canonical(&sp.task.name) {
+                        (None, Ident::new(can.to_owned(), sp.task.span))
+                    } else {
+                        (None, sp.task.clone())
+                    }
                 };
                 StmtKind::Spawn(SpawnStmt {
                     module: new_module,
@@ -1289,29 +1489,99 @@ impl<'a> AstRewriter<'a> {
 
     fn rewrite_switch_pat(&mut self, pat: &SwitchPat) -> SwitchPat {
         match pat {
-            SwitchPat::Ident { prefix, name, span } => {
-                if let Some(pref) = prefix {
-                    if let Some(can) = self.self_type_canonical(&pref.name) {
+            SwitchPat::Qualified { path, span } => {
+                let Some(first) = path.first() else {
+                    return SwitchPat::Wildcard(*span);
+                };
+                if self.is_resolved_module_alias(&first.name) {
+                    if path.len() != 3 {
+                        self.emit(
+                            *span,
+                            format!(
+                                "expected `<alias>.<Enum>.<Variant>` in switch pattern, found `{}`",
+                                path.iter()
+                                    .map(|s| s.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                            ),
+                        );
+                        SwitchPat::Wildcard(*span)
+                    } else if let Some(sym) = self.lookup_imported_member(
+                        &first.name,
+                        &path[1].name,
+                        Some(ExportNs::Type),
+                        first.span.merge(path[1].span),
+                    ) {
                         SwitchPat::Ident {
-                            prefix: Some(Ident::new(can.to_owned(), pref.span)),
-                            name: name.clone(),
+                            prefix: Some(Ident::new(
+                                sym.canonical_name,
+                                first.span.merge(path[1].span),
+                            )),
+                            name: path[2].clone(),
                             span: *span,
                         }
                     } else {
-                        SwitchPat::Ident {
-                            prefix: Some(pref.clone()),
-                            name: name.clone(),
-                            span: *span,
-                        }
-                    }
-                } else if let Some(can) = self.self_value_canonical(&name.name) {
-                    SwitchPat::Ident {
-                        prefix: None,
-                        name: Ident::new(can.to_owned(), name.span),
-                        span: *span,
+                        SwitchPat::Wildcard(*span)
                     }
                 } else {
-                    pat.clone()
+                    self.check_forged_private(&first.name, first.span);
+                    self.emit(
+                        first.span,
+                        format!("unknown module alias `{}` in switch pattern", first.name),
+                    );
+                    SwitchPat::Wildcard(*span)
+                }
+            }
+            SwitchPat::Ident { prefix, name, span } => {
+                if let Some(pref) = prefix {
+                    if !self.in_local_scope(&pref.name)
+                        && self.is_resolved_module_alias(&pref.name)
+                    {
+                        if let Some(sym) = self.lookup_imported_member(
+                            &pref.name,
+                            &name.name,
+                            Some(ExportNs::Value),
+                            *span,
+                        ) {
+                            SwitchPat::Ident {
+                                prefix: None,
+                                name: Ident::new(sym.canonical_name, *span),
+                                span: *span,
+                            }
+                        } else {
+                            SwitchPat::Wildcard(*span)
+                        }
+                    } else {
+                        self.check_forged_private(&pref.name, pref.span);
+                        if let Some(can) = self.self_type_canonical(&pref.name) {
+                            SwitchPat::Ident {
+                                prefix: Some(Ident::new(can.to_owned(), pref.span)),
+                                name: name.clone(),
+                                span: *span,
+                            }
+                        } else {
+                            SwitchPat::Ident {
+                                prefix: Some(pref.clone()),
+                                name: name.clone(),
+                                span: *span,
+                            }
+                        }
+                    }
+                } else {
+                    self.check_forged_private(&name.name, name.span);
+                    if !self.in_local_scope(&name.name) {
+                        if let Some(can) = self.self_value_canonical(&name.name) {
+                            SwitchPat::Ident {
+                                prefix: None,
+                                name: Ident::new(can.to_owned(), name.span),
+                                span: *span,
+                            }
+                        } else {
+                            pat.clone()
+                        }
+                    } else {
+                        pat.clone()
+                    }
                 }
             }
             other => other.clone(),
@@ -1345,12 +1615,15 @@ impl<'a> AstRewriter<'a> {
                         ),
                     );
                     ExprKind::Ident(id.clone())
-                } else if let Some(can) = self.self_value_canonical(&id.name) {
-                    ExprKind::Ident(Ident::new(can.to_owned(), id.span))
-                } else if let Some(can) = self.self_type_canonical(&id.name) {
-                    ExprKind::Ident(Ident::new(can.to_owned(), id.span))
                 } else {
-                    ExprKind::Ident(id.clone())
+                    self.check_forged_private(&id.name, id.span);
+                    if let Some(can) = self.self_value_canonical(&id.name) {
+                        ExprKind::Ident(Ident::new(can.to_owned(), id.span))
+                    } else if let Some(can) = self.self_type_canonical(&id.name) {
+                        ExprKind::Ident(Ident::new(can.to_owned(), id.span))
+                    } else {
+                        ExprKind::Ident(id.clone())
+                    }
                 }
             }
             ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
@@ -1516,10 +1789,13 @@ impl<'a> AstRewriter<'a> {
                         );
                         (Some(mod_id.clone()), name.clone())
                     }
-                } else if let Some(can) = self.self_type_canonical(&name.name) {
-                    (None, Ident::new(can.to_owned(), name.span))
                 } else {
-                    (None, name.clone())
+                    self.check_forged_private(&name.name, name.span);
+                    if let Some(can) = self.self_type_canonical(&name.name) {
+                        (None, Ident::new(can.to_owned(), name.span))
+                    } else {
+                        (None, name.clone())
+                    }
                 };
                 ExprKind::StructLit {
                     module: new_module,
@@ -1593,6 +1869,7 @@ fn rewrite_program(
     self_exports: &ModuleExports,
     imports: &BTreeMap<String, ResolvedImport>,
     exports_by_key: &BTreeMap<ModuleKey, (String, ModuleExports)>,
+    private_canonical_symbols: &BTreeMap<String, String>,
     display_names: &mut BTreeMap<String, String>,
     prog_idx: usize,
     file_label: &str,
@@ -1607,6 +1884,7 @@ fn rewrite_program(
         self_exports,
         imports,
         exports_by_key,
+        private_canonical_symbols,
         display_names,
         prog_idx,
         file_label,
@@ -1627,6 +1905,12 @@ fn rewrite_program(
                     .filter(|g| g.kind == GenericParamKind::Type)
                     .map(|g| g.name.name.clone())
                     .collect();
+                rw.push_scope();
+                for g in &st.generic_params {
+                    if g.kind != GenericParamKind::Type {
+                        rw.define_local(&g.name.name);
+                    }
+                }
                 let mut fields = Vec::with_capacity(st.fields.len());
                 for f in &st.fields {
                     fields.push(zev_ast::StructField {
@@ -1635,6 +1919,7 @@ fn rewrite_program(
                         span: f.span,
                     });
                 }
+                rw.pop_scope();
                 rw.generic_type_params.clear();
                 let new_name = rw.canonicalize_top_name(&st.name.name);
                 Item::with_pub(

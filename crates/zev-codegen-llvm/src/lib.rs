@@ -114,15 +114,18 @@ mod tests {
 
     fn compile_example_mir(paths: &[PathBuf]) -> zev_mir::MirModule {
         let mut sources = Vec::with_capacity(paths.len());
-        let mut all_generics = std::collections::BTreeSet::new();
         for path in paths {
             let raw = std::fs::read_to_string(path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
-            all_generics.extend(zev_parser::collect_declared_generic_names(&raw));
-            sources.push((path.display().to_string(), raw));
+            sources.push((path.clone(), path.display().to_string(), raw));
         }
+        let roots: Vec<(&str, Option<&Path>)> = sources
+            .iter()
+            .map(|(p, _, raw)| (raw.as_str(), Some(p.as_path())))
+            .collect();
+        let all_generics = zev_sema::collect_import_aware_generic_names(&roots, &[]);
         let mut named_progs = Vec::with_capacity(sources.len());
-        for (name, src) in &sources {
+        for (_, name, src) in &sources {
             let prog = zev_parser::parse_str_named_with_generics(src, name, Some(&all_generics))
                 .unwrap_or_else(|errs| panic!("failed to parse {name}: {errs:#?}"));
             named_progs.push((prog, name.as_str()));
@@ -3083,15 +3086,17 @@ mod tests {
         assert!(esp_ll.contains("__syn_rv_vector_table:"));
         assert!(esp_ll.contains("j __syn_rv_irq_tramp_1"));
         assert!(esp_ll.contains("j __syn_rv_irq_tramp_2"));
-        assert!(esp_ll.contains("j __syn_rv_irq_tramp_3"));
-        assert!(esp_ll.contains("j __syn_rv_irq_tramp_4"));
+        assert!(!esp_ll.contains("j __syn_rv_irq_tramp_3"));
+        assert!(!esp_ll.contains("j __syn_rv_irq_tramp_4"));
+        assert!(esp_ll.contains("j __syn_rv_irq_tramp_5"));
+        assert!(esp_ll.contains("j __syn_rv_irq_tramp_6"));
         assert!(esp_ll.contains("call __syn_vec_irq_5"));
         assert!(esp_ll.contains("call __syn_vec_irq_12"));
         assert!(esp_ll.contains("call __syn_vec_irq_19"));
         assert!(esp_ll.contains("call __syn_vec_irq_37"));
         assert!(esp_ll.contains("0x600C50A8"));
         assert!(esp_ll.contains("INTMTX src_id=5 -> cpu_int=1 (0x60010014)"));
-        assert!(esp_ll.contains("INTMTX src_id=37 -> cpu_int=4 (0x60010094)"));
+        assert!(esp_ll.contains("INTMTX src_id=37 -> cpu_int=6 (0x60010094)"));
         assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_PRI_1_REG (0x600C5010) = 1"));
         assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_THRESH_REG (0x600C508C) = 1"));
         assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_ENABLE_REG (0x600C5000)"));
@@ -3154,7 +3159,7 @@ mod tests {
             host_ll.contains("@__zev_mmio_buf_UART0 = internal global [4 x i8] zeroinitializer, align 4"),
             "host_ll={host_ll}"
         );
-        assert!(host_ll.contains("icmp ult i32 "));
+        assert!(host_ll.contains("icmp ult i64 "));
         assert!(host_ll.contains("select i1 "));
 
         let host_ll_path = dir.join("wave1_host.ll");
@@ -3361,5 +3366,155 @@ mod tests {
         assert_eq!(res.exec.exit_code, 0);
         // 1st fire: 5 + 7 = 12; 2nd fire: 12 + 7 = 19; sum = 31!
         assert_eq!(res.exec.stdout, "PRIM_ADDR=31\n");
+    }
+
+    #[test]
+    fn wave1_audit_backend_fixes_and_qemu_parity() {
+        use std::process::Command;
+        use zev_mir::{MirIrqBinding, MirIrqVector, MirIsr};
+
+        let dir = test_out_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 1. ESP32-C6 CLINT line skipping (0, 3, 4, 7), src_id >= 78 error, and > 28 vectors error.
+        let mk_vec = |irq_num: u32| MirIrqVector {
+            irq_name: format!("IRQ_{irq_num}"),
+            irq_num,
+            is_shared: false,
+            selector_symbol: None,
+            bindings: vec![MirIrqBinding {
+                binding_id: 0,
+                isr_name: "isr_h".to_string(),
+                baked_args: vec![],
+                state_vars: vec![],
+                cond_selector: None,
+            }],
+        };
+        let six_routes = esp32c6::assign_esp32c6_irq_routes(&(0..6u32).map(mk_vec).collect::<Vec<_>>())
+            .expect("6 routes");
+        let assigned_cpus: Vec<u8> = six_routes.iter().map(|r| r.cpu_int).collect();
+        assert_eq!(assigned_cpus, vec![1, 2, 5, 6, 8, 9]);
+
+        let oob_src = [mk_vec(78)];
+        assert!(
+            esp32c6::assign_esp32c6_irq_routes(&oob_src).is_err(),
+            "ESP32-C6 INTMTX src_id=78 must fail"
+        );
+        let too_many: Vec<_> = (0..29u32).map(mk_vec).collect();
+        assert!(
+            esp32c6::assign_esp32c6_irq_routes(&too_many).is_err(),
+            ">28 ESP32-C6 external IRQ sources must fail"
+        );
+
+        // Cortex-M3 / Host compilation MUST still allow irq_num >= 78!
+        let cm_prog = zev_parser::parse_str("fn main() {}").unwrap();
+        let mut cm_mod = zev_mir::lower_program(&cm_prog).unwrap();
+        cm_mod.isrs.push(MirIsr {
+            name: "isr_h".to_string(),
+            params: vec![],
+            vars: vec![],
+            state_vars: vec![],
+            body: vec![],
+        });
+        cm_mod.irq_vectors.push(mk_vec(78));
+        assert!(emit_llvm_ir_with_options(&cm_mod, &CodegenOptions::default()).is_ok());
+
+        // 2. Shared IRQ vector dispatch preserves exact source attachment order across unconditional
+        //    and conditional bindings in both LLVM IR and QEMU execution!
+        let shared_src = r#"
+irq IRQ_10 = 10;
+inbox<u32, 8> log_q;
+
+isr step_1() { log_q.post(1); }
+isr step_2() { log_q.post(2); }
+isr step_3() { log_q.post(3); }
+
+bool get_cond() { return true; }
+
+fn main() {
+    IRQ_10.attach_shared(step_1);
+    if (get_cond()) {
+        IRQ_10.attach_shared(step_2);
+    }
+    IRQ_10.attach_shared(step_3);
+    sys.pend_irq(10);
+    u32 a = log_q.try_recv() or 0;
+    u32 b = log_q.try_recv() or 0;
+    u32 c = log_q.try_recv() or 0;
+    println(f"ORDER={a},{b},{c}");
+    sys.exit(0);
+}
+"#;
+        let shared_prog = zev_parser::parse_str(shared_src).unwrap();
+        let shared_mir = zev_mir::lower_program(&shared_prog).unwrap();
+        let qres = run_qemu_cortex_m(
+            &shared_mir,
+            &dir.join("wave1_shared_order.elf"),
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("QEMU shared IRQ order run");
+        verify_ll_with_opt(&qres.build.ll_path).expect("opt verify shared order");
+        let shared_ll = std::fs::read_to_string(&qres.build.ll_path).unwrap();
+        let pos_1 = shared_ll
+            .find("call void @__syn_isr_step_1()")
+            .expect("step_1 call");
+        let pos_2 = shared_ll
+            .find("call void @__syn_isr_step_2()")
+            .expect("step_2 call");
+        let pos_3 = shared_ll
+            .find("call void @__syn_isr_step_3()")
+            .expect("step_3 call");
+        assert!(pos_1 < pos_2 && pos_2 < pos_3, "shared IRQ bindings out of order:\n{shared_ll}");
+        assert_eq!(qres.exec.stdout, "ORDER=1,2,3\n");
+
+        // 3. Host x86_64 64-bit dynamic MMIO index OOB check (`0x1_0000_0001` clamps to 0, not 1!).
+        let host_src = r#"
+mmio ArrRegs {
+    @rw [4]u32 arr @ 0x0;
+}
+mmio DEV : ArrRegs @ 0x4000_0000;
+
+usize make_idx(u64 hi, u64 lo) {
+    u64 full = (hi << 32) | lo;
+    return full as usize;
+}
+
+fn main() {
+    DEV.arr[0] = 10;
+    DEV.arr[1] = 20;
+    usize oob = make_idx(1, 1);
+    DEV.arr[oob] = 99;
+    println(f"HOST={DEV.arr[0]},{DEV.arr[1]}");
+}
+"#;
+        let host_prog = zev_parser::parse_str(host_src).unwrap();
+        let host_mir = zev_mir::lower_program(&host_prog).unwrap();
+        let mut h_opts = CodegenOptions::default();
+        h_opts.target = TargetArch::HostX86_64Linux;
+        h_opts.opt_level = "-O0".to_string();
+        let host_ll_64 = emit_llvm_ir_with_options(&host_mir, &h_opts).expect("emit host 64 IR");
+        let h_ll_path = dir.join("wave1_host_64idx.ll");
+        let h_obj_path = dir.join("wave1_host_64idx.o");
+        let h_exe_path = dir.join("wave1_host_64idx");
+        std::fs::write(&h_ll_path, &host_ll_64).unwrap();
+        verify_ll_with_opt(&h_ll_path).expect("opt verify host 64 idx");
+        compile_ll_to_obj(&h_ll_path, &h_obj_path, &h_opts).expect("llc host 64 idx");
+        let link = Command::new("/bin/clang")
+            .args([
+                h_obj_path.to_str().unwrap(),
+                "-o",
+                h_exe_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("link host exe");
+        assert!(
+            link.status.success(),
+            "clang link failed: {}",
+            String::from_utf8_lossy(&link.stderr)
+        );
+        let run = Command::new(&h_exe_path).output().expect("run host exe");
+        assert!(run.status.success());
+        assert_eq!(String::from_utf8_lossy(&run.stdout), "HOST=99,20\n");
     }
 }

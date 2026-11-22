@@ -138,6 +138,7 @@ struct BootCallArg {
     static_endpoint: Option<String>,
     endpoint_from_param: Option<usize>,
     has_non_static_local_ref: bool,
+    has_isr_state_ref: bool,
     ref_param_origins: BTreeSet<usize>,
     span: Span,
 }
@@ -230,6 +231,7 @@ pub(crate) struct Analyzer {
     fn_decl_order: Vec<String>,
     fn_boot_steps: BTreeMap<String, Vec<BootStep>>,
     recorded_call_args: Vec<RecordedCallArgs>,
+    prim_escaping_ref_params: BTreeMap<String, BTreeSet<usize>>,
     tasks: BTreeMap<String, TaskInfo>,
     isrs: BTreeMap<String, IsrInfo>,
     spawned_tasks: Vec<SpawnedTaskInstance>,
@@ -276,6 +278,7 @@ impl Analyzer {
             fn_decl_order: Vec::new(),
             fn_boot_steps: BTreeMap::new(),
             recorded_call_args: Vec::new(),
+            prim_escaping_ref_params: BTreeMap::new(),
             tasks: BTreeMap::new(),
             isrs: BTreeMap::new(),
             spawned_tasks: Vec::new(),
@@ -1179,16 +1182,30 @@ impl Analyzer {
         expr: &Expr,
         visiting: &mut BTreeSet<String>,
     ) -> Option<i128> {
+        self.eval_const_expr_i128_shadowed(expr, visiting, &BTreeSet::new())
+    }
+
+    fn eval_const_expr_i128_shadowed(
+        &self,
+        expr: &Expr,
+        visiting: &mut BTreeSet<String>,
+        shadowed: &BTreeSet<String>,
+    ) -> Option<i128> {
         match &expr.kind {
             ExprKind::Literal(Literal::Int(v)) => Some(*v as i128),
-            ExprKind::Ident(id) => self.eval_named_const_i128(&id.name, visiting).or_else(|| {
-                self.consts
-                    .get(&id.name)
-                    .and_then(|c| c.int_value)
-                    .map(|u| u as i128)
-            }),
+            ExprKind::Ident(id) => {
+                if shadowed.contains(&id.name) {
+                    return None;
+                }
+                self.eval_named_const_i128(&id.name, visiting).or_else(|| {
+                    self.consts
+                        .get(&id.name)
+                        .and_then(|c| c.int_value)
+                        .map(|u| u as i128)
+                })
+            }
             ExprKind::Cast { expr: inner, ty } => {
-                let v = self.eval_const_expr_i128(inner, visiting)?;
+                let v = self.eval_const_expr_i128_shadowed(inner, visiting, shadowed)?;
                 let target_prim = match &ty.kind {
                     TypeKind::Prim(p) if p.is_integer() => Some(*p),
                     TypeKind::Named(id) => PrimType::from_name(&id.name).filter(|p| p.is_integer()),
@@ -1197,7 +1214,7 @@ impl Analyzer {
                 Some(crate::monomorphize::truncate_int_prim(v, target_prim))
             }
             ExprKind::Unary { op, expr: inner } => {
-                let v = self.eval_const_expr_i128(inner, visiting)?;
+                let v = self.eval_const_expr_i128_shadowed(inner, visiting, shadowed)?;
                 match op {
                     UnaryOp::Neg => {
                         let neg = v.checked_neg()?;
@@ -1220,8 +1237,8 @@ impl Analyzer {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.eval_const_expr_i128(lhs, visiting)?;
-                let r = self.eval_const_expr_i128(rhs, visiting)?;
+                let l = self.eval_const_expr_i128_shadowed(lhs, visiting, shadowed)?;
+                let r = self.eval_const_expr_i128_shadowed(rhs, visiting, shadowed)?;
                 match op {
                     BinaryOp::Add => l.checked_add(r),
                     BinaryOp::Sub => l.checked_sub(r),
@@ -1444,6 +1461,11 @@ impl Analyzer {
             Some(ErrorSpec::Bare(_)) => ResolvedErrorSpec::Untyped,
             Some(ErrorSpec::Typed(err_ty_expr)) => {
                 let err_ty = self.resolve_type(err_ty_expr);
+                self.check_type_no_byval_mmio(
+                    &err_ty,
+                    err_ty_expr.span,
+                    &format!("error specification of function '{}'", f.name.name),
+                );
                 if err_ty.is_void() {
                     self.emit(Diagnostic::new(
                         DiagnosticKind::ErrorSpecMismatch,
@@ -2334,9 +2356,11 @@ impl Analyzer {
             );
         }
 
-        // 4. Verify interprocedural static-reference provenance for parameters forwarded into `spawn` (`E0010`),
-        //    then unroll `main()`'s static boot tree into `self.spawned_tasks` and `self.irq_bindings` (`E0032`).
+        // 4. Verify interprocedural reference provenance for `spawn` (`E0010`) and ISR `state`
+        //    escapes into OS primitives (`E0033`), then unroll `main()`'s static boot tree into
+        //    `self.spawned_tasks` and `self.irq_bindings` (`E0032`).
         self.verify_boot_spawn_arg_provenance();
+        self.verify_isr_state_escape_provenance();
         self.unroll_boot_spawn_tree();
         self.unroll_irq_boot_tree();
 
@@ -2391,6 +2415,36 @@ impl Analyzer {
         }
     }
 
+    fn propagate_escaping_ref_params(
+        escaping: &mut BTreeMap<String, BTreeSet<usize>>,
+        recorded_call_args: &[RecordedCallArgs],
+    ) {
+        loop {
+            let mut changed = false;
+            for call in recorded_call_args {
+                let Some(callee_params) = escaping.get(&call.callee).cloned() else {
+                    continue;
+                };
+                for p_idx in callee_params {
+                    if let Some(arg) = call.args.get(p_idx) {
+                        for &caller_p in &arg.ref_param_origins {
+                            if escaping
+                                .entry(call.caller.clone())
+                                .or_default()
+                                .insert(caller_p)
+                            {
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     fn verify_boot_spawn_arg_provenance(&mut self) {
         let mut spawning_ref_params: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
         for (fn_name, steps) in &self.fn_boot_steps {
@@ -2408,30 +2462,7 @@ impl Analyzer {
             }
         }
 
-        loop {
-            let mut changed = false;
-            for call in &self.recorded_call_args {
-                let Some(callee_params) = spawning_ref_params.get(&call.callee).cloned() else {
-                    continue;
-                };
-                for p_idx in callee_params {
-                    if let Some(arg) = call.args.get(p_idx) {
-                        for &caller_p in &arg.ref_param_origins {
-                            if spawning_ref_params
-                                .entry(call.caller.clone())
-                                .or_default()
-                                .insert(caller_p)
-                            {
-                                changed = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if !changed {
-                break;
-            }
-        }
+        Self::propagate_escaping_ref_params(&mut spawning_ref_params, &self.recorded_call_args);
 
         let calls = self.recorded_call_args.clone();
         for call in &calls {
@@ -2448,6 +2479,37 @@ impl Analyzer {
                                 arg.span,
                                 format!(
                                     "cannot pass non-static reference/slice into boot helper '{}' (argument {}): parameter is forwarded into 'spawn' and outlives local stack variables",
+                                    call.callee,
+                                    p_idx + 1
+                                ),
+                            )
+                            .with_file(caller_file.clone()),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn verify_isr_state_escape_provenance(&mut self) {
+        let mut escaping = self.prim_escaping_ref_params.clone();
+        Self::propagate_escaping_ref_params(&mut escaping, &self.recorded_call_args);
+
+        let calls = self.recorded_call_args.clone();
+        for call in &calls {
+            let Some(callee_params) = escaping.get(&call.callee) else {
+                continue;
+            };
+            let caller_file = self.node_files.get(&call.caller).cloned();
+            for &p_idx in callee_params {
+                if let Some(arg) = call.args.get(p_idx) {
+                    if arg.has_isr_state_ref {
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::InvalidIsrState,
+                                arg.span,
+                                format!(
+                                    "cannot pass `&` of ISR `state` variable into helper '{}' (argument {}): parameter escapes into an OS primitive",
                                     call.callee,
                                     p_idx + 1
                                 ),
@@ -2626,8 +2688,9 @@ impl Analyzer {
         irq_mode_seen: &mut BTreeMap<u32, (bool, String, Span)>,
         mixed_warned: &mut BTreeSet<u32>,
         next_branch_id: &mut usize,
-    ) -> (bool, BTreeSet<u32>) {
+    ) -> (bool, BTreeSet<u32>, BTreeSet<u32>) {
         let mut cur_excl = active_exclusive.clone();
+        let mut ret_union = BTreeSet::new();
         for node in nodes {
             match node {
                 IrqBootNode::Attach(att) => {
@@ -2744,7 +2807,7 @@ impl Analyzer {
                         })
                         .collect();
                     if let Some(child_nodes) = self.fn_irq_boot_nodes.get(callee).cloned() {
-                        let (child_div, child_excl) = self.unroll_irq_nodes(
+                        let (_child_div, mut child_fall, child_ret) = self.unroll_irq_nodes(
                             &child_nodes,
                             &child_params,
                             cond_branch,
@@ -2755,11 +2818,11 @@ impl Analyzer {
                             mixed_warned,
                             next_branch_id,
                         );
-                        cur_excl = child_excl;
+                        // Returning inside a helper exits only that helper; execution resumes
+                        // in this caller with the union of IRQs attached on all returning paths.
+                        child_fall.extend(child_ret);
+                        cur_excl = child_fall;
                         visiting.remove(callee);
-                        if child_div {
-                            return (true, cur_excl);
-                        }
                     } else {
                         visiting.remove(callee);
                     }
@@ -2782,7 +2845,7 @@ impl Analyzer {
                             *next_branch_id += 1;
                             Some(id)
                         };
-                        let (sub_div, arm_post) = self.unroll_irq_nodes(
+                        let (sub_div, arm_fall, arm_ret) = self.unroll_irq_nodes(
                             arm_nodes,
                             param_args,
                             arm_branch,
@@ -2793,24 +2856,27 @@ impl Analyzer {
                             mixed_warned,
                             next_branch_id,
                         );
-                        if !(*arm_div || sub_div) {
+                        ret_union.extend(arm_ret);
+                        if *arm_div || sub_div {
+                            ret_union.extend(arm_fall);
+                        } else {
                             all_arms_div = false;
                             if !any_non_div {
-                                post_union = arm_post;
+                                post_union = arm_fall;
                                 any_non_div = true;
                             } else {
-                                post_union.extend(arm_post);
+                                post_union.extend(arm_fall);
                             }
                         }
                     }
                     if all_arms_div {
-                        return (true, cur_excl);
+                        return (true, BTreeSet::new(), ret_union);
                     }
                     cur_excl = post_union;
                 }
             }
         }
-        (false, cur_excl)
+        (false, cur_excl, ret_union)
     }
 
     fn unroll_boot_fn(
@@ -2925,6 +2991,7 @@ struct BodyChecker<'a> {
     recorded_boosts: Vec<PriorityBoostSite>,
     proven_infallible_spans: BTreeSet<(u32, u32)>,
     last_struct_lit_fields: BTreeMap<(u32, u32), BTreeMap<String, Provenance>>,
+    mmio_array_expr_spans: BTreeMap<(u32, u32), (String, String, usize)>,
     /// Tracks lexical scope depths at loop entry and outer variables carrying DMA leases read inside the loop.
     loop_entry_depths: Vec<u32>,
     loop_outer_reads: Vec<Vec<(String, LeaseEnv, Provenance, Span)>>,
@@ -2961,6 +3028,7 @@ impl<'a> BodyChecker<'a> {
             recorded_boosts: Vec::new(),
             proven_infallible_spans: BTreeSet::new(),
             last_struct_lit_fields: BTreeMap::new(),
+            mmio_array_expr_spans: BTreeMap::new(),
             loop_entry_depths: Vec::new(),
             loop_outer_reads: Vec::new(),
         }
@@ -2968,6 +3036,14 @@ impl<'a> BodyChecker<'a> {
 
     fn current_depth(&self) -> u32 {
         self.scopes.len() as u32
+    }
+
+    fn active_local_names(&self) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        for scope in &self.scopes {
+            names.extend(scope.keys().cloned());
+        }
+        names
     }
 
     fn in_isr(&self) -> bool {
@@ -3429,7 +3505,11 @@ impl<'a> BodyChecker<'a> {
                         } else {
                             self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
                         }
-                        if !self.sema.is_compile_time_const_expr(init_expr) {
+                        let shadowed = self.active_local_names();
+                        if !self
+                            .sema
+                            .is_compile_time_const_expr_with_shadowed(init_expr, &shadowed)
+                        {
                             self.sema.emit(Diagnostic::new(
                                 DiagnosticKind::InvalidIsrState,
                                 init_expr.span,
@@ -4251,6 +4331,14 @@ impl<'a> BodyChecker<'a> {
                                         .with_note(hint),
                                     );
                                 }
+                            } else if let Some(pref) = prefix {
+                                if !sv.ty.is_error() {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::UndefinedSymbol,
+                                        *pat_span,
+                                        format!("unknown switch pattern '{}.{}'", pref.name, name.name),
+                                    ));
+                                }
                             } else if let Some(c) = self.sema.consts.get(&name.name) {
                                 if !c.ty.is_assignable_to(&sv.ty) {
                                     self.sema.emit(Diagnostic::new(
@@ -4267,6 +4355,20 @@ impl<'a> BodyChecker<'a> {
                                     DiagnosticKind::UndefinedSymbol,
                                     *pat_span,
                                     format!("unknown switch pattern '{}'", name.name),
+                                ));
+                            }
+                        }
+                        SwitchPat::Qualified { path, span: pat_span } => {
+                            if !sv.ty.is_error() {
+                                let rendered = path
+                                    .iter()
+                                    .map(|s| s.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(".");
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::UndefinedSymbol,
+                                    *pat_span,
+                                    format!("unknown qualified switch pattern '{rendered}'"),
                                 ));
                             }
                         }
@@ -5178,15 +5280,39 @@ impl<'a> BodyChecker<'a> {
     // Expression Checking
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn check_expr_infallible(&mut self, expr: &Expr) -> ExprVal {
+    fn take_mmio_array_tag(&mut self, span: Span) -> Option<(String, String, usize)> {
+        self.mmio_array_expr_spans.remove(&(span.start, span.end))
+    }
+
+    fn reject_unindexed_mmio_array(&mut self, span: Span) -> bool {
+        if let Some((layout_name, reg_name, _)) = self.take_mmio_array_tag(span) {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::MmioViolation,
+                span,
+                format!(
+                    "cannot use unindexed MMIO register array '{}.{}'; index an element with '[i]' or read '.len'",
+                    layout_name, reg_name
+                ),
+            ));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn check_expr_infallible_allow_mmio_array(
+        &mut self,
+        expr: &Expr,
+    ) -> (ExprVal, Option<(String, String, usize)>) {
         let mut val = self.check_expr_raw(expr);
+        let mmio_arr = self.take_mmio_array_tag(expr.span);
         if val.error_spec.is_fallible() {
             if self
                 .proven_infallible_spans
                 .remove(&(expr.span.start, expr.span.end))
             {
                 val.error_spec = ResolvedErrorSpec::None;
-                return val;
+                return (val, mmio_arr);
             }
             let note = match (&val.error_spec, val.ty.is_void()) {
                 (ResolvedErrorSpec::Typed(err_ty), false) => format!(
@@ -5212,6 +5338,22 @@ impl<'a> BodyChecker<'a> {
                 .with_note(note),
             );
             val.error_spec = ResolvedErrorSpec::None;
+        }
+        (val, mmio_arr)
+    }
+
+    fn check_expr_infallible(&mut self, expr: &Expr) -> ExprVal {
+        let (val, mmio_arr) = self.check_expr_infallible_allow_mmio_array(expr);
+        if let Some((layout_name, reg_name, _)) = mmio_arr {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::MmioViolation,
+                expr.span,
+                format!(
+                    "cannot use unindexed MMIO register array '{}.{}'; index an element with '[i]' or read '.len'",
+                    layout_name, reg_name
+                ),
+            ));
+            return ExprVal::error(expr.span);
         }
         val
     }
@@ -5292,7 +5434,7 @@ impl<'a> BodyChecker<'a> {
             } => self.check_method_call(receiver, method, args, expr.span),
 
             ExprKind::Index { target, index } => {
-                let tv = self.check_expr_infallible(target);
+                let (tv, mmio_arr) = self.check_expr_infallible_allow_mmio_array(target);
                 let iv = self.check_expr_infallible(index);
                 if !iv.ty.is_integer() && !iv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
@@ -5300,6 +5442,25 @@ impl<'a> BodyChecker<'a> {
                         index.span,
                         format!("index must be an integer, found '{}'", iv.ty),
                     ));
+                }
+                if let Some((layout_name, reg_name, len)) = mmio_arr {
+                    let shadowed = self.active_local_names();
+                    if let Some(idx) = self.sema.eval_const_expr_i128_shadowed(
+                        index,
+                        &mut BTreeSet::new(),
+                        &shadowed,
+                    ) {
+                        if idx < 0 || idx as u128 >= len as u128 {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::MmioViolation,
+                                index.span,
+                                format!(
+                                    "MMIO register array '{}.{}' index {} out of bounds (length {})",
+                                    layout_name, reg_name, idx, len
+                                ),
+                            ));
+                        }
+                    }
                 }
                 match &tv.ty {
                     Ty::Slice(elem) | Ty::Array { elem, .. } => {
@@ -5591,6 +5752,7 @@ impl<'a> BodyChecker<'a> {
                 fallback,
             } => {
                 let iv = self.check_expr_raw(inner);
+                let _ = self.reject_unindexed_mmio_array(inner.span);
                 let _ = self
                     .proven_infallible_spans
                     .remove(&(inner.span.start, inner.span.end));
@@ -5602,6 +5764,7 @@ impl<'a> BodyChecker<'a> {
                     ));
                 }
                 let fv = self.check_expr_raw(fallback);
+                let _ = self.reject_unindexed_mmio_array(fallback.span);
                 if !fv.ty.is_assignable_to(&iv.ty) && !iv.ty.is_assignable_to(&fv.ty) {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidOrFallback,
@@ -5919,32 +6082,8 @@ impl<'a> BodyChecker<'a> {
                     return ExprVal::error(span);
                 }
 
-                let mut prov = iv.prov.clone();
-                let mut endpoint_name = iv.endpoint_name.clone();
-                if let Some(root_name) = root_ident_of(inner) {
-                    if let Some(local) = self.lookup_local(&root_name) {
-                        if local.is_isr_state {
-                            prov = prov.merge(&Provenance::addr_of_isr_state(
-                                &local.name,
-                                local.decl_depth,
-                            ));
-                        } else {
-                            prov = prov.merge(&Provenance::addr_of_local(
-                                &local.name,
-                                local.decl_depth,
-                            ));
-                        }
-                        if endpoint_name.is_none() {
-                            endpoint_name = local.endpoint_alias.clone();
-                        }
-                    } else if self.sema.primitives.contains_key(&root_name) {
-                        prov = Provenance::addr_of_static();
-                        endpoint_name = Some(root_name);
-                    }
-                } else {
-                    // Taking address of temporary expression at current lexical depth.
-                    prov = prov.merge(&Provenance::addr_of_local("<temp>", self.current_depth()));
-                }
+                let (prov, endpoint_name) =
+                    self.resolve_addr_of_provenance(inner, iv.prov, iv.endpoint_name);
 
                 ExprVal {
                     ty: Ty::Ptr(Box::new(iv.ty)),
@@ -6145,8 +6284,54 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
+    fn resolve_addr_of_provenance(
+        &self,
+        inner: &Expr,
+        mut prov: Provenance,
+        mut endpoint_name: Option<String>,
+    ) -> (Provenance, Option<String>) {
+        if let Some(root_name) = root_ident_of(inner) {
+            if let Some(local) = self.lookup_local(&root_name) {
+                if local.is_isr_state {
+                    prov = prov.merge(&Provenance::addr_of_isr_state(
+                        &local.name,
+                        local.decl_depth,
+                    ));
+                } else {
+                    prov = prov.merge(&Provenance::addr_of_local(
+                        &local.name,
+                        local.decl_depth,
+                    ));
+                }
+                if endpoint_name.is_none() {
+                    endpoint_name = local.endpoint_alias.clone();
+                }
+            } else if self.sema.primitives.contains_key(&root_name) {
+                prov = Provenance::addr_of_static();
+                endpoint_name = Some(root_name);
+            }
+        } else {
+            // Taking address of temporary expression at current lexical depth.
+            prov = prov.merge(&Provenance::addr_of_local("<temp>", self.current_depth()));
+        }
+        (prov, endpoint_name)
+    }
+
     fn check_field_expr(&mut self, target: &Expr, field: &Ident, span: Span) -> ExprVal {
-        let tv = self.check_expr_infallible(target);
+        let (tv, mmio_arr) = self.check_expr_infallible_allow_mmio_array(target);
+        if let Some((layout_name, reg_name, _)) = mmio_arr {
+            if field.name != "len" {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::MmioViolation,
+                    span,
+                    format!(
+                        "cannot access '.{}' on MMIO register array '{}.{}' (only element indexing '[i]' and '.len' are allowed)",
+                        field.name, layout_name, reg_name
+                    ),
+                ));
+                return ExprVal::error(span);
+            }
+        }
         self.check_resolved_field_val(tv, target, field, span)
     }
 
@@ -6207,10 +6392,11 @@ impl<'a> BodyChecker<'a> {
                 if field.name == "len" {
                     ExprVal::scalar(Ty::usize(), span)
                 } else if field.name == "ptr" {
+                    let (prov, _) = self.resolve_addr_of_provenance(target, tv.prov, None);
                     ExprVal {
                         ty: Ty::Ptr(elem),
                         error_spec: ResolvedErrorSpec::None,
-                        prov: tv.prov,
+                        prov,
                         endpoint_name: None,
                         span,
                     }
@@ -6309,6 +6495,10 @@ impl<'a> BodyChecker<'a> {
                     ));
                 }
                 let reg_ty = if let Some(len) = reg.array_len {
+                    self.mmio_array_expr_spans.insert(
+                        (span.start, span.end),
+                        (layout_name, reg.name, len),
+                    );
                     Ty::Array {
                         elem: Box::new(Ty::Prim(reg.elem_ty)),
                         len,
@@ -6547,10 +6737,12 @@ impl<'a> BodyChecker<'a> {
                 .clone()
                 .filter(|ep| !ep.starts_with("param:"));
             let has_non_static_local_ref = av.prov.has_non_returning_origin();
+            let has_isr_state_ref = !av.prov.isr_state_origins.is_empty();
             boot_call_args.push(BootCallArg {
                 static_endpoint,
                 endpoint_from_param,
                 has_non_static_local_ref,
+                has_isr_state_ref,
                 ref_param_origins: av.prov.param_origins.clone(),
                 span: arg.span,
             });
@@ -7617,6 +7809,13 @@ impl<'a> BodyChecker<'a> {
                 ),
             ));
         }
+        if !val.prov.param_origins.is_empty() {
+            self.sema
+                .prim_escaping_ref_params
+                .entry(self.caller_key.clone())
+                .or_default()
+                .extend(val.prov.param_origins.iter().copied());
+        }
         if !val.ty.is_assignable_to(elem) {
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::TypeMismatch,
@@ -7660,6 +7859,7 @@ impl<'a> BodyChecker<'a> {
         span: Span,
     ) -> ExprVal {
         let iv = self.check_expr_raw(inner);
+        let _ = self.reject_unindexed_mmio_array(inner.span);
         let _ = self
             .proven_infallible_spans
             .remove(&(inner.span.start, inner.span.end));
@@ -8101,8 +8301,9 @@ impl<'a> BodyChecker<'a> {
     }
 
     fn eval_const_usize_expr(&self, expr: &Expr) -> Option<usize> {
+        let shadowed = self.active_local_names();
         self.sema
-            .eval_const_expr_i128(expr, &mut BTreeSet::new())
+            .eval_const_expr_i128_shadowed(expr, &mut BTreeSet::new(), &shadowed)
             .and_then(|v| usize::try_from(v).ok())
     }
 
@@ -8766,19 +8967,31 @@ impl Analyzer {
         }
     }
 
-    fn is_compile_time_const_expr(&self, expr: &Expr) -> bool {
+    fn is_compile_time_const_expr_with_shadowed(
+        &self,
+        expr: &Expr,
+        shadowed: &BTreeSet<String>,
+    ) -> bool {
         let mut visiting = BTreeSet::new();
-        self.is_const_expr_inner(expr, &mut visiting)
+        self.is_const_expr_inner(expr, &mut visiting, shadowed)
     }
 
-    fn is_const_expr_inner(&self, expr: &Expr, visiting: &mut BTreeSet<String>) -> bool {
+    fn is_const_expr_inner(
+        &self,
+        expr: &Expr,
+        visiting: &mut BTreeSet<String>,
+        shadowed: &BTreeSet<String>,
+    ) -> bool {
         match &expr.kind {
             ExprKind::Literal(_) | ExprKind::Priority(_) => true,
             ExprKind::Ident(id) => {
+                if shadowed.contains(&id.name) {
+                    return false;
+                }
                 if self.consts.contains_key(&id.name) {
                     if let Some((raw, _)) = self.raw_const_exprs.get(&id.name) {
                         if visiting.insert(id.name.clone()) {
-                            let ok = self.is_const_expr_inner(raw, visiting);
+                            let ok = self.is_const_expr_inner(raw, visiting, &BTreeSet::new());
                             visiting.remove(&id.name);
                             return ok;
                         }
@@ -8792,10 +9005,11 @@ impl Analyzer {
             }
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(en) = &target.kind {
-                    if self
-                        .enums
-                        .get(&en.name)
-                        .is_some_and(|e| e.has_variant(&field.name))
+                    if !shadowed.contains(&en.name)
+                        && self
+                            .enums
+                            .get(&en.name)
+                            .is_some_and(|e| e.has_variant(&field.name))
                     {
                         return true;
                     }
@@ -8804,63 +9018,78 @@ impl Analyzer {
             }
             ExprKind::Unary { op, expr: inner } => match op {
                 UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot => {
-                    self.is_const_expr_inner(inner, visiting)
+                    self.is_const_expr_inner(inner, visiting, shadowed)
                 }
                 UnaryOp::AddrOf | UnaryOp::Deref => false,
             },
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.is_const_expr_inner(lhs, visiting) && self.is_const_expr_inner(rhs, visiting)
+                self.is_const_expr_inner(lhs, visiting, shadowed)
+                    && self.is_const_expr_inner(rhs, visiting, shadowed)
             }
-            ExprKind::Cast { expr: inner, .. } => self.is_const_expr_inner(inner, visiting),
+            ExprKind::Cast { expr: inner, .. } => {
+                self.is_const_expr_inner(inner, visiting, shadowed)
+            }
             ExprKind::ArrayLit(elems) => elems
                 .iter()
-                .all(|e| self.is_const_expr_inner(e, visiting)),
+                .all(|e| self.is_const_expr_inner(e, visiting, shadowed)),
             ExprKind::StructLit { fields, .. } => fields
                 .iter()
-                .all(|f| self.is_const_expr_inner(&f.value, visiting)),
+                .all(|f| self.is_const_expr_inner(&f.value, visiting, shadowed)),
             _ => false,
         }
     }
 
-    fn eval_const_bool(&self, expr: &Expr, visiting: &mut BTreeSet<String>) -> Option<bool> {
+    fn eval_const_bool_shadowed(
+        &self,
+        expr: &Expr,
+        visiting: &mut BTreeSet<String>,
+        shadowed: &BTreeSet<String>,
+    ) -> Option<bool> {
         match &expr.kind {
             ExprKind::Literal(Literal::Bool(b)) => Some(*b),
             ExprKind::Ident(id) => {
+                if shadowed.contains(&id.name) {
+                    return None;
+                }
                 if !visiting.insert(id.name.clone()) {
                     return None;
                 }
                 let res = self
                     .raw_const_exprs
                     .get(&id.name)
-                    .and_then(|(raw, _)| self.eval_const_bool(raw, visiting));
+                    .and_then(|(raw, _)| {
+                        self.eval_const_bool_shadowed(raw, visiting, &BTreeSet::new())
+                    });
                 visiting.remove(&id.name);
                 res
             }
             ExprKind::Unary {
                 op: UnaryOp::Not,
                 expr: inner,
-            } => Some(!self.eval_const_bool(inner, visiting)?),
+            } => Some(!self.eval_const_bool_shadowed(inner, visiting, shadowed)?),
             ExprKind::Binary { op, lhs, rhs } => match op {
-                BinaryOp::And => {
-                    Some(self.eval_const_bool(lhs, visiting)? && self.eval_const_bool(rhs, visiting)?)
-                }
-                BinaryOp::Or => {
-                    Some(self.eval_const_bool(lhs, visiting)? || self.eval_const_bool(rhs, visiting)?)
-                }
+                BinaryOp::And => Some(
+                    self.eval_const_bool_shadowed(lhs, visiting, shadowed)?
+                        && self.eval_const_bool_shadowed(rhs, visiting, shadowed)?,
+                ),
+                BinaryOp::Or => Some(
+                    self.eval_const_bool_shadowed(lhs, visiting, shadowed)?
+                        || self.eval_const_bool_shadowed(rhs, visiting, shadowed)?,
+                ),
                 BinaryOp::Eq | BinaryOp::Ne => {
                     if let (Some(a), Some(b)) = (
-                        self.eval_const_bool(lhs, visiting),
-                        self.eval_const_bool(rhs, visiting),
+                        self.eval_const_bool_shadowed(lhs, visiting, shadowed),
+                        self.eval_const_bool_shadowed(rhs, visiting, shadowed),
                     ) {
                         return Some(if matches!(op, BinaryOp::Eq) { a == b } else { a != b });
                     }
-                    let a = self.eval_const_expr_i128(lhs, visiting)?;
-                    let b = self.eval_const_expr_i128(rhs, visiting)?;
+                    let a = self.eval_const_expr_i128_shadowed(lhs, visiting, shadowed)?;
+                    let b = self.eval_const_expr_i128_shadowed(rhs, visiting, shadowed)?;
                     Some(if matches!(op, BinaryOp::Eq) { a == b } else { a != b })
                 }
                 BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
-                    let a = self.eval_const_expr_i128(lhs, visiting)?;
-                    let b = self.eval_const_expr_i128(rhs, visiting)?;
+                    let a = self.eval_const_expr_i128_shadowed(lhs, visiting, shadowed)?;
+                    let b = self.eval_const_expr_i128_shadowed(rhs, visiting, shadowed)?;
                     Some(match op {
                         BinaryOp::Lt => a < b,
                         BinaryOp::Le => a <= b,
@@ -8875,16 +9104,22 @@ impl Analyzer {
         }
     }
 
-    fn eval_compile_time_irq_arg(&self, expr: &Expr, ty: &Ty) -> Option<IrqBindingArg> {
+    fn eval_compile_time_irq_arg_with_shadowed(
+        &self,
+        expr: &Expr,
+        ty: &Ty,
+        shadowed: &BTreeSet<String>,
+    ) -> Option<IrqBindingArg> {
         if ty.is_bool() {
             let mut visiting = BTreeSet::new();
-            if let Some(b) = self.eval_const_bool(expr, &mut visiting) {
+            if let Some(b) = self.eval_const_bool_shadowed(expr, &mut visiting, shadowed) {
                 return Some(IrqBindingArg::ConstBool(b));
             }
         }
         if ty.is_integer() || matches!(ty, Ty::IntLit) {
             let mut visiting = BTreeSet::new();
-            if let Some(value) = self.eval_const_expr_i128(expr, &mut visiting) {
+            if let Some(value) = self.eval_const_expr_i128_shadowed(expr, &mut visiting, shadowed)
+            {
                 let final_ty = if matches!(ty, Ty::IntLit) {
                     Ty::u32()
                 } else {
@@ -8896,7 +9131,7 @@ impl Analyzer {
                 });
             }
         }
-        if self.is_compile_time_const_expr(expr) {
+        if self.is_compile_time_const_expr_with_shadowed(expr, shadowed) {
             return Some(IrqBindingArg::ConstExpr {
                 ty: ty.clone(),
                 expr: expr.clone(),
@@ -8990,8 +9225,8 @@ impl<'a> BodyChecker<'a> {
             return;
         };
 
-        let target_ty = if elem_index.is_some() {
-            if reg.array_len.is_none() {
+        let target_ty = if let Some(idx_expr) = elem_index {
+            let Some(len) = reg.array_len else {
                 self.sema.emit(Diagnostic::new(
                     DiagnosticKind::TypeMismatch,
                     field.span,
@@ -9001,13 +9236,35 @@ impl<'a> BodyChecker<'a> {
                     ),
                 ));
                 return;
+            };
+            let shadowed = self.active_local_names();
+            if let Some(idx) = self.sema.eval_const_expr_i128_shadowed(
+                idx_expr,
+                &mut BTreeSet::new(),
+                &shadowed,
+            ) {
+                if idx < 0 || idx as u128 >= len as u128 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        idx_expr.span,
+                        format!(
+                            "MMIO register array '{}.{}' index {} out of bounds (length {})",
+                            layout_name, reg.name, idx, len
+                        ),
+                    ));
+                }
             }
             Ty::Prim(reg.elem_ty)
-        } else if let Some(len) = reg.array_len {
-            Ty::Array {
-                elem: Box::new(Ty::Prim(reg.elem_ty)),
-                len,
-            }
+        } else if reg.array_len.is_some() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::MmioViolation,
+                stmt_span,
+                format!(
+                    "cannot assign whole MMIO register array '{}.{}'; assign an element with '{}.{}[i] = ...' instead",
+                    layout_name, reg.name, layout_name, reg.name
+                ),
+            ));
+            return;
         } else {
             Ty::Prim(reg.elem_ty)
         };
@@ -9104,14 +9361,17 @@ impl<'a> BodyChecker<'a> {
                         id.name.clone(),
                     )));
                 }
+                let shadowed = self.active_local_names();
                 self.sema
-                    .eval_compile_time_irq_arg(expr, &val.ty)
+                    .eval_compile_time_irq_arg_with_shadowed(expr, &val.ty, &shadowed)
                     .map(BootAttachArgSpec::Static)
             }
-            _ => self
-                .sema
-                .eval_compile_time_irq_arg(expr, &val.ty)
-                .map(BootAttachArgSpec::Static),
+            _ => {
+                let shadowed = self.active_local_names();
+                self.sema
+                    .eval_compile_time_irq_arg_with_shadowed(expr, &val.ty, &shadowed)
+                    .map(BootAttachArgSpec::Static)
+            }
         }
     }
 

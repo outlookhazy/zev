@@ -37,9 +37,8 @@ fn load_and_check_detailed_with_includes(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
 ) -> Result<CheckedBundle, CheckFailure> {
-    let mut source_files: Vec<(String, SourceFile)> = Vec::with_capacity(files.len());
+    let mut source_files: Vec<(String, PathBuf, SourceFile)> = Vec::with_capacity(files.len());
     let mut seen_canon: HashSet<PathBuf> = HashSet::with_capacity(files.len());
-    let mut all_generics: BTreeSet<String> = BTreeSet::new();
 
     for path in files {
         let canon_key = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
@@ -61,14 +60,20 @@ fn load_and_check_detailed_with_includes(
             }],
         })?;
 
-        all_generics.extend(zev_parser::collect_declared_generic_names(&sf.src));
-        source_files.push((display, sf));
+        source_files.push((display, path.clone(), sf));
     }
+
+    let generic_roots: Vec<(&str, Option<&Path>)> = source_files
+        .iter()
+        .map(|(_, path, sf)| (sf.src.as_str(), Some(path.as_path())))
+        .collect();
+    let all_generics: BTreeSet<String> =
+        zev_sema::collect_import_aware_generic_names(&generic_roots, include_dirs);
 
     let mut loaded: Vec<(String, SourceFile, Program)> = Vec::with_capacity(source_files.len());
     let mut by_name: HashMap<String, usize> = HashMap::with_capacity(source_files.len());
 
-    for (display, sf) in source_files {
+    for (display, _, sf) in source_files {
         match zev_parser::parse_str_named_with_generics(&sf.src, &display, Some(&all_generics)) {
             Ok(prog) => {
                 let idx = loaded.len();

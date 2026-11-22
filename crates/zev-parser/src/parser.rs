@@ -269,6 +269,27 @@ impl<'a> Parser<'a> {
         true
     }
 
+    fn parse_speculative_generic_args(&mut self) -> Option<Vec<GenericArg>> {
+        let Ok((args, _)) = self.parse_generic_args() else {
+            return None;
+        };
+        if self.pending_gt.is_some() {
+            return None;
+        }
+        // A bare identifier in local `value_scopes` (e.g. `b` in `a < b, c > (d + 1)`)
+        // cannot be a valid compile-time generic type or constant parameter (`E0029`).
+        for arg in &args {
+            if let GenericArg::Type(te) = arg {
+                if let TypeKind::Named(id) = &te.kind {
+                    if self.value_scopes.iter().rev().any(|s| s.contains(&id.name)) {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(args)
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Token Cursor Helpers
     // ─────────────────────────────────────────────────────────────────────────
@@ -3034,21 +3055,31 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Ident(_) => {
                 let first = self.parse_ident()?;
-                if self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon) {
-                    let variant = self.parse_ident()?;
-                    let span = first.span.merge(variant.span);
-                    Ok(SwitchPat::Ident {
-                        prefix: Some(first),
-                        name: variant,
-                        span,
-                    })
-                } else {
+                let mut rest = Vec::new();
+                while self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon) {
+                    rest.push(self.parse_ident()?);
+                }
+                if rest.is_empty() {
                     let span = first.span;
                     Ok(SwitchPat::Ident {
                         prefix: None,
                         name: first,
                         span,
                     })
+                } else if rest.len() == 1 {
+                    let name = rest.pop().expect("len 1");
+                    let span = first.span.merge(name.span);
+                    Ok(SwitchPat::Ident {
+                        prefix: Some(first),
+                        name,
+                        span,
+                    })
+                } else {
+                    let mut path = Vec::with_capacity(1 + rest.len());
+                    path.push(first);
+                    path.extend(rest);
+                    let span = path[0].span.merge(path.last().unwrap().span);
+                    Ok(SwitchPat::Qualified { path, span })
                 }
             }
             TokenKind::Int(n) => {
@@ -3658,6 +3689,7 @@ impl<'a> Parser<'a> {
                             ExprKind::Ident(id)
                                 if !self.is_value_name(&id.name)
                                     && self.import_aliases.contains(&id.name)
+                                    && self.can_speculate_bare_generic_call(&field.name)
                         ),
                         TokenKind::ColonColon => self
                             .known_generics
@@ -3721,43 +3753,41 @@ impl<'a> Parser<'a> {
                     if (allow_bare_lt_call || allow_bare_lt_struct_lit) && self.at(&TokenKind::Lt)
                     {
                         let cp = self.save();
-                        if let Ok((generic_args, _)) = self.parse_generic_args() {
-                            if self.pending_gt.is_none() {
-                                if allow_bare_lt_call && self.at(&TokenKind::LParen) {
-                                    let args = self.parse_call_args()?;
-                                    let callee_span = expr.span.merge(field.span);
-                                    let callee = Expr::new(
-                                        ExprKind::Field {
-                                            target: Box::new(expr),
-                                            field,
-                                        },
-                                        callee_span,
-                                    );
-                                    let span = callee_span.merge(self.prev_span());
-                                    expr = Expr::new(
-                                        ExprKind::Call {
-                                            callee: Box::new(callee),
-                                            generic_args,
-                                            args,
-                                        },
-                                        span,
-                                    );
-                                    continue;
-                                } else if allow_bare_lt_struct_lit
-                                    && self.looks_like_struct_lit_body()
-                                {
-                                    let expr_span = expr.span;
-                                    let ExprKind::Ident(module_ident) = expr.kind else {
-                                        unreachable!()
-                                    };
-                                    expr = self.parse_struct_lit_with_module(
-                                        Some(module_ident),
+                        if let Some(generic_args) = self.parse_speculative_generic_args() {
+                            if allow_bare_lt_call && self.at(&TokenKind::LParen) {
+                                let args = self.parse_call_args()?;
+                                let callee_span = expr.span.merge(field.span);
+                                let callee = Expr::new(
+                                    ExprKind::Field {
+                                        target: Box::new(expr),
                                         field,
+                                    },
+                                    callee_span,
+                                );
+                                let span = callee_span.merge(self.prev_span());
+                                expr = Expr::new(
+                                    ExprKind::Call {
+                                        callee: Box::new(callee),
                                         generic_args,
-                                        expr_span,
-                                    )?;
-                                    continue;
-                                }
+                                        args,
+                                    },
+                                    span,
+                                );
+                                continue;
+                            } else if allow_bare_lt_struct_lit
+                                && self.looks_like_struct_lit_body()
+                            {
+                                let expr_span = expr.span;
+                                let ExprKind::Ident(module_ident) = expr.kind else {
+                                    unreachable!()
+                                };
+                                expr = self.parse_struct_lit_with_module(
+                                    Some(module_ident),
+                                    field,
+                                    generic_args,
+                                    expr_span,
+                                )?;
+                                continue;
                             }
                         }
                         self.restore(cp);
@@ -4098,24 +4128,22 @@ impl<'a> Parser<'a> {
                 //    for bare `<...>(...)` calls, when `known_generics` is provided and excludes `ident`.
                 if self.at(&TokenKind::Lt) && !self.is_value_name(&ident.name) {
                     let cp = self.save();
-                    if let Ok((generic_args, _)) = self.parse_generic_args() {
-                        if self.pending_gt.is_none() {
-                            if self.at(&TokenKind::LParen)
-                                && self.can_speculate_bare_generic_call(&ident.name)
-                            {
-                                let args = self.parse_call_args()?;
-                                let span = start.merge(self.prev_span());
-                                return Ok(Expr::new(
-                                    ExprKind::Call {
-                                        callee: Box::new(Expr::new(ExprKind::Ident(ident), start)),
-                                        generic_args,
-                                        args,
-                                    },
-                                    span,
-                                ));
-                            } else if self.allow_struct_lit && self.looks_like_struct_lit_body() {
-                                return self.parse_struct_lit(ident, generic_args);
-                            }
+                    if let Some(generic_args) = self.parse_speculative_generic_args() {
+                        if self.at(&TokenKind::LParen)
+                            && self.can_speculate_bare_generic_call(&ident.name)
+                        {
+                            let args = self.parse_call_args()?;
+                            let span = start.merge(self.prev_span());
+                            return Ok(Expr::new(
+                                ExprKind::Call {
+                                    callee: Box::new(Expr::new(ExprKind::Ident(ident), start)),
+                                    generic_args,
+                                    args,
+                                },
+                                span,
+                            ));
+                        } else if self.allow_struct_lit && self.looks_like_struct_lit_body() {
+                            return self.parse_struct_lit(ident, generic_args);
                         }
                     }
                     self.restore(cp);

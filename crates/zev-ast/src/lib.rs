@@ -890,12 +890,14 @@ pub struct SwitchArm {
 /// Pattern in a [`SwitchArm`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SwitchPat {
-    /// Enum variant or constant identifier (`Overcurrent` or `SupEvent.Overcurrent`).
+    /// Enum variant or constant identifier (`Overcurrent`, `SupEvent.Overcurrent`, or `sm.MODE_A`).
     Ident {
         prefix: Option<Ident>,
         name: Ident,
         span: Span,
     },
+    /// Module-qualified enum variant pattern (`sm.Kind.Alpha`).
+    Qualified { path: Vec<Ident>, span: Span },
     /// Scalar literal (`0`, `1`, `true`, ...).
     Literal(Literal, Span),
     /// Wildcard / default arm (`_` or `default`).

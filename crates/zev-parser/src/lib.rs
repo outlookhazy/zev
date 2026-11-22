@@ -2036,4 +2036,54 @@ fn main() {
             parse_str(bad).expect_err(&format!("expected parse error on `{bad}`"));
         }
     }
+
+    #[test]
+    fn parses_qualified_switch_patterns_and_module_member_comparisons() {
+        let src = r#"
+import mod_consts as m;
+import sw_mod as sm;
+
+fn take2(bool x, bool y) {}
+
+fn main() {
+    u32 b = 2;
+    u32 d = 3;
+    take2(m.A < b, m.C > (d + 1));
+
+    u32 k = 0;
+    switch (k) {
+        sm.Kind.Alpha => {}
+        sm.MODE_A => {}
+        default => {}
+    }
+}
+"#;
+        let prog = parse_str(src).expect("qualified switch & module comparison must parse");
+        let main_fn = prog
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ItemKind::Fn(f) if f.name.name == "main" => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        let stmts = &main_fn.body.as_ref().unwrap().stmts;
+        assert!(matches!(
+            &stmts[2].kind,
+            StmtKind::Expr(Expr { kind: ExprKind::Call { args, .. }, .. }) if args.len() == 2
+        ));
+        if let StmtKind::Switch { arms, .. } = &stmts[4].kind {
+            assert!(matches!(
+                &arms[0].pat,
+                SwitchPat::Qualified { path, .. }
+                    if path.iter().map(|i| i.as_str()).collect::<Vec<_>>() == vec!["sm", "Kind", "Alpha"]
+            ));
+            assert!(matches!(
+                &arms[1].pat,
+                SwitchPat::Ident { prefix: Some(p), name, .. } if p.as_str() == "sm" && name.as_str() == "MODE_A"
+            ));
+        } else {
+            panic!("expected Switch stmt");
+        }
+    }
 }

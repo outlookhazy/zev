@@ -30,7 +30,9 @@ pub use model::{
     MonomorphizedInstance, MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite,
     SemanticModel, SpawnedTaskInstance, TaskInfo,
 };
-pub use modules::{LinkedModulesOutput, load_and_link_modules};
+pub use modules::{
+    LinkedModulesOutput, collect_import_aware_generic_names, load_and_link_modules,
+};
 pub use monomorphize::{
     MAX_GENERIC_DEPTH, MAX_MONOMORPHIZED_INSTANCES, MonomorphizeOutput, mangle_type_expr,
     monomorphize_named_programs, monomorphize_programs,

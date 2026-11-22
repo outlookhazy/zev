@@ -1609,12 +1609,15 @@ int main(void) {
 
     fn parse_examples_compat(paths: &[&str]) -> Vec<(Program, String)> {
         let mut raws = Vec::with_capacity(paths.len());
-        let mut all_generics = std::collections::BTreeSet::new();
         for &path in paths {
             let raw = fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
-            all_generics.extend(zev_parser::collect_declared_generic_names(&raw));
             raws.push((path, raw));
         }
+        let roots: Vec<(&str, Option<&std::path::Path>)> = raws
+            .iter()
+            .map(|(p, r)| (r.as_str(), Some(std::path::Path::new(*p))))
+            .collect();
+        let all_generics = zev_sema::collect_import_aware_generic_names(&roots, &[]);
         raws.into_iter()
             .map(|(path, raw)| {
                 let prog = match zev_parser::parse_str_named_with_generics(

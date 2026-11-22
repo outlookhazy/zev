@@ -124,7 +124,11 @@ pub fn emit_llvm_ir_with_options(
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
     let nvic = NvicMap::from_irq_vectors(&module.irq_vectors);
-    let esp32c6_irq_routes = assign_esp32c6_irq_routes(&module.irq_vectors);
+    let esp32c6_irq_routes = if opts.target == TargetArch::Riscv32Esp32C6 {
+        assign_esp32c6_irq_routes(&module.irq_vectors)?
+    } else {
+        Vec::new()
+    };
     let mut rt_features = scan_module_runtime_features(module);
     rt_features.uses_rv_irqs =
         opts.target == TargetArch::Riscv32Esp32C6 && !module.irq_vectors.is_empty();
@@ -2775,35 +2779,55 @@ entry:
             });
 
             if let Some(sel_raw) = eff_selector {
-                let mut uncond_calls = Vec::new();
-                let mut grouped: BTreeMap<u8, Vec<String>> = BTreeMap::new();
-                for b in &vec.bindings {
-                    let call_ir = self.format_irq_binding_call(b)?;
-                    if let Some((_, val)) = &b.cond_selector {
-                        grouped.entry(*val).or_default().push(call_ir);
-                    } else {
-                        uncond_calls.push(call_ir);
-                    }
-                }
-                for call_ir in uncond_calls {
-                    let _ = writeln!(out, "  {call_ir}");
-                }
                 let sel_sym = sanitize_ident(sel_raw.trim_start_matches('@'));
                 let _ = writeln!(out, "  %sel = load i8, ptr @{sel_sym}, align 1");
-                let _ = writeln!(out, "  switch i8 %sel, label %done [");
-                for &val in grouped.keys() {
-                    let _ = writeln!(out, "    i8 {val}, label %arm_{val}");
-                }
-                let _ = writeln!(out, "  ]");
-                for (val, calls) in grouped {
-                    let _ = writeln!(out, "arm_{val}:");
-                    for call_ir in calls {
+                if !vec.is_shared {
+                    let mut uncond_calls = Vec::new();
+                    let mut grouped: BTreeMap<u8, Vec<String>> = BTreeMap::new();
+                    for b in &vec.bindings {
+                        let call_ir = self.format_irq_binding_call(b)?;
+                        if let Some((_, val)) = &b.cond_selector {
+                            grouped.entry(*val).or_default().push(call_ir);
+                        } else {
+                            uncond_calls.push(call_ir);
+                        }
+                    }
+                    for call_ir in uncond_calls {
                         let _ = writeln!(out, "  {call_ir}");
                     }
-                    let _ = writeln!(out, "  br label %done");
+                    let _ = writeln!(out, "  switch i8 %sel, label %done [");
+                    for &val in grouped.keys() {
+                        let _ = writeln!(out, "    i8 {val}, label %arm_{val}");
+                    }
+                    let _ = writeln!(out, "  ]");
+                    for (val, calls) in grouped {
+                        let _ = writeln!(out, "arm_{val}:");
+                        for call_ir in calls {
+                            let _ = writeln!(out, "  {call_ir}");
+                        }
+                        let _ = writeln!(out, "  br label %done");
+                    }
+                    let _ = writeln!(out, "done:");
+                    let _ = writeln!(out, "  ret void");
+                } else {
+                    for (idx, b) in vec.bindings.iter().enumerate() {
+                        let call_ir = self.format_irq_binding_call(b)?;
+                        if let Some((_, val)) = &b.cond_selector {
+                            let _ = writeln!(out, "  %cmp_{idx} = icmp eq i8 %sel, {val}");
+                            let _ = writeln!(
+                                out,
+                                "  br i1 %cmp_{idx}, label %shared_exec_{idx}, label %shared_next_{idx}"
+                            );
+                            let _ = writeln!(out, "shared_exec_{idx}:");
+                            let _ = writeln!(out, "  {call_ir}");
+                            let _ = writeln!(out, "  br label %shared_next_{idx}");
+                            let _ = writeln!(out, "shared_next_{idx}:");
+                        } else {
+                            let _ = writeln!(out, "  {call_ir}");
+                        }
+                    }
+                    let _ = writeln!(out, "  ret void");
                 }
-                let _ = writeln!(out, "done:");
-                let _ = writeln!(out, "  ret void");
             } else {
                 for b in &vec.bindings {
                     let call_ir = self.format_irq_binding_call(b)?;
@@ -5322,53 +5346,64 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             _ => ("i32", 4u32, 4usize),
         };
 
+        let is_host64 = self.ctx.opts.target == TargetArch::HostX86_64Linux;
+        let idx_ty = if is_host64 { "i64" } else { "i32" };
         let ptr_tmp = if let Some(idx_expr) = index {
             let iv = self.emit_expr(idx_expr)?;
-            let idx_i32 = self.coerce(iv, "i32", !idx_expr.ty.is_unsigned()).repr;
-            let eff_idx = if self.ctx.opts.target == TargetArch::HostX86_64Linux {
+            let idx_val = self.coerce(iv, idx_ty, !idx_expr.ty.is_unsigned()).repr;
+            let eff_idx = if is_host64 {
                 if let Some(alen) = array_len {
                     if alen == 0 {
                         "0".to_string()
                     } else {
                         let inb = self.next_tmp();
                         let clamped = self.next_tmp();
-                        self.emit_line(format!("{inb} = icmp ult i32 {idx_i32}, {alen}"));
+                        self.emit_line(format!("{inb} = icmp ult i64 {idx_val}, {alen}"));
                         self.emit_line(format!(
-                            "{clamped} = select i1 {inb}, i32 {idx_i32}, i32 0"
+                            "{clamped} = select i1 {inb}, i64 {idx_val}, i64 0"
                         ));
                         clamped
                     }
                 } else {
-                    idx_i32
+                    idx_val
                 }
             } else {
-                idx_i32
+                idx_val
             };
 
             let scaled = if stride == 1 {
                 eff_idx
             } else {
                 let s = self.next_tmp();
-                self.emit_line(format!("{s} = mul i32 {eff_idx}, {stride}"));
+                self.emit_line(format!("{s} = mul {idx_ty} {eff_idx}, {stride}"));
                 s
             };
             let total_off = if offset == 0 {
                 scaled
             } else {
                 let sum = self.next_tmp();
-                self.emit_line(format!("{sum} = add i32 {}, {scaled}", offset as i32));
+                let off_lit = if is_host64 {
+                    i64::from(offset)
+                } else {
+                    i64::from(offset as i32)
+                };
+                self.emit_line(format!("{sum} = add {idx_ty} {off_lit}, {scaled}"));
                 sum
             };
             let p = self.next_tmp();
             self.emit_line(format!(
-                "{p} = getelementptr i8, ptr {base_ptr}, i32 {total_off}"
+                "{p} = getelementptr i8, ptr {base_ptr}, {idx_ty} {total_off}"
             ));
             p
         } else {
             let p = self.next_tmp();
+            let off_lit = if is_host64 {
+                i64::from(offset)
+            } else {
+                i64::from(offset as i32)
+            };
             self.emit_line(format!(
-                "{p} = getelementptr i8, ptr {base_ptr}, i32 {}",
-                offset as i32
+                "{p} = getelementptr i8, ptr {base_ptr}, {idx_ty} {off_lit}"
             ));
             p
         };

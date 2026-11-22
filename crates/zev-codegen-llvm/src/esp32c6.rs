@@ -19,27 +19,60 @@ use std::fmt::Write;
 /// Expected first 8 bytes at offset `0x0` of an ESP32-C6 Direct-Boot flash image (`0xAEDB041D` x2 LE).
 pub const ESP32C6_DIRECT_BOOT_MAGIC: [u8; 8] = [0x1d, 0x04, 0xdb, 0xae, 0x1d, 0x04, 0xdb, 0xae];
 
-/// Deterministic ESP32-C6 peripheral interrupt matrix (`INTMTX` `src_id`) -> CPU line (`cpu_int` `1..=31`).
+/// External CPU interrupt lines on ESP32-C6 (`INTMTX` / `INTPRI`), excluding CLINT-reserved
+/// core lines `0, 3, 4, 7`.
+pub const ESP32C6_EXTERNAL_CPU_INTS: [u8; 28] = [
+    1, 2, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+    29, 30, 31,
+];
+
+/// Total peripheral interrupt matrix (`INTMTX`) sources on ESP32-C6 (`0..=77`).
+pub const ESP32C6_INTMTX_SOURCE_COUNT: u32 = 78;
+
+/// Deterministic ESP32-C6 peripheral interrupt matrix (`INTMTX` `src_id`) -> CPU line (`cpu_int`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Esp32C6IrqRoute {
     pub src_id: u32,
     pub cpu_int: u8,
 }
 
-/// Assign deterministic CPU interrupt lines (`1..=31`) for each attached `MirIrqVector` (`src_id = irq_num`).
-pub fn assign_esp32c6_irq_routes(vectors: &[zev_mir::MirIrqVector]) -> Vec<Esp32C6IrqRoute> {
+/// Assign deterministic CPU interrupt lines (`1..=31`, skipping CLINT-reserved `0, 3, 4, 7`) for
+/// each attached `MirIrqVector` (`src_id = irq_num`).
+pub fn assign_esp32c6_irq_routes(
+    vectors: &[zev_mir::MirIrqVector],
+) -> Result<Vec<Esp32C6IrqRoute>, crate::CodegenError> {
     let mut unique_srcs = BTreeSet::new();
     for v in vectors {
+        if v.irq_num >= ESP32C6_INTMTX_SOURCE_COUNT {
+            return Err(crate::CodegenError::new(
+                "llvm-ir",
+                format!(
+                    "ESP32-C6 IRQ source ID {} exceeds INTMTX range (0..={})",
+                    v.irq_num,
+                    ESP32C6_INTMTX_SOURCE_COUNT - 1
+                ),
+            ));
+        }
         unique_srcs.insert(v.irq_num);
     }
-    unique_srcs
+    if unique_srcs.len() > ESP32C6_EXTERNAL_CPU_INTS.len() {
+        return Err(crate::CodegenError::new(
+            "llvm-ir",
+            format!(
+                "ESP32-C6 supports at most {} distinct external CPU interrupt lines (excluding CLINT lines 0, 3, 4, 7), but program attached {} IRQ sources",
+                ESP32C6_EXTERNAL_CPU_INTS.len(),
+                unique_srcs.len()
+            ),
+        ));
+    }
+    Ok(unique_srcs
         .into_iter()
         .enumerate()
         .map(|(idx, src_id)| Esp32C6IrqRoute {
             src_id,
-            cpu_int: ((idx % 31) + 1) as u8,
+            cpu_int: ESP32C6_EXTERNAL_CPU_INTS[idx],
         })
-        .collect()
+        .collect())
 }
 
 /// Emit ESP32-C6 `.entry` (`@_start` at `0x4200_0008`), `@__syn_esp32c6_reset`, watchdog disarm,

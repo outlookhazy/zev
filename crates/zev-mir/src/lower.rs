@@ -3008,7 +3008,7 @@ fn convert_switch_pat(
     syms: &ModuleSymbols,
 ) -> Option<MirSwitchPattern> {
     match pat {
-        SwitchPat::Wildcard(_) => None,
+        SwitchPat::Wildcard(_) | SwitchPat::Qualified { .. } => None,
         SwitchPat::Literal(lit, _) => match lit {
             Literal::Int(v) => Some(MirSwitchPattern::Int(*v as i128)),
             Literal::Bool(b) => Some(MirSwitchPattern::Bool(*b)),
@@ -6834,6 +6834,10 @@ fn peek_expr_struct_type<B: LowerBackend>(expr: &Expr, be: &B) -> Option<String>
 
 fn peek_expr_mmio_layout<B: LowerBackend>(expr: &Expr, be: &B) -> Option<String> {
     match &expr.kind {
+        ExprKind::Unary {
+            op: UnaryOp::Deref,
+            expr: inner,
+        } => peek_expr_mmio_layout(inner, be),
         ExprKind::Ident(id) => {
             if let Some(vid) = be.scopes().lookup(&id.name) {
                 if let MirType::MmioPtr(layout) = &be.vars()[vid.0].ty {
@@ -6897,6 +6901,24 @@ fn peek_expr_mmio_layout<B: LowerBackend>(expr: &Expr, be: &B) -> Option<String>
     }
 }
 
+fn lower_mmio_base_be<B: LowerBackend>(
+    mut base_ast: &Expr,
+    be: &mut B,
+) -> Result<MirExpr, MirLowerError> {
+    while let ExprKind::Unary {
+        op: UnaryOp::Deref,
+        expr: inner,
+    } = &base_ast.kind
+    {
+        if peek_expr_mmio_layout(inner, be).is_some() {
+            base_ast = inner;
+        } else {
+            break;
+        }
+    }
+    be.lower_sub(base_ast, None)
+}
+
 fn resolve_mmio_lvalue_be<B: LowerBackend>(
     target: &Expr,
     be: &mut B,
@@ -6909,7 +6931,7 @@ fn resolve_mmio_lvalue_be<B: LowerBackend>(
             if peek_expr_mmio_layout(base_ast, be).is_none() {
                 return Ok(None);
             }
-            let base = be.lower_sub(base_ast, None)?;
+            let base = lower_mmio_base_be(base_ast, be)?;
             let MirType::MmioPtr(layout_name) = &base.ty else {
                 return Err(MirLowerError {
                     message: format!(
@@ -6946,7 +6968,7 @@ fn resolve_mmio_lvalue_be<B: LowerBackend>(
             if peek_expr_mmio_layout(base_ast, be).is_none() {
                 return Ok(None);
             }
-            let base = be.lower_sub(base_ast, None)?;
+            let base = lower_mmio_base_be(base_ast, be)?;
             let MirType::MmioPtr(layout_name) = &base.ty else {
                 return Err(MirLowerError {
                     message: format!(
@@ -7438,7 +7460,7 @@ fn lower_common_expr<B: LowerBackend>(
                 } = &target.kind
                 {
                     if let Some(layout_name) = peek_expr_mmio_layout(mmio_base_ast, be) {
-                        let _base = be.lower_sub(mmio_base_ast, None)?;
+                        let _base = lower_mmio_base_be(mmio_base_ast, be)?;
                         let reg =
                             lookup_mmio_reg(be.syms(), &layout_name, &reg_ident.name, target.span)?;
                         if let Some(len) = reg.array_len {
@@ -7447,7 +7469,28 @@ fn lower_common_expr<B: LowerBackend>(
                     }
                 }
             }
-            let base = be.lower_sub(target, None)?;
+            if field.name == "ptr" {
+                if let Ok((place, MirType::Array { elem, .. })) = be.lower_place_be(target) {
+                    if let Some(vid) = place_root_var(&place) {
+                        be.invalidate_boot_const(vid);
+                    }
+                    let idx0 = MirPlace::Index {
+                        base: Box::new(place),
+                        index: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                        elem_ty: *elem.clone(),
+                        is_slice: false,
+                    };
+                    return Ok(MirExpr::new(
+                        MirExprKind::AddrOfPlace(Box::new(idx0)),
+                        MirType::Ptr(elem),
+                    ));
+                }
+            }
+            let base = if peek_expr_mmio_layout(target, be).is_some() {
+                lower_mmio_base_be(target, be)?
+            } else {
+                be.lower_sub(target, None)?
+            };
             finish_field_access(base, &field.name, be.syms(), expr.span)
         }
         ExprKind::Index { target, index } => {

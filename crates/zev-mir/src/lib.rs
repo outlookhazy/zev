@@ -3485,4 +3485,243 @@ mod tests {
         });
         assert!(lower_program(&Program::new(loop_items, sp)).is_err());
     }
+
+    #[test]
+    fn wave1_audit_deref_mmio_pointer_and_array_ptr_lowering() {
+        let sp = Span::dummy();
+        let arr_ty = TypeExpr::new(
+            TypeKind::Array {
+                elem: Box::new(ty_prim(PrimType::U32)),
+                len: ArrayLen::Fixed(4),
+            },
+            sp,
+        );
+        let ptr_regs_ty = TypeExpr::new(TypeKind::Ptr(Box::new(ty_named("Regs"))), sp);
+        let ptr_u32_ty = TypeExpr::new(TypeKind::Ptr(Box::new(ty_prim(PrimType::U32))), sp);
+        let deref_ptr = Expr::new(
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                expr: Box::new(expr_id("ptr")),
+            },
+            sp,
+        );
+        let deref_arr_i = Expr::new(
+            ExprKind::Index {
+                target: Box::new(expr_field(deref_ptr.clone(), "arr")),
+                index: Box::new(expr_id("i")),
+            },
+            sp,
+        );
+        let prog = Program::new(
+            vec![
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Mmio(MmioDecl {
+                        name: id("Regs"),
+                        kind: MmioDeclKind::Layout {
+                            regs: vec![
+                                MmioRegDecl {
+                                    access: MmioAccess::Rw,
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("cr"),
+                                    offset: expr_int(0),
+                                    span: sp,
+                                },
+                                MmioRegDecl {
+                                    access: MmioAccess::Rw,
+                                    ty: arr_ty.clone(),
+                                    name: id("arr"),
+                                    offset: expr_int(0x10),
+                                    span: sp,
+                                },
+                            ],
+                        },
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Mmio(MmioDecl {
+                        name: id("DEV"),
+                        kind: MmioDeclKind::Instance {
+                            layout: ty_named("Regs"),
+                            base_addr: expr_int(0x4000_0000),
+                        },
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        is_extern_c: false,
+                        name: id("poke"),
+                        generic_params: vec![],
+                        params: vec![
+                            Param {
+                                ty: ptr_regs_ty,
+                                name: id("ptr"),
+                                span: sp,
+                            },
+                            Param {
+                                ty: ty_prim(PrimType::Usize),
+                                name: id("i"),
+                                span: sp,
+                            },
+                        ],
+                        is_variadic: false,
+                        ret_type: ty_prim(PrimType::U32),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::Assign {
+                                        target: expr_field(deref_ptr.clone(), "cr"),
+                                        op: AssignOp::Assign,
+                                        value: expr_int(7),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Assign {
+                                        target: deref_arr_i.clone(),
+                                        op: AssignOp::Assign,
+                                        value: expr_field(deref_ptr.clone(), "cr"),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_prim(PrimType::Usize),
+                                        name: id("n"),
+                                        init: Some(expr_field(
+                                            expr_field(deref_ptr.clone(), "arr"),
+                                            "len",
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: arr_ty,
+                                        name: id("local"),
+                                        init: Some(Expr::new(
+                                            ExprKind::ArrayLit(vec![
+                                                expr_int(10),
+                                                expr_int(20),
+                                                expr_int(30),
+                                                expr_int(40),
+                                            ]),
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ptr_u32_ty,
+                                        name: id("p"),
+                                        init: Some(expr_field(expr_id("local"), "ptr")),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Return(Some(Expr::new(
+                                        ExprKind::Binary {
+                                            op: BinaryOp::Add,
+                                            lhs: Box::new(deref_arr_i),
+                                            rhs: Box::new(Expr::new(
+                                                ExprKind::Cast {
+                                                    expr: Box::new(expr_id("n")),
+                                                    ty: ty_prim(PrimType::U32),
+                                                },
+                                                sp,
+                                            )),
+                                        },
+                                        sp,
+                                    ))),
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        is_extern_c: false,
+                        name: id("main"),
+                        generic_params: vec![],
+                        params: vec![],
+                        is_variadic: false,
+                        ret_type: ty_prim(PrimType::Void),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("v"),
+                                    init: Some(expr_call(
+                                        "poke",
+                                        vec![
+                                            Expr::new(
+                                                ExprKind::Unary {
+                                                    op: UnaryOp::AddrOf,
+                                                    expr: Box::new(expr_id("DEV")),
+                                                },
+                                                sp,
+                                            ),
+                                            expr_int(2),
+                                        ],
+                                    )),
+                                },
+                                sp,
+                            )],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+            ],
+            sp,
+        );
+        let mir = lower_program(&prog).expect(
+            "MIR lowering must handle (*ptr).reg, (*ptr).arr[i], (*ptr).arr.len, and arr.ptr",
+        );
+        let poke_fn = mir.functions.iter().find(|f| f.name == "poke").expect("poke fn");
+        let MirFnBody::Direct(stmts) = &poke_fn.body else {
+            panic!("expected Direct body");
+        };
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, MirStmt::MmioWrite { offset: 0x00, .. })),
+            "expected MmioWrite to (*ptr).cr at offset 0x00: {stmts:?}"
+        );
+        assert!(
+            stmts
+                .iter()
+                .any(|s| matches!(s, MirStmt::MmioWrite { offset: 0x10, index: Some(_), .. })),
+            "expected indexed MmioWrite to (*ptr).arr[i] at offset 0x10: {stmts:?}"
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(
+                s,
+                MirStmt::Assign { value, .. }
+                if matches!(&value.kind, MirExprKind::AddrOfPlace(_))
+            )),
+            "expected `local.ptr` to lower to AddrOfPlace: {stmts:?}"
+        );
+    }
 }

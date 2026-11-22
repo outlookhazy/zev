@@ -1109,10 +1109,10 @@ fn doc_topic_and_doc_command_cover_all_e0001_through_e0033() {
         ("E0027", "tasks"),
         ("E0028", "runtime"),
         ("E0029", "syntax"),
-        ("E0030", "syntax"),
-        ("E0031", "syntax"),
-        ("E0032", "tasks"),
-        ("E0033", "tasks"),
+        ("E0030", "runtime"),
+        ("E0031", "runtime"),
+        ("E0032", "runtime"),
+        ("E0033", "yielding"),
     ];
 
     for (kind, (code, topic)) in DiagnosticKind::ALL.iter().zip(expected_topics.iter()) {
@@ -4274,4 +4274,242 @@ fn wave1_isr_state_and_e0033_escape_checks() {
         expect_err_kind(bad_state, DiagnosticKind::InvalidIsrState);
     }
 }
+
+#[test]
+fn wave1_audit_frontend_regression_tests() {
+    // #1: Interprocedural ISR `state` pointer escape through helper fn(s) -> E0033.
+    expect_err_kind(
+        r#"
+        watch<*u32> leak_w;
+        void forward(*u32 p) { leak_w.publish(p); }
+        void bounce(*u32 p) { forward(p); }
+        isr bad() {
+            state u32 x = 0;
+            bounce(&x);
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::InvalidIsrState,
+    );
+
+    // #3: Boot-tree IRQ early-return helper call propagation & diverging branch union -> E0032.
+    expect_err_kind(
+        r#"
+        irq Q0 = 5;
+        isr h0 {}
+        isr h1 {}
+        void helper() {
+            if (true) {
+                Q0.attach(h0);
+                return;
+            } else {
+                return;
+            }
+        }
+        fn main() {
+            helper();
+            Q0.attach(h1);
+        }
+        "#,
+        DiagnosticKind::IrqAttachmentError,
+    );
+    expect_err_kind(
+        r#"
+        irq Q0 = 5;
+        irq Q1 = 6;
+        isr h0 {}
+        isr h1 {}
+        void helper() {
+            if (true) {
+                Q0.attach(h0);
+                return;
+            }
+            Q1.attach(h1);
+        }
+        fn main() {
+            helper();
+            Q0.attach(h1);
+        }
+        "#,
+        DiagnosticKind::IrqAttachmentError,
+    );
+
+    // #4: `arr.ptr` carries the exact same local/ISR-state/DMA provenance as `&arr[0]`.
+    expect_err_kind(
+        r#"
+        watch<*u32> leak_w;
+        isr bad() {
+            state [4]u32 buf = [0, 0, 0, 0];
+            leak_w.publish(buf.ptr);
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::InvalidIsrState,
+    );
+    expect_err_kind(
+        r#"
+        *u32 dangle() {
+            [4]u32 local = [1, 2, 3, 4];
+            return local.ptr;
+        }
+        fn main() { *u32 p = dangle(); }
+        "#,
+        DiagnosticKind::ReturnLocalReference,
+    );
+
+    // #7: Local variables/parameters shadowing top-level `const` must not trigger false const checks
+    // or slip runtime shadowed variables into compile-time `state` / `irq` const positions.
+    expect_err_kind(
+        r#"
+        const u32 K = 7;
+        isr bad(u32 K) {
+            state u32 s = K;
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::InvalidIsrState,
+    );
+    expect_err_kind(
+        r#"
+        const u32 C = 5;
+        irq Q = 9;
+        isr h(u32 val) {}
+        fn main() {
+            u32 C = 1;
+            C += 1;
+            Q.attach(h(C));
+        }
+        "#,
+        DiagnosticKind::IrqAttachmentError,
+    );
+
+    // #10: MMIO register array OOB + unindexed `.ptr` / slice / rvalue / whole-array write -> E0031.
+    for bad_mmio_arr in [
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; u32 f() { return DEV.r[4]; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; const i32 N = -1; u32 f() { return DEV.r[N]; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { DEV.r[4] = 1; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { *u32 p = DEV.r.ptr; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { []u32 s = DEV.r[0..2]; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { [4]u32 c = DEV.r; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { [4]u32 c = [1,2,3,4]; DEV.r = c; } fn main() {}",
+    ] {
+        expect_err_kind(bad_mmio_arr, DiagnosticKind::MmioViolation);
+    }
+    // Shadowed local `IDX` over out-of-bounds global `const IDX = 99` must succeed!
+    expect_ok(
+        r#"
+        mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000;
+        const usize IDX = 99;
+        u32 read_at(usize IDX) { return DEV.r[IDX]; }
+        fn main() { u32 v = read_at(1); }
+        "#,
+    );
+
+    // #13: Typed `error` spec cannot contain by-value MMIO layout -> E0031.
+    expect_err_kind(
+        r#"
+        mmio R { @rw u32 cr @ 0x0; }
+        fn bad_fn() error R {}
+        fn main() {}
+        "#,
+        DiagnosticKind::MmioViolation,
+    );
+
+    // #2 + #8 + #9 + #11: Multi-file module checks (generic `usize` scope in struct, qualified enum/const
+    // switch patterns, import-aware generic names, and anti-forgery of private canonical `<mod>__<sym>`).
+    let tmp = std::env::temp_dir().join(format!("zev_wave1_audit_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+    let mod_src = r#"
+pub struct Ring<T, usize N> {
+    [N]T data;
+    usize head;
+}
+pub enum Kind { Alpha, Beta }
+pub const u32 MODE_A = 1;
+pub bool take2(bool a, bool b) { return a && b; }
+const u32 N = 999;
+pub const u32 A = 10;
+pub const u32 C = 20;
+u32 secret_helper() { return 7; }
+"#;
+    std::fs::write(tmp.join("sub.zev"), mod_src).expect("write sub.zev");
+
+    // Valid use: `Ring<u8, 4>` inside `sub.zev` where `pub struct Ring<T, usize N>` sees `N`,
+    // `sub.Kind.Alpha` & `sub.MODE_A` in `switch`, and `sub.take2(sub.A < b, sub.C > (d + 1))`.
+    let main_ok = r#"
+import sub;
+fn main() {
+    sub.Ring<u8, 4> r = sub.Ring<u8, 4> { data: [1, 2, 3, 4], head: 0 };
+    sub.Kind k = sub.Kind.Alpha;
+    u32 x = 1;
+    switch (k) {
+        sub.Kind.Alpha => { x = 2; }
+        default => { x = 3; }
+    }
+    switch (x) {
+        sub.MODE_A => { x = 10; }
+        default => {}
+    }
+    u32 b = 20;
+    u32 d = 10;
+    bool ok = sub.take2(sub.A < b, sub.C > (d + 1));
+    if (ok && r.head == 0) { x = 11; }
+}
+"#;
+    let main_path = tmp.join("main.zev");
+    std::fs::write(&main_path, main_ok).expect("write main.zev");
+    let gens = zev_sema::collect_import_aware_generic_names(
+        &[(main_ok, Some(main_path.as_path()))],
+        &[],
+    );
+    let parsed_ok = zev_parser::parse_str_named_with_generics(
+        main_ok,
+        main_path.to_str().unwrap(),
+        Some(&gens),
+    )
+    .expect("parse main_ok");
+    let out_ok = analyze_and_monomorphize_named_programs(
+        &[(&parsed_ok, main_path.to_str())],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        out_ok.diagnostics.is_empty(),
+        "expected clean multi-module build, got:\n{}",
+        out_ok
+            .diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // #11: Direct forged reference to canonical name `sub__secret_helper` must fail with E0030.
+    let main_forge = r#"
+import sub;
+fn main() {
+    u32 v = sub__secret_helper();
+}
+"#;
+    let forge_path = tmp.join("forge.zev");
+    std::fs::write(&forge_path, main_forge).expect("write forge.zev");
+    let parsed_forge =
+        zev_parser::parse_str_named(main_forge, forge_path.to_str().unwrap()).expect("parse forge");
+    let out_forge = analyze_and_monomorphize_named_programs(
+        &[(&parsed_forge, forge_path.to_str())],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        out_forge
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::ModuleError),
+        "expected E0030 rejecting forged private canonical symbol, got: {:?}",
+        out_forge.diagnostics
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 

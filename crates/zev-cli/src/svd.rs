@@ -95,8 +95,6 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
             None => None,
         };
 
-        let props = device_props.merge(p_el)?;
-
         let mut interrupts = Vec::new();
         for irq_el in p_el.children("interrupt") {
             let Some(irq_raw_name) = irq_el.child_text("name") else {
@@ -123,10 +121,17 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
             name,
             derived_from,
             base_address,
-            props,
+            el: p_el,
+            props: RegProps::default(),
             registers_el: p_el.child("registers"),
             interrupts,
         });
+    }
+
+    for i in 0..raw_periphs.len() {
+        let resolved_props =
+            resolve_peripheral_props(i, &raw_periphs, &name_to_idx, &device_props)?;
+        raw_periphs[i].props = resolved_props;
     }
 
     // Resolve `derivedFrom` chains cleanly and detect cycles or missing bases.
@@ -199,14 +204,17 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
 
         let mut candidates = Vec::new();
         let mut seq = 0usize;
+        let sym_index = PeriphSymIndex::build(regs_el);
         collect_registers_from_container(
             regs_el,
             0,
             "",
             "",
+            "",
             &p.props,
             &p.name,
             true,
+            &sym_index,
             &mut candidates,
             &mut seq,
         )?;
@@ -364,7 +372,7 @@ impl RegProps {
     }
 }
 
-fn resolve_access(props: &RegProps) -> MmioAccess {
+fn resolve_access_with_fields(props: &RegProps, fields_el: Option<&XmlElement>) -> MmioAccess {
     let access = props.access.as_deref().unwrap_or("read-write").trim();
     if access == "read-only" {
         MmioAccess::Ro
@@ -375,11 +383,32 @@ fn resolve_access(props: &RegProps) -> MmioAccess {
         == Some("oneToClear")
     {
         MmioAccess::W1c
+    } else if props.modified_write_values.is_none()
+        && fields_has_unanimous_w1c(fields_el)
+    {
+        MmioAccess::W1c
     } else if access == "write-only" || access == "writeOnce" {
         MmioAccess::Wo
     } else {
         MmioAccess::Rw
     }
+}
+
+fn fields_has_unanimous_w1c(fields_el: Option<&XmlElement>) -> bool {
+    let Some(fields) = fields_el else {
+        return false;
+    };
+    let mut saw_w1c = false;
+    for f in fields.children("field") {
+        if let Some(mwv) = f.child_text("modifiedWriteValues").map(str::trim) {
+            if mwv == "oneToClear" {
+                saw_w1c = true;
+            } else if !mwv.is_empty() {
+                return false;
+            }
+        }
+    }
+    saw_w1c
 }
 
 struct RawInterrupt {
@@ -391,9 +420,44 @@ struct RawPeripheral<'a> {
     name: String,
     derived_from: Option<String>,
     base_address: Option<u32>,
+    el: &'a XmlElement,
     props: RegProps,
     registers_el: Option<&'a XmlElement>,
     interrupts: Vec<RawInterrupt>,
+}
+
+fn resolve_peripheral_props(
+    start: usize,
+    periphs: &[RawPeripheral<'_>],
+    by_name: &BTreeMap<String, usize>,
+    device_props: &RegProps,
+) -> Result<RegProps, String> {
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    let mut cur = start;
+    loop {
+        if !visited.insert(cur) {
+            return Err(format!(
+                "cyclic `derivedFrom` chain resolving properties at peripheral `{}`",
+                periphs[start].name
+            ));
+        }
+        chain.push(periphs[cur].el);
+        let Some(ref target) = periphs[cur].derived_from else {
+            break;
+        };
+        cur = *by_name.get(target).ok_or_else(|| {
+            format!(
+                "peripheral `{}` has `derivedFrom=\"{target}\"`, which does not exist",
+                periphs[cur].name
+            )
+        })?;
+    }
+    let mut props = device_props.clone();
+    for el in chain.into_iter().rev() {
+        props = props.merge(el)?;
+    }
+    Ok(props)
 }
 
 #[derive(Clone)]
@@ -494,56 +558,190 @@ fn resolve_base_address(
     }
 }
 
+struct PeriphSymIndex<'a> {
+    regs: BTreeMap<String, &'a XmlElement>,
+    clusters: BTreeMap<String, &'a XmlElement>,
+}
+
+impl<'a> PeriphSymIndex<'a> {
+    fn build(container: &'a XmlElement) -> Self {
+        let mut idx = Self {
+            regs: BTreeMap::new(),
+            clusters: BTreeMap::new(),
+        };
+        idx.visit(container, "");
+        idx
+    }
+
+    fn visit(&mut self, container: &'a XmlElement, prefix: &str) {
+        for child in &container.children {
+            match child.name.as_str() {
+                "register" => {
+                    if let Some(raw_name) = child.child_text("name").map(str::trim) {
+                        let key = if prefix.is_empty() {
+                            raw_name.to_string()
+                        } else {
+                            format!("{prefix}.{raw_name}")
+                        };
+                        self.regs.entry(key).or_insert(child);
+                        let stripped = strip_dim_placeholder(raw_name);
+                        if !stripped.is_empty() && stripped != raw_name {
+                            let skey = if prefix.is_empty() {
+                                stripped
+                            } else {
+                                format!("{prefix}.{stripped}")
+                            };
+                            self.regs.entry(skey).or_insert(child);
+                        }
+                    }
+                }
+                "cluster" => {
+                    if let Some(raw_name) = child.child_text("name").map(str::trim) {
+                        let key = if prefix.is_empty() {
+                            raw_name.to_string()
+                        } else {
+                            format!("{prefix}.{raw_name}")
+                        };
+                        self.clusters.entry(key.clone()).or_insert(child);
+                        let stripped = strip_dim_placeholder(raw_name);
+                        if !stripped.is_empty() && stripped != raw_name {
+                            let skey = if prefix.is_empty() {
+                                stripped
+                            } else {
+                                format!("{prefix}.{stripped}")
+                            };
+                            self.clusters.entry(skey).or_insert(child);
+                        }
+                        self.visit(child, &key);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn resolve_derived_chain<'a>(
+    leaf: &'a XmlElement,
+    scope_prefix: &str,
+    map: &BTreeMap<String, &'a XmlElement>,
+    tag: &str,
+) -> Result<Vec<&'a XmlElement>, String> {
+    let mut chain = Vec::new();
+    let mut visited = HashSet::new();
+    let mut cur = leaf;
+    loop {
+        let ptr = (cur as *const XmlElement) as usize;
+        if !visited.insert(ptr) {
+            return Err(format!("cyclic `<{tag} derivedFrom>` chain"));
+        }
+        chain.push(cur);
+        let Some(target) = cur.attr("derivedFrom").map(str::trim).filter(|s| !s.is_empty()) else {
+            break;
+        };
+        let scoped = if scope_prefix.is_empty() {
+            None
+        } else {
+            map.get(&format!("{scope_prefix}.{target}")).copied()
+        };
+        cur = scoped.or_else(|| map.get(target).copied()).ok_or_else(|| {
+            let src_name = cur.child_text("name").unwrap_or("<unnamed>");
+            format!("<{tag}> `{src_name}` references unknown `derivedFrom=\"{target}\"`")
+        })?;
+    }
+    Ok(chain)
+}
+
 #[allow(clippy::too_many_arguments)]
-fn collect_registers_from_container(
-    container: &XmlElement,
+fn collect_registers_from_container<'a>(
+    container: &'a XmlElement,
     base_offset: u64,
     cluster_prefix: &str,
     const_cluster_prefix: &str,
+    scope_path: &str,
     parent_props: &RegProps,
     periph_name: &str,
     emit_consts: bool,
+    sym_index: &PeriphSymIndex<'a>,
     out: &mut Vec<CandidateReg>,
     seq: &mut usize,
 ) -> Result<(), String> {
-    for child in &container.children {
+    collect_container_items(
+        &container.children,
+        base_offset,
+        cluster_prefix,
+        const_cluster_prefix,
+        scope_path,
+        parent_props,
+        periph_name,
+        emit_consts,
+        sym_index,
+        out,
+        seq,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_container_items<'a, I>(
+    items: I,
+    base_offset: u64,
+    cluster_prefix: &str,
+    const_cluster_prefix: &str,
+    scope_path: &str,
+    parent_props: &RegProps,
+    periph_name: &str,
+    emit_consts: bool,
+    sym_index: &PeriphSymIndex<'a>,
+    out: &mut Vec<CandidateReg>,
+    seq: &mut usize,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = &'a XmlElement>,
+{
+    for child in items {
         match child.name.as_str() {
             "register" => {
                 if child.child("alternateRegister").is_some() {
                     continue;
                 }
-                let Some(raw_name) = child.child_text("name") else {
+                let chain = resolve_derived_chain(child, scope_path, &sym_index.regs, "register")?;
+                let first_text = |tag: &str| chain.iter().find_map(|e| e.child_text(tag));
+                let Some(raw_name) = first_text("name") else {
                     continue;
                 };
-                let Some(rel_raw) = child.child_text("addressOffset") else {
+                let Some(rel_raw) = first_text("addressOffset") else {
                     continue;
                 };
                 let rel_offset = parse_svd_u64(rel_raw, "<addressOffset>")?;
-                let props = parent_props.merge(child)?;
+                let mut props = parent_props.clone();
+                for el in chain.iter().rev() {
+                    props = props.merge(el)?;
+                }
                 let size_bits = props.size_bits.unwrap_or(32);
                 if !matches!(size_bits, 8 | 16 | 32) {
                     continue;
                 }
                 let elem_bytes = (size_bits / 8) as u64;
-                let access = resolve_access(&props);
+                let fields_el = chain.iter().find_map(|e| e.child("fields"));
+                let access = resolve_access_with_fields(&props, fields_el);
                 let Some(abs_offset) = base_offset.checked_add(rel_offset) else {
                     continue;
                 };
 
-                if let Some(dim_raw) = child.child_text("dim") {
+                if let Some(dim_raw) = first_text("dim") {
                     let dim = parse_svd_u64(dim_raw, "<dim>")? as usize;
                     if dim == 0 {
                         continue;
                     }
-                    let dim_inc = match child.child_text("dimIncrement") {
+                    let dim_inc = match first_text("dimIncrement") {
                         Some(inc_raw) => parse_svd_u64(inc_raw, "<dimIncrement>")?,
                         None => elem_bytes,
                     };
-                    let dim_index = child.child_text("dimIndex");
+                    let dim_index = first_text("dimIndex");
                     let base_reg = strip_dim_placeholder(raw_name);
                     let const_reg_name = join_prefix(const_cluster_prefix, &base_reg);
                     let reg_consts = if emit_consts {
-                        collect_register_consts(child, periph_name, &const_reg_name)?
+                        collect_fields_consts(fields_el, periph_name, &const_reg_name)?
                     } else {
                         Vec::new()
                     };
@@ -598,7 +796,7 @@ fn collect_registers_from_container(
                     let reg_ident = sanitize_reg_ident(&joined);
                     let const_reg_name = join_prefix(const_cluster_prefix, raw_name);
                     let reg_consts = if emit_consts {
-                        collect_register_consts(child, periph_name, &const_reg_name)?
+                        collect_fields_consts(fields_el, periph_name, &const_reg_name)?
                     } else {
                         Vec::new()
                     };
@@ -618,26 +816,58 @@ fn collect_registers_from_container(
                 if child.child("alternateCluster").is_some() {
                     continue;
                 }
-                let raw_name = child.child_text("name").unwrap_or("");
-                let Some(rel_raw) = child.child_text("addressOffset") else {
+                let chain =
+                    resolve_derived_chain(child, scope_path, &sym_index.clusters, "cluster")?;
+                let first_text = |tag: &str| chain.iter().find_map(|e| e.child_text(tag));
+                let raw_name = first_text("name").unwrap_or("");
+                let Some(rel_raw) = first_text("addressOffset") else {
                     continue;
                 };
                 let rel_offset = parse_svd_u64(rel_raw, "<cluster><addressOffset>")?;
-                let props = parent_props.merge(child)?;
+                let mut props = parent_props.clone();
+                for el in chain.iter().rev() {
+                    props = props.merge(el)?;
+                }
                 let Some(abs_offset) = base_offset.checked_add(rel_offset) else {
                     continue;
                 };
 
-                if let Some(dim_raw) = child.child_text("dim") {
+                // Merge child `<register>` / `<cluster>` elements from base ancestors to derived leaf,
+                // allowing derived clusters to override or append child items cleanly.
+                let mut merged_children: Vec<&'a XmlElement> = Vec::new();
+                for el in chain.iter().rev() {
+                    for sub in &el.children {
+                        if !matches!(sub.name.as_str(), "register" | "cluster") {
+                            continue;
+                        }
+                        if let Some(sub_name) = sub.child_text("name").map(str::trim) {
+                            if let Some(pos) = merged_children.iter().position(|prev| {
+                                prev.name == sub.name
+                                    && prev.child_text("name").map(str::trim) == Some(sub_name)
+                            }) {
+                                merged_children[pos] = sub;
+                                continue;
+                            }
+                        }
+                        merged_children.push(sub);
+                    }
+                }
+                let next_scope = if scope_path.is_empty() {
+                    raw_name.to_string()
+                } else {
+                    format!("{scope_path}.{raw_name}")
+                };
+
+                if let Some(dim_raw) = first_text("dim") {
                     let dim = parse_svd_u64(dim_raw, "<cluster><dim>")? as usize;
                     if dim == 0 {
                         continue;
                     }
-                    let dim_inc = match child.child_text("dimIncrement") {
+                    let dim_inc = match first_text("dimIncrement") {
                         Some(inc_raw) => parse_svd_u64(inc_raw, "<cluster><dimIncrement>")?,
                         None => 0,
                     };
-                    let indices = parse_dim_indices(dim, child.child_text("dimIndex"));
+                    let indices = parse_dim_indices(dim, first_text("dimIndex"));
                     let base_cluster = strip_dim_placeholder(raw_name);
                     let next_const_prefix = join_prefix(const_cluster_prefix, &base_cluster);
                     for (k, idx_str) in indices.iter().enumerate() {
@@ -648,14 +878,16 @@ fn collect_registers_from_container(
                         };
                         let expanded = substitute_dim_name(raw_name, idx_str, true);
                         let next_prefix = join_prefix(cluster_prefix, &expanded);
-                        collect_registers_from_container(
-                            child,
+                        collect_container_items(
+                            merged_children.iter().copied(),
                             inst_offset,
                             &next_prefix,
                             &next_const_prefix,
+                            &next_scope,
                             &props,
                             periph_name,
                             emit_consts && k == 0,
+                            sym_index,
                             out,
                             seq,
                         )?;
@@ -663,14 +895,16 @@ fn collect_registers_from_container(
                 } else {
                     let next_prefix = join_prefix(cluster_prefix, raw_name);
                     let next_const_prefix = join_prefix(const_cluster_prefix, raw_name);
-                    collect_registers_from_container(
-                        child,
+                    collect_container_items(
+                        merged_children.iter().copied(),
                         abs_offset,
                         &next_prefix,
                         &next_const_prefix,
+                        &next_scope,
                         &props,
                         periph_name,
                         emit_consts,
+                        sym_index,
                         out,
                         seq,
                     )?;
@@ -682,13 +916,13 @@ fn collect_registers_from_container(
     Ok(())
 }
 
-fn collect_register_consts(
-    reg_el: &XmlElement,
+fn collect_fields_consts(
+    fields_el: Option<&XmlElement>,
     periph_name: &str,
     reg_name: &str,
 ) -> Result<Vec<CandidateConst>, String> {
     let mut out = Vec::new();
-    let Some(fields_el) = reg_el.child("fields") else {
+    let Some(fields_el) = fields_el else {
         return Ok(out);
     };
 
@@ -720,7 +954,7 @@ fn collect_register_consts(
                 else {
                     continue;
                 };
-                if lsb + width > 32 {
+                if lsb.checked_add(width).is_none_or(|hi| hi > 32) {
                     continue;
                 }
                 let expanded_field = substitute_dim_name(raw_field_name, idx_str, true);
@@ -729,7 +963,7 @@ fn collect_register_consts(
                 }
             }
         } else {
-            if base_lsb + width > 32 {
+            if base_lsb.checked_add(width).is_none_or(|hi| hi > 32) {
                 continue;
             }
             if let Some(c) = build_const(periph_name, reg_name, raw_field_name, base_lsb, width) {
@@ -934,6 +1168,10 @@ const ZEV_KEYWORDS: &[&str] = &[
     "mmio",
     "irq",
     "state",
+    // Built-in namespaces & scalar types
+    "sys",
+    "sim",
+    "str",
     // Primitive & OS type names
     "u8",
     "u16",
@@ -1068,41 +1306,46 @@ fn make_unique_name(base: &str, used: &HashSet<String>) -> String {
 fn parse_dim_indices(dim: usize, dim_index: Option<&str>) -> Vec<String> {
     let mut out = Vec::with_capacity(dim);
     if let Some(raw) = dim_index.map(str::trim).filter(|s| !s.is_empty()) {
-        if raw.contains(',') {
-            for part in raw.split(',') {
-                let p = part.trim();
-                if !p.is_empty() {
-                    out.push(p.to_string());
-                }
+        for part in raw.split(',') {
+            if out.len() >= dim {
+                break;
             }
-        } else if let Some((lhs, rhs)) = raw.split_once('-') {
-            let l = lhs.trim();
-            let r = rhs.trim();
-            if let (Ok(start), Ok(end)) = (l.parse::<usize>(), r.parse::<usize>()) {
-                if start <= end {
-                    let take = dim.min(end - start + 1);
-                    for i in 0..take {
-                        out.push((start + i).to_string());
-                    }
-                }
-            } else if l.len() == 1 && r.len() == 1 {
-                let lb = l.as_bytes()[0];
-                let rb = r.as_bytes()[0];
-                if lb.is_ascii_alphabetic()
-                    && rb.is_ascii_alphabetic()
-                    && lb.is_ascii_uppercase() == rb.is_ascii_uppercase()
-                    && lb <= rb
-                {
-                    for b in lb..=rb {
-                        out.push((b as char).to_string());
-                        if out.len() >= dim {
-                            break;
+            let p = part.trim();
+            if p.is_empty() {
+                continue;
+            }
+            if let Some((lhs, rhs)) = p.split_once('-') {
+                let l = lhs.trim();
+                let r = rhs.trim();
+                if let (Ok(start), Ok(end)) = (l.parse::<usize>(), r.parse::<usize>()) {
+                    if start <= end {
+                        for val in start..=end {
+                            out.push(val.to_string());
+                            if out.len() >= dim {
+                                break;
+                            }
                         }
+                        continue;
+                    }
+                } else if l.len() == 1 && r.len() == 1 {
+                    let lb = l.as_bytes()[0];
+                    let rb = r.as_bytes()[0];
+                    if lb.is_ascii_alphabetic()
+                        && rb.is_ascii_alphabetic()
+                        && lb.is_ascii_uppercase() == rb.is_ascii_uppercase()
+                        && lb <= rb
+                    {
+                        for b in lb..=rb {
+                            out.push((b as char).to_string());
+                            if out.len() >= dim {
+                                break;
+                            }
+                        }
+                        continue;
                     }
                 }
             }
-        } else {
-            out.push(raw.to_string());
+            out.push(p.to_string());
         }
     }
 
@@ -1913,5 +2156,110 @@ mod tests {
 
         let missing_code = run_import_svd(&temp.dir.join("missing.svd"), Some(&out_path));
         assert_eq!(missing_code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn wave1_audit_svd_derived_w1c_fields_keywords_dims_and_checked_bits() {
+        // 1. Keywords (`sys`, `sim`, `str`), mixed dimIndex (`0-1,4-5`), `#` binary ints,
+        //    field-level `oneToClear`, and `derivedFrom` on peripherals, registers & clusters.
+        let svd = r#"<?xml version="1.0" encoding="utf-8"?>
+<device>
+  <name>AUDIT</name>
+  <size>#100000</size>
+  <peripherals>
+    <peripheral>
+      <name>sys</name>
+      <baseAddress>0x40000000</baseAddress>
+      <registers>
+        <register>
+          <name>CR1</name>
+          <addressOffset>#100</addressOffset>
+          <access>read-only</access>
+          <size>16</size>
+        </register>
+        <register derivedFrom="CR1">
+          <name>CR2</name>
+          <addressOffset>0x08</addressOffset>
+        </register>
+        <register>
+          <name>ICR</name>
+          <addressOffset>0x0C</addressOffset>
+          <fields>
+            <field>
+              <name>TXCF</name>
+              <bitOffset>0</bitOffset>
+              <bitWidth>1</bitWidth>
+              <modifiedWriteValues>oneToClear</modifiedWriteValues>
+            </field>
+          </fields>
+        </register>
+        <register>
+          <dim>4</dim>
+          <dimIncrement>8</dimIncrement>
+          <dimIndex>0-1,4-5</dimIndex>
+          <name>MIX[%s]</name>
+          <addressOffset>0x20</addressOffset>
+        </register>
+        <cluster>
+          <name>CH0</name>
+          <addressOffset>0x40</addressOffset>
+          <register>
+            <name>CTRL</name>
+            <addressOffset>0x00</addressOffset>
+            <fields>
+              <field>
+                <name>OVR</name>
+                <bitOffset>0xFFFFFFFF</bitOffset>
+                <bitWidth>1</bitWidth>
+              </field>
+              <field>
+                <name>EN</name>
+                <bitOffset>0</bitOffset>
+                <bitWidth>1</bitWidth>
+              </field>
+            </fields>
+          </register>
+        </cluster>
+        <cluster derivedFrom="CH0">
+          <name>CH1</name>
+          <addressOffset>0x50</addressOffset>
+        </cluster>
+      </registers>
+    </peripheral>
+    <peripheral derivedFrom="SYS_ALIAS">
+      <name>SYS_LEAF</name>
+      <baseAddress>0x40020000</baseAddress>
+    </peripheral>
+    <peripheral derivedFrom="sys">
+      <name>SYS_ALIAS</name>
+      <baseAddress>0x40010000</baseAddress>
+    </peripheral>
+  </peripherals>
+</device>"#;
+        let zev = svd_to_zev(svd).expect("audited SVD conversion must succeed cleanly");
+        assert!(zev.contains("pub mmio sys_ : SysRegs @ 0x4000_0000;"), "{zev}");
+        assert!(zev.contains("pub mmio SYS_ALIAS : SysRegs @ 0x4001_0000;"), "{zev}");
+        assert!(zev.contains("pub mmio SYS_LEAF : SysRegs @ 0x4002_0000;"), "{zev}");
+        assert!(zev.contains("@ro u16 cr1 @ 0x04;"), "{zev}");
+        assert!(zev.contains("@ro u16 cr2 @ 0x08;"), "{zev}");
+        assert!(zev.contains("@w1c u32 icr @ 0x0C;"), "{zev}");
+        assert!(zev.contains("@rw u32 mix_0 @ 0x20;"), "{zev}");
+        assert!(zev.contains("@rw u32 mix_1 @ 0x28;"), "{zev}");
+        assert!(zev.contains("@rw u32 mix_4 @ 0x30;"), "{zev}");
+        assert!(zev.contains("@rw u32 mix_5 @ 0x38;"), "{zev}");
+        assert!(zev.contains("@rw u32 ch0_ctrl @ 0x40;"), "{zev}");
+        assert!(zev.contains("@rw u32 ch1_ctrl @ 0x50;"), "{zev}");
+        assert!(!zev.contains("OVR"), "overflow bitfield must be skipped: {zev}");
+
+        // Generated Zev must pass full parser + sema!
+        let parsed = zev_parser::parse_str(&zev).expect("generated SVD Zev must parse");
+        zev_sema::analyze_program(&parsed).expect("generated SVD Zev must pass sema");
+
+        // Cyclic register `derivedFrom` must return Err cleanly.
+        let cyc_reg = r#"<device><name>C</name><peripherals><peripheral><name>P</name><baseAddress>0x1000</baseAddress><registers>
+          <register derivedFrom="B"><name>A</name><addressOffset>0</addressOffset></register>
+          <register derivedFrom="A"><name>B</name><addressOffset>4</addressOffset></register>
+        </registers></peripheral></peripherals></device>"#;
+        assert!(svd_to_zev(cyc_reg).is_err());
     }
 }

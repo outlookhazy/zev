@@ -169,9 +169,11 @@ impl DiagnosticKind {
             Self::InvalidDurationResolution
             | Self::InvalidControlFlow
             | Self::NonDivergingTask
-            | Self::InvalidSpawnContext
-            | Self::IrqAttachmentError
-            | Self::InvalidIsrState => "tasks",
+            | Self::InvalidSpawnContext => "tasks",
+            Self::IrqAttachmentError
+            | Self::ModuleError
+            | Self::MmioViolation => "runtime",
+            Self::InvalidIsrState => "yielding",
             Self::ReturnMismatch
             | Self::ErrorSpecMismatch
             | Self::UnhandledFallibleExpr
@@ -184,9 +186,7 @@ impl DiagnosticKind {
             | Self::ImmutableAssignment
             | Self::InvalidOperation
             | Self::UnreachableCode
-            | Self::GenericInstantiationError
-            | Self::ModuleError
-            | Self::MmioViolation => "syntax",
+            | Self::GenericInstantiationError => "syntax",
         }
     }
 

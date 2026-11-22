@@ -1812,6 +1812,10 @@ impl<'a> Monomorphizer<'a> {
                             name: name.clone(),
                             span: *span,
                         },
+                        SwitchPat::Qualified { path, span } => SwitchPat::Qualified {
+                            path: path.clone(),
+                            span: *span,
+                        },
                         SwitchPat::Literal(l, sp) => SwitchPat::Literal(l.clone(), *sp),
                         SwitchPat::Wildcard(sp) => SwitchPat::Wildcard(*sp),
                     };
