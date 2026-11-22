@@ -497,6 +497,18 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                 self.register_type(elem);
                 self.register_type(&MirType::Slice(elem.clone()));
             }
+            MirPrimKind::ByteRing { .. } => {
+                let sl = MirType::Slice(Box::new(MirType::U8));
+                self.register_type(&sl);
+                self.register_type(&MirType::Result {
+                    ok: Box::new(MirType::U8),
+                    err: None,
+                });
+                self.register_type(&MirType::Result {
+                    ok: Box::new(sl),
+                    err: None,
+                });
+            }
         }
         self.prims.insert(pk.mangle_name(), pk.clone());
     }
@@ -594,6 +606,18 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                         elem: Box::new(elem_ty.clone()),
                         cap: *cap,
                     });
+                }
+                MirPrimNonBlockingOp::ByteRingConsume { target, cap, len }
+                | MirPrimNonBlockingOp::ByteRingCommitWrite {
+                    target, cap, len, ..
+                } => {
+                    self.register_prim_target(target);
+                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                    self.register_expr(len);
+                }
+                MirPrimNonBlockingOp::ByteRingClear { target, cap } => {
+                    self.register_prim_target(target);
+                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
                 }
             },
             MirStmt::Intrinsic(intr) => match intr {
@@ -744,6 +768,21 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                         cap: *cap,
                     });
                 }
+                MirYieldKind::ByteRingWaitRead {
+                    target,
+                    cap,
+                    dst_res,
+                    ..
+                } => {
+                    self.register_prim_target(target);
+                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                    if dst_res.is_some() {
+                        self.register_type(&MirType::Result {
+                            ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+                            err: None,
+                        });
+                    }
+                }
                 MirYieldKind::CallYielding { args, .. } => {
                     for a in args {
                         self.register_expr(a);
@@ -861,6 +900,41 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                         cap: *cap,
                     });
                     self.register_type(&MirType::Slice(Box::new(elem_ty.clone())));
+                }
+                MirPrimReadOp::ByteRingPush {
+                    target,
+                    cap,
+                    src: val,
+                    ..
+                }
+                | MirPrimReadOp::ByteRingPop {
+                    target,
+                    cap,
+                    dst: val,
+                }
+                | MirPrimReadOp::ByteRingPushByte {
+                    target,
+                    cap,
+                    byte: val,
+                    ..
+                }
+                | MirPrimReadOp::ByteRingGrantWrite {
+                    target,
+                    cap,
+                    len: val,
+                } => {
+                    self.register_prim_target(target);
+                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                    self.register_expr(val);
+                }
+                MirPrimReadOp::ByteRingReadSlice { target, cap }
+                | MirPrimReadOp::ByteRingTryPopByte { target, cap }
+                | MirPrimReadOp::ByteRingLen { target, cap }
+                | MirPrimReadOp::ByteRingFreeSpace { target, cap }
+                | MirPrimReadOp::ByteRingIsEmpty { target, cap }
+                | MirPrimReadOp::ByteRingIsFull { target, cap } => {
+                    self.register_prim_target(target);
+                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
                 }
             },
             MirExprKind::MmioRead { base, index, .. } => {
@@ -1463,6 +1537,290 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                         "struct syn_{mangle}_t {{\n    SYN_DMA_ALIGN {ec} buf[{n}];\n    syn_task_t *waiter;\n    uint32_t sleep_lock_bit;\n    volatile uint16_t len;\n    volatile bool leased;\n    volatile bool ready;\n}};\n\nstatic SYN_UNUSED inline bool syn_{mangle}_is_ready(void *obj) {{\n    const syn_{mangle}_t *l = (const syn_{mangle}_t *)obj;\n    return l != NULL && l->ready;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_set_active(syn_{mangle}_t *l, bool active) {{\n    l->leased = active;\n    if (active) {{ syn_sleep_lock_dma(l->sleep_lock_bit); }}\n    else {{ syn_sleep_unlock_dma(l->sleep_lock_bit); }}\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_complete(syn_{mangle}_t *l) {{\n    syn_enter_critical();\n    if (l->len == 0U) {{ l->len = {n}U; }}\n    l->ready = true;\n    syn_task_t *w = l->waiter;\n    l->waiter = NULL;\n    if (w != NULL) {{ syn_task_wake_from_isr_or_task(w, SYN_NO_BOOST); }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *l, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!l->ready) {{ syn_exit_critical(); return false; }}\n    uint16_t rlen = l->len;\n    l->ready = false;\n    l->len = 0U;\n    syn_exit_critical();\n    out_slice->ptr = &l->buf[0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *l, syn_task_t *task) {{\n    syn_enter_critical();\n    if (l->ready) {{ task->state = SYN_TASK_READY; task->sched_flags |= SYN_FLAG_MORE; syn_exit_critical(); return; }}\n    l->waiter = task;\n    task->wait_check = syn_{mangle}_is_ready;\n    task->wait_obj = l;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
                     );
                 }
+                MirPrimKind::ByteRing { cap } => {
+                    let n = (*cap).max(1);
+                    let res_u8_c = self.c_type(&MirType::Result {
+                        ok: Box::new(MirType::U8),
+                        err: None,
+                    });
+                    let res_slice_c = self.c_type(&MirType::Result {
+                        ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+                        err: None,
+                    });
+                    let _ = writeln!(
+                        self.out,
+                        r#"struct syn_{mangle}_t {{
+    uint8_t buf[{n}];
+    syn_task_t *rx_waiter;
+    uint32_t head;
+    uint32_t tail;
+    volatile uint32_t count;
+    uint32_t split_end;
+    uint32_t grant_off;
+    uint32_t grant_cap;
+    uint8_t boost_enc;
+}};
+
+static SYN_UNUSED inline uint32_t syn_{mangle}_seg1_nolock(const syn_{mangle}_t *r) {{
+    if (r->count == 0U) {{ return 0U; }}
+    if (r->split_end > 0U) {{ return r->split_end - r->head; }}
+    if (r->head < r->tail) {{ return r->tail - r->head; }}
+    return {n}U - r->head;
+}}
+static SYN_UNUSED inline uint32_t syn_{mangle}_free_space_nolock(const syn_{mangle}_t *r) {{
+    return (r->split_end > 0U) ? (r->head - r->tail) : ({n}U - r->count);
+}}
+static SYN_UNUSED inline void syn_{mangle}_advance_nolock(syn_{mangle}_t *r, uint32_t req) {{
+    uint32_t rem = (req < r->count) ? req : r->count;
+    if (rem == 0U) {{ return; }}
+    uint32_t s1 = syn_{mangle}_seg1_nolock(r);
+    if (rem == r->count) {{
+        r->head = (r->grant_cap > 0U) ? r->tail : 0U;
+        if (r->grant_cap == 0U) {{ r->tail = 0U; }}
+        r->count = 0U;
+        r->split_end = 0U;
+    }} else if (rem < s1) {{
+        r->head += rem;
+        r->count -= rem;
+    }} else {{
+        r->head = rem - s1;
+        r->count -= rem;
+        r->split_end = 0U;
+    }}
+}}
+static SYN_UNUSED inline void syn_{mangle}_wake_nolock(syn_{mangle}_t *r, uint8_t boost_prio) {{
+    if (boost_prio < SYN_PRIO_LEVELS) {{
+        uint8_t enc = (uint8_t)(boost_prio + 1U);
+        if (r->boost_enc == 0U || enc < r->boost_enc) {{ r->boost_enc = enc; }}
+    }}
+    syn_task_t *rw = r->rx_waiter;
+    r->rx_waiter = NULL;
+    if (rw != NULL) {{ syn_task_wake_from_isr_or_task(rw, boost_prio); }}
+}}
+static SYN_UNUSED inline bool syn_{mangle}_rx_ready(void *obj) {{
+    const syn_{mangle}_t *r = (const syn_{mangle}_t *)obj;
+    return r != NULL && r->count > 0U;
+}}
+static SYN_UNUSED inline bool syn_{mangle}_push_byte(syn_{mangle}_t *r, uint8_t b, uint8_t boost_prio) {{
+    syn_enter_critical();
+    r->grant_cap = 0U;
+    if (syn_{mangle}_free_space_nolock(r) == 0U) {{
+        syn_exit_critical();
+        return false;
+    }}
+    r->buf[r->tail] = b;
+    if (r->split_end > 0U) {{
+        r->tail += 1U;
+    }} else {{
+        uint32_t nt = r->tail + 1U;
+        r->tail = (nt >= {n}U) ? 0U : nt;
+    }}
+    r->count += 1U;
+    syn_{mangle}_wake_nolock(r, boost_prio);
+    syn_exit_critical();
+    return true;
+}}
+static SYN_UNUSED inline size_t syn_{mangle}_push(syn_{mangle}_t *r, syn_slice_u8 src, uint8_t boost_prio) {{
+    syn_enter_critical();
+    r->grant_cap = 0U;
+    uint32_t avail = syn_{mangle}_free_space_nolock(r);
+    uint32_t nw = (src.len < (size_t)avail) ? (uint32_t)src.len : avail;
+    if (src.ptr == NULL) {{ nw = 0U; }}
+    for (uint32_t i = 0U; i < nw; i++) {{
+        r->buf[r->tail] = src.ptr[i];
+        if (r->split_end > 0U) {{
+            r->tail += 1U;
+        }} else {{
+            uint32_t nt = r->tail + 1U;
+            r->tail = (nt >= {n}U) ? 0U : nt;
+        }}
+    }}
+    r->count += nw;
+    if (nw > 0U) {{ syn_{mangle}_wake_nolock(r, boost_prio); }}
+    syn_exit_critical();
+    return (size_t)nw;
+}}
+static SYN_UNUSED inline {res_slice_c} syn_{mangle}_grant_write(syn_{mangle}_t *r, size_t req_sz) {{
+    syn_enter_critical();
+    if (req_sz == 0U) {{
+        r->grant_off = r->tail;
+        r->grant_cap = 0U;
+        syn_exit_critical();
+        return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[0], .len = 0U }} }};
+    }}
+    if (req_sz > {n}U) {{
+        syn_exit_critical();
+        return ({res_slice_c}){{ .is_err = true }};
+    }}
+    uint32_t req = (uint32_t)req_sz;
+    if (r->count == 0U) {{
+        r->head = 0U;
+        r->tail = 0U;
+        r->split_end = 0U;
+        r->grant_off = 0U;
+        r->grant_cap = req;
+        syn_exit_critical();
+        return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[0], .len = req_sz }} }};
+    }}
+    if (r->split_end == 0U && r->head < r->tail) {{
+        if (req <= ({n}U - r->tail)) {{
+            r->grant_off = r->tail;
+            r->grant_cap = req;
+            uint32_t off = r->grant_off;
+            syn_exit_critical();
+            return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[off], .len = req_sz }} }};
+        }} else if (req <= r->head) {{
+            r->grant_off = 0U;
+            r->grant_cap = req;
+            syn_exit_critical();
+            return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[0], .len = req_sz }} }};
+        }} else {{
+            syn_exit_critical();
+            return ({res_slice_c}){{ .is_err = true }};
+        }}
+    }} else {{
+        uint32_t gap = (r->split_end > 0U || r->head > r->tail) ? (r->head - r->tail) : 0U;
+        if (req <= gap) {{
+            r->grant_off = r->tail;
+            r->grant_cap = req;
+            uint32_t off = r->grant_off;
+            syn_exit_critical();
+            return ({res_slice_c}){{ .is_err = false, .val = (syn_slice_u8){{ .ptr = &r->buf[off], .len = req_sz }} }};
+        }} else {{
+            syn_exit_critical();
+            return ({res_slice_c}){{ .is_err = true }};
+        }}
+    }}
+}}
+static SYN_UNUSED inline void syn_{mangle}_commit_write(syn_{mangle}_t *r, size_t req_sz, uint8_t boost_prio) {{
+    syn_enter_critical();
+    uint32_t nw = (req_sz < (size_t)r->grant_cap) ? (uint32_t)req_sz : r->grant_cap;
+    r->grant_cap = 0U;
+    if (nw == 0U) {{
+        syn_exit_critical();
+        return;
+    }}
+    if (r->grant_off == 0U && r->tail > 0U && r->split_end == 0U) {{
+        if (r->count == 0U) {{
+            r->head = 0U;
+            r->tail = nw;
+            r->count = nw;
+        }} else {{
+            r->split_end = r->tail;
+            r->tail = nw;
+            r->count += nw;
+        }}
+    }} else {{
+        uint32_t nt = r->tail + nw;
+        r->tail = (r->split_end == 0U && nt >= {n}U) ? 0U : nt;
+        r->count += nw;
+    }}
+    syn_{mangle}_wake_nolock(r, boost_prio);
+    syn_exit_critical();
+}}
+static SYN_UNUSED inline syn_slice_u8 syn_{mangle}_read_slice(syn_{mangle}_t *r) {{
+    syn_enter_critical();
+    uint32_t s1 = syn_{mangle}_seg1_nolock(r);
+    uint8_t *p = (s1 > 0U) ? &r->buf[r->head] : &r->buf[0];
+    syn_exit_critical();
+    return (syn_slice_u8){{ .ptr = p, .len = (size_t)s1 }};
+}}
+static SYN_UNUSED inline bool syn_{mangle}_poll_read(syn_{mangle}_t *r, syn_task_t *task, syn_slice_u8 *out_slice) {{
+    syn_enter_critical();
+    if (r->count == 0U) {{
+        syn_exit_critical();
+        return false;
+    }}
+    uint32_t s1 = syn_{mangle}_seg1_nolock(r);
+    out_slice->ptr = &r->buf[r->head];
+    out_slice->len = (size_t)s1;
+    if (r->rx_waiter == task) {{ r->rx_waiter = NULL; }}
+    uint8_t enc = r->boost_enc;
+    r->boost_enc = 0U;
+    syn_exit_critical();
+    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
+    return true;
+}}
+static SYN_UNUSED inline void syn_{mangle}_consume(syn_{mangle}_t *r, size_t req_sz) {{
+    syn_enter_critical();
+    uint32_t req = (req_sz > (size_t)r->count) ? r->count : (uint32_t)req_sz;
+    syn_{mangle}_advance_nolock(r, req);
+    syn_exit_critical();
+}}
+static SYN_UNUSED inline size_t syn_{mangle}_pop(syn_{mangle}_t *r, syn_slice_u8 dst, syn_task_t *task) {{
+    syn_enter_critical();
+    uint32_t rem = (dst.len < (size_t)r->count) ? (uint32_t)dst.len : r->count;
+    if (rem > 0U && dst.ptr != NULL) {{
+        uint32_t s1 = syn_{mangle}_seg1_nolock(r);
+        uint32_t c1 = (rem < s1) ? rem : s1;
+        for (uint32_t i = 0U; i < c1; i++) {{ dst.ptr[i] = r->buf[r->head + i]; }}
+        uint32_t c2 = rem - c1;
+        for (uint32_t i = 0U; i < c2; i++) {{ dst.ptr[c1 + i] = r->buf[i]; }}
+        syn_{mangle}_advance_nolock(r, rem);
+    }} else {{
+        rem = 0U;
+    }}
+    uint8_t enc = (rem > 0U) ? r->boost_enc : 0U;
+    if (rem > 0U) {{ r->boost_enc = 0U; }}
+    syn_exit_critical();
+    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
+    return (size_t)rem;
+}}
+static SYN_UNUSED inline {res_u8_c} syn_{mangle}_try_pop_byte(syn_{mangle}_t *r, syn_task_t *task) {{
+    syn_enter_critical();
+    if (r->count == 0U) {{
+        syn_exit_critical();
+        return ({res_u8_c}){{ .is_err = true }};
+    }}
+    uint8_t b = r->buf[r->head];
+    syn_{mangle}_advance_nolock(r, 1U);
+    uint8_t enc = r->boost_enc;
+    r->boost_enc = 0U;
+    syn_exit_critical();
+    if (task != NULL && enc != 0U) {{ syn_task_apply_boost(task, (uint8_t)(enc - 1U)); }}
+    return ({res_u8_c}){{ .is_err = false, .val = b }};
+}}
+static SYN_UNUSED inline void syn_{mangle}_clear(syn_{mangle}_t *r) {{
+    syn_enter_critical();
+    r->head = 0U;
+    r->tail = 0U;
+    r->count = 0U;
+    r->split_end = 0U;
+    r->grant_off = 0U;
+    r->grant_cap = 0U;
+    r->boost_enc = 0U;
+    syn_exit_critical();
+}}
+static SYN_UNUSED inline size_t syn_{mangle}_free_space(syn_{mangle}_t *r) {{
+    syn_enter_critical();
+    uint32_t fs = syn_{mangle}_free_space_nolock(r);
+    syn_exit_critical();
+    return (size_t)fs;
+}}
+static SYN_UNUSED inline void syn_{mangle}_arm_rx(syn_{mangle}_t *r, syn_task_t *task, bool has_to, uint32_t dl) {{
+    syn_enter_critical();
+    if (r->count > 0U) {{
+        task->state = SYN_TASK_READY;
+        task->sched_flags |= SYN_FLAG_MORE;
+        syn_exit_critical();
+        return;
+    }}
+    r->rx_waiter = task;
+    task->wait_check = syn_{mangle}_rx_ready;
+    task->wait_obj = r;
+    task->has_deadline = has_to;
+    task->delay_until = dl;
+    task->state = SYN_TASK_BLOCKED;
+    syn_exit_critical();
+}}
+static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const syn_task_t *task) {{
+    syn_enter_critical();
+    if (r->rx_waiter == task) {{ r->rx_waiter = NULL; }}
+    syn_exit_critical();
+}}
+"#
+                    );
+                }
             }
         }
     }
@@ -1554,6 +1912,12 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                         let _ = writeln!(
                             self.out,
                             "static SYN_UNUSED {dma_attr}{pt} {pname} = {{ .rx_waiter = NULL, .tx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U }};"
+                        );
+                    }
+                    MirPrimKind::ByteRing { .. } => {
+                        let _ = writeln!(
+                            self.out,
+                            "static SYN_UNUSED {dma_attr}{pt} {pname} = {{ .rx_waiter = NULL, .head = 0U, .tail = 0U, .count = 0U, .split_end = 0U, .grant_off = 0U, .grant_cap = 0U, .boost_enc = 0U }};"
                         );
                     }
                 }
@@ -2339,6 +2703,69 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     "        _f->_pc = {p}U;\n        return SYN_STEP_IDLE;\n    }}"
                 );
             }
+            MirYieldKind::ByteRingWaitRead {
+                target,
+                cap,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
+                poll_bb,
+                resume_bb,
+            } => {
+                let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                let ptr = self.fmt_prim_ptr(target, vars);
+                let p = poll_bb.0;
+                let r = resume_bb.0;
+
+                self.out.push_str("    {\n");
+                self.out.push_str("        syn_slice_u8 _ring_chunk;\n");
+                let _ = writeln!(
+                    self.out,
+                    "        if (syn_{mangle}_poll_read({ptr}, _task, &_ring_chunk)) {{"
+                );
+                self.out.push_str("            syn_task_clear_wait(_task);\n");
+                if let Some(dv) = dst_val {
+                    let _ = writeln!(self.out, "            {} = _ring_chunk;", self.var_ref(*dv, vars));
+                }
+                if let Some(dr) = dst_res {
+                    let rc = self.c_type(&vars[dr.0].ty);
+                    let _ = writeln!(
+                        self.out,
+                        "            {} = ({rc}){{ .is_err = false, .val = _ring_chunk }};",
+                        self.var_ref(*dr, vars)
+                    );
+                }
+                let _ = writeln!(self.out, "            goto _bb{r};\n        }}");
+
+                if let Some(tv) = timeout_deadline_var {
+                    let dl = self.var_ref(*tv, vars);
+                    let _ = writeln!(
+                        self.out,
+                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_{mangle}_cancel_rx({ptr}, _task);\n            syn_task_clear_wait(_task);"
+                    );
+                    if let Some(dr) = dst_res {
+                        let rc = self.c_type(&vars[dr.0].ty);
+                        let _ = writeln!(
+                            self.out,
+                            "            {} = ({rc}){{ .is_err = true }};",
+                            self.var_ref(*dr, vars)
+                        );
+                    }
+                    let _ = writeln!(
+                        self.out,
+                        "            goto _bb{r};\n        }}\n        syn_{mangle}_arm_rx({ptr}, _task, true, {dl});"
+                    );
+                } else {
+                    let _ = writeln!(
+                        self.out,
+                        "        syn_{mangle}_arm_rx({ptr}, _task, false, 0U);"
+                    );
+                }
+                let _ = writeln!(
+                    self.out,
+                    "        _f->_pc = {p}U;\n        return SYN_STEP_IDLE;\n    }}"
+                );
+            }
             MirYieldKind::InboxSend {
                 target,
                 elem_ty,
@@ -2978,6 +3405,32 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 let ptr = self.fmt_prim_ptr(target, vars);
                 let _ = writeln!(self.out, "{pad}syn_{mangle}_set_active({ptr}, {active});");
             }
+            MirPrimNonBlockingOp::ByteRingConsume { target, cap, len } => {
+                let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                let ptr = self.fmt_prim_ptr(target, vars);
+                let l = self.fmt_expr(len, vars);
+                let _ = writeln!(self.out, "{pad}syn_{mangle}_consume({ptr}, (size_t)({l}));");
+            }
+            MirPrimNonBlockingOp::ByteRingCommitWrite {
+                target,
+                cap,
+                len,
+                boost,
+            } => {
+                let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                let ptr = self.fmt_prim_ptr(target, vars);
+                let l = self.fmt_expr(len, vars);
+                let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                let _ = writeln!(
+                    self.out,
+                    "{pad}syn_{mangle}_commit_write({ptr}, (size_t)({l}), {b});"
+                );
+            }
+            MirPrimNonBlockingOp::ByteRingClear { target, cap } => {
+                let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                let ptr = self.fmt_prim_ptr(target, vars);
+                let _ = writeln!(self.out, "{pad}syn_{mangle}_clear({ptr});");
+            }
         }
     }
 
@@ -3151,7 +3604,15 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     "false".to_string()
                 }
             }
-            MirExprKind::StringLit(s) => escape_c_string(s),
+            MirExprKind::StringLit(s) => {
+                if matches!(expr.ty, MirType::Slice(_)) {
+                    let lit = escape_c_string(s);
+                    let slen = zev_mir::decoded_string_byte_len(s);
+                    format!("((syn_slice_u8){{ .ptr = (uint8_t *)({lit}), .len = (size_t){slen}U }})")
+                } else {
+                    escape_c_string(s)
+                }
+            }
             MirExprKind::TicksLit(t) => format!("((uint32_t){t}U)"),
             MirExprKind::EnumVariant { enum_name, variant } => {
                 format!("syn_{enum_name}_{variant}")
@@ -3431,6 +3892,76 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     }
                     .mangle_name();
                     format!("syn_{mangle}_dma_buf({})", self.fmt_prim_ptr(target, vars))
+                }
+                MirPrimReadOp::ByteRingPush {
+                    target,
+                    cap,
+                    src,
+                    boost,
+                } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    let ptr = self.fmt_prim_ptr(target, vars);
+                    let s = self.fmt_expr(src, vars);
+                    let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                    format!("syn_{mangle}_push({ptr}, {s}, {b})")
+                }
+                MirPrimReadOp::ByteRingPushByte {
+                    target,
+                    cap,
+                    byte,
+                    boost,
+                } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    let ptr = self.fmt_prim_ptr(target, vars);
+                    let by = self.fmt_expr(byte, vars);
+                    let b = boost.map_or("SYN_NO_BOOST", |p| p.c_const_name());
+                    format!("syn_{mangle}_push_byte({ptr}, (uint8_t)({by}), {b})")
+                }
+                MirPrimReadOp::ByteRingGrantWrite { target, cap, len } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    let ptr = self.fmt_prim_ptr(target, vars);
+                    let l = self.fmt_expr(len, vars);
+                    format!("syn_{mangle}_grant_write({ptr}, (size_t)({l}))")
+                }
+                MirPrimReadOp::ByteRingReadSlice { target, cap } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    format!(
+                        "syn_{mangle}_read_slice({})",
+                        self.fmt_prim_ptr(target, vars)
+                    )
+                }
+                MirPrimReadOp::ByteRingPop { target, cap, dst } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    let ptr = self.fmt_prim_ptr(target, vars);
+                    let d = self.fmt_expr(dst, vars);
+                    format!("syn_{mangle}_pop({ptr}, {d}, g_syn_sched.running)")
+                }
+                MirPrimReadOp::ByteRingTryPopByte { target, cap } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    format!(
+                        "syn_{mangle}_try_pop_byte({}, g_syn_sched.running)",
+                        self.fmt_prim_ptr(target, vars)
+                    )
+                }
+                MirPrimReadOp::ByteRingLen { target, .. } => {
+                    format!("((size_t)(({})->count))", self.fmt_prim_ptr(target, vars))
+                }
+                MirPrimReadOp::ByteRingFreeSpace { target, cap } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    format!(
+                        "syn_{mangle}_free_space({})",
+                        self.fmt_prim_ptr(target, vars)
+                    )
+                }
+                MirPrimReadOp::ByteRingIsEmpty { target, .. } => {
+                    format!("((({})->count) == 0U)", self.fmt_prim_ptr(target, vars))
+                }
+                MirPrimReadOp::ByteRingIsFull { target, cap } => {
+                    let mangle = MirPrimKind::ByteRing { cap: *cap }.mangle_name();
+                    format!(
+                        "(syn_{mangle}_free_space({}) == 0U)",
+                        self.fmt_prim_ptr(target, vars)
+                    )
                 }
             },
             MirExprKind::CallDirect {

@@ -4511,4 +4511,82 @@ fn main() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn byte_ring_methods_and_compile_time_lease_invalidation_e0011() {
+    // 1. Multiple `read_slice()` calls and local `ByteReader` structs stay valid BEFORE `consume()`,
+    //    and `grant_write()` lease stays independent from `read_slice()` lease!
+    let good = r#"
+struct ViewWrap { []u8 s; }
+byte_ring<64> rx;
+
+fn check_ok() {
+    []u8 a = rx.read_slice();
+    []u8 b = rx.read_slice();
+    ViewWrap w = ViewWrap { s: a };
+    []u8 wr = rx.grant_write(4) catch { return; };
+    wr[0] = b[0] + w.s[0];
+    rx.commit_write(1);
+    rx.consume(b.len);
+}
+
+fn main() {
+    check_ok();
+}
+"#;
+    let prog_good = zev_parser::parse_str(good).expect("parse good byte_ring");
+    analyze(&[prog_good]).expect("valid byte_ring usage before consume/commit must pass");
+
+    // 2. Reading a `read_slice()` after `consume()`, a `wait_read()` slice after `pop()`,
+    //    or a `grant_write()` slice after `commit_write()` / second `grant_write()` -> E0011 (`StaleDmaLease`)!
+    let bad = r#"
+struct ViewWrap { []u8 s; }
+byte_ring<64> rx;
+
+task reader(*byte_ring<64> ring) {
+    loop {
+        []u8 chunk = ring.wait_read();
+        ViewWrap w = ViewWrap { s: chunk };
+        u8 tmp[4];
+        usize n = ring.pop(tmp);
+        u8 stale_after_pop = w.s[0];
+    }
+}
+
+fn bad_seqs() {
+    []u8 s1 = rx.read_slice();
+    rx.consume(1);
+    u8 stale1 = s1[0];
+
+    []u8 g1 = rx.grant_write(4) catch { return; };
+    rx.commit_write(2);
+    u8 stale_g1 = g1[0];
+
+    []u8 g2 = rx.grant_write(4) catch { return; };
+    []u8 g3 = rx.grant_write(2) catch { return; };
+    g2[0] = 1;
+}
+
+fn main() {
+    spawn reader(&rx) @normal;
+    bad_seqs();
+}
+"#;
+    let prog_bad = zev_parser::parse_str(bad).expect("parse bad byte_ring");
+    let diags = analyze(&[prog_bad]).expect_err("stale byte_ring slices must be rejected");
+    let stale_diags: Vec<_> = diags
+        .iter()
+        .filter(|d| d.kind == DiagnosticKind::StaleDmaLease)
+        .collect();
+    assert_eq!(
+        stale_diags.len(),
+        4,
+        "expected 4 E0011 StaleDmaLease errors (after pop, consume, commit_write, grant_write), got:\n{}",
+        diags
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
 

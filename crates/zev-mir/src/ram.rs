@@ -614,6 +614,23 @@ impl<'a> LayoutCtx<'a> {
                     false,
                 )
             }
+            MirPrimKind::ByteRing { cap } => {
+                // `{ uint8_t buf[N]; syn_task_t *rx_waiter; uint32_t head, tail, count, split_end, grant_off, grant_cap; uint8_t boost_prio; }`
+                self.struct_layout(
+                    &[
+                        SizeAlign::new(*cap, 1),
+                        SizeAlign::new(ptr, ptr),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(1, 1),
+                    ],
+                    false,
+                )
+            }
         };
 
         if dma_safe {

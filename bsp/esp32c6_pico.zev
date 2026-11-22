@@ -75,3 +75,21 @@ pub fn ws2812_rgb(u8 r, u8 g, u8 b) {
         }
     }
 }
+
+pub fn enable_usb_rx_irq() {
+    // Enable SERIAL_OUT_RECV_PKT_INT (bit 2) so host CDC bytes trigger IRQ_USB_DEVICE cleanly.
+    hw.USB_DEVICE.int_clr = 4;
+    hw.USB_DEVICE.int_ena = hw.USB_DEVICE.int_ena | 4;
+}
+
+pub bool usb_rx_avail() {
+    return (hw.USB_DEVICE.ep1_conf & 4) != 0;
+}
+
+pub u8 usb_rx_read_byte() {
+    return (hw.USB_DEVICE.ep1 & 0xFF) as u8;
+}
+
+pub fn clear_usb_rx_irq() {
+    hw.USB_DEVICE.int_clr = 4;
+}

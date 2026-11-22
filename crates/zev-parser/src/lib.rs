@@ -2086,4 +2086,40 @@ fn main() {
             panic!("expected Switch stmt");
         }
     }
+
+    #[test]
+    fn parses_byte_ring_primitive_and_ptr() {
+        let src = r#"
+byte_ring<64> usb_rx;
+
+isr usb_isr(*byte_ring<64> rx) {
+    rx.push_byte(65, boost: @high);
+}
+
+task worker(*byte_ring<64> rx) {
+    loop {
+        []u8 chunk = rx.wait_read();
+        rx.consume(chunk.len);
+    }
+}
+"#;
+        let prog = parse_str(src).expect("byte_ring<64> and *byte_ring<64> must parse");
+        match &prog.items[0].kind {
+            ItemKind::OsPrimitive(os) => {
+                assert_eq!(os.name.as_str(), "usb_rx");
+                assert_eq!(os.ty, OsPrimitiveType::ByteRing { cap: 64 });
+            }
+            other => panic!("expected OsPrimitive(ByteRing), got {other:?}"),
+        }
+        match &prog.items[1].kind {
+            ItemKind::Isr(isr) => {
+                assert!(matches!(
+                    &isr.params[0].ty.kind,
+                    TypeKind::Ptr(inner)
+                        if matches!(inner.kind, TypeKind::OsPrimitive(OsPrimitiveType::ByteRing { cap: 64 }))
+                ));
+            }
+            other => panic!("expected Isr, got {other:?}"),
+        }
+    }
 }

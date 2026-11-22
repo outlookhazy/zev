@@ -85,3 +85,4 @@ pub const u8 BIT_PB5_LED  = 1 << 5; // Digital pin 13 (onboard L LED)
 pub const u8 BIT_PD2_IN   = 1 << 2; // Digital pin 2 (PCINT18 / INT0)
 pub const u8 BIT_OCF1A    = 1 << 1; // TIFR1 / TIMSK1 Timer1 Compare A
 pub const u8 BIT_PCIE0    = 1 << 0; // PCICR / PCIFR Pin-Change bank 0 (PORTB)
+pub const u8 BIT_RXCIE0   = 1 << 7; // UCSR0B USART0 RX Complete Interrupt Enable

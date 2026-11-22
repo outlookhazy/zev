@@ -246,6 +246,7 @@ pub enum MirPrimKind {
     Inbox { elem: Box<MirType>, cap: usize },
     PingPong { elem: Box<MirType>, cap: usize },
     Lease { elem: Box<MirType>, cap: usize },
+    ByteRing { cap: usize },
 }
 
 impl MirPrimKind {
@@ -256,6 +257,7 @@ impl MirPrimKind {
             MirPrimKind::Inbox { elem, cap } => format!("inbox_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::PingPong { elem, cap } => format!("pp_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::Lease { elem, cap } => format!("lease_{}_{}", elem.mangle_name(), cap),
+            MirPrimKind::ByteRing { cap } => format!("byte_ring_{cap}"),
         }
     }
 
@@ -268,6 +270,7 @@ impl MirPrimKind {
                 format!("ping_pong<{}, {cap}>", elem.display_name())
             }
             MirPrimKind::Lease { elem, cap } => format!("lease<{}, {cap}>", elem.display_name()),
+            MirPrimKind::ByteRing { cap } => format!("byte_ring<{cap}>"),
         }
     }
 
@@ -650,6 +653,21 @@ pub enum MirPrimNonBlockingOp {
         cap: usize,
         active: bool,
     },
+    ByteRingConsume {
+        target: MirPrimTarget,
+        cap: usize,
+        len: MirExpr,
+    },
+    ByteRingCommitWrite {
+        target: MirPrimTarget,
+        cap: usize,
+        len: MirExpr,
+        boost: Option<MirPriority>,
+    },
+    ByteRingClear {
+        target: MirPrimTarget,
+        cap: usize,
+    },
 }
 
 /// Built-in system, hardware SVD, and simulation intrinsics.
@@ -754,6 +772,16 @@ pub enum MirYieldKind {
         poll_bb: BlockId,
         resume_bb: BlockId,
     },
+    /// Blocking receive/view wait on `byte_ring<N>`, optionally bounded by `timeout_deadline_var`.
+    ByteRingWaitRead {
+        target: MirPrimTarget,
+        cap: usize,
+        timeout_deadline_var: Option<VarId>,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+        poll_bb: BlockId,
+        resume_bb: BlockId,
+    },
     /// Initialize and invoke a yielding child function via `union _child.<slot_name>`.
     CallYielding {
         callee: String,
@@ -831,6 +859,9 @@ impl MirTerminator {
                 }
                 | MirYieldKind::LeaseWaitChunk {
                     poll_bb, resume_bb, ..
+                }
+                | MirYieldKind::ByteRingWaitRead {
+                    poll_bb, resume_bb, ..
                 } => vec![*poll_bb, *resume_bb],
                 MirYieldKind::CallYielding { poll_bb, .. } => vec![*poll_bb],
                 MirYieldKind::PollChild {
@@ -852,6 +883,7 @@ impl MirTerminator {
                 | MirYieldKind::SignalWait { poll_bb, .. }
                 | MirYieldKind::PingPongWaitChunk { poll_bb, .. }
                 | MirYieldKind::LeaseWaitChunk { poll_bb, .. }
+                | MirYieldKind::ByteRingWaitRead { poll_bb, .. }
                 | MirYieldKind::PollChild { poll_bb, .. } => vec![*poll_bb],
                 MirYieldKind::CallYielding { .. } => vec![],
             },
@@ -1022,6 +1054,52 @@ pub enum MirPrimReadOp {
     PingPongDmaBuf {
         target: MirPrimTarget,
         elem_ty: MirType,
+        cap: usize,
+    },
+    ByteRingPush {
+        target: MirPrimTarget,
+        cap: usize,
+        src: Box<MirExpr>,
+        boost: Option<MirPriority>,
+    },
+    ByteRingPushByte {
+        target: MirPrimTarget,
+        cap: usize,
+        byte: Box<MirExpr>,
+        boost: Option<MirPriority>,
+    },
+    ByteRingGrantWrite {
+        target: MirPrimTarget,
+        cap: usize,
+        len: Box<MirExpr>,
+    },
+    ByteRingReadSlice {
+        target: MirPrimTarget,
+        cap: usize,
+    },
+    ByteRingPop {
+        target: MirPrimTarget,
+        cap: usize,
+        dst: Box<MirExpr>,
+    },
+    ByteRingTryPopByte {
+        target: MirPrimTarget,
+        cap: usize,
+    },
+    ByteRingLen {
+        target: MirPrimTarget,
+        cap: usize,
+    },
+    ByteRingFreeSpace {
+        target: MirPrimTarget,
+        cap: usize,
+    },
+    ByteRingIsEmpty {
+        target: MirPrimTarget,
+        cap: usize,
+    },
+    ByteRingIsFull {
+        target: MirPrimTarget,
         cap: usize,
     },
 }

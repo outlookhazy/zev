@@ -3561,6 +3561,7 @@ fn main() {
             "__syn_avr_systick_isr",
             "__syn_avr_vec_3",
             "__syn_avr_vec_11",
+            "__syn_avr_vec_18",
         ] {
             assert!(
                 img.elf.audit.defined_symbols.iter().any(|s| s == req_sym),
@@ -3632,5 +3633,106 @@ fn main() {
                 "expected descriptive validation error for vector {bad_num}"
             );
         }
+    }
+
+    #[test]
+    fn byte_ring_isr_push_bipbuffer_and_wait_read_in_qemu() {
+        let src = r#"
+byte_ring<16> uart_rx;
+signal done_sig;
+irq IRQ_EXTI4 = 4;
+
+isr uart_isr(*byte_ring<16> rx) {
+    state u8 byte_seq = 65;
+    rx.push_byte(byte_seq, boost: @critical);
+    byte_seq += 1;
+}
+
+task parser_task(*byte_ring<16> rx, *signal done) {
+    u32 got_bytes = 0;
+    loop {
+        []u8 chunk = rx.wait_read();
+        usize n = chunk.len;
+        if (n > 0) {
+            u32 prio = sys.current_prio();
+            u8 first = chunk[0];
+            println(f"RX len={n} first={first} prio={prio}");
+            got_bytes += n as u32;
+            rx.consume(n);
+        }
+        if (got_bytes >= 11) {
+            done.notify();
+        }
+    }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    IRQ_EXTI4.attach(uart_isr(&uart_rx));
+
+    // 1. Wrap-around + BipBuffer early wrap in pure LLVM IR
+    assert(uart_rx.push("0123456789AB") == 12);
+    u8 pre[8];
+    assert(uart_rx.pop(pre) == 8);
+    assert(pre[0] == '0' && pre[7] == '7');
+
+    // Back free=4 (12..16), front free=8 (0..8) -> grant_write(6) wraps to index 0!
+    []u8 wr = uart_rx.grant_write(6) catch {
+        sys.exit(1);
+    };
+    wr[0] = 'X';
+    wr[1] = 'Y';
+    wr[2] = 'Z';
+    uart_rx.commit_write(3);
+
+    u8 tail_a[4];
+    assert(uart_rx.pop(tail_a) == 4);
+    assert(tail_a[0] == '8' && tail_a[3] == 'B');
+
+    assert((uart_rx.try_pop_byte() or 0) == 'X');
+    assert((uart_rx.try_pop_byte() or 0) == 'Y');
+    assert((uart_rx.try_pop_byte() or 0) == 'Z');
+    assert(uart_rx.is_empty());
+
+    // 2. Spawn parser_task and drive it from NVIC ISR + slice push
+    spawn parser_task(&uart_rx, &done_sig) @low;
+    set_priority(@low);
+    sys.pend_irq(4);
+    delay(2ms);
+    assert(uart_rx.push("HELLO_RING") == 10);
+    done_sig.wait();
+    println("[PASS] BYTE_RING QEMU OK");
+    sys.exit(0);
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse byte_ring QEMU test");
+        zev_sema::analyze_program(&prog).expect("sema byte_ring QEMU test");
+        let mir = zev_mir::lower_program(&prog).expect("lower byte_ring QEMU test");
+        let dir = test_out_dir();
+        let elf = dir.join("byte_ring_qemu.elf");
+        let res = run_qemu_cortex_m(
+            &mir,
+            &elf,
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("run byte_ring Cortex-M3 QEMU");
+        assert_eq!(res.exec.exit_code, 0);
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert!(
+            res.exec.stdout.contains("RX len=1 first=65 prio=0"),
+            "stdout={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("RX len=10 first=72 prio=3"),
+            "stdout={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("[PASS] BYTE_RING QEMU OK"),
+            "stdout={}",
+            res.exec.stdout
+        );
     }
 }

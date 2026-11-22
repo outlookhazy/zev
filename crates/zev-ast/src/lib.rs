@@ -320,6 +320,8 @@ pub enum OsPrimitiveType {
     PingPong { elem: Box<TypeExpr>, cap: usize },
     /// `lease<T, N>` — static zero-copy buffer lending endpoint of size `cap`.
     Lease { elem: Box<TypeExpr>, cap: usize },
+    /// `byte_ring<N>` — lock-free SPSC circular + BipBuffer byte ring of capacity `cap`.
+    ByteRing { cap: usize },
 }
 
 impl OsPrimitiveType {
@@ -330,6 +332,7 @@ impl OsPrimitiveType {
             Self::Watch { .. } => "watch",
             Self::PingPong { .. } => "ping_pong",
             Self::Lease { .. } => "lease",
+            Self::ByteRing { .. } => "byte_ring",
         }
     }
 }

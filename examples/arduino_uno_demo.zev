@@ -13,12 +13,20 @@ import bsp.arduino_uno as bsp;
 
 inbox<u32, 8> t1_inbox;
 watch<u32>    pad_edges = 0;
+byte_ring<64> uart_rx;
 
 isr timer1_isr(*inbox<u32, 8> q, *hw.TifrRegs tifr) {
     state u32 seq = 0;
     seq += 1;
     tifr.tifr1 = hw.BIT_OCF1A;
     q.post(seq, boost: @critical);
+}
+
+isr uart_rx_isr(*byte_ring<64> rx, *hw.Usart0Regs uart) {
+    state u32 rx_bytes = 0;
+    rx_bytes += 1;
+    u8 b = uart.udr0;
+    rx.push_byte(b, boost: @high);
 }
 
 isr pcint_isr_a(*hw.PcifrRegs pcifr) {
@@ -58,17 +66,41 @@ task uno_telemetry() {
     }
 }
 
+task serial_cmd_worker(*byte_ring<64> rx, *watch<u32> edges_w) {
+    u32 cmds = 0;
+    loop {
+        []u8 chunk = rx.wait_read();
+        usize n = chunk.len;
+        for (u8 ch in chunk) {
+            if (ch == 'p' || ch == 'P' || ch == '?') {
+                cmds += 1;
+                println(f"[CMD UNO] PONG uptime={sys.now_ms()}ms led={bsp.read_led()} edges={edges_w.read()} cmds={cmds}");
+            } else if (ch == 't' || ch == 'T') {
+                cmds += 1;
+                noyield {
+                    bsp.toggle_led();
+                }
+                println(f"[CMD UNO] TOGGLE led={bsp.read_led()} cmds={cmds}");
+            }
+        }
+        rx.consume(n);
+    }
+}
+
 fn main() {
     bsp.init_board_gpio();
     hw.IRQ_TIMER1_COMPA.attach(timer1_isr(&t1_inbox, hw.TIFR));
     hw.IRQ_PCINT0.attach_shared(pcint_isr_a(hw.PCIFR));
     hw.IRQ_PCINT0.attach_shared(pcint_isr_b(&pad_edges));
+    hw.IRQ_USART_RX.attach(uart_rx_isr(&uart_rx, hw.USART0));
     bsp.enable_led_pcint();
     bsp.start_timer1_ctc(15624);
+    bsp.enable_uart_rx_irq();
 
     println("");
     println("[BOOT] Zev Language-OS on Arduino Uno R3 (ATmega328P avr, zero C)");
 
     spawn led_blinker() @high;
     spawn uno_telemetry() @normal;
+    spawn serial_cmd_worker(&uart_rx, &pad_edges) @normal;
 }

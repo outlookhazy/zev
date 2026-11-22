@@ -226,5 +226,43 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             );
             (direct, table)
         }
+
+        ResolvedOsPrimitive::ByteRing { .. } => {
+            let valid = [
+                "push",
+                "push_byte",
+                "grant_write",
+                "commit_write",
+                "read_slice",
+                "wait_read",
+                "consume",
+                "pop",
+                "try_pop_byte",
+                "clear",
+                "len",
+                "cap",
+                "free_space",
+                "is_empty",
+                "is_full",
+            ];
+            let direct = match method {
+                "write" | "send" | "post" | "enqueue" | "put" => {
+                    Some("`.push(slice)` or `.push_byte(b)` (or `.grant_write(n)` / `.commit_write(n)`)".to_string())
+                }
+                "read" | "recv" | "take" | "wait" | "peek" | "slice" => {
+                    Some("`.read_slice() -> []u8`, `.wait_read([timeout: <dur>]) -> []u8`, or `.pop(dst) -> usize`".to_string())
+                }
+                "advance" | "drop" | "ack" | "discard" => Some("`.consume(n)`".to_string()),
+                "pop_byte" | "getc" | "try_recv" => Some("`.try_pop_byte() -> u8 error`".to_string()),
+                "reset" => Some("`.clear()`".to_string()),
+                "space" | "avail" | "remaining" => Some("`.free_space() -> usize`".to_string()),
+                _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
+            };
+            let table = format!(
+                "valid methods on `{}`: `.push(slice [, boost: @prio])`, `.push_byte(b [, boost: @prio])`, `.grant_write(len) -> []u8 error`, `.commit_write(n [, boost: @prio])`, `.read_slice() -> []u8`, `.wait_read([timeout: <dur>]) -> []u8`, `.consume(n)`, `.pop(dst)`, `.try_pop_byte() -> u8 error`, `.len()`, `.free_space()`, `.cap()`, `.is_empty()`, `.is_full()`, `.clear()`",
+                prim
+            );
+            (direct, table)
+        }
     }
 }

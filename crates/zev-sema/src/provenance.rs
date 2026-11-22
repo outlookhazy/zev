@@ -8,14 +8,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use zev_ast::Span;
 
-/// A single active DMA buffer lease token produced by `x.wait_chunk()`.
+/// A single active DMA or `byte_ring` buffer lease token.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LeaseToken {
-    /// Canonical DMA endpoint identifier (e.g. `"uart1_dma"` or param `"rx_dma"`).
+    /// Canonical endpoint identifier (e.g. `"uart1_dma"` or `"usb_rx#write"`).
     pub source: String,
     /// Generation number of `source` at the moment this lease was acquired.
     pub generation: u64,
-    /// Source span of the `wait_chunk()` call that produced this lease.
+    /// Method that produced this lease (`"wait_chunk"`, `"read_slice"`, `"wait_read"`, `"grant_write"`).
+    pub acq_method: &'static str,
+    /// Source span of the acquisition call that produced this lease.
     pub acquired_at: Span,
 }
 
@@ -30,12 +32,14 @@ impl Ord for LeaseToken {
         (
             &self.source,
             self.generation,
+            self.acq_method,
             self.acquired_at.start,
             self.acquired_at.end,
         )
             .cmp(&(
                 &other.source,
                 other.generation,
+                other.acq_method,
                 other.acquired_at.start,
                 other.acquired_at.end,
             ))
@@ -130,10 +134,40 @@ impl Provenance {
         leases.insert(LeaseToken {
             source: source.clone(),
             generation,
+            acq_method: "wait_chunk",
             acquired_at: span,
         });
         let mut local_origins = BTreeSet::new();
         local_origins.insert(format!("<dma lease {}>", source));
+        Self {
+            origin_depth: scope_depth,
+            pointee_depth: Some(scope_depth),
+            pointee_is_caller_or_static: false,
+            local_origins,
+            param_origins: BTreeSet::new(),
+            leases,
+            fn_callbacks: BTreeSet::new(),
+            isr_state_origins: BTreeSet::new(),
+        }
+    }
+
+    /// Provenance for a slice lease acquired via `byte_ring` (`read_slice`, `wait_read`, `grant_write`).
+    pub fn ring_lease(
+        source: String,
+        generation: u64,
+        scope_depth: u32,
+        span: Span,
+        acq_method: &'static str,
+    ) -> Self {
+        let mut leases = BTreeSet::new();
+        leases.insert(LeaseToken {
+            source: source.clone(),
+            generation,
+            acq_method,
+            acquired_at: span,
+        });
+        let mut local_origins = BTreeSet::new();
+        local_origins.insert(format!("<ring lease {}>", source));
         Self {
             origin_depth: scope_depth,
             pointee_depth: Some(scope_depth),
@@ -206,13 +240,15 @@ impl Provenance {
     }
 }
 
-/// Tracks current valid DMA lease generations and invalidation spans across control flow.
+/// Tracks current valid DMA/`byte_ring` lease generations and invalidation spans across control flow.
 #[derive(Clone, Debug, Default)]
 pub struct LeaseEnv {
-    /// Current generation number per DMA source (`0` = never waited yet).
+    /// Current generation number per lease source (`0` = never acquired yet).
     current_gen: BTreeMap<String, u64>,
-    /// Span of the most recent `wait_chunk()` that invalidated prior generations for `source`.
+    /// Span of the most recent call that invalidated prior generations for `source`.
     last_wait_span: BTreeMap<String, Span>,
+    /// Name of the method that most recently invalidated `source`.
+    last_inv_method: BTreeMap<String, &'static str>,
     /// Monotonic global counter so merged control-flow branches never accidentally collide.
     next_id: u64,
 }
@@ -222,18 +258,44 @@ impl LeaseEnv {
         Self::default()
     }
 
-    /// Advance the DMA lease generation for `source` upon `source.wait_chunk()`,
+    /// Return the active generation for `source` without invalidating prior leases
+    /// (creating generation `1` if `source` has not been acquired yet).
+    pub fn acquire_current(&mut self, source: &str) -> u64 {
+        if let Some(&gen) = self.current_gen.get(source) {
+            if gen > 0 {
+                return gen;
+            }
+        }
+        self.next_id += 1;
+        let gen = self.next_id;
+        self.current_gen.insert(source.to_string(), gen);
+        gen
+    }
+
+    /// Advance the lease generation for `source` using `inv_method`,
     /// invalidating all previously acquired leases from `source`.
-    pub fn acquire_next(&mut self, source: &str, span: Span) -> u64 {
+    pub fn invalidate(&mut self, source: &str, span: Span, inv_method: &'static str) -> u64 {
         self.next_id += 1;
         let gen = self.next_id;
         self.current_gen.insert(source.to_string(), gen);
         self.last_wait_span.insert(source.to_string(), span);
+        self.last_inv_method.insert(source.to_string(), inv_method);
         gen
     }
 
+    /// Advance the DMA lease generation for `source` upon `source.wait_chunk()`,
+    /// invalidating all previously acquired leases from `source`.
+    pub fn acquire_next(&mut self, source: &str, span: Span) -> u64 {
+        self.invalidate(source, span, "wait_chunk")
+    }
+
+    /// Return the name of the method that last invalidated `source` (defaults to `"wait_chunk"`).
+    pub fn last_invalidator(&self, source: &str) -> &'static str {
+        self.last_inv_method.get(source).copied().unwrap_or("wait_chunk")
+    }
+
     /// Check if `token` is still valid in the current state.
-    /// Returns `Err(invalidated_by_span)` if a subsequent `wait_chunk()` has invalidated it.
+    /// Returns `Err(invalidated_by_span)` if a subsequent invalidating call invalidated it.
     pub fn check_valid(&self, token: &LeaseToken) -> Result<(), Option<Span>> {
         match self.current_gen.get(&token.source) {
             Some(&cur) if cur == token.generation => Ok(()),
@@ -255,7 +317,7 @@ impl LeaseEnv {
     }
 
     /// Join two branch lease environments after `if / else` or `switch` arms.
-    /// If a DMA source's generation differs across branches, any lease held from before or
+    /// If a lease source's generation differs across branches, any lease held from before or
     /// only one branch is conservatively invalidated.
     pub fn join_branches(&mut self, branches: &[LeaseEnv]) {
         for b in branches {
@@ -268,6 +330,7 @@ impl LeaseEnv {
         for src in all_sources {
             let mut gens = BTreeSet::new();
             let mut latest_span = self.last_wait_span.get(&src).copied();
+            let mut latest_method = self.last_inv_method.get(&src).copied();
             if branches.is_empty() {
                 continue;
             }
@@ -275,6 +338,9 @@ impl LeaseEnv {
                 gens.insert(b.current_gen.get(&src).copied().unwrap_or(0));
                 if let Some(sp) = b.last_wait_span.get(&src).copied() {
                     latest_span = Some(sp);
+                    if let Some(m) = b.last_inv_method.get(&src).copied() {
+                        latest_method = Some(m);
+                    }
                 }
             }
             if gens.len() == 1 {
@@ -283,12 +349,15 @@ impl LeaseEnv {
                     self.current_gen.insert(src.clone(), g);
                 }
             } else {
-                // Branches diverged on DMA acquisitions -> bump to a fresh post-join generation.
+                // Branches diverged on DMA/`byte_ring` invalidations -> bump generation.
                 self.next_id += 1;
                 self.current_gen.insert(src.clone(), self.next_id);
             }
             if let Some(sp) = latest_span {
-                self.last_wait_span.insert(src, sp);
+                self.last_wait_span.insert(src.clone(), sp);
+            }
+            if let Some(m) = latest_method {
+                self.last_inv_method.insert(src, m);
             }
         }
     }

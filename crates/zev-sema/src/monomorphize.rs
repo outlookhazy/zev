@@ -1211,6 +1211,7 @@ impl<'a> Monomorphizer<'a> {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
                 cap: *cap,
             },
+            OsPrimitiveType::ByteRing { cap } => OsPrimitiveType::ByteRing { cap: *cap },
         }
     }
 
@@ -1263,6 +1264,9 @@ impl<'a> Monomorphizer<'a> {
                 }
                 OsPrimitiveType::Lease { elem, cap } => {
                     format!("_Glease_L_{}__{}_R_", self.format_mangled_type(elem), cap)
+                }
+                OsPrimitiveType::ByteRing { cap } => {
+                    format!("_Gbyte_0ring_L_{}_R_", cap)
                 }
             },
             TypeKind::FnPtr { params, ret } => {
@@ -1324,6 +1328,9 @@ impl<'a> Monomorphizer<'a> {
                 }
                 OsPrimitiveType::Lease { elem, cap } => {
                     format!("lease<{}, {}>", self.format_human_type(elem), cap)
+                }
+                OsPrimitiveType::ByteRing { cap } => {
+                    format!("byte_ring<{}>", cap)
                 }
             },
             TypeKind::FnPtr { params, ret } => {
@@ -2406,6 +2413,42 @@ impl<'a> Monomorphizer<'a> {
                                     expr.span,
                                 ));
                             }
+                            (
+                                OsPrimitiveType::ByteRing { .. },
+                                "read_slice" | "wait_read" | "grant_write",
+                            ) => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Slice(Box::new(TypeExpr::new(
+                                        TypeKind::Prim(PrimType::U8),
+                                        expr.span,
+                                    ))),
+                                    expr.span,
+                                ));
+                            }
+                            (OsPrimitiveType::ByteRing { .. }, "try_pop_byte") => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::U8),
+                                    expr.span,
+                                ));
+                            }
+                            (
+                                OsPrimitiveType::ByteRing { .. },
+                                "push" | "pop" | "len" | "cap" | "free_space",
+                            ) => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::Usize),
+                                    expr.span,
+                                ));
+                            }
+                            (
+                                OsPrimitiveType::ByteRing { .. },
+                                "push_byte" | "is_empty" | "is_full",
+                            ) => {
+                                out_ty = InferTy::Concrete(TypeExpr::new(
+                                    TypeKind::Prim(PrimType::Bool),
+                                    expr.span,
+                                ));
+                            }
                             _ => {}
                         }
                     }
@@ -3119,6 +3162,9 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             }
             OsPrimitiveType::Lease { elem, cap } => {
                 format!("_Glease_L_{}__{}_R_", mangle_type_expr(elem), cap)
+            }
+            OsPrimitiveType::ByteRing { cap } => {
+                format!("_Gbyte_0ring_L_{}_R_", cap)
             }
         },
         TypeKind::FnPtr { params, ret } => {

@@ -224,6 +224,14 @@ fn compute_terminator_live_before(
                 dst_res,
                 resume_bb,
                 ..
+            }
+            | MirYieldKind::ByteRingWaitRead {
+                target,
+                timeout_deadline_var,
+                dst_val,
+                dst_res,
+                resume_bb,
+                ..
             } => {
                 let mut out = block_live(*resume_bb);
                 // `dst_val` / `dst_res` are written ONLY when the receive completes before `resume_bb`!
@@ -482,12 +490,18 @@ fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
             collect_prim_target_uses(target, uses);
             collect_expr_uses(value, uses);
         }
+        MirPrimNonBlockingOp::ByteRingConsume { target, len, .. }
+        | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. } => {
+            collect_prim_target_uses(target, uses);
+            collect_expr_uses(len, uses);
+        }
         MirPrimNonBlockingOp::SignalNotify { target, .. }
         | MirPrimNonBlockingOp::SignalClear { target }
         | MirPrimNonBlockingOp::PingPongFlip { target, .. }
         | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
         | MirPrimNonBlockingOp::LeaseComplete { target, .. }
-        | MirPrimNonBlockingOp::LeaseSetActive { target, .. } => {
+        | MirPrimNonBlockingOp::LeaseSetActive { target, .. }
+        | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
             collect_prim_target_uses(target, uses);
         }
     }
@@ -575,6 +589,19 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
                 collect_prim_target_uses(target, uses);
                 collect_expr_uses(value, uses);
             }
+            MirPrimReadOp::ByteRingPush { target, src, .. }
+            | MirPrimReadOp::ByteRingPop { target, dst: src, .. } => {
+                collect_prim_target_uses(target, uses);
+                collect_expr_uses(src, uses);
+            }
+            MirPrimReadOp::ByteRingPushByte { target, byte, .. } => {
+                collect_prim_target_uses(target, uses);
+                collect_expr_uses(byte, uses);
+            }
+            MirPrimReadOp::ByteRingGrantWrite { target, len, .. } => {
+                collect_prim_target_uses(target, uses);
+                collect_expr_uses(len, uses);
+            }
             MirPrimReadOp::WatchRead { target, .. }
             | MirPrimReadOp::InboxTryRecv { target, .. }
             | MirPrimReadOp::InboxLen { target, .. }
@@ -582,7 +609,13 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             | MirPrimReadOp::InboxIsFull { target, .. }
             | MirPrimReadOp::SignalIsSet { target }
             | MirPrimReadOp::SignalTryWait { target }
-            | MirPrimReadOp::PingPongDmaBuf { target, .. } => {
+            | MirPrimReadOp::PingPongDmaBuf { target, .. }
+            | MirPrimReadOp::ByteRingReadSlice { target, .. }
+            | MirPrimReadOp::ByteRingTryPopByte { target, .. }
+            | MirPrimReadOp::ByteRingLen { target, .. }
+            | MirPrimReadOp::ByteRingFreeSpace { target, .. }
+            | MirPrimReadOp::ByteRingIsEmpty { target, .. }
+            | MirPrimReadOp::ByteRingIsFull { target, .. } => {
                 collect_prim_target_uses(target, uses);
             }
         },
@@ -655,11 +688,18 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
                 collect_addr_of_vars(e, out);
             }
         }
-        MirExprKind::PrimRead(ro) => {
-            if let MirPrimReadOp::InboxTrySend { value, .. } = ro.as_ref() {
+        MirExprKind::PrimRead(ro) => match ro.as_ref() {
+            MirPrimReadOp::InboxTrySend { value, .. } => {
                 collect_addr_of_vars(value, out);
             }
-        }
+            MirPrimReadOp::ByteRingPush { src: value, .. }
+            | MirPrimReadOp::ByteRingPop { dst: value, .. }
+            | MirPrimReadOp::ByteRingPushByte { byte: value, .. }
+            | MirPrimReadOp::ByteRingGrantWrite { len: value, .. } => {
+                collect_addr_of_vars(value, out);
+            }
+            _ => {}
+        },
         _ => {}
     }
 }
@@ -871,6 +911,10 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
             | MirPrimNonBlockingOp::InboxPost { value, .. } => {
                 collect_addr_of_vars(value, &mut taken);
             }
+            MirPrimNonBlockingOp::ByteRingConsume { len, .. }
+            | MirPrimNonBlockingOp::ByteRingCommitWrite { len, .. } => {
+                collect_addr_of_vars(len, &mut taken);
+            }
             _ => {}
         },
         MirStmt::If {
@@ -935,6 +979,10 @@ fn collect_terminator_forced_hoists(
                 force_hoist.insert(*deadline_var);
             }
             MirYieldKind::InboxRecv {
+                timeout_deadline_var: Some(tv),
+                ..
+            }
+            | MirYieldKind::ByteRingWaitRead {
                 timeout_deadline_var: Some(tv),
                 ..
             }

@@ -32,13 +32,27 @@ watch<u32>            active_slot    = 0;
 watch<u32>            active_color   = 0;
 watch<u32>            diag_signature = 0;
 inbox<SupEvent, 8>    sup_inbox;
+byte_ring<64>         usb_rx;
 
-// ── Synthesized RISC-V `INTMTX` + `mtvec` IRQ Handler ───────────────────────
+// ── Synthesized RISC-V `INTMTX` + `mtvec` IRQ Handlers ──────────────────────
 isr gpio_btn_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
     state u32 irq_edges = 0;
     irq_edges += 1;
     gpio.status_w1tc = 1 << bsp.PIN_BOOT_BTN;
     sup.post(ButtonPressed, boost: @critical);
+}
+
+isr usb_rx_isr(*byte_ring<64> rx, *hw.UsbDeviceRegs usb) {
+    state u32 usb_irqs = 0;
+    usb_irqs += 1;
+    usb.int_clr = 4;
+    for (u32 i in 0..64) {
+        if ((usb.ep1_conf & 4) == 0) {
+            break;
+        }
+        u8 b = (usb.ep1 & 0xFF) as u8;
+        rx.push_byte(b, boost: @high);
+    }
 }
 
 // ── Monomorphized `<T, usize N>` Helpers (Zero Vtables, Zero Heap) ──────────
@@ -184,10 +198,38 @@ task button_monitor() {
     }
 }
 
+task usb_cmd_worker(
+    *byte_ring<64> rx,
+    *watch<u32> slot_w,
+    *watch<u32> color_w,
+    *inbox<SupEvent, 8> sup
+) {
+    u32 cmds = 0;
+    loop {
+        []u8 chunk = rx.wait_read();
+        usize n = chunk.len;
+        for (u8 ch in chunk) {
+            if (ch == 'p' || ch == 'P' || ch == '?') {
+                cmds += 1;
+                u32 slot = slot_w.read();
+                u32 rgb = color_w.read();
+                println(f"[CMD ESP32-C6] PONG uptime={sys.now_ms()}ms slot={slot} color=0x{rgb:06x} prio={sys.current_prio()} cmds={cmds}");
+            } else if (ch == 'n' || ch == 'N') {
+                cmds += 1;
+                sup.post(ButtonPressed, boost: @critical);
+                println(f"[CMD ESP32-C6] NEXT queued cmds={cmds}");
+            }
+        }
+        rx.consume(n);
+    }
+}
+
 // ── Sequential Boot + Low-Priority Telemetry Supervisor ─────────────────────
 fn main() {
     bsp.init_board_gpio();
     hw.IRQ_GPIO.attach(gpio_btn_isr(&sup_inbox, hw.GPIO));
+    hw.IRQ_USB_DEVICE.attach(usb_rx_isr(&usb_rx, hw.USB_DEVICE));
+    bsp.enable_usb_rx_irq();
 
     // Immediate visual boot confirmation on GPIO8 WS2812B RGB LED
     u32 boot_rgb = drive_palette_slot(0);
@@ -203,6 +245,7 @@ fn main() {
 
     spawn led_animator(&palette_offset, &active_slot, &active_color) @normal;
     spawn button_monitor() @high;
+    spawn usb_cmd_worker(&usb_rx, &active_slot, &active_color, &sup_inbox) @normal;
 
     set_priority(@low);
     u32 presses = 0;

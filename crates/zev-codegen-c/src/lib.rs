@@ -5024,4 +5024,133 @@ int main(void) {
             "stdout:\n{stdout}"
         );
     }
+
+    #[test]
+    fn byte_ring_spsc_wrap_bipbuffer_grant_wait_read_and_boost_asan() {
+        let src = r#"
+byte_ring<16> stream;
+signal done_sig;
+
+task consumer(*byte_ring<16> rx, *signal done) {
+    u32 total = 0;
+    loop {
+        []u8 chunk = rx.wait_read(timeout: 20ms) catch {
+            println("TIMEOUT");
+            if (total == 36) {
+                done.notify();
+            }
+            continue;
+        };
+        usize n = chunk.len;
+        if (n > 0) {
+            u32 prio = sys.current_prio();
+            u8 first = chunk[0];
+            println(f"CHUNK len={n} first={first} prio={prio}");
+            total += n as u32;
+            rx.consume(n);
+        }
+    }
+}
+
+fn main() {
+    byte_ring<16> *r = &stream;
+    // 1. Wrap-around push/pop/try_pop_byte
+    usize w1 = r.push("0123456789AB");
+    assert(w1 == 12);
+    assert(r.len() == 12);
+    assert(r.free_space() == 4);
+
+    u8 tmp[6];
+    usize p1 = r.pop(tmp);
+    assert(p1 == 6);
+    assert(tmp[0] == '0');
+    assert(tmp[5] == '5');
+
+    // 2. BipBuffer contiguous grant_write across wrap-around:
+    //    back gap is 4 bytes (12..16), front space is 6 bytes (0..6) -> grant_write(5) wraps to index 0!
+    []u8 g = r.grant_write(5) catch {
+        println("ERR grant5");
+        return;
+    };
+    g[0] = 'X';
+    g[1] = 'Y';
+    g[2] = 'Z';
+    r.commit_write(3);
+    assert(r.len() == 9);
+    assert(r.free_space() == 3);
+
+    // 3. Drain first segment (6789AB) -> frees front segment automatically -> FIFO order intact!
+    u8 out_a[6];
+    usize pa = r.pop(out_a);
+    assert(pa == 6);
+    assert(out_a[0] == '6');
+    assert(out_a[5] == 'B');
+
+    []u8 rs = r.read_slice();
+    assert(rs.len == 3);
+    assert(rs[0] == 'X');
+    assert(rs[2] == 'Z');
+    r.consume(1);
+
+    u8 popped = r.try_pop_byte() or 0;
+    assert(popped == 'Y');
+    u8 popped2 = r.try_pop_byte() or 0;
+    assert(popped2 == 'Z');
+    assert(r.is_empty());
+
+    // 4. Push exact 16 bytes + overflow rejection + clear()
+    usize wfull = r.push("ABCDEFGHIJKLMNOP");
+    assert(wfull == 16);
+    assert(r.is_full());
+    assert(!r.push_byte('Q'));
+    r.clear();
+    assert(r.is_empty());
+    assert(r.free_space() == 16);
+
+    spawn consumer(&stream, &done_sig) @low;
+
+    // 5. Exercise wait_read + boost: @critical + consume across multiple chunks (= 36 bytes)
+    usize s1 = stream.push("AAAAAAAAAA", boost: @critical);
+    assert(s1 == 10);
+    delay(5ms);
+    usize s2 = stream.push("BBBBBBBBBBBB");
+    assert(s2 == 12);
+    delay(5ms);
+    []u8 gw = stream.grant_write(6) catch {
+        println("ERR gw");
+        return;
+    };
+    for (usize i in 0..6) {
+        gw[i] = 'C';
+    }
+    stream.commit_write(6);
+    delay(5ms);
+    usize s3 = stream.push("DDDDDDDD", boost: @high);
+    assert(s3 == 8);
+    done_sig.wait();
+    println("[PASS] BYTE_RING C99 OK");
+    sys.exit(0);
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse byte_ring C99 test");
+        zev_sema::analyze_program(&prog).expect("sema byte_ring C99 test");
+        let mir = lower_program(&prog).expect("lower byte_ring C99 test");
+        assert!(mir.ram_report.format_table().contains("byte_ring<16>"));
+
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("byte_ring_spsc_asan", &c_code);
+        let stdout = compile_and_run_clang_sanitized("byte_ring_spsc_asan", &c_code, None);
+        assert!(
+            stdout.contains("CHUNK len=10 first=65 prio=0"),
+            "expected critical boost on first chunk:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("CHUNK len=8 first=68 prio=1"),
+            "expected high boost on D chunk:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("TIMEOUT") && stdout.contains("[PASS] BYTE_RING C99 OK"),
+            "expected timeout and PASS marker:\n{stdout}"
+        );
+    }
 }

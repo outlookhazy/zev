@@ -1426,7 +1426,7 @@ impl Analyzer {
                 DiagnosticKind::IllegalMutableGlobal,
                 g.span,
                 format!(
-                    "mutable raw global variable '{}' is forbidden; top-level declarations must be 'const' or an OS primitive (signal, inbox, watch, ping_pong, lease)",
+                    "mutable raw global variable '{}' is forbidden; top-level declarations must be 'const' or an OS primitive (signal, inbox, watch, ping_pong, lease, byte_ring)",
                     g.name.name
                 ),
             )
@@ -1803,6 +1803,16 @@ impl Analyzer {
                     elem: Box::new(self.resolve_non_void_elem(elem)),
                     cap: *cap,
                 }
+            }
+            OsPrimitiveType::ByteRing { cap } => {
+                if *cap == 0 {
+                    self.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        span,
+                        "byte_ring capacity must be greater than 0",
+                    ));
+                }
+                ResolvedOsPrimitive::ByteRing { cap: *cap }
             }
         }
     }
@@ -4510,19 +4520,38 @@ impl<'a> BodyChecker<'a> {
                 for tok in &var_prov.leases {
                     if let Some(inv_span) = modified.get(&tok.source) {
                         if leases_before.check_valid(tok).is_ok() {
-                            let mut diag = Diagnostic::new(
-                                DiagnosticKind::StaleDmaLease,
-                                isp,
-                                format!(
-                                    "cannot iterate over slice derived from '{}.wait_chunk()' across a loop body that calls 'wait_chunk()'",
-                                    tok.source
-                                ),
-                            );
-                            if let Some(sp) = inv_span {
-                                diag = diag.with_note(format!(
-                                    "DMA lease invalidated inside 'for..in' body via 'wait_chunk()' at {}",
-                                    sp
-                                ));
+                            let inv_method = self.leases.last_invalidator(&tok.source);
+                            let display_src = tok.source.strip_suffix("#write").unwrap_or(&tok.source);
+                            let (msg, note_msg) = if tok.acq_method == "wait_chunk" {
+                                (
+                                    format!(
+                                        "cannot iterate over slice derived from '{}.wait_chunk()' across a loop body that calls 'wait_chunk()'",
+                                        tok.source
+                                    ),
+                                    inv_span.map(|sp| {
+                                        format!(
+                                            "DMA lease invalidated inside 'for..in' body via 'wait_chunk()' at {}",
+                                            sp
+                                        )
+                                    }),
+                                )
+                            } else {
+                                (
+                                    format!(
+                                        "cannot iterate over slice derived from '{}.{}()' across a loop body that calls '{}.{}()'",
+                                        display_src, tok.acq_method, display_src, inv_method
+                                    ),
+                                    inv_span.map(|sp| {
+                                        format!(
+                                            "byte_ring lease invalidated inside 'for..in' body via '{}()' at {}",
+                                            inv_method, sp
+                                        )
+                                    }),
+                                )
+                            };
+                            let mut diag = Diagnostic::new(DiagnosticKind::StaleDmaLease, isp, msg);
+                            if let Some(nm) = note_msg {
+                                diag = diag.with_note(nm);
                             }
                             self.sema.emit(diag);
                         }
@@ -4534,19 +4563,39 @@ impl<'a> BodyChecker<'a> {
                 for tok in &r_prov.leases {
                     if let Some(inv_span) = modified.get(&tok.source) {
                         if read_env.check_valid(tok).is_ok() {
-                            let mut diag = Diagnostic::new(
-                                DiagnosticKind::StaleDmaLease,
-                                read_span,
-                                format!(
-                                    "cannot read outer variable '{}' derived from '{}.wait_chunk()' across loop iterations that call 'wait_chunk()'",
-                                    r_name, tok.source
-                                ),
-                            );
-                            if let Some(sp) = inv_span {
-                                diag = diag.with_note(format!(
-                                    "subsequent loop iteration invalidates lease via 'wait_chunk()' at {}",
-                                    sp
-                                ));
+                            let inv_method = self.leases.last_invalidator(&tok.source);
+                            let display_src = tok.source.strip_suffix("#write").unwrap_or(&tok.source);
+                            let (msg, note_msg) = if tok.acq_method == "wait_chunk" {
+                                (
+                                    format!(
+                                        "cannot read outer variable '{}' derived from '{}.wait_chunk()' across loop iterations that call 'wait_chunk()'",
+                                        r_name, tok.source
+                                    ),
+                                    inv_span.map(|sp| {
+                                        format!(
+                                            "subsequent loop iteration invalidates lease via 'wait_chunk()' at {}",
+                                            sp
+                                        )
+                                    }),
+                                )
+                            } else {
+                                (
+                                    format!(
+                                        "cannot read outer variable '{}' derived from '{}.{}()' across loop iterations that call '{}.{}()'",
+                                        r_name, display_src, tok.acq_method, display_src, inv_method
+                                    ),
+                                    inv_span.map(|sp| {
+                                        format!(
+                                            "subsequent loop iteration invalidates lease via '{}()' at {}",
+                                            inv_method, sp
+                                        )
+                                    }),
+                                )
+                            };
+                            let mut diag =
+                                Diagnostic::new(DiagnosticKind::StaleDmaLease, read_span, msg);
+                            if let Some(nm) = note_msg {
+                                diag = diag.with_note(nm);
                             }
                             self.sema.emit(diag);
                         }
@@ -4571,26 +4620,46 @@ impl<'a> BodyChecker<'a> {
 
         let modified = self.leases.modified_sources_since(&leases_before);
         if !modified.is_empty() {
-            // Check if any outer variable holding a pre-loop DMA lease on a source mutated inside
+            // Check if any outer variable holding a pre-loop DMA/ring lease on a source mutated inside
             // the loop was read in the loop (which would read a stale chunk on iteration 2).
             for (var_name, read_env, var_prov, read_span) in outer_reads {
                 for tok in &var_prov.leases {
                     if let Some(inv_span) = modified.get(&tok.source) {
                         // Only report if `read_env` hadn't already reported it stale on iteration 1.
                         if read_env.check_valid(tok).is_ok() {
-                            let mut diag = Diagnostic::new(
-                                DiagnosticKind::StaleDmaLease,
-                                read_span,
-                                format!(
-                                    "cannot read outer variable '{}' derived from '{}.wait_chunk()' across loop iterations that call 'wait_chunk()'",
-                                    var_name, tok.source
-                                ),
-                            );
-                            if let Some(sp) = inv_span {
-                                diag = diag.with_note(format!(
-                                    "subsequent loop iteration invalidates lease via 'wait_chunk()' at {}",
-                                    sp
-                                ));
+                            let inv_method = self.leases.last_invalidator(&tok.source);
+                            let display_src = tok.source.strip_suffix("#write").unwrap_or(&tok.source);
+                            let (msg, note_msg) = if tok.acq_method == "wait_chunk" {
+                                (
+                                    format!(
+                                        "cannot read outer variable '{}' derived from '{}.wait_chunk()' across loop iterations that call 'wait_chunk()'",
+                                        var_name, tok.source
+                                    ),
+                                    inv_span.map(|sp| {
+                                        format!(
+                                            "subsequent loop iteration invalidates lease via 'wait_chunk()' at {}",
+                                            sp
+                                        )
+                                    }),
+                                )
+                            } else {
+                                (
+                                    format!(
+                                        "cannot read outer variable '{}' derived from '{}.{}()' across loop iterations that call '{}.{}()'",
+                                        var_name, display_src, tok.acq_method, display_src, inv_method
+                                    ),
+                                    inv_span.map(|sp| {
+                                        format!(
+                                            "subsequent loop iteration invalidates lease via '{}()' at {}",
+                                            inv_method, sp
+                                        )
+                                    }),
+                                )
+                            };
+                            let mut diag =
+                                Diagnostic::new(DiagnosticKind::StaleDmaLease, read_span, msg);
+                            if let Some(nm) = note_msg {
+                                diag = diag.with_note(nm);
                             }
                             self.sema.emit(diag);
                         }
@@ -5808,27 +5877,57 @@ impl<'a> BodyChecker<'a> {
     fn check_ident_expr(&mut self, ident: &Ident) -> ExprVal {
         // 1. Local variable or parameter.
         if let Some(var) = self.lookup_local(&ident.name).cloned() {
-            // Check for invalidated DMA lease on read!
+            // Check for invalidated DMA / `byte_ring` lease on read!
             if let Some((stale_tok, inv_span)) = self.leases.find_stale_lease(&var.prov) {
-                let mut diag = Diagnostic::new(
-                    DiagnosticKind::StaleDmaLease,
-                    ident.span,
-                    format!(
-                        "cannot read '{}' derived from '{}.wait_chunk()' after a subsequent 'wait_chunk()' invalidated its DMA buffer lease",
-                        ident.name, stale_tok.source
-                    ),
-                );
-                if let Some(sp) = inv_span {
-                    diag = diag.with_note(format!(
-                        "DMA lease acquired at {} was invalidated by subsequent `{}.wait_chunk()` at {}; finish decoding/parsing `{}` (e.g. `Type.from_bytes(slice)`) or copy needed bytes into a local `[N]u8` buffer before calling `wait_chunk()` again",
-                        stale_tok.acquired_at, stale_tok.source, sp, ident.name
-                    ));
+                let inv_method = self.leases.last_invalidator(&stale_tok.source);
+                let display_src = stale_tok
+                    .source
+                    .strip_suffix("#write")
+                    .unwrap_or(&stale_tok.source);
+                let mut diag = if stale_tok.acq_method == "wait_chunk" {
+                    let mut d = Diagnostic::new(
+                        DiagnosticKind::StaleDmaLease,
+                        ident.span,
+                        format!(
+                            "cannot read '{}' derived from '{}.wait_chunk()' after a subsequent 'wait_chunk()' invalidated its DMA buffer lease",
+                            ident.name, stale_tok.source
+                        ),
+                    );
+                    if let Some(sp) = inv_span {
+                        d = d.with_note(format!(
+                            "DMA lease acquired at {} was invalidated by subsequent `{}.wait_chunk()` at {}; finish decoding/parsing `{}` (e.g. `Type.from_bytes(slice)`) or copy needed bytes into a local `[N]u8` buffer before calling `wait_chunk()` again",
+                            stale_tok.acquired_at, stale_tok.source, sp, ident.name
+                        ));
+                    } else {
+                        d = d.with_note(format!(
+                            "finish reading/decoding `{}` or copy needed bytes out before calling `{}.wait_chunk()` again",
+                            ident.name, stale_tok.source
+                        ));
+                    }
+                    d
                 } else {
-                    diag = diag.with_note(format!(
-                        "finish reading/decoding `{}` or copy needed bytes out before calling `{}.wait_chunk()` again",
-                        ident.name, stale_tok.source
-                    ));
-                }
+                    let mut d = Diagnostic::new(
+                        DiagnosticKind::StaleDmaLease,
+                        ident.span,
+                        format!(
+                            "cannot read '{}' derived from '{}.{}()' after '{}.{}()' invalidated its byte_ring lease",
+                            ident.name, display_src, stale_tok.acq_method, display_src, inv_method
+                        ),
+                    );
+                    if let Some(sp) = inv_span {
+                        d = d.with_note(format!(
+                            "byte_ring slice acquired at {} was invalidated by `{}.{}()` at {}; finish reading/copying bytes from `{}` before calling `consume()`, `pop()`, `commit_write()`, or `grant_write()`",
+                            stale_tok.acquired_at, display_src, inv_method, sp, ident.name
+                        ));
+                    } else {
+                        d = d.with_note(format!(
+                            "finish reading/copying bytes from `{}` before calling `{}.{}()`",
+                            ident.name, display_src, inv_method
+                        ));
+                    }
+                    d
+                };
+                let _ = &mut diag;
                 self.sema.emit(diag);
             } else if !var.prov.leases.is_empty() && !self.loop_outer_reads.is_empty() {
                 // Record reads of variables declared OUTSIDE the enclosing loop so cross-iteration
@@ -7781,6 +7880,141 @@ impl<'a> BodyChecker<'a> {
                 }
                 _ => self.unknown_prim_method(prim, method, span),
             },
+
+            ResolvedOsPrimitive::ByteRing { .. } => {
+                let u8_slice = Ty::Slice(Box::new(Ty::u8()));
+                match m {
+                    "push" => {
+                        self.expect_single_elem(m, &pos_vals, &u8_slice, span);
+                        let wkey = format!("{source_key}#write");
+                        let _ = self.leases.invalidate(&wkey, span, "push");
+                        ExprVal::scalar(Ty::usize(), span)
+                    }
+                    "push_byte" => {
+                        self.expect_single_elem(m, &pos_vals, &Ty::u8(), span);
+                        let wkey = format!("{source_key}#write");
+                        let _ = self.leases.invalidate(&wkey, span, "push_byte");
+                        ExprVal::scalar(Ty::bool(), span)
+                    }
+                    "grant_write" => {
+                        self.expect_single_elem(m, &pos_vals, &Ty::usize(), span);
+                        let wkey = format!("{source_key}#write");
+                        let gen = self.leases.invalidate(&wkey, span, "grant_write");
+                        let prov = Provenance::ring_lease(
+                            wkey,
+                            gen,
+                            self.current_depth(),
+                            span,
+                            "grant_write",
+                        );
+                        ExprVal {
+                            ty: u8_slice,
+                            error_spec: ResolvedErrorSpec::Untyped,
+                            prov,
+                            endpoint_name: None,
+                            span,
+                        }
+                    }
+                    "commit_write" => {
+                        self.expect_single_elem(m, &pos_vals, &Ty::usize(), span);
+                        let wkey = format!("{source_key}#write");
+                        let _ = self.leases.invalidate(&wkey, span, "commit_write");
+                        ExprVal::scalar(Ty::void(), span)
+                    }
+                    "read_slice" => {
+                        self.expect_positional_arity(m, &pos_vals, 0, span);
+                        let gen = self.leases.acquire_current(source_key);
+                        let prov = Provenance::ring_lease(
+                            source_key.to_string(),
+                            gen,
+                            self.current_depth(),
+                            span,
+                            "read_slice",
+                        );
+                        ExprVal {
+                            ty: u8_slice,
+                            error_spec: ResolvedErrorSpec::None,
+                            prov,
+                            endpoint_name: None,
+                            span,
+                        }
+                    }
+                    "wait_read" => {
+                        self.expect_positional_arity(m, &pos_vals, 0, span);
+                        self.record_direct_yield(
+                            span,
+                            FnEffect::HardBlocking,
+                            &format!("{}.wait_read()", source_key),
+                        );
+                        let gen = self.leases.acquire_current(source_key);
+                        let prov = Provenance::ring_lease(
+                            source_key.to_string(),
+                            gen,
+                            self.current_depth(),
+                            span,
+                            "wait_read",
+                        );
+                        ExprVal {
+                            ty: u8_slice,
+                            error_spec: if has_timeout {
+                                ResolvedErrorSpec::Untyped
+                            } else {
+                                ResolvedErrorSpec::None
+                            },
+                            prov,
+                            endpoint_name: None,
+                            span,
+                        }
+                    }
+                    "consume" => {
+                        self.expect_single_elem(m, &pos_vals, &Ty::usize(), span);
+                        let _ = self.leases.invalidate(source_key, span, "consume");
+                        ExprVal::scalar(Ty::void(), span)
+                    }
+                    "pop" => {
+                        self.expect_single_elem(m, &pos_vals, &u8_slice, span);
+                        if pos_vals
+                            .first()
+                            .is_some_and(|(v, _, _)| matches!(v.ty, Ty::Str))
+                        {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                pos_vals[0].2,
+                                "cannot call 'pop' into an immutable string literal; pass a mutable `[N]u8` or `[]u8` buffer",
+                            ));
+                        }
+                        let _ = self.leases.invalidate(source_key, span, "pop");
+                        ExprVal::scalar(Ty::usize(), span)
+                    }
+                    "try_pop_byte" => {
+                        self.expect_positional_arity(m, &pos_vals, 0, span);
+                        let _ = self.leases.invalidate(source_key, span, "try_pop_byte");
+                        ExprVal {
+                            ty: Ty::u8(),
+                            error_spec: ResolvedErrorSpec::Untyped,
+                            prov: Provenance::pure_static(),
+                            endpoint_name: None,
+                            span,
+                        }
+                    }
+                    "clear" => {
+                        self.expect_positional_arity(m, &pos_vals, 0, span);
+                        let _ = self.leases.invalidate(source_key, span, "clear");
+                        let wkey = format!("{source_key}#write");
+                        let _ = self.leases.invalidate(&wkey, span, "clear");
+                        ExprVal::scalar(Ty::void(), span)
+                    }
+                    "len" | "cap" | "free_space" => {
+                        self.expect_positional_arity(m, &pos_vals, 0, span);
+                        ExprVal::scalar(Ty::usize(), span)
+                    }
+                    "is_empty" | "is_full" => {
+                        self.expect_positional_arity(m, &pos_vals, 0, span);
+                        ExprVal::scalar(Ty::bool(), span)
+                    }
+                    _ => self.unknown_prim_method(prim, method, span),
+                }
+            }
         }
     }
 

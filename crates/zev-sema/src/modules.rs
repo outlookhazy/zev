@@ -1295,6 +1295,7 @@ impl<'a> AstRewriter<'a> {
                 elem: Box::new(self.rewrite_type(elem)),
                 cap: *cap,
             },
+            OsPrimitiveType::ByteRing { cap } => OsPrimitiveType::ByteRing { cap: *cap },
         }
     }
 

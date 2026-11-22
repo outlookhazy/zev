@@ -288,6 +288,7 @@ impl ModuleSymbols {
                 elem: Box::new(self.resolve_type(elem)),
                 cap: *cap,
             },
+            OsPrimitiveType::ByteRing { cap } => MirPrimKind::ByteRing { cap: *cap },
         }
     }
 
@@ -5878,6 +5879,28 @@ impl<'a> CoroutineLowerCtx<'a> {
                             );
                             return Ok(true);
                         }
+                        ("wait_read", MirPrimKind::ByteRing { cap })
+                            if find_named_arg(args, "timeout").is_none() =>
+                        {
+                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            let poll_bb = self.alloc_bb();
+                            let resume_bb = self.alloc_bb();
+                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                            self.seal_bb(
+                                MirTerminator::Yield(MirYieldKind::ByteRingWaitRead {
+                                    target,
+                                    cap,
+                                    timeout_deadline_var: None,
+                                    dst_val: Some(dst_vid),
+                                    dst_res: None,
+                                    poll_bb,
+                                    resume_bb,
+                                }),
+                                resume_bb,
+                                false,
+                            );
+                            return Ok(true);
+                        }
                         _ => {}
                     }
                 }
@@ -6569,6 +6592,70 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     false,
                                 );
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_val), *elem));
+                            }
+                        }
+                        ("wait_read", MirPrimKind::ByteRing { cap }) => {
+                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            let slice_ty = MirType::Slice(Box::new(MirType::U8));
+                            if let Some(texpr) = find_named_arg(args, "timeout") {
+                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
+                                let dl_var = self.alloc_temp("ring_deadline", MirType::U32);
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(dl_var),
+                                    op: MirAssignOp::Assign,
+                                    value: MirExpr::new(
+                                        MirExprKind::Binary {
+                                            op: MirBinOp::Add,
+                                            lhs: Box::new(MirExpr::new(
+                                                MirExprKind::NowTicks,
+                                                MirType::U32,
+                                            )),
+                                            rhs: Box::new(ticks),
+                                        },
+                                        MirType::U32,
+                                    ),
+                                });
+                                let rty = MirType::Result {
+                                    ok: Box::new(slice_ty),
+                                    err: None,
+                                };
+                                let dst_res = self.alloc_temp("ring_res", rty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::ByteRingWaitRead {
+                                        target,
+                                        cap,
+                                        timeout_deadline_var: Some(dl_var),
+                                        dst_val: None,
+                                        dst_res: Some(dst_res),
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
+                                    resume_bb,
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                            } else {
+                                let dst_val = self.alloc_temp("ring_chunk", slice_ty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::ByteRingWaitRead {
+                                        target,
+                                        cap,
+                                        timeout_deadline_var: None,
+                                        dst_val: Some(dst_val),
+                                        dst_res: None,
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
+                                    resume_bb,
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
                             }
                         }
                         ("wait", MirPrimKind::Signal) => {
@@ -8398,6 +8485,116 @@ fn finish_prim_read_method<B: LowerBackend>(
                 slice_ty,
             ))
         }
+        ("push", MirPrimKind::ByteRing { cap }) => {
+            let src = if let Some(first) = first_positional_arg(args) {
+                let mut s = lower_fmt_buf_dst_be(first, be)?;
+                if matches!(s.kind, MirExprKind::StringLit(_)) && s.ty == MirType::Str {
+                    s.ty = MirType::Slice(Box::new(MirType::U8));
+                }
+                s
+            } else {
+                MirExpr::new(
+                    MirExprKind::StringLit(String::new()),
+                    MirType::Slice(Box::new(MirType::U8)),
+                )
+            };
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingPush {
+                    target,
+                    cap,
+                    src: Box::new(src),
+                    boost,
+                })),
+                MirType::Usize,
+            ))
+        }
+        ("push_byte", MirPrimKind::ByteRing { cap }) => {
+            let b = if let Some(first) = first_positional_arg(args) {
+                let raw = be.lower_sub(first, Some(&MirType::U8))?;
+                coerce_expr_if_needed(raw, &MirType::U8)
+            } else {
+                MirExpr::new(MirExprKind::IntLit(0), MirType::U8)
+            };
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingPushByte {
+                    target,
+                    cap,
+                    byte: Box::new(b),
+                    boost,
+                })),
+                MirType::Bool,
+            ))
+        }
+        ("grant_write", MirPrimKind::ByteRing { cap }) => {
+            let len = if let Some(first) = first_positional_arg(args) {
+                let raw = be.lower_sub(first, Some(&MirType::Usize))?;
+                coerce_expr_if_needed(raw, &MirType::Usize)
+            } else {
+                MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
+            };
+            let slice_ty = MirType::Slice(Box::new(MirType::U8));
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingGrantWrite {
+                    target,
+                    cap,
+                    len: Box::new(len),
+                })),
+                MirType::Result {
+                    ok: Box::new(slice_ty),
+                    err: None,
+                },
+            ))
+        }
+        ("read_slice", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingReadSlice { target, cap })),
+            MirType::Slice(Box::new(MirType::U8)),
+        )),
+        ("pop", MirPrimKind::ByteRing { cap }) => {
+            let dst = if let Some(first) = first_positional_arg(args) {
+                lower_fmt_buf_dst_be(first, be)?
+            } else {
+                MirExpr::new(
+                    MirExprKind::StringLit(String::new()),
+                    MirType::Slice(Box::new(MirType::U8)),
+                )
+            };
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingPop {
+                    target,
+                    cap,
+                    dst: Box::new(dst),
+                })),
+                MirType::Usize,
+            ))
+        }
+        ("try_pop_byte", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingTryPopByte { target, cap })),
+            MirType::Result {
+                ok: Box::new(MirType::U8),
+                err: None,
+            },
+        )),
+        ("len", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingLen { target, cap })),
+            MirType::Usize,
+        )),
+        ("free_space", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingFreeSpace { target, cap })),
+            MirType::Usize,
+        )),
+        ("cap", MirPrimKind::ByteRing { cap }) => {
+            Ok(MirExpr::new(MirExprKind::IntLit(cap as i128), MirType::Usize))
+        }
+        ("is_empty", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingIsEmpty { target, cap })),
+            MirType::Bool,
+        )),
+        ("is_full", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingIsFull { target, cap })),
+            MirType::Bool,
+        )),
         _ => Err(MirLowerError {
             message: format!("unknown primitive read method `.{method}()`"),
             span,
@@ -8700,6 +8897,40 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                                 active: false,
                             },
                         )));
+                    }
+                    ("consume", MirPrimKind::ByteRing { cap }) => {
+                        let len = if let Some(first) = first_positional_arg(args) {
+                            let raw = be.lower_sub(first, Some(&MirType::Usize))?;
+                            coerce_expr_if_needed(raw, &MirType::Usize)
+                        } else {
+                            MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
+                        };
+                        return Ok(Some(MirStmt::PrimOp(
+                            MirPrimNonBlockingOp::ByteRingConsume { target, cap, len },
+                        )));
+                    }
+                    ("commit_write", MirPrimKind::ByteRing { cap }) => {
+                        let len = if let Some(first) = first_positional_arg(args) {
+                            let raw = be.lower_sub(first, Some(&MirType::Usize))?;
+                            coerce_expr_if_needed(raw, &MirType::Usize)
+                        } else {
+                            MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
+                        };
+                        let boost = extract_boost_arg(args);
+                        return Ok(Some(MirStmt::PrimOp(
+                            MirPrimNonBlockingOp::ByteRingCommitWrite {
+                                target,
+                                cap,
+                                len,
+                                boost,
+                            },
+                        )));
+                    }
+                    ("clear", MirPrimKind::ByteRing { cap }) => {
+                        return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::ByteRingClear {
+                            target,
+                            cap,
+                        })));
                     }
                     _ => {}
                 }

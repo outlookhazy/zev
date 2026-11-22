@@ -60,3 +60,8 @@ pub fn start_timer1_ctc(u16 compare_top) {
     hw.TIMSK_REGS.timsk1 = hw.BIT_OCF1A;
     hw.TIMER1.tccr1b = 0x0C;
 }
+
+pub fn enable_uart_rx_irq() {
+    u8 cur = hw.USART0.ucsr0b;
+    hw.USART0.ucsr0b = cur | hw.BIT_RXCIE0;
+}

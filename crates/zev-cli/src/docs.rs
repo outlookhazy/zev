@@ -319,10 +319,10 @@ fn spi_burst_transfer([]u8 tx, *hw.GpioRegs cs_port, *hw.SpiRegs spi) {
     TopicDoc {
         name: "primitives",
         aliases: &[
-            "prim", "signal", "watch", "inbox", "chan", "channel", "channels", "isolation",
-            "globals", "boost",
+            "prim", "signal", "watch", "inbox", "byte_ring", "chan", "channel", "channels",
+            "isolation", "globals", "boost",
         ],
-        summary: "Static OS primitives (unified `inbox`, `watch`, `signal`) and ISR `boost: @critical`",
+        summary: "Static OS primitives (`inbox`, `watch`, `signal`, `byte_ring<N>`) and ISR `boost: @critical`",
         body: "\
 # Zev Topic Guide: `primitives`
 
@@ -335,9 +335,10 @@ values or static scheduler-aware OS primitives at module scope and pass pointers
 |---|---|---|---|
 | `watch<T> w = init;` | Latest-value cell | `w.read() -> T`, `w.publish(v)` | `w.wait() -> T` |
 | `inbox<T, N> q;` | Unified bounded queue | `q.post(v [, boost: @prio])`, `q.try_send(v) -> bool`, `q.try_recv()` | `q.send(v [, timeout: d])`, `q.recv([timeout: d]) -> T` |
+| `byte_ring<N> r;` | Lock-free SPSC stream / BipBuffer | `r.push(s)`, `r.push_byte(b)`, `r.grant_write(n)`, `r.commit_write(n)`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
 | `signal s;` | Lightweight wakeup | `s.notify([boost: @prio])`, `s.try_wait() -> bool`, `s.clear()` | `s.wait([timeout: d])` |
 
-Inspection helpers `.len()`, `.is_empty()`, `.is_full()` are non-blocking on `inbox<T, N>`.
+Inspection helpers `.len()`, `.is_empty()`, `.is_full()` work on both `inbox<T, N>` and `byte_ring<N>` (plus `.cap()` and `.free_space()` on `byte_ring<N>`), while stale `read_slice()`, `wait_read()`, or `grant_write()` slices after `consume()` / `pop()` / `commit_write()` are caught at compile time (`E0011`).
 
 ## 2. ISR Priority Elevation (`boost: @critical`) & Sequential Dispatch
 An `isr` can wake a low-priority supervisor at elevated priority for a single turn; priority

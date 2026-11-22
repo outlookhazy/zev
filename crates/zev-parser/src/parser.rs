@@ -2003,6 +2003,18 @@ impl<'a> Parser<'a> {
                             start.merge(gt_span),
                         )
                     }
+                    "byte_ring" if self.peek_n_kind(1) == TokenKind::Lt => {
+                        self.bump();
+                        self.expect(&TokenKind::Lt)?;
+                        let cap = self.parse_usize_literal(
+                            "byte_ring capacity (e.g. `byte_ring<256>`)",
+                        )?;
+                        let gt_span = self.expect_type_gt()?;
+                        TypeExpr::new(
+                            TypeKind::OsPrimitive(OsPrimitiveType::ByteRing { cap }),
+                            start.merge(gt_span),
+                        )
+                    }
                     "chan" if self.peek_n_kind(1) == TokenKind::Lt => {
                         // Trap retired `chan<T, N>` (or `chan<T>`) with `P0012` -> unified `inbox<T, N>`!
                         self.bump(); // `chan`

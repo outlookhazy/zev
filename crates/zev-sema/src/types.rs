@@ -66,6 +66,7 @@ pub enum PrimitiveKind {
     Watch,
     PingPong,
     Lease,
+    ByteRing,
 }
 
 impl PrimitiveKind {
@@ -76,6 +77,7 @@ impl PrimitiveKind {
             Self::Watch => "watch",
             Self::PingPong => "ping_pong",
             Self::Lease => "lease",
+            Self::ByteRing => "byte_ring",
         }
     }
 
@@ -100,7 +102,10 @@ pub enum ResolvedOsPrimitive {
     Watch { elem: Box<Ty> },
     PingPong { elem: Box<Ty>, cap: usize },
     Lease { elem: Box<Ty>, cap: usize },
+    ByteRing { cap: usize },
 }
+
+static BYTE_RING_ELEM_U8: Ty = Ty::Prim(PrimType::U8);
 
 impl ResolvedOsPrimitive {
     pub const fn kind(&self) -> PrimitiveKind {
@@ -110,6 +115,7 @@ impl ResolvedOsPrimitive {
             Self::Watch { .. } => PrimitiveKind::Watch,
             Self::PingPong { .. } => PrimitiveKind::PingPong,
             Self::Lease { .. } => PrimitiveKind::Lease,
+            Self::ByteRing { .. } => PrimitiveKind::ByteRing,
         }
     }
 
@@ -120,15 +126,17 @@ impl ResolvedOsPrimitive {
             | Self::Watch { elem }
             | Self::PingPong { elem, .. }
             | Self::Lease { elem, .. } => Some(elem),
+            Self::ByteRing { .. } => Some(&BYTE_RING_ELEM_U8),
         }
     }
 
     pub const fn capacity(&self) -> Option<usize> {
         match self {
             Self::Signal | Self::Watch { .. } => None,
-            Self::Inbox { cap, .. } | Self::PingPong { cap, .. } | Self::Lease { cap, .. } => {
-                Some(*cap)
-            }
+            Self::Inbox { cap, .. }
+            | Self::PingPong { cap, .. }
+            | Self::Lease { cap, .. }
+            | Self::ByteRing { cap } => Some(*cap),
         }
     }
 }
@@ -141,6 +149,7 @@ impl fmt::Display for ResolvedOsPrimitive {
             Self::Watch { elem } => write!(f, "watch<{}>", elem),
             Self::PingPong { elem, cap } => write!(f, "ping_pong<{}, {}>", elem, cap),
             Self::Lease { elem, cap } => write!(f, "lease<{}, {}>", elem, cap),
+            Self::ByteRing { cap } => write!(f, "byte_ring<{}>", cap),
         }
     }
 }
@@ -439,6 +448,7 @@ impl Ty {
                 ResolvedOsPrimitive::Lease { elem, cap } => {
                     elem.byte_size(ptr_bytes, structs) * cap + 16
                 }
+                ResolvedOsPrimitive::ByteRing { cap } => cap + ptr_bytes + 28,
             },
             Self::Namespace(_) | Self::Error => 0,
         }

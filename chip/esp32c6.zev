@@ -24,8 +24,12 @@ pub mmio SystimerRegs {
 }
 
 pub mmio UsbDeviceRegs {
-    @rw u32 ep1      @ 0x00;
-    @rw u32 ep1_conf @ 0x04;
+    @rw  u32 ep1      @ 0x00;
+    @rw  u32 ep1_conf @ 0x04;
+    @ro  u32 int_raw  @ 0x08;
+    @ro  u32 int_st   @ 0x0C;
+    @rw  u32 int_ena  @ 0x10;
+    @w1c u32 int_clr  @ 0x14;
 }
 
 pub mmio IntmtxRegs {
@@ -85,6 +89,8 @@ pub irq IRQ_FROM_CPU0        = 22;
 pub irq IRQ_FROM_CPU1        = 23;
 pub irq IRQ_GPIO             = 30;
 pub irq IRQ_UART0            = 43;
+pub irq IRQ_USB_DEVICE       = 48;
+pub irq IRQ_RMT              = 49;
 pub irq IRQ_SYSTIMER_TARGET0 = 57;
 
 pub const u32 PIN_RGB_LED      = 8;

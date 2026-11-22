@@ -168,16 +168,17 @@ flowchart LR
 
 - **Why a State-Machine MIR in the middle:** Coroutine lowering, backward-liveness variable hoisting, disjoint frame union-packing, and scheduler synthesis happen *above* the backend:
   - **Stage 0 (`zev-codegen-c`):** Emits clean freestanding C99 for deterministic host simulation, Clang ASan/UBSan verification (`zevc run --sanitize`), and legacy MCU toolchains.
-  - **Stage 1 (`zev-codegen-llvm`):** Emits opaque-pointer LLVM 23 IR passed through middle-end `/bin/opt` + `/bin/llc` (`-O0`, `-O1`, `-O2` default, `-O3`, `-Os` `optsize`, and `-Oz` `minsize`—achieving ~38–42% `.text` Flash reductions over `-O0` while preserving `.iram1` cycle-exact routines and freestanding zero-libc startup) and linked via `/bin/ld.lld` into bare-metal ARM Cortex-M3 `.elf` and Espressif ESP32-C6 (`rv32imac`) Direct-Boot `.bin` images.
+  - **Stage 1 (`zev-codegen-llvm`):** Emits opaque-pointer LLVM 23 IR passed through middle-end `/bin/opt` + `/bin/llc` (`-O0`, `-O1`, `-O2` default, `-O3`, `-Os` `optsize`, and `-Oz` `minsize`—achieving ~38–42% `.text` Flash reductions over `-O0` while preserving freestanding zero-libc startup) and linked via `/bin/ld.lld` into bare-metal ARM Cortex-M3 `.elf`, Espressif ESP32-C6 (`rv32imac`) Direct-Boot `.bin`, and Microchip ATmega328P (`avr`, Arduino Uno R3 Optiboot) images.
 
 ---
 
 ## 4. Reference Examples
 
-- [`examples/motor_controller.zev`](examples/motor_controller.zev) + [`examples/motor_support.zev`](examples/motor_support.zev) — North Star dual-bus STM32G4 motor controller demonstrating `main()` + multi-instance `spawn`, periodic `noyield` PI loop, circular `ping_pong` UART DMA, `u16be` wire frames, ISR `boost: @critical`, and `20 B` disjoint child `union` SRAM savings.
+- [`examples/motor_controller.zev`](examples/motor_controller.zev) + [`examples/motor_support.zev`](examples/motor_support.zev) — North Star dual-bus STM32G4 motor controller demonstrating `main()` + multi-instance `spawn`, periodic `noyield` PI loop, circular `ping_pong` UART DMA, `u16be` wire frames, ISR `boost: @critical`, and `24 B` disjoint child `union` SRAM savings.
 - [`examples/sim_demo.zev`](examples/sim_demo.zev) — Deterministic ASan/UBSan host simulation timeline exercising big-endian DMA packets, `BadCrc` recovery, `EXTI0` priority boost/restore, and `LIGHT -> DEEP` sleep-lock clamping.
 - [`examples/cortex_m_demo.zev`](examples/cortex_m_demo.zev) — Zero-C bare-metal ARM Cortex-M3 firmware executing live in `qemu-system-arm` with real NVIC preemption and `SysTick`.
-- [`examples/esp32c6_demo.zev`](examples/esp32c6_demo.zev) — Zero-bootloader ESP32-C6-Pico (`rv32imac` Direct-Boot) firmware verified on physical silicon (`16 MHz SYSTIMER`, `.iram1` WS2812B RGB driver on `GPIO8`, debounced `GPIO9` button `boost: @critical`, and `USB_DEVICE` serial telemetry).
+- [`examples/esp32c6_demo.zev`](examples/esp32c6_demo.zev) — Zero-bootloader ESP32-C6-Pico (`rv32imac` Direct-Boot) firmware verified on physical silicon (`16 MHz SYSTIMER`, pure-`.zev` hardware `RMT` WS2812B RGB driver on `GPIO8`, `GPIO9` button `boost: @critical`, interrupt-driven `USB_DEVICE` serial `byte_ring` commands, and zero-C `USB_DEVICE` telemetry).
+- [`examples/arduino_uno_demo.zev`](examples/arduino_uno_demo.zev) — Zero-C Microchip ATmega328P / Arduino Uno R3 (`avr` Optiboot STK500v1) firmware verified on physical silicon (`Timer0` 1 kHz tick, `Timer1` compare ISR, shared `PCINT0` ISRs, and interrupt-driven `USART0` RX `byte_ring` commands).
 
 ---
 
@@ -200,11 +201,11 @@ flowchart LR
 
 ### 6.1 Live in `zevc` v0.1 Today
 - [x] Lexer, recursive-descent `.zev` parser, `f32`/`f64` float literals, `<T, usize N>` generics, `f"..."` interpolation, and foreign-idiom traps `P0001`–`P0012` (`crates/zev-parser`).
-- [x] Whole-program static verifier `E0001`–`E0029`: `<T, usize N>` monomorphization, 3-tier call-graph yield inference, shortest-path yield traces, Boot-Tree `spawn` provenance, immortal `task` + unreachable-code safety, static `fmt_buf` capacity proofs, global/ISR isolation, `noyield`/`critical`/`defer`/`extern "C"` callback safety, zero-`'a` scope-depth & DMA `ping_pong` lease tracking, and fuzzy primitive/identifier hints (`crates/zev-sema`).
-- [x] Built-in `zevc doc` progressive-disclosure primer, 8 topic guides, 41 verified `BAD`/`GOOD` error explainers, and `zevc check --json` (`crates/zev-cli`).
+- [x] Whole-program static verifier `E0001`–`E0033`: `<T, usize N>` monomorphization, 3-tier call-graph yield inference, shortest-path yield traces, Boot-Tree `spawn` provenance, immortal `task` + unreachable-code safety, static `fmt_buf` capacity proofs, global/ISR isolation, `noyield`/`critical`/`defer`/`extern "C"` callback safety, zero-`'a` scope-depth, DMA `ping_pong` & `byte_ring` lease tracking, and fuzzy primitive/identifier hints (`crates/zev-sema`).
+- [x] Built-in `zevc doc` progressive-disclosure primer, 8 topic guides, 45 verified `BAD`/`GOOD` error explainers, and `zevc check --json` (`crates/zev-cli`).
 - [x] CFG state-machine MIR lowering, backward-liveness frame variable hoisting, disjoint child coroutine `union` packing, `SoftYielding` `noyield` clone specialization, compile-time `f"..."` / `{pkt:?}` expansion, and static zero-heap `zevc ram` budget & provenance reports (`crates/zev-mir`).
 - [x] Stage-0 freestanding C99 emitter + deterministic host simulation harness verified under Clang `-fsanitize=address,undefined` (`crates/zev-codegen-c`).
-- [x] Stage-1 native LLVM 23 backend (`crates/zev-codegen-llvm`) with `/bin/opt` + `/bin/llc` (`-O0`..`-O3`, `-Os`, `-Oz`) targeting bare-metal ARM Cortex-M3 `.elf` (`qemu-system-arm`) and physical Espressif ESP32-C6 (`rv32imac` Direct-Boot `.bin`).
+- [x] Stage-1 native LLVM 23 backend (`crates/zev-codegen-llvm`) with `/bin/opt` + `/bin/llc` (`-O0`..`-O3`, `-Os`, `-Oz`) targeting bare-metal ARM Cortex-M3 `.elf` (`qemu-system-arm`), physical Espressif ESP32-C6 (`rv32imac` Direct-Boot `.bin`), and physical Microchip ATmega328P (`avr`, Arduino Uno R3 Optiboot).
 
 ### 6.2 Established Semantic Refinements (Wave 1 & Wave 2 Complete)
 - [x] Enforce **Boot-Tree `spawn`** (`E0027`): permit `spawn` inside `fn main()` (including conditional `if` / `switch` boot branches) and boot-only setup `fn`s called before scheduler start; forbid `spawn` inside loops, recursion, `task`s, and `isr`s; print full static spawn provenance paths (`main -> usb.start -> usb::xfer_task @high`) in `zevc ram`.
@@ -223,6 +224,6 @@ flowchart LR
 - [x] Compile-time `irq` token delegation (`vec.attach(handler(inst, regs))` and `attach_shared`) synthesizing zero-RAM Flash `.isr_vector` (ARM Cortex-M NVIC) and RISC-V `INTMTX` + `mtvec` (ESP32-C6) dispatch with baked constant instance pointers and compile-time duplicate-attachment checks.
 - [x] Typed `mmio` register blocks (`@rw`, `@ro`, `@wo`, `@w1c` forbidding RMW on W1C/WO, `u8`/`u16`/`u32` widths, register arrays) + `zevc import-svd <chip.svd>`.
 - [x] ISR-private persistent `state` variables (static `.bss` scoped exclusively to a single `isr`).
-- [ ] Lock-free SPSC `byte_ring<N>` with wrap-safe `push`/`pop`, BipBuffer-style `grant_write(len) error`, and compile-time `read_slice()` invalidation on `consume(n)`.
+- [x] Lock-free SPSC `byte_ring<N>` with wrap-safe `push`/`pop`, BipBuffer-style `grant_write(len) error`, `wait_read([timeout: d])` with `boost:`, and compile-time `read_slice()` / `grant_write()` lease invalidation (`E0011`) on `consume(n)` / `commit_write(n)`.
 - [ ] Bidirectional zero-copy `@dma_safe pool<T, K>` + move-only `Lease<T>` handles with `dma_slot<T>` in-flight parking across IRQs, leak-free full-queue `inbox.post(lease)` recycling, and IRQ-safe `O(1)` bitmap allocation + cache-line alignment (retiring standalone v0.1 `lease<T, N>`, while keeping `@dma_safe ping_pong<T, N>` for contiguous `2 * N` hardware circular `HALF_TRANSFER` / `FULL_TRANSFER` DMA).
 - [ ] Whole-program visibility optimizations: automatic IRQ-mask elision on task-to-task and 1-ISR SPSC queues, singleton subsystem constant-folding (`instance_count == 1`), dead `watch` stripping (`readers == 0`), and static call-graph + LLVM `.stack_sizes` single-stack + `.bss` high-water proof in `zevc ram`.
