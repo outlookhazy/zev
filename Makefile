@@ -2,7 +2,7 @@ CARGO ?= cargo
 PORT  ?= /dev/ttyACM0
 ZEVC  := $(CARGO) run --quiet --bin zevc --
 
-.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno
+.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every
 
 all: test
 
@@ -12,7 +12,7 @@ build:
 doc:
 	$(ZEVC) doc >/dev/null
 	$(ZEVC) doc --list >/dev/null
-	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029 E0030 E0031 E0032 E0033; do \
+	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 P0013 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029 E0030 E0031 E0032 E0033 E0034; do \
 		$(ZEVC) doc $$q >/dev/null || exit 1; \
 	done
 	@echo "OK (zevc doc primer, 8 topics, and error explainers verified)"
@@ -23,6 +23,7 @@ check:
 	$(ZEVC) check examples/cortex_m_demo.zev
 	$(ZEVC) check examples/esp32c6_demo.zev
 	$(ZEVC) check examples/arduino_uno_demo.zev
+	$(ZEVC) check examples/arduino_nano_every_demo.zev
 
 ram:
 	$(ZEVC) ram examples/motor_controller.zev examples/motor_support.zev
@@ -44,6 +45,12 @@ uno:
 
 flash-uno:
 	$(ZEVC) flash-avr examples/arduino_uno_demo.zev --port $(PORT)
+
+nano-every:
+	$(ZEVC) build-nano-every examples/arduino_nano_every_demo.zev -o /tmp/zev-nano-every/arduino_nano_every_demo.bin
+
+flash-nano-every:
+	$(ZEVC) flash-nano-every examples/arduino_nano_every_demo.zev --port $(PORT)
 
 test:
 	$(CARGO) test --workspace -- --test-threads=2

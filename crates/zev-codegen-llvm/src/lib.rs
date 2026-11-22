@@ -10,6 +10,7 @@
 //!   `.iram1` WS2812B RGB driver (`GPIO8`), and `BOOT` button (`GPIO9`) into a flashable `.bin`!
 
 pub mod avr;
+pub mod avr_mega0;
 pub mod esp32c6;
 pub mod mir_codegen;
 pub mod nvic;
@@ -19,6 +20,7 @@ pub mod toolchain;
 
 use std::path::Path;
 
+pub use avr_mega0::{flash_avr_nano_every_bin, objcopy_elf_to_avr_nano_every_bin};
 pub use esp32c6::ESP32C6_DIRECT_BOOT_MAGIC;
 pub use mir_codegen::emit_llvm_ir_with_options;
 pub use nvic::NvicMap;
@@ -102,6 +104,39 @@ pub fn build_avr_uno_image_with_options(
 ) -> Result<AvrImageResult, CodegenError> {
     let elf = build_elf(module, out_elf, opts)?;
     let (bin_size, sram_static_bytes) = objcopy_elf_to_avr_bin(&elf.elf_path, out_bin)?;
+    Ok(AvrImageResult {
+        elf,
+        bin_path: out_bin.to_path_buf(),
+        bin_size,
+        sram_static_bytes,
+    })
+}
+
+/// Build a freestanding Microchip ATmega4809 (`avrxmega3`, Arduino Nano Every UPDI) `.elf` and
+/// Flash `.bin` image (verifying zero undefined/heap symbols, reset `jmp` vector, `<= 49,152 B`
+/// Flash, and `< 5,632 B` static SRAM inside the 6 KB internal SRAM).
+pub fn build_avr_nano_every_image(
+    module: &zev_mir::MirModule,
+    out_elf: &Path,
+    out_bin: &Path,
+) -> Result<AvrImageResult, CodegenError> {
+    build_avr_nano_every_image_with_options(
+        module,
+        out_elf,
+        out_bin,
+        &CodegenOptions::avr_nano_every(),
+    )
+}
+
+/// Build a freestanding Microchip ATmega4809 (`avrxmega3`) `.elf` and Flash `.bin` with custom [`CodegenOptions`].
+pub fn build_avr_nano_every_image_with_options(
+    module: &zev_mir::MirModule,
+    out_elf: &Path,
+    out_bin: &Path,
+    opts: &CodegenOptions,
+) -> Result<AvrImageResult, CodegenError> {
+    let elf = build_elf(module, out_elf, opts)?;
+    let (bin_size, sram_static_bytes) = objcopy_elf_to_avr_nano_every_bin(&elf.elf_path, out_bin)?;
     Ok(AvrImageResult {
         elf,
         bin_path: out_bin.to_path_buf(),
@@ -3653,6 +3688,496 @@ fn main() {
                 "expected descriptive validation error for vector {bad_num}"
             );
         }
+    }
+
+    #[test]
+    fn avr_mega0_irq_vector_validation_rejects_reserved_and_out_of_range_slots() {
+        assert!(
+            avr_mega0::validate_avr_mega0_irq_vectors(&[])
+                .expect("empty ok")
+                .is_empty()
+        );
+
+        let make_vec = |irq_num: u32, irq_name: &str| zev_mir::MirIrqVector {
+            irq_name: irq_name.to_string(),
+            irq_num,
+            is_shared: false,
+            selector_symbol: None,
+            bindings: vec![zev_mir::MirIrqBinding {
+                binding_id: 0,
+                isr_name: "dummy_isr".to_string(),
+                baked_args: Vec::new(),
+                state_vars: Vec::new(),
+                cond_selector: None,
+            }],
+        };
+
+        let attached = avr_mega0::validate_avr_mega0_irq_vectors(&[
+            make_vec(12, "IRQ_TCB0_INT"),
+            make_vec(35, "IRQ_PORTE_PORT"),
+            make_vec(36, "IRQ_TCB3_INT"),
+            make_vec(39, "IRQ_USART3_TXC"),
+        ])
+        .expect("slots 12, 35, 36, 39 are all valid on pure-ISA ATmega4809");
+        assert!(
+            attached.contains(&12)
+                && attached.contains(&35)
+                && attached.contains(&36)
+                && attached.contains(&39)
+        );
+
+        for (bad_num, name) in [(0, "RESET"), (40, "OOB")] {
+            let err = avr_mega0::validate_avr_mega0_irq_vectors(&[make_vec(bad_num, name)])
+                .expect_err("reserved/out-of-range ATmega4809 vector must be rejected");
+            assert!(
+                !err.message.is_empty(),
+                "expected descriptive validation error for ATmega4809 vector {bad_num}"
+            );
+        }
+    }
+
+    #[test]
+    fn atmega4809_standalone_builds_bin_disasm_and_stack_proof() {
+        assert!(
+            !include_str!("avr_mega0.rs").contains("inttoptr"),
+            "avr_mega0.rs must remain 100% peripheral-free pure avrxmega3 ISA/CPU"
+        );
+
+        let src = r#"
+mmio PortRegs {
+    @rw u8 dir    @ 0x00;
+    @wo u8 dirset @ 0x01;
+    @wo u8 outtgl @ 0x07;
+}
+mmio UsartRegs {
+    @wo u8 txd_l  @ 0x02;
+    @ro u8 status @ 0x04;
+}
+mmio PORTE  : PortRegs  @ 0x0480;
+mmio USART3 : UsartRegs @ 0x0860;
+
+irq IRQ_TCB0_INT = 12;
+irq IRQ_TCB3_INT = 36;
+irq IRQ_USART3_RXC = 37;
+
+signal tick_sig;
+
+pub fn console_putc(u8 c) {
+    while ((USART3.status & 0x20) == 0) {}
+    USART3.txd_l = c;
+}
+
+isr systick_isr() {
+    sys.tick();
+}
+
+isr tcb0_isr(*signal s) {
+    state u16 pulses = 0;
+    pulses += 1;
+    s.notify(boost: @critical);
+}
+
+isr rx_isr() {
+    state u8 seen = 0;
+    seen += 1;
+}
+
+task blinker(*signal s) {
+    loop {
+        s.wait();
+        PORTE.outtgl = 0x04;
+        u32 ms = now_ms();
+        println(f"NANO4809 ms={ms}");
+        delay(10ms);
+    }
+}
+
+fn main() {
+    PORTE.dirset = 0x04;
+    IRQ_TCB3_INT.attach(systick_isr());
+    IRQ_TCB0_INT.attach(tcb0_isr(&tick_sig));
+    IRQ_USART3_RXC.attach(rx_isr());
+    spawn blinker(&tick_sig) @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse ATmega4809 standalone test");
+        zev_sema::analyze_program(&prog).expect("sema ATmega4809 standalone test");
+        let mir = zev_mir::lower_program(&prog).expect("lower ATmega4809 standalone test");
+
+        let dir = test_out_dir();
+        let out_elf = dir.join("atmega4809_standalone.elf");
+        let out_bin = dir.join("atmega4809_standalone.bin");
+
+        let img = build_avr_nano_every_image(&mir, &out_elf, &out_bin)
+            .unwrap_or_else(|e| panic!("ATmega4809 image build failed: {e}"));
+
+        verify_ll_with_opt(&img.elf.ll_path)
+            .expect("LLVM 23 opt -passes=verify on atmega4809_standalone.ll");
+
+        assert!(img.elf.audit.is_zero_heap_freestanding());
+        assert!(
+            !img.elf
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_avr_systick_isr"),
+            "unexpected Rust-hardcoded `__syn_avr_systick_isr` in pure-ISA 4809 build"
+        );
+        let standalone_raw_ll =
+            std::fs::read_to_string(&img.elf.ll_path).expect("read standalone .ll");
+        assert!(standalone_raw_ll.contains("define void @__syn_sys_tick("));
+        assert!(standalone_raw_ll.contains("@__syn_fn_console_putc(i8 %c)"));
+        for req_sym in [
+            "__syn_avr_mega0_reset",
+            "__syn_avr_mega0_entry",
+            "__syn_uart_putc",
+            "__syn_avr_vec_12",
+            "__syn_avr_vec_36",
+            "__syn_avr_vec_37",
+        ] {
+            assert!(
+                img.elf.audit.defined_symbols.iter().any(|s| s == req_sym),
+                "missing ATmega4809 symbol {req_sym} in {:?}",
+                img.elf.audit.defined_symbols
+            );
+        }
+        assert!(
+            img.bin_size >= 160 && img.bin_size <= 49_152,
+            "expected ATmega4809 Flash image in 160..=49152 B, got {}",
+            img.bin_size
+        );
+        assert!(
+            img.sram_static_bytes > 0 && img.sram_static_bytes < 5_632,
+            "expected ATmega4809 static SRAM < 5632 B, got {}",
+            img.sram_static_bytes
+        );
+
+        let vec_objdump = Command::new("/bin/llvm-objdump")
+            .args(["-d", "--start-address=0x0000", "--stop-address=0x00a0"])
+            .arg(&img.elf.elf_path)
+            .output()
+            .expect("invoke llvm-objdump on ATmega4809 vector table");
+        assert!(vec_objdump.status.success());
+        let vec_disasm = String::from_utf8_lossy(&vec_objdump.stdout);
+        let jmp_count = vec_disasm
+            .lines()
+            .filter(|l| l.contains("\tjmp\t"))
+            .count();
+        assert_eq!(
+            jmp_count, 40,
+            "expected 40 `jmp` vectors in 0x0000..0x00A0, got {jmp_count}:\n{vec_disasm}"
+        );
+
+        let full_objdump = Command::new("/bin/llvm-objdump")
+            .arg("-d")
+            .arg(&img.elf.elf_path)
+            .output()
+            .expect("invoke full llvm-objdump on ATmega4809 ELF");
+        assert!(full_objdump.status.success());
+        let full_disasm = String::from_utf8_lossy(&full_objdump.stdout);
+        let full_lower = full_disasm.to_ascii_lowercase();
+
+        for (desc, hex_pat, dec_pat) in [
+            ("PORTE.DIRSET", "0x0481", "1153"),
+            ("PORTE.OUTTGL", "0x0487", "1159"),
+            ("USART3.TXDATAL", "0x0862", "2146"),
+            ("USART3.STATUS", "0x0864", "2148"),
+        ] {
+            let hex_short = hex_pat.trim_start_matches("0x0");
+            let found = full_lower.contains(hex_pat)
+                || full_lower.contains(&format!("0x{hex_short}"))
+                || full_lower.contains(dec_pat);
+            assert!(
+                found,
+                "expected {desc} ({hex_pat} / {dec_pat}) in ATmega4809 disassembly:\n{full_disasm}"
+            );
+        }
+        assert!(
+            !full_disasm.contains("in\tr26, 0x3d"),
+            "found forbidden AVR dynamic stack alloca in ATmega4809 ELF disassembly"
+        );
+
+        let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::avr_nano_every())
+            .expect("ATmega4809 hardware stack high-water proof");
+        assert_eq!(proof.sram_budget_bytes, 6_144);
+        assert!(proof.within_budget, "proof table:\n{}", proof.format_table());
+        assert!(!proof.has_cycle, "unexpected cycle in ATmega4809 call graph");
+        assert!(proof.format_table().contains("ATmega4809"));
+    }
+
+    #[test]
+    fn arduino_nano_every_demo_builds_avr_bin_and_passes_audit() {
+        let demo_path = repo_root().join("examples/arduino_nano_every_demo.zev");
+        if !demo_path.exists() {
+            return;
+        }
+        let mir = compile_example_mir(&[demo_path]);
+        assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
+
+        let dir = test_out_dir();
+        let out_elf = dir.join("arduino_nano_every_demo.elf");
+        let out_bin = dir.join("arduino_nano_every_demo.bin");
+
+        let img = build_avr_nano_every_image(&mir, &out_elf, &out_bin)
+            .unwrap_or_else(|e| panic!("arduino_nano_every_demo build failed: {e}"));
+
+        verify_ll_with_opt(&img.elf.ll_path)
+            .expect("LLVM 23 opt -passes=verify on arduino_nano_every_demo.ll");
+        assert!(img.elf.audit.is_zero_heap_freestanding());
+        assert!(
+            !img.elf
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_avr_systick_isr"),
+            "unexpected Rust-hardcoded `__syn_avr_systick_isr` in Nano Every demo"
+        );
+        for req_sym in [
+            "__syn_avr_mega0_reset",
+            "__syn_uart_putc",
+            "__syn_avr_vec_12",
+            "__syn_avr_vec_16",
+            "__syn_avr_vec_35",
+            "__syn_avr_vec_36",
+            "__syn_avr_vec_37",
+            "__syn_avr_vec_38",
+        ] {
+            assert!(
+                img.elf.audit.defined_symbols.iter().any(|s| s == req_sym),
+                "missing Nano Every demo symbol {req_sym} in {:?}",
+                img.elf.audit.defined_symbols
+            );
+        }
+        assert!(img.bin_size >= 160 && img.bin_size <= 49_152);
+        assert!(img.sram_static_bytes > 0 && img.sram_static_bytes < 5_632);
+
+        // Audit H-AVR-1: verify zero `urem` and zero `__udivmodsi4` calls inside
+        // `@__syn_scan_rank`, `@__syn_sched_loop`, `@__syn_ring_*`, `@__syn_q_*`,
+        // and all ISR / vector dispatchers in both `.ll` / `.opt.ll` and AVR disassembly!
+        let raw_ll = std::fs::read_to_string(&img.elf.ll_path).expect("read raw .ll");
+        let opt_ll_path = img.elf.elf_path.with_extension("opt.ll");
+        let opt_ll = std::fs::read_to_string(&opt_ll_path).unwrap_or_else(|_| raw_ll.clone());
+        let check_ll_fn_no_urem = |ll_text: &str, fn_marker: &str| {
+            let start = ll_text
+                .find(fn_marker)
+                .unwrap_or_else(|| panic!("missing {fn_marker} in IR"));
+            let rest = &ll_text[start..];
+            let end = rest.find("\n}\n").map(|i| i + 3).unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                !body.contains(" urem "),
+                "forbidden `urem` found inside {fn_marker}:\n{body}"
+            );
+        };
+        for ir in [&raw_ll, &opt_ll] {
+            check_ll_fn_no_urem(ir, "define i32 @__syn_scan_rank");
+            check_ll_fn_no_urem(ir, "define void @__syn_sched_loop");
+            for marker in [
+                "@__syn_isr_",
+                "@__syn_ring_",
+                "@__syn_q_",
+            ] {
+                let mut search_from = 0;
+                while let Some(rel) = ir[search_from..].find(marker) {
+                    let pos = search_from + rel;
+                    let line_start = ir[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    let line = &ir[line_start..];
+                    if line.starts_with("define ") {
+                        let end = line.find("\n}\n").map(|i| i + 3).unwrap_or(line.len());
+                        let body = &line[..end];
+                        let header = line.lines().next().unwrap_or(marker);
+                        assert!(
+                            !body.contains(" urem "),
+                            "forbidden `urem` found inside {header}:\n{body}"
+                        );
+                        search_from = line_start + end;
+                    } else {
+                        search_from = pos + marker.len();
+                    }
+                }
+            }
+        }
+
+        let disasm_out = Command::new("/bin/llvm-objdump")
+            .args(["-d", "--symbolize-operands"])
+            .arg(&img.elf.elf_path)
+            .output()
+            .expect("invoke llvm-objdump on arduino_nano_every_demo.elf");
+        assert!(disasm_out.status.success());
+        let disasm = String::from_utf8_lossy(&disasm_out.stdout);
+        let mut div32_addrs = std::collections::BTreeSet::new();
+        for line in disasm.lines() {
+            for div_sym in [
+                "<__udivmodsi4>:",
+                "<__divmodsi4>:",
+                "<__syn_avr_udivrem32>:",
+                "<__syn_avr_sdivrem32>:",
+            ] {
+                if line.ends_with(div_sym) {
+                    if let Some(addr_hex) = line.split_whitespace().next() {
+                        if let Ok(addr) = u64::from_str_radix(addr_hex, 16) {
+                            div32_addrs.insert(format!("0x{addr:x}"));
+                        }
+                    }
+                }
+            }
+        }
+        let mut cur_sym = String::new();
+        for line in disasm.lines() {
+            if let (Some(lt), Some(gt)) = (line.find('<'), line.find(">:")) {
+                if lt < gt {
+                    cur_sym = line[lt + 1..gt].to_string();
+                }
+            } else if line.contains("call") || line.contains("jmp") {
+                let hits_div32 = line.contains("__udivmodsi4")
+                    || line.contains("__divmodsi4")
+                    || line.contains("__syn_avr_udivrem32")
+                    || div32_addrs.iter().any(|a| line.ends_with(a.as_str()) || line.contains(&format!("{a} ")));
+                if hits_div32 {
+                    let is_sched_or_isr = cur_sym == "__syn_scan_rank"
+                        || cur_sym == "__syn_sched_loop"
+                        || cur_sym == "__syn_select_next_task"
+                        || cur_sym.starts_with("__syn_isr_")
+                        || cur_sym.starts_with("__syn_avr_vec_")
+                        || cur_sym.starts_with("__syn_vec_irq_")
+                        || cur_sym.starts_with("__syn_ring_")
+                        || cur_sym.starts_with("__syn_q_");
+                    assert!(
+                        !is_sched_or_isr,
+                        "forbidden 32-bit div/mod call inside `{cur_sym}`: {line}"
+                    );
+                }
+            }
+        }
+
+        // Verify all ATmega4809 peripheral accesses (`USART3`, `TCB3`, `PORTMUX`, `FUSE.OSCCFG`,
+        // `CLKCTRL`, `WDT`, `SLPCTRL`) come from pure `.zev` and that `CPU.ccp` (`0x34` / `52`)
+        // unlocks are immediately followed within <= 4 AVR cycles by 2-cycle `sts` writes to
+        // `WDT.ctrla` (`0x0100` / `256`) and `CLKCTRL.mclkctrlb` (`0x0061` / `97`).
+        let disasm_lower = disasm.to_ascii_lowercase();
+        for (desc, hex_pat, dec_pat) in [
+            ("USART3.TXDATAL", "0x0862", "2146"),
+            ("USART3.STATUS", "0x0864", "2148"),
+            ("USART3.BAUD", "0x0868", "2152"),
+            ("TCB3.INTCTRL", "0x0ab5", "2741"),
+            ("TCB3.INTFLAGS", "0x0ab6", "2742"),
+            ("TCB3.CCMP", "0x0abc", "2748"),
+            ("PORTMUX.USARTROUTEA", "0x05e2", "1506"),
+            ("FUSE.OSCCFG", "0x1282", "4738"),
+            ("CLKCTRL.MCLKCTRLB", "0x0061", "97"),
+            ("WDT.CTRLA", "0x0100", "256"),
+            ("SLPCTRL.CTRLA", "0x0050", "80"),
+        ] {
+            let hex_short = hex_pat.trim_start_matches("0x0");
+            let found = disasm_lower.contains(hex_pat)
+                || disasm_lower.contains(&format!("0x{hex_short}"))
+                || disasm_lower.contains(dec_pat);
+            assert!(
+                found,
+                "expected .zev peripheral access {desc} ({hex_pat} / {dec_pat}) in Nano Every disassembly:\n{disasm}"
+            );
+        }
+
+        let mut insns: Vec<(String, String)> = Vec::new();
+        for line in disasm_lower.lines() {
+            let trimmed = line.trim_start();
+            if let Some((_addr, rest)) = trimmed.split_once(':') {
+                let mut tab_parts = rest.trim_start().split('\t');
+                let _bytes = tab_parts.next();
+                if let Some(mnem) = tab_parts.next() {
+                    let ops = tab_parts.next().unwrap_or("").trim().to_string();
+                    insns.push((mnem.trim().to_string(), ops));
+                }
+            }
+        }
+        let mut saw_ccp_wdt = false;
+        let mut saw_ccp_clk = false;
+        for pair in insns.windows(2) {
+            let (m0, op0) = &pair[0];
+            let (m1, op1) = &pair[1];
+            let is_ccp_write = (m0 == "out"
+                && (op0.starts_with("0x34,") || op0.starts_with("52,")))
+                || (m0 == "sts"
+                    && (op0.starts_with("0x0034,")
+                        || op0.starts_with("0x34,")
+                        || op0.starts_with("52,")));
+            if is_ccp_write {
+                assert_eq!(
+                    m1, "sts",
+                    "expected 2-cycle `sts` immediately after `CPU.ccp` write (<= 4 cycles), got `{m1} {op1}`"
+                );
+                if op1.starts_with("0x0100,")
+                    || op1.starts_with("0x100,")
+                    || op1.starts_with("256,")
+                {
+                    saw_ccp_wdt = true;
+                }
+                if op1.starts_with("0x0061,")
+                    || op1.starts_with("0x61,")
+                    || op1.starts_with("97,")
+                {
+                    saw_ccp_clk = true;
+                }
+            }
+        }
+        assert!(
+            saw_ccp_wdt && saw_ccp_clk,
+            "expected 4-cycle CCP unlock pairs for both WDT.CTRLA (0x0100) and CLKCTRL.MCLKCTRLB (0x0061), got wdt={saw_ccp_wdt}, clk={saw_ccp_clk}"
+        );
+
+        let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::avr_nano_every())
+            .expect("arduino_nano_every_demo stack high-water proof");
+        assert_eq!(proof.sram_budget_bytes, 6_144);
+        assert!(proof.within_budget, "proof table:\n{}", proof.format_table());
+        assert!(!proof.has_cycle);
+    }
+
+    #[test]
+    fn avr_mega0_muxto_flasher_script_parses_and_matches_crc16_ccitt() {
+        let check_py = r#"
+import ast, struct, sys
+
+script = sys.stdin.read()
+ast.parse(script)
+
+ns = {}
+crc_src = script.split("def crc16_ccitt")[1].split("def read_exact")[0]
+exec("def crc16_ccitt" + crc_src, ns)
+crc16 = ns["crc16_ccitt"]
+
+# Verify against JTAGICE mkII CMND_GET_SIGN_ON packet (`1B 00 00 01 00 00 00 0E 01`)
+# Known JTAGICE mkII CRC-16-CCITT (0x8408, seed 0xFFFF): 0xF397 (little-endian `97 F3`)
+pkt_sign_on = b"\x1B" + struct.pack("<HI", 0, 1) + b"\x0E\x01"
+# Verify against MuxTO `crc_table` (`0x0000, 0x1189, 0x2312, 0x329B` and `crc_table[0x80] = 0x8408`)
+assert crc16(b"\x7F") == (0x8408 ^ 0x00FF)
+for b, tbl_v in [(0xFF, 0x00FF), (0xFE, 0x1189 ^ 0x00FF), (0xFD, 0x2312 ^ 0x00FF), (0xFC, 0x329B ^ 0x00FF)]:
+    assert crc16(bytes([b])) == tbl_v, (hex(b), hex(crc16(bytes([b]))), hex(tbl_v))
+assert len(pkt_sign_on + struct.pack("<H", crc16(pkt_sign_on))) == 11
+print("OK")
+"#;
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(check_py)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn python3 for MuxTO flasher syntax & CRC check");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(avr_mega0::AVR_MUXTO_JTAG2UPDI_FLASH_SCRIPT.as_bytes())
+            .expect("feed flasher script");
+        let out = child.wait_with_output().expect("wait python3");
+        assert!(
+            out.status.success(),
+            "MuxTO flasher script check failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "OK");
     }
 
     #[test]

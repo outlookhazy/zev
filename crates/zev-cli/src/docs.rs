@@ -452,7 +452,7 @@ task net_worker() {
 `f\"...\"` unpacks at compile time into direct per-call-site chunk writes (zero `malloc`, zero runtime
 format-string parser, zero global handler registry):
 - **Console / UART Sinks**: `print(f\"...\");` and `println(f\"...\");` stream directly to host `stdout`,
-  Cortex-M3 `UART0` (`0x4000C000`), ESP32-C6 `USB_DEVICE`, or ATmega328P `USART0`.
+  Cortex-M3 `UART0` (`0x4000C000`), ESP32-C6 `USB_DEVICE`, ATmega328P `USART0`, or ATmega4809 `USART3`.
 - **Bounded Buffer Sink**: `fmt_buf(dst, f\"...\") -> []u8 error FmtErr` proves worst-case capacity fit at
   compile time when all holes are bounded (`E0028` if `dst` is too small) and returns dual-exit
   `error Truncated, clamped_slice;` when dynamic `[]u8` slices exceed `dst.len`.
@@ -467,9 +467,11 @@ format-string parser, zero global handler registry):
   - `{t:e}` / `{t:.3e}` — Scientific float (linked via `--gc-sections` *only* if `:e` appears in program!).
   - `{pkt:?}` — Compile-time struct field debug expansion (`\"CmdFrame { op: 1, ... }\"`).
 
-## 2. Portable Built-Ins & `sys.*` Namespace (Works Across C99 Sim, Cortex-M3 & ESP32-C6)
+## 2. Portable Built-Ins & `sys.*` Namespace (Works Across C99 Sim, Cortex-M3, ESP32-C6 & AVR)
 - `assert(cond);` / `delay(10ms);` / `checkpoint();` / `set_priority(@low);`
 - `sys.use_systick(u32 hz);` — Configures core timer (`12_000_000` on QEMU LM3S, `170_000_000` on STM32G4).
+- `sys.tick();` / `sys.tick_ms();` — Advances the 1 ms scheduler tick from a pure-`.zev` timer `isr` (e.g., `TCB3` on ATmega4809).
+- `pub fn console_putc(u8 c)` — Pure-`.zev` BSP console byte sink wired automatically into `print`/`println` on pure-ISA targets.
 - `sys.now_ms() -> u32` / `sys.now_ticks() -> u32` — Current monotonic millisecond tick counter.
 - `sys.log(*u8 msg);` / `sys.log_kv(*u8 label, i32 val);` / `sys.log_hex(*u8 label, u32 val);`
 - `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` in QEMU & host sim).
@@ -504,9 +506,10 @@ isr dma_rx_isr(*DmaRegs dma, u32 clr) {
         name: "targets",
         aliases: &[
             "target", "cli", "ram", "sim", "c99", "llvm", "elf", "qemu", "cortex-m", "cortex-m3",
-            "esp32", "esp32c6", "riscv", "avr", "atmega328p", "uno", "arduino", "svd", "import-svd",
+            "esp32", "esp32c6", "riscv", "avr", "atmega328p", "uno", "arduino", "atmega4809",
+            "nano-every", "nano", "updi", "svd", "import-svd",
         ],
-        summary: "CLI workflow: `check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, ESP32-C6, and AVR",
+        summary: "CLI workflow: `check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, ESP32-C6, Uno & Nano Every",
         body: "\
 # Zev Topic Guide: `targets`
 
@@ -522,13 +525,14 @@ zevc check --json app.zev             # Structured JSON diagnostics + dual-spec 
 Generate typed `.zev` `pub mmio` layouts, peripheral base addresses, and `pub irq` tokens directly
 from any vendor CMSIS-SVD file, inspect exact 32-bit/64-bit `.bss`/ISR `state`/union RAM budgets
 (with singleton constant-folding `[singleton -> folded]`, dead-`watch` stripping & IRQ-mask elision telemetry), or run a hardware single-stack +
-`.bss` high-water proof (`--target <cortex-m3|esp32c6|avr>` using LLVM `.stack_sizes` / AVR disassembly):
+`.bss` high-water proof (`--target <cortex-m3|esp32c6|avr|nano-every>` using LLVM `.stack_sizes` / AVR disassembly):
 ```bash
 zevc import-svd vendor/STM32G474.svd -o chip/stm32g474.zev
 zevc check -I chip examples/motor_controller.zev examples/motor_support.zev
 zevc ram examples/motor_controller.zev examples/motor_support.zev
 zevc ram --target esp32c6 examples/esp32c6_demo.zev
 zevc ram --target avr examples/arduino_uno_demo.zev
+zevc ram --target nano-every examples/arduino_nano_every_demo.zev
 ```
 
 ## 3. Stage 0: Freestanding C99 & Sanitized Host Simulation (`emit-c`, `run`)
@@ -565,6 +569,16 @@ Synthesizes the 26-slot Flash vector table, WDT disarm, `.data`/`.rodata`/`.bss`
 zevc emit-llvm --target avr examples/arduino_uno_demo.zev -o build/uno.ll
 zevc build-avr examples/arduino_uno_demo.zev -o build/uno_demo.bin
 zevc flash-avr examples/arduino_uno_demo.zev --port /dev/ttyACM0
+```
+
+## 7. Stage 1D: Bare-Metal Microchip ATmega4809 / Arduino Nano Every (`avrxmega3` UPDI)
+Synthesizes pure-ISA 40-slot Flash vectors + `.data`/`.bss` startup (zero peripheral MMIO in Rust), while
+`bsp.init_board()` configures `CPU.ccp` WDT/clock unlock, `FUSE.OSCCFG` 16/20 MHz auto-calibration,
+`SLPCTRL`, `isr systick_isr` (`TCB3` 1 kHz `sys.tick()`), and `pub fn console_putc(u8)` (`115200 8N1` `USART3`) in `.zev`:
+```bash
+zevc emit-llvm --target nano-every examples/arduino_nano_every_demo.zev -o build/nano.ll
+zevc build-nano-every examples/arduino_nano_every_demo.zev -o build/nano_every_demo.bin
+zevc flash-nano-every examples/arduino_nano_every_demo.zev --port /dev/ttyACM0
 ```
 ",
     },
@@ -688,6 +702,9 @@ mod tests {
             "views",
             "ram",
             "avr",
+            "nano-every",
+            "atmega4809",
+            "updi",
             "for",
             "defer",
             "restart",

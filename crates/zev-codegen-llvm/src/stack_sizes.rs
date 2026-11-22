@@ -36,6 +36,7 @@ pub const fn target_sram_budget_bytes(target: TargetArch) -> Option<u64> {
         TargetArch::Thumbv7mNoneEabi => Some(65_536),
         TargetArch::Riscv32Esp32C6 => Some(524_288),
         TargetArch::AvrAtmega328p => Some(2_048),
+        TargetArch::AvrAtmega4809 => Some(6_144),
         TargetArch::HostX86_64Linux => None,
     }
 }
@@ -79,6 +80,10 @@ impl HardwareStackProof {
             ),
             TargetArch::AvrAtmega328p => (
                 "Microchip ATmega328P AVR (avr / Arduino Uno R3)",
+                "AVR ELF disassembly (push + sbiw/rcall.+0 + 2B return PC + 2B IRQ push)",
+            ),
+            TargetArch::AvrAtmega4809 => (
+                "Microchip ATmega4809 AVR (avrxmega3 / Arduino Nano Every)",
                 "AVR ELF disassembly (push + sbiw/rcall.+0 + 2B return PC + 2B IRQ push)",
             ),
             TargetArch::HostX86_64Linux => (
@@ -243,8 +248,8 @@ fn compile_ll_to_obj_with_stack_sizes(
                 .arg("-data-sections")
                 .arg("--stack-size-section");
         }
-        TargetArch::AvrAtmega328p => {
-            cmd.arg("-mcpu=atmega328p")
+        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
+            cmd.arg(format!("-mcpu={}", opts.target.avr_mcpu()))
                 .arg("-function-sections")
                 .arg("-data-sections");
         }
@@ -830,7 +835,7 @@ fn walk_worst_stack(
     res
 }
 
-/// Compile `mir` for `opts.target` (`Thumbv7mNoneEabi`, `Riscv32Esp32C6`, or `AvrAtmega328p`)
+/// Compile `mir` for `opts.target` (`Thumbv7mNoneEabi`, `Riscv32Esp32C6`, `AvrAtmega328p`, or `AvrAtmega4809`)
 /// and prove worst-case hardware single-stack + `.data`/`.bss` SRAM high-water mark against target limits.
 pub fn analyze_hardware_stack_high_water(
     mir: &MirModule,
@@ -839,7 +844,7 @@ pub fn analyze_hardware_stack_high_water(
     let sram_budget_bytes = target_sram_budget_bytes(opts.target).ok_or_else(|| {
         CodegenError::new(
             "stack-sizes",
-            "hardware stack high-water proof only supports bare-metal targets (`cortex-m3`, `esp32c6`, `avr`)",
+            "hardware stack high-water proof only supports bare-metal targets (`cortex-m3`, `esp32c6`, `avr`, `nano-every`)",
         )
     })?;
 
@@ -891,12 +896,12 @@ pub fn analyze_hardware_stack_high_water(
             let g = build_arm_or_rv_call_graph(opts.target, &disasm, &ll_text, &frames);
             (frames, g)
         }
-        TargetArch::AvrAtmega328p => analyze_avr_disasm(&disasm),
+        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => analyze_avr_disasm(&disasm),
         TargetArch::HostX86_64Linux => unreachable!(),
     };
 
     // Wire indirect task-step dispatch edges from `__syn_sched_loop` -> `__syn_task_step_<bp>`
-    let step_edge_cost = if opts.target == TargetArch::AvrAtmega328p {
+    let step_edge_cost = if opts.target.is_avr() {
         2
     } else {
         0
@@ -934,6 +939,7 @@ pub fn analyze_hardware_stack_high_water(
             "Reset_Handler",
             "__syn_esp32c6_reset",
             "__syn_avr_entry",
+            "__syn_avr_mega0_entry",
             "_start",
         ]
         .into_iter()
@@ -1061,7 +1067,7 @@ pub fn analyze_hardware_stack_high_water(
                     }
                 }
             }
-            TargetArch::AvrAtmega328p => {
+            TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
                 let hw_frame = 2u64;
                 let mut candidates = Vec::new();
                 if disasm.elf_symbols.contains("__syn_avr_systick_isr")

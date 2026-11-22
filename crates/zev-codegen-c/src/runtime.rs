@@ -447,9 +447,64 @@ static SYN_UNUSED inline void syn_sys_use_systick(uint32_t hz) {{
     g_syn_sleep.systick_configured = true;
 }}
 
+typedef void (*syn_putc_fn_t)(uint8_t);
+static SYN_UNUSED syn_putc_fn_t g_syn_user_putc = NULL;
+
+static SYN_UNUSED inline void syn_sys_set_putc(syn_putc_fn_t fn) {{
+    g_syn_user_putc = fn;
+}}
+
+static SYN_UNUSED inline void syn_sys_tick(void) {{
+    syn_enter_critical();
+    g_syn_tick_ms += 1U;
+    g_syn_sleep.systick_configured = true;
+    syn_exit_critical();
+}}
+
+static SYN_UNUSED inline void syn_user_putc_cstr(const void *msg) {{
+    if (g_syn_user_putc == NULL || msg == NULL) {{ return; }}
+    const uint8_t *p = (const uint8_t *)msg;
+    while (*p != 0U) {{
+        g_syn_user_putc(*p++);
+    }}
+}}
+
+static SYN_UNUSED inline void syn_user_putc_i32(int32_t val) {{
+    uint32_t mag;
+    if (val < 0) {{
+        g_syn_user_putc((uint8_t)'-');
+        mag = (uint32_t)(-(val + 1)) + 1U;
+    }} else {{
+        mag = (uint32_t)val;
+    }}
+    uint8_t buf[10];
+    uint32_t n = 0U;
+    do {{
+        buf[n++] = (uint8_t)('0' + (mag % 10U));
+        mag /= 10U;
+    }} while (mag > 0U);
+    while (n > 0U) {{
+        g_syn_user_putc(buf[--n]);
+    }}
+}}
+
+static SYN_UNUSED inline void syn_user_putc_hex32(uint32_t val) {{
+    const char *hex = "0123456789ABCDEF";
+    g_syn_user_putc((uint8_t)'0');
+    g_syn_user_putc((uint8_t)'x');
+    for (int shift = 28; shift >= 0; shift -= 4) {{
+        g_syn_user_putc((uint8_t)hex[(val >> shift) & 0xFU]);
+    }}
+}}
+
 /* ── System Diagnostics & Logging Helpers ────────────────────────────────── */
 
 static SYN_UNUSED inline void syn_sys_log(const void *msg) {{
+    if (g_syn_user_putc != NULL) {{
+        syn_user_putc_cstr(msg);
+        g_syn_user_putc((uint8_t)'\n');
+        return;
+    }}
 #if !defined(SYN_FREESTANDING)
     puts((msg != NULL) ? (const char *)msg : "");
     fflush(stdout);
@@ -459,6 +514,12 @@ static SYN_UNUSED inline void syn_sys_log(const void *msg) {{
 }}
 
 static SYN_UNUSED inline void syn_sys_log_kv(const void *label, int32_t val) {{
+    if (g_syn_user_putc != NULL) {{
+        syn_user_putc_cstr(label);
+        syn_user_putc_i32(val);
+        g_syn_user_putc((uint8_t)'\n');
+        return;
+    }}
 #if !defined(SYN_FREESTANDING)
     printf("%s%d\n", (label != NULL) ? (const char *)label : "", (int)val);
     fflush(stdout);
@@ -469,6 +530,12 @@ static SYN_UNUSED inline void syn_sys_log_kv(const void *label, int32_t val) {{
 }}
 
 static SYN_UNUSED inline void syn_sys_log_hex(const void *label, uint32_t val) {{
+    if (g_syn_user_putc != NULL) {{
+        syn_user_putc_cstr(label);
+        syn_user_putc_hex32(val);
+        g_syn_user_putc((uint8_t)'\n');
+        return;
+    }}
 #if !defined(SYN_FREESTANDING)
     printf("%s0x%08X\n", (label != NULL) ? (const char *)label : "", (unsigned)val);
     fflush(stdout);
@@ -1402,13 +1469,22 @@ static SYN_UNUSED inline void syn_fmt_write(syn_fmt_sink_t *s, const void *data,
             s->truncated = true;
         }}
     }} else {{
+        if (g_syn_user_putc != NULL) {{
+            if (data != NULL) {{
+                const uint8_t *src = (const uint8_t *)data;
+                for (size_t i = 0U; i < len; i++) {{
+                    g_syn_user_putc(src[i]);
+                }}
+            }}
+        }} else {{
 #if !defined(SYN_FREESTANDING)
-        if (data != NULL) {{
-            (void)fwrite(data, 1U, len, stdout);
-        }}
+            if (data != NULL) {{
+                (void)fwrite(data, 1U, len, stdout);
+            }}
 #else
-        (void)data;
+            (void)data;
 #endif
+        }}
     }}
 }}
 

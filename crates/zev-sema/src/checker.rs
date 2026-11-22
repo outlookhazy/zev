@@ -2560,28 +2560,45 @@ impl Analyzer {
             }
         }
 
-        // 2. Check all `extern "C"` callback arguments for yielding, boot-spawning, or boot-attaching functions.
+        // 2. Check all `extern "C"` and `sys.set_putc` callback arguments for yielding, boot-spawning, or boot-attaching functions.
         let cb_sites = self.call_graph.extern_callbacks.clone();
         for site in &cb_sites {
             if let Some(cb_node) = self.call_graph.nodes.get(&site.callback_fn).cloned() {
+                let is_sys_putc = site.extern_fn == "sys.set_putc";
                 if cb_node.any_yield_effect.can_yield() {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
                     let sub_chain = self
                         .call_graph
                         .shortest_any_yield_chain(&site.callback_fn)
                         .join(" -> ");
-                    let note = format!(
-                        "yield chain: extern \"C\" {}(...) callback -> {}; stackless coroutines cannot suspend across C stack frames—pass a non-yielding `fn` callback",
-                        site.extern_fn, sub_chain
-                    );
-                    self.emit(
-                        Diagnostic::new(
-                            DiagnosticKind::YieldingCallbackToExternC,
-                            site.span,
+                    let (msg, note) = if is_sys_putc {
+                        (
+                            format!(
+                                "cannot pass yielding function '{}' to 'sys.set_putc': console byte-sink callbacks must be non-yielding",
+                                site.callback_fn
+                            ),
+                            format!(
+                                "yield chain: sys.set_putc(...) callback -> {}; pass a non-yielding `fn(u8)` callback",
+                                sub_chain
+                            ),
+                        )
+                    } else {
+                        (
                             format!(
                                 "cannot pass yielding function '{}' as callback to extern \"C\" function '{}': stackless coroutine yields cannot unwind through C stack frames",
                                 site.callback_fn, site.extern_fn
                             ),
+                            format!(
+                                "yield chain: extern \"C\" {}(...) callback -> {}; stackless coroutines cannot suspend across C stack frames—pass a non-yielding `fn` callback",
+                                site.extern_fn, sub_chain
+                            ),
+                        )
+                    };
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldingCallbackToExternC,
+                            site.span,
+                            msg,
                         )
                         .with_file(cb_file)
                         .with_note(note),
@@ -2589,13 +2606,18 @@ impl Analyzer {
                 }
                 if cb_node.spawns_in_boot {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
+                    let target_desc = if is_sys_putc {
+                        "'sys.set_putc'".to_string()
+                    } else {
+                        format!("extern \"C\" function '{}'", site.extern_fn)
+                    };
                     self.emit(
                         Diagnostic::new(
                             DiagnosticKind::InvalidSpawnContext,
                             site.span,
                             format!(
-                                "cannot pass boot-spawning function '{}' as callback to extern \"C\" function '{}'",
-                                site.callback_fn, site.extern_fn
+                                "cannot pass boot-spawning function '{}' as callback to {}",
+                                site.callback_fn, target_desc
                             ),
                         )
                         .with_file(cb_file),
@@ -2603,13 +2625,18 @@ impl Analyzer {
                 }
                 if cb_node.attaches_in_boot {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
+                    let target_desc = if is_sys_putc {
+                        "'sys.set_putc'".to_string()
+                    } else {
+                        format!("extern \"C\" function '{}'", site.extern_fn)
+                    };
                     self.emit(
                         Diagnostic::new(
                             DiagnosticKind::IrqAttachmentError,
                             site.span,
                             format!(
-                                "cannot pass IRQ-attaching function '{}' as callback to extern \"C\" function '{}'",
-                                site.callback_fn, site.extern_fn
+                                "cannot pass IRQ-attaching function '{}' as callback to {}",
+                                site.callback_fn, target_desc
                             ),
                         )
                         .with_file(cb_file),
@@ -8677,6 +8704,81 @@ impl<'a> BodyChecker<'a> {
                 ExprVal::scalar(Ty::void(), span)
             }
 
+            "tick" | "tick_ms" => {
+                if !args.is_empty() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!("'sys.{}()' takes 0 arguments, found {}", m, args.len()),
+                    ));
+                    for a in args {
+                        let _ = self.check_expr_infallible(&a.value);
+                    }
+                }
+                ExprVal::scalar(Ty::void(), span)
+            }
+
+            "set_putc" => {
+                if self.in_isr() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        span,
+                        "cannot call 'sys.set_putc' inside an ISR",
+                    ));
+                }
+                let expected_ty = Ty::FnPtr {
+                    params: vec![Ty::u8()],
+                    ret: Box::new(Ty::void()),
+                };
+                if args.len() != 1 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "'sys.set_putc(fn(u8))' expects 1 argument, found {}",
+                            args.len()
+                        ),
+                    ));
+                    for a in args {
+                        let _ = self.check_expr_infallible(&a.value);
+                    }
+                } else {
+                    let av = self.check_expr_infallible(&args[0].value);
+                    if av.ty != expected_ty && !av.ty.is_error() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            args[0].span,
+                            format!(
+                                "'sys.set_putc' expects callback of type '{}', found '{}'",
+                                expected_ty, av.ty
+                            ),
+                        ));
+                    }
+                    for cb_fn in &av.prov.fn_callbacks {
+                        if let Some(fn_info) = self.sema.functions.get(cb_fn) {
+                            if fn_info.error_spec.is_fallible() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    args[0].span,
+                                    format!(
+                                        "cannot pass fallible function '{}' (`error`) to 'sys.set_putc': console byte-sink callbacks must not fail",
+                                        cb_fn
+                                    ),
+                                ));
+                            }
+                        }
+                        self.sema
+                            .call_graph
+                            .add_extern_callback(ExternCallbackSite {
+                                extern_fn: "sys.set_putc".to_string(),
+                                callback_fn: cb_fn.clone(),
+                                span: args[0].span,
+                            });
+                    }
+                }
+                ExprVal::scalar(Ty::void(), span)
+            }
+
             "now_ticks" | "now_ms" | "current_prio" | "sleep_depth" | "wfi_count" => {
                 if !args.is_empty() {
                     self.sema.emit(Diagnostic::new(
@@ -8848,6 +8950,9 @@ impl<'a> BodyChecker<'a> {
                 }
                 let valid_sys = [
                     "use_systick",
+                    "tick",
+                    "tick_ms",
+                    "set_putc",
                     "now_ms",
                     "now_ticks",
                     "current_prio",
@@ -10633,7 +10738,7 @@ impl<'a> BodyChecker<'a> {
 // Small Pure Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
+const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.set_putc(fn(u8))`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
 
 fn is_string_arg_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Str)

@@ -295,12 +295,12 @@ static SYN_UNUSED void syn_fmt_float_sci(syn_fmt_sink_t *s, double val, uint8_t 
         self.out.push_str(
             r#"
 #if !defined(SYN_FREESTANDING)
-static SYN_UNUSED inline void print(const void *s) { if (s != NULL) { fputs((const char *)s, stdout); fflush(stdout); } }
-static SYN_UNUSED inline void println(const void *s) { if (s != NULL) { puts((const char *)s); fflush(stdout); } }
+static SYN_UNUSED inline void print(const void *s) { if (g_syn_user_putc != NULL) { syn_user_putc_cstr(s); } else if (s != NULL) { fputs((const char *)s, stdout); fflush(stdout); } }
+static SYN_UNUSED inline void println(const void *s) { if (g_syn_user_putc != NULL) { syn_user_putc_cstr(s); g_syn_user_putc((uint8_t)'\n'); } else if (s != NULL) { puts((const char *)s); fflush(stdout); } }
 static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { fputs("Zev assertion failed!\n", stderr); fflush(stderr); abort(); } }
 #else
-static SYN_UNUSED inline void print(const void *s) { (void)s; }
-static SYN_UNUSED inline void println(const void *s) { (void)s; }
+static SYN_UNUSED inline void print(const void *s) { if (g_syn_user_putc != NULL) { syn_user_putc_cstr(s); } else { (void)s; } }
+static SYN_UNUSED inline void println(const void *s) { if (g_syn_user_putc != NULL) { syn_user_putc_cstr(s); g_syn_user_putc((uint8_t)'\n'); } else { (void)s; } }
 static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (;;) {} } }
 #endif
 
@@ -4213,6 +4213,16 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                         .unwrap_or_else(|| "false".to_string());
                     let _ = writeln!(self.out, "{pad}syn_sim_enable_trace((bool)({on}));");
                 }
+                "tick" | "tick_ms" => {
+                    let _ = writeln!(self.out, "{pad}syn_sys_tick();");
+                }
+                "set_putc" => {
+                    let cb = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let _ = writeln!(self.out, "{pad}syn_sys_set_putc((syn_putc_fn_t)({cb}));");
+                }
                 _ => {
                     for a in args {
                         let s = self.fmt_expr(a, vars);
@@ -5860,3 +5870,73 @@ fn elide_c_crit(c: &mut String) {
             .replace("syn_exit_critical();", "");
     }
 }
+
+#[cfg(test)]
+mod sys_tick_and_putc_c_tests {
+    use crate::{CodegenOptions, emit_c_with_options};
+
+    #[test]
+    fn sys_tick_and_set_putc_emit_and_run_cleanly() {
+        let src = r#"
+            irq IRQ_TICK = 5;
+            byte_ring<64> captured;
+
+            fn capture_putc(u8 c) {
+                bool _ok = captured.push_byte(c);
+            }
+
+            isr tick_isr() {
+                sys.tick();
+            }
+
+            fn main() {
+                sys.set_putc(capture_putc);
+                IRQ_TICK.attach(tick_isr);
+                sys.pend_irq(IRQ_TICK);
+                sys.pend_irq(IRQ_TICK);
+                sys.tick_ms();
+                u32 t = sys.now_ms();
+                assert(t == 3);
+                println(f"ms={t}");
+                assert(captured.len() == 5);
+                sys.exit(0);
+            }
+        "#;
+        let prog = zev_parser::parse_str(src).expect("parse ok");
+        let mono = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, Some("<test>"))],
+            &zev_sema::AnalyzeOptions::default(),
+        );
+        assert!(mono.diagnostics.is_empty(), "diags: {:?}", mono.diagnostics);
+        let mir = zev_mir::lower_program(&mono.programs[0]).expect("mir lower ok");
+        let c_code = emit_c_with_options(&mir, &CodegenOptions::default());
+        assert!(c_code.contains("syn_sys_set_putc((syn_putc_fn_t)(syn_fn_capture_putc));"));
+        assert!(c_code.contains("syn_sys_tick();"));
+
+        let tmp = std::env::temp_dir().join(format!("zev_sys_putc_test_{}", std::process::id()));
+        let c_path = tmp.with_extension("c");
+        let bin_path = tmp.with_extension("bin");
+        std::fs::write(&c_path, &c_code).expect("write c");
+        let st = std::process::Command::new("cc")
+            .args([
+                "-std=c99",
+                "-O1",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                c_path.to_str().unwrap(),
+                "-o",
+                bin_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("invoke cc");
+        let _ = std::fs::remove_file(&c_path);
+        assert!(st.success(), "generated C99 failed cc -Werror");
+        let run_st = std::process::Command::new(&bin_path)
+            .status()
+            .expect("run compiled C99");
+        let _ = std::fs::remove_file(&bin_path);
+        assert!(run_st.success(), "compiled C99 runtime assertions failed");
+    }
+}
+

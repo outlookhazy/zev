@@ -18,6 +18,8 @@ pub struct RuntimeIrFeatures {
     pub uses_fmt: bool,
     pub uses_fmt_float_sci: bool,
     pub uses_rv_irqs: bool,
+    pub uses_sys_tick: bool,
+    pub uses_set_putc: bool,
 }
 
 impl RuntimeIrFeatures {
@@ -28,6 +30,8 @@ impl RuntimeIrFeatures {
             uses_fmt: true,
             uses_fmt_float_sci: true,
             uses_rv_irqs: false,
+            uses_sys_tick: true,
+            uses_set_putc: false,
         }
     }
 }
@@ -108,6 +112,17 @@ pub fn emit_kernel_runtime_ir_with_features(
     let _ = writeln!(out);
 
     let fn_ptr_ty = opts.target.fn_ptr_llvm_ty();
+    let systick_init = if features.uses_sys_tick { 1 } else { 0 };
+    let user_putc_global = if features.uses_set_putc && opts.target != TargetArch::AvrAtmega4809 {
+        let ptr_al = if opts.target.is_avr() {
+            1
+        } else {
+            opts.target.ptr_bits() / 8
+        };
+        format!("\n@__syn_user_putc_fn = global {fn_ptr_ty} null, align {ptr_al}")
+    } else {
+        String::new()
+    };
 
     // %SynTask control block, %SynFmtSink, & scheduler globals
     let _ = writeln!(
@@ -149,23 +164,41 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_tasks = global [{slots_alloc} x %SynTask] zeroinitializer, align 4
 @__syn_rr_idx = global [4 x i32] zeroinitializer, align 4
 @__syn_tick_ms = global i32 0, align 4
-@__syn_systick_enabled = global i8 0, align 1
+@__syn_systick_enabled = global i8 {systick_init}, align 1
 @__syn_sleep_lock_mask = global i32 0, align 4
 @__syn_dma_locks = global i32 0, align 4
 @__syn_last_sleep_depth = global i32 2, align 4
 @__syn_wfi_count = global i32 0, align 4
 @__syn_irq_woke_urgent = global i8 0, align 1
-@__syn_current_task = global ptr null, align 4
+@__syn_current_task = global ptr null, align 4{user_putc_global}
 "#
     );
 
     let sz = opts.fn_size_attrs();
 
     match opts.target {
-        TargetArch::Thumbv7mNoneEabi => emit_cortex_m_hal_ir(out, sz),
+        TargetArch::Thumbv7mNoneEabi => emit_cortex_m_hal_ir(out, sz, features.uses_set_putc),
         TargetArch::Riscv32Esp32C6 => crate::esp32c6::emit_esp32c6_hal_ir(out, sz),
         TargetArch::AvrAtmega328p => crate::avr::emit_avr_hal_ir(out, sz),
-        TargetArch::HostX86_64Linux => emit_host_linux_hal_ir(out, sz),
+        TargetArch::AvrAtmega4809 => crate::avr_mega0::emit_avr_mega0_hal_ir(out, sz),
+        TargetArch::HostX86_64Linux => emit_host_linux_hal_ir(out, sz, features.uses_set_putc),
+    }
+
+    if features.uses_sys_tick {
+        let _ = writeln!(
+            out,
+            r#"define void @__syn_sys_tick() nounwind{sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  store i8 1, ptr @__syn_systick_enabled, align 1
+  %t = load volatile i32, ptr @__syn_tick_ms, align 4
+  %t1 = add i32 %t, 1
+  store volatile i32 %t1, ptr @__syn_tick_ms, align 4
+  call void @__syn_crit_exit(i32 %pm)
+  ret void
+}}
+"#
+        );
     }
 
     emit_freestanding_mem_builtins_ir(out, opts.target);
@@ -192,7 +225,7 @@ pub fn emit_kernel_runtime_ir_with_features(
 
 fn emit_freestanding_mem_builtins_ir(out: &mut String, target: TargetArch) {
     let uty = target.usize_llvm_ty();
-    let c_int_ty = if target == TargetArch::AvrAtmega328p {
+    let c_int_ty = if target.is_avr() {
         "i16"
     } else {
         "i32"
@@ -345,7 +378,19 @@ entry:
     }
 }
 
-fn emit_cortex_m_hal_ir(out: &mut String, sz: &str) {
+fn emit_cortex_m_hal_ir(out: &mut String, sz: &str, uses_set_putc: bool) {
+    let user_putc_hook = if uses_set_putc {
+        r#"  %ufp = load ptr, ptr @__syn_user_putc_fn, align 4
+  %uhas = icmp ne ptr %ufp, null
+  br i1 %uhas, label %u_call, label %hw_uart
+u_call:
+  call void %ufp(i8 %c)
+  ret void
+hw_uart:
+"#
+    } else {
+        ""
+    };
     let _ = writeln!(
         out,
         r#"; ── ARM Cortex-M3 Inline Thumb-2 Hardware Primitives (lm3s6965evb) ──
@@ -363,11 +408,15 @@ entry:
 
 define void @__syn_uart_putc(i8 %c) nounwind{sz} {{
 entry:
-  ; Stellaris LM3S6965 UART0 Data Register at 0x4000C000 (1073790976)
+{user_putc_hook}  ; Stellaris LM3S6965 UART0 Data Register at 0x4000C000 (1073790976)
   %z = zext i8 %c to i32
   store volatile i32 %z, ptr inttoptr (i32 1073790976 to ptr), align 4
   ret void
-}}
+}}"#,
+    );
+    let _ = writeln!(
+        out,
+        r#"
 
 define void @__syn_platform_exit(i32 %code) noreturn nounwind{sz} {{
 entry:
@@ -462,7 +511,19 @@ restore:
     );
 }
 
-fn emit_host_linux_hal_ir(out: &mut String, sz: &str) {
+fn emit_host_linux_hal_ir(out: &mut String, sz: &str, uses_set_putc: bool) {
+    let user_putc_hook = if uses_set_putc {
+        r#"  %ufp = load ptr, ptr @__syn_user_putc_fn, align 8
+  %uhas = icmp ne ptr %ufp, null
+  br i1 %uhas, label %u_call, label %host_put
+u_call:
+  call void %ufp(i8 %c)
+  ret void
+host_put:
+"#
+    } else {
+        ""
+    };
     let _ = writeln!(
         out,
         r#"; ── Host Linux x86_64 Simulation Runtime Hooks ──
@@ -481,10 +542,14 @@ entry:
 
 define void @__syn_uart_putc(i8 %c) nounwind{sz} {{
 entry:
-  %z = zext i8 %c to i32
+{user_putc_hook}  %z = zext i8 %c to i32
   %r = call i32 @putchar(i32 %z)
   ret void
-}}
+}}"#,
+    );
+    let _ = writeln!(
+        out,
+        r#"
 
 define void @__syn_platform_exit(i32 %code) noreturn nounwind{sz} {{
 entry:
@@ -693,7 +758,7 @@ entry:
   ret i32 %t
 }}"#
         );
-    } else if target == TargetArch::AvrAtmega328p {
+    } else if target.is_avr() {
         let _ = writeln!(
             out,
             r#"; ── Cooperative Scheduler Core: Overdue -> Work -> Poll -> Idle Sleep ──
@@ -1060,7 +1125,9 @@ slot_loop:
   br i1 %kdone, label %prio_next, label %slot_body
 slot_body:
   %sum = add i32 %rr, %k
-  %idx = urem i32 %sum, %n
+  %sum_ge = icmp uge i32 %sum, %n
+  %sum_sub = sub i32 %sum, %n
+  %idx = select i1 %sum_ge, i32 %sum_sub, i32 %sum
   %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %idx
   %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
   %st = load i8, ptr %st_ptr, align 1
@@ -1191,7 +1258,7 @@ entry:
     );
     let mie_enable_ir = if target == TargetArch::Riscv32Esp32C6 && enable_rv_irqs {
         "  call void asm sideeffect \"csrsi mstatus, 8\", \"~{memory}\"()\n"
-    } else if target == TargetArch::AvrAtmega328p {
+    } else if target.is_avr() {
         "  call void asm sideeffect \"sei\", \"~{memory}\"()\n"
     } else {
         ""
@@ -1236,7 +1303,9 @@ dispatch:
   %ep_clamp = and i32 %ep32, 3
   %rr_ptr = getelementptr inbounds [4 x i32], ptr @__syn_rr_idx, i32 0, i32 %ep_clamp
   %sel1 = add i32 %sel, 1
-  %next_rr = urem i32 %sel1, %n
+  %rr_wrap = icmp uge i32 %sel1, %n
+  %rr_sub = sub i32 %sel1, %n
+  %next_rr = select i1 %rr_wrap, i32 %rr_sub, i32 %sel1
   store i32 %next_rr, ptr %rr_ptr, align 4
 
   store volatile i8 0, ptr @__syn_irq_woke_urgent, align 1

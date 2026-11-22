@@ -287,8 +287,18 @@ restore:
   call void @__syn_crit_exit(i32 %pm)
   ret void
 }}
+"#
+    );
+    emit_avr_libgcc_arith_shims_ir(out);
+}
 
-; ── Freestanding AVR libgcc Arithmetic ABI Shims (Garbage-Collected per Symbol) ──
+/// Emit per-section weak `avr-libgcc` integer mul/divmod ABI shims (`__mulsi3`,
+/// `__udivmodsi4`, `__divmodsi4`, `__udivmodhi4`, `__divmodhi4`, `__udivmodqi4`,
+/// `__divmodqi4`, `@__muldi3`) backed by pure SSA `#99` helpers (shared across all AVR targets).
+pub(crate) fn emit_avr_libgcc_arith_shims_ir(out: &mut String) {
+    let _ = writeln!(
+        out,
+        r#"; ── Freestanding AVR libgcc Arithmetic ABI Shims (Garbage-Collected per Symbol) ──
 module asm ".section .text.__mulsi3, \22ax\22, @progbits"
 module asm ".weak __mulsi3"
 module asm ".type __mulsi3, @function"

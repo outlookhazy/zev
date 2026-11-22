@@ -1,0 +1,306 @@
+// Microchip ATmega4809 (Arduino Nano Every, 16/20 MHz megaAVR 0-series) Typed MMIO Register Map & IRQ Vectors
+// Register data-space addresses & layouts verified against Microchip ATmega4809 Datasheet Section 7 & avr-libc `iom4809.h`.
+
+pub mmio CpuRegs {
+    @wo u8 ccp @ 0x04;
+}
+
+pub mmio SlpctrlRegs {
+    @rw u8 ctrla @ 0x00;
+}
+
+pub mmio ClkctrlRegs {
+    @rw u8 mclkctrla    @ 0x00;
+    @rw u8 mclkctrlb    @ 0x01;
+    @rw u8 mclklock     @ 0x02;
+    @ro u8 mclkstatus   @ 0x03;
+    @rw u8 osc20mctrla  @ 0x10;
+    @rw u8 osc32kctrla  @ 0x18;
+    @rw u8 xosc32kctrla @ 0x1C;
+}
+
+pub mmio VrefRegs {
+    @rw u8 ctrla @ 0x00;
+    @rw u8 ctrlb @ 0x01;
+}
+
+pub mmio WdtRegs {
+    @rw u8 ctrla  @ 0x00;
+    @ro u8 status @ 0x01;
+}
+
+pub mmio PortRegs {
+    @rw  u8 dir      @ 0x00;
+    @wo  u8 dirset   @ 0x01;
+    @wo  u8 dirclr   @ 0x02;
+    @wo  u8 dirtgl   @ 0x03;
+    @rw  u8 out      @ 0x04;
+    @wo  u8 outset   @ 0x05;
+    @wo  u8 outclr   @ 0x06;
+    @wo  u8 outtgl   @ 0x07;
+    @ro  u8 in_reg   @ 0x08;
+    @w1c u8 intflags @ 0x09;
+    @rw  u8 portctrl @ 0x0A;
+    @rw  u8 pin0ctrl @ 0x10;
+    @rw  u8 pin1ctrl @ 0x11;
+    @rw  u8 pin2ctrl @ 0x12;
+    @rw  u8 pin3ctrl @ 0x13;
+    @rw  u8 pin4ctrl @ 0x14;
+    @rw  u8 pin5ctrl @ 0x15;
+    @rw  u8 pin6ctrl @ 0x16;
+    @rw  u8 pin7ctrl @ 0x17;
+}
+
+pub mmio PortmuxRegs {
+    @rw u8 evsysroutea  @ 0x00;
+    @rw u8 cclroutea    @ 0x01;
+    @rw u8 usartroutea  @ 0x02;
+    @rw u8 twispiroutea @ 0x03;
+    @rw u8 tcaroutea    @ 0x04;
+    @rw u8 tcbroutea    @ 0x05;
+}
+
+pub mmio Adc0Regs {
+    @rw  u8  ctrla    @ 0x00;
+    @rw  u8  ctrlb    @ 0x01;
+    @rw  u8  ctrlc    @ 0x02;
+    @rw  u8  ctrld    @ 0x03;
+    @rw  u8  ctrle    @ 0x04;
+    @rw  u8  sampctrl @ 0x05;
+    @rw  u8  muxpos   @ 0x06;
+    @rw  u8  command  @ 0x08;
+    @rw  u8  evctrl   @ 0x09;
+    @rw  u8  intctrl  @ 0x0A;
+    @w1c u8  intflags @ 0x0B;
+    @ro  u8  dbgctrl  @ 0x0C;
+    @rw  u8  temp     @ 0x0D;
+    @ro  u16 res      @ 0x10;
+    @rw  u16 winlt    @ 0x12;
+    @rw  u16 winht    @ 0x14;
+    @rw  u8  calib    @ 0x16;
+}
+
+pub mmio UsartRegs {
+    @ro u8  rxd_l    @ 0x00;
+    @ro u8  rxd_h    @ 0x01;
+    @rw u8  txd_l    @ 0x02;
+    @rw u8  txd_h    @ 0x03;
+    @rw u8  status   @ 0x04;
+    @rw u8  ctrla    @ 0x05;
+    @rw u8  ctrlb    @ 0x06;
+    @rw u8  ctrlc    @ 0x07;
+    @rw u16 baud     @ 0x08;
+    @rw u8  ctrld    @ 0x0A;
+    @rw u8  dbgctrl  @ 0x0B;
+    @rw u8  evctrl   @ 0x0C;
+    @rw u8  txplctrl @ 0x0D;
+    @rw u8  rxplctrl @ 0x0E;
+}
+
+pub mmio Twi0Regs {
+    @rw u8 ctrla     @ 0x00;
+    @rw u8 dualctrl  @ 0x01;
+    @rw u8 dbgctrl   @ 0x02;
+    @rw u8 mctrla    @ 0x03;
+    @rw u8 mctrlb    @ 0x04;
+    @rw u8 mstatus   @ 0x05;
+    @rw u8 mbaud     @ 0x06;
+    @rw u8 maddr     @ 0x07;
+    @rw u8 mdata     @ 0x08;
+    @rw u8 sctrla    @ 0x09;
+    @rw u8 sctrlb    @ 0x0A;
+    @rw u8 sstatus   @ 0x0B;
+    @rw u8 saddr     @ 0x0C;
+    @rw u8 sdata     @ 0x0D;
+    @rw u8 saddrmask @ 0x0E;
+}
+
+pub mmio Spi0Regs {
+    @rw  u8 ctrla    @ 0x00;
+    @rw  u8 ctrlb    @ 0x01;
+    @rw  u8 intctrl  @ 0x02;
+    @w1c u8 intflags @ 0x03;
+    @rw  u8 data     @ 0x04;
+}
+
+pub mmio TcaSingleRegs {
+    @rw  u8  ctrla    @ 0x00;
+    @rw  u8  ctrlb    @ 0x01;
+    @rw  u8  ctrlc    @ 0x02;
+    @rw  u8  ctrld    @ 0x03;
+    @rw  u8  ctrleclr @ 0x04;
+    @rw  u8  ctrleset @ 0x05;
+    @rw  u8  ctrlfclr @ 0x06;
+    @rw  u8  ctrlfset @ 0x07;
+    @rw  u8  evctrl   @ 0x09;
+    @rw  u8  intctrl  @ 0x0A;
+    @w1c u8  intflags @ 0x0B;
+    @rw  u8  dbgctrl  @ 0x0E;
+    @rw  u8  temp     @ 0x0F;
+    @rw  u16 cnt      @ 0x20;
+    @rw  u16 per      @ 0x26;
+    @rw  u16 cmp0     @ 0x28;
+    @rw  u16 cmp1     @ 0x2A;
+    @rw  u16 cmp2     @ 0x2C;
+    @rw  u16 perbuf   @ 0x36;
+    @rw  u16 cmp0buf  @ 0x38;
+    @rw  u16 cmp1buf  @ 0x3A;
+    @rw  u16 cmp2buf  @ 0x3C;
+}
+
+// `TCB_t`: 0x00 CTRLA, 0x01 CTRLB, 0x02..0x03 rsv, 0x04 EVCTRL,
+//          0x05 INTCTRL, 0x06 INTFLAGS, 0x07 STATUS, 0x08 DBGCTRL, 0x09 TEMP, 0x0A CNT, 0x0C CCMP.
+pub mmio TcbRegs {
+    @rw  u8  ctrla    @ 0x00;
+    @rw  u8  ctrlb    @ 0x01;
+    @rw  u8  evctrl   @ 0x04;
+    @rw  u8  intctrl  @ 0x05;
+    @w1c u8  intflags @ 0x06;
+    @ro  u8  status   @ 0x07;
+    @rw  u8  dbgctrl  @ 0x08;
+    @rw  u8  temp     @ 0x09;
+    @rw  u16 cnt      @ 0x0A;
+    @rw  u16 ccmp     @ 0x0C;
+}
+
+pub mmio SigrowRegs {
+    @ro u8 deviceid0  @ 0x00;
+    @ro u8 deviceid1  @ 0x01;
+    @ro u8 deviceid2  @ 0x02;
+    @ro u8 tempsense0 @ 0x20;
+    @ro u8 tempsense1 @ 0x21;
+    @ro u8 osc16err3v @ 0x22;
+    @ro u8 osc16err5v @ 0x23;
+    @ro u8 osc20err3v @ 0x24;
+    @ro u8 osc20err5v @ 0x25;
+}
+
+pub mmio FuseRegs {
+    @ro u8 wdtcfg  @ 0x00;
+    @ro u8 bodcfg  @ 0x01;
+    @ro u8 osccfg  @ 0x02;
+    @ro u8 syscfg0 @ 0x05;
+    @ro u8 syscfg1 @ 0x06;
+    @ro u8 append  @ 0x07;
+    @ro u8 bootend @ 0x08;
+}
+
+pub mmio CPU     : CpuRegs       @ 0x0030;
+pub mmio SLPCTRL : SlpctrlRegs   @ 0x0050;
+pub mmio CLKCTRL : ClkctrlRegs   @ 0x0060;
+pub mmio VREF    : VrefRegs      @ 0x00A0;
+pub mmio WDT     : WdtRegs       @ 0x0100;
+pub mmio PORTA   : PortRegs      @ 0x0400;
+pub mmio PORTB   : PortRegs      @ 0x0420;
+pub mmio PORTC   : PortRegs      @ 0x0440;
+pub mmio PORTD   : PortRegs      @ 0x0460;
+pub mmio PORTE   : PortRegs      @ 0x0480;
+pub mmio PORTF   : PortRegs      @ 0x04A0;
+pub mmio PORTMUX : PortmuxRegs   @ 0x05E0;
+pub mmio ADC0    : Adc0Regs      @ 0x0600;
+pub mmio USART0  : UsartRegs     @ 0x0800;
+pub mmio USART1  : UsartRegs     @ 0x0820;
+pub mmio USART2  : UsartRegs     @ 0x0840;
+pub mmio USART3  : UsartRegs     @ 0x0860;
+pub mmio TWI0    : Twi0Regs      @ 0x08A0;
+pub mmio SPI0    : Spi0Regs      @ 0x08C0;
+pub mmio TCA0    : TcaSingleRegs @ 0x0A00;
+pub mmio TCB0    : TcbRegs       @ 0x0A80;
+pub mmio TCB1    : TcbRegs       @ 0x0A90;
+pub mmio TCB2    : TcbRegs       @ 0x0AA0;
+pub mmio TCB3    : TcbRegs       @ 0x0AB0;
+pub mmio SIGROW  : SigrowRegs    @ 0x1100;
+pub mmio FUSE    : FuseRegs      @ 0x1280;
+
+// Interrupt vector indices (`iom4809.h`, 40 slots `0..=39`; slot 0=RESET, slots `1..=39` peripheral IRQs)
+pub irq IRQ_CRCSCAN_NMI = 1;
+pub irq IRQ_BOD_VLM     = 2;
+pub irq IRQ_RTC_CNT     = 3;
+pub irq IRQ_RTC_PIT     = 4;
+pub irq IRQ_CCL_CCL     = 5;
+pub irq IRQ_PORTA_PORT  = 6;
+pub irq IRQ_TCA0_OVF    = 7;
+pub irq IRQ_TCA0_HUNF   = 8;
+pub irq IRQ_TCA0_CMP0   = 9;
+pub irq IRQ_TCA0_CMP1   = 10;
+pub irq IRQ_TCA0_CMP2   = 11;
+pub irq IRQ_TCB0_INT    = 12;
+pub irq IRQ_TCB1_INT    = 13;
+pub irq IRQ_TWI0_TWIS   = 14;
+pub irq IRQ_TWI0_TWIM   = 15;
+pub irq IRQ_SPI0_INT    = 16;
+pub irq IRQ_USART0_RXC  = 17;
+pub irq IRQ_USART0_DRE  = 18;
+pub irq IRQ_USART0_TXC  = 19;
+pub irq IRQ_PORTD_PORT  = 20;
+pub irq IRQ_AC0_AC      = 21;
+pub irq IRQ_ADC0_RESRDY = 22;
+pub irq IRQ_ADC0_WCOMP  = 23;
+pub irq IRQ_PORTC_PORT  = 24;
+pub irq IRQ_TCB2_INT    = 25;
+pub irq IRQ_USART1_RXC  = 26;
+pub irq IRQ_USART1_DRE  = 27;
+pub irq IRQ_USART1_TXC  = 28;
+pub irq IRQ_PORTF_PORT  = 29;
+pub irq IRQ_NVMCTRL_EE  = 30;
+pub irq IRQ_USART2_RXC  = 31;
+pub irq IRQ_USART2_DRE  = 32;
+pub irq IRQ_USART2_TXC  = 33;
+pub irq IRQ_PORTB_PORT  = 34;
+pub irq IRQ_PORTE_PORT  = 35;
+pub irq IRQ_TCB3_INT    = 36;
+pub irq IRQ_USART3_RXC  = 37;
+pub irq IRQ_USART3_DRE  = 38;
+pub irq IRQ_USART3_TXC  = 39;
+
+pub const u8 CCP_IOREG             = 0xD8;   // `CPU.ccp` Configuration Change Protection I/O unlock key
+pub const u8 BIT_SLPCTRL_SEN       = 0x01;   // `SLPCTRL.ctrla` Sleep Enable (Idle mode)
+
+pub const u8 BIT_PE0_MOSI          = 1 << 0; // Digital pin 11 (`PE0`, SPI0 ALT2 MOSI)
+pub const u8 BIT_PE1_MISO          = 1 << 1; // Digital pin 12 (`PE1`, SPI0 ALT2 MISO)
+pub const u8 BIT_PE2_LED           = 1 << 2; // Digital pin 13 (`PE2`, onboard L LED & SPI0 ALT2 SCK)
+pub const u8 BIT_PE3_SS            = 1 << 3; // Digital pin 8  (`PE3`, SPI0 ALT2 SS)
+pub const u8 BIT_PA0_D2            = 1 << 0; // Digital pin 2  (`PA0`)
+pub const u8 BIT_PD3_A0            = 1 << 3; // Analog pin A0  (`PD3` / `AIN3`)
+pub const u8 BIT_PORTB_TXD         = 1 << 4; // `PB4` (`USART3` `ALT1` TXD -> SAMD11 `MuxTO`)
+pub const u8 BIT_PORTB_RXD         = 1 << 5; // `PB5` (`USART3` `ALT1` RXD <- SAMD11 `MuxTO`)
+
+pub const u8 PORT_ISC_INTDISABLE   = 0x00;
+pub const u8 PORT_ISC_BOTHEDGES    = 0x01;
+pub const u8 PORT_ISC_INPUT_DISABLE = 0x04;
+pub const u8 PORT_PULLUPEN         = 0x08;
+
+pub const u8 PORTMUX_USART3_ALT1   = 0x40;   // `USART3` on `PB4` TX / `PB5` RX (SAMD11 USB-CDC)
+pub const u8 PORTMUX_SPI0_GM       = 0x03;
+pub const u8 PORTMUX_SPI0_ALT2     = 0x02;   // `SPI0` on `PE[3:0]`
+
+pub const u8 BIT_TCB_CAPT          = 0x01;   // `TCBn.INTCTRL` / `TCBn.INTFLAGS` Capture/Timeout
+pub const u8 BIT_TCB_ENABLE        = 0x01;   // `TCBn.CTRLA` Enable
+pub const u8 TCB_CLKSEL_CLKDIV2    = 0x02;   // `TCBn.CTRLA` `CLK_PER / 2`
+
+pub const u8 BIT_USART_RXCIE       = 0x80;   // `USARTn.CTRLA` RX Complete Interrupt Enable
+pub const u8 BIT_USART_TXCIE       = 0x40;   // `USARTn.CTRLA` / `STATUS` TX Complete
+pub const u8 BIT_USART_DREIE       = 0x20;   // `USARTn.CTRLA` Data Register Empty Interrupt Enable
+pub const u8 BIT_USART_DREIF       = 0x20;   // `USARTn.STATUS` Data Register Empty Flag
+pub const u8 USART_CTRLC_8N1       = 0x03;   // `USARTn.CTRLC` Asynchronous `8N1`
+pub const u8 USART_CTRLB_RXTXEN    = 0xC0;   // `USARTn.CTRLB` `RXEN | TXEN`
+
+pub const u8 BIT_SPI_IF            = 0x80;   // `SPI0.INTFLAGS` Interrupt Flag
+pub const u8 BIT_SPI_IE            = 0x01;   // `SPI0.INTCTRL` Interrupt Enable
+pub const u8 BIT_SPI_MASTER        = 0x20;   // `SPI0.CTRLA` Host/Master Mode
+pub const u8 BIT_SPI_ENABLE        = 0x01;   // `SPI0.CTRLA` Enable
+pub const u8 SPI_PRESC_DIV16       = 0x02;   // `SPI0.CTRLA` `CLK_PER / 16`
+pub const u8 BIT_SPI_SSD           = 0x04;   // `SPI0.CTRLB` Client Select Disable
+
+pub const u8 VREF_ADC0_1V1         = 0x10;   // `VREF.CTRLA` `ADC0REFSEL = 1.1V`
+pub const u8 BIT_VREF_ADC0EN       = 0x02;   // `VREF.CTRLB` Force ADC0 reference enable
+pub const u8 ADC_REFSEL_INTREF     = 0x00;   // `ADC0.CTRLC` Internal VREF
+pub const u8 ADC_REFSEL_VDDREF     = 0x10;   // `ADC0.CTRLC` VDD reference
+pub const u8 BIT_ADC_SAMPCAP       = 0x40;   // `ADC0.CTRLC` Reduced sample capacitance
+pub const u8 ADC_PRESC_DIV16       = 0x03;   // `ADC0.CTRLC` `CLK_PER / 16`
+pub const u8 ADC_INITDLY_DLY64     = 0x60;   // `ADC0.CTRLD` 64 `CLK_ADC` cycles initial delay
+pub const u8 ADC_MUX_AIN3          = 0x03;   // `ADC0.MUXPOS` `AIN3` (`PD3` / `A0`)
+pub const u8 ADC_MUX_TEMPSENSE     = 0x1E;   // `ADC0.MUXPOS` Internal temperature sensor
+pub const u8 BIT_ADC_ENABLE        = 0x01;   // `ADC0.CTRLA` Enable (10-bit mode)
+pub const u8 BIT_ADC_STCONV        = 0x01;   // `ADC0.COMMAND` Start conversion
+pub const u8 BIT_ADC_RESRDY        = 0x01;   // `ADC0.INTFLAGS` Result Ready

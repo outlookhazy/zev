@@ -99,8 +99,21 @@ struct ModuleCtx<'a> {
     uses_byte_ring_view: bool,
     uses_pool_lease: bool,
     rt_features: RuntimeIrFeatures,
+    avr_mega0_putc: AvrMega0PutcMode,
     strings: Vec<String>,
     string_dedup: HashMap<String, usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AvrMega0PutcMode {
+    Noop,
+    DirectStatic {
+        symbol: String,
+        elide_set_putc_store: bool,
+    },
+    DynamicGlobal {
+        fallback_symbol: Option<String>,
+    },
 }
 
 #[derive(Clone)]
@@ -137,10 +150,12 @@ pub fn emit_llvm_ir_with_options(
     } else {
         Vec::new()
     };
-    let avr_irq_vectors = if opts.target == TargetArch::AvrAtmega328p {
-        crate::avr::validate_avr_irq_vectors(&module.irq_vectors)?
-    } else {
-        BTreeSet::new()
+    let avr_irq_vectors = match opts.target {
+        TargetArch::AvrAtmega328p => crate::avr::validate_avr_irq_vectors(&module.irq_vectors)?,
+        TargetArch::AvrAtmega4809 => {
+            crate::avr_mega0::validate_avr_mega0_irq_vectors(&module.irq_vectors)?
+        }
+        _ => BTreeSet::new(),
     };
     let mut rt_features = scan_module_runtime_features(module);
     rt_features.uses_rv_irqs =
@@ -169,11 +184,15 @@ pub fn emit_llvm_ir_with_options(
         uses_byte_ring_view: false,
         uses_pool_lease: false,
         rt_features,
+        avr_mega0_putc: AvrMega0PutcMode::Noop,
         strings: Vec::new(),
         string_dedup: HashMap::new(),
     };
 
     ctx.prepare()?;
+    if opts.target == TargetArch::AvrAtmega4809 {
+        ctx.avr_mega0_putc = ctx.resolve_avr_mega0_putc();
+    }
 
     let mut out = String::with_capacity(64 * 1024);
 
@@ -201,6 +220,16 @@ pub fn emit_llvm_ir_with_options(
                 opts.fn_size_attrs(),
                 &ctx.avr_irq_vectors,
             );
+            emit_avr_irq_dispatch_ir(&mut out, &ctx);
+        }
+        TargetArch::AvrAtmega4809 => {
+            crate::avr_mega0::emit_avr_mega0_startup_ir(
+                &mut out,
+                opts.initial_sp(),
+                opts.fn_size_attrs(),
+                &ctx.avr_irq_vectors,
+            );
+            ctx.emit_avr_mega0_uart_putc_ir(&mut out);
             emit_avr_irq_dispatch_ir(&mut out, &ctx);
         }
         TargetArch::HostX86_64Linux => {
@@ -248,7 +277,7 @@ pub fn emit_llvm_ir_with_options(
     // 12. Pooled string literal constants (`@.str.<k>`)
     ctx.emit_string_constants_ir(&mut out);
 
-    if opts.target == TargetArch::AvrAtmega328p {
+    if opts.target.is_avr() {
         return Ok(crate::avr::apply_avr_program_addrspace(&out));
     }
 
@@ -328,6 +357,8 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
         uses_fmt: false,
         uses_fmt_float_sci: false,
         uses_rv_irqs: false,
+        uses_sys_tick: false,
+        uses_set_putc: false,
     };
 
     fn scan_ty(ty: &MirType, feat: &mut RuntimeIrFeatures) {
@@ -710,7 +741,12 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                 },
                 MirStmt::Intrinsic(iop) => match iop {
                     MirIntrinsicOp::UseSystick { hz } => scan_expr(hz, feat),
-                    MirIntrinsicOp::SysOp { args, .. } => {
+                    MirIntrinsicOp::SysOp { method, args } => {
+                        if matches!(method.as_str(), "tick" | "tick_ms") {
+                            feat.uses_sys_tick = true;
+                        } else if method == "set_putc" {
+                            feat.uses_set_putc = true;
+                        }
                         for a in args {
                             scan_expr(a, feat);
                         }
@@ -1101,6 +1137,167 @@ impl<'a> ModuleCtx<'a> {
         }
 
         Ok(())
+    }
+
+    fn find_console_putc_symbol(&self) -> Option<String> {
+        let mut candidates: Vec<(u8, &str, String)> = Vec::new();
+        for f in &self.module.functions {
+            if (f.name == "console_putc" || f.name.ends_with("__console_putc"))
+                && !f.is_yielding
+                && !f.error_spec.has_error()
+                && f.ret_ty == MirType::Void
+                && f.params.len() == 1
+                && f.vars[f.params[0].0].ty == MirType::U8
+            {
+                if let Some(sig) = self.fn_sigs.get(&f.name) {
+                    let rank = if f.name == "console_putc" {
+                        0
+                    } else if f.name.starts_with("bsp__") {
+                        1
+                    } else {
+                        2
+                    };
+                    candidates.push((rank, f.name.as_str(), sig.symbol.clone()));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        candidates.into_iter().next().map(|(_, _, sym)| sym)
+    }
+
+    fn resolve_avr_mega0_putc(&self) -> AvrMega0PutcMode {
+        let console_sym = self.find_console_putc_symbol();
+        if !self.rt_features.uses_set_putc {
+            return match console_sym {
+                Some(symbol) => AvrMega0PutcMode::DirectStatic {
+                    symbol,
+                    elide_set_putc_store: true,
+                },
+                None => AvrMega0PutcMode::Noop,
+            };
+        }
+
+        fn unwrap_fn_addr(mut e: &MirExpr) -> Option<&str> {
+            while let MirExprKind::Cast { expr, .. } = &e.kind {
+                e = expr;
+            }
+            if let MirExprKind::FnAddr(name) = &e.kind {
+                Some(name.as_str())
+            } else {
+                None
+            }
+        }
+
+        fn collect_stmts<'a>(stmts: &'a [MirStmt], out: &mut Vec<Option<&'a str>>) {
+            for s in stmts {
+                match s {
+                    MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, args })
+                        if method == "set_putc" =>
+                    {
+                        out.push(args.first().and_then(unwrap_fn_addr));
+                    }
+                    MirStmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        collect_stmts(then_body, out);
+                        collect_stmts(else_body, out);
+                    }
+                    MirStmt::While { body, .. } => collect_stmts(body, out),
+                    MirStmt::Switch {
+                        arms, default, ..
+                    } => {
+                        for (_, b) in arms {
+                            collect_stmts(b, out);
+                        }
+                        collect_stmts(default, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut sites = Vec::new();
+        for step in &self.module.boot.steps {
+            if let MirBootStep::Stmt(s) = step {
+                collect_stmts(std::slice::from_ref(s), &mut sites);
+            }
+        }
+        for f in &self.module.functions {
+            match &f.body {
+                MirFnBody::Direct(stmts) => collect_stmts(stmts, &mut sites),
+                MirFnBody::Coroutine { blocks, .. } => {
+                    for b in blocks {
+                        collect_stmts(&b.stmts, &mut sites);
+                    }
+                }
+            }
+        }
+        for bp in &self.module.task_blueprints {
+            for b in &bp.blocks {
+                collect_stmts(&b.stmts, &mut sites);
+            }
+        }
+        for isr in &self.module.isrs {
+            collect_stmts(&isr.body, &mut sites);
+        }
+
+        if console_sym.is_none() && sites.len() == 1 {
+            if let Some(fname) = sites[0] {
+                if let Some(sig) = self.fn_sigs.get(fname) {
+                    return AvrMega0PutcMode::DirectStatic {
+                        symbol: sig.symbol.clone(),
+                        elide_set_putc_store: true,
+                    };
+                }
+            }
+        }
+        AvrMega0PutcMode::DynamicGlobal {
+            fallback_symbol: console_sym,
+        }
+    }
+
+    fn emit_avr_mega0_uart_putc_ir(&self, out: &mut String) {
+        let fn_sz = self.opts.fn_size_attrs();
+        match &self.avr_mega0_putc {
+            AvrMega0PutcMode::Noop => {
+                let _ = writeln!(
+                    out,
+                    "define void @__syn_uart_putc(i8 %c) nounwind noinline{fn_sz} {{\nentry:\n  ret void\n}}\n"
+                );
+            }
+            AvrMega0PutcMode::DirectStatic { symbol, .. } => {
+                let _ = writeln!(
+                    out,
+                    "define void @__syn_uart_putc(i8 %c) nounwind noinline{fn_sz} {{\nentry:\n  call void {symbol}(i8 %c)\n  ret void\n}}\n"
+                );
+            }
+            AvrMega0PutcMode::DynamicGlobal { fallback_symbol } => {
+                let fb = if let Some(sym) = fallback_symbol {
+                    format!("  call void {sym}(i8 %c)\n  ret void")
+                } else {
+                    "  ret void".to_string()
+                };
+                let _ = writeln!(
+                    out,
+                    r#"@__syn_user_putc_fn = internal global ptr addrspace(1) null, align 1
+
+define void @__syn_uart_putc(i8 %c) nounwind noinline{fn_sz} {{
+entry:
+  %fp = load ptr addrspace(1), ptr @__syn_user_putc_fn, align 1
+  %has = icmp ne ptr addrspace(1) %fp, null
+  br i1 %has, label %do_call, label %fallback
+do_call:
+  call void %fp(i8 %c)
+  ret void
+fallback:
+{fb}
+}}
+"#
+                );
+            }
+        }
     }
 
     fn visit_struct<'b>(
@@ -1844,7 +2041,7 @@ impl<'a> ModuleCtx<'a> {
     }
 
     fn ptr_align(&self) -> usize {
-        if self.opts.target == TargetArch::AvrAtmega328p {
+        if self.opts.target.is_avr() {
             1
         } else {
             (self.opts.target.ptr_bits() / 8) as usize
@@ -1852,7 +2049,7 @@ impl<'a> ModuleCtx<'a> {
     }
 
     fn llvm_scalar_abi_align(&self, natural_align: usize) -> usize {
-        if self.opts.target == TargetArch::AvrAtmega328p {
+        if self.opts.target.is_avr() {
             1
         } else {
             natural_align
@@ -1863,7 +2060,7 @@ impl<'a> ModuleCtx<'a> {
         match self.opts.target {
             TargetArch::HostX86_64Linux => (24, 8),
             TargetArch::Thumbv7mNoneEabi | TargetArch::Riscv32Esp32C6 => (16, 4),
-            TargetArch::AvrAtmega328p => (12, 1),
+            TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => (12, 1),
         }
     }
 
@@ -2707,7 +2904,7 @@ impl<'a> ModuleCtx<'a> {
         }
         let usize_ty = self.opts.target.usize_llvm_ty();
         let fn_sz = self.opts.fn_size_attrs();
-        let tmp_al = if matches!(self.opts.target, TargetArch::AvrAtmega328p) {
+        let tmp_al = if self.opts.target.is_avr() {
             1
         } else {
             4
@@ -3174,7 +3371,9 @@ do_push:
   %sb = select i1 %has_b, i8 %b8, i8 0
   store i8 %sb, ptr %bp, align 1
   %t1 = add i32 %tail, 1
-  %tnext = urem i32 %t1, {c}
+  %twrap = icmp uge i32 %t1, {c}
+  %tsub = sub i32 %t1, {c}
+  %tnext = select i1 %twrap, i32 %tsub, i32 %t1
   store i32 %tnext, ptr %tail_p, align 4
   %c1 = add i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
@@ -3203,7 +3402,9 @@ do_pop:
   %sb = load i8, ptr %bp, align 1
   store i8 0, ptr %bp, align 1
   %h1 = add i32 %head, 1
-  %hnext = urem i32 %h1, {c}
+  %hwrap = icmp uge i32 %h1, {c}
+  %hsub = sub i32 %h1, {c}
+  %hnext = select i1 %hwrap, i32 %hsub, i32 %h1
   store i32 %hnext, ptr %head_p, align 4
   %c1 = sub i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
@@ -4166,7 +4367,9 @@ do_push:
   %sb = select i1 %has_b, i8 %b8, i8 0
   store i8 %sb, ptr %bp, align 1
   %t1 = add i32 %tail, 1
-  %tnext = urem i32 %t1, %cap
+  %twrap = icmp uge i32 %t1, %cap
+  %tsub = sub i32 %t1, %cap
+  %tnext = select i1 %twrap, i32 %tsub, i32 %t1
   store i32 %tnext, ptr %tail_p, align 4
   %c1 = add i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
@@ -4197,7 +4400,9 @@ do_pop:
   %sb = load i8, ptr %bp, align 1
   store i8 0, ptr %bp, align 1
   %h1 = add i32 %head, 1
-  %hnext = urem i32 %h1, %cap
+  %hwrap = icmp uge i32 %h1, %cap
+  %hsub = sub i32 %h1, %cap
+  %hnext = select i1 %hwrap, i32 %hsub, i32 %h1
   store i32 %hnext, ptr %head_p, align 4
   %c1 = sub i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
@@ -5330,7 +5535,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn stack_align(&self, lty: &str) -> u32 {
-        if matches!(self.ctx.opts.target, TargetArch::AvrAtmega328p) {
+        if self.ctx.opts.target.is_avr() {
             return 1;
         }
         let ptr_bits = self.ctx.opts.target.ptr_bits();
@@ -8176,6 +8381,30 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                                 "call void @__syn_uart_log_hex(ptr {}, i32 {})",
                                 p.repr, v32.repr
                             ));
+                        }
+                    }
+                    "tick" | "tick_ms" => {
+                        self.emit_line("call void @__syn_sys_tick()");
+                    }
+                    "set_putc" => {
+                        let elide = self.ctx.opts.target == TargetArch::AvrAtmega4809
+                            && matches!(
+                                self.ctx.avr_mega0_putc,
+                                AvrMega0PutcMode::DirectStatic {
+                                    elide_set_putc_store: true,
+                                    ..
+                                }
+                            );
+                        if !elide {
+                            if let Some((fp_val, _)) = ev.first() {
+                                let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
+                                let ptr_al = self.ctx.ptr_align();
+                                let coerced = self.coerce(fp_val.clone(), fn_ptr_ty, false);
+                                self.emit_line(format!(
+                                    "store {} {}, ptr @__syn_user_putc_fn, align {ptr_al}",
+                                    coerced.ty, coerced.repr
+                                ));
+                            }
                         }
                     }
                     "assert" => {

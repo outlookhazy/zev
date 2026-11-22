@@ -5128,6 +5128,112 @@ fn rejects_e0034_linear_lease_violations_and_e0011_stale_get() {
     );
 }
 
+#[test]
+fn sys_tick_and_set_putc_hooks_validation() {
+    // 1. Valid `sys.tick()`, `sys.tick_ms()`, and `sys.set_putc(fn(u8))` across ISR / fn / task
+    let model = expect_ok(
+        r#"
+        irq IRQ_SYSTICK = 36;
+        mmio TcbRegs { @w1c u8 intflags @ 0x06; }
+        mmio TCB3 : TcbRegs @ 0x0AB0;
+
+        fn uart_putc(u8 c) {
+            usize _unused = (usize)c;
+        }
+
+        isr systick_isr(*TcbRegs tcb) {
+            tcb.intflags = 1;
+            sys.tick();
+        }
+
+        task ticker_worker() {
+            loop {
+                sys.tick_ms();
+                checkpoint();
+            }
+        }
+
+        fn main() {
+            sys.set_putc(uart_putc);
+            IRQ_SYSTICK.attach(systick_isr(TCB3));
+            spawn ticker_worker() @normal;
+        }
+        "#,
+    );
+    assert_eq!(model.fn_effect("uart_putc"), FnEffect::NonYielding);
+
+    // 2. Arity errors on `sys.tick(1)` and `sys.tick_ms(1)`
+    expect_err_kind(
+        r#"
+        fn main() {
+            sys.tick(1);
+        }
+        "#,
+        DiagnosticKind::TypeMismatch,
+    );
+    expect_err_kind(
+        r#"
+        fn main() {
+            sys.tick_ms(1);
+        }
+        "#,
+        DiagnosticKind::TypeMismatch,
+    );
+
+    // 3. `sys.set_putc` wrong callback signature -> TypeMismatch
+    for bad_sig in [
+        "fn bad(u16 c) {} fn main() { sys.set_putc(bad); }",
+        "u8 bad(u8 c) { return c; } fn main() { sys.set_putc(bad); }",
+        "fn bad() {} fn main() { sys.set_putc(bad); }",
+        "fn main() { sys.set_putc(); }",
+    ] {
+        expect_err_kind(bad_sig, DiagnosticKind::TypeMismatch);
+    }
+
+    // 4. `sys.set_putc` fallible (`error`) callback rejected -> TypeMismatch
+    expect_err_kind(
+        r#"
+        fn fallible_putc(u8 c) error {
+            if (c == 0) { error; }
+        }
+        fn main() {
+            sys.set_putc(fallible_putc);
+        }
+        "#,
+        DiagnosticKind::TypeMismatch,
+    );
+
+    // 5. `sys.set_putc` yielding callback rejected -> YieldingCallbackToExternC
+    expect_err_kind(
+        r#"
+        fn yielding_putc(u8 c) {
+            usize _u = (usize)c;
+            checkpoint();
+        }
+        fn main() {
+            sys.set_putc(yielding_putc);
+        }
+        "#,
+        DiagnosticKind::YieldingCallbackToExternC,
+    );
+
+    // 6. `sys.set_putc` inside `isr` rejected -> InvalidControlFlow
+    expect_err_kind(
+        r#"
+        irq IRQ0 = 1;
+        fn uart_putc(u8 c) { usize _u = (usize)c; }
+        isr bad_isr() {
+            sys.set_putc(uart_putc);
+        }
+        fn main() {
+            IRQ0.attach(bad_isr);
+        }
+        "#,
+        DiagnosticKind::InvalidControlFlow,
+    );
+}
+
+
 
 
 

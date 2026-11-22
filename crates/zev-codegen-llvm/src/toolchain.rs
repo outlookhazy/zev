@@ -18,16 +18,30 @@ pub enum TargetArch {
     Riscv32Esp32C6,
     /// Bare-metal Microchip ATmega328P AVR (`avr`, Arduino Uno R3 Optiboot 16 MHz).
     AvrAtmega328p,
+    /// Bare-metal Microchip ATmega4809 AVR (`avr` / `avrxmega3`, Arduino Nano Every 16/20 MHz).
+    AvrAtmega4809,
     /// Host 64-bit Linux (`x86_64-unknown-linux-gnu`) for host `.ll` inspection/testing.
     HostX86_64Linux,
 }
 
 impl TargetArch {
+    pub const fn is_avr(self) -> bool {
+        matches!(self, Self::AvrAtmega328p | Self::AvrAtmega4809)
+    }
+
+    pub const fn avr_mcpu(self) -> &'static str {
+        match self {
+            Self::AvrAtmega328p => "atmega328p",
+            Self::AvrAtmega4809 => "atmega4809",
+            Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 | Self::HostX86_64Linux => "",
+        }
+    }
+
     pub const fn triple(self) -> &'static str {
         match self {
             Self::Thumbv7mNoneEabi => "thumbv7m-none-eabi",
             Self::Riscv32Esp32C6 => "riscv32-unknown-none-elf",
-            Self::AvrAtmega328p => "avr",
+            Self::AvrAtmega328p | Self::AvrAtmega4809 => "avr",
             Self::HostX86_64Linux => "x86_64-unknown-linux-gnu",
         }
     }
@@ -36,7 +50,9 @@ impl TargetArch {
         match self {
             Self::Thumbv7mNoneEabi => "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
             Self::Riscv32Esp32C6 => "e-m:e-p:32:32-i64:64-n32-S128",
-            Self::AvrAtmega328p => "e-P1-p:16:8-i8:8-i16:8-i32:8-i64:8-f32:8-f64:8-n8:16-a:8",
+            Self::AvrAtmega328p | Self::AvrAtmega4809 => {
+                "e-P1-p:16:8-i8:8-i16:8-i32:8-i64:8-f32:8-f64:8-n8:16-a:8"
+            }
             Self::HostX86_64Linux => {
                 "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
             }
@@ -46,7 +62,7 @@ impl TargetArch {
     pub const fn ptr_bits(self) -> u32 {
         match self {
             Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 => 32,
-            Self::AvrAtmega328p => 16,
+            Self::AvrAtmega328p | Self::AvrAtmega4809 => 16,
             Self::HostX86_64Linux => 64,
         }
     }
@@ -54,14 +70,14 @@ impl TargetArch {
     pub const fn usize_llvm_ty(self) -> &'static str {
         match self {
             Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 => "i32",
-            Self::AvrAtmega328p => "i16",
+            Self::AvrAtmega328p | Self::AvrAtmega4809 => "i16",
             Self::HostX86_64Linux => "i64",
         }
     }
 
     pub const fn fn_ptr_llvm_ty(self) -> &'static str {
         match self {
-            Self::AvrAtmega328p => "ptr addrspace(1)",
+            Self::AvrAtmega328p | Self::AvrAtmega4809 => "ptr addrspace(1)",
             Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 | Self::HostX86_64Linux => "ptr",
         }
     }
@@ -130,10 +146,25 @@ impl CodegenOptions {
         }
     }
 
+    /// Default options for bare-metal Microchip ATmega4809 (`avrxmega3`, Arduino Nano Every UPDI):
+    /// - `FLASH`: `0x0000_0000` (`49,152 B` = 48 KB full Flash via SAMD11 `MuxTO` UPDI)
+    /// - `RAM`:   `0x0000_2800` (`6,144 B` = 6 KB SRAM `0x2800..=0x3FFF`, initial `SP = 0x3FFF`)
+    pub fn avr_nano_every() -> Self {
+        Self {
+            target: TargetArch::AvrAtmega4809,
+            flash_origin: 0x0000_0000,
+            flash_len: 49_152,
+            ram_origin: 0x0000_2800,
+            ram_len: 6_144,
+            opt_level: "-Os".to_string(),
+            max_ticks: 0,
+        }
+    }
+
     /// Initial stack pointer (`ram_origin + ram_len`, or `- 1` on AVR post-decrement push).
     pub const fn initial_sp(&self) -> u32 {
         let top = self.ram_origin.wrapping_add(self.ram_len);
-        if matches!(self.target, TargetArch::AvrAtmega328p) {
+        if self.target.is_avr() {
             top.wrapping_sub(1)
         } else {
             top
@@ -312,12 +343,12 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-/// Auto-generate the freestanding linker script (`FLASH` + `RAM`, zero libc) for Cortex-M3, ESP32-C6, or ATmega328P.
+/// Auto-generate the freestanding linker script (`FLASH` + `RAM`, zero libc) for Cortex-M3, ESP32-C6, or AVR.
 pub fn synthesize_linker_script(opts: &CodegenOptions) -> String {
-    if opts.target == TargetArch::AvrAtmega328p {
+    if opts.target.is_avr() {
         let ram_vma = 0x0080_0000u32.wrapping_add(opts.ram_origin);
         return format!(
-            r#"/* Auto-synthesized by zev-codegen-llvm for ATmega328P (Arduino Uno R3 Optiboot) */
+            r#"/* Auto-synthesized by zev-codegen-llvm for AVR ({mcpu}) */
 MEMORY
 {{
   FLASH (rx)  : ORIGIN = 0x{flash_orig:08X}, LENGTH = {flash_len}
@@ -365,6 +396,7 @@ SECTIONS
             flash_len = opts.flash_len,
             ram_vma = ram_vma,
             ram_len = opts.ram_len,
+            mcpu = opts.target.avr_mcpu(),
         );
     }
 
@@ -482,7 +514,7 @@ SECTIONS
     )
 }
 
-fn find_tool(preferred_abs: &'static str, fallback_name: &'static str) -> &'static str {
+pub(crate) fn find_tool(preferred_abs: &'static str, fallback_name: &'static str) -> &'static str {
     if Path::new(preferred_abs).exists() {
         preferred_abs
     } else {
@@ -515,8 +547,8 @@ pub fn optimize_ll_with_opt(
         TargetArch::Riscv32Esp32C6 => {
             cmd.arg("-mcpu=generic-rv32").arg("-mattr=+m,+a,+c");
         }
-        TargetArch::AvrAtmega328p => {
-            cmd.arg("-mcpu=atmega328p");
+        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
+            cmd.arg(format!("-mcpu={}", opts.target.avr_mcpu()));
         }
         TargetArch::HostX86_64Linux => {}
     }
@@ -571,8 +603,8 @@ pub fn compile_ll_to_obj(
                 .arg("-function-sections")
                 .arg("-data-sections");
         }
-        TargetArch::AvrAtmega328p => {
-            cmd.arg("-mcpu=atmega328p")
+        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
+            cmd.arg(format!("-mcpu={}", opts.target.avr_mcpu()))
                 .arg("-function-sections")
                 .arg("-data-sections");
         }
@@ -770,11 +802,14 @@ pub fn compile_ll_to_elf(
 ) -> Result<ElfBuildResult, CodegenError> {
     if !matches!(
         opts.target,
-        TargetArch::Thumbv7mNoneEabi | TargetArch::Riscv32Esp32C6 | TargetArch::AvrAtmega328p
+        TargetArch::Thumbv7mNoneEabi
+            | TargetArch::Riscv32Esp32C6
+            | TargetArch::AvrAtmega328p
+            | TargetArch::AvrAtmega4809
     ) {
         return Err(CodegenError::new(
             "build-elf",
-            "bare-metal .elf linking requires Thumbv7mNoneEabi, Riscv32Esp32C6, or AvrAtmega328p",
+            "bare-metal .elf linking requires Thumbv7mNoneEabi, Riscv32Esp32C6, AvrAtmega328p, or AvrAtmega4809",
         ));
     }
     if let Some(parent) = out_elf.parent() {
@@ -1009,7 +1044,7 @@ pub fn flash_esp32c6_bin(bin_path: &Path, port: &str) -> Result<String, CodegenE
     Ok(combined)
 }
 
-fn read_elf32_sym_addr(elf_path: &Path, target_name: &str) -> Option<u32> {
+pub(crate) fn read_elf32_sym_addr(elf_path: &Path, target_name: &str) -> Option<u32> {
     let bytes = fs::read(elf_path).ok()?;
     if bytes.len() < 52 || &bytes[0..4] != b"\x7FELF" || bytes[4] != 1 {
         return None;
@@ -1253,3 +1288,5 @@ pub fn flash_avr_uno_bin(bin_path: &Path, port: &str) -> Result<String, CodegenE
     }
     Ok(combined)
 }
+
+pub use crate::avr_mega0::{flash_avr_nano_every_bin, objcopy_elf_to_avr_nano_every_bin};

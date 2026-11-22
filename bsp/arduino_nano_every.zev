@@ -1,0 +1,259 @@
+// Arduino Nano Every (ATmega4809 16/20 MHz megaAVR 0-series) Board Support Package
+//
+// Pinout (`ArduinoCore-megaavr/variants/nona4809/pins_arduino.h`):
+//   - `D13` / `LED_BUILTIN` = `PE2`
+//   - `D2`                  = `PA0`
+//   - `A0`                  = `PD3` (`AIN3`)
+//   - `USART3` (`ALT1`)     = `PB4` TX / `PB5` RX (SAMD11 `MuxTO` USB-CDC bridge)
+//   - `SPI0`   (`ALT2`)     = `PE0` MOSI (`D11`) / `PE1` MISO (`D12`) / `PE2` SCK (`D13`) / `PE3` SS (`D8`)
+
+import chip.atmega4809 as hw;
+
+pub fn console_putc(u8 c) {
+    while ((hw.USART3.status & hw.BIT_USART_DREIF) == 0) {}
+    hw.USART3.txd_l = c;
+}
+
+isr systick_isr(*hw.TcbRegs tcb) {
+    tcb.intflags = hw.BIT_TCB_CAPT;
+    sys.tick();
+}
+
+pub fn init_board_gpio() {
+    // Configure Digital Pin 13 (`PE2`, onboard yellow LED) as output driven LOW,
+    // Digital Pin 2 (`PA0`) as input with internal pull-up enabled,
+    // and Analog Pin A0 (`PD3` / `AIN3`) as analog input with digital buffer disabled.
+    hw.PORTE.outclr = hw.BIT_PE2_LED;
+    hw.PORTE.dirset = hw.BIT_PE2_LED;
+
+    hw.PORTA.dirclr = hw.BIT_PA0_D2;
+    hw.PORTA.pin0ctrl = hw.PORT_PULLUPEN;
+
+    hw.PORTD.dirclr = hw.BIT_PD3_A0;
+    hw.PORTD.pin3ctrl = hw.PORT_ISC_INPUT_DISABLE;
+}
+
+pub fn init_board() {
+    // Disarm WDT and clear `/6` reset main-clock prescaler within 4 AVR cycles of CCP unlock.
+    critical {
+        hw.CPU.ccp = hw.CCP_IOREG;
+        hw.WDT.ctrla = 0;
+        hw.CPU.ccp = hw.CCP_IOREG;
+        hw.CLKCTRL.mclkctrlb = 0;
+    }
+
+    // Enable Idle sleep mode ready for `sleep` instructions in scheduler idle path.
+    hw.SLPCTRL.ctrla = hw.BIT_SLPCTRL_SEN;
+
+    // Auto-detect 16 MHz (`FREQSEL == 1`) vs 20 MHz (`else`) from `FUSE.OSCCFG` bits `[1:0]`.
+    u8 freqsel = hw.FUSE.osccfg & 0x03;
+    u16 baud = 694u16;
+    u16 ccmp = 19999u16;
+    u32 f_cpu = 20_000_000u32;
+    if (freqsel == 1u8) {
+        baud = 556u16;
+        ccmp = 15999u16;
+        f_cpu = 16_000_000u32;
+    }
+
+    // Route `USART3` to `ALT1` (`PB4` TX / `PB5` RX -> SAMD11 `MuxTO` USB-CDC) at `115200 8N1`
+    // (`@__syn_uart_putc` routes directly to `pub fn console_putc(u8)` above).
+    hw.PORTMUX.usartroutea = hw.PORTMUX_USART3_ALT1;
+    hw.PORTB.outset = hw.BIT_PORTB_TXD;
+    hw.PORTB.dirset = hw.BIT_PORTB_TXD;
+    hw.PORTB.dirclr = hw.BIT_PORTB_RXD;
+    hw.PORTB.pin5ctrl = hw.PORT_PULLUPEN;
+    hw.USART3.baud = baud;
+    hw.USART3.ctrlc = hw.USART_CTRLC_8N1;
+    hw.USART3.ctrlb = hw.USART_CTRLB_RXTXEN;
+
+    // Start `TCB3` at 1.000 kHz Periodic Interrupt mode and attach `systick_isr` -> `sys.tick()`.
+    hw.TCB3.ctrla = 0;
+    hw.TCB3.ctrlb = 0;
+    hw.TCB3.evctrl = 0;
+    hw.TCB3.cnt = 0;
+    hw.TCB3.ccmp = ccmp;
+    hw.TCB3.intflags = hw.BIT_TCB_CAPT;
+    hw.TCB3.intctrl = hw.BIT_TCB_CAPT;
+    hw.TCB3.ctrla = hw.BIT_TCB_ENABLE;
+    sys.use_systick(f_cpu);
+    hw.IRQ_TCB3_INT.attach(systick_isr(hw.TCB3));
+
+    init_board_gpio();
+}
+
+pub fn set_led(bool on) {
+    if (on) {
+        hw.PORTE.outset = hw.BIT_PE2_LED;
+    } else {
+        hw.PORTE.outclr = hw.BIT_PE2_LED;
+    }
+}
+
+pub fn toggle_led() {
+    hw.PORTE.outtgl = hw.BIT_PE2_LED;
+}
+
+pub u8 read_led() {
+    return (hw.PORTE.out >> 2) & 1;
+}
+
+pub u8 read_d2_pin() {
+    return hw.PORTA.in_reg & 1;
+}
+
+pub fn enable_led_port_irq() {
+    critical {
+        hw.PORTE.intflags = hw.BIT_PE2_LED;
+        hw.PORTE.pin2ctrl = hw.PORT_ISC_BOTHEDGES;
+    }
+}
+
+pub fn clear_porte_led_flag() {
+    hw.PORTE.intflags = hw.BIT_PE2_LED;
+}
+
+pub fn start_tcb0_periodic(u16 ccmp) {
+    // Configure 16-bit TCB0 in Periodic Interrupt mode (`CLK_PER / 2` -> 5.000 ms @ 16 MHz with ccmp=39999).
+    hw.TCB0.ctrla = 0;
+    hw.TCB0.ctrlb = 0;
+    hw.TCB0.evctrl = 0;
+    hw.TCB0.cnt = 0;
+    hw.TCB0.ccmp = ccmp;
+    hw.TCB0.intflags = hw.BIT_TCB_CAPT;
+    hw.TCB0.intctrl = hw.BIT_TCB_CAPT;
+    hw.TCB0.ctrla = hw.TCB_CLKSEL_CLKDIV2 | hw.BIT_TCB_ENABLE;
+}
+
+pub fn enable_uart_rx_irq() {
+    critical {
+        u8 cur = hw.USART3.ctrla;
+        hw.USART3.ctrla = cur | hw.BIT_USART_RXCIE;
+    }
+}
+
+pub fn enable_uart_dre_irq() {
+    critical {
+        hw.USART3.ctrla = hw.USART3.ctrla | hw.BIT_USART_DREIE;
+    }
+}
+
+pub fn disable_uart_dre_irq() {
+    critical {
+        hw.USART3.ctrla = hw.USART3.ctrla & (~hw.BIT_USART_DREIE);
+    }
+}
+
+u16 adc_convert_once() {
+    hw.ADC0.intflags = hw.BIT_ADC_RESRDY;
+    hw.ADC0.command = hw.BIT_ADC_STCONV;
+    for (u32 i in 0..8192) {
+        if ((hw.ADC0.intflags & hw.BIT_ADC_RESRDY) != 0) {
+            break;
+        }
+    }
+    u16 res = hw.ADC0.res;
+    hw.ADC0.intflags = hw.BIT_ADC_RESRDY;
+    return res;
+}
+
+pub fn init_adc() {
+    // Enable internal 1.1V reference for ADC0 (`ADC0REFEN` keeps reference warm between reads).
+    hw.VREF.ctrla = hw.VREF_ADC0_1V1;
+    hw.VREF.ctrlb = hw.BIT_VREF_ADC0EN;
+
+    // 10-bit single-conversion mode, `CLK_PER / 16` (1.0 MHz @ 16 MHz, 1.25 MHz @ 20 MHz),
+    // 64-cycle initial delay (>= 51 us), 40-cycle sample length (>= 32 us).
+    hw.ADC0.ctrla = 0;
+    hw.ADC0.ctrlb = 0;
+    hw.ADC0.ctrlc = hw.BIT_ADC_SAMPCAP | hw.ADC_REFSEL_INTREF | hw.ADC_PRESC_DIV16;
+    hw.ADC0.ctrld = hw.ADC_INITDLY_DLY64;
+    hw.ADC0.sampctrl = 40;
+    hw.ADC0.muxpos = hw.ADC_MUX_TEMPSENSE;
+    hw.ADC0.ctrla = hw.BIT_ADC_ENABLE;
+    u16 _discard = adc_convert_once();
+}
+
+pub u16 read_a0() {
+    hw.ADC0.ctrlc = hw.BIT_ADC_SAMPCAP | hw.ADC_REFSEL_VDDREF | hw.ADC_PRESC_DIV16;
+    hw.ADC0.sampctrl = 16;
+    hw.ADC0.muxpos = hw.ADC_MUX_AIN3;
+    u16 _settle = adc_convert_once();
+    return adc_convert_once();
+}
+
+pub u16 read_mcu_temp_c_x10() {
+    // ATmega4809 Datasheet Section 30.3.2.6 calibrated on-die temperature in tenths of deg C:
+    //   Temp_K     = ((ADC0.RES - (i8)SIGROW.TEMPSENSE1) * SIGROW.TEMPSENSE0) / 256
+    //   Temp_C_x10 = (((raw - offset) * gain * 10) - 699264 + 128) >> 8   (273.15 * 10 * 256 = 699264)
+    hw.VREF.ctrla = hw.VREF_ADC0_1V1;
+    hw.VREF.ctrlb = hw.BIT_VREF_ADC0EN;
+    hw.ADC0.ctrlc = hw.BIT_ADC_SAMPCAP | hw.ADC_REFSEL_INTREF | hw.ADC_PRESC_DIV16;
+    hw.ADC0.ctrld = hw.ADC_INITDLY_DLY64;
+    hw.ADC0.sampctrl = 40;
+    hw.ADC0.muxpos = hw.ADC_MUX_TEMPSENSE;
+    u16 _settle = adc_convert_once();
+    u16 raw = adc_convert_once();
+
+    u8 gain = hw.SIGROW.tempsense0;
+    if (gain == 0 || gain == 0xFF) {
+        return 0;
+    }
+    i8 offset = hw.SIGROW.tempsense1 as i8;
+    i32 temp_k_x2560 = ((raw as i32) - (offset as i32)) * (gain as i32) * 10;
+    if (temp_k_x2560 <= 699264) {
+        return 0;
+    }
+    u32 num = ((temp_k_x2560 - 699264) as u32) + 128u32;
+    return (num >> 8) as u16;
+}
+
+pub fn spi_master_start_byte(u8 first_byte) {
+    critical {
+        // Mask `PE2` port interrupt while hardware `SPI0` (`ALT2`) clocks `SCK` on `PE2`.
+        hw.PORTE.pin2ctrl = hw.PORT_ISC_INTDISABLE;
+        hw.PORTE.intflags = hw.BIT_PE2_LED;
+
+        // Route `SPI0` to `ALT2` (`PE0` MOSI, `PE1` MISO, `PE2` SCK, `PE3` SS).
+        u8 mux = hw.PORTMUX.twispiroutea;
+        hw.PORTMUX.twispiroutea = (mux & (~hw.PORTMUX_SPI0_GM)) | hw.PORTMUX_SPI0_ALT2;
+
+        hw.PORTE.outset = hw.BIT_PE3_SS;
+        hw.PORTE.dirset = hw.BIT_PE0_MOSI | hw.BIT_PE2_LED | hw.BIT_PE3_SS;
+        hw.PORTE.dirclr = hw.BIT_PE1_MISO;
+
+        // Clear stale flags, enable `SSD` (host-only SS), `SPI_IE`, and Master @ `CLK_PER / 16`.
+        hw.SPI0.ctrlb = hw.BIT_SPI_SSD;
+        u8 st = hw.SPI0.intflags;
+        u8 dr = hw.SPI0.data;
+        u8 _clr = st ^ dr;
+        hw.SPI0.intflags = hw.BIT_SPI_IF;
+        hw.SPI0.intctrl = hw.BIT_SPI_IE;
+        hw.SPI0.ctrla = hw.BIT_SPI_MASTER | hw.SPI_PRESC_DIV16 | hw.BIT_SPI_ENABLE;
+        hw.SPI0.data = first_byte;
+    }
+}
+
+pub u8 spi_transfer_read() {
+    u8 st = hw.SPI0.intflags;
+    u8 b = hw.SPI0.data;
+    hw.SPI0.intflags = hw.BIT_SPI_IF;
+    if ((st & hw.BIT_SPI_IF) == 0) {
+        return b;
+    }
+    return b;
+}
+
+pub fn spi_transfer_next(u8 b) {
+    hw.SPI0.data = b;
+}
+
+pub fn spi_master_finish() {
+    critical {
+        hw.SPI0.intctrl = 0;
+        hw.SPI0.ctrla = 0;
+        hw.SPI0.intflags = hw.BIT_SPI_IF;
+        hw.PORTE.intflags = hw.BIT_PE2_LED;
+        hw.PORTE.pin2ctrl = hw.PORT_ISC_BOTHEDGES;
+    }
+}

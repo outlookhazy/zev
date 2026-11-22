@@ -250,13 +250,18 @@ fn resolve_llvm_options(
         Some("avr") | Some("atmega328p") | Some("uno") | Some("arduino-uno") => {
             Ok(zev_codegen_llvm::CodegenOptions::avr_uno())
         }
+        Some("nano-every")
+        | Some("arduino-nano-every")
+        | Some("atmega4809")
+        | Some("avr-mega0")
+        | Some("avrxmega3") => Ok(zev_codegen_llvm::CodegenOptions::avr_nano_every()),
         Some("host") | Some("x86_64") | Some("x86_64-unknown-linux-gnu") => {
             let mut opts = zev_codegen_llvm::CodegenOptions::default();
             opts.target = zev_codegen_llvm::TargetArch::HostX86_64Linux;
             Ok(opts)
         }
         Some(other) => Err(format!(
-            "unsupported `--target {other}` (expected `cortex-m3`, `esp32c6`, `avr`, or `host`)"
+            "unsupported `--target {other}` (expected `cortex-m3`, `esp32c6`, `avr`, `nano-every`, or `host`)"
         )),
     }
 }
@@ -291,6 +296,21 @@ fn print_avr_summary(res: &zev_codegen_llvm::AvrImageResult) {
     );
 }
 
+fn print_avr_nano_every_summary(res: &zev_codegen_llvm::AvrImageResult) {
+    println!(
+        "Built ATmega4809 AVR image: {} ({} bytes flash / 49152 B, {} bytes static SRAM / 6144 B)",
+        res.bin_path.display(),
+        res.bin_size,
+        res.sram_static_bytes
+    );
+    print!("{}", res.elf.sizes.raw_output);
+    println!(
+        "Zero-heap audit: undefined_symbols={}, allocator_symbols={}",
+        res.elf.audit.undefined_symbols.len(),
+        res.elf.audit.heap_or_libc_symbols.len()
+    );
+}
+
 enum RamExecOutcome {
     Output { text: String, within_budget: bool },
     UsageErr(String),
@@ -309,7 +329,7 @@ fn execute_ram_command(
             Ok(mut o) => {
                 if o.target == zev_codegen_llvm::TargetArch::HostX86_64Linux {
                     return RamExecOutcome::UsageErr(format!(
-                        "unsupported `--target {t}` for `zevc ram` (expected `cortex-m3`, `esp32c6`, or `avr`)"
+                        "unsupported `--target {t}` for `zevc ram` (expected `cortex-m3`, `esp32c6`, `avr`, or `nano-every`)"
                     ));
                 }
                 if let Some(lvl) = opt_level {
@@ -807,6 +827,92 @@ fn main() -> ExitCode {
                 print_avr_summary(&res);
                 println!("Flashing Arduino Uno (ATmega328P) on `{port}` via STK500v1...");
                 match zev_codegen_llvm::flash_avr_uno_bin(&res.bin_path, &port) {
+                    Ok(flash_out) => {
+                        print!("{flash_out}");
+                        drop(temp_holder);
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::BuildAvrNanoEvery {
+            files,
+            include_dirs,
+            opt_level,
+            output,
+        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+            Ok((_, mir)) => {
+                let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
+                let out_elf = out_bin.with_extension("elf");
+                let mut opts = zev_codegen_llvm::CodegenOptions::avr_nano_every();
+                opts.opt_level = opt_level;
+                match zev_codegen_llvm::build_avr_nano_every_image_with_options(
+                    &mir, &out_elf, &out_bin, &opts,
+                ) {
+                    Ok(res) => {
+                        print_avr_nano_every_summary(&res);
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::FlashAvrNanoEvery {
+            files,
+            include_dirs,
+            port,
+            opt_level,
+            output,
+        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+            Ok((_, mir)) => {
+                let mut temp_holder: Option<TempWorkDir> = None;
+                let out_bin = match output {
+                    Some(p) => p,
+                    None => {
+                        let temp = match TempWorkDir::create("zevc-nano-every") {
+                            Ok(t) => t,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let p = temp.dir.join("firmware.bin");
+                        temp_holder = Some(temp);
+                        p
+                    }
+                };
+                let out_elf = out_bin.with_extension("elf");
+                let mut opts = zev_codegen_llvm::CodegenOptions::avr_nano_every();
+                opts.opt_level = opt_level;
+                let res = match zev_codegen_llvm::build_avr_nano_every_image_with_options(
+                    &mir, &out_elf, &out_bin, &opts,
+                ) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                print_avr_nano_every_summary(&res);
+                println!(
+                    "Flashing Arduino Nano Every (ATmega4809) on `{port}` via MuxTO UPDI..."
+                );
+                match zev_codegen_llvm::flash_avr_nano_every_bin(&res.bin_path, &port) {
                     Ok(flash_out) => {
                         print!("{flash_out}");
                         drop(temp_holder);
@@ -1369,6 +1475,58 @@ fn main() {
         );
         let (_, mir) = compile_to_mir(&[demo_path]).expect("uno demo checks & lowers to MIR");
         assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
+    }
+
+    #[test]
+    fn arduino_nano_every_example_checks_builds_and_ram_target_proves_stack() {
+        for alias in [
+            "nano-every",
+            "arduino-nano-every",
+            "atmega4809",
+            "avr-mega0",
+            "avrxmega3",
+        ] {
+            let opts = resolve_llvm_options(Some(alias))
+                .unwrap_or_else(|e| panic!("target {alias} failed: {e}"));
+            assert_eq!(opts.target, zev_codegen_llvm::TargetArch::AvrAtmega4809);
+            assert_eq!(opts.flash_len, 49_152);
+            assert_eq!(opts.ram_len, 6_144);
+            assert_eq!(opts.opt_level, "-Os");
+        }
+
+        let root = repo_root();
+        let nano_path = root.join("examples/arduino_nano_every_demo.zev");
+        let (_, mir) = compile_to_mir(std::slice::from_ref(&nano_path))
+            .expect("examples/arduino_nano_every_demo.zev must check & lower to MIR");
+        assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
+
+        let temp = TempWorkDir::create("zevc-cli-test-nano").unwrap();
+        let nano_elf = temp.dir.join("arduino_nano_every_demo.elf");
+        let nano_bin = temp.dir.join("arduino_nano_every_demo.bin");
+        let nano_res = zev_codegen_llvm::build_avr_nano_every_image_with_options(
+            &mir,
+            &nano_elf,
+            &nano_bin,
+            &zev_codegen_llvm::CodegenOptions::avr_nano_every(),
+        )
+        .expect("ATmega4809 Nano Every image build must succeed");
+        assert!(nano_res.elf.audit.is_zero_heap_freestanding());
+        assert!(nano_res.bin_size > 160 && nano_res.bin_size <= 49_152);
+        assert!(nano_res.sram_static_bytes < 5_632);
+
+        match execute_ram_command(&[nano_path], &[], Some("nano-every"), None) {
+            RamExecOutcome::Output {
+                text,
+                within_budget,
+            } => {
+                assert!(within_budget, "expected within_budget for nano-every:\n{text}");
+                assert!(text.contains("STATIC ZERO-HEAP SRAM REPORT"));
+                assert!(text.contains("HARDWARE SINGLE-STACK + .BSS HIGH-WATER PROOF"));
+                assert!(text.contains("6144 B"), "missing 6144 B in:\n{text}");
+                assert!(text.contains("PASS"));
+            }
+            _ => panic!("expected targeted ram output for nano-every"),
+        }
     }
 
     #[test]
