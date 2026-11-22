@@ -247,13 +247,16 @@ fn resolve_llvm_options(
         Some("esp32c6") | Some("riscv32") | Some("rv32imac") | Some("riscv32-esp32c6") => {
             Ok(zev_codegen_llvm::CodegenOptions::esp32c6())
         }
+        Some("avr") | Some("atmega328p") | Some("uno") | Some("arduino-uno") => {
+            Ok(zev_codegen_llvm::CodegenOptions::avr_uno())
+        }
         Some("host") | Some("x86_64") | Some("x86_64-unknown-linux-gnu") => {
             let mut opts = zev_codegen_llvm::CodegenOptions::default();
             opts.target = zev_codegen_llvm::TargetArch::HostX86_64Linux;
             Ok(opts)
         }
         Some(other) => Err(format!(
-            "unsupported `--target {other}` (expected `cortex-m3`, `esp32c6`, or `host`)"
+            "unsupported `--target {other}` (expected `cortex-m3`, `esp32c6`, `avr`, or `host`)"
         )),
     }
 }
@@ -264,6 +267,21 @@ fn print_esp32c6_summary(res: &zev_codegen_llvm::Esp32C6ImageResult) {
         res.bin_path.display(),
         res.bin_size,
         res.magic_header
+    );
+    print!("{}", res.elf.sizes.raw_output);
+    println!(
+        "Zero-heap audit: undefined_symbols={}, allocator_symbols={}",
+        res.elf.audit.undefined_symbols.len(),
+        res.elf.audit.heap_or_libc_symbols.len()
+    );
+}
+
+fn print_avr_summary(res: &zev_codegen_llvm::AvrImageResult) {
+    println!(
+        "Built ATmega328P AVR image: {} ({} bytes flash / 32256 B, {} bytes static SRAM / 2048 B)",
+        res.bin_path.display(),
+        res.bin_size,
+        res.sram_static_bytes
     );
     print!("{}", res.elf.sizes.raw_output);
     println!(
@@ -652,6 +670,90 @@ fn main() -> ExitCode {
             }
             }
         }
+        Command::BuildAvr {
+            files,
+            include_dirs,
+            opt_level,
+            output,
+        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+            Ok((_, mir)) => {
+                let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
+                let out_elf = out_bin.with_extension("elf");
+                let mut opts = zev_codegen_llvm::CodegenOptions::avr_uno();
+                opts.opt_level = opt_level;
+                match zev_codegen_llvm::build_avr_uno_image_with_options(
+                    &mir, &out_elf, &out_bin, &opts,
+                ) {
+                    Ok(res) => {
+                        print_avr_summary(&res);
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::FlashAvr {
+            files,
+            include_dirs,
+            port,
+            opt_level,
+            output,
+        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+            Ok((_, mir)) => {
+                let mut temp_holder: Option<TempWorkDir> = None;
+                let out_bin = match output {
+                    Some(p) => p,
+                    None => {
+                        let temp = match TempWorkDir::create("zevc-avr") {
+                            Ok(t) => t,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let p = temp.dir.join("firmware.bin");
+                        temp_holder = Some(temp);
+                        p
+                    }
+                };
+                let out_elf = out_bin.with_extension("elf");
+                let mut opts = zev_codegen_llvm::CodegenOptions::avr_uno();
+                opts.opt_level = opt_level;
+                let res = match zev_codegen_llvm::build_avr_uno_image_with_options(
+                    &mir, &out_elf, &out_bin, &opts,
+                ) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                print_avr_summary(&res);
+                println!("Flashing Arduino Uno (ATmega328P) on `{port}` via STK500v1...");
+                match zev_codegen_llvm::flash_avr_uno_bin(&res.bin_path, &port) {
+                    Ok(flash_out) => {
+                        print!("{flash_out}");
+                        drop(temp_holder);
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -1180,5 +1282,23 @@ fn main() {
         assert!(qres.exec.stdout.contains("diff=-200"), "out={}", qres.exec.stdout);
         assert!(qres.exec.stdout.contains("temp=42"), "out={}", qres.exec.stdout);
         assert!(qres.exec.stdout.contains("tick"), "out={}", qres.exec.stdout);
+    }
+
+    #[test]
+    fn arduino_uno_example_checks_and_avr_target_resolves() {
+        for alias in ["avr", "atmega328p", "uno", "arduino-uno"] {
+            let opts = resolve_llvm_options(Some(alias))
+                .unwrap_or_else(|e| panic!("target {alias} failed: {e}"));
+            assert_eq!(opts.target, zev_codegen_llvm::TargetArch::AvrAtmega328p);
+        }
+
+        let demo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/arduino_uno_demo.zev");
+        assert!(
+            load_and_check_detailed(std::slice::from_ref(&demo_path)).is_ok(),
+            "examples/arduino_uno_demo.zev must check cleanly"
+        );
+        let (_, mir) = compile_to_mir(&[demo_path]).expect("uno demo checks & lowers to MIR");
+        assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
     }
 }

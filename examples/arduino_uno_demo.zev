@@ -1,0 +1,76 @@
+// Bare-Metal Arduino Uno R3 (ATmega328P 16 MHz AVR, Zero-C / Zero-libc)
+//
+// Compiles directly through LLVM 23 (`llc -mtriple=avr -mcpu=atmega328p`) + `ld.lld`
+// into a < 4 KB Flash, < 500 B SRAM Optiboot image with:
+//   - Typed `mmio` `u8`/`u16` & `@w1c` register access (`chip.atmega328p` + `bsp.arduino_uno`)
+//   - Hardware `Timer0` 1.000 kHz system tick + `115200 8N1` `USART0` serial telemetry
+//   - Exclusive `hw.IRQ_TIMER1_COMPA` (16-bit hardware timer compare ISR, `boost: @critical`)
+//   - Shared `hw.IRQ_PCINT0` handlers tracking physical `PB5` (Pin 13 L LED) pin transitions
+//     across isolated ISR-private `state` counters
+
+import chip.atmega328p as hw;
+import bsp.arduino_uno as bsp;
+
+extern "C" u32 zev_now_ms();
+
+inbox<u32, 8> t1_inbox;
+watch<u32>    pad_edges = 0;
+
+isr timer1_isr(*inbox<u32, 8> q, *hw.TifrRegs tifr) {
+    state u32 seq = 0;
+    seq += 1;
+    tifr.tifr1 = hw.BIT_OCF1A;
+    q.post(seq, boost: @critical);
+}
+
+isr pcint_isr_a(*hw.PcifrRegs pcifr) {
+    state u32 edges = 0;
+    edges += 1;
+    pcifr.pcifr = hw.BIT_PCIE0;
+}
+
+isr pcint_isr_b(*watch<u32> w) {
+    state u32 count = 0;
+    count += 1;
+    w.publish(count);
+}
+
+task led_blinker() {
+    loop every 500ms {
+        noyield {
+            bsp.toggle_led();
+        }
+    }
+}
+
+task uno_telemetry() {
+    u32 last_t1 = 0;
+    loop every 1000ms {
+        for (u32 i in 0..8) {
+            u32 v = t1_inbox.try_recv() or 0;
+            if (v != 0) {
+                last_t1 = v;
+            }
+        }
+        u32 ms = zev_now_ms();
+        u8 led = bsp.read_led();
+        u8 d2 = bsp.read_d2_pin();
+        u32 edges = pad_edges.read();
+        println(f"[Zev on ATmega328P Uno] uptime={ms}ms led={led} edges={edges} t1_seq={last_t1} d2={d2}");
+    }
+}
+
+fn main() {
+    bsp.init_board_gpio();
+    hw.IRQ_TIMER1_COMPA.attach(timer1_isr(&t1_inbox, hw.TIFR));
+    hw.IRQ_PCINT0.attach_shared(pcint_isr_a(hw.PCIFR));
+    hw.IRQ_PCINT0.attach_shared(pcint_isr_b(&pad_edges));
+    bsp.enable_led_pcint();
+    bsp.start_timer1_ctc(15624);
+
+    println("");
+    println("[BOOT] Zev Language-OS on Arduino Uno R3 (ATmega328P avr, zero C)");
+
+    spawn led_blinker() @high;
+    spawn uno_telemetry() @normal;
+}

@@ -1,0 +1,62 @@
+// Arduino Uno R3 (ATmega328P 16 MHz) Board Support Package
+import chip.atmega328p as hw;
+
+pub fn init_board_gpio() {
+    // Configure Digital Pin 13 (`PB5`, onboard yellow L LED) as output driven LOW,
+    // and Digital Pin 2 (`PD2`) as input with internal pull-up enabled (leaving PD0/PD1 UART intact).
+    u8 ddrb = hw.PORTB.ddr;
+    hw.PORTB.ddr = ddrb | hw.BIT_PB5_LED;
+    u8 pb = hw.PORTB.port;
+    hw.PORTB.port = pb & (~hw.BIT_PB5_LED);
+
+    u8 ddrd = hw.PORTD.ddr;
+    hw.PORTD.ddr = ddrd & (~hw.BIT_PD2_IN);
+    u8 pd = hw.PORTD.port;
+    hw.PORTD.port = pd | hw.BIT_PD2_IN;
+}
+
+pub fn set_led(bool on) {
+    u8 cur = hw.PORTB.port;
+    if (on) {
+        hw.PORTB.port = cur | hw.BIT_PB5_LED;
+    } else {
+        hw.PORTB.port = cur & (~hw.BIT_PB5_LED);
+    }
+}
+
+pub fn toggle_led() {
+    u8 cur = hw.PORTB.port;
+    hw.PORTB.port = cur ^ hw.BIT_PB5_LED;
+}
+
+pub u8 read_led() {
+    return (hw.PORTB.port >> 5) & 1;
+}
+
+pub u8 read_d2_pin() {
+    return (hw.PORTD.pin >> 2) & 1;
+}
+
+pub fn enable_led_pcint() {
+    u8 m = hw.PCMSK_REGS.pcmsk0;
+    hw.PCMSK_REGS.pcmsk0 = m | hw.BIT_PB5_LED;
+    hw.PCIFR.pcifr = hw.BIT_PCIE0;
+    u8 c = hw.PCICR_REGS.pcicr;
+    hw.PCICR_REGS.pcicr = c | hw.BIT_PCIE0;
+}
+
+pub fn clear_pcint0_flag() {
+    hw.PCIFR.pcifr = hw.BIT_PCIE0;
+}
+
+pub fn start_timer1_ctc(u16 compare_top) {
+    // Configure 16-bit Timer1 in CTC mode (`/256` prescaler = 62,500 Hz -> 250ms at 15624).
+    hw.TIMSK_REGS.timsk1 = 0;
+    hw.TIMER1.tccr1a = 0;
+    hw.TIMER1.tccr1b = 0;
+    hw.TIMER1.tcnt1 = 0;
+    hw.TIMER1.ocr1a = compare_top;
+    hw.TIFR.tifr1 = hw.BIT_OCF1A;
+    hw.TIMSK_REGS.timsk1 = hw.BIT_OCF1A;
+    hw.TIMER1.tccr1b = 0x0C;
+}

@@ -99,6 +99,8 @@ pub fn emit_kernel_runtime_ir_with_features(
     }
     let _ = writeln!(out);
 
+    let fn_ptr_ty = opts.target.fn_ptr_llvm_ty();
+
     // %SynTask control block, %SynFmtSink, & scheduler globals
     let _ = writeln!(
         out,
@@ -116,7 +118,7 @@ pub fn emit_kernel_runtime_ir_with_features(
         out,
         r#"; ── Cooperative Language-OS Task & Scheduler State (100% Static SRAM) ──
 %SynTask = type {{
-  ptr, ; 0: step_fn: i32 (ptr %frame, ptr %task)
+  {fn_ptr_ty}, ; 0: step_fn: i32 (ptr %frame, ptr %task)
   ptr, ; 1: frame
   i8,  ; 2: state (0=DEAD, 1=READY, 2=BLOCKED_DEADLINE, 3=BLOCKED_PRIM)
   i8,  ; 3: base_prio (0=@critical, 1=@high, 2=@normal, 3=@low)
@@ -151,6 +153,7 @@ pub fn emit_kernel_runtime_ir_with_features(
     match opts.target {
         TargetArch::Thumbv7mNoneEabi => emit_cortex_m_hal_ir(out, sz),
         TargetArch::Riscv32Esp32C6 => crate::esp32c6::emit_esp32c6_hal_ir(out, sz),
+        TargetArch::AvrAtmega328p => crate::avr::emit_avr_hal_ir(out, sz),
         TargetArch::HostX86_64Linux => emit_host_linux_hal_ir(out, sz),
     }
 
@@ -178,6 +181,11 @@ pub fn emit_kernel_runtime_ir_with_features(
 
 fn emit_freestanding_mem_builtins_ir(out: &mut String, target: TargetArch) {
     let uty = target.usize_llvm_ty();
+    let c_int_ty = if target == TargetArch::AvrAtmega328p {
+        "i16"
+    } else {
+        "i32"
+    };
     let _ = writeln!(
         out,
         r#"; ── Freestanding Zero-Libc @memcpy / @memset / @memmove (#99 = "no-builtins") ──
@@ -199,9 +207,9 @@ exit:
   ret ptr %dst
 }}
 
-define weak ptr @memset(ptr %dst, i32 %c, {uty} %n) #99 {{
+define weak ptr @memset(ptr %dst, {c_int_ty} %c, {uty} %n) #99 {{
 entry:
-  %b = trunc i32 %c to i8
+  %b = trunc {c_int_ty} %c to i8
   br label %loop
 loop:
   %i = phi {uty} [ 0, %entry ], [ %inext, %body ]
@@ -659,6 +667,7 @@ fn emit_scheduler_core_ir(
     sz: &str,
     enable_rv_irqs: bool,
 ) {
+    let fn_ptr_ty = target.fn_ptr_llvm_ty();
     if target == TargetArch::Riscv32Esp32C6 {
         let _ = writeln!(
             out,
@@ -666,6 +675,16 @@ fn emit_scheduler_core_ir(
 define i32 @__syn_now_ms() nounwind alwaysinline {{
 entry:
   %t = call i32 @__syn_esp32c6_read_ms()
+  ret i32 %t
+}}"#
+        );
+    } else if target == TargetArch::AvrAtmega328p {
+        let _ = writeln!(
+            out,
+            r#"; ── Cooperative Scheduler Core: Overdue -> Work -> Poll -> Idle Sleep ──
+define i32 @__syn_now_ms() nounwind alwaysinline {{
+entry:
+  %t = call i32 @__syn_avr_read_ms()
   ret i32 %t
 }}"#
         );
@@ -1105,7 +1124,7 @@ none:
   ret i32 -1
 }}
 
-define void @__syn_activate_task(i32 %slot, ptr %step_fn, ptr %frame, i8 %prio, i8 %core_pin) nounwind{sz} {{
+define void @__syn_activate_task(i32 %slot, {fn_ptr_ty} %step_fn, ptr %frame, i8 %prio, i8 %core_pin) nounwind{sz} {{
 entry:
   %now = call i32 @__syn_now_ms()
   %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %slot
@@ -1122,7 +1141,7 @@ entry:
   %f10 = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   %f11 = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 11
   %f12 = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 12
-  store ptr %step_fn, ptr %f0, align 4
+  store {fn_ptr_ty} %step_fn, ptr %f0, align 4
   store ptr %frame, ptr %f1, align 4
   store i8 1, ptr %f2, align 1
   store i8 %prio, ptr %f3, align 1
@@ -1143,6 +1162,8 @@ entry:
     );
     let mie_enable_ir = if target == TargetArch::Riscv32Esp32C6 && enable_rv_irqs {
         "  call void asm sideeffect \"csrsi mstatus, 8\", \"~{memory}\"()\n"
+    } else if target == TargetArch::AvrAtmega328p {
+        "  call void asm sideeffect \"sei\", \"~{memory}\"()\n"
     } else {
         ""
     };
@@ -1201,7 +1222,7 @@ dispatch:
 
   %fn_ptr_p = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 0
   %fr_ptr_p = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 1
-  %step_fn = load ptr, ptr %fn_ptr_p, align 4
+  %step_fn = load {fn_ptr_ty}, ptr %fn_ptr_p, align 4
   %frame = load ptr, ptr %fr_ptr_p, align 4
 
   ; Execute one cooperative step: 0=MORE, 1=WAIT, 2=DONE
@@ -1814,6 +1835,7 @@ finite_mul:
 
 define weak float @__divsf3(float %a, float %b) #99 {
 entry:
+  %rem = alloca i64, align 8
   %ua = bitcast float %a to i32
   %ub = bitcast float %b to i32
   %aa = and i32 %ua, 2147483647
@@ -1852,7 +1874,6 @@ ret_zero:
   %fz = bitcast i32 %sbit to float
   ret float %fz
 finite_div:
-  %rem = alloca i64, align 8
   store i64 0, ptr %rem, align 8
   %upa = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ua)
   %upb = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ub)
@@ -3297,6 +3318,7 @@ entry:
             r#"; ── Arduino-Style Fixed-Decimal Float Formatter (Pure Integer/Bit Math, Zero Soft-Float/Libm) ──
 define weak void @__syn_fmt_f64_fixed(ptr %sink, double %val, i32 %prec) noinline #99 {
 entry:
+  %rem_slot = alloca i64, align 8
   %bits = bitcast double %val to i64
   %abs_bits = and i64 %bits, 9223372036854775807
   %neg_bit = icmp slt i64 %bits, 0
@@ -3362,7 +3384,6 @@ do_shift_round:
   %rsh128 = zext i32 %rsh to i128
   %tot128 = lshr i128 %rounded128, %rsh128
   %tot64 = trunc i128 %tot128 to i64
-  %rem_slot = alloca i64, align 8
   %ipart = call i64 @__syn_udivrem64(i64 %tot64, i64 %scale, ptr %rem_slot)
   %fpart = load i64, ptr %rem_slot, align 8
   br label %emit_parts

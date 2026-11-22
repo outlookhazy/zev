@@ -9,6 +9,7 @@
 //!   watchdog disarm, 16 MHz `SYSTIMER`, `USB_DEVICE` (`/dev/ttyACM0`) serial console, HP-SRAM
 //!   `.iram1` WS2812B RGB driver (`GPIO8`), and `BOOT` button (`GPIO9`) into a flashable `.bin`!
 
+pub mod avr;
 pub mod esp32c6;
 pub mod mir_codegen;
 pub mod nvic;
@@ -21,11 +22,12 @@ pub use esp32c6::ESP32C6_DIRECT_BOOT_MAGIC;
 pub use mir_codegen::emit_llvm_ir_with_options;
 pub use nvic::NvicMap;
 pub use toolchain::{
-    CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
+    AvrImageResult, CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
     Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, TargetArch,
-    compile_ll_to_elf, compile_ll_to_obj, flash_esp32c6_bin, inspect_elf_sizes,
-    inspect_elf_symbols, link_obj_to_elf, objcopy_elf_to_esp32c6_bin, optimize_ll_with_opt,
-    run_elf_in_qemu, synthesize_linker_script, verify_ll_with_opt,
+    compile_ll_to_elf, compile_ll_to_obj, flash_avr_uno_bin, flash_esp32c6_bin,
+    inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf, objcopy_elf_to_avr_bin,
+    objcopy_elf_to_esp32c6_bin, optimize_ll_with_opt, run_elf_in_qemu, synthesize_linker_script,
+    verify_ll_with_opt,
 };
 
 /// Emit freestanding ARM Cortex-M3 (`thumbv7m-none-eabi`) LLVM 23 `.ll` IR from `MirModule`.
@@ -76,6 +78,33 @@ pub fn build_esp32c6_image_with_options(
         bin_path: out_bin.to_path_buf(),
         bin_size,
         magic_header,
+    })
+}
+
+/// Build a freestanding Microchip ATmega328P (`avr`, Arduino Uno R3 Optiboot) `.elf` and Flash `.bin`
+/// image (verifying zero undefined/heap symbols, reset `jmp` vector, and `< 1,792 B` static SRAM).
+pub fn build_avr_uno_image(
+    module: &zev_mir::MirModule,
+    out_elf: &Path,
+    out_bin: &Path,
+) -> Result<AvrImageResult, CodegenError> {
+    build_avr_uno_image_with_options(module, out_elf, out_bin, &CodegenOptions::avr_uno())
+}
+
+/// Build a freestanding Microchip ATmega328P (`avr`) `.elf` and Flash `.bin` with custom [`CodegenOptions`].
+pub fn build_avr_uno_image_with_options(
+    module: &zev_mir::MirModule,
+    out_elf: &Path,
+    out_bin: &Path,
+    opts: &CodegenOptions,
+) -> Result<AvrImageResult, CodegenError> {
+    let elf = build_elf(module, out_elf, opts)?;
+    let (bin_size, sram_static_bytes) = objcopy_elf_to_avr_bin(&elf.elf_path, out_bin)?;
+    Ok(AvrImageResult {
+        elf,
+        bin_path: out_bin.to_path_buf(),
+        bin_size,
+        sram_static_bytes,
     })
 }
 
@@ -3518,5 +3547,100 @@ fn main() {
         let run = Command::new(&h_exe_path).output().expect("run host exe");
         assert!(run.status.success());
         assert_eq!(String::from_utf8_lossy(&run.stdout), "HOST=99,20\n");
+    }
+
+    #[test]
+    fn arduino_uno_demo_builds_avr_bin_and_passes_audit() {
+        let demo_path = repo_root().join("examples/arduino_uno_demo.zev");
+        let mir = compile_example_mir(&[demo_path]);
+
+        assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
+
+        let dir = test_out_dir();
+        let out_elf = dir.join("arduino_uno_demo.elf");
+        let out_bin = dir.join("arduino_uno_demo.bin");
+
+        let img = build_avr_uno_image(&mir, &out_elf, &out_bin)
+            .unwrap_or_else(|e| panic!("ATmega328P AVR image build failed: {e}"));
+
+        verify_ll_with_opt(&img.elf.ll_path).expect("LLVM 23 opt -passes=verify on arduino_uno_demo.ll");
+
+        assert!(img.elf.audit.is_zero_heap_freestanding());
+        for req_sym in [
+            "__syn_avr_reset",
+            "__syn_avr_systick_isr",
+            "__syn_avr_vec_3",
+            "__syn_avr_vec_11",
+        ] {
+            assert!(
+                img.elf.audit.defined_symbols.iter().any(|s| s == req_sym),
+                "missing AVR symbol {req_sym} in {:?}",
+                img.elf.audit.defined_symbols
+            );
+        }
+        assert!(
+            img.bin_size > 0 && img.bin_size <= 32_256,
+            "expected AVR Flash image <= 32256 B, got {}",
+            img.bin_size
+        );
+        assert!(
+            img.sram_static_bytes > 0 && img.sram_static_bytes < 1_792,
+            "expected AVR static SRAM < 1792 B, got {}",
+            img.sram_static_bytes
+        );
+
+        let objdump = Command::new("/bin/llvm-objdump")
+            .args(["-d", "--start-address=0x0000", "--stop-address=0x0068"])
+            .arg(&img.elf.elf_path)
+            .output()
+            .expect("invoke llvm-objdump on AVR ELF");
+        assert!(objdump.status.success());
+        let disasm = String::from_utf8_lossy(&objdump.stdout);
+        assert!(disasm.contains("00000000 <_start>:"), "disasm:\n{disasm}");
+        assert!(disasm.contains("__syn_avr_reset") || disasm.contains("jmp"), "disasm:\n{disasm}");
+
+        let full_objdump = Command::new("/bin/llvm-objdump")
+            .arg("-d")
+            .arg(&img.elf.elf_path)
+            .output()
+            .expect("invoke full llvm-objdump on AVR ELF");
+        assert!(full_objdump.status.success());
+        let full_disasm = String::from_utf8_lossy(&full_objdump.stdout);
+        assert!(
+            !full_disasm.contains("in\tr26, 0x3d"),
+            "found forbidden AVR dynamic stack alloca in ELF disassembly"
+        );
+    }
+
+    #[test]
+    fn avr_irq_vector_validation_rejects_reserved_and_out_of_range_slots() {
+        assert!(avr::validate_avr_irq_vectors(&[]).expect("empty ok").is_empty());
+
+        let make_vec = |irq_num: u32, irq_name: &str| zev_mir::MirIrqVector {
+            irq_name: irq_name.to_string(),
+            irq_num,
+            is_shared: false,
+            selector_symbol: None,
+            bindings: vec![zev_mir::MirIrqBinding {
+                binding_id: 0,
+                isr_name: "dummy_isr".to_string(),
+                baked_args: Vec::new(),
+                state_vars: Vec::new(),
+                cond_selector: None,
+            }],
+        };
+
+        let attached = avr::validate_avr_irq_vectors(&[make_vec(11, "IRQ_TIMER1_COMPA")])
+            .expect("slot 11 is valid on ATmega328P");
+        assert!(attached.contains(&11));
+
+        for (bad_num, name) in [(0, "RESET"), (14, "TIMER0_COMPA"), (26, "OOB")] {
+            let err = avr::validate_avr_irq_vectors(&[make_vec(bad_num, name)])
+                .expect_err("reserved/out-of-range vector must be rejected");
+            assert!(
+                !err.message.is_empty(),
+                "expected descriptive validation error for vector {bad_num}"
+            );
+        }
     }
 }

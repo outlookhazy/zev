@@ -1,0 +1,87 @@
+// Microchip ATmega328P (Arduino Uno R3, 16 MHz AVR) Typed MMIO Register Map & IRQ Vectors
+// Register data-space addresses per Microchip ATmega328P Datasheet Section 31 ("Register Summary").
+
+pub mmio PortRegs {
+    @ro u8 pin  @ 0x00;
+    @rw u8 ddr  @ 0x01;
+    @rw u8 port @ 0x02;
+}
+
+pub mmio TifrRegs {
+    @w1c u8 tifr0 @ 0x00;
+    @w1c u8 tifr1 @ 0x01;
+    @w1c u8 tifr2 @ 0x02;
+}
+
+pub mmio PcifrRegs {
+    @w1c u8 pcifr @ 0x00;
+}
+
+pub mmio EifrRegs {
+    @w1c u8 eifr  @ 0x00;
+    @rw  u8 eimsk @ 0x01;
+}
+
+pub mmio PcicrRegs {
+    @rw u8 pcicr @ 0x00;
+    @rw u8 eicra @ 0x01;
+}
+
+pub mmio PcmskRegs {
+    @rw u8 pcmsk0 @ 0x00;
+    @rw u8 pcmsk1 @ 0x01;
+    @rw u8 pcmsk2 @ 0x02;
+}
+
+pub mmio TimskRegs {
+    @rw u8 timsk0 @ 0x00;
+    @rw u8 timsk1 @ 0x01;
+    @rw u8 timsk2 @ 0x02;
+}
+
+pub mmio Timer1Regs {
+    @rw u8  tccr1a @ 0x00;
+    @rw u8  tccr1b @ 0x01;
+    @rw u8  tccr1c @ 0x02;
+    @rw u16 tcnt1  @ 0x04;
+    @rw u16 icr1   @ 0x06;
+    @rw u16 ocr1a  @ 0x08;
+    @rw u16 ocr1b  @ 0x0A;
+}
+
+pub mmio Usart0Regs {
+    @rw u8  ucsr0a @ 0x00;
+    @rw u8  ucsr0b @ 0x01;
+    @rw u8  ucsr0c @ 0x02;
+    @rw u16 ubrr0  @ 0x04;
+    @rw u8  udr0   @ 0x06;
+}
+
+pub mmio PORTB      : PortRegs   @ 0x23;
+pub mmio PORTC      : PortRegs   @ 0x26;
+pub mmio PORTD      : PortRegs   @ 0x29;
+pub mmio TIFR       : TifrRegs   @ 0x35;
+pub mmio PCIFR      : PcifrRegs  @ 0x3B;
+pub mmio EIFR       : EifrRegs   @ 0x3C;
+pub mmio PCICR_REGS : PcicrRegs  @ 0x68;
+pub mmio PCMSK_REGS : PcmskRegs  @ 0x6B;
+pub mmio TIMSK_REGS : TimskRegs  @ 0x6E;
+pub mmio TIMER1     : Timer1Regs @ 0x80;
+pub mmio USART0     : Usart0Regs @ 0xC0;
+
+// Interrupt vector indices (ATmega328P Datasheet Table 11-1; slot 0=RESET, 14=TIMER0_COMPA runtime tick)
+pub irq IRQ_INT0         = 1;
+pub irq IRQ_INT1         = 2;
+pub irq IRQ_PCINT0       = 3;
+pub irq IRQ_PCINT1       = 4;
+pub irq IRQ_PCINT2       = 5;
+pub irq IRQ_WDT          = 6;
+pub irq IRQ_TIMER2_COMPA = 7;
+pub irq IRQ_TIMER1_COMPA = 11;
+pub irq IRQ_TIMER1_OVF   = 13;
+pub irq IRQ_USART_RX     = 18;
+
+pub const u8 BIT_PB5_LED  = 1 << 5; // Digital pin 13 (onboard L LED)
+pub const u8 BIT_PD2_IN   = 1 << 2; // Digital pin 2 (PCINT18 / INT0)
+pub const u8 BIT_OCF1A    = 1 << 1; // TIFR1 / TIMSK1 Timer1 Compare A
+pub const u8 BIT_PCIE0    = 1 << 0; // PCICR / PCIFR Pin-Change bank 0 (PORTB)

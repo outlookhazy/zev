@@ -486,9 +486,9 @@ isr dma_rx_isr(*DmaRegs dma, u32 clr) {
         name: "targets",
         aliases: &[
             "target", "cli", "ram", "sim", "c99", "llvm", "elf", "qemu", "cortex-m", "cortex-m3",
-            "esp32", "esp32c6", "riscv", "svd", "import-svd",
+            "esp32", "esp32c6", "riscv", "avr", "atmega328p", "uno", "arduino", "svd", "import-svd",
         ],
-        summary: "CLI workflow: `check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, and ESP32-C6",
+        summary: "CLI workflow: `check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, ESP32-C6, and AVR",
         body: "\
 # Zev Topic Guide: `targets`
 
@@ -534,6 +534,15 @@ Synthesizes `0xAEDB041D` x2 ROM Direct-Boot header, `@_start` at `0x42000008`, w
 zevc emit-llvm --target esp32c6 examples/esp32c6_demo.zev -o build/esp32c6.ll
 zevc build-esp32c6 -Oz examples/esp32c6_demo.zev -o build/esp32c6_demo.bin
 zevc flash-esp32c6 -Oz examples/esp32c6_demo.zev --port /dev/ttyACM0
+```
+
+## 6. Stage 1C: Bare-Metal Microchip ATmega328P / Arduino Uno R3 (`avr` Optiboot)
+Synthesizes the 26-slot Flash vector table, WDT disarm, `.data`/`.rodata`/`.bss` startup copy,
+16 MHz `Timer0` 1 kHz tick, `115200 8N1` `USART0`, and verified STK500v1 Optiboot flashing:
+```bash
+zevc emit-llvm --target avr examples/arduino_uno_demo.zev -o build/uno.ll
+zevc build-avr examples/arduino_uno_demo.zev -o build/uno_demo.bin
+zevc flash-avr examples/arduino_uno_demo.zev --port /dev/ttyACM0
 ```
 ",
     },

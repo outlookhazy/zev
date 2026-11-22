@@ -76,6 +76,7 @@ struct ModuleCtx<'a> {
     opts: &'a CodegenOptions,
     nvic: NvicMap,
     esp32c6_irq_routes: Vec<Esp32C6IrqRoute>,
+    avr_irq_vectors: BTreeSet<u32>,
     mmio_layouts: HashMap<String, MirMmioLayout>,
     mmio_instances: HashMap<String, MirMmioInstance>,
     structs: HashMap<String, StructInfo>,
@@ -129,6 +130,11 @@ pub fn emit_llvm_ir_with_options(
     } else {
         Vec::new()
     };
+    let avr_irq_vectors = if opts.target == TargetArch::AvrAtmega328p {
+        crate::avr::validate_avr_irq_vectors(&module.irq_vectors)?
+    } else {
+        BTreeSet::new()
+    };
     let mut rt_features = scan_module_runtime_features(module);
     rt_features.uses_rv_irqs =
         opts.target == TargetArch::Riscv32Esp32C6 && !module.irq_vectors.is_empty();
@@ -137,6 +143,7 @@ pub fn emit_llvm_ir_with_options(
         opts,
         nvic,
         esp32c6_irq_routes,
+        avr_irq_vectors,
         mmio_layouts: HashMap::new(),
         mmio_instances: HashMap::new(),
         structs: HashMap::new(),
@@ -176,6 +183,15 @@ pub fn emit_llvm_ir_with_options(
                 &ctx.esp32c6_irq_routes,
             );
             emit_esp32c6_irq_dispatch_ir(&mut out, &ctx);
+        }
+        TargetArch::AvrAtmega328p => {
+            crate::avr::emit_avr_startup_ir(
+                &mut out,
+                opts.initial_sp(),
+                opts.fn_size_attrs(),
+                &ctx.avr_irq_vectors,
+            );
+            emit_avr_irq_dispatch_ir(&mut out, &ctx);
         }
         TargetArch::HostX86_64Linux => {
             emit_host_entry_ir(&mut out, &ctx);
@@ -222,6 +238,10 @@ pub fn emit_llvm_ir_with_options(
     // 12. Pooled string literal constants (`@.str.<k>`)
     ctx.emit_string_constants_ir(&mut out);
 
+    if opts.target == TargetArch::AvrAtmega328p {
+        return Ok(crate::avr::apply_avr_program_addrspace(&out));
+    }
+
     Ok(out)
 }
 
@@ -258,6 +278,15 @@ fn emit_esp32c6_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
         out,
         "@__syn_esp32c6_dispatch_irq",
         "; ── ESP32-C6 Software/Matrix IRQ Dispatcher ──",
+        ctx,
+    );
+}
+
+fn emit_avr_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
+    emit_sw_irq_dispatch_ir(
+        out,
+        "@__syn_avr_dispatch_irq",
+        "; ── ATmega328P Software/Vector IRQ Dispatcher ──",
         ctx,
     );
 }
@@ -1123,9 +1152,8 @@ impl<'a> ModuleCtx<'a> {
             MirType::F64 => "double".to_string(),
             MirType::EndianInt { .. } => "i32".to_string(),
             MirType::Usize | MirType::Isize => self.opts.target.usize_llvm_ty().to_string(),
-            MirType::Ptr(_) | MirType::MmioPtr(_) | MirType::FnPtr { .. } | MirType::Str => {
-                "ptr".to_string()
-            }
+            MirType::Ptr(_) | MirType::MmioPtr(_) | MirType::Str => "ptr".to_string(),
+            MirType::FnPtr { .. } => self.opts.target.fn_ptr_llvm_ty().to_string(),
             MirType::Slice(_) => format!("{{ ptr, {} }}", self.opts.target.usize_llvm_ty()),
             MirType::Array { elem, len } => {
                 let n = (*len).max(1);
@@ -1544,6 +1572,8 @@ impl<'a> ModuleCtx<'a> {
             MirType::Usize => {
                 if ptr_bits == 64 {
                     format!("{}", self.eval_const_int(expr) as u64)
+                } else if ptr_bits == 16 {
+                    format!("{}", self.eval_const_int(expr) as u16)
                 } else {
                     format!("{}", self.eval_const_int(expr) as u32)
                 }
@@ -1551,6 +1581,8 @@ impl<'a> ModuleCtx<'a> {
             MirType::Isize => {
                 if ptr_bits == 64 {
                     format!("{}", self.eval_const_int(expr) as i64)
+                } else if ptr_bits == 16 {
+                    format!("{}", self.eval_const_int(expr) as i16)
                 } else {
                     format!("{}", self.eval_const_int(expr) as i32)
                 }
@@ -1601,10 +1633,17 @@ impl<'a> ModuleCtx<'a> {
                     }
                     MirExprKind::IntLit(0) => "null".to_string(),
                     MirExprKind::IntLit(v) => {
-                        if ptr_bits == 64 {
-                            format!("inttoptr (i64 {} to ptr)", *v as i64)
+                        let dst_ptr = if matches!(target_ty, MirType::FnPtr { .. }) {
+                            self.opts.target.fn_ptr_llvm_ty()
                         } else {
-                            format!("inttoptr (i32 {} to ptr)", *v as i32)
+                            "ptr"
+                        };
+                        if ptr_bits == 64 {
+                            format!("inttoptr (i64 {} to {dst_ptr})", *v as i64)
+                        } else if ptr_bits == 16 {
+                            format!("inttoptr (i16 {} to {dst_ptr})", *v as i16)
+                        } else {
+                            format!("inttoptr (i32 {} to {dst_ptr})", *v as i32)
                         }
                     }
                     _ => "null".to_string(),
@@ -1680,6 +1719,11 @@ impl<'a> ModuleCtx<'a> {
         }
         let usize_ty = self.opts.target.usize_llvm_ty();
         let fn_sz = self.opts.fn_size_attrs();
+        let tmp_al = if matches!(self.opts.target, TargetArch::AvrAtmega328p) {
+            1
+        } else {
+            4
+        };
         for name in &self.struct_order {
             let si = &self.structs[name];
             let sname = sanitize_ident(name);
@@ -1689,6 +1733,7 @@ impl<'a> ModuleCtx<'a> {
                 out,
                 r#"define {{ {sty}, i32 }} @__syn_from_bytes_{sname}({{ ptr, {usize_ty} }} %slice) nounwind{fn_sz} {{
 entry:
+  %tmp = alloca {sty}, align {tmp_al}
   %ptr = extractvalue {{ ptr, {usize_ty} }} %slice, 0
   %len = extractvalue {{ ptr, {usize_ty} }} %slice, 1
   %short = icmp ult {usize_ty} %len, {sz}
@@ -1696,7 +1741,6 @@ entry:
 err_bb:
   ret {{ {sty}, i32 }} {{ {sty} zeroinitializer, i32 1 }}
 ok_bb:
-  %tmp = alloca {sty}, align 4
   call void @llvm.memcpy.p0.p0.i32(ptr %tmp, ptr %ptr, i32 {sz}, i1 false)
   %val = load {sty}, ptr %tmp, align 1
   %r0 = insertvalue {{ {sty}, i32 }} poison, {sty} %val, 0
@@ -3121,6 +3165,9 @@ struct FnIrBuilder<'ctx, 'm> {
     ret_ty: MirType,
     error_spec: MirErrorSpec,
     buf: String,
+    entry_allocas: String,
+    entry_alloca_insert_pos: Option<usize>,
+    temp_alloca_id: usize,
     tmp_id: usize,
     lbl_id: usize,
     cur_label: String,
@@ -3144,6 +3191,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             ret_ty: ret_ty.clone(),
             error_spec: error_spec.clone(),
             buf: String::with_capacity(4096),
+            entry_allocas: String::new(),
+            entry_alloca_insert_pos: None,
+            temp_alloca_id: 0,
             tmp_id: 0,
             lbl_id: 0,
             cur_label: "entry".to_string(),
@@ -3152,8 +3202,35 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
     }
 
-    fn finish(self) -> String {
+    fn finish(mut self) -> String {
+        if !self.entry_allocas.is_empty() {
+            let pos = self
+                .entry_alloca_insert_pos
+                .expect("entry block must exist before finish");
+            self.buf.insert_str(pos, &self.entry_allocas);
+        }
         self.buf
+    }
+
+    fn stack_align(&self, lty: &str) -> u32 {
+        if matches!(self.ctx.opts.target, TargetArch::AvrAtmega328p) {
+            return 1;
+        }
+        let ptr_bits = self.ctx.opts.target.ptr_bits();
+        if lty == "double" || lty == "i64" || (lty == "ptr" && ptr_bits == 64) {
+            8
+        } else {
+            4
+        }
+    }
+
+    fn emit_temp_alloca(&mut self, lty: &str) -> (String, u32) {
+        let id = self.temp_alloca_id;
+        self.temp_alloca_id += 1;
+        let name = format!("%__a{id}");
+        let al = self.stack_align(lty);
+        let _ = writeln!(self.entry_allocas, "  {name} = alloca {lty}, align {al}");
+        (name, al)
     }
 
     fn next_tmp(&mut self) -> String {
@@ -3189,12 +3266,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
     fn emit_entry_allocas(&mut self, param_vids: &[VarId]) {
         self.start_block("entry");
-        self.emit_line("%__crit_pm = alloca i32, align 4");
-        self.emit_line("store i32 0, ptr %__crit_pm, align 4");
+        self.entry_alloca_insert_pos = Some(self.buf.len());
+        let crit_al = self.stack_align("i32");
+        self.emit_line(format!("%__crit_pm = alloca i32, align {crit_al}"));
+        self.emit_line(format!("store i32 0, ptr %__crit_pm, align {crit_al}"));
         if self.ctx.rt_features.uses_fmt {
-            self.emit_line("%__fmt_sink = alloca %SynFmtSink, align 4");
+            self.emit_line(format!("%__fmt_sink = alloca %SynFmtSink, align {crit_al}"));
         }
-        let ptr_bits = self.ctx.opts.target.ptr_bits();
         for v in &self.vars.clone() {
             if v.role == VarRole::IsrState || self.isr_state_ptrs.contains_key(&v.id) {
                 continue;
@@ -3205,21 +3283,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
             }
             let lty = self.ctx.llvm_ty(&v.ty);
-            let al = if lty == "double" || lty == "i64" || (lty == "ptr" && ptr_bits == 64) {
-                8
-            } else {
-                4
-            };
+            let al = self.stack_align(&lty);
             self.emit_line(format!("%v_{} = alloca {lty}, align {al}", v.id.0));
             self.emit_line(format!("store {lty} zeroinitializer, ptr %v_{}, align {al}", v.id.0));
         }
         for (idx, &vid) in param_vids.iter().enumerate() {
             let lty = self.ctx.llvm_ty(&self.vars[vid.0].ty);
-            let al = if lty == "double" || lty == "i64" || (lty == "ptr" && ptr_bits == 64) {
-                8
-            } else {
-                4
-            };
+            let al = self.stack_align(&lty);
             self.emit_line(format!("store {lty} %arg{idx}, ptr %v_{}, align {al}", vid.0));
         }
     }
@@ -3293,14 +3363,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             ));
             return SsaVal::new(dst_ty, tf);
         }
-        if dst_ty == "ptr" && val.ty.starts_with('i') {
+        if (dst_ty == "ptr" || dst_ty == "ptr addrspace(1)") && val.ty.starts_with('i') {
             let t = self.next_tmp();
-            self.emit_line(format!("{t} = inttoptr {} {} to ptr", val.ty, val.repr));
-            return SsaVal::new("ptr", t);
+            self.emit_line(format!("{t} = inttoptr {} {} to {dst_ty}", val.ty, val.repr));
+            return SsaVal::new(dst_ty, t);
         }
-        if val.ty == "ptr" && dst_ty.starts_with('i') {
+        if (val.ty == "ptr" || val.ty == "ptr addrspace(1)") && dst_ty.starts_with('i') {
             let t = self.next_tmp();
-            self.emit_line(format!("{t} = ptrtoint ptr {} to {dst_ty}", val.repr));
+            self.emit_line(format!("{t} = ptrtoint {} {} to {dst_ty}", val.ty, val.repr));
             return SsaVal::new(dst_ty, t);
         }
         if val.ty.starts_with('i') && dst_ty.starts_with('i') {
@@ -3317,6 +3387,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
         if !dst_ty.starts_with('i')
             && dst_ty != "ptr"
+            && dst_ty != "ptr addrspace(1)"
             && dst_ty != "void"
             && dst_ty != "float"
             && dst_ty != "double"
@@ -3331,8 +3402,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             return val.repr;
         }
         let t = self.next_tmp();
-        if val.ty == "ptr" {
-            self.emit_line(format!("{t} = icmp ne ptr {}, null", val.repr));
+        if val.ty == "ptr" || val.ty == "ptr addrspace(1)" {
+            self.emit_line(format!("{t} = icmp ne {} {}, null", val.ty, val.repr));
         } else if val.ty == "float" || val.ty == "double" {
             self.emit_line(format!("{t} = fcmp une {} {}, 0.0", val.ty, val.repr));
         } else {
@@ -4084,9 +4155,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let id = sanitize_ident(&pk.mangle_name());
         let qptr = self.resolve_prim_ptr(target)?;
         let ety = self.ctx.llvm_ty(elem_ty);
-        let tmp_elem = self.next_tmp();
-        self.emit_line(format!("{tmp_elem} = alloca {ety}, align 4"));
-        self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp_elem}, align 4"));
+        let (tmp_elem, al) = self.emit_temp_alloca(&ety);
+        self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp_elem}, align {al}"));
 
         let ok = self.next_tmp();
         self.emit_line(format!(
@@ -4100,7 +4170,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
         self.start_block(&ok_lbl);
         let val = self.next_tmp();
-        self.emit_line(format!("{val} = load {ety}, ptr {tmp_elem}, align 4"));
+        self.emit_line(format!("{val} = load {ety}, ptr {tmp_elem}, align {al}"));
         if let Some(vvid) = dst_val {
             let vp = self.var_ptr(vvid);
             self.emit_line(format!("store {ety} {val}, ptr {vp}, align 4"));
@@ -4317,8 +4387,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
         let prio = sp.priority.as_u8();
         let core = sp.core_pin.map_or(-1i8, |c| c as i8);
+        let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
         self.emit_line(format!(
-            "call void @__syn_activate_task(i32 {slot_id}, ptr {step_sym}, ptr {fsym}, i8 {prio}, i8 {core})"
+            "call void @__syn_activate_task(i32 {slot_id}, {fn_ptr_ty} {step_sym}, ptr {fsym}, i8 {prio}, i8 {core})"
         ));
         Ok(())
     }
@@ -4878,9 +4949,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{dl} = extractvalue {sl_ty} {}, 1", sv.repr));
                 self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 91)"));
 
-                let idx_slot = self.next_tmp();
-                self.emit_line(format!("{idx_slot} = alloca {usize_ty}, align 4"));
-                self.emit_line(format!("store {usize_ty} 0, ptr {idx_slot}, align 4"));
+                let (idx_slot, idx_al) = self.emit_temp_alloca(&usize_ty);
+                self.emit_line(format!("store {usize_ty} 0, ptr {idx_slot}, align {idx_al}"));
 
                 let cond_lbl = self.next_label("dsl_cond");
                 let body_lbl = self.next_label("dsl_body");
@@ -4893,7 +4963,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.start_block(&cond_lbl);
                 let idx_v = self.next_tmp();
                 let more = self.next_tmp();
-                self.emit_line(format!("{idx_v} = load {usize_ty}, ptr {idx_slot}, align 4"));
+                self.emit_line(format!("{idx_v} = load {usize_ty}, ptr {idx_slot}, align {idx_al}"));
                 self.emit_line(format!("{more} = icmp ult {usize_ty} {idx_v}, {dl}"));
                 self.emit_term(format!("br i1 {more}, label %{body_lbl}, label %{end_lbl}"));
 
@@ -5035,7 +5105,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
                 let idx_next = self.next_tmp();
                 self.emit_line(format!("{idx_next} = add {usize_ty} {idx_v}, 1"));
-                self.emit_line(format!("store {usize_ty} {idx_next}, ptr {idx_slot}, align 4"));
+                self.emit_line(format!("store {usize_ty} {idx_next}, ptr {idx_slot}, align {idx_al}"));
                 self.emit_term(format!("br label %{cond_lbl}"));
 
                 self.start_block(&end_lbl);
@@ -5546,14 +5616,19 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let dst_lty = self.ctx.llvm_ty(&expr.ty.host_value_type());
         match &expr.kind {
             MirExprKind::IntLit(v) => {
-                if dst_lty == "ptr" {
+                if dst_lty == "ptr" || dst_lty == "ptr addrspace(1)" {
                     if *v == 0 {
-                        Ok(SsaVal::new("ptr", "null"))
+                        Ok(SsaVal::new(dst_lty, "null"))
+                    } else if self.ctx.opts.target.ptr_bits() == 16 {
+                        let t = self.next_tmp();
+                        let v16 = *v as i16;
+                        self.emit_line(format!("{t} = inttoptr i16 {v16} to {dst_lty}"));
+                        Ok(SsaVal::new(dst_lty, t))
                     } else {
                         let t = self.next_tmp();
                         let v32 = *v as i32;
-                        self.emit_line(format!("{t} = inttoptr i32 {v32} to ptr"));
-                        Ok(SsaVal::new("ptr", t))
+                        self.emit_line(format!("{t} = inttoptr i32 {v32} to {dst_lty}"));
+                        Ok(SsaVal::new(dst_lty, t))
                     }
                 } else if dst_lty == "void" {
                     Ok(SsaVal::new("void", "0"))
@@ -5690,10 +5765,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(self.coerce(SsaVal::new(lty, val), &dst_lty, !expr.ty.is_unsigned()))
             }
             MirExprKind::FnAddr(fname) => {
+                let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
                 if let Some(sig) = self.ctx.fn_sigs.get(fname) {
-                    Ok(SsaVal::new("ptr", sig.symbol.clone()))
+                    Ok(SsaVal::new(fn_ptr_ty, sig.symbol.clone()))
                 } else {
-                    Ok(SsaVal::new("ptr", format!("@{}", sanitize_ident(fname))))
+                    Ok(SsaVal::new(fn_ptr_ty, format!("@{}", sanitize_ident(fname))))
                 }
             }
             MirExprKind::Var(vid) => {
@@ -5885,10 +5961,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     Ok(self.load_from_place_ptr(&ep, &expr.ty, false))
                 } else {
                     let bv = self.emit_expr(base)?;
-                    let tmp = self.next_tmp();
+                    let (tmp, al) = self.emit_temp_alloca(&bv.ty);
                     let ep = self.next_tmp();
-                    self.emit_line(format!("{tmp} = alloca {}, align 4", bv.ty));
-                    self.emit_line(format!("store {} {}, ptr {tmp}, align 4", bv.ty, bv.repr));
+                    self.emit_line(format!("store {} {}, ptr {tmp}, align {al}", bv.ty, bv.repr));
                     self.emit_line(format!(
                         "{ep} = getelementptr inbounds {}, ptr {tmp}, {usize_ty} 0, {usize_ty} {}",
                         bv.ty, ic.repr
@@ -5927,10 +6002,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             gp
                         } else {
                             let bv = self.emit_expr(base)?;
-                            let tmp = self.next_tmp();
-                            self.emit_line(format!("{tmp} = alloca {}, align 4", bv.ty));
+                            let (tmp, al) = self.emit_temp_alloca(&bv.ty);
                             self.emit_line(format!(
-                                "store {} {}, ptr {tmp}, align 4",
+                                "store {} {}, ptr {tmp}, align {al}",
                                 bv.ty, bv.repr
                             ));
                             tmp
@@ -6230,9 +6304,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let qptr = self.resolve_prim_ptr(target)?;
         let ety = self.ctx.llvm_ty(elem_ty);
         let rty = format!("{{ {ety}, i32 }}");
-        let tmp = self.next_tmp();
-        self.emit_line(format!("{tmp} = alloca {ety}, align 4"));
-        self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp}, align 4"));
+        let (tmp, al) = self.emit_temp_alloca(&ety);
+        self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp}, align {al}"));
         let task_arg = if self.coroutine.is_some() {
             "%__task"
         } else {
@@ -6247,7 +6320,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let tag = self.next_tmp();
         let r0 = self.next_tmp();
         let r1 = self.next_tmp();
-        self.emit_line(format!("{val} = load {ety}, ptr {tmp}, align 4"));
+        self.emit_line(format!("{val} = load {ety}, ptr {tmp}, align {al}"));
         self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
         self.emit_line(format!("{tag} = select i1 {got}, i32 0, i32 1"));
         self.emit_line(format!("{r0} = insertvalue {rty} poison, {ety} {val}, 0"));
@@ -6301,7 +6374,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let fp_addr = self.var_ptr(vid);
                 let fp_val = self.load_from_place_ptr(&fp_addr, &fp_ty, false);
-                let fp_ptr = self.coerce(fp_val, "ptr", false);
+                let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
+                let fp_ptr = self.coerce(fp_val, fn_ptr_ty, false);
                 let ret_lty = self.ctx.llvm_ty(&ret.host_value_type());
                 let mut call_args = Vec::new();
                 for (i, a) in args.iter().enumerate() {
@@ -6563,7 +6637,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let signed = !lhs.ty.is_unsigned() || !rhs.ty.is_unsigned();
 
         // Pick common operand type
-        let common_ty = if lv.ty == "ptr" || rv.ty == "ptr" {
+        let common_ty = if lv.ty == "ptr addrspace(1)" || rv.ty == "ptr addrspace(1)" {
+            "ptr addrspace(1)".to_string()
+        } else if lv.ty == "ptr" || rv.ty == "ptr" {
             "ptr".to_string()
         } else {
             let lb = llvm_int_bits(&lv.ty);

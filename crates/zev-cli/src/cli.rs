@@ -55,6 +55,19 @@ pub enum Command {
         opt_level: String,
         output: Option<PathBuf>,
     },
+    BuildAvr {
+        files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
+        opt_level: String,
+        output: Option<PathBuf>,
+    },
+    FlashAvr {
+        files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
+        port: String,
+        opt_level: String,
+        output: Option<PathBuf>,
+    },
     ImportSvd {
         svd_path: PathBuf,
         output: Option<PathBuf>,
@@ -85,18 +98,20 @@ COMMANDS:
     run-qemu [OPT] <files...>               Build bare-metal ARM Cortex-M3 .elf and run in qemu-system-arm
     build-esp32c6 [OPT] <files...> [-o <bin>] Synthesize Direct-Boot header + RV32IMAC .elf/.bin for ESP32-C6
     flash-esp32c6 [OPT] <files...> [--port] Build Direct-Boot .bin and flash ESP32-C6 via esptool (default /dev/ttyACM0)
+    build-avr [OPT] <files...> [-o <bin>]   Synthesize vectors + ATmega328P AVR .elf/.bin for Arduino Uno R3 (default -Os)
+    flash-avr [OPT] <files...> [--port]     Build AVR .bin and flash Arduino Uno R3 via STK500v1 Optiboot (aliases: build-uno/flash-uno)
     help                                    Show this help message
 
-MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6):
+MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr):
     -I <dir> | --include <dir>              Add a module search root directory for `import` resolution (repeatable)
 
 CHECK OPTIONS:
     --json                                  Emit structured machine-readable JSON diagnostics
 
-LLVM OPTIMIZATION & TARGET OPTIONS (emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6):
-    -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default -O2; raw on emit-llvm)
+LLVM OPTIMIZATION & TARGET OPTIONS (emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr):
+    -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default -O2; -Os on AVR; raw on emit-llvm)
     --opt-level <O0|O1|O2|O3|Os|Oz>         Explicit long-form optimization level selector
-    --target <cortex-m3|esp32c6|host>       Target triple selector (`emit-llvm` only; default `cortex-m3`)
+    --target <cortex-m3|esp32c6|avr|host>   Target triple selector (`emit-llvm` only; default `cortex-m3`)
 
 RUN & RUN-QEMU OPTIONS:
     --sanitize                              Compile C99 host binary with -fsanitize=address,undefined (`run` only)
@@ -173,10 +188,38 @@ where
             }),
             None => Ok(Command::Help),
         },
-        "flash-esp32c6" => parse_flash_esp32c6(&raw[1..]),
+        "flash-esp32c6" => match parse_flash_serial(&raw[1..], "flash-esp32c6", "-O2")? {
+            Some((files, include_dirs, port, opt_level, output)) => Ok(Command::FlashEsp32C6 {
+                files,
+                include_dirs,
+                port,
+                opt_level,
+                output,
+            }),
+            None => Ok(Command::Help),
+        },
+        "build-avr" | "build-uno" => match parse_files_with_output_and_opt_default(&raw[1..], &raw[0], "-Os")? {
+            Some((files, include_dirs, opt_level, output)) => Ok(Command::BuildAvr {
+                files,
+                include_dirs,
+                opt_level,
+                output,
+            }),
+            None => Ok(Command::Help),
+        },
+        "flash-avr" | "flash-uno" => match parse_flash_serial(&raw[1..], &raw[0], "-Os")? {
+            Some((files, include_dirs, port, opt_level, output)) => Ok(Command::FlashAvr {
+                files,
+                include_dirs,
+                port,
+                opt_level,
+                output,
+            }),
+            None => Ok(Command::Help),
+        },
         "run" => parse_run(&raw[1..]),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, or `flash-esp32c6`; try `zevc --help`)"
+            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, or `flash-avr`; try `zevc --help`)"
         )),
     }
 }
@@ -409,9 +452,17 @@ fn parse_files_with_output_and_opt(
     args: &[String],
     subcmd: &str,
 ) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>, String, Option<PathBuf>)>, String> {
+    parse_files_with_output_and_opt_default(args, subcmd, "-O2")
+}
+
+fn parse_files_with_output_and_opt_default(
+    args: &[String],
+    subcmd: &str,
+    default_opt: &str,
+) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>, String, Option<PathBuf>)>, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
-    let mut opt_level = "-O2".to_string();
+    let mut opt_level = default_opt.to_string();
     let mut output: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
@@ -490,7 +541,7 @@ fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
             "--target" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("`--target` requires a target name (`cortex-m3`, `esp32c6`, or `host`)".to_string());
+                    return Err("`--target` requires a target name (`cortex-m3`, `esp32c6`, `avr`, or `host`)".to_string());
                 }
                 target = Some(args[i].clone());
             }
@@ -605,21 +656,27 @@ fn parse_run_qemu(args: &[String]) -> Result<Command, String> {
     })
 }
 
-fn parse_flash_esp32c6(args: &[String]) -> Result<Command, String> {
+type FlashArgs = (Vec<PathBuf>, Vec<PathBuf>, String, String, Option<PathBuf>);
+
+fn parse_flash_serial(
+    args: &[String],
+    subcmd: &str,
+    default_opt: &str,
+) -> Result<Option<FlashArgs>, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
     let mut port = "/dev/ttyACM0".to_string();
-    let mut opt_level = "-O2".to_string();
+    let mut opt_level = default_opt.to_string();
     let mut output: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, "flash-esp32c6")? {
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, subcmd)? {
             i += 1;
             continue;
         }
         match arg.as_str() {
-            "-h" | "--help" => return Ok(Command::Help),
+            "-h" | "--help" => return Ok(None),
             "-p" | "--port" => {
                 i += 1;
                 if i >= args.len() {
@@ -630,17 +687,16 @@ fn parse_flash_esp32c6(args: &[String]) -> Result<Command, String> {
             "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("`-o` requires an output `.bin` path for `zevc flash-esp32c6`".to_string());
+                    return Err(format!("`-o` requires an output `.bin` path for `zevc {subcmd}`"));
                 }
                 output = Some(PathBuf::from(&args[i]));
             }
             "--opt-level" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err(
-                        "`--opt-level` requires a level (`O0`, `O1`, `O2`, `O3`, `Os`, or `Oz`) for `zevc flash-esp32c6`"
-                            .to_string(),
-                    );
+                    return Err(format!(
+                        "`--opt-level` requires a level (`O0`, `O1`, `O2`, `O3`, `Os`, or `Oz`) for `zevc {subcmd}`"
+                    ));
                 }
                 opt_level = normalize_opt_level(&args[i])?;
             }
@@ -660,22 +716,18 @@ fn parse_flash_esp32c6(args: &[String]) -> Result<Command, String> {
                 opt_level = normalize_opt_level(arg)?;
             }
             _ if arg.starts_with('-') => {
-                return Err(format!("unexpected option `{arg}` for `zevc flash-esp32c6`"));
+                return Err(format!("unexpected option `{arg}` for `zevc {subcmd}`"));
             }
             _ => files.push(PathBuf::from(arg)),
         }
         i += 1;
     }
     if files.is_empty() {
-        return Err("`zevc flash-esp32c6` requires at least one `.zev` input file".to_string());
+        return Err(format!(
+            "`zevc {subcmd}` requires at least one `.zev` input file"
+        ));
     }
-    Ok(Command::FlashEsp32C6 {
-        files,
-        include_dirs,
-        port,
-        opt_level,
-        output,
-    })
+    Ok(Some((files, include_dirs, port, opt_level, output)))
 }
 
 fn parse_run(args: &[String]) -> Result<Command, String> {
@@ -931,6 +983,10 @@ mod tests {
             assert!(parse_args(["emit-llvm", bad, "a.zev"]).is_err(), "expected err on {bad}");
             assert!(parse_args(["build-esp32c6", bad, "a.zev"]).is_err(), "expected err on {bad}");
             assert!(parse_args(["flash-esp32c6", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["build-avr", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["build-uno", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["flash-avr", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["flash-uno", bad, "a.zev"]).is_err(), "expected err on {bad}");
         }
         assert!(parse_args(["build-elf", "--opt-level", "O9", "a.zev"]).is_err());
         assert!(parse_args(["build-elf", "--opt-level=fast", "a.zev"]).is_err());
@@ -1129,9 +1185,51 @@ mod tests {
             parse_args(esp_flash_args).unwrap(),
             Command::FlashEsp32C6 {
                 files: vec![PathBuf::from("app.zev")],
-                include_dirs: expected_dirs,
+                include_dirs: expected_dirs.clone(),
                 port: "/dev/ttyACM0".to_string(),
                 opt_level: "-O2".to_string(),
+                output: None,
+            }
+        );
+
+        for alias in ["build-avr", "build-uno"] {
+            let mut avr_build_args = vec![alias, "-Os", "-o", "uno.bin"];
+            avr_build_args.extend_from_slice(&include_flags);
+            avr_build_args.push("app.zev");
+            assert_eq!(
+                parse_args(avr_build_args).unwrap(),
+                Command::BuildAvr {
+                    files: vec![PathBuf::from("app.zev")],
+                    include_dirs: expected_dirs.clone(),
+                    opt_level: "-Os".to_string(),
+                    output: Some(PathBuf::from("uno.bin")),
+                }
+            );
+        }
+
+        for alias in ["flash-avr", "flash-uno"] {
+            let mut avr_flash_args = vec![alias, "--port", "/dev/ttyACM0", "-Oz", "-o", "uno.bin"];
+            avr_flash_args.extend_from_slice(&include_flags);
+            avr_flash_args.push("app.zev");
+            assert_eq!(
+                parse_args(avr_flash_args).unwrap(),
+                Command::FlashAvr {
+                    files: vec![PathBuf::from("app.zev")],
+                    include_dirs: expected_dirs.clone(),
+                    port: "/dev/ttyACM0".to_string(),
+                    opt_level: "-Oz".to_string(),
+                    output: Some(PathBuf::from("uno.bin")),
+                }
+            );
+        }
+
+        assert_eq!(
+            parse_args(["emit-llvm", "--target", "avr", "app.zev"]).unwrap(),
+            Command::EmitLlvm {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: Vec::new(),
+                target: Some("avr".to_string()),
+                opt_level: None,
                 output: None,
             }
         );
@@ -1155,6 +1253,10 @@ mod tests {
         assert!(parse_args(["run-qemu", "--max-ticks", "50"]).is_err());
         assert!(parse_args(["build-esp32c6", "-o", "fw.bin"]).is_err());
         assert!(parse_args(["flash-esp32c6", "--port", "/dev/ttyACM0"]).is_err());
+        assert!(parse_args(["build-avr", "-o", "uno.bin"]).is_err());
+        assert!(parse_args(["build-uno", "-o", "uno.bin"]).is_err());
+        assert!(parse_args(["flash-avr", "--port", "/dev/ttyACM0"]).is_err());
+        assert!(parse_args(["flash-uno", "--port", "/dev/ttyACM0"]).is_err());
         assert!(parse_args(["run"]).is_err());
     }
 }

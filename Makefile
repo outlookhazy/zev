@@ -2,7 +2,7 @@ CARGO ?= cargo
 PORT  ?= /dev/ttyACM0
 ZEVC  := $(CARGO) run --quiet --bin zevc --
 
-.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6
+.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno
 
 all: test
 
@@ -22,6 +22,7 @@ check:
 	$(ZEVC) check examples/sim_demo.zev
 	$(ZEVC) check examples/cortex_m_demo.zev
 	$(ZEVC) check examples/esp32c6_demo.zev
+	$(ZEVC) check examples/arduino_uno_demo.zev
 
 ram:
 	$(ZEVC) ram examples/motor_controller.zev examples/motor_support.zev
@@ -37,6 +38,12 @@ esp32c6:
 
 flash-esp32c6:
 	$(ZEVC) flash-esp32c6 examples/esp32c6_demo.zev --port $(PORT)
+
+uno:
+	$(ZEVC) build-avr examples/arduino_uno_demo.zev -o /tmp/zev-avr/arduino_uno_demo.bin
+
+flash-uno:
+	$(ZEVC) flash-avr examples/arduino_uno_demo.zev --port $(PORT)
 
 test:
 	$(CARGO) test --workspace -- --test-threads=2
