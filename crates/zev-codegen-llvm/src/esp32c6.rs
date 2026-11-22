@@ -26,8 +26,8 @@ pub const ESP32C6_EXTERNAL_CPU_INTS: [u8; 28] = [
     29, 30, 31,
 ];
 
-/// Total peripheral interrupt matrix (`INTMTX`) sources on ESP32-C6 (`0..=77`).
-pub const ESP32C6_INTMTX_SOURCE_COUNT: u32 = 78;
+/// Total peripheral interrupt matrix (`INTMTX`) sources on ESP32-C6 (`0..=76`).
+pub const ESP32C6_INTMTX_SOURCE_COUNT: u32 = 77;
 
 /// Deterministic ESP32-C6 peripheral interrupt matrix (`INTMTX` `src_id`) -> CPU line (`cpu_int`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +77,7 @@ pub fn assign_esp32c6_irq_routes(
 
 /// Emit ESP32-C6 `.entry` (`@_start` at `0x4200_0008`), `@__syn_esp32c6_reset`, watchdog disarm,
 /// `.data`/`.iram1` copy + `fence.i`, `.bss` zeroing, `SYSTIMER` init, and `GPIO8`/`GPIO9` +
-/// APB `store_ns` / `.iram1` cycle calibration (plus `INTMTX`/`INTPRI`/vectored `mtvec` when `routes` is non-empty).
+/// APB `store_ns` / `.iram1` cycle calibration (plus `INTMTX`/`PLIC_MX`/`mie`/vectored `mtvec` when `routes` is non-empty).
 pub fn emit_esp32c6_startup_ir(
     out: &mut String,
     initial_sp: u32,
@@ -327,7 +327,7 @@ boot:
 
 /// Emit 256-byte-aligned `.iram1` vectored trap table `@__syn_rv_vector_table`,
 /// naked RV32 GPR-preserving trampolines `@__syn_rv_irq_tramp_<cpu_int>`, and
-/// `@__syn_esp32c6_irq_init` (`INTMTX`, `INTPRI`, and `mtvec = (__syn_rv_vector_table | 1)`).
+/// `@__syn_esp32c6_irq_init` (`INTMTX`, `PLIC_MX`, `mie`, and `mtvec = (__syn_rv_vector_table | 1)`).
 pub fn emit_esp32c6_irq_vectors_ir(
     out: &mut String,
     routes: &[Esp32C6IrqRoute],
@@ -408,9 +408,12 @@ define void @__syn_rv_unhandled_irq() naked nounwind section ".iram1" {{
     sw t4, 52(sp)
     sw t5, 56(sp)
     sw t6, 60(sp)
-{calls_asm}    li t0, 0x600C50A8
+{calls_asm}    li t0, 0x20001008
     li t1, 0x{clear_mask:X}
-    sw t1, 0(t0)
+    lw t2, 0(t0)
+    or t3, t2, t1
+    sw t3, 0(t0)
+    sw t2, 0(t0)
     lw ra, 0(sp)
     lw t0, 4(sp)
     lw t1, 8(sp)
@@ -452,34 +455,42 @@ define void @__syn_rv_unhandled_irq() naked nounwind section ".iram1" {{
         );
     }
     for &cpu_int in by_cpu_int.keys() {
-        let pri_addr = 0x600C_500Cu32 + 4 * u32::from(cpu_int);
+        let pri_addr = 0x2000_1010u32 + 4 * u32::from(cpu_int);
         let pri_i32 = pri_addr as i32;
         let _ = writeln!(
             cfg_ir,
-            "  ; INTPRI_CORE0_CPU_INT_PRI_{cpu_int}_REG (0x{pri_addr:08X}) = 1"
+            "  ; PLIC_MXINT{cpu_int}_PRI_REG (0x{pri_addr:08X}) = 1"
         );
         let _ = writeln!(
             cfg_ir,
             "  store volatile i32 1, ptr inttoptr (i32 {pri_i32} to ptr), align 4"
         );
     }
-    let thresh_addr = 0x600C_508Cu32 as i32;
-    let en_addr = 0x600C_5000u32 as i32;
+    let en_addr = 0x2000_1000u32 as i32;
+    let type_addr = 0x2000_1004u32 as i32;
+    let thresh_addr = 0x2000_1090u32 as i32;
     let enable_mask_i32 = enable_mask as i32;
+    let clear_type_mask_i32 = (!enable_mask) as i32;
+    let mie_mask: u32 = enable_mask | (1u32 << 11);
+    let mie_mask_i32 = mie_mask as i32;
     let _ = writeln!(
         out,
         r#"define void @__syn_esp32c6_irq_init() nounwind{sz} {{
 entry:
-{cfg_ir}  ; INTPRI_CORE0_CPU_INT_THRESH_REG (0x600C508C) = 1
+{cfg_ir}  ; PLIC_MXINT_TYPE_REG (0x20001004) &= ~0x{enable_mask:08X} (level-triggered)
+  %type_old = load volatile i32, ptr inttoptr (i32 {type_addr} to ptr), align 4
+  %type_new = and i32 %type_old, {clear_type_mask_i32}
+  store volatile i32 %type_new, ptr inttoptr (i32 {type_addr} to ptr), align 4
+  ; PLIC_MXINT_THRESH_REG (0x20001090) = 1
   store volatile i32 1, ptr inttoptr (i32 {thresh_addr} to ptr), align 4
-  ; INTPRI_CORE0_CPU_INT_ENABLE_REG (0x600C5000) |= 0x{enable_mask:08X}
-  %en_old = load volatile i32, ptr inttoptr (i32 {en_addr} to ptr), align 4
-  %en_new = or i32 %en_old, {enable_mask_i32}
-  store volatile i32 %en_new, ptr inttoptr (i32 {en_addr} to ptr), align 4
-  ; Set mtvec = (__syn_rv_vector_table | 1) for vectored HP-SRAM trap dispatch
+  ; Set mtvec = (__syn_rv_vector_table | 1) for vectored HP-SRAM trap dispatch before unmasking
   %vt_a = ptrtoint ptr @__syn_rv_vector_table to i32
   %mtvec_v = or i32 %vt_a, 1
   call void asm sideeffect "csrw mtvec, $0", "r,~{{memory}}"(i32 %mtvec_v)
+  ; PLIC_MXINT_ENABLE_REG (0x20001000) = 0x{enable_mask:08X}
+  store volatile i32 {enable_mask_i32}, ptr inttoptr (i32 {en_addr} to ptr), align 4
+  ; Unmask attached external lines + MEIE (bit 11) in RISC-V mie CSR (0x{mie_mask:08X})
+  call void asm sideeffect "csrw mie, $0", "r,~{{memory}}"(i32 {mie_mask_i32})
   ret void
 }}
 "#

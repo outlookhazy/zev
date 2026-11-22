@@ -3094,13 +3094,15 @@ mod tests {
         assert!(esp_ll.contains("call __syn_vec_irq_12"));
         assert!(esp_ll.contains("call __syn_vec_irq_19"));
         assert!(esp_ll.contains("call __syn_vec_irq_37"));
-        assert!(esp_ll.contains("0x600C50A8"));
+        assert!(esp_ll.contains("0x20001008"));
         assert!(esp_ll.contains("INTMTX src_id=5 -> cpu_int=1 (0x60010014)"));
         assert!(esp_ll.contains("INTMTX src_id=37 -> cpu_int=6 (0x60010094)"));
-        assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_PRI_1_REG (0x600C5010) = 1"));
-        assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_THRESH_REG (0x600C508C) = 1"));
-        assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_ENABLE_REG (0x600C5000)"));
+        assert!(esp_ll.contains("PLIC_MXINT1_PRI_REG (0x20001014) = 1"));
+        assert!(esp_ll.contains("PLIC_MXINT_TYPE_REG (0x20001004)"));
+        assert!(esp_ll.contains("PLIC_MXINT_THRESH_REG (0x20001090) = 1"));
+        assert!(esp_ll.contains("PLIC_MXINT_ENABLE_REG (0x20001000)"));
         assert!(esp_ll.contains("csrw mtvec, $0"));
+        assert!(esp_ll.contains("csrw mie, $0"));
         assert!(esp_ll.contains("csrsi mstatus, 8"));
         assert!(esp_ll.contains("call void @__syn_vec_irq_37()"));
 
@@ -3395,10 +3397,10 @@ mod tests {
         let assigned_cpus: Vec<u8> = six_routes.iter().map(|r| r.cpu_int).collect();
         assert_eq!(assigned_cpus, vec![1, 2, 5, 6, 8, 9]);
 
-        let oob_src = [mk_vec(78)];
+        let oob_src = [mk_vec(77)];
         assert!(
             esp32c6::assign_esp32c6_irq_routes(&oob_src).is_err(),
-            "ESP32-C6 INTMTX src_id=78 must fail"
+            "ESP32-C6 INTMTX src_id=77 must fail"
         );
         let too_many: Vec<_> = (0..29u32).map(mk_vec).collect();
         assert!(
@@ -3406,7 +3408,7 @@ mod tests {
             ">28 ESP32-C6 external IRQ sources must fail"
         );
 
-        // Cortex-M3 / Host compilation MUST still allow irq_num >= 78!
+        // Cortex-M3 / Host compilation MUST still allow irq_num >= 77!
         let cm_prog = zev_parser::parse_str("fn main() {}").unwrap();
         let mut cm_mod = zev_mir::lower_program(&cm_prog).unwrap();
         cm_mod.isrs.push(MirIsr {
@@ -3416,7 +3418,7 @@ mod tests {
             state_vars: vec![],
             body: vec![],
         });
-        cm_mod.irq_vectors.push(mk_vec(78));
+        cm_mod.irq_vectors.push(mk_vec(77));
         assert!(emit_llvm_ir_with_options(&cm_mod, &CodegenOptions::default()).is_ok());
 
         // 2. Shared IRQ vector dispatch preserves exact source attachment order across unconditional
