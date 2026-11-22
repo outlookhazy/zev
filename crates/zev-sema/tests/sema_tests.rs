@@ -1071,8 +1071,8 @@ fn check_cortex_m_and_esp32c6_examples_clean() {
 }
 
 #[test]
-fn doc_topic_and_doc_command_cover_all_e0001_through_e0029() {
-    assert_eq!(DiagnosticKind::ALL.len(), 29);
+fn doc_topic_and_doc_command_cover_all_e0001_through_e0033() {
+    assert_eq!(DiagnosticKind::ALL.len(), 33);
 
     let expected_topics = [
         ("E0001", "primitives"),
@@ -1104,6 +1104,10 @@ fn doc_topic_and_doc_command_cover_all_e0001_through_e0029() {
         ("E0027", "tasks"),
         ("E0028", "runtime"),
         ("E0029", "syntax"),
+        ("E0030", "syntax"),
+        ("E0031", "syntax"),
+        ("E0032", "tasks"),
+        ("E0033", "tasks"),
     ];
 
     for (kind, (code, topic)) in DiagnosticKind::ALL.iter().zip(expected_topics.iter()) {
@@ -3750,5 +3754,510 @@ fn r4_struct_fnptr_field_call_and_ptr_receiver_validation() {
         "#,
         DiagnosticKind::UndefinedSymbol,
     );
+}
+
+struct TempWorkspace {
+    root: std::path::PathBuf,
+}
+
+impl TempWorkspace {
+    fn new(tag: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "zev_sema_mod_{}_{}_{}",
+            tag,
+            std::process::id(),
+            id
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn write(&self, rel: &str, content: &str) -> std::path::PathBuf {
+        let p = self.root.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+}
+
+impl Drop for TempWorkspace {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+#[test]
+fn wave1_module_resolution_diamond_pub_extern_c_and_generics() {
+    use zev_sema::IrqBindingArg;
+
+    let ws = TempWorkspace::new("mod_ok");
+    // Shared leaf module (`common/types.zev`) imported via `mod.zev` / sibling / include dir.
+    ws.write(
+        "libs/common/mod.zev",
+        r#"
+        pub const u32 DEFAULT_BAUD = 115200;
+        pub enum Mode { Idle = 0, Active = 1 }
+        pub struct Box<T, usize N> { [N]T data; }
+        pub T first_item<T, usize N>(Box<T, N> b) { return b.data[0]; }
+        pub extern "C" fn hal_tick();
+        "#,
+    );
+    ws.write(
+        "app/drivers/uart.zev",
+        r#"
+        import common as cmn;
+
+        pub extern "C" fn hal_tick();
+        extern "C" fn private_c_hook();
+
+        pub mmio UartRegs {
+            @rw u32 cr1 @ 0x00;
+            @ro u32 isr @ 0x1C;
+            @w1c u32 icr @ 0x20;
+            @rw [2]u32 brr @ 0x24;
+        }
+
+        pub mmio USART1 : UartRegs @ 0x4001_1000;
+        pub irq IRQ_UART1 = 37;
+
+        pub isr rx_isr(*UartRegs regs, *watch<u32> out, u32 shift) {
+            state u32 hits = 0;
+            hits += 1;
+            u32 s = regs.isr;
+            regs.icr = s;
+            out.publish((s >> shift) + hits);
+        }
+
+        pub fn configure(*UartRegs regs, u32 baud) {
+            private_c_hook();
+            cmn.hal_tick();
+            regs.cr1 |= 1;
+            regs.brr[0] = baud;
+        }
+
+        pub task uart_worker(*watch<u32> w) {
+            loop {
+                u32 v = w.wait_change();
+                sys.log_kv("v=", (i32)v);
+            }
+        }
+        "#,
+    );
+    let main_path = ws.write(
+        "app/sub/main.zev",
+        r#"
+        import common as cmn;
+        import drivers.uart as drv;
+
+        pub watch<u32> rx_watch = 0;
+
+        fn main() {
+            cmn.Box<u32, 2> b = cmn.Box<u32, 2> { data: [10, 20] };
+            u32 first = cmn.first_item<u32, 2>(b);
+            drv.configure(drv.USART1, cmn.DEFAULT_BAUD + first);
+            drv.IRQ_UART1.attach(drv.rx_isr(drv.USART1, &rx_watch, 1));
+            cmn.hal_tick();
+            spawn drv.uart_worker(&rx_watch) @high;
+        }
+        "#,
+    );
+    // Write fake `Zev.toml` workspace root at `ws.root/app` AND include `ws.root/libs` via `include_dirs`.
+    ws.write("app/Zev.toml", "[package]\nname = \"demo\"\n");
+
+    let main_src = std::fs::read_to_string(&main_path).unwrap();
+    let main_prog = zev_parser::parse_str_named(&main_src, main_path.to_str().unwrap()).unwrap();
+    let mut opts = AnalyzeOptions::default();
+    opts.include_dirs.push(ws.root.join("libs"));
+
+    let out = analyze_and_monomorphize_named_programs(
+        &[(&main_prog, main_path.to_str())],
+        &opts,
+    );
+    assert!(
+        out.diagnostics.is_empty(),
+        "unexpected module diagnostics: {:?}",
+        out.diagnostics
+    );
+
+    // 1. Canonicalized symbols and `display_names`.
+    assert!(out.model.mmio_layouts.contains_key("drivers_uart__UartRegs"));
+    assert!(out.model.mmio_instances.contains_key("drivers_uart__USART1"));
+    assert!(out.model.irqs.contains_key("drivers_uart__IRQ_UART1"));
+    assert_eq!(
+        out.model
+            .display_names
+            .get("drivers_uart__USART1")
+            .map(String::as_str),
+        Some("drivers.uart.USART1")
+    );
+    // 2. `extern "C"` keeps C symbol unmangled (`hal_tick`, `private_c_hook`).
+    assert!(out.model.functions.contains_key("hal_tick"));
+    assert!(out.model.functions.contains_key("private_c_hook"));
+    // 3. Cross-module IRQ binding & ISR state metadata recorded cleanly.
+    assert_eq!(out.model.irq_bindings.len(), 1);
+    let binding = &out.model.irq_bindings[0];
+    assert_eq!(binding.irq_num, 37);
+    assert_eq!(binding.isr_name, "drivers_uart__rx_isr");
+    assert_eq!(
+        binding.args,
+        vec![
+            IrqBindingArg::MmioAddr("drivers_uart__USART1".to_string()),
+            IrqBindingArg::PrimAddr("rx_watch".to_string()),
+            IrqBindingArg::ConstInt {
+                ty: zev_sema::Ty::Prim(zev_ast::PrimType::U32),
+                value: 1,
+            },
+        ]
+    );
+    assert_eq!(out.model.isr_states.len(), 1);
+    assert_eq!(out.model.isr_states[0].name, "hits");
+    assert_eq!(out.model.spawned_tasks.len(), 1);
+    assert_eq!(out.model.spawned_tasks[0].task_name, "drivers_uart__uart_worker");
+}
+
+#[test]
+fn wave1_module_errors_cycle_private_extern_leak_and_chip_override() {
+    // 1. Circular import (`a -> b -> a`) -> `E0030` with file path preserved.
+    {
+        let ws = TempWorkspace::new("mod_cycle");
+        let a_path = ws.write("a.zev", "import b;\nfn main() {}\n");
+        ws.write("b.zev", "import a;\npub const u32 X = 1;\n");
+        let a_prog = zev_parser::parse_file(&a_path).unwrap();
+        let out = analyze_and_monomorphize_named_programs(
+            &[(&a_prog, a_path.to_str())],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::ModuleError && d.message.contains("circular")),
+            "expected E0030 cycle error, got: {:?}",
+            out.diagnostics
+        );
+    }
+
+    // 2. Private cross-module symbol + bare un-imported `extern "C"` leak -> `E0030`.
+    {
+        let ws = TempWorkspace::new("mod_priv");
+        ws.write(
+            "secret.zev",
+            r#"
+            struct Hidden { u32 v; }
+            extern "C" fn secret_c();
+            fn hidden_fn() { secret_c(); }
+            pub fn ok() {}
+            "#,
+        );
+        for (idx, main_src) in [
+            "import secret as s;\nfn main() { s.Hidden h = s.Hidden { v: 1 }; }\n",
+            "import secret as s;\nfn main() { s.hidden_fn(); }\n",
+            "import secret as s;\nfn main() { s.secret_c(); }\n",
+            "import secret as s;\nfn main() { s.ok(); secret_c(); }\n",
+            "import does_not_exist as m;\nfn main() {}\n",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let main_path = ws.write(&format!("main_{idx}.zev"), main_src);
+            let main_prog = zev_parser::parse_file(&main_path).unwrap();
+            let out = analyze_and_monomorphize_named_programs(
+                &[(&main_prog, main_path.to_str())],
+                &AnalyzeOptions::default(),
+            );
+            assert!(
+                out.diagnostics
+                    .iter()
+                    .any(|d| d.kind == DiagnosticKind::ModuleError),
+                "case #{idx} expected E0030 ModuleError, got: {:?}",
+                out.diagnostics
+            );
+        }
+    }
+
+    // 3. Real `.zev` `chip.*` module on disk takes priority over legacy `NamespaceKind::Chip` fallback!
+    {
+        let ws = TempWorkspace::new("chip_override");
+        ws.write(
+            "chip/myboard.zev",
+            r#"
+            pub mmio Gpio @ 0x4800_0000 {
+                @rw u32 odr @ 0x14;
+            }
+            pub irq IRQ_EXTI0 = 6;
+            "#,
+        );
+        let main_path = ws.write(
+            "main.zev",
+            r#"
+            import chip.myboard as hw;
+            isr exti0() {}
+            fn main() {
+                hw.Gpio.odr |= 1;
+                hw.IRQ_EXTI0.attach(exti0);
+            }
+            "#,
+        );
+        let main_prog = zev_parser::parse_file(&main_path).unwrap();
+        let out = analyze_and_monomorphize_named_programs(
+            &[(&main_prog, main_path.to_str())],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            out.diagnostics.is_empty(),
+            "expected disk chip/*.zev override to succeed, got: {:?}",
+            out.diagnostics
+        );
+        assert!(out.model.chip_imports.is_empty());
+        assert_eq!(out.model.irq_bindings.len(), 1);
+    }
+}
+
+#[test]
+fn wave1_mmio_validation_and_e0031_enforcement() {
+    // 1. Valid `mmio` layouts, instances, inline desugaring, `&PERIPH`, `PERIPH -> *Layout`,
+    //    `(*ptr).reg`, array registers, `@rw`/`@ro`/`@wo`/`@w1c`.
+    let m = expect_ok(
+        r#"
+        const u32 RCC_BASE = 0x4002_1000;
+        const u32 CR1_OFF = 0x00;
+
+        mmio UartRegs {
+            @rw u32 cr1 @ CR1_OFF;
+            @ro u16 sr @ 0x04;
+            @wo u8 dr @ 0x06;
+            @w1c u32 icr @ 0x08;
+            @rw [2]u32 brr @ 0x0C;
+            @wo u32 tx[2] @ 0x14;
+        }
+
+        mmio USART1 : UartRegs @ 0x4001_1000;
+        mmio Rcc @ RCC_BASE {
+            @rw u32 cr @ 0x00;
+        }
+
+        void step_uart(*UartRegs r) {
+            r.cr1 |= 1;
+            (*r).cr1 = 2;
+            u16 st = r.sr;
+            u32 flags = r.icr;
+            r.icr = flags;
+            r.dr = 0x41;
+            r.brr[0] = 9600;
+            r.brr[1] |= 0x10;
+            r.tx[1] = 0x55;
+            sys.log_kv("st=", (i32)st);
+        }
+
+        fn main() {
+            *UartRegs p1 = USART1;
+            *UartRegs p2 = &USART1;
+            step_uart(USART1);
+            step_uart(p1);
+            step_uart(p2);
+            Rcc.cr |= 1;
+        }
+        "#,
+    );
+    assert!(m.mmio_layouts.contains_key("UartRegs"));
+    assert_eq!(m.mmio_layouts["UartRegs"].byte_size, 0x1C);
+    assert!(m.mmio_layouts.contains_key("Rcc__Layout"));
+    assert_eq!(m.mmio_instances["Rcc"].base_addr, 0x4002_1000);
+
+    // 2. Reject invalid register widths, misalignment, overlap, duplicate reg names, bad bases,
+    //    by-value `mmio` in locals/params/returns/fields/casts, `&regs.reg`, and access qualifier violations (`E0031`).
+    for bad_mmio in [
+        // Unsupported register types (`u64`, `i32`, `f32`, `*u32`, struct)
+        "mmio Bad { @rw u64 r @ 0x00; } fn main() {}",
+        "mmio Bad { @rw i32 r @ 0x00; } fn main() {}",
+        "mmio Bad { @rw *u32 r @ 0x00; } fn main() {}",
+        // Unaligned `u16` and `u32`
+        "mmio Bad { @rw u16 r @ 0x01; } fn main() {}",
+        "mmio Bad { @rw u32 r @ 0x02; } fn main() {}",
+        // Overlapping registers
+        "mmio Bad { @rw [2]u32 a @ 0x00; @rw u32 b @ 0x04; } fn main() {}",
+        // Duplicate register name
+        "mmio Bad { @rw u32 cr @ 0x00; @rw u32 cr @ 0x04; } fn main() {}",
+        // Out-of-range base address
+        "mmio Regs { @rw u32 a @ 0x00; } mmio P : Regs @ 0x1_0000_0000; fn main() {}",
+        // By-value `mmio` local, parameter, return, struct field, array, cast
+        "mmio Regs { @rw u32 a @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { Regs r; }",
+        "mmio Regs { @rw u32 a @ 0x00; } void take(Regs r) {} fn main() {}",
+        "mmio Regs { @rw u32 a @ 0x00; } Regs make() { while (true) {} } fn main() {}",
+        "mmio Regs { @rw u32 a @ 0x00; } struct Holder { Regs r; } fn main() {}",
+        "mmio Regs { @rw u32 a @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P as Regs; }",
+        // Taking `&regs.icr` or `&regs.arr[0]`
+        "mmio Regs { @w1c u32 icr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { *u32 p = &P.icr; }",
+        "mmio Regs { @rw [2]u32 brr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { *u32 p = &P.brr[0]; }",
+        // `@ro` write / RMW forbidden
+        "mmio Regs { @ro u32 sr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P.sr = 1; }",
+        "mmio Regs { @ro u32 sr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P.sr |= 1; }",
+        // `@wo` read & RMW forbidden
+        "mmio Regs { @wo u32 dr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { u32 x = P.dr; }",
+        "mmio Regs { @wo u32 dr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P.dr |= 1; }",
+        "mmio Regs { @wo [2]u32 dr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P.dr[0] |= 1; }",
+        // `@w1c` compound RMW forbidden (`|=`, `&=`, `^=`)
+        "mmio Regs { @w1c u32 icr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P.icr |= 1; }",
+        "mmio Regs { @w1c u32 icr @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P.icr &= ~1; }",
+    ] {
+        expect_err_kind(bad_mmio, DiagnosticKind::MmioViolation);
+    }
+}
+
+#[test]
+fn wave1_irq_boot_tree_attachment_shared_and_e0032_errors() {
+    // 1. Valid boot-tree `attach` / `attach_shared` / 0-arg `attach`, boot-helper forwarding,
+    //    mutually exclusive `if`/`else`/`switch` branches, and `sys.pend_irq(IRQ)`.
+    let m = expect_ok(
+        r#"
+        mmio UartRegs {
+            @rw u32 cr1 @ 0x00;
+            @w1c u32 icr @ 0x04;
+        }
+        mmio USART1 : UartRegs @ 0x4001_1000;
+        mmio USART2 : UartRegs @ 0x4000_4400;
+
+        irq IRQ_MODE = 10;
+        irq IRQ_SHARED = 11;
+        irq IRQ_SIMPLE = 12;
+
+        watch<u32> evt_watch = 0;
+
+        enum BootCfg { Fast, Safe }
+
+        isr fast_isr(*UartRegs regs, u32 tag) {
+            regs.icr = tag;
+        }
+        isr safe_isr(*UartRegs regs, *watch<u32> out) {
+            regs.icr = 1;
+            out.publish(2);
+        }
+        isr shared_a(bool flag) {
+            if (flag) { sys.log("a"); }
+        }
+        isr shared_b(u32 id) {
+            sys.log_kv("b=", (i32)id);
+        }
+        isr simple_isr {}
+
+        void bind_uart_irq(*UartRegs regs, u32 tag) {
+            IRQ_MODE.attach(fast_isr(regs, tag));
+        }
+
+        fn main() {
+            BootCfg cfg = BootCfg.Fast;
+            switch (cfg) {
+                Fast => { bind_uart_irq(USART1, 0xA); }
+                Safe => { IRQ_MODE.attach(safe_isr(USART2, &evt_watch)); }
+            }
+            IRQ_SHARED.attach_shared(shared_a(true));
+            IRQ_SHARED.attach_shared(shared_b(2));
+            IRQ_SIMPLE.attach(simple_isr);
+            sys.pend_irq(IRQ_SIMPLE);
+            sys.pend_irq(99);
+        }
+        "#,
+    );
+    assert_eq!(m.irqs.len(), 3);
+    assert_eq!(m.irq_bindings.len(), 5);
+    assert!(m.irq_bindings[0].conditional_branch.is_some());
+    assert!(m.irq_bindings[1].conditional_branch.is_some());
+    assert_ne!(
+        m.irq_bindings[0].conditional_branch,
+        m.irq_bindings[1].conditional_branch
+    );
+    assert!(m.irq_bindings[2].is_shared);
+    assert!(m.irq_bindings[3].is_shared);
+
+    // 2. Reject invalid `attach` contexts, duplicate exclusive bindings (including aliased IRQ numbers),
+    //    mixing `attach` + `attach_shared`, post-`if` conflict, and non-static/non-const handler args (`E0032`).
+    for bad_irq in [
+        // Inside `task`
+        "irq Q = 1; isr h {} task t() { Q.attach(h); loop { sys.delay(1ms); } } fn main() { spawn t(); }",
+        // Inside `isr`
+        "irq Q = 1; irq Q2 = 2; isr h {} isr bad { Q2.attach(h); } fn main() { Q.attach(bad); }",
+        // Inside `loop` / `while`
+        "irq Q = 1; isr h {} fn main() { for (u32 i in 0..2) { Q.attach(h); } }",
+        // After supervisor loop in `main()`
+        "irq Q = 1; isr h {} fn main() { loop { sys.delay(1ms); } Q.attach(h); }",
+        // Duplicate exclusive attach in sequence
+        "irq Q = 5; isr h1 {} isr h2 {} fn main() { Q.attach(h1); Q.attach(h2); }",
+        // Two `irq` tokens sharing same vector number!
+        "irq Q1 = 5; irq Q2 = 5; isr h1 {} isr h2 {} fn main() { Q1.attach(h1); Q2.attach(h2); }",
+        // Mixing exclusive `attach` and `attach_shared` even in mutually exclusive branches!
+        "irq Q = 5; isr h1 {} isr h2 {} fn main() { bool c = true; if (c) { Q.attach(h1); } else { Q.attach_shared(h2); } }",
+        // Non-exclusive fallthrough before second `attach`
+        "irq Q = 5; isr h1 {} isr h2 {} fn main() { bool c = true; if (c) { Q.attach(h1); } Q.attach(h2); }",
+        // Recursive boot-attaching cycle
+        "irq Q = 5; isr h {} fn rec(u32 n) { if (n > 0) { rec(n - 1); } else { Q.attach(h); } } fn main() { rec(1); }",
+        // Non-const runtime arg directly in `attach`
+        "irq Q = 5; isr h(u32 x) {} fn main() { u32 x = 1; x += 1; Q.attach(h(x)); }",
+        // Local stack address passed to `attach`
+        "irq Q = 5; isr h(*u32 p) {} fn main() { u32 local = 1; Q.attach(h(&local)); }",
+        // Non-const runtime arg forwarded through boot helper!
+        "irq Q = 5; isr h(u32 x) {} void setup(u32 x) { Q.attach(h(x)); } u32 dyn_val() { return 7; } fn main() { setup(dyn_val()); }",
+        // Helper forwarding param with no boot callers
+        "irq Q = 5; isr h(u32 x) {} void dead_setup(u32 x) { Q.attach(h(x)); } fn main() {}",
+    ] {
+        expect_err_kind(bad_irq, DiagnosticKind::IrqAttachmentError);
+    }
+}
+
+#[test]
+fn wave1_isr_state_and_e0033_escape_checks() {
+    // 1. Valid ISR `state` variables (scalar, fixed array, const struct init, local helper use).
+    let m = expect_ok(
+        r#"
+        struct Pair { u32 a; u32 b; }
+        const u32 ZERO = 0;
+
+        void bump(*u32 p) {
+            *p += 1;
+        }
+
+        irq IRQ_TIMER = 15;
+        isr tim_isr() {
+            state u32 count = ZERO;
+            state [4]u32 ring = [0, 0, 0, 0];
+            state Pair pair = Pair { a: 1, b: 2 };
+            bump(&count);
+            ring[count & 3] = pair.a;
+        }
+
+        fn main() {
+            IRQ_TIMER.attach(tim_isr);
+        }
+        "#,
+    );
+    assert_eq!(m.isr_states.len(), 3);
+
+    // 2. Reject invalid `state` declarations and escaping `&state_var` (`E0033`).
+    for bad_state in [
+        // Outside `isr`: inside `fn` and inside `task`
+        "fn helper() { state u32 x = 0; } fn main() { helper(); }",
+        "task worker() { state u32 x = 0; loop { sys.delay(1ms); } } fn main() { spawn worker(); }",
+        // Missing initializer
+        "isr bad { state u32 x; } fn main() {}",
+        // Non-constant initializer
+        "isr bad(u32 seed) { state u32 x = seed + 1; } fn main() {}",
+        // Reference-bearing type (`*u32`, `[]u8`, struct with `*u8`)
+        "isr bad { state u32 n = 0; state *u32 p = 0 as *u32; } fn main() {}",
+        "struct RefWrap { *u8 p; } isr bad { state RefWrap w = RefWrap { p: 0 as *u8 }; } fn main() {}",
+        // Duplicate `state` name within same ISR (even in nested block)
+        "isr bad { state u32 x = 0; if (true) { state u32 x = 1; } } fn main() {}",
+        // Escaping `&state_var` via outer local variable
+        "isr bad { *u32 outer = 0 as *u32; if (true) { state u32 inner = 1; outer = &inner; } } fn main() {}",
+        // Escaping `&state_var` through ISR pointer parameter (`**u32`)
+        "isr bad(**u32 slot) { state u32 x = 0; *slot = &x; } fn main() {}",
+        // Escaping `&state_var` through OS primitive `watch.publish` / `inbox.post`
+        "watch<*u32> leak_w; isr bad { state u32 x = 0; leak_w.publish(&x); } fn main() {}",
+        "inbox<*u32, 4> leak_q; isr bad { state u32 x = 0; leak_q.post(&x); } fn main() {}",
+    ] {
+        expect_err_kind(bad_state, DiagnosticKind::InvalidIsrState);
+    }
 }
 

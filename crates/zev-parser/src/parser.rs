@@ -92,6 +92,7 @@ impl<'a> Parser<'a> {
             let iter_start = self.pos;
             let _ = self.parse_attrs();
             while self.eat(&TokenKind::KwPub) || self.eat(&TokenKind::KwStatic) {}
+            let _ = self.parse_attrs();
 
             match self.peek_kind() {
                 TokenKind::Eof => break,
@@ -105,6 +106,24 @@ impl<'a> Parser<'a> {
                     } else {
                         self.prescan_skip_until_semi_depth0();
                     }
+                }
+                TokenKind::Ident(ref kw) if kw == "mmio" && self.is_mmio_decl_start() => {
+                    self.bump();
+                    if let TokenKind::Ident(name) = self.peek_kind() {
+                        self.bump();
+                        if !self.at(&TokenKind::LBrace) {
+                            self.top_level_values.insert(name);
+                        }
+                    }
+                    self.prescan_skip_item();
+                }
+                TokenKind::Ident(ref kw) if kw == "irq" && self.is_irq_decl_start() => {
+                    self.bump();
+                    if let TokenKind::Ident(name) = self.peek_kind() {
+                        self.bump();
+                        self.top_level_values.insert(name);
+                    }
+                    self.prescan_skip_until_semi_depth0();
                 }
                 TokenKind::KwPacked | TokenKind::KwStruct => {
                     let _ = self.eat(&TokenKind::KwPacked);
@@ -604,17 +623,12 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn trap_p0010(&self, kw: &str, span: Span) -> ParseError {
-        let msg = if kw == "pub" {
-            "`pub` visibility modifier is not used in Zev v0"
-        } else {
-            "`static` variable modifier is not used in Zev"
-        };
-        self.err_at(msg, span)
+    fn trap_p0010(&self, span: Span) -> ParseError {
+        self.err_at("`static` variable modifier is not used in Zev", span)
             .with_code("P0010")
             .with_doc_topic("primitives")
             .with_hint(
-                "task locals declared before `loop`/`loop every` (e.g. `i32 integral = 0;`) persist in static task frames automatically; top-level constants use `const`, and shared task/ISR state uses `watch<T>`, `inbox<T, N>`, or `signal` (omit `pub`)",
+                "task locals declared before `loop`/`loop every` (e.g. `i32 integral = 0;`) persist in static task frames automatically, persistent `isr` state uses `state Type x = init;` inside `isr`, top-level constants use `const`, and shared task/ISR state uses `watch<T>`, `inbox<T, N>`, or `signal`",
             )
     }
 
@@ -631,8 +645,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwTry => Some(self.trap_p0007("`try`", tok.span)),
             TokenKind::KwFor => Some(self.trap_p0008(tok.span)),
             TokenKind::KwEvery => Some(self.trap_p0011(tok.span, None)),
-            TokenKind::KwStatic => Some(self.trap_p0010("static", tok.span)),
-            TokenKind::KwPub => Some(self.trap_p0010("pub", tok.span)),
+            TokenKind::KwStatic => Some(self.trap_p0010(tok.span)),
             TokenKind::Question => Some(self.trap_p0007("`?` operator", tok.span)),
             _ => None,
         }
@@ -705,15 +718,49 @@ impl<'a> Parser<'a> {
         Ok(Program::new(items, end_span))
     }
 
+    fn is_mmio_decl_start(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "mmio")
+            && (self.peek_n_kind(1) == TokenKind::LBrace
+                || (matches!(self.peek_n_kind(1), TokenKind::Ident(_))
+                    && !matches!(
+                        self.peek_n_kind(2),
+                        TokenKind::LParen
+                            | TokenKind::Lt
+                            | TokenKind::Eq
+                            | TokenKind::Semi
+                            | TokenKind::LBracket
+                    )))
+    }
+
+    fn is_irq_decl_start(&self) -> bool {
+        matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "irq")
+            && matches!(self.peek_n_kind(1), TokenKind::Ident(_))
+            && !matches!(
+                self.peek_n_kind(2),
+                TokenKind::LParen | TokenKind::Lt | TokenKind::LBracket
+            )
+    }
+
     fn parse_top_level_items(&mut self, out: &mut Vec<Item>) -> Result<(), ParseError> {
         let first_span = self.peek_span();
-        let attrs = self.parse_attrs()?;
+        let mut attrs = self.parse_attrs()?;
+        let pub_span = if self.at(&TokenKind::KwPub) {
+            Some(self.bump().span)
+        } else {
+            None
+        };
+        attrs.extend(self.parse_attrs()?);
+        if self.at(&TokenKind::KwPub) {
+            return Err(self
+                .err_at("duplicate `pub` visibility modifier", self.peek_span())
+                .with_doc_topic("syntax"));
+        }
+        let is_pub = pub_span.is_some();
         let cur_span = self.peek_span();
 
         match self.peek_kind() {
             // ── Foreign-idiom top-level traps ──
-            TokenKind::KwPub => return Err(self.trap_p0010("pub", cur_span)),
-            TokenKind::KwStatic => return Err(self.trap_p0010("static", cur_span)),
+            TokenKind::KwStatic => return Err(self.trap_p0010(cur_span)),
             TokenKind::KwLet => return Err(self.trap_p0001("let", cur_span)),
             TokenKind::KwVar => return Err(self.trap_p0001("var", cur_span)),
             TokenKind::KwMut => return Err(self.trap_p0001("mut", cur_span)),
@@ -734,6 +781,14 @@ impl<'a> Parser<'a> {
 
             // ── Valid Zev top-level constructs ──
             TokenKind::KwImport => {
+                if let Some(ps) = pub_span {
+                    return Err(self
+                        .err_at(
+                            "`pub` visibility modifier is not allowed on `import` declarations",
+                            ps,
+                        )
+                        .with_doc_topic("syntax"));
+                }
                 if !attrs.is_empty() {
                     return Err(self
                         .err_at(
@@ -756,35 +811,45 @@ impl<'a> Parser<'a> {
                 }
                 let span = first_span.merge(st.span);
                 st.span = span;
-                out.push(Item::new(attrs, ItemKind::Struct(st), span));
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Struct(st), span));
             }
             TokenKind::KwEnum => {
                 let en = self.parse_enum()?;
                 let span = first_span.merge(en.span);
-                out.push(Item::new(attrs, ItemKind::Enum(en), span));
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Enum(en), span));
             }
             TokenKind::KwIsr => {
                 let isr = self.parse_isr(attrs.clone(), first_span)?;
                 let span = isr.span;
-                out.push(Item::new(attrs, ItemKind::Isr(isr), span));
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Isr(isr), span));
             }
             TokenKind::KwTask => {
                 let task = self.parse_task(attrs.clone(), first_span)?;
                 let span = task.span;
-                out.push(Item::new(attrs, ItemKind::Task(task), span));
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Task(task), span));
             }
             TokenKind::KwConst => {
                 let c = self.parse_const(first_span)?;
                 let span = c.span;
-                out.push(Item::new(attrs, ItemKind::Const(c), span));
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Const(c), span));
             }
             TokenKind::KwExtern => {
-                self.parse_extern_items(attrs, first_span, out)?;
+                self.parse_extern_items(attrs, is_pub, first_span, out)?;
             }
             TokenKind::KwFn => {
                 let f = self.parse_kw_fn(attrs.clone(), false, first_span)?;
                 let span = f.span;
-                out.push(Item::new(attrs, ItemKind::Fn(f), span));
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Fn(f), span));
+            }
+            TokenKind::Ident(ref kw) if kw == "mmio" && self.is_mmio_decl_start() => {
+                let mmio = self.parse_mmio(first_span)?;
+                let span = mmio.span;
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Mmio(mmio), span));
+            }
+            TokenKind::Ident(ref kw) if kw == "irq" && self.is_irq_decl_start() => {
+                let irq = self.parse_irq(first_span)?;
+                let span = irq.span;
+                out.push(Item::with_pub(attrs, is_pub, ItemKind::Irq(irq), span));
             }
             _ => {
                 // Catch `ErrSet!RetType func(...)` at top-level (`P0007`)
@@ -803,7 +868,7 @@ impl<'a> Parser<'a> {
                 if self.at(&TokenKind::LParen) || self.at(&TokenKind::Lt) {
                     let f = self.finish_fn_after_name(attrs.clone(), false, ty, name, first_span)?;
                     let span = f.span;
-                    out.push(Item::new(attrs, ItemKind::Fn(f), span));
+                    out.push(Item::with_pub(attrs, is_pub, ItemKind::Fn(f), span));
                 } else {
                     let init = if self.eat(&TokenKind::Eq) {
                         Some(self.parse_expr()?)
@@ -814,8 +879,9 @@ impl<'a> Parser<'a> {
                     let span = first_span.merge(semi.span);
                     match ty.kind {
                         TypeKind::OsPrimitive(os_ty) => {
-                            out.push(Item::new(
+                            out.push(Item::with_pub(
                                 attrs.clone(),
+                                is_pub,
                                 ItemKind::OsPrimitive(OsPrimitiveDecl {
                                     attrs,
                                     ty: os_ty,
@@ -827,8 +893,9 @@ impl<'a> Parser<'a> {
                             ));
                         }
                         _ => {
-                            out.push(Item::new(
+                            out.push(Item::with_pub(
                                 attrs,
+                                is_pub,
                                 ItemKind::GlobalVar(GlobalVarDecl {
                                     ty,
                                     name,
@@ -963,10 +1030,15 @@ impl<'a> Parser<'a> {
         while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
             let f_start = self.peek_span();
             if self.at(&TokenKind::KwPub) {
-                return Err(self.trap_p0010("pub", f_start));
+                return Err(self
+                    .err_at(
+                        "`pub` visibility modifier is not allowed on struct fields",
+                        f_start,
+                    )
+                    .with_doc_topic("syntax"));
             }
             if self.at(&TokenKind::KwStatic) {
-                return Err(self.trap_p0010("static", f_start));
+                return Err(self.trap_p0010(f_start));
             }
             let (ty, field_name) = self.parse_field_or_param("struct field")?;
             let f_end = if self.eat(&TokenKind::Semi) || self.eat(&TokenKind::Comma) {
@@ -1082,6 +1154,7 @@ impl<'a> Parser<'a> {
     fn parse_extern_items(
         &mut self,
         attrs: Vec<Attr>,
+        is_pub: bool,
         first_span: Span,
         out: &mut Vec<Item>,
     ) -> Result<(), ParseError> {
@@ -1101,33 +1174,192 @@ impl<'a> Parser<'a> {
         if self.eat(&TokenKind::LBrace) {
             while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
                 let item_start = self.peek_span();
-                if self.at(&TokenKind::KwPub) {
-                    return Err(self.trap_p0010("pub", item_start));
+                if self.at(&TokenKind::KwStatic) {
+                    return Err(self.trap_p0010(item_start));
                 }
                 let mut item_attrs = attrs.clone();
                 item_attrs.extend(self.parse_attrs()?);
+                let inner_pub_span = if self.at(&TokenKind::KwPub) {
+                    Some(self.bump().span)
+                } else {
+                    None
+                };
+                item_attrs.extend(self.parse_attrs()?);
+                if self.at(&TokenKind::KwPub) {
+                    return Err(self
+                        .err_at("duplicate `pub` visibility modifier", self.peek_span())
+                        .with_doc_topic("syntax"));
+                }
+                if is_pub {
+                    if let Some(ps) = inner_pub_span {
+                        return Err(self
+                            .err_at(
+                                "duplicate `pub` visibility modifier on `extern \"C\"` item",
+                                ps,
+                            )
+                            .with_doc_topic("syntax"));
+                    }
+                }
+                let item_is_pub = is_pub || inner_pub_span.is_some();
                 let decl = if self.at(&TokenKind::KwFn) {
                     self.parse_kw_fn(item_attrs.clone(), true, item_start)?
                 } else {
                     let (ty, name) = self.parse_typed_declarator("extern \"C\" function")?;
                     self.finish_fn_after_name(item_attrs.clone(), true, ty, name, item_start)?
                 };
-                let span = decl.span;
-                out.push(Item::new(item_attrs, ItemKind::Fn(decl), span));
+                let span = item_start.merge(decl.span);
+                out.push(Item::with_pub(item_attrs, item_is_pub, ItemKind::Fn(decl), span));
             }
             self.expect(&TokenKind::RBrace)?;
         } else if self.at(&TokenKind::KwFn) {
             let decl = self.parse_kw_fn(attrs.clone(), true, first_span)?;
             let span = decl.span;
-            out.push(Item::new(attrs, ItemKind::Fn(decl), span));
+            out.push(Item::with_pub(attrs, is_pub, ItemKind::Fn(decl), span));
         } else {
             let (ty, name) = self.parse_typed_declarator("extern \"C\" function")?;
             let decl = self.finish_fn_after_name(attrs.clone(), true, ty, name, first_span)?;
             let span = decl.span;
-            out.push(Item::new(attrs, ItemKind::Fn(decl), span));
+            out.push(Item::with_pub(attrs, is_pub, ItemKind::Fn(decl), span));
         }
 
         Ok(())
+    }
+
+    fn parse_mmio(&mut self, first_span: Span) -> Result<MmioDecl, ParseError> {
+        // Consume contextual `mmio` keyword.
+        let kw = self.bump();
+        debug_assert!(matches!(kw.kind, TokenKind::Ident(ref s) if s == "mmio"));
+        let name = self.parse_ident()?;
+        self.check_generic_lifetime_after_decl_name()?;
+
+        let (kind, end_span) = if self.at(&TokenKind::LBrace) {
+            let (regs, rb_span) = self.parse_mmio_reg_block()?;
+            let end = if self.eat(&TokenKind::Semi) {
+                self.prev_span()
+            } else {
+                rb_span
+            };
+            (MmioDeclKind::Layout { regs }, end)
+        } else if self.eat(&TokenKind::Colon) {
+            let layout = self.parse_type()?;
+            self.expect(&TokenKind::At)?;
+            let base_addr = self.parse_expr()?;
+            let semi = self.expect(&TokenKind::Semi)?;
+            (MmioDeclKind::Instance { layout, base_addr }, semi.span)
+        } else if self.eat(&TokenKind::At) {
+            // `allow_struct_lit = false` so `RCC_BASE { ... }` is never misparsed as a struct lit.
+            let base_addr = self.parse_condition_expr()?;
+            let (regs, rb_span) = self.parse_mmio_reg_block()?;
+            let end = if self.eat(&TokenKind::Semi) {
+                self.prev_span()
+            } else {
+                rb_span
+            };
+            (MmioDeclKind::Inline { base_addr, regs }, end)
+        } else {
+            return Err(self
+                .err_at(
+                    format!(
+                        "expected `{{`, `:`, or `@` after `mmio` name `{}`, found {}",
+                        name.name,
+                        self.peek_kind()
+                    ),
+                    self.peek_span(),
+                )
+                .with_doc_topic("syntax")
+                .with_hint(
+                    "use `mmio Regs { ... }`, `mmio PERIPH : Regs @ 0x...;`, or `mmio PERIPH @ 0x... { ... }`",
+                ));
+        };
+
+        Ok(MmioDecl {
+            name,
+            kind,
+            span: first_span.merge(end_span),
+        })
+    }
+
+    fn parse_mmio_reg_block(&mut self) -> Result<(Vec<MmioRegDecl>, Span), ParseError> {
+        self.expect(&TokenKind::LBrace)?;
+        let mut regs = Vec::new();
+        while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+            let r_start = self.peek_span();
+            if self.at(&TokenKind::KwStatic) {
+                return Err(self.trap_p0010(r_start));
+            }
+            if self.at(&TokenKind::KwPub) {
+                return Err(self
+                    .err_at(
+                        "`pub` visibility modifier is not allowed on `mmio` registers",
+                        r_start,
+                    )
+                    .with_doc_topic("syntax"));
+            }
+            if !self.eat(&TokenKind::At) {
+                return Err(self
+                    .err_at(
+                        format!(
+                            "expected MMIO register access qualifier (`@rw`, `@ro`, `@wo`, or `@w1c`), found {}",
+                            self.peek_kind()
+                        ),
+                        r_start,
+                    )
+                    .with_doc_topic("syntax")
+                    .with_hint("prefix every `mmio` register with `@rw`, `@ro`, `@wo`, or `@w1c`"));
+            }
+            let access_ident =
+                self.parse_word_ident("MMIO access qualifier (`rw`, `ro`, `wo`, or `w1c`)")?;
+            let access = match access_ident.name.as_str() {
+                "rw" => MmioAccess::Rw,
+                "ro" => MmioAccess::Ro,
+                "wo" => MmioAccess::Wo,
+                "w1c" => MmioAccess::W1c,
+                other => {
+                    return Err(self
+                        .err_at(
+                            format!(
+                                "invalid MMIO access qualifier `@{other}`; expected `@rw`, `@ro`, `@wo`, or `@w1c`"
+                            ),
+                            r_start.merge(access_ident.span),
+                        )
+                        .with_doc_topic("syntax"));
+                }
+            };
+            let (ty, name) = self.parse_typed_declarator_inner("MMIO register", true)?;
+            self.expect(&TokenKind::At).map_err(|_| {
+                self.err_at(
+                    format!("expected `@ <offset>` on MMIO register `{}`", name.name),
+                    self.peek_span(),
+                )
+                .with_doc_topic("syntax")
+                .with_hint("specify register byte offset, e.g. `@rw u32 cr1 @ 0x00;`")
+            })?;
+            let offset = self.parse_expr()?;
+            let semi = self.expect(&TokenKind::Semi)?;
+            regs.push(MmioRegDecl {
+                access,
+                ty,
+                name,
+                offset,
+                span: r_start.merge(semi.span),
+            });
+        }
+        let rb = self.expect(&TokenKind::RBrace)?;
+        Ok((regs, rb.span))
+    }
+
+    fn parse_irq(&mut self, first_span: Span) -> Result<IrqDecl, ParseError> {
+        let kw = self.bump();
+        debug_assert!(matches!(kw.kind, TokenKind::Ident(ref s) if s == "irq"));
+        let name = self.parse_ident()?;
+        self.expect(&TokenKind::Eq)?;
+        let number = self.parse_expr()?;
+        let semi = self.expect(&TokenKind::Semi)?;
+        Ok(IrqDecl {
+            name,
+            number,
+            span: first_span.merge(semi.span),
+        })
     }
 
     /// Parse `fn name(params...) [error ...] ({ ... } | ;)`.
@@ -1552,10 +1784,30 @@ impl<'a> Parser<'a> {
     fn parse_isr(&mut self, attrs: Vec<Attr>, first_span: Span) -> Result<IsrDecl, ParseError> {
         self.expect(&TokenKind::KwIsr)?;
         let vector = self.parse_ident()?;
-        if self.eat(&TokenKind::LParen) {
-            self.expect(&TokenKind::RParen)?;
+        self.check_generic_lifetime_after_decl_name()?;
+        let params = if self.at(&TokenKind::LParen) {
+            let (params, is_variadic) = self.parse_param_list()?;
+            if is_variadic {
+                return Err(self
+                    .err_at("`isr` handlers cannot be variadic (`...`)", vector.span)
+                    .with_doc_topic("tasks"));
+            }
+            params
+        } else {
+            Vec::new()
+        };
+        if self.at(&TokenKind::Arrow) {
+            let arrow = self.bump();
+            return Err(self
+                .err_at("`isr` handlers do not return values (`-> ...`)", arrow.span)
+                .with_code("P0002")
+                .with_doc_topic("tasks")
+                .with_hint("remove `-> ...`; `isr` handlers return `void`"));
         }
         self.push_value_scope();
+        for p in &params {
+            self.record_local_value(&p.name.name);
+        }
         let body_res = self.parse_block();
         self.pop_value_scope();
         let body = body_res?;
@@ -1563,7 +1815,7 @@ impl<'a> Parser<'a> {
         Ok(IsrDecl {
             attrs,
             vector,
-            params: Vec::new(),
+            params,
             body,
             span,
         })
@@ -1892,6 +2144,14 @@ impl<'a> Parser<'a> {
 
     /// Parse `Type name` (including C-style `Type *name`, `Type name[N]`, and `Ret (*cb)(Args...)`).
     fn parse_typed_declarator(&mut self, context: &str) -> Result<(TypeExpr, Ident), ParseError> {
+        self.parse_typed_declarator_inner(context, false)
+    }
+
+    fn parse_typed_declarator_inner(
+        &mut self,
+        context: &str,
+        allow_keyword_name: bool,
+    ) -> Result<(TypeExpr, Ident), ParseError> {
         let start = self.peek_span();
         if self.at(&TokenKind::KwMut) {
             return Err(self.trap_p0001("mut", start));
@@ -1932,7 +2192,11 @@ impl<'a> Parser<'a> {
             return Ok((fn_ty, name));
         }
 
-        let name = self.parse_ident()?;
+        let name = if allow_keyword_name {
+            self.parse_word_ident(&format!("{context} name"))?
+        } else {
+            self.parse_ident()?
+        };
 
         // Trailing C-style array declarator on variable/field name: `u8 buf[16]`
         while self.at(&TokenKind::LBracket) {
@@ -2095,8 +2359,15 @@ impl<'a> Parser<'a> {
             TokenKind::KwSelect => return Err(self.trap_p0004(cur_span)),
             TokenKind::KwMatch => return Err(self.trap_p0005(cur_span)),
             TokenKind::KwTry => return Err(self.trap_p0007("`try`", cur_span)),
-            TokenKind::KwStatic => return Err(self.trap_p0010("static", cur_span)),
-            TokenKind::KwPub => return Err(self.trap_p0010("pub", cur_span)),
+            TokenKind::KwStatic => return Err(self.trap_p0010(cur_span)),
+            TokenKind::KwPub => {
+                return Err(self
+                    .err_at(
+                        "`pub` visibility modifier is only allowed on top-level declarations, not inside blocks",
+                        cur_span,
+                    )
+                    .with_doc_topic("syntax"));
+            }
             TokenKind::KwConst => {
                 return Err(self
                     .err_at(
@@ -2275,6 +2546,23 @@ impl<'a> Parser<'a> {
                     ));
                 }
 
+                if self.looks_like_state_var_decl() {
+                    self.bump(); // `state`
+                    let (ty, name) = self.parse_typed_declarator("`state` variable declaration")?;
+                    let init = if self.eat(&TokenKind::Eq) {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    let semi = self.expect(&TokenKind::Semi)?;
+                    self.record_local_value(&name.name);
+                    return Ok(Stmt::with_attrs(
+                        attrs,
+                        StmtKind::StateVar { ty, name, init },
+                        start.merge(semi.span),
+                    ));
+                }
+
                 if self.looks_like_var_decl() {
                     let (ty, name) = self.parse_typed_declarator("variable declaration")?;
                     let init = if self.eat(&TokenKind::Eq) {
@@ -2381,6 +2669,38 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+    }
+
+    fn looks_like_state_var_decl(&mut self) -> bool {
+        if !matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "state") {
+            return false;
+        }
+        let starts_like_type = match self.peek_n_kind(1) {
+            TokenKind::KwConst | TokenKind::KwFn | TokenKind::Star | TokenKind::LBracket => true,
+            TokenKind::Ident(ref t) => {
+                (PrimType::from_name(t).is_some()
+                    && self.peek_n_kind(2) != TokenKind::Dot
+                    && self.peek_n_kind(2) != TokenKind::KwMut)
+                    || matches!(
+                        self.peek_n_kind(2),
+                        TokenKind::Star
+                            | TokenKind::LBracket
+                            | TokenKind::Lt
+                            | TokenKind::Ident(_)
+                            | TokenKind::Dot
+                            | TokenKind::ColonColon
+                    )
+            }
+            _ => false,
+        };
+        if !starts_like_type {
+            return false;
+        }
+        let cp = self.save();
+        self.bump(); // `state`
+        let ok = self.looks_like_var_decl();
+        self.restore(cp);
+        ok
     }
 
     /// Speculatively check whether the upcoming tokens form a C-style local variable declaration
@@ -2894,7 +3214,12 @@ impl<'a> Parser<'a> {
 
     fn parse_spawn_stmt(&mut self, mut attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
         self.expect(&TokenKind::KwSpawn)?;
-        let task = self.parse_ident()?;
+        let first = self.parse_ident()?;
+        let (module, task) = if self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon) {
+            (Some(first), self.parse_ident()?)
+        } else {
+            (None, first)
+        };
         let args = self.parse_call_args()?;
 
         let mut priority: Option<Priority> = None;
@@ -2929,7 +3254,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::with_attrs(
             retained_stmt_attrs,
             StmtKind::Spawn(SpawnStmt {
-                module: None,
+                module,
                 task,
                 args,
                 priority,
@@ -3324,8 +3649,10 @@ impl<'a> Parser<'a> {
 
                     // Support module-qualified generic function calls (`mod.clamp<f32>(...)` ONLY when `mod`
                     // is an `import` alias so struct field comparisons `s.a < b, c > (d + 1)` never speculate;
-                    // `::` turbofish works unconditionally).
-                    let allow_bare_lt = match dot_tok.kind {
+                    // `::` turbofish and module-qualified struct literals (`mod.Box<u32> { ... }`) also handled).
+                    let is_mod_ident = dot_tok.kind == TokenKind::Dot
+                        && matches!(&expr.kind, ExprKind::Ident(_));
+                    let allow_bare_lt_call = match dot_tok.kind {
                         TokenKind::Dot => matches!(
                             &expr.kind,
                             ExprKind::Ident(id)
@@ -3337,27 +3664,116 @@ impl<'a> Parser<'a> {
                             .map_or(true, |set| set.contains(&field.name)),
                         _ => false,
                     };
-                    if let Some(generic_args) =
-                        self.try_parse_call_only_generic_args(allow_bare_lt)?
-                    {
-                        let args = self.parse_call_args()?;
-                        let callee_span = expr.span.merge(field.span);
-                        let callee = Expr::new(
-                            ExprKind::Field {
-                                target: Box::new(expr),
+                    let allow_bare_lt_struct_lit = is_mod_ident
+                        && self.allow_struct_lit
+                        && matches!(&expr.kind, ExprKind::Ident(id) if !self.is_value_name(&id.name));
+
+                    if self.at(&TokenKind::ColonColon) && self.peek_n_kind(1) == TokenKind::Lt {
+                        self.bump(); // `::`
+                        let (generic_args, _) = self.parse_generic_args()?;
+                        if self.at(&TokenKind::LParen) {
+                            let args = self.parse_call_args()?;
+                            let callee_span = expr.span.merge(field.span);
+                            let callee = Expr::new(
+                                ExprKind::Field {
+                                    target: Box::new(expr),
+                                    field,
+                                },
+                                callee_span,
+                            );
+                            let span = callee_span.merge(self.prev_span());
+                            expr = Expr::new(
+                                ExprKind::Call {
+                                    callee: Box::new(callee),
+                                    generic_args,
+                                    args,
+                                },
+                                span,
+                            );
+                        } else if is_mod_ident
+                            && self.allow_struct_lit
+                            && self.looks_like_struct_lit_body()
+                        {
+                            let expr_span = expr.span;
+                            let ExprKind::Ident(module_ident) = expr.kind else {
+                                unreachable!()
+                            };
+                            expr = self.parse_struct_lit_with_module(
+                                Some(module_ident),
                                 field,
-                            },
-                            callee_span,
-                        );
-                        let span = callee_span.merge(self.prev_span());
-                        expr = Expr::new(
-                            ExprKind::Call {
-                                callee: Box::new(callee),
                                 generic_args,
-                                args,
-                            },
-                            span,
-                        );
+                                expr_span,
+                            )?;
+                        } else {
+                            return Err(self
+                                .err_at(
+                                    format!(
+                                        "expected `(` or `{{ ... }}` after `::<...>` generic arguments, found {}",
+                                        self.peek_kind()
+                                    ),
+                                    self.peek_span(),
+                                )
+                                .with_doc_topic("syntax"));
+                        }
+                        continue;
+                    }
+
+                    if (allow_bare_lt_call || allow_bare_lt_struct_lit) && self.at(&TokenKind::Lt)
+                    {
+                        let cp = self.save();
+                        if let Ok((generic_args, _)) = self.parse_generic_args() {
+                            if self.pending_gt.is_none() {
+                                if allow_bare_lt_call && self.at(&TokenKind::LParen) {
+                                    let args = self.parse_call_args()?;
+                                    let callee_span = expr.span.merge(field.span);
+                                    let callee = Expr::new(
+                                        ExprKind::Field {
+                                            target: Box::new(expr),
+                                            field,
+                                        },
+                                        callee_span,
+                                    );
+                                    let span = callee_span.merge(self.prev_span());
+                                    expr = Expr::new(
+                                        ExprKind::Call {
+                                            callee: Box::new(callee),
+                                            generic_args,
+                                            args,
+                                        },
+                                        span,
+                                    );
+                                    continue;
+                                } else if allow_bare_lt_struct_lit
+                                    && self.looks_like_struct_lit_body()
+                                {
+                                    let expr_span = expr.span;
+                                    let ExprKind::Ident(module_ident) = expr.kind else {
+                                        unreachable!()
+                                    };
+                                    expr = self.parse_struct_lit_with_module(
+                                        Some(module_ident),
+                                        field,
+                                        generic_args,
+                                        expr_span,
+                                    )?;
+                                    continue;
+                                }
+                            }
+                        }
+                        self.restore(cp);
+                    }
+
+                    if is_mod_ident && self.allow_struct_lit && self.looks_like_struct_lit_body() {
+                        let expr_span = expr.span;
+                        let ExprKind::Ident(module_ident) = expr.kind else {
+                            unreachable!()
+                        };
+                        expr = self.parse_struct_lit_with_module(
+                            Some(module_ident),
+                            field,
+                            Vec::new(),
+                            expr_span,
+                        )?;
                     } else if self.at(&TokenKind::LParen) {
                         let args = self.parse_call_args()?;
                         let span = expr.span.merge(self.prev_span());
@@ -3419,37 +3835,6 @@ impl<'a> Parser<'a> {
 
     /// Parse turbofish `::<Args>` unconditionally, or speculatively parse `<Args>` ONLY when
     /// `allow_bare_lt` holds and `<Args>` is immediately followed by `(`.
-    fn try_parse_call_only_generic_args(
-        &mut self,
-        allow_bare_lt: bool,
-    ) -> Result<Option<Vec<GenericArg>>, ParseError> {
-        if self.at(&TokenKind::ColonColon) && self.peek_n_kind(1) == TokenKind::Lt {
-            self.bump(); // `::`
-            let (args, _) = self.parse_generic_args()?;
-            if !self.at(&TokenKind::LParen) {
-                return Err(self
-                    .err_at(
-                        format!("expected `(` after `::<...>` generic arguments, found {}", self.peek_kind()),
-                        self.peek_span(),
-                    )
-                    .with_doc_topic("syntax"));
-            }
-            return Ok(Some(args));
-        }
-
-        if allow_bare_lt && self.at(&TokenKind::Lt) {
-            let cp = self.save();
-            if let Ok((args, _)) = self.parse_generic_args() {
-                if self.pending_gt.is_none() && self.at(&TokenKind::LParen) {
-                    return Ok(Some(args));
-                }
-            }
-            self.restore(cp);
-        }
-
-        Ok(None)
-    }
-
     fn parse_call_args(&mut self) -> Result<Vec<CallArg>, ParseError> {
         self.expect(&TokenKind::LParen)?;
         let prev_allow = self.allow_struct_lit;
@@ -3836,6 +4221,16 @@ impl<'a> Parser<'a> {
         generic_args: Vec<GenericArg>,
     ) -> Result<Expr, ParseError> {
         let start = name.span;
+        self.parse_struct_lit_with_module(None, name, generic_args, start)
+    }
+
+    fn parse_struct_lit_with_module(
+        &mut self,
+        module: Option<Ident>,
+        name: Ident,
+        generic_args: Vec<GenericArg>,
+        start: Span,
+    ) -> Result<Expr, ParseError> {
         self.expect(&TokenKind::LBrace)?;
         let prev_allow = self.allow_struct_lit;
         self.allow_struct_lit = true;
@@ -3868,7 +4263,7 @@ impl<'a> Parser<'a> {
         let rb = self.expect(&TokenKind::RBrace)?;
         Ok(Expr::new(
             ExprKind::StructLit {
-                module: None,
+                module,
                 name,
                 generic_args,
                 fields,

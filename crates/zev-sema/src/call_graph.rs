@@ -63,6 +63,10 @@ pub struct CallNode {
     pub spawns_in_boot: bool,
     /// Shortest witness chain explaining why `spawns_in_boot` is true.
     pub spawn_chain: Vec<String>,
+    pub direct_attach_irq: Option<String>,
+    pub attaches_in_boot: bool,
+    /// Shortest witness chain explaining why `attaches_in_boot` is true.
+    pub attach_chain: Vec<String>,
     /// Shortest witness chain explaining why `can_yield` is true
     /// (e.g. `["log_fault()", "write_page()", "checkpoint() [yields here]"]`).
     pub yield_chain: Vec<String>,
@@ -98,6 +102,9 @@ impl CallGraph {
                 direct_spawn_task: None,
                 spawns_in_boot: false,
                 spawn_chain: Vec::new(),
+                direct_attach_irq: None,
+                attaches_in_boot: false,
+                attach_chain: Vec::new(),
                 yield_chain: Vec::new(),
                 span,
             },
@@ -142,6 +149,22 @@ impl CallGraph {
                 node.spawn_chain = vec![
                     format_callable_step(&node.name),
                     format!("spawn {}", task_name),
+                ];
+            }
+        }
+    }
+
+    pub fn mark_direct_attach(&mut self, name: &str, irq_name: &str) {
+        if let Some(node) = self.nodes.get_mut(name) {
+            if node.kind == CallableKind::ExternCFn {
+                return;
+            }
+            node.attaches_in_boot = true;
+            if node.direct_attach_irq.is_none() {
+                node.direct_attach_irq = Some(irq_name.to_string());
+                node.attach_chain = vec![
+                    format_callable_step(&node.name),
+                    format!("{}.attach(...)", irq_name),
                 ];
             }
         }
@@ -213,19 +236,33 @@ impl CallGraph {
                     }
                 }
             }
+            for edge in &self.edges {
+                let callee_attaches = self
+                    .nodes
+                    .get(&edge.callee)
+                    .is_some_and(|c| c.attaches_in_boot);
+                if callee_attaches {
+                    if let Some(caller) = self.nodes.get_mut(&edge.caller) {
+                        if caller.kind == CallableKind::Fn && !caller.attaches_in_boot {
+                            caller.attaches_in_boot = true;
+                            changed = true;
+                        }
+                    }
+                }
+            }
             if !changed {
                 break;
             }
         }
 
-        // 2. Populate shortest witness chains for `can_yield` and `spawns_in_boot`.
+        // 2. Populate shortest witness chains for `can_yield`, `spawns_in_boot`, and `attaches_in_boot`.
         let names: Vec<String> = self.nodes.keys().cloned().collect();
         for name in names {
-            let (needs_yield_chain, needs_spawn_chain) = self
+            let (needs_yield_chain, needs_spawn_chain, needs_attach_chain) = self
                 .nodes
                 .get(&name)
-                .map(|n| (n.can_yield, n.spawns_in_boot))
-                .unwrap_or((false, false));
+                .map(|n| (n.can_yield, n.spawns_in_boot, n.attaches_in_boot))
+                .unwrap_or((false, false, false));
             if needs_yield_chain {
                 let chain = self.shortest_yield_chain(&name);
                 if let Some(node) = self.nodes.get_mut(&name) {
@@ -236,6 +273,12 @@ impl CallGraph {
                 let sc = self.shortest_spawn_chain(&name);
                 if let Some(node) = self.nodes.get_mut(&name) {
                     node.spawn_chain = sc;
+                }
+            }
+            if needs_attach_chain {
+                let ac = self.shortest_attach_chain(&name);
+                if let Some(node) = self.nodes.get_mut(&name) {
+                    node.attach_chain = ac;
                 }
             }
         }
@@ -426,10 +469,44 @@ impl CallGraph {
         if let Some(t) = &start_node.direct_spawn_task {
             return vec![format_callable_step(start), format!("spawn {}", t)];
         }
+        self.bfs_boot_chain(
+            start,
+            |n| n.spawns_in_boot,
+            |n| n.direct_spawn_task.as_ref().map(|t| format!("spawn {t}")),
+        )
+    }
 
+    /// Shortest call-chain path from `start` down to an `irq.attach` / `irq.attach_shared` call.
+    pub fn shortest_attach_chain(&self, start: &str) -> Vec<String> {
+        let Some(start_node) = self.nodes.get(start) else {
+            return Vec::new();
+        };
+        if !start_node.attaches_in_boot {
+            return Vec::new();
+        }
+        if let Some(q) = &start_node.direct_attach_irq {
+            return vec![format_callable_step(start), format!("{q}.attach(...)")];
+        }
+        self.bfs_boot_chain(
+            start,
+            |n| n.attaches_in_boot,
+            |n| {
+                n.direct_attach_irq
+                    .as_ref()
+                    .map(|q| format!("{q}.attach(...)"))
+            },
+        )
+    }
+
+    fn bfs_boot_chain(
+        &self,
+        start: &str,
+        node_ok: impl Fn(&CallNode) -> bool,
+        leaf_label: impl Fn(&CallNode) -> Option<String>,
+    ) -> Vec<String> {
         let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for e in &self.edges {
-            if self.nodes.get(&e.callee).is_some_and(|n| n.spawns_in_boot) {
+            if self.nodes.get(&e.callee).is_some_and(&node_ok) {
                 adj.entry(e.caller.as_str())
                     .or_default()
                     .push(e.callee.as_str());
@@ -454,7 +531,7 @@ impl CallGraph {
                     }
                     parent.insert(nxt, curr);
                     if let Some(nxt_node) = self.nodes.get(nxt) {
-                        if let Some(task_name) = &nxt_node.direct_spawn_task {
+                        if let Some(label) = leaf_label(nxt_node) {
                             let mut hops = vec![format_callable_step(nxt)];
                             let mut p = nxt;
                             while let Some(&prev) = parent.get(p) {
@@ -462,7 +539,7 @@ impl CallGraph {
                                 p = prev;
                             }
                             hops.reverse();
-                            hops.push(format!("spawn {}", task_name));
+                            hops.push(label);
                             return hops;
                         }
                     }
@@ -568,6 +645,11 @@ impl CallGraph {
     /// Detect all call-graph cycles containing at least one boot-spawning function (`spawns_in_boot == true`).
     pub fn find_spawning_cycles(&self) -> Vec<(Vec<String>, Span)> {
         self.find_cycles_matching(|n| n.spawns_in_boot)
+    }
+
+    /// Detect all call-graph cycles containing at least one boot-attaching function (`attaches_in_boot == true`).
+    pub fn find_attaching_cycles(&self) -> Vec<(Vec<String>, Span)> {
+        self.find_cycles_matching(|n| n.attaches_in_boot)
     }
 
     fn find_cycles_matching(&self, pred: impl Fn(&CallNode) -> bool) -> Vec<(Vec<String>, Span)> {

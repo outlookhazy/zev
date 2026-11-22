@@ -1013,20 +1013,30 @@ mod tests {
             "fn main() { static i32 integral = 0; }",
             "P0010",
             "primitives",
+            "state Type x = init;",
+        );
+        assert_trap(
+            "struct Frame { static u8 op; }",
+            "P0010",
+            "primitives",
             "const",
         );
-        assert_trap(
-            "pub fn main() { }",
-            "P0010",
-            "primitives",
-            "pub",
-        );
-        assert_trap(
+
+        let pub_prog = parse_str("pub fn main() {}").expect("top-level pub fn should parse");
+        assert!(pub_prog.items[0].is_pub);
+
+        for bad_pub in [
+            "pub import chip.stm32g4 as hw;",
+            "fn main() { pub u32 x = 1; }",
             "struct Frame { pub u8 op; }",
-            "P0010",
-            "primitives",
-            "pub",
-        );
+            "pub pub fn foo() {}",
+        ] {
+            let err = parse_str(bad_pub).expect_err(&format!("expected error on `{bad_pub}`"));
+            assert!(
+                err.code.is_none() && err.message.contains("`pub`"),
+                "expected clean non-P0010 syntax error on `{bad_pub}`, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1790,6 +1800,230 @@ fn main() {
                 err.message.contains("float literal"),
                 "expected float literal diagnostic for `{bad_num}`, got: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_pub_visibility_across_all_top_level_items_and_attrs() {
+        let src = r#"
+pub struct Vec2 { u32 x; u32 y; }
+@packed pub packed struct Frame { u8 cmd; u16 crc; }
+pub enum Mode { Idle = 0, Run = 1 }
+pub const u32 BAUD = 115200;
+pub fn helper(u32 a) {}
+pub u32 add(u32 a, u32 b) { return a + b; }
+pub extern "C" fn c_hook(u32 v);
+extern "C" {
+    pub fn ext_pub(u32 x);
+    u32 ext_priv(u32 y);
+}
+@high pub task worker(u32 id) {}
+pub @normal isr exti0(u32 pin) {}
+pub mmio UartRegs { @rw u32 cr1 @ 0x00; }
+pub irq IRQ_UART = 37;
+pub watch<u32> w_val = 0;
+pub inbox<u8, 4> rx_q;
+pub signal ready;
+pub ping_pong<u8, 8> pp;
+pub lease<u8, 16> pool;
+"#;
+        let prog = parse_str(src).expect("all top-level pub declarations must parse");
+        assert_eq!(prog.items.len(), 18);
+        for (idx, item) in prog.items.iter().enumerate() {
+            if idx == 8 {
+                assert!(!item.is_pub, "extern block item `ext_priv` should default to private");
+            } else {
+                assert!(item.is_pub, "item #{idx} should be marked `pub`: {:?}", item.kind);
+            }
+        }
+    }
+
+    #[test]
+    fn parses_mmio_irq_parameterized_isr_state_and_qualified_constructs() {
+        let src = r#"
+import drivers.uart as drv;
+import board.gpio as gpio;
+
+const u32 RCC_BASE = 0x4002_1000;
+
+pub mmio UartRegs {
+    @rw u32 cr1 @ 0x00;
+    @ro u32 isr @ 0x1C;
+    @w1c u32 icr @ 0x20;
+    @rw [4]u32 brr @ 0x24;
+    @wo u8 dr @ 0x28;
+}
+
+pub mmio USART1 : UartRegs @ 0x4001_1000;
+mmio USART2 : gpio.UartRegs @ 0x4000_4400;
+mmio Rcc @ RCC_BASE {
+    @rw u32 cr @ 0x00;
+}
+
+pub irq IRQ_USART1 = 37;
+
+isr no_parens {
+    state u32 count = 0;
+    state [4]u32 ring = [0, 0, 0, 0];
+    state drv.RingCfg cfg = drv.RingCfg { cap: 4 };
+    state u32 uninit;
+    count += 1;
+}
+
+isr empty_parens() {
+    u32 irq = 3;
+    u32 state = 1;
+    [2]u32 arr = [0, 0];
+    state += irq;
+    state = 2;
+    arr[0] = state;
+}
+
+isr with_params(*UartRegs regs, u32 mask) {
+    state u32 ticks = 0;
+    ticks += mask;
+    regs.icr = ticks;
+}
+
+fn mmio(u32 a) {}
+
+fn main() {
+    mmio(1);
+    u32 state = 0;
+    [2]u32 state_arr = [0, 0];
+    state_arr[0] = 1;
+    let_free: {
+        drv.Config c = drv.Config { baud: 115200, .stop_bits = 1 };
+        drv.Box<u32, 4> b1 = drv.Box<u32, 4> { val: 7 };
+        drv.Box<u32, 4> b2 = drv.Box::<u32, 4> { val: 8 };
+        if (b1.val < b2.val) {
+            spawn drv.worker(c.baud) @high;
+        }
+    }
+}
+"#;
+        // Replace label if unsupported (`{ ... }` block directly works).
+        let src = src.replace("let_free: ", "");
+        let prog = parse_str(&src).expect("new syntax constructs must parse cleanly");
+
+        // Check mmio forms
+        let mmio_decls: Vec<&MmioDecl> = prog
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Mmio(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(mmio_decls.len(), 4);
+        assert!(matches!(&mmio_decls[0].kind, MmioDeclKind::Layout { regs } if regs.len() == 5));
+        assert!(matches!(&mmio_decls[1].kind, MmioDeclKind::Instance { .. }));
+        assert!(matches!(
+            &mmio_decls[2].kind,
+            MmioDeclKind::Instance { layout, .. } if matches!(&layout.kind, TypeKind::Path(p) if p.len() == 2)
+        ));
+        assert!(matches!(
+            &mmio_decls[3].kind,
+            MmioDeclKind::Inline { regs, .. } if regs.len() == 1
+        ));
+
+        // Check irq
+        let irqs: Vec<&IrqDecl> = prog
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Irq(q) => Some(q),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(irqs.len(), 1);
+        assert_eq!(irqs[0].name.name, "IRQ_USART1");
+
+        // Check ISRs
+        let isrs: Vec<&IsrDecl> = prog
+            .items
+            .iter()
+            .filter_map(|i| match &i.kind {
+                ItemKind::Isr(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(isrs.len(), 3);
+        assert!(isrs[0].params.is_empty());
+        assert!(isrs[1].params.is_empty());
+        assert_eq!(isrs[2].params.len(), 2);
+
+        // Check contextual `state` declarations vs assignments/arrays
+        let state_var_count = isrs[0]
+            .body
+            .stmts
+            .iter()
+            .filter(|s| matches!(s.kind, StmtKind::StateVar { .. }))
+            .count();
+        assert_eq!(state_var_count, 4);
+
+        // Verify contextual `state += irq;` did NOT become StateVar
+        assert!(
+            isrs[1]
+                .body
+                .stmts
+                .iter()
+                .all(|s| !matches!(s.kind, StmtKind::StateVar { .. }))
+        );
+
+        // Check qualified StructLit and Spawn in main
+        let main_fn = prog
+            .items
+            .iter()
+            .find_map(|i| match &i.kind {
+                ItemKind::Fn(f) if f.name.name == "main" => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        let body = main_fn.body.as_ref().unwrap();
+        // Verify `state[0] = 1;` also parses normally inside main
+        parse_str("fn test_state_idx() { [2]u32 state = [0, 0]; state[0] = 1; }")
+            .expect("state[0] = 1 must parse as indexing, not StateVar");
+
+        let blk = match &body.stmts[4].kind {
+            StmtKind::Block(b) => b,
+            other => panic!("expected block, got {other:?}"),
+        };
+        assert!(matches!(
+            &blk.stmts[0].kind,
+            StmtKind::VarDecl { init: Some(Expr { kind: ExprKind::StructLit { module: Some(m), name, generic_args, .. }, .. }), .. }
+                if m.name == "drv" && name.name == "Config" && generic_args.is_empty()
+        ));
+        assert!(matches!(
+            &blk.stmts[1].kind,
+            StmtKind::VarDecl { init: Some(Expr { kind: ExprKind::StructLit { module: Some(m), name, generic_args, .. }, .. }), .. }
+                if m.name == "drv" && name.name == "Box" && generic_args.len() == 2
+        ));
+        assert!(matches!(
+            &blk.stmts[2].kind,
+            StmtKind::VarDecl { init: Some(Expr { kind: ExprKind::StructLit { module: Some(m), name, generic_args, .. }, .. }), .. }
+                if m.name == "drv" && name.name == "Box" && generic_args.len() == 2
+        ));
+        if let StmtKind::If { then_block, .. } = &blk.stmts[3].kind {
+            assert!(matches!(
+                &then_block.stmts[0].kind,
+                StmtKind::Spawn(SpawnStmt { module: Some(m), task, priority: Some(Priority::High), .. })
+                    if m.name == "drv" && task.name == "worker"
+            ));
+        } else {
+            panic!("expected if stmt");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_mmio_declarations() {
+        for bad in [
+            "mmio Bad { u32 cr1 @ 0x00; }",
+            "mmio Bad { @dma_safe u32 cr1 @ 0x00; }",
+            "mmio Bad { @rw u32 cr1; }",
+            "mmio Bad { @ro u32 isr @ 0x04 }",
+        ] {
+            parse_str(bad).expect_err(&format!("expected parse error on `{bad}`"));
         }
     }
 }

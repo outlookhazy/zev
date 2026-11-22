@@ -38,7 +38,13 @@ pub enum Ty {
     },
     /// SVD / virtual hardware peripheral handle or register path (`hw.GPIOA`, `hw.DMA1.CH5`, `hw.USART1`).
     HwPeripheral(String),
-    /// Built-in namespace (`sys`, `sim`, imported `chip.*` alias, or type name for associated calls).
+    /// Typed MMIO register block layout (`UartRegs`), usable behind pointer `*UartRegs` (`mmio` values cannot be copied by value).
+    MmioLayout(String),
+    /// Typed physical MMIO peripheral instance (`USART1 : UartRegs @ 0x4001_1000`), coercing implicitly to `*UartRegs`.
+    MmioInstance { name: String, layout: String },
+    /// Hardware interrupt vector token (`irq IRQ_USART1 = 37;`).
+    IrqToken,
+    /// Built-in namespace (`sys`, `sim`, imported module/chip alias, or type name for associated calls).
     Namespace(NamespaceKind),
     /// Error recovery sentinel to prevent cascading duplicate diagnostics.
     Error,
@@ -50,6 +56,7 @@ pub enum NamespaceKind {
     Sys,
     Sim,
     Chip(String),
+    Module(String),
     Type(String),
     Enum(String),
 }
@@ -382,6 +389,13 @@ impl Ty {
             }
             (Ty::Str, Ty::Slice(inner)) if matches!(**inner, Ty::Prim(PrimType::U8)) => true,
 
+            // Typed physical MMIO peripheral instance coerces implicitly to `*Layout`.
+            (Ty::MmioInstance { layout: a, .. }, Ty::Ptr(inner))
+                if matches!(&**inner, Ty::MmioLayout(b) if a == b) =>
+            {
+                true
+            }
+
             // Function pointers match when parameter/return types are compatible.
             (
                 Ty::FnPtr {
@@ -413,7 +427,12 @@ impl Ty {
             Self::Duration => 8,
             Self::Priority | Self::Enum(_) => 1,
             Self::Str | Self::Slice(_) => ptr_bytes * 2,
-            Self::Ptr(_) | Self::FnPtr { .. } | Self::HwPeripheral(_) => ptr_bytes,
+            Self::Ptr(_)
+            | Self::FnPtr { .. }
+            | Self::HwPeripheral(_)
+            | Self::MmioInstance { .. } => ptr_bytes,
+            Self::IrqToken => 4,
+            Self::MmioLayout(_) => 0,
             Self::Array { elem, len } => elem.byte_size(ptr_bytes, structs) * len,
             Self::Struct(name) => {
                 if let Some(s) = structs.get(name) {
@@ -468,10 +487,14 @@ impl fmt::Display for Ty {
                 write!(f, ") -> {}", ret)
             }
             Self::HwPeripheral(path) => write!(f, "hw::{}", path),
+            Self::MmioLayout(name) => write!(f, "mmio {name}"),
+            Self::MmioInstance { name, layout } => write!(f, "mmio {name} : {layout}"),
+            Self::IrqToken => write!(f, "irq"),
             Self::Namespace(ns) => match ns {
                 NamespaceKind::Sys => write!(f, "sys"),
                 NamespaceKind::Sim => write!(f, "sim"),
                 NamespaceKind::Chip(c) => write!(f, "chip.{}", c),
+                NamespaceKind::Module(m) => write!(f, "module {}", m),
                 NamespaceKind::Type(t) | NamespaceKind::Enum(t) => write!(f, "type {}", t),
             },
             Self::Error => write!(f, "<error>"),

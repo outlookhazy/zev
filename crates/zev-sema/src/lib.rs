@@ -15,6 +15,7 @@ pub mod call_graph;
 pub mod checker;
 pub mod diag;
 pub mod model;
+pub mod modules;
 pub mod monomorphize;
 pub mod provenance;
 pub mod suggest;
@@ -24,10 +25,12 @@ pub use call_graph::{CallContext, CallEdge, CallGraph, CallableKind, ExternCallb
 pub use checker::{AnalysisOutput, AnalyzeOptions};
 pub use diag::{Diagnostic, DiagnosticKind};
 pub use model::{
-    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IsrInfo, MonomorphizedInstance,
-    MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite, SemanticModel,
-    SpawnedTaskInstance, TaskInfo,
+    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo,
+    IrqInfo, IsrInfo, IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo,
+    MonomorphizedInstance, MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite,
+    SemanticModel, SpawnedTaskInstance, TaskInfo,
 };
+pub use modules::{LinkedModulesOutput, load_and_link_modules};
 pub use monomorphize::{
     MAX_GENERIC_DEPTH, MAX_MONOMORPHIZED_INSTANCES, MonomorphizeOutput, mangle_type_expr,
     monomorphize_named_programs, monomorphize_programs,
@@ -86,7 +89,34 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
     programs: &[(&'a Program, Option<&'a str>)],
     opts: &AnalyzeOptions,
 ) -> MonomorphizedAnalysisOutput {
-    let mono_out = monomorphize::monomorphize_named_programs(programs);
+    let linked = modules::load_and_link_modules(programs, &opts.include_dirs);
+    if !linked.diagnostics.is_empty() {
+        let mut diagnostics = linked.diagnostics;
+        if programs.len() == 1 {
+            if let Some(fname) = programs[0].1 {
+                for d in &mut diagnostics {
+                    if d.file.is_none() {
+                        d.file = Some(fname.to_string());
+                    }
+                }
+            }
+        }
+        let mut empty_model = checker::Analyzer::new(opts).run(&[]).model;
+        empty_model.display_names = linked.display_names;
+        return MonomorphizedAnalysisOutput {
+            programs: linked.programs.into_iter().map(|(p, _)| p).collect(),
+            model: empty_model,
+            diagnostics,
+        };
+    }
+
+    let linked_pairs: Vec<(&Program, Option<&str>)> = linked
+        .programs
+        .iter()
+        .map(|(p, f)| (p, f.as_deref()))
+        .collect();
+
+    let mono_out = monomorphize::monomorphize_named_programs(&linked_pairs);
     if !mono_out.diagnostics.is_empty() {
         let mut diagnostics = mono_out.diagnostics;
         if programs.len() == 1 {
@@ -100,6 +130,7 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
         }
         let mut empty_model = checker::Analyzer::new(opts).run(&[]).model;
         empty_model.monomorphized_instances = mono_out.instances;
+        empty_model.display_names = linked.display_names;
         return MonomorphizedAnalysisOutput {
             programs: mono_out.programs,
             model: empty_model,
@@ -112,12 +143,14 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
         .iter()
         .enumerate()
         .map(|(idx, p)| {
-            let fname = programs.get(idx).and_then(|(_, f)| *f);
+            let fname = linked.programs.get(idx).and_then(|(_, f)| f.as_deref());
             (p, fname)
         })
         .collect();
 
-    let mut sema_out = checker::Analyzer::new(opts).run(&mono_pairs);
+    let mut sema_out = checker::Analyzer::new(opts)
+        .with_linked_context(&linked)
+        .run(&mono_pairs);
 
     // Ensure `model.monomorphized_instances` includes all deduplicated & sorted instances.
     if !mono_out.instances.is_empty() {
@@ -127,6 +160,7 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
         merged.dedup();
         sema_out.model.monomorphized_instances = merged;
     }
+    sema_out.model.display_names = linked.display_names;
 
     let mut diagnostics = mono_out.diagnostics;
     diagnostics.extend(sema_out.diagnostics);
