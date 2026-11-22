@@ -4,46 +4,59 @@ use std::path::PathBuf;
 pub enum Command {
     Check {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         json: bool,
     },
     Ram {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
     },
     EmitC {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         output: Option<PathBuf>,
     },
     Run {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         sanitize: bool,
         max_ticks: Option<u64>,
         run_args: Vec<String>,
     },
     EmitLlvm {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         target: Option<String>,
         opt_level: Option<String>,
         output: Option<PathBuf>,
     },
     BuildElf {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         opt_level: String,
         output: Option<PathBuf>,
     },
     RunQemu {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         max_ticks: Option<u64>,
         opt_level: String,
     },
     BuildEsp32C6 {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         opt_level: String,
         output: Option<PathBuf>,
     },
     FlashEsp32C6 {
         files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
         port: String,
         opt_level: String,
+        output: Option<PathBuf>,
+    },
+    ImportSvd {
+        svd_path: PathBuf,
         output: Option<PathBuf>,
     },
     Doc {
@@ -62,16 +75,20 @@ USAGE:
 
 COMMANDS:
     doc [topic | code | --list]             Built-in Zev language primer, 8 topic guides & error explainers
-    check [--json] <files...>               Parse and statically verify .zev source files
-    ram <files...>                          Print static zero-heap SRAM budget & coroutine frame report
-    emit-c <files...> [-o <out.c>]          Emit freestanding C99 source + synthesized cooperative kernel
-    run <files...> [OPTIONS]                Compile emitted C99 via clang and run deterministic host simulation
+    import-svd <chip.svd> [-o <out.zev>]    Convert a CMSIS-SVD XML description into Zev mmio/irq declarations
+    check [--json] [-I <dir>] <files...>    Parse and statically verify .zev source files
+    ram [-I <dir>] <files...>               Print static zero-heap SRAM budget & coroutine frame report
+    emit-c [-I <dir>] <files...> [-o <out>] Emit freestanding C99 source + synthesized cooperative kernel
+    run [-I <dir>] <files...> [OPTIONS]     Compile emitted C99 via clang and run deterministic host simulation
     emit-llvm [OPT] <files...> [-o <out.ll>] Emit LLVM 23 IR (raw by default, or optimized via opt w/ -O1..-Oz)
     build-elf [OPT] <files...> [-o <elf>]   Synthesize vector table + linker script and link Cortex-M3 .elf
     run-qemu [OPT] <files...>               Build bare-metal ARM Cortex-M3 .elf and run in qemu-system-arm
     build-esp32c6 [OPT] <files...> [-o <bin>] Synthesize Direct-Boot header + RV32IMAC .elf/.bin for ESP32-C6
     flash-esp32c6 [OPT] <files...> [--port] Build Direct-Boot .bin and flash ESP32-C6 via esptool (default /dev/ttyACM0)
     help                                    Show this help message
+
+MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6):
+    -I <dir> | --include <dir>              Add a module search root directory for `import` resolution (repeatable)
 
 CHECK OPTIONS:
     --json                                  Emit structured machine-readable JSON diagnostics
@@ -119,19 +136,28 @@ where
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" | "version" => Ok(Command::Version),
         "doc" | "docs" | "explain" => parse_doc(&raw[1..]),
+        "import-svd" => parse_import_svd(&raw[1..]),
         "check" => parse_check(&raw[1..]),
         "ram" => match parse_file_list(&raw[1..], "ram")? {
-            Some(files) => Ok(Command::Ram { files }),
+            Some((files, include_dirs)) => Ok(Command::Ram {
+                files,
+                include_dirs,
+            }),
             None => Ok(Command::Help),
         },
         "emit-c" => match parse_files_with_output(&raw[1..], "emit-c")? {
-            Some((files, output)) => Ok(Command::EmitC { files, output }),
+            Some((files, include_dirs, output)) => Ok(Command::EmitC {
+                files,
+                include_dirs,
+                output,
+            }),
             None => Ok(Command::Help),
         },
         "emit-llvm" => parse_emit_llvm(&raw[1..]),
         "build-elf" => match parse_files_with_output_and_opt(&raw[1..], "build-elf")? {
-            Some((files, opt_level, output)) => Ok(Command::BuildElf {
+            Some((files, include_dirs, opt_level, output)) => Ok(Command::BuildElf {
                 files,
+                include_dirs,
                 opt_level,
                 output,
             }),
@@ -139,8 +165,9 @@ where
         },
         "run-qemu" => parse_run_qemu(&raw[1..]),
         "build-esp32c6" => match parse_files_with_output_and_opt(&raw[1..], "build-esp32c6")? {
-            Some((files, opt_level, output)) => Ok(Command::BuildEsp32C6 {
+            Some((files, include_dirs, opt_level, output)) => Ok(Command::BuildEsp32C6 {
                 files,
+                include_dirs,
                 opt_level,
                 output,
             }),
@@ -149,9 +176,103 @@ where
         "flash-esp32c6" => parse_flash_esp32c6(&raw[1..]),
         "run" => parse_run(&raw[1..]),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `doc`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, or `flash-esp32c6`; try `zevc --help`)"
+            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, or `flash-esp32c6`; try `zevc --help`)"
         )),
     }
+}
+
+fn try_parse_include_arg(
+    args: &[String],
+    i: &mut usize,
+    include_dirs: &mut Vec<PathBuf>,
+    subcmd: &str,
+) -> Result<bool, String> {
+    let arg = &args[*i];
+    if arg == "-I" || arg == "--include" {
+        *i += 1;
+        if *i >= args.len() {
+            return Err(format!(
+                "`{arg}` requires an include directory path for `zevc {subcmd}`"
+            ));
+        }
+        if args[*i].is_empty() {
+            return Err(format!(
+                "`{arg}` requires a non-empty include directory path for `zevc {subcmd}`"
+            ));
+        }
+        include_dirs.push(PathBuf::from(&args[*i]));
+        return Ok(true);
+    }
+    if let Some(dir) = arg.strip_prefix("--include=") {
+        if dir.is_empty() {
+            return Err(format!(
+                "`--include=` requires a non-empty include directory path for `zevc {subcmd}`"
+            ));
+        }
+        include_dirs.push(PathBuf::from(dir));
+        return Ok(true);
+    }
+    if let Some(dir) = arg.strip_prefix("-I=") {
+        if dir.is_empty() {
+            return Err(format!(
+                "`-I=` requires a non-empty include directory path for `zevc {subcmd}`"
+            ));
+        }
+        include_dirs.push(PathBuf::from(dir));
+        return Ok(true);
+    }
+    if let Some(dir) = arg.strip_prefix("-I") {
+        include_dirs.push(PathBuf::from(dir));
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn parse_import_svd(args: &[String]) -> Result<Command, String> {
+    let mut svd_path: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() || args[i].is_empty() {
+                    return Err("`-o` requires an output `.zev` path for `zevc import-svd`".to_string());
+                }
+                output = Some(PathBuf::from(&args[i]));
+            }
+            _ if arg.starts_with("-o=") => {
+                let val = &arg[3..];
+                if val.is_empty() {
+                    return Err("`-o=` requires a non-empty output `.zev` path for `zevc import-svd`".to_string());
+                }
+                output = Some(PathBuf::from(val));
+            }
+            _ if arg.starts_with("--output=") => {
+                let val = &arg[9..];
+                if val.is_empty() {
+                    return Err("`--output=` requires a non-empty output `.zev` path for `zevc import-svd`".to_string());
+                }
+                output = Some(PathBuf::from(val));
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unexpected option `{arg}` for `zevc import-svd`"));
+            }
+            _ => {
+                if svd_path.is_some() {
+                    return Err("`zevc import-svd` accepts exactly one `.svd` input file".to_string());
+                }
+                svd_path = Some(PathBuf::from(arg));
+            }
+        }
+        i += 1;
+    }
+    let Some(svd_path) = svd_path else {
+        return Err("`zevc import-svd` requires an input `.svd` file path".to_string());
+    };
+    Ok(Command::ImportSvd { svd_path, output })
 }
 
 fn parse_doc(args: &[String]) -> Result<Command, String> {
@@ -181,8 +302,15 @@ fn parse_doc(args: &[String]) -> Result<Command, String> {
 
 fn parse_check(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
     let mut json = false;
-    for arg in args {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "check")? {
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "--json" => json = true,
@@ -191,16 +319,31 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
             }
             _ => files.push(PathBuf::from(arg)),
         }
+        i += 1;
     }
     if files.is_empty() {
         return Err("`zevc check` requires at least one `.zev` input file".to_string());
     }
-    Ok(Command::Check { files, json })
+    Ok(Command::Check {
+        files,
+        include_dirs,
+        json,
+    })
 }
 
-fn parse_file_list(args: &[String], subcmd: &str) -> Result<Option<Vec<PathBuf>>, String> {
+fn parse_file_list(
+    args: &[String],
+    subcmd: &str,
+) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>)>, String> {
     let mut files = Vec::new();
-    for arg in args {
+    let mut include_dirs = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, subcmd)? {
+            i += 1;
+            continue;
+        }
         if arg == "-h" || arg == "--help" {
             return Ok(None);
         }
@@ -208,24 +351,30 @@ fn parse_file_list(args: &[String], subcmd: &str) -> Result<Option<Vec<PathBuf>>
             return Err(format!("unexpected option `{arg}` for `zevc {subcmd}`"));
         }
         files.push(PathBuf::from(arg));
+        i += 1;
     }
     if files.is_empty() {
         return Err(format!(
             "`zevc {subcmd}` requires at least one `.zev` input file"
         ));
     }
-    Ok(Some(files))
+    Ok(Some((files, include_dirs)))
 }
 
 fn parse_files_with_output(
     args: &[String],
     subcmd: &str,
-) -> Result<Option<(Vec<PathBuf>, Option<PathBuf>)>, String> {
+) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>, Option<PathBuf>)>, String> {
     let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
     let mut output: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, subcmd)? {
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "-o" | "--output" => {
@@ -253,19 +402,24 @@ fn parse_files_with_output(
             "`zevc {subcmd}` requires at least one `.zev` input file"
         ));
     }
-    Ok(Some((files, output)))
+    Ok(Some((files, include_dirs, output)))
 }
 
 fn parse_files_with_output_and_opt(
     args: &[String],
     subcmd: &str,
-) -> Result<Option<(Vec<PathBuf>, String, Option<PathBuf>)>, String> {
+) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>, String, Option<PathBuf>)>, String> {
     let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
     let mut opt_level = "-O2".to_string();
     let mut output: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, subcmd)? {
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Ok(None),
             "-o" | "--output" => {
@@ -308,17 +462,22 @@ fn parse_files_with_output_and_opt(
             "`zevc {subcmd}` requires at least one `.zev` input file"
         ));
     }
-    Ok(Some((files, opt_level, output)))
+    Ok(Some((files, include_dirs, opt_level, output)))
 }
 
 fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
     let mut target: Option<String> = None;
     let mut opt_level: Option<String> = None;
     let mut output: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "emit-llvm")? {
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-o" | "--output" => {
@@ -372,6 +531,7 @@ fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
     }
     Ok(Command::EmitLlvm {
         files,
+        include_dirs,
         target,
         opt_level,
         output,
@@ -380,11 +540,16 @@ fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
 
 fn parse_run_qemu(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
     let mut max_ticks: Option<u64> = None;
     let mut opt_level = "-O2".to_string();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "run-qemu")? {
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "--max-ticks" => {
@@ -434,6 +599,7 @@ fn parse_run_qemu(args: &[String]) -> Result<Command, String> {
     }
     Ok(Command::RunQemu {
         files,
+        include_dirs,
         max_ticks,
         opt_level,
     })
@@ -441,12 +607,17 @@ fn parse_run_qemu(args: &[String]) -> Result<Command, String> {
 
 fn parse_flash_esp32c6(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
     let mut port = "/dev/ttyACM0".to_string();
     let mut opt_level = "-O2".to_string();
     let mut output: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "flash-esp32c6")? {
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-p" | "--port" => {
@@ -500,6 +671,7 @@ fn parse_flash_esp32c6(args: &[String]) -> Result<Command, String> {
     }
     Ok(Command::FlashEsp32C6 {
         files,
+        include_dirs,
         port,
         opt_level,
         output,
@@ -508,17 +680,22 @@ fn parse_flash_esp32c6(args: &[String]) -> Result<Command, String> {
 
 fn parse_run(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
     let mut sanitize = false;
     let mut max_ticks = None;
     let mut run_args = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
+        if arg == "--" {
+            run_args.extend_from_slice(&args[i + 1..]);
+            break;
+        }
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "run")? {
+            i += 1;
+            continue;
+        }
         match arg.as_str() {
-            "--" => {
-                run_args.extend_from_slice(&args[i + 1..]);
-                break;
-            }
             "-h" | "--help" => return Ok(Command::Help),
             "--sanitize" => sanitize = true,
             "--max-ticks" => {
@@ -550,6 +727,7 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
     }
     Ok(Command::Run {
         files,
+        include_dirs,
         sanitize,
         max_ticks,
         run_args,
@@ -587,6 +765,7 @@ mod tests {
             parse_args(["check", "--json", "a.zev", "b.zev"]).unwrap(),
             Command::Check {
                 files: vec![PathBuf::from("a.zev"), PathBuf::from("b.zev")],
+                include_dirs: vec![],
                 json: true,
             }
         );
@@ -603,7 +782,8 @@ mod tests {
                 files: vec![
                     PathBuf::from("examples/motor_controller.zev"),
                     PathBuf::from("examples/motor_support.zev"),
-                ]
+                ],
+                include_dirs: vec![],
             }
         );
     }
@@ -615,6 +795,7 @@ mod tests {
             cmd_c,
             Command::EmitC {
                 files: vec![PathBuf::from("a.zev"), PathBuf::from("b.zev")],
+                include_dirs: vec![],
                 output: Some(PathBuf::from("out.c")),
             }
         );
@@ -625,6 +806,7 @@ mod tests {
             cmd_ll_raw,
             Command::EmitLlvm {
                 files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
+                include_dirs: vec![],
                 target: None,
                 opt_level: None,
                 output: Some(PathBuf::from("out.ll")),
@@ -645,6 +827,7 @@ mod tests {
             cmd_ll_opt,
             Command::EmitLlvm {
                 files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
+                include_dirs: vec![],
                 target: Some("esp32c6".to_string()),
                 opt_level: Some("-Oz".to_string()),
                 output: Some(PathBuf::from("out.ll")),
@@ -657,6 +840,7 @@ mod tests {
             cmd_elf,
             Command::BuildElf {
                 files: vec![PathBuf::from("examples/cortex_m_demo.zev")],
+                include_dirs: vec![],
                 opt_level: "-Os".to_string(),
                 output: Some(PathBuf::from("fw.elf")),
             }
@@ -675,6 +859,7 @@ mod tests {
             cmd_qemu,
             Command::RunQemu {
                 files: vec![PathBuf::from("examples/cortex_m_demo.zev")],
+                include_dirs: vec![],
                 max_ticks: Some(50),
                 opt_level: "-Oz".to_string(),
             }
@@ -692,6 +877,7 @@ mod tests {
             cmd_esp_build,
             Command::BuildEsp32C6 {
                 files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
+                include_dirs: vec![],
                 opt_level: "-O2".to_string(),
                 output: Some(PathBuf::from("/tmp/esp32c6_demo.bin")),
             }
@@ -709,6 +895,7 @@ mod tests {
             cmd_esp_flash,
             Command::FlashEsp32C6 {
                 files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
+                include_dirs: vec![],
                 port: "/dev/ttyACM0".to_string(),
                 opt_level: "-Oz".to_string(),
                 output: None,
@@ -731,6 +918,7 @@ mod tests {
                 cmd,
                 Command::BuildElf {
                     files: vec![PathBuf::from("a.zev")],
+                    include_dirs: vec![],
                     opt_level: norm.to_string(),
                     output: None,
                 }
@@ -765,11 +953,194 @@ mod tests {
             cmd,
             Command::Run {
                 files: vec![PathBuf::from("examples/sim_demo.zev")],
+                include_dirs: vec![],
                 sanitize: true,
                 max_ticks: Some(500),
                 run_args: vec!["--trace".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn parses_import_svd_subcommand() {
+        assert_eq!(
+            parse_args(["import-svd", "stm32g4.svd"]).unwrap(),
+            Command::ImportSvd {
+                svd_path: PathBuf::from("stm32g4.svd"),
+                output: None,
+            }
+        );
+        assert_eq!(
+            parse_args(["import-svd", "stm32g4.svd", "-o", "chip/stm32g4.zev"]).unwrap(),
+            Command::ImportSvd {
+                svd_path: PathBuf::from("stm32g4.svd"),
+                output: Some(PathBuf::from("chip/stm32g4.zev")),
+            }
+        );
+        assert_eq!(
+            parse_args(["import-svd", "--output=out.zev", "chip.svd"]).unwrap(),
+            Command::ImportSvd {
+                svd_path: PathBuf::from("chip.svd"),
+                output: Some(PathBuf::from("out.zev")),
+            }
+        );
+        assert_eq!(
+            parse_args(["import-svd", "-o=out.zev", "chip.svd"]).unwrap(),
+            Command::ImportSvd {
+                svd_path: PathBuf::from("chip.svd"),
+                output: Some(PathBuf::from("out.zev")),
+            }
+        );
+        assert_eq!(parse_args(["import-svd", "--help"]).unwrap(), Command::Help);
+
+        assert!(parse_args(["import-svd"]).is_err());
+        assert!(parse_args(["import-svd", "a.svd", "b.svd"]).is_err());
+        assert!(parse_args(["import-svd", "a.svd", "-o"]).is_err());
+        assert!(parse_args(["import-svd", "a.svd", "-o="]).is_err());
+        assert!(parse_args(["import-svd", "a.svd", "--output="]).is_err());
+        assert!(parse_args(["import-svd", "a.svd", "--unknown"]).is_err());
+    }
+
+    #[test]
+    fn parses_include_dirs_across_all_file_commands() {
+        let expected_dirs = vec![
+            PathBuf::from("libs"),
+            PathBuf::from("chips"),
+            PathBuf::from("bsp"),
+            PathBuf::from("hal"),
+            PathBuf::from("extra"),
+        ];
+        let include_flags = [
+            "-I",
+            "libs",
+            "--include",
+            "chips",
+            "--include=bsp",
+            "-I=hal",
+            "-Iextra",
+        ];
+
+        let mut check_args = vec!["check", "--json"];
+        check_args.extend_from_slice(&include_flags);
+        check_args.push("app.zev");
+        assert_eq!(
+            parse_args(check_args).unwrap(),
+            Command::Check {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+                json: true,
+            }
+        );
+
+        let mut ram_args = vec!["ram"];
+        ram_args.extend_from_slice(&include_flags);
+        ram_args.push("app.zev");
+        assert_eq!(
+            parse_args(ram_args).unwrap(),
+            Command::Ram {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+            }
+        );
+
+        let mut emit_c_args = vec!["emit-c"];
+        emit_c_args.extend_from_slice(&include_flags);
+        emit_c_args.extend_from_slice(&["app.zev", "-o", "app.c"]);
+        assert_eq!(
+            parse_args(emit_c_args).unwrap(),
+            Command::EmitC {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+                output: Some(PathBuf::from("app.c")),
+            }
+        );
+
+        let mut run_args = vec!["run", "--sanitize"];
+        run_args.extend_from_slice(&include_flags);
+        run_args.extend_from_slice(&["app.zev", "--", "-I", "user_arg"]);
+        assert_eq!(
+            parse_args(run_args).unwrap(),
+            Command::Run {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+                sanitize: true,
+                max_ticks: None,
+                run_args: vec!["-I".to_string(), "user_arg".to_string()],
+            }
+        );
+
+        let mut llvm_args = vec!["emit-llvm"];
+        llvm_args.extend_from_slice(&include_flags);
+        llvm_args.push("app.zev");
+        assert_eq!(
+            parse_args(llvm_args).unwrap(),
+            Command::EmitLlvm {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+                target: None,
+                opt_level: None,
+                output: None,
+            }
+        );
+
+        let mut elf_args = vec!["build-elf"];
+        elf_args.extend_from_slice(&include_flags);
+        elf_args.push("app.zev");
+        assert_eq!(
+            parse_args(elf_args).unwrap(),
+            Command::BuildElf {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+                opt_level: "-O2".to_string(),
+                output: None,
+            }
+        );
+
+        let mut qemu_args = vec!["run-qemu"];
+        qemu_args.extend_from_slice(&include_flags);
+        qemu_args.push("app.zev");
+        assert_eq!(
+            parse_args(qemu_args).unwrap(),
+            Command::RunQemu {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+                max_ticks: None,
+                opt_level: "-O2".to_string(),
+            }
+        );
+
+        let mut esp_build_args = vec!["build-esp32c6"];
+        esp_build_args.extend_from_slice(&include_flags);
+        esp_build_args.push("app.zev");
+        assert_eq!(
+            parse_args(esp_build_args).unwrap(),
+            Command::BuildEsp32C6 {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs.clone(),
+                opt_level: "-O2".to_string(),
+                output: None,
+            }
+        );
+
+        let mut esp_flash_args = vec!["flash-esp32c6"];
+        esp_flash_args.extend_from_slice(&include_flags);
+        esp_flash_args.push("app.zev");
+        assert_eq!(
+            parse_args(esp_flash_args).unwrap(),
+            Command::FlashEsp32C6 {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: expected_dirs,
+                port: "/dev/ttyACM0".to_string(),
+                opt_level: "-O2".to_string(),
+                output: None,
+            }
+        );
+
+        assert!(parse_args(["check", "-I"]).is_err());
+        assert!(parse_args(["check", "--include"]).is_err());
+        assert!(parse_args(["check", "-I="]).is_err());
+        assert!(parse_args(["check", "--include="]).is_err());
+        assert!(parse_args(["check", "-I", "", "app.zev"]).is_err());
     }
 
     #[test]

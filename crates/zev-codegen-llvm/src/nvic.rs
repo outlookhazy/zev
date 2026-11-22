@@ -8,45 +8,72 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-/// Number of external NVIC IRQ lines emitted in `.isr_vector` (`IRQ0..IRQ31`, all in `ISER0`/`ISPR0`).
+/// Number of external NVIC IRQ lines in the minimum Cortex-M3 `.isr_vector` (`IRQ0..IRQ31`).
 pub const CORTEX_M3_NVIC_IRQS: usize = 32;
 
-/// Total entries in `.isr_vector` (16 Cortex-M system exceptions + 32 NVIC IRQs).
+/// Minimum number of entries in `.isr_vector` (16 Cortex-M system exceptions + 32 NVIC IRQs).
 pub const CORTEX_M3_VECTOR_LEN: usize = 16 + CORTEX_M3_NVIC_IRQS;
 
-/// Resolved mapping from user `isr <NAME>` names to Cortex-M3 NVIC IRQ numbers (`0..31`).
+/// Resolved mapping from user `isr <NAME>` / `MirIrqVector` entries to Cortex-M3 NVIC vector slots.
 #[derive(Debug, Clone, Default)]
 pub struct NvicMap {
-    /// Ordered map: user ISR vector name -> NVIC IRQ index (`0..31`).
+    /// Ordered map: user ISR vector name -> NVIC IRQ index (`0..31` legacy or `< 256`).
     pub by_name: BTreeMap<String, u8>,
-    /// Reverse table: NVIC IRQ index (`0..31`) -> LLVM function symbol (e.g. `@__syn_isr_EXTI0`).
+    /// Reverse table: NVIC IRQ index (`0..31`) -> LLVM function symbol (e.g. `@__syn_isr_EXTI0` or `@__syn_vec_irq_0`).
     pub irq_symbols: [Option<String>; CORTEX_M3_NVIC_IRQS],
     /// 32-bit bitmask written to `NVIC_ISER0` (`0xE000E100`) before `main()` / scheduler start.
     pub iser0_mask: u32,
+    /// Full external NVIC vector slots (`max(32, max_irq + 1)` entries).
+    pub vector_slots: Vec<Option<String>>,
+    /// Bitmasks written to `NVIC_ISER0..ISER7` (`0xE000_E100 + 4 * word`) for all attached IRQs.
+    pub iser_masks: [u32; 8],
 }
 
 impl NvicMap {
+    /// Build `.isr_vector` and `NVIC_ISER0..ISER7` masks from Wave 1 `MirIrqVector` bindings.
+    pub fn from_irq_vectors(vectors: &[zev_mir::MirIrqVector]) -> Self {
+        let max_irq = vectors.iter().map(|v| v.irq_num as usize).max().unwrap_or(0);
+        let num_slots = (max_irq + 1).max(CORTEX_M3_NVIC_IRQS);
+        let mut map = NvicMap {
+            by_name: BTreeMap::new(),
+            irq_symbols: std::array::from_fn(|_| None),
+            iser0_mask: 0,
+            vector_slots: vec![None; num_slots],
+            iser_masks: [0u32; 8],
+        };
+
+        for v in vectors {
+            let irq = v.irq_num as usize;
+            let sym = format!("@__syn_vec_irq_{}", v.irq_num);
+            if irq < map.vector_slots.len() {
+                map.vector_slots[irq] = Some(sym.clone());
+            }
+            if irq < CORTEX_M3_NVIC_IRQS {
+                map.irq_symbols[irq] = Some(sym);
+            }
+            if let Ok(irq_u8) = u8::try_from(v.irq_num) {
+                map.by_name.insert(v.irq_name.clone(), irq_u8);
+            }
+            let word = irq / 32;
+            let bit = v.irq_num % 32;
+            if word < 8 {
+                map.iser_masks[word] |= 1u32 << bit;
+            }
+        }
+        map.iser0_mask = map.iser_masks[0];
+        map
+    }
+
     /// Build a deterministic Cortex-M3 NVIC vector assignment for the given user ISR names.
     ///
-    /// Canonical mappings (matching `lm3s6965evb` & STM32-style names used in `.zev` firmware):
-    /// - `GPIOA` / `EXTI0` -> `IRQ0`
-    /// - `GPIOB` / `EXTI1` -> `IRQ1`
-    /// - `GPIOC` / `EXTI2` -> `IRQ2`
-    /// - `GPIOD` / `EXTI3` -> `IRQ3`
-    /// - `GPIOE` / `EXTI4` -> `IRQ4`
-    /// - `UART0` / `USART1` / `DMA1_CH5` -> `IRQ5`
-    /// - `UART1` / `USART2` / `DMA1_CH6` -> `IRQ6`
-    /// - `SSI0` / `SPI1` / `DMA1_CH1` -> `IRQ7`
-    /// - `I2C0` / `I2C1` / `DMA1_CH2` -> `IRQ8`
-    /// - `ADC0` / `ADC1` -> `IRQ14`
-    /// - `TIM0A` / `TIM1` -> `IRQ19`
-    /// - `TIM1A` / `TIM2` -> `IRQ21`
-    /// - `IRQ<N>` (`0..=31`) -> `IRQ<N>`
+    /// Legacy fallback used only when `MirModule::irq_vectors` is empty.
     pub fn from_isr_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
         let mut map = NvicMap {
             by_name: BTreeMap::new(),
             irq_symbols: std::array::from_fn(|_| None),
             iser0_mask: 0,
+            vector_slots: vec![None; CORTEX_M3_NVIC_IRQS],
+            iser_masks: [0u32; 8],
         };
 
         let collected: Vec<&str> = names.into_iter().collect();
@@ -62,7 +89,8 @@ impl NvicMap {
                 if idx < CORTEX_M3_NVIC_IRQS && map.irq_symbols[idx].is_none() {
                     let sym = format!("@__syn_isr_{}", sanitize_ident(name));
                     map.by_name.insert(name.to_string(), pref);
-                    map.irq_symbols[idx] = Some(sym);
+                    map.irq_symbols[idx] = Some(sym.clone());
+                    map.vector_slots[idx] = Some(sym);
                     map.iser0_mask |= 1u32 << pref;
                     continue;
                 }
@@ -80,11 +108,13 @@ impl NvicMap {
                 let irq = free_irq as u8;
                 let sym = format!("@__syn_isr_{}", sanitize_ident(name));
                 map.by_name.insert(name.to_string(), irq);
-                map.irq_symbols[free_irq] = Some(sym);
+                map.irq_symbols[free_irq] = Some(sym.clone());
+                map.vector_slots[free_irq] = Some(sym);
                 map.iser0_mask |= 1u32 << irq;
             }
         }
 
+        map.iser_masks[0] = map.iser0_mask;
         map
     }
 
@@ -160,7 +190,38 @@ pub fn emit_cortex_m_startup_ir(
     nvic: &NvicMap,
 ) {
     let sp_i32 = initial_sp as i32;
-    let iser_i32 = nvic.iser0_mask as i32;
+    let ext_irqs = nvic.vector_slots.len().max(CORTEX_M3_NVIC_IRQS);
+    let total_vector_len = 16 + ext_irqs;
+
+    let mut iser_words = nvic.iser_masks;
+    if iser_words[0] == 0 && nvic.iser0_mask != 0 {
+        iser_words[0] = nvic.iser0_mask;
+    }
+
+    let mut nvic_enable_ir = String::new();
+    let mut any_iser = false;
+    for (word, &mask) in iser_words.iter().enumerate() {
+        if mask != 0 {
+            any_iser = true;
+            let addr_u32 = 0xE000_E100u32 + (word as u32) * 4;
+            let addr_i32 = addr_u32 as i32;
+            let mask_i32 = mask as i32;
+            let _ = writeln!(
+                nvic_enable_ir,
+                "  ; Enable NVIC_ISER{word} (0x{addr_u32:08X}) = 0x{mask:08X}"
+            );
+            let _ = writeln!(
+                nvic_enable_ir,
+                "  store volatile i32 {mask_i32}, ptr inttoptr (i32 {addr_i32} to ptr), align 4"
+            );
+        }
+    }
+    if any_iser {
+        let _ = writeln!(
+            nvic_enable_ir,
+            "  call void asm sideeffect \"dsb\\0Aisb\", \"~{{memory}}\"()"
+        );
+    }
 
     let _ = writeln!(out, "; ── ARM Cortex-M3 Freestanding Vector Table & Startup ──");
     let _ = writeln!(out, "@__sbss = external global i8");
@@ -176,7 +237,7 @@ pub fn emit_cortex_m_startup_ir(
 
     let _ = writeln!(
         out,
-        "@__isr_vector = constant [{CORTEX_M3_VECTOR_LEN} x ptr] ["
+        "@__isr_vector = constant [{total_vector_len} x ptr] ["
     );
     let _ = writeln!(
         out,
@@ -198,15 +259,20 @@ pub fn emit_cortex_m_startup_ir(
     let _ = writeln!(out, "  ptr @Default_Handler,                ; 14: PendSV");
     let _ = writeln!(out, "  ptr @SysTick_Handler,                ; 15: SysTick");
 
-    for irq in 0..CORTEX_M3_NVIC_IRQS {
-        let handler = nvic.irq_symbols[irq]
-            .as_deref()
+    for irq in 0..ext_irqs {
+        let handler = nvic
+            .vector_slots
+            .get(irq)
+            .and_then(|s| s.as_deref())
+            .or_else(|| {
+                if irq < CORTEX_M3_NVIC_IRQS {
+                    nvic.irq_symbols[irq].as_deref()
+                } else {
+                    None
+                }
+            })
             .unwrap_or("@Default_Handler");
-        let comma = if irq + 1 == CORTEX_M3_NVIC_IRQS {
-            ""
-        } else {
-            ","
-        };
+        let comma = if irq + 1 == ext_irqs { "" } else { "," };
         let _ = writeln!(out, "  ptr {handler}{comma} ; {}: IRQ{irq}", 16 + irq);
     }
     let _ = writeln!(out, "], section \".isr_vector\", align 4");
@@ -277,14 +343,8 @@ data_body:
   br label %data_loop
 
 hw_init:
-  ; 3. Enable user-declared NVIC IRQs in NVIC_ISER0 (0xE000E100 = -536813312)
-  %mask = add i32 0, {iser_i32}
-  %has_irqs = icmp ne i32 %mask, 0
-  br i1 %has_irqs, label %enable_nvic, label %call_boot
-enable_nvic:
-  store volatile i32 %mask, ptr inttoptr (i32 -536813312 to ptr), align 4
-  call void asm sideeffect "dsb\0Aisb", "~{{memory}}"()
-  br label %call_boot
+  ; 3. Enable attached NVIC IRQs in NVIC_ISER0..ISER7 (0xE000E100..0xE000E11C)
+{nvic_enable_ir}  br label %call_boot
 
 call_boot:
   ; 4. Run sequential main() boot phase, then enter cooperative Language-OS scheduler

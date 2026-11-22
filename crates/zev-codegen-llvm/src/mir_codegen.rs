@@ -13,13 +13,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write;
 
 use zev_mir::{
-    BlockId, MirAssignOp, MirBinOp, MirBlock, MirBootStep, MirCallDst, MirChildCallSlot,
-    MirErrorSpec, MirExpr, MirExprKind, MirExternFn, MirFloatFmt, MirFmtChunk, MirFnBody,
-    MirFunction, MirIntFmt, MirIntrinsicOp, MirIsr, MirModule, MirPlace, MirPrimKind,
-    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern,
-    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
+    BlockId, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootStep, MirCallDst,
+    MirChildCallSlot, MirErrorSpec, MirExpr, MirExprKind, MirExternFn, MirFloatFmt, MirFmtChunk,
+    MirFnBody, MirFunction, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
+    MirMmioInstance, MirMmioLayout, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
+    MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern, MirTaskBlueprint,
+    MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
 };
 
+use crate::esp32c6::{Esp32C6IrqRoute, assign_esp32c6_irq_routes};
 use crate::nvic::{NvicMap, emit_cortex_m_startup_ir, preferred_nvic_irq, sanitize_ident};
 use crate::runtime_ir::{RuntimeIrFeatures, emit_kernel_runtime_ir_with_features};
 use crate::toolchain::{CodegenError, CodegenOptions, TargetArch};
@@ -73,6 +75,9 @@ struct ModuleCtx<'a> {
     module: &'a MirModule,
     opts: &'a CodegenOptions,
     nvic: NvicMap,
+    esp32c6_irq_routes: Vec<Esp32C6IrqRoute>,
+    mmio_layouts: HashMap<String, MirMmioLayout>,
+    mmio_instances: HashMap<String, MirMmioInstance>,
     structs: HashMap<String, StructInfo>,
     struct_order: Vec<String>,
     enum_variants: HashMap<(String, String), i64>,
@@ -118,12 +123,22 @@ pub fn emit_llvm_ir_with_options(
     module: &MirModule,
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
-    let nvic = NvicMap::from_isr_names(module.isrs.iter().map(|i| i.name.as_str()));
-    let rt_features = scan_module_runtime_features(module);
+    let nvic = if !module.irq_vectors.is_empty() {
+        NvicMap::from_irq_vectors(&module.irq_vectors)
+    } else {
+        NvicMap::from_isr_names(module.isrs.iter().map(|i| i.name.as_str()))
+    };
+    let esp32c6_irq_routes = assign_esp32c6_irq_routes(&module.irq_vectors);
+    let mut rt_features = scan_module_runtime_features(module);
+    rt_features.uses_rv_irqs =
+        opts.target == TargetArch::Riscv32Esp32C6 && !module.irq_vectors.is_empty();
     let mut ctx = ModuleCtx {
         module,
         opts,
         nvic,
+        esp32c6_irq_routes,
+        mmio_layouts: HashMap::new(),
+        mmio_instances: HashMap::new(),
         structs: HashMap::new(),
         struct_order: Vec::new(),
         enum_variants: HashMap::new(),
@@ -158,6 +173,7 @@ pub fn emit_llvm_ir_with_options(
                 &mut out,
                 opts.initial_sp(),
                 opts.fn_size_attrs(),
+                &ctx.esp32c6_irq_routes,
             );
             emit_esp32c6_irq_dispatch_ir(&mut out, &ctx);
         }
@@ -166,8 +182,10 @@ pub fn emit_llvm_ir_with_options(
         }
     }
 
-    // 3. User struct type declarations + FromBytes decoders
+    // 3. User struct type declarations + Host MMIO backing buffers + ISR static state globals
     ctx.emit_struct_types_ir(&mut out);
+    ctx.emit_mmio_host_buffers_ir(&mut out);
+    ctx.emit_isr_state_and_selector_globals_ir(&mut out);
 
     // 4. OS primitive type declarations, global instances, and typed helper functions
     ctx.emit_primitives_ir(&mut out);
@@ -182,10 +200,11 @@ pub fn emit_llvm_ir_with_options(
     // 7. `extern "C"` declarations + synthesized bare-metal `@syn_*` intrinsics
     ctx.emit_extern_fns_ir(&mut out);
 
-    // 8. User hardware ISRs (`@__syn_isr_<NAME>`)
+    // 8. User hardware ISRs (`@__syn_isr_<NAME>`) + Flash IRQ vector dispatchers (`@__syn_vec_irq_<N>`)
     for isr in &module.isrs {
         ctx.emit_isr_ir(&mut out, isr)?;
     }
+    ctx.emit_irq_vector_dispatchers_ir(&mut out)?;
 
     // 9. User functions (both Direct dual-exit register fns and Coroutine state-machine fns)
     for func in &module.functions {
@@ -206,46 +225,64 @@ pub fn emit_llvm_ir_with_options(
     Ok(out)
 }
 
-fn emit_esp32c6_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
-    let _ = writeln!(out, "; ── ESP32-C6 Software/Matrix IRQ Dispatcher ──");
-    let _ = writeln!(out, "define void @__syn_esp32c6_dispatch_irq(i32 %irq) nounwind {{");
+fn emit_sw_irq_dispatch_ir(
+    out: &mut String,
+    fn_name: &str,
+    comment: &str,
+    ctx: &ModuleCtx<'_>,
+) {
+    let _ = writeln!(out, "{comment}");
+    let _ = writeln!(out, "define void {fn_name}(i32 %irq) nounwind {{");
     let _ = writeln!(out, "entry:");
-    let _ = writeln!(out, "  switch i32 %irq, label %done [");
-    for &irq in ctx.nvic.by_name.values() {
-        let _ = writeln!(out, "    i32 {irq}, label %irq_{irq}");
-    }
-    let _ = writeln!(out, "  ]");
-    for (name, &irq) in &ctx.nvic.by_name {
-        let sym = format!("@__syn_isr_{}", sanitize_ident(name));
-        let _ = writeln!(out, "irq_{irq}:");
-        let _ = writeln!(out, "  call void {sym}()");
-        let _ = writeln!(out, "  br label %done");
+    if !ctx.module.irq_vectors.is_empty() {
+        let mut irqs = BTreeSet::new();
+        for vec in &ctx.module.irq_vectors {
+            irqs.insert(vec.irq_num);
+        }
+        let _ = writeln!(out, "  switch i32 %irq, label %done [");
+        for &irq in &irqs {
+            let _ = writeln!(out, "    i32 {irq}, label %irq_{irq}");
+        }
+        let _ = writeln!(out, "  ]");
+        for &irq in &irqs {
+            let _ = writeln!(out, "irq_{irq}:");
+            let _ = writeln!(out, "  call void @__syn_vec_irq_{irq}()");
+            let _ = writeln!(out, "  br label %done");
+        }
+    } else {
+        let _ = writeln!(out, "  switch i32 %irq, label %done [");
+        for &irq in ctx.nvic.by_name.values() {
+            let _ = writeln!(out, "    i32 {irq}, label %irq_{irq}");
+        }
+        let _ = writeln!(out, "  ]");
+        for (name, &irq) in &ctx.nvic.by_name {
+            let sym = format!("@__syn_isr_{}", sanitize_ident(name));
+            let _ = writeln!(out, "irq_{irq}:");
+            let _ = writeln!(out, "  call void {sym}()");
+            let _ = writeln!(out, "  br label %done");
+        }
     }
     let _ = writeln!(out, "done:");
     let _ = writeln!(out, "  ret void");
     let _ = writeln!(out, "}}\n");
 }
 
+fn emit_esp32c6_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
+    emit_sw_irq_dispatch_ir(
+        out,
+        "@__syn_esp32c6_dispatch_irq",
+        "; ── ESP32-C6 Software/Matrix IRQ Dispatcher ──",
+        ctx,
+    );
+}
+
 fn emit_host_entry_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
-    let _ = writeln!(out, "; ── Host Simulation IRQ Dispatcher & Entry Point ──");
-    let _ = writeln!(out, "define void @__syn_host_dispatch_irq(i32 %irq) nounwind {{");
-    let _ = writeln!(out, "entry:");
-    let _ = writeln!(out, "  switch i32 %irq, label %done [");
-    for (name, &irq) in &ctx.nvic.by_name {
-        let sym = format!("@__syn_isr_{}", sanitize_ident(name));
-        let _ = writeln!(out, "    i32 {irq}, label %irq_{irq}");
-        let _ = sym;
-    }
-    let _ = writeln!(out, "  ]");
-    for (name, &irq) in &ctx.nvic.by_name {
-        let sym = format!("@__syn_isr_{}", sanitize_ident(name));
-        let _ = writeln!(out, "irq_{irq}:");
-        let _ = writeln!(out, "  call void {sym}()");
-        let _ = writeln!(out, "  br label %done");
-    }
-    let _ = writeln!(out, "done:");
-    let _ = writeln!(out, "  ret void");
-    let _ = writeln!(out, "}}\n");
+    emit_sw_irq_dispatch_ir(
+        out,
+        "@__syn_host_dispatch_irq",
+        "; ── Host Simulation IRQ Dispatcher & Entry Point ──",
+        ctx,
+    );
 
     let _ = writeln!(
         out,
@@ -265,6 +302,7 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
         uses_floats: false,
         uses_fmt: false,
         uses_fmt_float_sci: false,
+        uses_rv_irqs: false,
     };
 
     fn scan_ty(ty: &MirType, feat: &mut RuntimeIrFeatures) {
@@ -419,6 +457,12 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                     scan_prim_target(target, feat);
                 }
             },
+            MirExprKind::MmioRead { base, index, .. } => {
+                scan_expr(base, feat);
+                if let Some(idx) = index {
+                    scan_expr(idx, feat);
+                }
+            }
             _ => {}
         }
     }
@@ -549,6 +593,15 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                     scan_expr(buf, feat);
                     scan_fmt_chunks(chunks, feat);
                 }
+                MirStmt::MmioWrite {
+                    base, index, value, ..
+                } => {
+                    scan_expr(base, feat);
+                    if let Some(idx) = index {
+                        scan_expr(idx, feat);
+                    }
+                    scan_expr(value, feat);
+                }
                 _ => {}
             }
         }
@@ -625,7 +678,24 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
         for v in &isr.vars {
             scan_ty(&v.ty, &mut feat);
         }
+        for sv in &isr.state_vars {
+            scan_ty(&sv.ty, &mut feat);
+            scan_expr(&sv.init, &mut feat);
+        }
         scan_stmts(&isr.body, &mut feat);
+    }
+    for vec in &module.irq_vectors {
+        for b in &vec.bindings {
+            for barg in &b.baked_args {
+                if let MirBakedArg::Const(e) = barg {
+                    scan_expr(e, &mut feat);
+                }
+            }
+            for sv in &b.state_vars {
+                scan_ty(&sv.ty, &mut feat);
+                scan_expr(&sv.init, &mut feat);
+            }
+        }
     }
     for func in &module.functions {
         scan_ty(&func.ret_ty, &mut feat);
@@ -693,10 +763,33 @@ impl<'a> ModuleCtx<'a> {
             self.visit_struct(s.name.as_str(), &by_name, &mut visited);
         }
 
-        // Collect all distinct OS primitive types across globals, functions, tasks, and boot
+        // MMIO layouts & peripheral instances
+        for layout in &self.module.mmio_layouts {
+            self.mmio_layouts.insert(layout.name.clone(), layout.clone());
+        }
+        for inst in &self.module.mmio_instances {
+            self.mmio_instances.insert(inst.name.clone(), inst.clone());
+        }
+
+        // Collect all distinct OS primitive types across globals, ISRs, functions, tasks, and boot
         for p in &self.module.primitives {
             self.prim_globals.insert(p.name.clone(), p.kind.clone());
             self.register_prim_kind(&p.kind);
+        }
+        for isr in &self.module.isrs {
+            for v in &isr.vars {
+                self.scan_mir_type_for_prims(&v.ty);
+            }
+            for sv in &isr.state_vars {
+                self.scan_mir_type_for_prims(&sv.ty);
+            }
+        }
+        for vec in &self.module.irq_vectors {
+            for b in &vec.bindings {
+                for sv in &b.state_vars {
+                    self.scan_mir_type_for_prims(&sv.ty);
+                }
+            }
         }
         for f in &self.module.functions {
             for v in &f.vars {
@@ -1242,6 +1335,360 @@ impl<'a> ModuleCtx<'a> {
             }
         }
         let _ = writeln!(out);
+    }
+
+    fn emit_mmio_host_buffers_ir(&self, out: &mut String) {
+        if self.opts.target != TargetArch::HostX86_64Linux || self.module.mmio_instances.is_empty()
+        {
+            return;
+        }
+        let _ = writeln!(out, "; ── Host Simulation MMIO Backing Buffers ──");
+        for inst in &self.module.mmio_instances {
+            let layout_sz = self
+                .mmio_layouts
+                .get(&inst.layout)
+                .map_or(0, |l| l.byte_size);
+            let buf_len = inst.byte_size.max(layout_sz).max(4);
+            let sym = format!("@__zev_mmio_buf_{}", sanitize_ident(&inst.name));
+            let _ = writeln!(
+                out,
+                "{sym} = internal global [{buf_len} x i8] zeroinitializer, align 4"
+            );
+        }
+        let _ = writeln!(out);
+    }
+
+    fn emit_isr_state_and_selector_globals_ir(&mut self, out: &mut String) {
+        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let mut emitted_state = BTreeSet::new();
+        let mut state_lines = Vec::new();
+        let mut selector_syms = BTreeSet::new();
+
+        for vec in &self.module.irq_vectors.clone() {
+            if let Some(sel) = &vec.selector_symbol {
+                selector_syms.insert(sel.trim_start_matches('@').to_string());
+            }
+            for b in &vec.bindings {
+                if let Some((sel, _)) = &b.cond_selector {
+                    selector_syms.insert(sel.trim_start_matches('@').to_string());
+                }
+                for sv in &b.state_vars {
+                    let sym = sanitize_ident(sv.storage_symbol.trim_start_matches('@'));
+                    if emitted_state.insert(sym.clone()) {
+                        let lty = self.llvm_ty(&sv.ty);
+                        let (_, align) = self.size_align(&sv.ty, ptr_bytes);
+                        let init_val = self.const_expr_to_llvm(&sv.init, &sv.ty);
+                        state_lines.push(format!(
+                            "@{sym} = internal global {lty} {init_val}, align {}",
+                            align.max(1)
+                        ));
+                    }
+                }
+            }
+        }
+
+        fn scan_stmt_selectors(stmts: &[MirStmt], out: &mut BTreeSet<String>) {
+            for s in stmts {
+                match s {
+                    MirStmt::SetIrqSelector { symbol, .. } => {
+                        out.insert(symbol.trim_start_matches('@').to_string());
+                    }
+                    MirStmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        scan_stmt_selectors(then_body, out);
+                        scan_stmt_selectors(else_body, out);
+                    }
+                    MirStmt::While { body, .. } => scan_stmt_selectors(body, out),
+                    MirStmt::Switch { arms, default, .. } => {
+                        for (_, ab) in arms {
+                            scan_stmt_selectors(ab, out);
+                        }
+                        scan_stmt_selectors(default, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for step in &self.module.boot.steps {
+            if let MirBootStep::Stmt(s) = step {
+                scan_stmt_selectors(std::slice::from_ref(s), &mut selector_syms);
+            }
+        }
+        for f in &self.module.functions {
+            if let MirFnBody::Direct(stmts) = &f.body {
+                scan_stmt_selectors(stmts, &mut selector_syms);
+            }
+        }
+
+        if !state_lines.is_empty() || !selector_syms.is_empty() {
+            let _ = writeln!(out, "; ── Per-Binding ISR Static State & Conditional IRQ Selectors ──");
+            for line in state_lines {
+                let _ = writeln!(out, "{line}");
+            }
+            for raw_sel in selector_syms {
+                let sym = sanitize_ident(&raw_sel);
+                let _ = writeln!(out, "@{sym} = internal global i8 0, align 1");
+            }
+            let _ = writeln!(out);
+        }
+    }
+
+    fn const_expr_to_llvm(&mut self, expr: &MirExpr, target_ty: &MirType) -> String {
+        let ptr_bits = self.opts.target.ptr_bits();
+        match target_ty {
+            MirType::Bool => {
+                if self.eval_const_int(expr) != 0 {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                }
+            }
+            MirType::U8 => format!("{}", self.eval_const_int(expr) as u8),
+            MirType::I8 => format!("{}", self.eval_const_int(expr) as i8),
+            MirType::U16
+            | MirType::EndianInt {
+                bits: 16,
+                signed: false,
+                ..
+            } => {
+                let mut v = self.eval_const_int(expr) as u16;
+                if matches!(
+                    target_ty,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    v = v.swap_bytes();
+                }
+                format!("{v}")
+            }
+            MirType::I16
+            | MirType::EndianInt {
+                bits: 16,
+                signed: true,
+                ..
+            } => {
+                let mut v = self.eval_const_int(expr) as i16;
+                if matches!(
+                    target_ty,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    v = v.swap_bytes();
+                }
+                format!("{v}")
+            }
+            MirType::U32
+            | MirType::EndianInt {
+                bits: 32,
+                signed: false,
+                ..
+            } => {
+                let mut v = self.eval_const_int(expr) as u32;
+                if matches!(
+                    target_ty,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    v = v.swap_bytes();
+                }
+                format!("{v}")
+            }
+            MirType::I32
+            | MirType::Enum(_)
+            | MirType::HwPeripheral(_)
+            | MirType::EndianInt {
+                bits: 32,
+                signed: true,
+                ..
+            } => {
+                let mut v = self.eval_const_int(expr) as i32;
+                if matches!(
+                    target_ty,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    v = v.swap_bytes();
+                }
+                format!("{v}")
+            }
+            MirType::U64
+            | MirType::EndianInt {
+                bits: 64,
+                signed: false,
+                ..
+            } => {
+                let mut v = self.eval_const_int(expr) as u64;
+                if matches!(
+                    target_ty,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    v = v.swap_bytes();
+                }
+                format!("{v}")
+            }
+            MirType::I64
+            | MirType::EndianInt {
+                bits: 64,
+                signed: true,
+                ..
+            } => {
+                let mut v = self.eval_const_int(expr) as i64;
+                if matches!(
+                    target_ty,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    v = v.swap_bytes();
+                }
+                format!("{v}")
+            }
+            MirType::Usize => {
+                if ptr_bits == 64 {
+                    format!("{}", self.eval_const_int(expr) as u64)
+                } else {
+                    format!("{}", self.eval_const_int(expr) as u32)
+                }
+            }
+            MirType::Isize => {
+                if ptr_bits == 64 {
+                    format!("{}", self.eval_const_int(expr) as i64)
+                } else {
+                    format!("{}", self.eval_const_int(expr) as i32)
+                }
+            }
+            MirType::F32 => {
+                let f = f64::from_bits(self.eval_const_float_bits(expr)) as f32;
+                let norm = if f.is_nan() {
+                    0x7FF8_0000_0000_0000u64
+                } else {
+                    (f as f64).to_bits()
+                };
+                format!("0x{norm:016X}")
+            }
+            MirType::F64 => {
+                let bits = self.eval_const_float_bits(expr);
+                format!("0x{bits:016X}")
+            }
+            MirType::Ptr(_) | MirType::MmioPtr(_) | MirType::FnPtr { .. } | MirType::Str => {
+                let inner = match &expr.kind {
+                    MirExprKind::Cast { expr: sub, .. } => sub.as_ref(),
+                    _ => expr,
+                };
+                match &inner.kind {
+                    MirExprKind::GlobalPrimAddr(name) => {
+                        format!("@__syn_prim_{}", sanitize_ident(name))
+                    }
+                    MirExprKind::MmioAddr(inst) => {
+                        if self.opts.target == TargetArch::HostX86_64Linux {
+                            format!("@__zev_mmio_buf_{}", sanitize_ident(inst))
+                        } else {
+                            let addr = self
+                                .mmio_instances
+                                .get(inst)
+                                .map_or(0, |m| m.base_addr as i32);
+                            format!("inttoptr (i32 {addr} to ptr)")
+                        }
+                    }
+                    MirExprKind::StringLit(s) => {
+                        let idx = self.intern_string(s);
+                        format!("@.str.{idx}")
+                    }
+                    MirExprKind::FnAddr(fname) => {
+                        if let Some(sig) = self.fn_sigs.get(fname) {
+                            sig.symbol.clone()
+                        } else {
+                            format!("@{}", sanitize_ident(fname))
+                        }
+                    }
+                    MirExprKind::IntLit(0) => "null".to_string(),
+                    MirExprKind::IntLit(v) => {
+                        if ptr_bits == 64 {
+                            format!("inttoptr (i64 {} to ptr)", *v as i64)
+                        } else {
+                            format!("inttoptr (i32 {} to ptr)", *v as i32)
+                        }
+                    }
+                    _ => "null".to_string(),
+                }
+            }
+            MirType::Slice(_) => {
+                if let MirExprKind::StringLit(s) = &expr.kind {
+                    let idx = self.intern_string(s);
+                    let slen = zev_ast::decoded_string_byte_len(s);
+                    let usize_ty = self.opts.target.usize_llvm_ty();
+                    format!("{{ ptr @.str.{idx}, {usize_ty} {slen} }}")
+                } else {
+                    "zeroinitializer".to_string()
+                }
+            }
+            MirType::Array { elem, len } => {
+                let n = (*len).max(1);
+                if let MirExprKind::ArrayLit { elems, .. } = &expr.kind {
+                    let ety = self.llvm_ty(elem);
+                    let mut parts = Vec::with_capacity(n);
+                    for i in 0..n {
+                        if let Some(el) = elems.get(i) {
+                            let cv = self.const_expr_to_llvm(el, elem);
+                            parts.push(format!("{ety} {cv}"));
+                        } else {
+                            parts.push(format!("{ety} zeroinitializer"));
+                        }
+                    }
+                    format!("[{}]", parts.join(", "))
+                } else {
+                    "zeroinitializer".to_string()
+                }
+            }
+            MirType::Struct(sname) => {
+                if let MirExprKind::StructLit { fields, .. } = &expr.kind {
+                    if let Some(si) = self.structs.get(sname).cloned() {
+                        if si.decl.fields.is_empty() {
+                            return "zeroinitializer".to_string();
+                        }
+                        let by_field: HashMap<&str, &MirExpr> = fields
+                            .iter()
+                            .map(|(fname, fexpr, _)| (fname.as_str(), fexpr))
+                            .collect();
+                        let mut parts = Vec::with_capacity(si.decl.fields.len());
+                        for fld in &si.decl.fields {
+                            let fty = self.llvm_ty(&fld.ty);
+                            if let Some(&fexpr) = by_field.get(fld.name.as_str()) {
+                                let cv = self.const_expr_to_llvm(fexpr, &fld.ty);
+                                parts.push(format!("{fty} {cv}"));
+                            } else {
+                                parts.push(format!("{fty} zeroinitializer"));
+                            }
+                        }
+                        if si.decl.packed {
+                            format!("<{{ {} }}>", parts.join(", "))
+                        } else {
+                            format!("{{ {} }}", parts.join(", "))
+                        }
+                    } else {
+                        "zeroinitializer".to_string()
+                    }
+                } else {
+                    "zeroinitializer".to_string()
+                }
+            }
+            _ => "zeroinitializer".to_string(),
+        }
     }
 
     fn emit_from_bytes_helpers_ir(&self, out: &mut String) {
@@ -2142,7 +2589,17 @@ entry:
             }
             other if other.starts_with("syn_sim_fire_isr_") => {
                 let isr_vec = &other["syn_sim_fire_isr_".len()..];
-                if let Some(irq) = self.nvic.irq_for(isr_vec) {
+                let irq_opt = if !self.module.irq_vectors.is_empty() {
+                    self.module
+                        .irq_vectors
+                        .iter()
+                        .find(|v| v.irq_name == isr_vec)
+                        .map(|v| v.irq_num)
+                        .or_else(|| self.nvic.irq_for(isr_vec).map(u32::from))
+                } else {
+                    self.nvic.irq_for(isr_vec).map(u32::from)
+                };
+                if let Some(irq) = irq_opt {
                     let _ = writeln!(
                         out,
                         "define void @{name}({sig_args}) nounwind {{\nentry:\n  call void @__syn_nvic_pend_irq(i32 {irq})\n  ret void\n}}"
@@ -2279,15 +2736,142 @@ entry:
     fn emit_isr_ir(&mut self, out: &mut String, isr: &MirIsr) -> Result<(), CodegenError> {
         let sym = format!("@__syn_isr_{}", sanitize_ident(&isr.name));
         let fn_sz = self.opts.fn_size_attrs();
+        let mut param_sig = Vec::new();
+        for (idx, &vid) in isr.params.iter().enumerate() {
+            let pty = self.llvm_ty(&isr.vars[vid.0].ty);
+            param_sig.push(format!("{pty} %arg{idx}"));
+        }
+        for (sidx, _) in isr.state_vars.iter().enumerate() {
+            param_sig.push(format!("ptr %__state_{sidx}"));
+        }
+
         let mut fb = FnIrBuilder::new(self, &isr.vars, None, &MirType::Void, &MirErrorSpec::None);
-        fb.emit_entry_allocas(&[]);
+        for (sidx, sd) in isr.state_vars.iter().enumerate() {
+            fb.isr_state_ptrs
+                .insert(sd.var_id, format!("%__state_{sidx}"));
+        }
+        fb.emit_entry_allocas(&isr.params);
         for stmt in &isr.body {
             fb.emit_stmt(stmt)?;
         }
         fb.ensure_terminated_void();
         let body = fb.finish();
         let _ = writeln!(out, "; ── Hardware ISR `{}` ──", isr.name);
-        let _ = writeln!(out, "define void {sym}() nounwind{fn_sz} {{\n{body}}}\n");
+        let _ = writeln!(
+            out,
+            "define void {sym}({}) nounwind{fn_sz} {{\n{body}}}\n",
+            param_sig.join(", ")
+        );
+        Ok(())
+    }
+
+    fn format_irq_binding_call(&mut self, binding: &MirIrqBinding) -> Result<String, CodegenError> {
+        let isr_opt = self
+            .module
+            .isrs
+            .iter()
+            .find(|i| i.name == binding.isr_name)
+            .cloned();
+        let isr_sym = format!("@__syn_isr_{}", sanitize_ident(&binding.isr_name));
+        let mut args = Vec::new();
+
+        for (idx, barg) in binding.baked_args.iter().enumerate() {
+            let expected_ty = isr_opt
+                .as_ref()
+                .and_then(|isr| isr.params.get(idx).map(|vid| isr.vars[vid.0].ty.clone()));
+            match barg {
+                MirBakedArg::PrimAddr(prim_name) => {
+                    args.push(format!("ptr @__syn_prim_{}", sanitize_ident(prim_name)));
+                }
+                MirBakedArg::MmioAddr(inst_name) => {
+                    if self.opts.target == TargetArch::HostX86_64Linux {
+                        args.push(format!("ptr @__zev_mmio_buf_{}", sanitize_ident(inst_name)));
+                    } else {
+                        let addr = self
+                            .mmio_instances
+                            .get(inst_name)
+                            .map_or(0, |m| m.base_addr as i32);
+                        args.push(format!("ptr inttoptr (i32 {addr} to ptr)"));
+                    }
+                }
+                MirBakedArg::Const(expr) => {
+                    let target_mir_ty = expected_ty.unwrap_or_else(|| expr.ty.clone());
+                    let lty = self.llvm_ty(&target_mir_ty);
+                    let cval = self.const_expr_to_llvm(expr, &target_mir_ty);
+                    args.push(format!("{lty} {cval}"));
+                }
+            }
+        }
+
+        for sv in &binding.state_vars {
+            let sym = sanitize_ident(sv.storage_symbol.trim_start_matches('@'));
+            args.push(format!("ptr @{sym}"));
+        }
+
+        Ok(format!("call void {isr_sym}({})", args.join(", ")))
+    }
+
+    fn emit_irq_vector_dispatchers_ir(&mut self, out: &mut String) -> Result<(), CodegenError> {
+        if self.module.irq_vectors.is_empty() {
+            return Ok(());
+        }
+        let fn_sz = self.opts.fn_size_attrs().to_string();
+        let vectors: Vec<MirIrqVector> = self.module.irq_vectors.clone();
+        let _ = writeln!(out, "; ── Zero-RAM Static Flash IRQ Vector Dispatchers ──");
+        for vec in &vectors {
+            let irq_num = vec.irq_num;
+            let _ = writeln!(
+                out,
+                "define void @__syn_vec_irq_{irq_num}() nounwind{fn_sz} {{"
+            );
+            let _ = writeln!(out, "entry:");
+
+            let eff_selector: Option<String> = vec.selector_symbol.clone().or_else(|| {
+                vec.bindings
+                    .iter()
+                    .find_map(|b| b.cond_selector.as_ref().map(|(s, _)| s.clone()))
+            });
+
+            if let Some(sel_raw) = eff_selector {
+                let mut uncond_calls = Vec::new();
+                let mut grouped: BTreeMap<u8, Vec<String>> = BTreeMap::new();
+                for b in &vec.bindings {
+                    let call_ir = self.format_irq_binding_call(b)?;
+                    if let Some((_, val)) = &b.cond_selector {
+                        grouped.entry(*val).or_default().push(call_ir);
+                    } else {
+                        uncond_calls.push(call_ir);
+                    }
+                }
+                for call_ir in uncond_calls {
+                    let _ = writeln!(out, "  {call_ir}");
+                }
+                let sel_sym = sanitize_ident(sel_raw.trim_start_matches('@'));
+                let _ = writeln!(out, "  %sel = load i8, ptr @{sel_sym}, align 1");
+                let _ = writeln!(out, "  switch i8 %sel, label %done [");
+                for &val in grouped.keys() {
+                    let _ = writeln!(out, "    i8 {val}, label %arm_{val}");
+                }
+                let _ = writeln!(out, "  ]");
+                for (val, calls) in grouped {
+                    let _ = writeln!(out, "arm_{val}:");
+                    for call_ir in calls {
+                        let _ = writeln!(out, "  {call_ir}");
+                    }
+                    let _ = writeln!(out, "  br label %done");
+                }
+                let _ = writeln!(out, "done:");
+                let _ = writeln!(out, "  ret void");
+            } else {
+                for b in &vec.bindings {
+                    let call_ir = self.format_irq_binding_call(b)?;
+                    let _ = writeln!(out, "  {call_ir}");
+                }
+                let _ = writeln!(out, "  ret void");
+            }
+
+            let _ = writeln!(out, "}}\n");
+        }
         Ok(())
     }
 
@@ -2573,6 +3157,7 @@ struct FnIrBuilder<'ctx, 'm> {
     ctx: &'ctx mut ModuleCtx<'m>,
     vars: Vec<MirVar>,
     coroutine: Option<CoroutineFrameLayout>,
+    isr_state_ptrs: HashMap<VarId, String>,
     ret_ty: MirType,
     error_spec: MirErrorSpec,
     buf: String,
@@ -2595,6 +3180,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             ctx,
             vars: vars.to_vec(),
             coroutine: coroutine.cloned(),
+            isr_state_ptrs: HashMap::new(),
             ret_ty: ret_ty.clone(),
             error_spec: error_spec.clone(),
             buf: String::with_capacity(4096),
@@ -2648,25 +3234,40 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         if self.ctx.rt_features.uses_fmt {
             self.emit_line("%__fmt_sink = alloca %SynFmtSink, align 4");
         }
+        let ptr_bits = self.ctx.opts.target.ptr_bits();
         for v in &self.vars.clone() {
+            if v.role == VarRole::IsrState || self.isr_state_ptrs.contains_key(&v.id) {
+                continue;
+            }
             if let Some(coro) = &self.coroutine {
                 if coro.hoisted_var_gep.contains_key(&v.id) {
                     continue;
                 }
             }
             let lty = self.ctx.llvm_ty(&v.ty);
-            let al = if lty == "double" || lty == "i64" { 8 } else { 4 };
+            let al = if lty == "double" || lty == "i64" || (lty == "ptr" && ptr_bits == 64) {
+                8
+            } else {
+                4
+            };
             self.emit_line(format!("%v_{} = alloca {lty}, align {al}", v.id.0));
             self.emit_line(format!("store {lty} zeroinitializer, ptr %v_{}, align {al}", v.id.0));
         }
         for (idx, &vid) in param_vids.iter().enumerate() {
             let lty = self.ctx.llvm_ty(&self.vars[vid.0].ty);
-            let al = if lty == "double" || lty == "i64" { 8 } else { 4 };
+            let al = if lty == "double" || lty == "i64" || (lty == "ptr" && ptr_bits == 64) {
+                8
+            } else {
+                4
+            };
             self.emit_line(format!("store {lty} %arg{idx}, ptr %v_{}, align {al}", vid.0));
         }
     }
 
     fn var_ptr(&mut self, vid: VarId) -> String {
+        if let Some(state_ptr) = self.isr_state_ptrs.get(&vid) {
+            return state_ptr.clone();
+        }
         let hoisted_info = self
             .coroutine
             .as_ref()
@@ -3898,7 +4499,32 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirStmt::PrimOp(pop) => self.emit_prim_nonblocking(pop)?,
             MirStmt::Intrinsic(iop) => self.emit_intrinsic(iop)?,
-            MirStmt::MmioWrite { .. } | MirStmt::SetIrqSelector { .. } => {}
+            MirStmt::MmioWrite {
+                base,
+                offset,
+                elem_bits,
+                index,
+                array_len,
+                value,
+            } => {
+                let (p, lty, align) = self.emit_mmio_elem_ptr(
+                    base,
+                    *offset,
+                    *elem_bits,
+                    index.as_deref(),
+                    *array_len,
+                )?;
+                let vv = self.emit_expr(value)?;
+                let vc = self.coerce(vv, lty, !value.ty.is_unsigned());
+                self.emit_line(format!(
+                    "store volatile {lty} {}, ptr {p}, align {align}",
+                    vc.repr
+                ));
+            }
+            MirStmt::SetIrqSelector { symbol, value } => {
+                let sym = sanitize_ident(symbol.trim_start_matches('@'));
+                self.emit_line(format!("store i8 {value}, ptr @{sym}, align 1"));
+            }
             MirStmt::EnterCritical => {
                 let pm = self.next_tmp();
                 self.emit_line(format!("{pm} = call i32 @__syn_crit_enter()"));
@@ -4861,7 +5487,77 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok(())
     }
 
-    // ── Places & Wire-Endian Load/Store ──────────────────────────────────────
+    // ── Places, Typed MMIO Addressing & Wire-Endian Load/Store ───────────────
+
+    fn emit_mmio_elem_ptr(
+        &mut self,
+        base: &MirExpr,
+        offset: u32,
+        elem_bits: u8,
+        index: Option<&MirExpr>,
+        array_len: Option<usize>,
+    ) -> Result<(String, &'static str, usize), CodegenError> {
+        let bv = self.emit_expr(base)?;
+        let base_ptr = self.coerce(bv, "ptr", false).repr;
+        let (lty, stride, align) = match elem_bits {
+            8 => ("i8", 1u32, 1usize),
+            16 => ("i16", 2u32, 2usize),
+            _ => ("i32", 4u32, 4usize),
+        };
+
+        let ptr_tmp = if let Some(idx_expr) = index {
+            let iv = self.emit_expr(idx_expr)?;
+            let idx_i32 = self.coerce(iv, "i32", !idx_expr.ty.is_unsigned()).repr;
+            let eff_idx = if self.ctx.opts.target == TargetArch::HostX86_64Linux {
+                if let Some(alen) = array_len {
+                    if alen == 0 {
+                        "0".to_string()
+                    } else {
+                        let inb = self.next_tmp();
+                        let clamped = self.next_tmp();
+                        self.emit_line(format!("{inb} = icmp ult i32 {idx_i32}, {alen}"));
+                        self.emit_line(format!(
+                            "{clamped} = select i1 {inb}, i32 {idx_i32}, i32 0"
+                        ));
+                        clamped
+                    }
+                } else {
+                    idx_i32
+                }
+            } else {
+                idx_i32
+            };
+
+            let scaled = if stride == 1 {
+                eff_idx
+            } else {
+                let s = self.next_tmp();
+                self.emit_line(format!("{s} = mul i32 {eff_idx}, {stride}"));
+                s
+            };
+            let total_off = if offset == 0 {
+                scaled
+            } else {
+                let sum = self.next_tmp();
+                self.emit_line(format!("{sum} = add i32 {}, {scaled}", offset as i32));
+                sum
+            };
+            let p = self.next_tmp();
+            self.emit_line(format!(
+                "{p} = getelementptr i8, ptr {base_ptr}, i32 {total_off}"
+            ));
+            p
+        } else {
+            let p = self.next_tmp();
+            self.emit_line(format!(
+                "{p} = getelementptr i8, ptr {base_ptr}, i32 {}",
+                offset as i32
+            ));
+            p
+        };
+
+        Ok((ptr_tmp, lty, align))
+    }
 
     fn emit_place_ptr(&mut self, place: &MirPlace) -> Result<(String, MirType, bool), CodegenError> {
         match place {
@@ -5120,14 +5816,40 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 );
                 Ok(SsaVal::new("i32", format!("{id}")))
             }
-            MirExprKind::MmioAddr(_) => Ok(SsaVal::new("ptr", "null")),
-            MirExprKind::MmioRead { elem_bits, .. } => {
-                let ity = match elem_bits {
-                    8 => "i8",
-                    16 => "i16",
-                    _ => "i32",
-                };
-                Ok(SsaVal::new(ity, "0"))
+            MirExprKind::MmioAddr(inst) => {
+                if !self.ctx.mmio_instances.contains_key(inst) {
+                    return Err(CodegenError::new(
+                        "mir_codegen",
+                        format!("unknown MMIO peripheral instance `{inst}`"),
+                    ));
+                }
+                if self.ctx.opts.target == TargetArch::HostX86_64Linux {
+                    Ok(SsaVal::new(
+                        "ptr",
+                        format!("@__zev_mmio_buf_{}", sanitize_ident(inst)),
+                    ))
+                } else {
+                    let addr = self.ctx.mmio_instances[inst].base_addr as i32;
+                    Ok(SsaVal::new("ptr", format!("inttoptr (i32 {addr} to ptr)")))
+                }
+            }
+            MirExprKind::MmioRead {
+                base,
+                offset,
+                elem_bits,
+                index,
+                array_len,
+            } => {
+                let (p, lty, align) = self.emit_mmio_elem_ptr(
+                    base,
+                    *offset,
+                    *elem_bits,
+                    index.as_deref(),
+                    *array_len,
+                )?;
+                let val = self.next_tmp();
+                self.emit_line(format!("{val} = load volatile {lty}, ptr {p}, align {align}"));
+                Ok(self.coerce(SsaVal::new(lty, val), &dst_lty, !expr.ty.is_unsigned()))
             }
             MirExprKind::FnAddr(fname) => {
                 if let Some(sig) = self.ctx.fn_sigs.get(fname) {

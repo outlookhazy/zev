@@ -17,6 +17,7 @@ pub struct RuntimeIrFeatures {
     pub uses_floats: bool,
     pub uses_fmt: bool,
     pub uses_fmt_float_sci: bool,
+    pub uses_rv_irqs: bool,
 }
 
 impl RuntimeIrFeatures {
@@ -26,6 +27,7 @@ impl RuntimeIrFeatures {
             uses_floats: true,
             uses_fmt: true,
             uses_fmt_float_sci: true,
+            uses_rv_irqs: false,
         }
     }
 }
@@ -169,7 +171,7 @@ pub fn emit_kernel_runtime_ir_with_features(
             features.uses_fmt_float_sci,
         );
     }
-    emit_scheduler_core_ir(out, opts.target, sz);
+    emit_scheduler_core_ir(out, opts.target, sz, features.uses_rv_irqs);
 
     let _ = writeln!(out, "attributes #98 = {{ noreturn nounwind \"no-builtins\" }}");
     let _ = writeln!(out, "attributes #99 = {{ nounwind \"no-builtins\" }}");
@@ -381,10 +383,15 @@ entry:
 
 define void @__syn_nvic_pend_irq(i32 %irq) nounwind{sz} {{
 entry:
+  %word = lshr i32 %irq, 5
+  %wcl = and i32 %word, 7
+  %off = shl i32 %wcl, 2
+  ; NVIC_ISPR0..ISPR7 at 0xE000E200 (-536813056) + 4 * word triggers immediate hardware preemption
+  %addr = add i32 -536813056, %off
+  %ispr_p = inttoptr i32 %addr to ptr
   %sh = and i32 %irq, 31
   %bit = shl i32 1, %sh
-  ; NVIC_ISPR0 at 0xE000E200 (-536813056) triggers immediate hardware preemption
-  store volatile i32 %bit, ptr inttoptr (i32 -536813056 to ptr), align 4
+  store volatile i32 %bit, ptr %ispr_p, align 4
   call void asm sideeffect "dsb\0Aisb", "~{{memory}}"()
   ret void
 }}
@@ -648,7 +655,12 @@ hex_done:
     );
 }
 
-fn emit_scheduler_core_ir(out: &mut String, target: TargetArch, sz: &str) {
+fn emit_scheduler_core_ir(
+    out: &mut String,
+    target: TargetArch,
+    sz: &str,
+    enable_rv_irqs: bool,
+) {
     if target == TargetArch::Riscv32Esp32C6 {
         let _ = writeln!(
             out,
@@ -1129,10 +1141,18 @@ entry:
   store ptr null, ptr %f12, align 4
   ret void
 }}
-
-define void @__syn_sched_loop() noreturn nounwind{sz} {{
+"#
+    );
+    let mie_enable_ir = if target == TargetArch::Riscv32Esp32C6 && enable_rv_irqs {
+        "  call void asm sideeffect \"csrsi mstatus, 8\", \"~{memory}\"()\n"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        out,
+        r#"define void @__syn_sched_loop() noreturn nounwind{sz} {{
 entry:
-  %alive_init = call i1 @__syn_any_alive_task()
+{mie_enable_ir}  %alive_init = call i1 @__syn_any_alive_task()
   br i1 %alive_init, label %chk_init_st, label %clean_exit
 chk_init_st:
   %st_en = load i8, ptr @__syn_systick_enabled, align 1

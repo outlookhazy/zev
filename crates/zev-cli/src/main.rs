@@ -3,6 +3,7 @@ mod diag;
 mod docs;
 mod docs_errors;
 mod runner;
+mod svd;
 
 use cli::{parse_args, Command, HELP_TEXT};
 use diag::{
@@ -271,7 +272,14 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Check { files, json } => match load_and_check_detailed(&files) {
+        Command::ImportSvd { svd_path, output } => svd::run_import_svd(&svd_path, output.as_deref()),
+        Command::Check {
+            files,
+            include_dirs,
+            json,
+        } => {
+            let _ = include_dirs;
+            match load_and_check_detailed(&files) {
             Ok(bundle) => {
                 let verified_files = bundle.programs.len();
                 let dual_vec: Vec<String> =
@@ -311,8 +319,14 @@ fn main() -> ExitCode {
                 }
                 ExitCode::FAILURE
             }
-        },
-        Command::Ram { files } => match compile_to_mir(&files) {
+            }
+        }
+        Command::Ram {
+            files,
+            include_dirs,
+        } => {
+            let _ = include_dirs;
+            match compile_to_mir(&files) {
             Ok((_, mir)) => {
                 print!("{}", mir.ram_report.format_table());
                 ExitCode::SUCCESS
@@ -321,8 +335,15 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
-        Command::EmitC { files, output } => match compile_to_mir(&files) {
+            }
+        }
+        Command::EmitC {
+            files,
+            include_dirs,
+            output,
+        } => {
+            let _ = include_dirs;
+            match compile_to_mir(&files) {
             Ok((_, mir)) => {
                 let c_src = zev_codegen_c::emit_c(&mir);
                 if let Err(err) = write_output(output.as_deref(), &c_src) {
@@ -335,13 +356,17 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
+            }
+        }
         Command::Run {
             files,
+            include_dirs,
             sanitize,
             max_ticks,
             run_args,
-        } => match compile_to_mir(&files) {
+        } => {
+            let _ = include_dirs;
+            match compile_to_mir(&files) {
             Ok((_, mir)) => {
                 let c_src = zev_codegen_c::emit_c(&mir);
                 match runner::compile_and_run_c99(&c_src, sanitize, max_ticks, &run_args) {
@@ -357,13 +382,16 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
+            }
+        }
         Command::EmitLlvm {
             files,
+            include_dirs,
             target,
             opt_level,
             output,
         } => {
+            let _ = include_dirs;
             let mut opts = match resolve_llvm_options(target.as_deref()) {
                 Ok(o) => o,
                 Err(err) => {
@@ -427,9 +455,12 @@ fn main() -> ExitCode {
         }
         Command::BuildElf {
             files,
+            include_dirs,
             opt_level,
             output,
-        } => match compile_to_mir(&files) {
+        } => {
+            let _ = include_dirs;
+            match compile_to_mir(&files) {
             Ok((_, mir)) => {
                 let out_elf = output.unwrap_or_else(|| default_output_with_ext(&files, "elf"));
                 let mut opts = zev_codegen_llvm::CodegenOptions::default();
@@ -459,12 +490,16 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
+            }
+        }
         Command::RunQemu {
             files,
+            include_dirs,
             max_ticks,
             opt_level,
-        } => match compile_to_mir(&files) {
+        } => {
+            let _ = include_dirs;
+            match compile_to_mir(&files) {
             Ok((_, mir)) => {
                 let temp = match TempWorkDir::create("zevc-qemu") {
                     Ok(t) => t,
@@ -504,12 +539,16 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
+            }
+        }
         Command::BuildEsp32C6 {
             files,
+            include_dirs,
             opt_level,
             output,
-        } => match compile_to_mir(&files) {
+        } => {
+            let _ = include_dirs;
+            match compile_to_mir(&files) {
             Ok((_, mir)) => {
                 let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
                 let out_elf = out_bin.with_extension("elf");
@@ -532,13 +571,17 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
+            }
+        }
         Command::FlashEsp32C6 {
             files,
+            include_dirs,
             port,
             opt_level,
             output,
-        } => match compile_to_mir(&files) {
+        } => {
+            let _ = include_dirs;
+            match compile_to_mir(&files) {
             Ok((_, mir)) => {
                 let mut temp_holder: Option<TempWorkDir> = None;
                 let out_bin = match output {
@@ -586,7 +629,8 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
+            }
+        }
     }
 }
 

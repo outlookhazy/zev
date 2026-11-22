@@ -2376,4 +2376,975 @@ mod tests {
             assert_eq!(res.exec.stdout, "FNPTR:42:42:12:7.00\n", "level={level}");
         }
     }
+
+    fn build_wave1_mmio_irq_test_module() -> zev_mir::MirModule {
+        use zev_mir::{
+            MirBakedArg, MirBinOp, MirBootSequence, MirBootStep, MirExpr, MirExprKind,
+            MirFmtChunk, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
+            MirIsrStateDecl, MirIsrStateVar, MirMmioAccess, MirMmioInstance, MirMmioLayout,
+            MirMmioReg, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget,
+            MirPrimitive, MirStmt, MirType, MirVar, VarId, VarRole,
+        };
+
+        let scratch_layout = MirMmioLayout {
+            name: "ScratchRegs".to_string(),
+            byte_size: 24,
+            regs: vec![
+                MirMmioReg {
+                    name: "ctrl".to_string(),
+                    access: MirMmioAccess::Rw,
+                    elem_bits: 32,
+                    array_len: None,
+                    offset: 0,
+                },
+                MirMmioReg {
+                    name: "half".to_string(),
+                    access: MirMmioAccess::Rw,
+                    elem_bits: 16,
+                    array_len: None,
+                    offset: 4,
+                },
+                MirMmioReg {
+                    name: "byte_reg".to_string(),
+                    access: MirMmioAccess::Rw,
+                    elem_bits: 8,
+                    array_len: None,
+                    offset: 6,
+                },
+                MirMmioReg {
+                    name: "slots".to_string(),
+                    access: MirMmioAccess::Rw,
+                    elem_bits: 32,
+                    array_len: Some(4),
+                    offset: 8,
+                },
+            ],
+        };
+        let uart_layout = MirMmioLayout {
+            name: "Uart0Regs".to_string(),
+            byte_size: 4,
+            regs: vec![MirMmioReg {
+                name: "dr".to_string(),
+                access: MirMmioAccess::Rw,
+                elem_bits: 32,
+                array_len: None,
+                offset: 0,
+            }],
+        };
+
+        let scratch_a = MirMmioInstance {
+            name: "SCRATCH_A".to_string(),
+            layout: "ScratchRegs".to_string(),
+            base_addr: 0x2000_E000,
+            byte_size: 24,
+        };
+        let scratch_b = MirMmioInstance {
+            name: "SCRATCH_B".to_string(),
+            layout: "ScratchRegs".to_string(),
+            base_addr: 0x2000_E100,
+            byte_size: 24,
+        };
+        let uart0 = MirMmioInstance {
+            name: "UART0".to_string(),
+            layout: "Uart0Regs".to_string(),
+            base_addr: 0x4000_C000,
+            byte_size: 4,
+        };
+
+        let inbox_elem = MirType::U32;
+        let primitives = vec![
+            MirPrimitive {
+                name: "uart_log".to_string(),
+                kind: MirPrimKind::Inbox {
+                    elem: Box::new(inbox_elem.clone()),
+                    cap: 8,
+                },
+                dma_safe: false,
+                init: None,
+                sleep_lock_bit: None,
+            },
+            MirPrimitive {
+                name: "shared_hits".to_string(),
+                kind: MirPrimKind::Watch {
+                    elem: Box::new(MirType::U32),
+                },
+                dma_safe: false,
+                init: Some(MirExpr::new(MirExprKind::IntLit(0), MirType::U32)),
+                sleep_lock_bit: None,
+            },
+            MirPrimitive {
+                name: "sel_val".to_string(),
+                kind: MirPrimKind::Watch {
+                    elem: Box::new(MirType::U32),
+                },
+                dma_safe: false,
+                init: Some(MirExpr::new(MirExprKind::IntLit(0), MirType::U32)),
+                sleep_lock_bit: None,
+            },
+        ];
+
+        let mk_var = |id: usize, name: &str, ty: MirType, role: VarRole| MirVar {
+            id: VarId(id),
+            name: name.to_string(),
+            ty,
+            role,
+            in_noyield_scope: true,
+            addr_taken: false,
+            hoisted: false,
+        };
+
+        let u32_expr = |v: i128| MirExpr::new(MirExprKind::IntLit(v), MirType::U32);
+        let var_expr = |id: usize, ty: MirType| MirExpr::new(MirExprKind::Var(VarId(id)), ty);
+
+        // Parameterized ISR `mmio_worker(*ScratchRegs regs, *Uart0Regs uart, u32 tag)` + `state u32 count = 10;`
+        let isr_worker = MirIsr {
+            name: "mmio_worker".to_string(),
+            params: vec![VarId(0), VarId(1), VarId(2)],
+            state_vars: vec![MirIsrStateDecl {
+                var_id: VarId(3),
+                name: "count".to_string(),
+                ty: MirType::U32,
+                init: u32_expr(10),
+            }],
+            vars: vec![
+                mk_var(0, "regs", MirType::MmioPtr("ScratchRegs".to_string()), VarRole::Param),
+                mk_var(1, "uart", MirType::MmioPtr("Uart0Regs".to_string()), VarRole::Param),
+                mk_var(2, "tag", MirType::U32, VarRole::Param),
+                mk_var(3, "count", MirType::U32, VarRole::IsrState),
+            ],
+            body: vec![
+                MirStmt::MmioWrite {
+                    base: Box::new(var_expr(0, MirType::MmioPtr("ScratchRegs".to_string()))),
+                    offset: 0,
+                    elem_bits: 32,
+                    index: None,
+                    array_len: None,
+                    value: var_expr(2, MirType::U32),
+                },
+                MirStmt::MmioWrite {
+                    base: Box::new(var_expr(0, MirType::MmioPtr("ScratchRegs".to_string()))),
+                    offset: 4,
+                    elem_bits: 16,
+                    index: None,
+                    array_len: None,
+                    value: MirExpr::new(MirExprKind::IntLit(0x1234), MirType::U16),
+                },
+                MirStmt::MmioWrite {
+                    base: Box::new(var_expr(0, MirType::MmioPtr("ScratchRegs".to_string()))),
+                    offset: 6,
+                    elem_bits: 8,
+                    index: None,
+                    array_len: None,
+                    value: MirExpr::new(MirExprKind::IntLit(0x5A), MirType::U8),
+                },
+                MirStmt::MmioWrite {
+                    base: Box::new(var_expr(0, MirType::MmioPtr("ScratchRegs".to_string()))),
+                    offset: 8,
+                    elem_bits: 32,
+                    index: Some(Box::new(u32_expr(2))),
+                    array_len: Some(4),
+                    value: MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Add,
+                            lhs: Box::new(var_expr(2, MirType::U32)),
+                            rhs: Box::new(var_expr(3, MirType::U32)),
+                        },
+                        MirType::U32,
+                    ),
+                },
+                MirStmt::Assign {
+                    target: zev_mir::MirPlace::Var(VarId(3)),
+                    op: zev_mir::MirAssignOp::AddAssign,
+                    value: u32_expr(1),
+                },
+                MirStmt::MmioWrite {
+                    base: Box::new(var_expr(1, MirType::MmioPtr("Uart0Regs".to_string()))),
+                    offset: 0,
+                    elem_bits: 32,
+                    index: None,
+                    array_len: None,
+                    value: u32_expr(0x4D), // 'M'
+                },
+                MirStmt::PrimOp(MirPrimNonBlockingOp::InboxPost {
+                    target: MirPrimTarget::Global("uart_log".to_string()),
+                    elem_ty: MirType::U32,
+                    cap: 8,
+                    value: MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Add,
+                            lhs: Box::new(MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Mul,
+                                    lhs: Box::new(var_expr(2, MirType::U32)),
+                                    rhs: Box::new(u32_expr(100)),
+                                },
+                                MirType::U32,
+                            )),
+                            rhs: Box::new(var_expr(3, MirType::U32)),
+                        },
+                        MirType::U32,
+                    ),
+                    boost: None,
+                }),
+            ],
+        };
+
+        let isr_shared_a = MirIsr {
+            name: "shared_a".to_string(),
+            params: vec![VarId(0)],
+            state_vars: vec![MirIsrStateDecl {
+                var_id: VarId(1),
+                name: "acc".to_string(),
+                ty: MirType::U32,
+                init: u32_expr(1),
+            }],
+            vars: vec![
+                mk_var(0, "delta", MirType::U32, VarRole::Param),
+                mk_var(1, "acc", MirType::U32, VarRole::IsrState),
+            ],
+            body: vec![
+                MirStmt::Assign {
+                    target: zev_mir::MirPlace::Var(VarId(1)),
+                    op: zev_mir::MirAssignOp::AddAssign,
+                    value: var_expr(0, MirType::U32),
+                },
+                MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
+                    target: MirPrimTarget::Global("shared_hits".to_string()),
+                    elem_ty: MirType::U32,
+                    value: MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Add,
+                            lhs: Box::new(MirExpr::new(
+                                MirExprKind::PrimRead(Box::new(MirPrimReadOp::WatchRead {
+                                    target: MirPrimTarget::Global("shared_hits".to_string()),
+                                    elem_ty: MirType::U32,
+                                })),
+                                MirType::U32,
+                            )),
+                            rhs: Box::new(var_expr(1, MirType::U32)),
+                        },
+                        MirType::U32,
+                    ),
+                }),
+            ],
+        };
+
+        let isr_shared_b = MirIsr {
+            name: "shared_b".to_string(),
+            params: vec![VarId(0)],
+            state_vars: vec![MirIsrStateDecl {
+                var_id: VarId(1),
+                name: "calls".to_string(),
+                ty: MirType::U32,
+                init: u32_expr(0),
+            }],
+            vars: vec![
+                mk_var(0, "mult", MirType::U32, VarRole::Param),
+                mk_var(1, "calls", MirType::U32, VarRole::IsrState),
+            ],
+            body: vec![
+                MirStmt::Assign {
+                    target: zev_mir::MirPlace::Var(VarId(1)),
+                    op: zev_mir::MirAssignOp::AddAssign,
+                    value: u32_expr(1),
+                },
+                MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
+                    target: MirPrimTarget::Global("shared_hits".to_string()),
+                    elem_ty: MirType::U32,
+                    value: MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Add,
+                            lhs: Box::new(MirExpr::new(
+                                MirExprKind::PrimRead(Box::new(MirPrimReadOp::WatchRead {
+                                    target: MirPrimTarget::Global("shared_hits".to_string()),
+                                    elem_ty: MirType::U32,
+                                })),
+                                MirType::U32,
+                            )),
+                            rhs: Box::new(MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Mul,
+                                    lhs: Box::new(var_expr(1, MirType::U32)),
+                                    rhs: Box::new(var_expr(0, MirType::U32)),
+                                },
+                                MirType::U32,
+                            )),
+                        },
+                        MirType::U32,
+                    ),
+                }),
+            ],
+        };
+
+        let isr_cond_1 = MirIsr {
+            name: "cond_isr_1".to_string(),
+            params: vec![],
+            state_vars: vec![],
+            vars: vec![],
+            body: vec![MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
+                target: MirPrimTarget::Global("sel_val".to_string()),
+                elem_ty: MirType::U32,
+                value: u32_expr(111),
+            })],
+        };
+
+        let isr_cond_2 = MirIsr {
+            name: "cond_isr_2".to_string(),
+            params: vec![],
+            state_vars: vec![MirIsrStateDecl {
+                var_id: VarId(0),
+                name: "v".to_string(),
+                ty: MirType::U32,
+                init: u32_expr(222),
+            }],
+            vars: vec![mk_var(0, "v", MirType::U32, VarRole::IsrState)],
+            body: vec![MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
+                target: MirPrimTarget::Global("sel_val".to_string()),
+                elem_ty: MirType::U32,
+                value: var_expr(0, MirType::U32),
+            })],
+        };
+
+        let irq_vectors = vec![
+            MirIrqVector {
+                irq_name: "IRQ_5".to_string(),
+                irq_num: 5,
+                is_shared: false,
+                selector_symbol: None,
+                bindings: vec![MirIrqBinding {
+                    binding_id: 0,
+                    isr_name: "mmio_worker".to_string(),
+                    baked_args: vec![
+                        MirBakedArg::MmioAddr("SCRATCH_A".to_string()),
+                        MirBakedArg::MmioAddr("UART0".to_string()),
+                        MirBakedArg::Const(u32_expr(100)),
+                    ],
+                    state_vars: vec![MirIsrStateVar {
+                        storage_symbol: "__zev_isr_state_0_count".to_string(),
+                        var_name: "count".to_string(),
+                        ty: MirType::U32,
+                        init: u32_expr(10),
+                    }],
+                    cond_selector: None,
+                }],
+            },
+            MirIrqVector {
+                irq_name: "IRQ_37".to_string(),
+                irq_num: 37,
+                is_shared: false,
+                selector_symbol: None,
+                bindings: vec![MirIrqBinding {
+                    binding_id: 1,
+                    isr_name: "mmio_worker".to_string(),
+                    baked_args: vec![
+                        MirBakedArg::MmioAddr("SCRATCH_B".to_string()),
+                        MirBakedArg::MmioAddr("UART0".to_string()),
+                        MirBakedArg::Const(u32_expr(200)),
+                    ],
+                    state_vars: vec![MirIsrStateVar {
+                        storage_symbol: "__zev_isr_state_1_count".to_string(),
+                        var_name: "count".to_string(),
+                        ty: MirType::U32,
+                        init: u32_expr(10),
+                    }],
+                    cond_selector: None,
+                }],
+            },
+            MirIrqVector {
+                irq_name: "IRQ_SHARED".to_string(),
+                irq_num: 12,
+                is_shared: true,
+                selector_symbol: None,
+                bindings: vec![
+                    MirIrqBinding {
+                        binding_id: 2,
+                        isr_name: "shared_a".to_string(),
+                        baked_args: vec![MirBakedArg::Const(u32_expr(10))],
+                        state_vars: vec![MirIsrStateVar {
+                            storage_symbol: "__zev_isr_state_2_acc".to_string(),
+                            var_name: "acc".to_string(),
+                            ty: MirType::U32,
+                            init: u32_expr(1),
+                        }],
+                        cond_selector: None,
+                    },
+                    MirIrqBinding {
+                        binding_id: 3,
+                        isr_name: "shared_b".to_string(),
+                        baked_args: vec![MirBakedArg::Const(u32_expr(1000))],
+                        state_vars: vec![MirIsrStateVar {
+                            storage_symbol: "__zev_isr_state_3_calls".to_string(),
+                            var_name: "calls".to_string(),
+                            ty: MirType::U32,
+                            init: u32_expr(0),
+                        }],
+                        cond_selector: None,
+                    },
+                ],
+            },
+            MirIrqVector {
+                irq_name: "IRQ_COND".to_string(),
+                irq_num: 19,
+                is_shared: false,
+                selector_symbol: Some("__zev_irq_sel_19".to_string()),
+                bindings: vec![
+                    MirIrqBinding {
+                        binding_id: 4,
+                        isr_name: "cond_isr_1".to_string(),
+                        baked_args: vec![],
+                        state_vars: vec![],
+                        cond_selector: Some(("__zev_irq_sel_19".to_string(), 1)),
+                    },
+                    MirIrqBinding {
+                        binding_id: 5,
+                        isr_name: "cond_isr_2".to_string(),
+                        baked_args: vec![],
+                        state_vars: vec![MirIsrStateVar {
+                            storage_symbol: "__zev_isr_state_5_v".to_string(),
+                            var_name: "v".to_string(),
+                            ty: MirType::U32,
+                            init: u32_expr(222),
+                        }],
+                        cond_selector: Some(("__zev_irq_sel_19".to_string(), 2)),
+                    },
+                ],
+            },
+        ];
+
+        let try_recv_res_ty = MirType::Result {
+            ok: Box::new(MirType::U32),
+            err: None,
+        };
+        let boot_vars = vec![
+            mk_var(0, "r0", try_recv_res_ty.clone(), VarRole::CompilerTemp),
+            mk_var(1, "r1", try_recv_res_ty.clone(), VarRole::CompilerTemp),
+            mk_var(2, "r2", try_recv_res_ty.clone(), VarRole::CompilerTemp),
+        ];
+
+        let try_recv_expr = MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxTryRecv {
+                target: MirPrimTarget::Global("uart_log".to_string()),
+                elem_ty: MirType::U32,
+                cap: 8,
+            })),
+            try_recv_res_ty,
+        );
+        let mmio_a = MirExpr::new(
+            MirExprKind::MmioAddr("SCRATCH_A".to_string()),
+            MirType::MmioPtr("ScratchRegs".to_string()),
+        );
+        let mmio_b = MirExpr::new(
+            MirExprKind::MmioAddr("SCRATCH_B".to_string()),
+            MirType::MmioPtr("ScratchRegs".to_string()),
+        );
+
+        let mmio_read = |base: MirExpr, offset: u32, elem_bits: u8, idx: Option<i128>, ty: MirType| {
+            MirExpr::new(
+                MirExprKind::MmioRead {
+                    base: Box::new(base),
+                    offset,
+                    elem_bits,
+                    index: idx.map(|i| Box::new(u32_expr(i))),
+                    array_len: idx.map(|_| 4),
+                },
+                ty,
+            )
+        };
+        let pend = |irq: i128| {
+            MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                method: "pend_irq".to_string(),
+                args: vec![u32_expr(irq)],
+            }))
+        };
+        let dec = |value: MirExpr| MirFmtChunk::Int {
+            value,
+            signed: false,
+            bits: 32,
+            fmt: MirIntFmt::Dec,
+        };
+
+        let boot_steps = vec![
+            MirBootStep::Stmt(MirStmt::SetIrqSelector {
+                symbol: "__zev_irq_sel_19".to_string(),
+                value: 2,
+            }),
+            pend(5),
+            pend(5),
+            pend(37),
+            pend(12),
+            pend(19),
+            MirBootStep::Stmt(MirStmt::Assign {
+                target: zev_mir::MirPlace::Var(VarId(0)),
+                op: zev_mir::MirAssignOp::Assign,
+                value: try_recv_expr.clone(),
+            }),
+            MirBootStep::Stmt(MirStmt::Assign {
+                target: zev_mir::MirPlace::Var(VarId(1)),
+                op: zev_mir::MirAssignOp::Assign,
+                value: try_recv_expr.clone(),
+            }),
+            MirBootStep::Stmt(MirStmt::Assign {
+                target: zev_mir::MirPlace::Var(VarId(2)),
+                op: zev_mir::MirAssignOp::Assign,
+                value: try_recv_expr,
+            }),
+            MirBootStep::Stmt(MirStmt::PrintFmt {
+                chunks: vec![
+                    MirFmtChunk::Literal("\nLOG=".to_string()),
+                    dec(MirExpr::new(MirExprKind::ResultVal(VarId(0)), MirType::U32)),
+                    MirFmtChunk::Literal(",".to_string()),
+                    dec(MirExpr::new(MirExprKind::ResultVal(VarId(1)), MirType::U32)),
+                    MirFmtChunk::Literal(",".to_string()),
+                    dec(MirExpr::new(MirExprKind::ResultVal(VarId(2)), MirType::U32)),
+                ],
+                newline: true,
+            }),
+            MirBootStep::Stmt(MirStmt::PrintFmt {
+                chunks: vec![
+                    MirFmtChunk::Literal("MMIO_A=".to_string()),
+                    dec(mmio_read(mmio_a.clone(), 0, 32, None, MirType::U32)),
+                    MirFmtChunk::Literal(":".to_string()),
+                    dec(MirExpr::new(
+                        MirExprKind::Cast {
+                            expr: Box::new(mmio_read(mmio_a.clone(), 4, 16, None, MirType::U16)),
+                            target_ty: MirType::U32,
+                        },
+                        MirType::U32,
+                    )),
+                    MirFmtChunk::Literal(":".to_string()),
+                    dec(MirExpr::new(
+                        MirExprKind::Cast {
+                            expr: Box::new(mmio_read(mmio_a.clone(), 6, 8, None, MirType::U8)),
+                            target_ty: MirType::U32,
+                        },
+                        MirType::U32,
+                    )),
+                    MirFmtChunk::Literal(":".to_string()),
+                    dec(mmio_read(mmio_a, 8, 32, Some(2), MirType::U32)),
+                ],
+                newline: true,
+            }),
+            MirBootStep::Stmt(MirStmt::PrintFmt {
+                chunks: vec![
+                    MirFmtChunk::Literal("MMIO_B=".to_string()),
+                    dec(mmio_read(mmio_b.clone(), 0, 32, None, MirType::U32)),
+                    MirFmtChunk::Literal(":".to_string()),
+                    dec(mmio_read(mmio_b, 8, 32, Some(2), MirType::U32)),
+                ],
+                newline: true,
+            }),
+            MirBootStep::Stmt(MirStmt::PrintFmt {
+                chunks: vec![
+                    MirFmtChunk::Literal("SHARED=".to_string()),
+                    dec(MirExpr::new(
+                        MirExprKind::PrimRead(Box::new(MirPrimReadOp::WatchRead {
+                            target: MirPrimTarget::Global("shared_hits".to_string()),
+                            elem_ty: MirType::U32,
+                        })),
+                        MirType::U32,
+                    )),
+                    MirFmtChunk::Literal(" SEL=".to_string()),
+                    dec(MirExpr::new(
+                        MirExprKind::PrimRead(Box::new(MirPrimReadOp::WatchRead {
+                            target: MirPrimTarget::Global("sel_val".to_string()),
+                            elem_ty: MirType::U32,
+                        })),
+                        MirType::U32,
+                    )),
+                ],
+                newline: true,
+            }),
+            MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                method: "exit".to_string(),
+                args: vec![u32_expr(0)],
+            })),
+        ];
+
+        let dummy_prog = zev_parser::parse_str("fn main() {}").unwrap();
+        let mut mir = zev_mir::lower_program(&dummy_prog).unwrap();
+        mir.mmio_layouts = vec![scratch_layout, uart_layout];
+        mir.mmio_instances = vec![scratch_a, scratch_b, uart0];
+        mir.primitives = primitives;
+        mir.isrs = vec![
+            isr_worker,
+            isr_shared_a,
+            isr_shared_b,
+            isr_cond_1,
+            isr_cond_2,
+        ];
+        mir.irq_vectors = irq_vectors;
+        mir.boot = MirBootSequence {
+            present: true,
+            vars: boot_vars,
+            steps: boot_steps,
+            boot_yielding_callees: vec![],
+        };
+        mir
+    }
+
+    #[test]
+    fn wave1_mmio_parameterized_isr_state_and_nvic_iser_in_qemu() {
+        let dir = test_out_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mir = build_wave1_mmio_irq_test_module();
+
+        // 1. Verify Thumb-2 LLVM IR structure (`.isr_vector` > 32, `ISER0` + `ISER1`, volatile MMIO, zero-alloca state)
+        let raw_ll = emit_llvm_ir(&mir).expect("emit Wave 1 Thumb-2 LLVM IR");
+        assert!(
+            raw_ll.contains("@__isr_vector = constant [54 x ptr] ["),
+            "expected 16 + max(32, 37 + 1) = 54 vector slots:\n{raw_ll}"
+        );
+        assert!(raw_ll.contains("ptr @__syn_vec_irq_5"));
+        assert!(raw_ll.contains("ptr @__syn_vec_irq_12"));
+        assert!(raw_ll.contains("ptr @__syn_vec_irq_19"));
+        assert!(raw_ll.contains("ptr @__syn_vec_irq_37"));
+        assert!(raw_ll.contains("NVIC_ISER0 (0xE000E100)"));
+        assert!(raw_ll.contains("NVIC_ISER1 (0xE000E104)"));
+        assert!(raw_ll.contains("load volatile i8, ptr"));
+        assert!(raw_ll.contains("load volatile i16, ptr"));
+        assert!(raw_ll.contains("load volatile i32, ptr"));
+        assert!(raw_ll.contains("store volatile i8 "));
+        assert!(raw_ll.contains("store volatile i16 "));
+        assert!(raw_ll.contains("store volatile i32 "));
+        assert!(raw_ll.contains("getelementptr i8, ptr "));
+        assert!(raw_ll.contains("@__zev_isr_state_0_count = internal global i32 10, align 4"));
+        assert!(raw_ll.contains("@__zev_isr_state_1_count = internal global i32 10, align 4"));
+        assert!(raw_ll.contains("@__zev_irq_sel_19 = internal global i8 0, align 1"));
+        assert!(
+            raw_ll.contains("define void @__syn_isr_mmio_worker(ptr %arg0, ptr %arg1, i32 %arg2, ptr %__state_0)"),
+            "expected parameterized ISR signature:\n{raw_ll}"
+        );
+        assert!(
+            raw_ll.contains("switch i8 %sel, label %done"),
+            "expected selector switch in @__syn_vec_irq_19:\n{raw_ll}"
+        );
+
+        // Verify `VarRole::IsrState` has NO stack alloca inside `@__syn_isr_mmio_worker`
+        let worker_ir = raw_ll
+            .split("define void @__syn_isr_mmio_worker(")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(!worker_ir.contains("%v_3 = alloca"), "worker_ir={worker_ir}");
+        assert!(worker_ir.contains("load i32, ptr %__state_0"), "worker_ir={worker_ir}");
+        assert!(worker_ir.contains("store i32 "), "worker_ir={worker_ir}");
+
+        // 2. Build & run live in QEMU Cortex-M3 (`lm3s6965evb`) at `-O0` and `-O2`!
+        for level in ["-O0", "-O2"] {
+            let mut opts = CodegenOptions::default();
+            opts.opt_level = level.to_string();
+            let tag = level.trim_start_matches('-');
+            let res = run_qemu_cortex_m(
+                &mir,
+                &dir.join(format!("wave1_mmio_irq_{tag}.elf")),
+                &opts,
+                &QemuRunOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("Wave 1 MMIO/IRQ QEMU run failed at {level}: {e}"));
+            verify_ll_with_opt(&res.build.ll_path).expect("opt -passes=verify on Wave 1 IR");
+            assert!(res.build.audit.is_zero_heap_freestanding());
+            assert_eq!(res.exec.exit_code, 0, "level={level} out={}", res.exec.stdout);
+            let out = &res.exec.stdout;
+            assert!(out.contains("MMM\nLOG=10011,10012,20011\n"), "level={level} out={out}");
+            assert!(out.contains("MMIO_A=100:4660:90:111\n"), "level={level} out={out}");
+            assert!(out.contains("MMIO_B=200:210\n"), "level={level} out={out}");
+            assert!(out.contains("SHARED=1011 SEL=222\n"), "level={level} out={out}");
+        }
+    }
+
+    #[test]
+    fn wave1_mmio_irq_vectors_esp32c6_and_host_verify_link() {
+        let dir = test_out_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mir = build_wave1_mmio_irq_test_module();
+
+        // 1. ESP32-C6 (`rv32imac`) IR, `opt -passes=verify`, `llc`, `ld.lld --gc-sections`, and ELF audit
+        let esp_opts = CodegenOptions::esp32c6();
+        let esp_ll = emit_llvm_ir_with_options(&mir, &esp_opts).expect("emit ESP32-C6 Wave 1 IR");
+        assert!(esp_ll.contains("section \".iram1\", align 256"));
+        assert!(esp_ll.contains(".balign 256"));
+        assert!(esp_ll.contains("__syn_rv_vector_table:"));
+        assert!(esp_ll.contains("j __syn_rv_irq_tramp_1"));
+        assert!(esp_ll.contains("j __syn_rv_irq_tramp_2"));
+        assert!(esp_ll.contains("j __syn_rv_irq_tramp_3"));
+        assert!(esp_ll.contains("j __syn_rv_irq_tramp_4"));
+        assert!(esp_ll.contains("call __syn_vec_irq_5"));
+        assert!(esp_ll.contains("call __syn_vec_irq_12"));
+        assert!(esp_ll.contains("call __syn_vec_irq_19"));
+        assert!(esp_ll.contains("call __syn_vec_irq_37"));
+        assert!(esp_ll.contains("0x600C50A8"));
+        assert!(esp_ll.contains("INTMTX src_id=5 -> cpu_int=1 (0x60010014)"));
+        assert!(esp_ll.contains("INTMTX src_id=37 -> cpu_int=4 (0x60010094)"));
+        assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_PRI_1_REG (0x600C5010) = 1"));
+        assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_THRESH_REG (0x600C508C) = 1"));
+        assert!(esp_ll.contains("INTPRI_CORE0_CPU_INT_ENABLE_REG (0x600C5000)"));
+        assert!(esp_ll.contains("csrw mtvec, $0"));
+        assert!(esp_ll.contains("csrsi mstatus, 8"));
+        assert!(esp_ll.contains("call void @__syn_vec_irq_37()"));
+
+        let esp_elf = dir.join("wave1_esp32c6.elf");
+        let esp_bin = dir.join("wave1_esp32c6.bin");
+        let img = build_esp32c6_image(&mir, &esp_elf, &esp_bin)
+            .expect("build Wave 1 ESP32-C6 Direct-Boot image");
+        verify_ll_with_opt(&img.elf.ll_path).expect("opt verify ESP32-C6 Wave 1 IR");
+        assert!(img.elf.audit.is_zero_heap_freestanding());
+        assert_eq!(img.magic_header, ESP32C6_DIRECT_BOOT_MAGIC);
+        assert!(
+            img.elf
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_rv_vector_table")
+        );
+        assert!(
+            img.elf
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_vec_irq_37")
+        );
+
+        let nm = Command::new("/bin/llvm-nm")
+            .arg(&img.elf.elf_path)
+            .output()
+            .expect("invoke /bin/llvm-nm");
+        assert!(nm.status.success());
+        let nm_out = String::from_utf8_lossy(&nm.stdout);
+        let vt_line = nm_out
+            .lines()
+            .find(|l| l.ends_with(" __syn_rv_vector_table"))
+            .unwrap_or_else(|| panic!("missing __syn_rv_vector_table in llvm-nm:\n{nm_out}"));
+        let vt_addr = u32::from_str_radix(vt_line.split_whitespace().next().unwrap(), 16).unwrap();
+        assert_eq!(
+            vt_addr % 256,
+            0,
+            "expected __syn_rv_vector_table to be 256-byte aligned, got 0x{vt_addr:08X}"
+        );
+        assert!(
+            vt_addr >= 0x4080_0000,
+            "expected __syn_rv_vector_table in HP-SRAM .iram1, got 0x{vt_addr:08X}"
+        );
+
+        // 2. Host x86_64 LLVM IR (`@__zev_mmio_buf_*`, bounds clamping, `opt -passes=verify` & `llc`)
+        let mut host_opts = CodegenOptions::default();
+        host_opts.target = TargetArch::HostX86_64Linux;
+        let host_ll = emit_llvm_ir_with_options(&mir, &host_opts).expect("emit Host Wave 1 IR");
+        assert!(
+            host_ll.contains("@__zev_mmio_buf_SCRATCH_A = internal global [24 x i8] zeroinitializer, align 4"),
+            "host_ll={host_ll}"
+        );
+        assert!(
+            host_ll.contains("@__zev_mmio_buf_UART0 = internal global [4 x i8] zeroinitializer, align 4"),
+            "host_ll={host_ll}"
+        );
+        assert!(host_ll.contains("icmp ult i32 "));
+        assert!(host_ll.contains("select i1 "));
+
+        let host_ll_path = dir.join("wave1_host.ll");
+        let host_obj_path = dir.join("wave1_host.o");
+        std::fs::write(&host_ll_path, &host_ll).unwrap();
+        verify_ll_with_opt(&host_ll_path).expect("opt verify Host Wave 1 IR");
+        compile_ll_to_obj(&host_ll_path, &host_obj_path, &host_opts)
+            .expect("llc compile Host Wave 1 object");
+    }
+
+    #[test]
+    fn wave1_isr_prim_addr_and_state_addrof_in_qemu() {
+        use zev_mir::{
+            MirAssignOp, MirBakedArg, MirBinOp, MirBootSequence, MirBootStep, MirExpr,
+            MirExprKind, MirFmtChunk, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector,
+            MirIsr, MirIsrStateDecl, MirIsrStateVar, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
+            MirPrimReadOp, MirPrimTarget, MirPrimitive, MirStmt, MirType, MirUnaryOp, MirVar,
+            VarId, VarRole,
+        };
+
+        let dir = test_out_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mk_var = |id: usize, name: &str, ty: MirType, role: VarRole| MirVar {
+            id: VarId(id),
+            name: name.to_string(),
+            ty,
+            role,
+            in_noyield_scope: true,
+            addr_taken: false,
+            hoisted: false,
+        };
+        let u32_expr = |v: i128| MirExpr::new(MirExprKind::IntLit(v), MirType::U32);
+        let var_expr = |id: usize, ty: MirType| MirExpr::new(MirExprKind::Var(VarId(id)), ty);
+
+        let inbox_ty = MirType::Primitive(MirPrimKind::Inbox {
+            elem: Box::new(MirType::U32),
+            cap: 4,
+        });
+        let ptr_inbox_ty = MirType::Ptr(Box::new(inbox_ty));
+
+        // ISR taking `*inbox<u32, 4> q` (`MirBakedArg::PrimAddr`) and mutating `state u32 acc = 5` via `&acc` (`AddrOfPlace`)!
+        let mut state_var = mk_var(1, "acc", MirType::U32, VarRole::IsrState);
+        state_var.addr_taken = true;
+        let ptr_u32_ty = MirType::Ptr(Box::new(MirType::U32));
+        let isr_handler = MirIsr {
+            name: "prim_state_worker".to_string(),
+            params: vec![VarId(0)],
+            state_vars: vec![MirIsrStateDecl {
+                var_id: VarId(1),
+                name: "acc".to_string(),
+                ty: MirType::U32,
+                init: u32_expr(5),
+            }],
+            vars: vec![
+                mk_var(0, "q", ptr_inbox_ty.clone(), VarRole::Param),
+                state_var,
+                mk_var(2, "p_acc", ptr_u32_ty.clone(), VarRole::UserLocal),
+            ],
+            body: vec![
+                MirStmt::Assign {
+                    target: MirPlace::Var(VarId(2)),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(
+                        MirExprKind::AddrOfPlace(Box::new(MirPlace::Var(VarId(1)))),
+                        ptr_u32_ty.clone(),
+                    ),
+                },
+                MirStmt::Assign {
+                    target: MirPlace::Deref(
+                        Box::new(var_expr(2, ptr_u32_ty.clone())),
+                        MirType::U32,
+                    ),
+                    op: MirAssignOp::AddAssign,
+                    value: u32_expr(7),
+                },
+                MirStmt::PrimOp(MirPrimNonBlockingOp::InboxPost {
+                    target: MirPrimTarget::PtrExpr(var_expr(0, ptr_inbox_ty)),
+                    elem_ty: MirType::U32,
+                    cap: 4,
+                    value: MirExpr::new(
+                        MirExprKind::Unary {
+                            op: MirUnaryOp::Deref,
+                            expr: Box::new(var_expr(2, ptr_u32_ty)),
+                        },
+                        MirType::U32,
+                    ),
+                    boost: None,
+                }),
+            ],
+        };
+
+        let try_recv_res_ty = MirType::Result {
+            ok: Box::new(MirType::U32),
+            err: None,
+        };
+        let try_recv_expr = MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxTryRecv {
+                target: MirPrimTarget::Global("ev_q".to_string()),
+                elem_ty: MirType::U32,
+                cap: 4,
+            })),
+            try_recv_res_ty.clone(),
+        );
+
+        let dummy_prog = zev_parser::parse_str("fn main() {}").unwrap();
+        let mut mir = zev_mir::lower_program(&dummy_prog).unwrap();
+        mir.primitives = vec![MirPrimitive {
+            name: "ev_q".to_string(),
+            kind: MirPrimKind::Inbox {
+                elem: Box::new(MirType::U32),
+                cap: 4,
+            },
+            dma_safe: false,
+            init: None,
+            sleep_lock_bit: None,
+        }];
+        mir.isrs = vec![isr_handler];
+        mir.irq_vectors = vec![MirIrqVector {
+            irq_name: "IRQ_3".to_string(),
+            irq_num: 3,
+            is_shared: false,
+            selector_symbol: None,
+            bindings: vec![MirIrqBinding {
+                binding_id: 0,
+                isr_name: "prim_state_worker".to_string(),
+                baked_args: vec![MirBakedArg::PrimAddr("ev_q".to_string())],
+                state_vars: vec![MirIsrStateVar {
+                    storage_symbol: "__zev_isr_state_99_acc".to_string(),
+                    var_name: "acc".to_string(),
+                    ty: MirType::U32,
+                    init: u32_expr(5),
+                }],
+                cond_selector: None,
+            }],
+        }];
+        mir.boot = MirBootSequence {
+            present: true,
+            vars: vec![
+                mk_var(0, "r0", try_recv_res_ty.clone(), VarRole::CompilerTemp),
+                mk_var(1, "r1", try_recv_res_ty, VarRole::CompilerTemp),
+            ],
+            steps: vec![
+                MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                    method: "pend_irq".to_string(),
+                    args: vec![u32_expr(3)],
+                })),
+                MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                    method: "pend_irq".to_string(),
+                    args: vec![u32_expr(3)],
+                })),
+                MirBootStep::Stmt(MirStmt::Assign {
+                    target: MirPlace::Var(VarId(0)),
+                    op: MirAssignOp::Assign,
+                    value: try_recv_expr.clone(),
+                }),
+                MirBootStep::Stmt(MirStmt::Assign {
+                    target: MirPlace::Var(VarId(1)),
+                    op: MirAssignOp::Assign,
+                    value: try_recv_expr,
+                }),
+                MirBootStep::Stmt(MirStmt::PrintFmt {
+                    chunks: vec![
+                        MirFmtChunk::Literal("PRIM_ADDR=".to_string()),
+                        MirFmtChunk::Int {
+                            value: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Add,
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::ResultVal(VarId(0)),
+                                        MirType::U32,
+                                    )),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::ResultVal(VarId(1)),
+                                        MirType::U32,
+                                    )),
+                                },
+                                MirType::U32,
+                            ),
+                            signed: false,
+                            bits: 32,
+                            fmt: MirIntFmt::Dec,
+                        },
+                    ],
+                    newline: true,
+                }),
+                MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                    method: "exit".to_string(),
+                    args: vec![u32_expr(0)],
+                })),
+            ],
+            boot_yielding_callees: vec![],
+        };
+
+        let res = run_qemu_cortex_m(
+            &mir,
+            &dir.join("wave1_prim_addr_state_addrof.elf"),
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("QEMU prim_addr + state addrof run");
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify");
+        assert!(res.build.audit.is_zero_heap_freestanding());
+        assert_eq!(res.exec.exit_code, 0);
+        // 1st fire: 5 + 7 = 12; 2nd fire: 12 + 7 = 19; sum = 31!
+        assert_eq!(res.exec.stdout, "PRIM_ADDR=31\n");
+    }
 }
