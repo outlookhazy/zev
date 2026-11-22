@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use crate::ir::{
     MirBakedArg, MirBlock, MirBootStep, MirExpr, MirExprKind, MirFmtChunk, MirFnBody,
     MirFunction, MirIntrinsicOp, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
-    MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirTerminator, MirType, MirYieldKind,
+    MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirStmt, MirStruct, MirTerminator, MirType,
+    MirYieldKind,
 };
 
 /// Whole-program primitive contention and dead-watch analysis report.
@@ -23,6 +24,8 @@ use crate::ir::{
 pub struct VisibilityReport {
     /// Top-level `watch<T>` primitive names that are never read/waited anywhere.
     pub dead_watches: BTreeSet<String>,
+    /// Top-level primitive names whose address was taken via `GlobalPrimAddr` or `MirBakedArg::PrimAddr`.
+    pub addr_taken_prims: BTreeSet<String>,
     /// Static SRAM bytes saved by stripping dead watches on 32-bit MCU targets.
     pub dead_watch_bytes_saved_32: usize,
     /// Static SRAM bytes saved by stripping dead watches on 64-bit host targets.
@@ -33,6 +36,68 @@ pub struct VisibilityReport {
     pub isr_contended_prim_mangles: BTreeSet<String>,
     /// Non-dead top-level primitives that are pure task-to-task (never touched by an ISR).
     pub elided_globals: BTreeSet<String>,
+}
+
+impl VisibilityReport {
+    /// True iff `name` is an unread dead `watch<T>` whose address is never taken,
+    /// so its `.bss` global storage can be stripped to `0 B`.
+    pub fn can_strip_bss(&self, name: &str) -> bool {
+        self.dead_watches.contains(name) && !self.addr_taken_prims.contains(name)
+    }
+
+    /// Return `module.visibility` when populated, or compute it on demand for
+    /// manually constructed `MirModule` values (e.g. unit-test fixtures).
+    pub fn effective_for(module: &MirModule) -> Self {
+        if module.visibility.dead_watches.is_empty()
+            && module.visibility.isr_contended_globals.is_empty()
+            && module.visibility.isr_contended_prim_mangles.is_empty()
+            && module.visibility.elided_globals.is_empty()
+            && module.visibility.addr_taken_prims.is_empty()
+            && (!module.primitives.is_empty()
+                || !module.subsystems.is_empty()
+                || !module.isrs.is_empty()
+                || !module.irq_vectors.is_empty())
+        {
+            analyze_visibility(module)
+        } else {
+            module.visibility.clone()
+        }
+    }
+
+    /// True if any ISR can access primitives of concrete family `pk` (directly or via unsized views).
+    pub fn is_prim_family_contended(&self, pk: &MirPrimKind) -> bool {
+        if self.isr_contended_prim_mangles.contains(&pk.mangle_name()) {
+            return true;
+        }
+        match pk {
+            MirPrimKind::ByteRing { .. } => {
+                self.isr_contended_prim_mangles.contains("view_byte_ring")
+            }
+            MirPrimKind::Inbox { elem, .. } => self.isr_contended_prim_mangles.contains(
+                &MirPrimViewKind::Inbox { elem: elem.clone() }.mangle_name(),
+            ),
+            _ => false,
+        }
+    }
+
+    /// True if `*inbox<elem>` views may alias an ISR-contended `inbox<elem, N>`.
+    pub fn is_inbox_view_contended(&self, elem: &MirType) -> bool {
+        let vm = MirPrimViewKind::Inbox {
+            elem: Box::new(elem.clone()),
+        }
+        .mangle_name();
+        let prefix = format!("inbox_{}_", elem.mangle_name());
+        self.isr_contended_prim_mangles
+            .iter()
+            .any(|m| m == &vm || m.starts_with(&prefix))
+    }
+
+    /// True if `*byte_ring` views may alias any ISR-contended `byte_ring<N>`.
+    pub fn is_byte_ring_view_contended(&self) -> bool {
+        self.isr_contended_prim_mangles
+            .iter()
+            .any(|m| m == "view_byte_ring" || m.starts_with("byte_ring_"))
+    }
 }
 
 const fn align_up(offset: usize, align: usize) -> usize {
@@ -103,6 +168,8 @@ fn type_size_align(
             (sz * len, al)
         }
         MirType::Primitive(pk) => watch_or_prim_size_align(pk, false, ptr_bytes, structs, seen_structs),
+        MirType::PrimView(MirPrimViewKind::ByteRing) => (ptr_bytes * 2, ptr_bytes),
+        MirType::PrimView(MirPrimViewKind::Inbox { .. }) => (ptr_bytes * 3, ptr_bytes),
         MirType::Result { ok, err } => {
             let mut fields = vec![(1, 1)];
             if let Some(et) = err {
@@ -260,6 +327,9 @@ impl<'a> ScanCtx<'a> {
             MirType::Primitive(pk) => {
                 self.acc.isr_contended_prim_mangles.insert(pk.mangle_name());
             }
+            MirType::PrimView(vk) => {
+                self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+            }
             MirType::Ptr(inner) | MirType::Slice(inner) | MirType::Array { elem: inner, .. } => {
                 self.record_prim_types_in_ty(inner, seen_structs);
             }
@@ -382,6 +452,27 @@ impl<'a> ScanCtx<'a> {
                 if in_isr {
                     self.record_isr_prim_global(name, None);
                 }
+            }
+            MirExprKind::SubsystemAddr(name) => {
+                if in_isr {
+                    self.acc.isr_contended_globals.insert(name.clone());
+                }
+            }
+            MirExprKind::MakePrimView { ptr, cap, kind } => {
+                if in_isr {
+                    self.acc.isr_contended_prim_mangles.insert(kind.mangle_name());
+                    let concrete = match kind {
+                        MirPrimViewKind::ByteRing => MirPrimKind::ByteRing { cap: *cap },
+                        MirPrimViewKind::Inbox { elem } => MirPrimKind::Inbox {
+                            elem: elem.clone(),
+                            cap: *cap,
+                        },
+                    };
+                    self.acc
+                        .isr_contended_prim_mangles
+                        .insert(concrete.mangle_name());
+                }
+                self.visit_expr(ptr, in_isr, callees);
             }
             MirExprKind::FnAddr(name) => {
                 callees.insert(name.clone());
@@ -533,6 +624,76 @@ impl<'a> ScanCtx<'a> {
                     let kind = MirPrimKind::ByteRing { cap: *cap };
                     self.visit_prim_target(target, &kind, in_isr, callees);
                 }
+                MirPrimReadOp::InboxViewTryRecv { view, elem_ty }
+                | MirPrimReadOp::InboxViewLen { view, elem_ty }
+                | MirPrimReadOp::InboxViewCap { view, elem_ty }
+                | MirPrimReadOp::InboxViewIsEmpty { view, elem_ty }
+                | MirPrimReadOp::InboxViewIsFull { view, elem_ty } => {
+                    if in_isr {
+                        let vk = MirPrimViewKind::Inbox {
+                            elem: Box::new(elem_ty.clone()),
+                        };
+                        self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
+                }
+                MirPrimReadOp::InboxViewTrySend {
+                    view,
+                    elem_ty,
+                    value,
+                    ..
+                } => {
+                    if in_isr {
+                        let vk = MirPrimViewKind::Inbox {
+                            elem: Box::new(elem_ty.clone()),
+                        };
+                        self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
+                    self.visit_expr(value, in_isr, callees);
+                }
+                MirPrimReadOp::ByteRingViewPush { view, src, .. }
+                | MirPrimReadOp::ByteRingViewPop { view, dst: src } => {
+                    if in_isr {
+                        self.acc
+                            .isr_contended_prim_mangles
+                            .insert(MirPrimViewKind::ByteRing.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
+                    self.visit_expr(src, in_isr, callees);
+                }
+                MirPrimReadOp::ByteRingViewPushByte { view, byte, .. } => {
+                    if in_isr {
+                        self.acc
+                            .isr_contended_prim_mangles
+                            .insert(MirPrimViewKind::ByteRing.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
+                    self.visit_expr(byte, in_isr, callees);
+                }
+                MirPrimReadOp::ByteRingViewGrantWrite { view, len } => {
+                    if in_isr {
+                        self.acc
+                            .isr_contended_prim_mangles
+                            .insert(MirPrimViewKind::ByteRing.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
+                    self.visit_expr(len, in_isr, callees);
+                }
+                MirPrimReadOp::ByteRingViewReadSlice { view }
+                | MirPrimReadOp::ByteRingViewTryPopByte { view }
+                | MirPrimReadOp::ByteRingViewLen { view }
+                | MirPrimReadOp::ByteRingViewCap { view }
+                | MirPrimReadOp::ByteRingViewFreeSpace { view }
+                | MirPrimReadOp::ByteRingViewIsEmpty { view }
+                | MirPrimReadOp::ByteRingViewIsFull { view } => {
+                    if in_isr {
+                        self.acc
+                            .isr_contended_prim_mangles
+                            .insert(MirPrimViewKind::ByteRing.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
+                }
             },
         }
     }
@@ -619,6 +780,39 @@ impl<'a> ScanCtx<'a> {
                 let kind = MirPrimKind::ByteRing { cap: *cap };
                 self.visit_prim_target(target, &kind, in_isr, callees);
             }
+            MirPrimNonBlockingOp::InboxViewPost {
+                view,
+                elem_ty,
+                value,
+                ..
+            } => {
+                if in_isr {
+                    let vk = MirPrimViewKind::Inbox {
+                        elem: Box::new(elem_ty.clone()),
+                    };
+                    self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                }
+                self.visit_expr(view, in_isr, callees);
+                self.visit_expr(value, in_isr, callees);
+            }
+            MirPrimNonBlockingOp::ByteRingViewConsume { view, len }
+            | MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len, .. } => {
+                if in_isr {
+                    self.acc
+                        .isr_contended_prim_mangles
+                        .insert(MirPrimViewKind::ByteRing.mangle_name());
+                }
+                self.visit_expr(view, in_isr, callees);
+                self.visit_expr(len, in_isr, callees);
+            }
+            MirPrimNonBlockingOp::ByteRingViewClear { view } => {
+                if in_isr {
+                    self.acc
+                        .isr_contended_prim_mangles
+                        .insert(MirPrimViewKind::ByteRing.mangle_name());
+                }
+                self.visit_expr(view, in_isr, callees);
+            }
         }
     }
 
@@ -704,6 +898,12 @@ impl<'a> ScanCtx<'a> {
             }
             MirStmt::FmtBuf { buf, chunks, .. } => {
                 self.visit_expr(buf, in_isr, callees);
+                for ch in chunks {
+                    self.visit_fmt_chunk(ch, in_isr, callees);
+                }
+            }
+            MirStmt::FmtRing { ring, chunks, .. } => {
+                self.visit_expr(ring, in_isr, callees);
                 for ch in chunks {
                     self.visit_fmt_chunk(ch, in_isr, callees);
                 }
@@ -796,6 +996,24 @@ impl<'a> ScanCtx<'a> {
                 MirYieldKind::ByteRingWaitRead { target, cap, .. } => {
                     let kind = MirPrimKind::ByteRing { cap: *cap };
                     self.visit_prim_target(target, &kind, in_isr, callees);
+                }
+                MirYieldKind::InboxViewRecv { view, elem_ty, .. }
+                | MirYieldKind::InboxViewSend { view, elem_ty, .. } => {
+                    if in_isr {
+                        let vk = MirPrimViewKind::Inbox {
+                            elem: Box::new(elem_ty.clone()),
+                        };
+                        self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
+                }
+                MirYieldKind::ByteRingViewWaitRead { view, .. } => {
+                    if in_isr {
+                        self.acc
+                            .isr_contended_prim_mangles
+                            .insert(MirPrimViewKind::ByteRing.mangle_name());
+                    }
+                    self.visit_expr(view, in_isr, callees);
                 }
                 MirYieldKind::CallYielding { callee, args, .. } => {
                     callees.insert(callee.clone());
@@ -895,6 +1113,37 @@ pub fn analyze_visibility(module: &MirModule) -> VisibilityReport {
                         ctx.acc.addr_taken_prims.insert(name.clone());
                         ctx.record_isr_prim_global(name, None);
                     }
+                    MirBakedArg::SubsystemPath {
+                        root,
+                        root_struct,
+                        field_chain,
+                    } => {
+                        ctx.acc.isr_contended_globals.insert(root.clone());
+                        let path_key = if field_chain.is_empty() {
+                            root.clone()
+                        } else {
+                            let chain: Vec<&str> =
+                                field_chain.iter().map(|(f, _)| f.as_str()).collect();
+                            format!("{root}.{}", chain.join("."))
+                        };
+                        ctx.acc.isr_contended_globals.insert(path_key);
+                        let mut cur_ty = MirType::Struct(root_struct.clone());
+                        for (fname, fstruct) in field_chain {
+                            let sname = match &cur_ty {
+                                MirType::Struct(s) => s.as_str(),
+                                _ => fstruct.as_str(),
+                            };
+                            if let Some(st) = ctx.structs.get(sname) {
+                                if let Some(fld) = st.fields.iter().find(|f| &f.name == fname) {
+                                    cur_ty = fld.ty.clone();
+                                    continue;
+                                }
+                            }
+                            cur_ty = MirType::Struct(fstruct.clone());
+                        }
+                        let mut seen_structs = BTreeSet::new();
+                        ctx.record_prim_types_in_ty(&cur_ty, &mut seen_structs);
+                    }
                     MirBakedArg::MmioAddr(_) => {}
                     MirBakedArg::Const(expr) => {
                         let mut c = BTreeSet::new();
@@ -982,6 +1231,7 @@ pub fn analyze_visibility(module: &MirModule) -> VisibilityReport {
 
     VisibilityReport {
         dead_watches,
+        addr_taken_prims: ctx.acc.addr_taken_prims,
         dead_watch_bytes_saved_32,
         dead_watch_bytes_saved_64,
         isr_contended_globals: ctx.acc.isr_contended_globals,
@@ -1087,6 +1337,7 @@ mod tests {
             consts: vec![],
             enums: vec![],
             structs: vec![],
+            subsystems: vec![],
             mmio_layouts: vec![],
             mmio_instances: vec![],
             primitives: vec![],
@@ -1105,6 +1356,7 @@ mod tests {
                 steps: vec![],
                 boot_yielding_callees: vec![],
             },
+            visibility: VisibilityReport::default(),
             ram_report: RamReport::default(),
         }
     }
@@ -1566,6 +1818,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "w_b".to_string(),
@@ -1575,6 +1829,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "w_other_ty".to_string(),
@@ -1584,6 +1840,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
         ];
         mir.functions.push(MirFunction {
@@ -1674,6 +1932,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "task_only_w".to_string(),
@@ -1683,6 +1943,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "dead_isr_w".to_string(),
@@ -1692,6 +1954,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "isr_callee_q".to_string(),
@@ -1702,6 +1966,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "task_only_sig".to_string(),
@@ -1709,6 +1975,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "isr_ptr_ring".to_string(),
@@ -1716,6 +1984,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
         ];
 
@@ -1959,6 +2229,7 @@ mod tests {
         mir.structs.push(MirStruct {
             name: "Pair".to_string(),
             packed: false,
+            is_subsystem: false,
             fields: vec![
                 MirField {
                     name: "a".to_string(),
@@ -1978,6 +2249,8 @@ mod tests {
             dma_safe: false,
             init: None,
             sleep_lock_bit: None,
+            dead_stripped: false,
+            irq_mask_elided: false,
         });
         mir.primitives.push(MirPrimitive {
             name: "task_sig".to_string(),
@@ -1985,6 +2258,8 @@ mod tests {
             dma_safe: false,
             init: None,
             sleep_lock_bit: None,
+            dead_stripped: false,
+            irq_mask_elided: false,
         });
         // Cyclic helper functions reachable from ISR (must terminate cleanly without stack overflow)
         mir.functions.push(MirFunction {
@@ -2086,6 +2361,8 @@ mod tests {
                 dma_safe: true,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "fmt_live_w".to_string(),
@@ -2095,6 +2372,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
         ];
         mir.functions.push(MirFunction {

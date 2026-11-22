@@ -364,6 +364,10 @@ pub struct MirPrimitive {
     pub init: Option<MirExpr>,
     /// Assigned wake-lock bit (`0..31`) if this primitive clamps sleep depth (`ping_pong`, `lease`).
     pub sleep_lock_bit: Option<u8>,
+    /// True if whole-program visibility proved this `watch<T>` unread and address-free (`.bss` stripped).
+    pub dead_stripped: bool,
+    /// True if whole-program visibility proved this primitive never contended by any hardware ISR.
+    pub irq_mask_elided: bool,
 }
 
 /// Function error exit specification (`error` or `error ErrType`).
@@ -1561,5 +1565,6 @@ pub struct MirModule {
     /// Sorted list of enum names referenced by `MirFmtChunk::EnumName` (for on-demand `.rodata` variant-name tables).
     pub formatted_enums: Vec<String>,
     pub boot: MirBootSequence,
+    pub visibility: crate::opt::VisibilityReport,
     pub ram_report: RamReport,
 }

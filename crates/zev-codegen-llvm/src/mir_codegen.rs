@@ -912,6 +912,9 @@ impl<'a> ModuleCtx<'a> {
             }
         }
         for p in &self.module.primitives {
+            if p.dead_stripped {
+                continue;
+            }
             self.prim_globals.insert(p.name.clone(), p.kind.clone());
             self.register_prim_kind(&p.kind);
         }
@@ -2485,6 +2488,10 @@ ok_bb:
 
         // Emit static global primitive instances
         for p in &self.module.primitives {
+            if p.dead_stripped {
+                let _ = writeln!(out, "; dead watch stripped: @__syn_prim_{}", sanitize_ident(&p.name));
+                continue;
+            }
             let gsym = format!("@__syn_prim_{}", sanitize_ident(&p.name));
             let pty = format!("%prim.{}", sanitize_ident(&p.kind.mangle_name()));
             let align = if p.dma_safe { 16 } else { 4 };
@@ -2566,15 +2573,17 @@ ok_bb:
         }
         let _ = writeln!(out);
 
+        let vis = zev_mir::opt::VisibilityReport::effective_for(self.module);
         // Emit typed primitive runtime helpers for each distinct primitive kind
         let fn_sz = self.opts.fn_size_attrs();
         for (mangled, pk) in &self.distinct_prims {
             let id = sanitize_ident(mangled);
             let pty = format!("%prim.{id}");
+            let mut sec = String::new();
             match pk {
                 MirPrimKind::Signal => {
                     let _ = writeln!(
-                        out,
+                        sec,
                         r#"define void @__syn_sig_notify_{id}(ptr %s, i32 %boost) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
@@ -2628,7 +2637,7 @@ empty:
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
                     let _ = writeln!(
-                        out,
+                        sec,
                         r#"define void @__syn_watch_pub_{id}(ptr %w, {ety} %val) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
@@ -2657,7 +2666,7 @@ entry:
                     let ety = self.llvm_ty(elem);
                     let c = (*cap).max(1) as i32;
                     let _ = writeln!(
-                        out,
+                        sec,
                         r#"define i8 @__syn_q_push_{id}(ptr %q, {ety} %val, i32 %boost) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
@@ -2732,7 +2741,7 @@ empty:
                 }
                 MirPrimKind::PingPong { .. } => {
                     let _ = writeln!(
-                        out,
+                        sec,
                         r#"define void @__syn_pp_set_active_{id}(ptr %pp, i8 %active) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
@@ -2794,7 +2803,7 @@ none:
                 }
                 MirPrimKind::Lease { .. } => {
                     let _ = writeln!(
-                        out,
+                        sec,
                         r#"define void @__syn_lease_set_active_{id}(ptr %ls, i8 %active) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
@@ -2868,7 +2877,7 @@ none:
                     let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
                     let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
                     let _ = writeln!(
-                        out,
+                        sec,
                         r#"define i32 @__syn_ring_seg1_{id}(ptr %r) nounwind{fn_sz} {{
 entry:
   %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
@@ -3400,13 +3409,18 @@ entry:
                     );
                 }
             }
+            if !vis.is_prim_family_contended(pk) {
+                elide_llvm_crit(&mut sec);
+            }
+            out.push_str(&sec);
         }
 
         // Emit capacity-erased unsized `*inbox<T>` view helpers
         for (key, elem) in &self.distinct_inbox_views {
             let ety = self.llvm_ty(elem);
+            let mut sec = String::new();
             let _ = writeln!(
-                out,
+                sec,
                 r#"define i8 @__syn_q_view_push_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost) nounwind{fn_sz} {{
 entry:
   %pm = call i32 @__syn_crit_enter()
@@ -3482,10 +3496,15 @@ empty:
 }}
 "#
             );
+            if !vis.is_inbox_view_contended(elem) {
+                elide_llvm_crit(&mut sec);
+            }
+            out.push_str(&sec);
         }
 
         // Emit capacity-erased unsized `*byte_ring` view helpers (pure SSA, zero non-entry allocas)
         if self.uses_byte_ring_view {
+            let mut sec = String::new();
             let usize_ty = self.opts.target.usize_llvm_ty();
             let slice_ty = format!("{{ ptr, {usize_ty} }}");
             let res_slice_ty = format!("{{ {slice_ty}, i32 }}");
@@ -3509,7 +3528,7 @@ empty:
             let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
             let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
             let _ = writeln!(
-                out,
+                sec,
                 r#"define i32 @__syn_ring_view_seg1(ptr %r, i32 %cap) nounwind{fn_sz} {{
 entry:
   %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
@@ -4047,6 +4066,10 @@ entry:
 }}
 "#
             );
+            if !vis.is_byte_ring_view_contended() {
+                elide_llvm_crit(&mut sec);
+            }
+            out.push_str(&sec);
         }
     }
 
@@ -6932,6 +6955,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 elem_ty,
                 value,
             } => {
+                if let MirPrimTarget::Global(name) = target {
+                    if self
+                        .ctx
+                        .module
+                        .primitives
+                        .iter()
+                        .any(|p| p.name == *name && p.dead_stripped)
+                    {
+                        let _ = self.emit_expr(value)?;
+                        return Ok(());
+                    }
+                }
                 let pk = MirPrimKind::Watch {
                     elem: Box::new(elem_ty.clone()),
                 };
@@ -9055,5 +9090,16 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.emit_line(format!("{t} = {inst} {common_ty} {}, {}", lc.repr, rc.repr));
         let dst_lty = self.ctx.llvm_ty(&res_ty.host_value_type());
         Ok(self.coerce(SsaVal::new(common_ty, t), &dst_lty, !res_ty.is_unsigned()))
+    }
+}
+
+fn elide_llvm_crit(ir: &mut String) {
+    if ir.contains("%pm = call i32 @__syn_crit_enter()") {
+        *ir = ir
+            .replace(
+                "  %pm = call i32 @__syn_crit_enter()\n",
+                "  ; irq-mask elided (task-to-task)\n",
+            )
+            .replace("  call void @__syn_crit_exit(i32 %pm)\n", "");
     }
 }

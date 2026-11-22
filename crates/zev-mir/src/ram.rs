@@ -130,6 +130,8 @@ pub struct PrimitiveRam {
     pub kind_display: String,
     pub dma_safe: bool,
     pub holds_sleep_lock: bool,
+    pub dead_stripped: bool,
+    pub irq_mask_elided: bool,
     pub bytes_32: usize,
     pub bytes_64: usize,
 }
@@ -295,6 +297,11 @@ impl RamReport {
                 }
                 if p.holds_sleep_lock {
                     flags.push("clamps sleep->LIGHT");
+                }
+                if p.dead_stripped {
+                    flags.push("dead watch stripped -> 0 B");
+                } else if p.irq_mask_elided {
+                    flags.push("irq-mask elided");
                 }
                 let flag_str = if flags.is_empty() {
                     String::new()
@@ -829,13 +836,21 @@ pub fn compute_ram_report_with_subsystems(
 
     let mut prim_rams = Vec::new();
     for p in primitives {
-        let s32 = ctx.prim_layout(&p.kind, p.dma_safe, TargetAbi::Mcu32).size;
-        let s64 = ctx.prim_layout(&p.kind, p.dma_safe, TargetAbi::Host64).size;
+        let (s32, s64) = if p.dead_stripped {
+            (0, 0)
+        } else {
+            (
+                ctx.prim_layout(&p.kind, p.dma_safe, TargetAbi::Mcu32).size,
+                ctx.prim_layout(&p.kind, p.dma_safe, TargetAbi::Host64).size,
+            )
+        };
         prim_rams.push(PrimitiveRam {
             name: p.name.clone(),
             kind_display: p.kind.display_name(),
             dma_safe: p.dma_safe,
             holds_sleep_lock: p.kind.holds_dma_sleep_lock(),
+            dead_stripped: p.dead_stripped,
+            irq_mask_elided: p.irq_mask_elided,
             bytes_32: s32,
             bytes_64: s64,
         });
@@ -859,6 +874,8 @@ pub fn compute_ram_report_with_subsystems(
             kind_display: sub.struct_name.clone(),
             dma_safe: sub.dma_safe,
             holds_sleep_lock: struct_holds_dma_sleep_lock(&sub.struct_name, &ctx.structs),
+            dead_stripped: false,
+            irq_mask_elided: false,
             bytes_32: s32,
             bytes_64: s64,
         });

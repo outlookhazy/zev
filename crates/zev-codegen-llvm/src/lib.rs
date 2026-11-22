@@ -2501,6 +2501,8 @@ mod tests {
                 dma_safe: false,
                 init: None,
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "shared_hits".to_string(),
@@ -2510,6 +2512,8 @@ mod tests {
                 dma_safe: false,
                 init: Some(MirExpr::new(MirExprKind::IntLit(0), MirType::U32)),
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
             MirPrimitive {
                 name: "sel_val".to_string(),
@@ -2519,6 +2523,8 @@ mod tests {
                 dma_safe: false,
                 init: Some(MirExpr::new(MirExprKind::IntLit(0), MirType::U32)),
                 sleep_lock_bit: None,
+                dead_stripped: false,
+                irq_mask_elided: false,
             },
         ];
 
@@ -3299,6 +3305,8 @@ mod tests {
             dma_safe: false,
             init: None,
             sleep_lock_bit: None,
+            dead_stripped: false,
+            irq_mask_elided: false,
         }];
         mir.isrs = vec![isr_handler];
         mir.irq_vectors = vec![MirIrqVector {
@@ -3564,6 +3572,7 @@ fn main() {
             "__syn_avr_vec_3",
             "__syn_avr_vec_11",
             "__syn_avr_vec_18",
+            "__syn_avr_vec_19",
         ] {
             assert!(
                 img.elf.audit.defined_symbols.iter().any(|s| s == req_sym),
@@ -4195,5 +4204,81 @@ fn main() {
         assert!(over_proof.total_high_water_bytes > 2_048);
         assert!(!over_proof.within_budget);
         assert!(over_proof.format_table().contains("FAIL"));
+    }
+
+    #[test]
+    fn visibility_strips_dead_watch_and_elides_task_only_irq_masks() {
+        let src = r#"
+watch<u64> dead_diag = 0;
+watch<u32> task_metric = 7;
+watch<u16> isr_hits = 0;
+byte_ring<16> task_ring;
+irq IRQ_TEST = 2;
+
+isr on_test(*watch<u16> hits) {
+    hits.publish(hits.read() + 1);
+}
+
+task worker() {
+    task_metric.publish(42);
+    task_ring.push_byte(9);
+    loop {
+        u32 m = task_metric.read();
+        u16 h = isr_hits.read();
+        u8 b = task_ring.try_pop_byte() or 0;
+        if (m > 0 && h == 999 && b == 99) {
+            sys.exit(0);
+        }
+        sys.delay(5ms);
+    }
+}
+
+fn main() {
+    dead_diag.publish(12345);
+    IRQ_TEST.attach(on_test(&isr_hits));
+    spawn worker() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse visibility LLVM test");
+        zev_sema::analyze_program(&prog).expect("sema visibility LLVM test");
+        let mir = zev_mir::lower_program(&prog).expect("lower visibility LLVM test");
+        let ram_txt = mir.ram_report.format_table();
+        assert!(
+            ram_txt.contains("dead watch stripped -> 0 B"),
+            "expected dead watch stripped in RAM report:\n{ram_txt}"
+        );
+        assert!(
+            ram_txt.contains("irq-mask elided"),
+            "expected irq-mask elided in RAM report:\n{ram_txt}"
+        );
+        let ll = emit_llvm_ir_with_options(&mir, &CodegenOptions::default()).expect("emit IR");
+        assert!(
+            !ll.contains("@__syn_prim_dead_diag ="),
+            "dead watch global should be stripped from LLVM IR .bss"
+        );
+        // Task-only watch<u32> helper must elide @__syn_crit_enter, while ISR watch<u16> retains it
+        let u32_fn_start = ll.find("define void @__syn_watch_pub_watch_u32").unwrap();
+        let u32_fn_end = ll[u32_fn_start..].find("\n}\n").unwrap() + u32_fn_start;
+        assert!(
+            ll[u32_fn_start..u32_fn_end].contains("; irq-mask elided"),
+            "task-only watch<u32> should elide critical section:\n{}",
+            &ll[u32_fn_start..u32_fn_end]
+        );
+        assert!(!ll[u32_fn_start..u32_fn_end].contains("@__syn_crit_enter"));
+
+        let ring_fn_start = ll.find("define i8 @__syn_ring_push_byte_byte_ring_16").unwrap();
+        let ring_fn_end = ll[ring_fn_start..].find("\n}\n").unwrap() + ring_fn_start;
+        assert!(
+            ll[ring_fn_start..ring_fn_end].contains("; irq-mask elided"),
+            "task-only byte_ring<16> should elide critical section:\n{}",
+            &ll[ring_fn_start..ring_fn_end]
+        );
+
+        let u16_fn_start = ll.find("define void @__syn_watch_pub_watch_u16").unwrap();
+        let u16_fn_end = ll[u16_fn_start..].find("\n}\n").unwrap() + u16_fn_start;
+        assert!(
+            ll[u16_fn_start..u16_fn_end].contains("@__syn_crit_enter"),
+            "ISR-contended watch<u16> must keep critical section"
+        );
     }
 }

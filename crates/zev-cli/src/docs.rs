@@ -32,7 +32,7 @@ CORE MENTAL MODEL (5 RULES):
      through static primitives: `watch<T>`, unified `inbox<T, N>` (`.post`, `.send`, `.recv`),
      `signal`, `ping_pong<T, N>`, and `lease<T, N>` (with optional ISR `boost: @critical`).
   5. Dual-Exit Errors, `defer` & Zero-Heap `f\"...\"`: Normal exit `return val;`, failure `error [E [, v]];`,
-     handled via `or <val>` / `catch (...)`. `println(f\"t={t:.2} x=0x{v:04x}\")` & `fmt_buf(dst, f\"...\")` use 0 heap.
+     handled via `or <val>` / `catch (...)`. `println(...)`, `fmt_buf`, & `fmt_ring` use 0 heap.
 
 ROSETTA STONE (FOREIGN HABIT -> IDIOMATIC ZEV):
   Foreign Habit (Rust / Zig / Go / C)     | Idiomatic Zev (`.zev`)
@@ -46,8 +46,8 @@ ROSETTA STONE (FOREIGN HABIT -> IDIOMATIC ZEV):
   `Result<u16, E>` / `!u16` / `try f()`   | `u16 f() error E` + `error Bad;` + `catch (E e)` / `or 0`
   `for (int i=0; i<n; i++)` / `for i in`  | `for (usize i in 0..n) { ... }` / `for (u8 b in slice)`
   `every 1ms { ... }` / `chan<T, N>`      | `loop every 1ms { ... }` / unified `inbox<T, N>`
-  `struct R<'a> { b: &'a mut [u8] }`      | `struct R { []u8 b; }` + `i32 *ptr` (0 `'a` syntax)
-  `println!(\"t={:.2}\", t)` / `snprintf`   | `println(f\"t={t:.2} {pkt:?}\");` / `fmt_buf(dst, f\"...\")`
+  `struct R<'a> { b: &'a mut [u8] }`      | `struct R { []u8 b; }` + `*byte_ring` / `*inbox<T>` views
+  `println!(\"t={:.2}\", t)` / `snprintf`   | `println(f\"t={t:.2}\");` / `fmt_buf` / `fmt_ring`
   RAII Drop guard                         | `defer cs_high();` or `defer { ... }` (LIFO on return/error)
 
 SHARDED TOPIC GUIDES (`zevc doc <topic>`):
@@ -55,10 +55,10 @@ SHARDED TOPIC GUIDES (`zevc doc <topic>`):
   zevc doc errors       Dual-exit `error`, partial progress, `fmt_buf -> []u8 error FmtErr`, `catch` / `or`
   zevc doc tasks        Boot-Tree `spawn`, immortal `task` + `restart;`, `loop every <period_expr>`
   zevc doc yielding     3-tier effects (`SoftYielding` dual-spec), `noyield`, `critical`, `isr`, FFI
-  zevc doc primitives   Unified `inbox` (`.post`/`.send`/`.recv`), `watch`, `signal`, `boost: @critical`
+  zevc doc primitives   `inbox`, `watch`, `signal`, `byte_ring<N>`, `*byte_ring`/`*inbox<T>` views, subsystems
   zevc doc dma          `@dma_safe ping_pong`, `lease`, zero-`'a` scope/lease rules, sleep locks
-  zevc doc runtime      Zero-heap `f\"...\"`, `import`/`pub` modules, typed `mmio`, `irq.attach`, `sys.*`
-  zevc doc targets      `zevc check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, ESP32-C6
+  zevc doc runtime      Zero-heap `f\"...\"` (`fmt_buf`/`fmt_ring`), `import`/`pub`, typed `mmio`, `irq.attach`
+  zevc doc targets      `zevc check [--json]`, `ram --target`, `import-svd`, `run`, `run-qemu`, ESP32-C6, AVR
 
 ERROR CODE EXPLAINERS (`zevc doc <code>` or `zevc doc --list`):
   Parser Traps   : P0001..P0012  (instant rewrites for `let`, `->`, `async`, `for(;;)`, bare `every`, `chan`)
@@ -320,9 +320,9 @@ fn spi_burst_transfer([]u8 tx, *hw.GpioRegs cs_port, *hw.SpiRegs spi) {
         name: "primitives",
         aliases: &[
             "prim", "signal", "watch", "inbox", "byte_ring", "chan", "channel", "channels",
-            "isolation", "globals", "boost",
+            "isolation", "globals", "boost", "subsystem", "subsystems", "view", "views",
         ],
-        summary: "Static OS primitives (`inbox`, `watch`, `signal`, `byte_ring<N>`) and ISR `boost: @critical`",
+        summary: "Static OS primitives, subsystem `struct`s, `*byte_ring`/`*inbox<T>` views, and `boost:`",
         body: "\
 # Zev Topic Guide: `primitives`
 
@@ -335,12 +335,28 @@ values or static scheduler-aware OS primitives at module scope and pass pointers
 |---|---|---|---|
 | `watch<T> w = init;` | Latest-value cell | `w.read() -> T`, `w.publish(v)` | `w.wait() -> T` |
 | `inbox<T, N> q;` | Unified bounded queue | `q.post(v [, boost: @prio])`, `q.try_send(v) -> bool`, `q.try_recv()` | `q.send(v [, timeout: d])`, `q.recv([timeout: d]) -> T` |
-| `byte_ring<N> r;` | Lock-free SPSC stream / BipBuffer | `r.push(s)`, `r.push_byte(b)`, `r.grant_write(n)`, `r.commit_write(n)`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
+| `byte_ring<N> r;` | Lock-free SPSC stream / BipBuffer | `r.push(s [, boost:])`, `r.push_byte(b [, boost:])`, `r.grant_write(n)`, `r.commit_write(n [, boost:])`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
 | `signal s;` | Lightweight wakeup | `s.notify([boost: @prio])`, `s.try_wait() -> bool`, `s.clear()` | `s.wait([timeout: d])` |
 
 Inspection helpers `.len()`, `.is_empty()`, `.is_full()` work on both `inbox<T, N>` and `byte_ring<N>` (plus `.cap()` and `.free_space()` on `byte_ring<N>`), while stale `read_slice()`, `wait_read()`, or `grant_write()` slices after `consume()` / `pop()` / `commit_write()` are caught at compile time (`E0011`).
 
-## 2. ISR Priority Elevation (`boost: @critical`) & Sequential Dispatch
+## 2. Subsystem `struct`s & Capacity-Erased Views (`*byte_ring`, `*inbox<T>`)
+Group a driver's RX/TX rings, queues, or flags inside a module-level `struct` instantiated as a static primitive:
+```zev
+struct SerialPort {
+    byte_ring<64> rx;
+    byte_ring<128> tx;
+    watch<u32> drops;
+}
+SerialPort usb_serial;
+
+fn flush_tx(*byte_ring tx) { /* ... works for byte_ring<64>, byte_ring<128>, etc. ... */ }
+fn push_evt(*inbox<u32> q, u32 ev) { q.try_send(ev); }
+```
+- `*byte_ring` and `*inbox<T>` are two-word fat capacity-erased views (no dynamic vtables, no `<usize N>` code duplication on Flash).
+- Whole-program visibility optimization automatically strips unread `watch<T>` cells (`0 B` `.bss`, keeping side effects in `.publish(expr)`) and elides IRQ critical sections (`irq_mask_elided`) when a primitive or view family is never accessed from an `isr`.
+
+## 3. ISR Priority Elevation (`boost: @critical`) & Sequential Dispatch
 An `isr` can wake a low-priority supervisor at elevated priority for a single turn; priority
 automatically restores to the task's base priority when that turn loops back to `recv()` (or `restart;`):
 
@@ -428,20 +444,23 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
         name: "runtime",
         aliases: &[
             "io", "std", "sys", "hw", "chip", "bsp", "mmio", "irq", "attach", "nvic", "print",
-            "println", "uart", "fmt", "format", "fstring",
+            "println", "uart", "fmt", "format", "fstring", "fmt_ring",
         ],
-        summary: "Zero-heap `f\"...\"`, typed `mmio` (`@rw`/`@ro`/`@wo`/`@w1c`), `irq.attach`, and `sys.*`",
+        summary: "Zero-heap `f\"...\"` (`fmt_buf`/`fmt_ring`), typed `mmio`, `irq.attach`, and `sys.*`",
         body: "\
 # Zev Topic Guide: `runtime`
 
-## 1. Zero-Heap Streamable `f\"...\"` Formatting (`print`, `println`, `fmt_buf`)
+## 1. Zero-Heap Streamable `f\"...\"` Formatting (`print`, `println`, `fmt_buf`, `fmt_ring`)
 `f\"...\"` unpacks at compile time into direct per-call-site chunk writes (zero `malloc`, zero runtime
 format-string parser, zero global handler registry):
 - **Console / UART Sinks**: `print(f\"...\");` and `println(f\"...\");` stream directly to host `stdout`,
-  Cortex-M3 `UART0` (`0x4000C000`), or ESP32-C6 `USB_DEVICE` (`/dev/ttyACM0`).
+  Cortex-M3 `UART0` (`0x4000C000`), ESP32-C6 `USB_DEVICE`, or ATmega328P `USART0`.
 - **Bounded Buffer Sink**: `fmt_buf(dst, f\"...\") -> []u8 error FmtErr` proves worst-case capacity fit at
   compile time when all holes are bounded (`E0028` if `dst` is too small) and returns dual-exit
   `error Truncated, clamped_slice;` when dynamic `[]u8` slices exceed `dst.len`.
+- **Ring Stream Sink**: `fmt_ring(tx_ring, f\"...\" [, boost: @prio]) -> usize error FmtErr` accepts
+  `*byte_ring<N>` or capacity-erased `*byte_ring`, emits directly into the SPSC ring with single-wake
+  notification, and supports `boost:` for interrupt-driven or buffered serial TX.
 - **Supported `{...}` Specifiers** (`{{` and `}}` escape literal braces):
   - `{v}` — Decimal integers, `bool`, `[]u8` / string literals, default `.2` fixed float, and automatic
     `enum` variant names (`.rodata` emitted only for formatted enums!).
@@ -501,13 +520,17 @@ zevc check examples/motor_controller.zev examples/motor_support.zev
 zevc check --json app.zev             # Structured JSON diagnostics + dual-spec & monomorphized lists
 ```
 
-## 2. SVD Hardware Generation & Static SRAM Provenance (`zevc import-svd`, `zevc ram`)
+## 2. SVD Hardware Generation & Static SRAM + Stack Proofs (`zevc import-svd`, `zevc ram`)
 Generate typed `.zev` `pub mmio` layouts, peripheral base addresses, and `pub irq` tokens directly
-from any vendor CMSIS-SVD file, and inspect exact 32-bit/64-bit `.bss`/ISR `state`/union RAM budgets:
+from any vendor CMSIS-SVD file, inspect exact 32-bit/64-bit `.bss`/ISR `state`/union RAM budgets
+(with automatic dead-`watch` stripping & IRQ-mask elision telemetry), or run a hardware single-stack +
+`.bss` high-water proof (`--target <cortex-m3|esp32c6|avr>` using LLVM `.stack_sizes` / AVR disassembly):
 ```bash
 zevc import-svd vendor/STM32G474.svd -o chip/stm32g474.zev
 zevc check -I chip examples/motor_controller.zev examples/motor_support.zev
 zevc ram examples/motor_controller.zev examples/motor_support.zev
+zevc ram --target esp32c6 examples/esp32c6_demo.zev
+zevc ram --target avr examples/arduino_uno_demo.zev
 ```
 
 ## 3. Stage 0: Freestanding C99 & Sanitized Host Simulation (`emit-c`, `run`)
@@ -660,6 +683,11 @@ mod tests {
             "floats",
             "fmt",
             "fmt_buf",
+            "fmt_ring",
+            "subsystem",
+            "views",
+            "ram",
+            "avr",
             "for",
             "defer",
             "restart",

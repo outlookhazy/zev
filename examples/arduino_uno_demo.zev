@@ -10,10 +10,16 @@
 
 import chip.atmega328p as hw;
 import bsp.arduino_uno as bsp;
+import std.io as io;
+
+struct SerialPort {
+    byte_ring<64> rx;
+    byte_ring<80> tx;
+}
 
 inbox<u32, 8> t1_inbox;
 watch<u32>    pad_edges = 0;
-byte_ring<64> uart_rx;
+SerialPort    uart_port;
 
 isr timer1_isr(*inbox<u32, 8> q, *hw.TifrRegs tifr) {
     state u32 seq = 0;
@@ -22,11 +28,22 @@ isr timer1_isr(*inbox<u32, 8> q, *hw.TifrRegs tifr) {
     q.post(seq, boost: @critical);
 }
 
-isr uart_rx_isr(*byte_ring<64> rx, *hw.Usart0Regs uart) {
+isr uart_rx_isr(*byte_ring rx, *hw.Usart0Regs uart) {
     state u32 rx_bytes = 0;
     rx_bytes += 1;
     u8 b = uart.udr0;
     rx.push_byte(b, boost: @high);
+}
+
+isr uart_tx_isr(*byte_ring tx, *hw.Usart0Regs uart) {
+    state u32 tx_bytes = 0;
+    u8 b = tx.try_pop_byte() catch {
+        u8 ctrl = uart.ucsr0b;
+        uart.ucsr0b = ctrl & (~hw.BIT_UDRIE0);
+        return;
+    };
+    tx_bytes += 1;
+    uart.udr0 = b;
 }
 
 isr pcint_isr_a(*hw.PcifrRegs pcifr) {
@@ -39,6 +56,12 @@ isr pcint_isr_b(*watch<u32> w) {
     state u32 count = 0;
     count += 1;
     w.publish(count);
+}
+
+fn kick_uart_tx(*byte_ring tx) {
+    if (!tx.is_empty()) {
+        bsp.enable_uart_udre_irq();
+    }
 }
 
 task led_blinker() {
@@ -66,21 +89,38 @@ task uno_telemetry() {
     }
 }
 
-task serial_cmd_worker(*byte_ring<64> rx, *watch<u32> edges_w) {
+task serial_cmd_worker(*SerialPort port, *watch<u32> edges_w) {
+    *byte_ring rx = &port.rx;
+    *byte_ring tx = &port.tx;
     u32 cmds = 0;
     loop {
         []u8 chunk = rx.wait_read();
         usize n = chunk.len;
-        for (u8 ch in chunk) {
+        []u8 trimmed = io.trim_ascii(chunk);
+        for (u8 ch in trimmed) {
             if (ch == 'p' || ch == 'P' || ch == '?') {
                 cmds += 1;
-                println(f"[CMD UNO] PONG uptime={sys.now_ms()}ms led={bsp.read_led()} edges={edges_w.read()} cmds={cmds}");
+                usize wn = fmt_ring(tx, f"[CMD UNO] PONG uptime={sys.now_ms()}ms led={bsp.read_led()} edges={edges_w.read()} cmds={cmds}\r\n") catch { 0 };
+                if (wn > 0) {
+                    kick_uart_tx(tx);
+                }
+            } else if (ch == 's' || ch == 'S' || ch == 'v' || ch == 'V') {
+                cmds += 1;
+                u16 vcc = bsp.read_mcu_vcc_mv();
+                u16 a0 = bsp.read_a0();
+                usize wn = fmt_ring(tx, f"[SENS UNO] vcc={vcc}mV a0={a0} led={bsp.read_led()} cmds={cmds}\r\n") catch { 0 };
+                if (wn > 0) {
+                    kick_uart_tx(tx);
+                }
             } else if (ch == 't' || ch == 'T') {
                 cmds += 1;
                 noyield {
                     bsp.toggle_led();
                 }
-                println(f"[CMD UNO] TOGGLE led={bsp.read_led()} cmds={cmds}");
+                usize wn = fmt_ring(tx, f"[CMD UNO] TOGGLE led={bsp.read_led()} cmds={cmds}\r\n") catch { 0 };
+                if (wn > 0) {
+                    kick_uart_tx(tx);
+                }
             }
         }
         rx.consume(n);
@@ -89,10 +129,12 @@ task serial_cmd_worker(*byte_ring<64> rx, *watch<u32> edges_w) {
 
 fn main() {
     bsp.init_board_gpio();
+    bsp.init_adc();
     hw.IRQ_TIMER1_COMPA.attach(timer1_isr(&t1_inbox, hw.TIFR));
     hw.IRQ_PCINT0.attach_shared(pcint_isr_a(hw.PCIFR));
     hw.IRQ_PCINT0.attach_shared(pcint_isr_b(&pad_edges));
-    hw.IRQ_USART_RX.attach(uart_rx_isr(&uart_rx, hw.USART0));
+    hw.IRQ_USART_RX.attach(uart_rx_isr(&uart_port.rx, hw.USART0));
+    hw.IRQ_USART_UDRE.attach(uart_tx_isr(&uart_port.tx, hw.USART0));
     bsp.enable_led_pcint();
     bsp.start_timer1_ctc(15624);
     bsp.enable_uart_rx_irq();
@@ -102,5 +144,5 @@ fn main() {
 
     spawn led_blinker() @high;
     spawn uno_telemetry() @normal;
-    spawn serial_cmd_worker(&uart_rx, &pad_edges) @normal;
+    spawn serial_cmd_worker(&uart_port, &pad_edges) @normal;
 }

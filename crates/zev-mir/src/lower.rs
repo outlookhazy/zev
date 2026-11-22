@@ -881,6 +881,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                     dma_safe: pinfo.dma_safe,
                     init,
                     sleep_lock_bit: pinfo.sleep_lock_bit,
+                    dead_stripped: false,
+                    irq_mask_elided: false,
                 });
             }
             _ => {}
@@ -1066,8 +1068,35 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         monomorphized_instances,
         formatted_enums,
         boot,
+        visibility: crate::opt::VisibilityReport::default(),
         ram_report: RamReport::default(),
     };
+
+    let vis = crate::opt::analyze_visibility(&module);
+    for p in &mut module.primitives {
+        p.dead_stripped = vis.can_strip_bss(&p.name);
+        let view_contended = if vis.addr_taken_prims.contains(&p.name) {
+            match &p.kind {
+                MirPrimKind::ByteRing { .. } => {
+                    vis.isr_contended_prim_mangles.contains("view_byte_ring")
+                }
+                MirPrimKind::Inbox { elem, .. } => vis.isr_contended_prim_mangles.contains(
+                    &MirPrimViewKind::Inbox {
+                        elem: elem.clone(),
+                    }
+                    .mangle_name(),
+                ),
+                _ => false,
+            }
+        } else {
+            false
+        };
+        p.irq_mask_elided = !p.dead_stripped
+            && !view_contended
+            && !vis.isr_contended_globals.contains(&p.name)
+            && !vis.isr_contended_prim_mangles.contains(&p.kind.mangle_name());
+    }
+    module.visibility = vis;
 
     populate_module_ram_report(&mut module);
     Ok(module)
