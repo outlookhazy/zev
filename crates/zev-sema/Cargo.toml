@@ -9,6 +9,4 @@ description = "Whole-program static verifier and semantic analyzer for the Zev L
 
 [dependencies]
 zev-ast = { path = "../zev-ast" }
-
-[dev-dependencies]
 zev-parser = { path = "../zev-parser" }

@@ -2,7 +2,7 @@
 //! `zev-codegen-llvm`, and `zev-cli`.
 
 use std::collections::{BTreeMap, BTreeSet};
-use zev_ast::{DurationLit, Priority, Span};
+use zev_ast::{DurationLit, Expr, MmioAccess, PrimType, Priority, Span};
 
 use crate::call_graph::CallGraph;
 use crate::types::{
@@ -123,8 +123,82 @@ pub struct PriorityBoostSite {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IsrInfo {
     pub vector: String,
+    pub params: Vec<ParamInfo>,
     pub callees: Vec<String>,
     pub priority_boosts: Vec<PriorityBoostSite>,
+    pub span: Span,
+}
+
+/// Resolved `mmio` register metadata inside an [`MmioLayoutInfo`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmioRegInfo {
+    pub name: String,
+    pub access: MmioAccess,
+    pub elem_ty: PrimType,
+    pub array_len: Option<usize>,
+    pub offset: u32,
+    pub span: Span,
+}
+
+/// Resolved reusable `mmio` register block layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmioLayoutInfo {
+    pub name: String,
+    pub byte_size: usize,
+    pub regs: Vec<MmioRegInfo>,
+    pub span: Span,
+}
+
+/// Resolved physical `mmio` peripheral instance (`mmio USART1 : UartRegs @ 0x4001_1000;`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MmioInstanceInfo {
+    pub name: String,
+    pub layout: String,
+    pub base_addr: u32,
+    pub span: Span,
+}
+
+/// Resolved hardware `irq` vector token (`irq IRQ_EXTI0 = 0;`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrqInfo {
+    pub name: String,
+    pub irq_num: u32,
+    pub span: Span,
+}
+
+/// Boot-time argument passed to a bound hardware ISR (`vec.attach(handler(args...))`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IrqBindingArg {
+    /// Static OS/DMA primitive handle address (`&sup_inbox`).
+    PrimAddr(String),
+    /// Static `mmio` peripheral instance base pointer (`USART1` / `&USART1`).
+    MmioAddr(String),
+    /// Compile-time constant scalar (`i128` integer value + resolved scalar type).
+    ConstInt { ty: Ty, value: i128 },
+    /// Compile-time constant boolean.
+    ConstBool(bool),
+    /// Other compile-time constant expression (e.g. `const` float or resolved enum literal).
+    ConstExpr { ty: Ty, expr: Expr },
+}
+
+/// Resolved boot-time `irq.attach(...)` or `irq.attach_shared(...)` binding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrqBindingInfo {
+    pub irq_name: String,
+    pub irq_num: u32,
+    pub is_shared: bool,
+    pub isr_name: String,
+    pub args: Vec<IrqBindingArg>,
+    pub conditional_branch: Option<usize>,
+    pub span: Span,
+}
+
+/// Resolved ISR-private `state` variable (`state u32 count = 0;`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IsrStateInfo {
+    pub isr_name: String,
+    pub name: String,
+    pub ty: Ty,
     pub span: Span,
 }
 
@@ -209,6 +283,18 @@ pub struct SemanticModel {
     pub tasks: BTreeMap<String, TaskInfo>,
     /// Declared hardware `isr` handlers.
     pub isrs: BTreeMap<String, IsrInfo>,
+    /// Typed MMIO register block layouts (`UartRegs`, `<mod>__UartRegs`).
+    pub mmio_layouts: BTreeMap<String, MmioLayoutInfo>,
+    /// Typed physical MMIO peripheral instances (`USART1`, `<mod>__USART1`).
+    pub mmio_instances: BTreeMap<String, MmioInstanceInfo>,
+    /// Hardware IRQ vector tokens (`IRQ_USART1`, `<mod>__IRQ_USART1`).
+    pub irqs: BTreeMap<String, IrqInfo>,
+    /// Validated boot-tree `vec.attach(...)` and `vec.attach_shared(...)` bindings.
+    pub irq_bindings: Vec<IrqBindingInfo>,
+    /// Validated ISR-private `state` variables across all `isr` handlers.
+    pub isr_states: Vec<IsrStateInfo>,
+    /// Human-readable display names for canonicalized module symbols (`mod__Foo` -> `alias.Foo`).
+    pub display_names: BTreeMap<String, String>,
     /// Static task instances allocated across all `spawn` sites in boot-tree order.
     pub spawned_tasks: Vec<SpawnedTaskInstance>,
     /// Concrete generic `struct` and `fn` instantiations (deduplicated & sorted).

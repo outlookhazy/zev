@@ -65,11 +65,19 @@ pub enum DiagnosticKind {
     FormatBufferTooSmall,
     /// Invalid `<T>` / `<T, usize N>` generic instantiation (arity, kind, inference, non-const `usize`, or recursion depth > 32) (`E0029`).
     GenericInstantiationError,
+    /// Module resolution failure, import cycle, or cross-module visibility (`pub`) violation (`E0030`).
+    ModuleError,
+    /// Invalid `mmio` layout, by-value `mmio` usage, raw `&reg`, or `@rw`/`@ro`/`@wo`/`@w1c` access violation (`E0031`).
+    MmioViolation,
+    /// Invalid `irq.attach` / `irq.attach_shared` context, duplicate exclusive binding, or non-static/non-const handler argument (`E0032`).
+    IrqAttachmentError,
+    /// Invalid ISR `state` variable outside `isr`, missing/non-const initializer, reference-bearing type, or escaping `&state` (`E0033`).
+    InvalidIsrState,
 }
 
 impl DiagnosticKind {
-    /// All 29 semantic error kinds (`E0001`..`E0029`) in code order.
-    pub const ALL: [Self; 29] = [
+    /// All 33 semantic error kinds (`E0001`..`E0033`) in code order.
+    pub const ALL: [Self; 33] = [
         Self::IllegalMutableGlobal,
         Self::GlobalIsolationViolation,
         Self::YieldInNoYield,
@@ -99,9 +107,13 @@ impl DiagnosticKind {
         Self::InvalidSpawnContext,
         Self::FormatBufferTooSmall,
         Self::GenericInstantiationError,
+        Self::ModuleError,
+        Self::MmioViolation,
+        Self::IrqAttachmentError,
+        Self::InvalidIsrState,
     ];
 
-    /// Stable error code (`"E0001"`..`"E0029"`).
+    /// Stable error code (`"E0001"`..`"E0033"`).
     pub const fn code(self) -> &'static str {
         match self {
             Self::IllegalMutableGlobal => "E0001",
@@ -133,6 +145,10 @@ impl DiagnosticKind {
             Self::InvalidSpawnContext => "E0027",
             Self::FormatBufferTooSmall => "E0028",
             Self::GenericInstantiationError => "E0029",
+            Self::ModuleError => "E0030",
+            Self::MmioViolation => "E0031",
+            Self::IrqAttachmentError => "E0032",
+            Self::InvalidIsrState => "E0033",
         }
     }
 
@@ -153,7 +169,9 @@ impl DiagnosticKind {
             Self::InvalidDurationResolution
             | Self::InvalidControlFlow
             | Self::NonDivergingTask
-            | Self::InvalidSpawnContext => "tasks",
+            | Self::InvalidSpawnContext
+            | Self::IrqAttachmentError
+            | Self::InvalidIsrState => "tasks",
             Self::ReturnMismatch
             | Self::ErrorSpecMismatch
             | Self::UnhandledFallibleExpr
@@ -166,7 +184,9 @@ impl DiagnosticKind {
             | Self::ImmutableAssignment
             | Self::InvalidOperation
             | Self::UnreachableCode
-            | Self::GenericInstantiationError => "syntax",
+            | Self::GenericInstantiationError
+            | Self::ModuleError
+            | Self::MmioViolation => "syntax",
         }
     }
 
@@ -268,6 +288,18 @@ impl DiagnosticKind {
             }
             Self::GenericInstantiationError => {
                 "supply matching `<Type, usize N>` generic arguments (with compile-time constant `usize` bounds and non-recursive type expansion)"
+            }
+            Self::ModuleError => {
+                "verify the `import path.to.module as alias;` path, break any circular `import` cycles, and mark cross-module APIs with `pub`"
+            }
+            Self::MmioViolation => {
+                "use natural alignment and scalar/array integer widths (`u8`, `u16`, `u32`) in `mmio`, pass `*Layout` pointers instead of by-value `mmio`, never take `&regs.reg`, and obey `@rw`/`@ro`/`@wo`/`@w1c` (no RMW on `@w1c`)"
+            }
+            Self::IrqAttachmentError => {
+                "call `IRQ.attach(isr(args...))` or `IRQ.attach_shared(...)` only during sequential boot in `fn main()` (or non-loop boot helpers) with static primitive `&prim`, peripheral handles, or `const` arguments, without conflicting exclusive attachments"
+            }
+            Self::InvalidIsrState => {
+                "declare `state Type name = const_init;` only inside an `isr`, using non-reference-bearing types and without escaping `&name` outside the ISR"
             }
         }
     }

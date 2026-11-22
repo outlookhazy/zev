@@ -61,6 +61,8 @@ pub struct Provenance {
     pub leases: BTreeSet<LeaseToken>,
     /// Declared function names referenced as function pointers (directly or inside structs).
     pub fn_callbacks: BTreeSet<String>,
+    /// ISR-private `state` variable names whose address (`&state_var` or slice) was taken.
+    pub isr_state_origins: BTreeSet<String>,
 }
 
 impl Provenance {
@@ -105,6 +107,23 @@ impl Provenance {
         }
     }
 
+    /// Provenance for taking `&state_var` of an ISR-private persistent `state` variable.
+    pub fn addr_of_isr_state(name: impl Into<String>, decl_depth: u32) -> Self {
+        let name = name.into();
+        let mut local_origins = BTreeSet::new();
+        local_origins.insert(name.clone());
+        let mut isr_state_origins = BTreeSet::new();
+        isr_state_origins.insert(name);
+        Self {
+            origin_depth: decl_depth,
+            pointee_depth: Some(decl_depth),
+            pointee_is_caller_or_static: false,
+            local_origins,
+            isr_state_origins,
+            ..Self::default()
+        }
+    }
+
     /// Provenance for a DMA slice newly acquired via `source.wait_chunk()` at `scope_depth`.
     pub fn dma_lease(source: String, generation: u64, scope_depth: u32, span: Span) -> Self {
         let mut leases = BTreeSet::new();
@@ -123,6 +142,7 @@ impl Provenance {
             param_origins: BTreeSet::new(),
             leases,
             fn_callbacks: BTreeSet::new(),
+            isr_state_origins: BTreeSet::new(),
         }
     }
 
@@ -163,6 +183,11 @@ impl Provenance {
             fn_callbacks: self
                 .fn_callbacks
                 .union(&other.fn_callbacks)
+                .cloned()
+                .collect(),
+            isr_state_origins: self
+                .isr_state_origins
+                .union(&other.isr_state_origins)
                 .cloned()
                 .collect(),
         }

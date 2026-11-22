@@ -16,9 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use zev_ast::{
     ArrayLen, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, CatchParam, ConstDecl,
     ErrorSpec, Expr, ExprKind, FieldInit, FnDecl, FormatPart, GenericArg, GenericParam,
-    GenericParamKind, GlobalVarDecl, Ident, IsrDecl, Item, ItemKind, Literal, OsPrimitiveDecl,
-    OsPrimitiveType, Param, PrimType, Program, SpawnStmt, Span, Stmt, StmtKind, StructDecl,
-    StructField, SwitchArm, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
+    GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal, MmioDecl,
+    MmioDeclKind, MmioRegDecl, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType, Program,
+    SpawnStmt, Span, Stmt, StmtKind, StructDecl, StructField, SwitchArm, SwitchPat, TaskDecl,
+    TypeExpr, TypeKind, UnaryOp,
 };
 
 use crate::diag::{Diagnostic, DiagnosticKind};
@@ -130,6 +131,8 @@ struct Monomorphizer<'a> {
     known_enums: BTreeMap<String, Vec<String>>,
     variant_to_enums: BTreeMap<String, Vec<String>>,
     prim_types: BTreeMap<String, OsPrimitiveType>,
+    mmio_layouts: BTreeMap<String, BTreeMap<String, TypeExpr>>,
+    mmio_instances: BTreeMap<String, TypeExpr>,
     non_generic_fn_rets: BTreeMap<String, TypeExpr>,
     struct_templates: BTreeMap<String, TemplateEntry<StructDecl>>,
     fn_templates: BTreeMap<String, TemplateEntry<FnDecl>>,
@@ -162,6 +165,8 @@ impl<'a> Monomorphizer<'a> {
             known_enums,
             variant_to_enums: BTreeMap::new(),
             prim_types: BTreeMap::new(),
+            mmio_layouts: BTreeMap::new(),
+            mmio_instances: BTreeMap::new(),
             non_generic_fn_rets: BTreeMap::new(),
             struct_templates: BTreeMap::new(),
             fn_templates: BTreeMap::new(),
@@ -295,6 +300,38 @@ impl<'a> Monomorphizer<'a> {
                     ItemKind::OsPrimitive(p) => {
                         self.prim_types.insert(p.name.name.clone(), p.ty.clone());
                     }
+                    ItemKind::Mmio(mm) => match &mm.kind {
+                        MmioDeclKind::Layout { regs } => {
+                            let fields = regs
+                                .iter()
+                                .map(|r| (r.name.name.clone(), r.ty.clone()))
+                                .collect();
+                            self.mmio_layouts.insert(mm.name.name.clone(), fields);
+                        }
+                        MmioDeclKind::Instance { layout, .. } => {
+                            self.mmio_instances.insert(
+                                mm.name.name.clone(),
+                                TypeExpr::new(TypeKind::Ptr(Box::new(layout.clone())), mm.span),
+                            );
+                        }
+                        MmioDeclKind::Inline { regs, .. } => {
+                            let fields = regs
+                                .iter()
+                                .map(|r| (r.name.name.clone(), r.ty.clone()))
+                                .collect();
+                            self.mmio_layouts.insert(mm.name.name.clone(), fields);
+                            self.mmio_instances.insert(
+                                mm.name.name.clone(),
+                                TypeExpr::new(
+                                    TypeKind::Ptr(Box::new(TypeExpr::new(
+                                        TypeKind::Named(mm.name.clone()),
+                                        mm.span,
+                                    ))),
+                                    mm.span,
+                                ),
+                            );
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -384,8 +421,74 @@ impl<'a> Monomorphizer<'a> {
             let mut out_items = Vec::new();
             for (item_idx, item) in prog.items.iter().enumerate() {
                 match &item.kind {
-                    ItemKind::Import(_) | ItemKind::Enum(_) | ItemKind::Mmio(_) | ItemKind::Irq(_) => {
+                    ItemKind::Import(_) | ItemKind::Enum(_) => {
                         out_items.push(item.clone());
+                    }
+                    ItemKind::Mmio(mm) => {
+                        let mut scopes = vec![BTreeMap::new()];
+                        let new_kind = match &mm.kind {
+                            MmioDeclKind::Layout { regs } => MmioDeclKind::Layout {
+                                regs: regs
+                                    .iter()
+                                    .map(|r| MmioRegDecl {
+                                        access: r.access,
+                                        ty: self.rewrite_type_expr(&r.ty, &env),
+                                        name: r.name.clone(),
+                                        offset: self
+                                            .rewrite_expr(&r.offset, &env, &mut scopes, None)
+                                            .0,
+                                        span: r.span,
+                                    })
+                                    .collect(),
+                            },
+                            MmioDeclKind::Instance { layout, base_addr } => {
+                                MmioDeclKind::Instance {
+                                    layout: self.rewrite_type_expr(layout, &env),
+                                    base_addr: self
+                                        .rewrite_expr(base_addr, &env, &mut scopes, None)
+                                        .0,
+                                }
+                            }
+                            MmioDeclKind::Inline { base_addr, regs } => MmioDeclKind::Inline {
+                                base_addr: self.rewrite_expr(base_addr, &env, &mut scopes, None).0,
+                                regs: regs
+                                    .iter()
+                                    .map(|r| MmioRegDecl {
+                                        access: r.access,
+                                        ty: self.rewrite_type_expr(&r.ty, &env),
+                                        name: r.name.clone(),
+                                        offset: self
+                                            .rewrite_expr(&r.offset, &env, &mut scopes, None)
+                                            .0,
+                                        span: r.span,
+                                    })
+                                    .collect(),
+                            },
+                        };
+                        out_items.push(Item {
+                            attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
+                            kind: ItemKind::Mmio(MmioDecl {
+                                name: mm.name.clone(),
+                                kind: new_kind,
+                                span: mm.span,
+                            }),
+                            span: item.span,
+                        });
+                    }
+                    ItemKind::Irq(iq) => {
+                        let mut scopes = vec![BTreeMap::new()];
+                        let number = self.rewrite_expr(&iq.number, &env, &mut scopes, None).0;
+                        out_items.push(Item {
+                            attrs: item.attrs.clone(),
+                            is_pub: item.is_pub,
+                            kind: ItemKind::Irq(IrqDecl {
+                                name: iq.name.clone(),
+                                number,
+                                span: iq.span,
+                            }),
+                            span: item.span,
+                        });
                     }
                     ItemKind::Struct(st) => {
                         if !st.generic_params.is_empty() {
@@ -504,7 +607,19 @@ impl<'a> Monomorphizer<'a> {
                         });
                     }
                     ItemKind::Isr(i) => {
+                        let params: Vec<Param> = i
+                            .params
+                            .iter()
+                            .map(|p| Param {
+                                ty: self.rewrite_type_expr(&p.ty, &env),
+                                name: p.name.clone(),
+                                span: p.span,
+                            })
+                            .collect();
                         let mut scopes = vec![BTreeMap::new()];
+                        for p in &params {
+                            scopes[0].insert(p.name.name.clone(), p.ty.clone());
+                        }
                         let body = self.rewrite_block(&i.body, &env, &mut scopes);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
@@ -512,7 +627,7 @@ impl<'a> Monomorphizer<'a> {
                             kind: ItemKind::Isr(IsrDecl {
                                 attrs: i.attrs.clone(),
                                 vector: i.vector.clone(),
-                                params: i.params.clone(),
+                                params,
                                 body,
                                 span: i.span,
                             }),
@@ -1767,6 +1882,9 @@ impl<'a> Monomorphizer<'a> {
                 Span::dummy(),
             ));
         }
+        if let Some(mmio_ptr_ty) = self.mmio_instances.get(name) {
+            return InferTy::Concrete(mmio_ptr_ty.clone());
+        }
         if let Some(enums) = self.variant_to_enums.get(name) {
             if enums.len() == 1 {
                 return InferTy::Concrete(TypeExpr::new(
@@ -1938,6 +2056,10 @@ impl<'a> Monomorphizer<'a> {
                                 if let Some(sf) = st.fields.iter().find(|f| f.name.name == field.name)
                                 {
                                     out_ty = InferTy::Concrete(sf.ty.clone());
+                                }
+                            } else if let Some(regs) = self.mmio_layouts.get(&sname.name) {
+                                if let Some(r_ty) = regs.get(&field.name) {
+                                    out_ty = InferTy::Concrete(r_ty.clone());
                                 }
                             }
                         }
@@ -2114,7 +2236,7 @@ impl<'a> Monomorphizer<'a> {
                     );
                 }
 
-                if !generic_args.is_empty() {
+                if !generic_args.is_empty() && module.is_none() {
                     self.emit(
                         &env.file,
                         Diagnostic::new(

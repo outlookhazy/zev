@@ -1,22 +1,26 @@
 //! Multi-pass semantic analyzer and static verifier for the Zev Language-OS.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, ConstDecl,
     DurationLit, EnumDecl, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec,
-    GlobalVarDecl, Ident, ImportDecl, IsrDecl, Item, ItemKind, Literal, OsPrimitiveDecl,
-    OsPrimitiveType, Param, PrimType, Priority, Program, SpawnStmt, Span, Stmt, StmtKind,
-    StructDecl, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
+    GlobalVarDecl, Ident, ImportDecl, IrqDecl, IsrDecl, Item, ItemKind, Literal, MmioAccess,
+    MmioDecl, MmioDeclKind, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType, Priority, Program,
+    SpawnStmt, Span, Stmt, StmtKind, StructDecl, SwitchPat, TaskDecl, TypeExpr, TypeKind,
+    UnaryOp,
 };
 
 use crate::call_graph::{CallContext, CallEdge, CallGraph, CallableKind, ExternCallbackSite};
 use crate::diag::{Diagnostic, DiagnosticKind};
 use crate::model::{
-    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IsrInfo, MonomorphizedInstance,
-    MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite, SemanticModel,
-    SpawnedTaskInstance, TaskInfo,
+    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo,
+    IrqInfo, IsrInfo, IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo,
+    MonomorphizedInstance, MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite,
+    SemanticModel, SpawnedTaskInstance, TaskInfo,
 };
+use crate::modules::LinkedModulesOutput;
 use crate::provenance::{LeaseEnv, Provenance};
 use crate::suggest::{
     advise_primitive_method, closest_match, suggest_foreign_type_name,
@@ -30,12 +34,15 @@ use crate::types::{
 pub struct AnalyzeOptions {
     /// Default scheduler tick resolution in microseconds (`1000` = `1ms`).
     pub default_tick_period_us: u64,
+    /// Explicit module search directories (`-I` include paths) checked by module resolution.
+    pub include_dirs: Vec<PathBuf>,
 }
 
 impl Default for AnalyzeOptions {
     fn default() -> Self {
         Self {
             default_tick_period_us: DEFAULT_TICK_PERIOD_US,
+            include_dirs: Vec::new(),
         }
     }
 }
@@ -98,6 +105,7 @@ struct LocalVar {
     prov: Provenance,
     field_prov: BTreeMap<String, Provenance>,
     endpoint_alias: Option<String>,
+    is_isr_state: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +183,42 @@ enum BootStep {
 }
 
 #[derive(Clone, Debug)]
+enum BootAttachArgSpec {
+    Static(IrqBindingArg),
+    Param { index: usize },
+}
+
+#[derive(Clone, Debug)]
+struct BootAttachCallArg {
+    spec: Option<BootAttachArgSpec>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingIrqAttach {
+    irq_name: String,
+    irq_num: u32,
+    is_shared: bool,
+    isr_name: String,
+    args: Vec<(Option<BootAttachArgSpec>, Span, String)>,
+    span: Span,
+    file: Option<String>,
+    in_caller: String,
+    invalid_ctx: bool,
+}
+
+#[derive(Clone, Debug)]
+enum IrqBootNode {
+    Attach(PendingIrqAttach),
+    Call {
+        callee: String,
+        args: Vec<BootAttachCallArg>,
+    },
+    BranchGroup {
+        arms: Vec<(bool, Vec<IrqBootNode>)>,
+    },
+}
+
+#[derive(Clone, Debug)]
 struct RecordedCallArgs {
     caller: String,
     callee: String,
@@ -187,6 +231,11 @@ pub(crate) struct Analyzer {
     systick_hz: Option<u64>,
     has_chip_import: bool,
     chip_imports: BTreeMap<String, String>,
+    loaded_module_paths: BTreeSet<String>,
+    display_names: BTreeMap<String, String>,
+    program_extern_c_scopes: Vec<BTreeSet<String>>,
+    rewritten_pub_extern_sites: BTreeSet<(usize, u32, u32)>,
+    non_root_extern_c_names: BTreeSet<String>,
     structs: BTreeMap<String, StructInfo>,
     struct_files: BTreeMap<String, Option<String>>,
     enums: BTreeMap<String, EnumInfo>,
@@ -196,6 +245,13 @@ pub(crate) struct Analyzer {
     raw_const_exprs: BTreeMap<String, (Expr, Ty)>,
     builtin_svd_consts: BTreeSet<String>,
     primitives: BTreeMap<String, PrimitiveInfo>,
+    mmio_layout_names: BTreeSet<String>,
+    mmio_layouts: BTreeMap<String, MmioLayoutInfo>,
+    mmio_instances: BTreeMap<String, MmioInstanceInfo>,
+    irqs: BTreeMap<String, IrqInfo>,
+    irq_bindings: Vec<IrqBindingInfo>,
+    isr_states: Vec<IsrStateInfo>,
+    fn_irq_boot_nodes: BTreeMap<String, Vec<IrqBootNode>>,
     illegal_globals: BTreeMap<String, IllegalGlobalInfo>,
     functions: BTreeMap<String, FunctionInfo>,
     fn_decl_order: Vec<String>,
@@ -210,6 +266,7 @@ pub(crate) struct Analyzer {
     main_supervisor_priority: Option<Priority>,
     call_graph: CallGraph,
     current_file: Option<String>,
+    current_prog_idx: usize,
     current_instantiation_note: Option<String>,
     mono_instantiation_notes: BTreeMap<String, String>,
     f32_overflow_reported_spans: BTreeSet<(u32, u32)>,
@@ -225,6 +282,11 @@ impl Analyzer {
             systick_hz: None,
             has_chip_import: false,
             chip_imports: BTreeMap::new(),
+            loaded_module_paths: BTreeSet::new(),
+            display_names: BTreeMap::new(),
+            program_extern_c_scopes: Vec::new(),
+            rewritten_pub_extern_sites: BTreeSet::new(),
+            non_root_extern_c_names: BTreeSet::new(),
             structs: BTreeMap::new(),
             struct_files: BTreeMap::new(),
             enums: BTreeMap::new(),
@@ -233,6 +295,13 @@ impl Analyzer {
             raw_const_exprs: BTreeMap::new(),
             builtin_svd_consts: BTreeSet::new(),
             primitives: BTreeMap::new(),
+            mmio_layout_names: BTreeSet::new(),
+            mmio_layouts: BTreeMap::new(),
+            mmio_instances: BTreeMap::new(),
+            irqs: BTreeMap::new(),
+            irq_bindings: Vec::new(),
+            isr_states: Vec::new(),
+            fn_irq_boot_nodes: BTreeMap::new(),
             illegal_globals: BTreeMap::new(),
             functions: BTreeMap::new(),
             fn_decl_order: Vec::new(),
@@ -247,12 +316,22 @@ impl Analyzer {
             main_supervisor_priority: None,
             call_graph: CallGraph::new(),
             current_file: None,
+            current_prog_idx: 0,
             current_instantiation_note: None,
             mono_instantiation_notes: BTreeMap::new(),
             f32_overflow_reported_spans: BTreeSet::new(),
             node_files: BTreeMap::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_linked_context(mut self, linked: &LinkedModulesOutput) -> Self {
+        self.loaded_module_paths = linked.loaded_module_paths.clone();
+        self.display_names = linked.display_names.clone();
+        self.program_extern_c_scopes = linked.program_extern_c_scopes.clone();
+        self.rewritten_pub_extern_sites = linked.rewritten_pub_extern_sites.clone();
+        self.non_root_extern_c_names = linked.non_root_extern_c_names.clone();
+        self
     }
 
     fn emit(&mut self, mut diag: Diagnostic) {
@@ -275,18 +354,19 @@ impl Analyzer {
     }
 
     pub fn run(mut self, programs: &[(&Program, Option<&str>)]) -> AnalysisOutput {
-        // Merge items while tracking optional file names per item if needed.
-        let mut all_items: Vec<(&Item, Option<String>)> = Vec::new();
-        for (prog, file) in programs {
+        // Merge items while tracking optional file names and program index per item.
+        let mut all_items: Vec<(&Item, Option<String>, usize)> = Vec::new();
+        for (prog_idx, (prog, file)) in programs.iter().enumerate() {
             for item in &prog.items {
-                all_items.push((item, file.map(str::to_string)));
+                all_items.push((item, file.map(str::to_string), prog_idx));
             }
         }
 
-        // Pass 1a: Imports, struct names, and enum declarations.
+        // Pass 1a: Imports, struct names, enum declarations, and MMIO layout type names.
         let mut mono_instances_from_attrs: BTreeSet<MonomorphizedInstance> = BTreeSet::new();
-        for (item, file) in &all_items {
+        for (item, file, prog_idx) in &all_items {
             self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
             match &item.kind {
                 ItemKind::Import(imp) => self.collect_import(imp),
                 ItemKind::Struct(st) => {
@@ -309,6 +389,14 @@ impl Analyzer {
                     self.register_struct_header(st);
                 }
                 ItemKind::Enum(en) => self.collect_enum(en),
+                ItemKind::Mmio(mm)
+                    if matches!(
+                        mm.kind,
+                        MmioDeclKind::Layout { .. } | MmioDeclKind::Inline { .. }
+                    ) =>
+                {
+                    self.register_mmio_layout_name(mm);
+                }
                 ItemKind::Fn(f) if f.generic_params.is_empty() => {
                     if let Some(sig) = extract_monomorphized_attr(&item.attrs) {
                         mono_instances_from_attrs.insert(MonomorphizedInstance {
@@ -327,7 +415,10 @@ impl Analyzer {
         }
 
         // Pre-register built-in `enum FmtErr { Truncated }` if not user-declared.
-        if !self.enums.contains_key("FmtErr") && !self.structs.contains_key("FmtErr") {
+        if !self.enums.contains_key("FmtErr")
+            && !self.structs.contains_key("FmtErr")
+            && !self.mmio_layout_names.contains("FmtErr")
+        {
             self.enums.insert(
                 "FmtErr".to_string(),
                 EnumInfo {
@@ -349,8 +440,9 @@ impl Analyzer {
         }
 
         // Pass 1b: Resolve struct fields and verify packed struct & recursive value invariants.
-        for (item, file) in &all_items {
+        for (item, file, prog_idx) in &all_items {
             self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
             if let ItemKind::Struct(st) = &item.kind {
                 if st.generic_params.is_empty() {
                     self.current_instantiation_note =
@@ -365,7 +457,7 @@ impl Analyzer {
 
         // Pass 1c: Pre-scan for `sys.use_systick` / `sys.set_tick` so custom tick period is known
         // before validating duration literals anywhere in the program.
-        for (item, _) in &all_items {
+        for (item, _, _) in &all_items {
             if let ItemKind::Fn(f) = &item.kind {
                 if f.generic_params.is_empty() {
                     if let Some(body) = &f.body {
@@ -375,11 +467,24 @@ impl Analyzer {
             }
         }
 
-        // Pass 1d: Collect consts, OS primitives, illegal mutable globals, and callable signatures.
-        for (item, file) in &all_items {
+        // Pass 1d: Collect and evaluate `const` declarations first so `mmio` offsets/base addresses,
+        // `irq` vector numbers, and `[CAP]T` array sizes can reference any top-level `const`.
+        for (item, file, prog_idx) in &all_items {
             self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
+            if let ItemKind::Const(c) = &item.kind {
+                self.collect_const(c);
+            }
+        }
+        self.evaluate_all_const_int_values();
+
+        // Collect `mmio`, `irq`, OS primitives, illegal mutable globals, and callable signatures.
+        for (item, file, prog_idx) in &all_items {
+            self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
             match &item.kind {
-                ItemKind::Const(c) => self.collect_const(c),
+                ItemKind::Mmio(mm) => self.collect_mmio(mm),
+                ItemKind::Irq(iq) => self.collect_irq(iq),
                 ItemKind::OsPrimitive(p) => self.collect_os_primitive(&item.attrs, p),
                 ItemKind::GlobalVar(g) => self.collect_global_var(&item.attrs, g),
                 ItemKind::Fn(f) if f.generic_params.is_empty() => {
@@ -393,12 +498,12 @@ impl Analyzer {
                 _ => {}
             }
         }
-        self.evaluate_all_const_int_values();
 
         // Pass 2a: Analyze non-`main` helper functions first so interprocedural `return_param_origins`
         // summaries are ready before `main` and `task` bodies call them.
-        for (item, file) in &all_items {
+        for (item, file, prog_idx) in &all_items {
             self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
             if let ItemKind::Fn(f) = &item.kind {
                 if f.generic_params.is_empty() && f.name.name != "main" {
                     self.check_fn_body(&item.attrs, f);
@@ -406,8 +511,9 @@ impl Analyzer {
             }
         }
         // Pass 2b: Analyze `main()`, `task` blueprints, and `isr` handlers.
-        for (item, file) in &all_items {
+        for (item, file, prog_idx) in &all_items {
             self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
             match &item.kind {
                 ItemKind::Fn(f) if f.generic_params.is_empty() && f.name.name == "main" => {
                     self.check_fn_body(&item.attrs, f);
@@ -420,7 +526,7 @@ impl Analyzer {
         self.current_file = None;
 
         // Pass 3: Whole-program transitive yield inference, `noyield`/`critical`/`isr` call checks,
-        // `extern "C"` callback checks, and yielding recursion cycle detection.
+        // `extern "C"` callback checks, boot-tree spawn & IRQ attach unrolling, and cycle detection.
         self.run_whole_program_verification();
 
         let main_can_yield = self
@@ -443,6 +549,12 @@ impl Analyzer {
             functions: self.functions,
             tasks: self.tasks,
             isrs: self.isrs,
+            mmio_layouts: self.mmio_layouts,
+            mmio_instances: self.mmio_instances,
+            irqs: self.irqs,
+            irq_bindings: self.irq_bindings,
+            isr_states: self.isr_states,
+            display_names: self.display_names,
             spawned_tasks: self.spawned_tasks,
             monomorphized_instances,
             soft_yielding_in_coro: self.soft_yielding_in_coro,
@@ -477,16 +589,32 @@ impl Analyzer {
             .or_else(|| imp.path.last().map(|l| l.name.clone()))
             .unwrap_or_else(|| full_path.clone());
 
-        if imp.path.first().is_some_and(|p| p.name == "chip") {
+        if imp.path.first().is_some_and(|p| p.name == "chip")
+            && !self.loaded_module_paths.contains(&full_path)
+        {
             self.has_chip_import = true;
-            self.chip_imports.insert(alias, full_path);
-        } else {
             self.chip_imports.insert(alias, full_path);
         }
     }
 
+    fn register_mmio_layout_name(&mut self, mm: &MmioDecl) {
+        if self.structs.contains_key(&mm.name.name)
+            || self.enums.contains_key(&mm.name.name)
+            || !self.mmio_layout_names.insert(mm.name.name.clone())
+        {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::DuplicateDefinition,
+                mm.name.span,
+                format!("duplicate type definition '{}'", mm.name.name),
+            ));
+        }
+    }
+
     fn register_struct_header(&mut self, st: &StructDecl) {
-        if self.structs.contains_key(&st.name.name) || self.enums.contains_key(&st.name.name) {
+        if self.structs.contains_key(&st.name.name)
+            || self.enums.contains_key(&st.name.name)
+            || self.mmio_layout_names.contains(&st.name.name)
+        {
             self.emit(Diagnostic::new(
                 DiagnosticKind::DuplicateDefinition,
                 st.name.span,
@@ -506,7 +634,10 @@ impl Analyzer {
     }
 
     fn collect_enum(&mut self, en: &EnumDecl) {
-        if self.enums.contains_key(&en.name.name) || self.structs.contains_key(&en.name.name) {
+        if self.enums.contains_key(&en.name.name)
+            || self.structs.contains_key(&en.name.name)
+            || self.mmio_layout_names.contains(&en.name.name)
+        {
             self.emit(Diagnostic::new(
                 DiagnosticKind::DuplicateDefinition,
                 en.name.span,
@@ -570,6 +701,11 @@ impl Analyzer {
                     ),
                 ));
             }
+            self.check_type_no_byval_mmio(
+                &ty,
+                f.ty.span,
+                &format!("field '{}' of struct '{}'", f.name.name, st.name.name),
+            );
             if st.is_packed && matches!(ty, Ty::Ptr(_) | Ty::Slice(_) | Ty::FnPtr { .. }) {
                 self.emit(Diagnostic::new(
                     DiagnosticKind::InvalidOperation,
@@ -719,6 +855,8 @@ impl Analyzer {
     fn check_top_level_name_unique(&mut self, name: &Ident) -> bool {
         if self.consts.contains_key(&name.name)
             || self.primitives.contains_key(&name.name)
+            || self.mmio_instances.contains_key(&name.name)
+            || self.irqs.contains_key(&name.name)
             || self.illegal_globals.contains_key(&name.name)
             || self.functions.contains_key(&name.name)
             || self.tasks.contains_key(&name.name)
@@ -731,6 +869,259 @@ impl Analyzer {
             return false;
         }
         true
+    }
+
+    fn collect_mmio(&mut self, mm: &MmioDecl) {
+        match &mm.kind {
+            MmioDeclKind::Layout { regs } => {
+                self.collect_mmio_layout(&mm.name, regs, mm.span);
+            }
+            MmioDeclKind::Instance { layout, base_addr } => {
+                if !self.check_top_level_name_unique(&mm.name) {
+                    return;
+                }
+                let resolved_layout = self.resolve_type(layout);
+                let layout_name = match resolved_layout {
+                    Ty::MmioLayout(l) => l,
+                    Ty::Error => return,
+                    other => {
+                        self.emit(Diagnostic::new(
+                            DiagnosticKind::MmioViolation,
+                            layout.span,
+                            format!(
+                                "MMIO instance '{}' must use a `mmio` register layout type, found '{}'",
+                                mm.name.name, other
+                            ),
+                        ));
+                        return;
+                    }
+                };
+                let base_u32 = self.eval_u32_const(
+                    base_addr,
+                    DiagnosticKind::MmioViolation,
+                    &format!("MMIO instance '{}' base address", mm.name.name),
+                );
+                self.mmio_instances.insert(
+                    mm.name.name.clone(),
+                    MmioInstanceInfo {
+                        name: mm.name.name.clone(),
+                        layout: layout_name,
+                        base_addr: base_u32,
+                        span: mm.span,
+                    },
+                );
+            }
+            MmioDeclKind::Inline { base_addr, regs } => {
+                if !self.check_top_level_name_unique(&mm.name) {
+                    return;
+                }
+                let layout_id = Ident::new(format!("{}__Layout", mm.name.name), mm.name.span);
+                self.collect_mmio_layout(&layout_id, regs, mm.span);
+                let base_u32 = self.eval_u32_const(
+                    base_addr,
+                    DiagnosticKind::MmioViolation,
+                    &format!("MMIO instance '{}' base address", mm.name.name),
+                );
+                self.mmio_instances.insert(
+                    mm.name.name.clone(),
+                    MmioInstanceInfo {
+                        name: mm.name.name.clone(),
+                        layout: layout_id.name,
+                        base_addr: base_u32,
+                        span: mm.span,
+                    },
+                );
+            }
+        }
+    }
+
+    fn collect_mmio_layout(
+        &mut self,
+        name: &Ident,
+        regs: &[zev_ast::MmioRegDecl],
+        span: Span,
+    ) {
+        if self.mmio_layouts.contains_key(&name.name) {
+            return;
+        }
+        let mut seen_regs = BTreeSet::new();
+        let mut resolved_regs = Vec::new();
+        let mut ranges: Vec<(u64, u64, String)> = Vec::new();
+        let mut max_end: u64 = 0;
+
+        for reg in regs {
+            if !seen_regs.insert(reg.name.name.clone()) {
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::MmioViolation,
+                    reg.name.span,
+                    format!(
+                        "duplicate MMIO register '{}' in layout '{}'",
+                        reg.name.name, name.name
+                    ),
+                ));
+                continue;
+            }
+
+            let reg_ty = self.resolve_type(&reg.ty);
+            let (elem_ty, array_len, elem_bytes) = match &reg_ty {
+                Ty::Prim(p @ (PrimType::U8 | PrimType::U16 | PrimType::U32)) => {
+                    (*p, None, p.byte_size(4) as u64)
+                }
+                Ty::Array { elem, len } => match &**elem {
+                    Ty::Prim(p @ (PrimType::U8 | PrimType::U16 | PrimType::U32)) => {
+                        if *len == 0 {
+                            self.emit(Diagnostic::new(
+                                DiagnosticKind::MmioViolation,
+                                reg.ty.span,
+                                format!(
+                                    "MMIO register array '{}.{}' must have length >= 1",
+                                    name.name, reg.name.name
+                                ),
+                            ));
+                        }
+                        (*p, Some((*len).max(1)), p.byte_size(4) as u64)
+                    }
+                    _ => {
+                        self.emit(Diagnostic::new(
+                            DiagnosticKind::MmioViolation,
+                            reg.ty.span,
+                            format!(
+                                "MMIO register '{}.{}' has unsupported type '{}'; only `u8`, `u16`, `u32`, and fixed arrays `[N]u8`/`[N]u16`/`[N]u32` are supported",
+                                name.name, reg.name.name, reg_ty
+                            ),
+                        ));
+                        continue;
+                    }
+                },
+                Ty::Error => continue,
+                other => {
+                    self.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        reg.ty.span,
+                        format!(
+                            "MMIO register '{}.{}' has unsupported type '{}'; only `u8`, `u16`, `u32`, and fixed arrays `[N]u8`/`[N]u16`/`[N]u32` are supported",
+                            name.name, reg.name.name, other
+                        ),
+                    ));
+                    continue;
+                }
+            };
+
+            let offset_u32 = self.eval_u32_const(
+                &reg.offset,
+                DiagnosticKind::MmioViolation,
+                &format!("MMIO register '{}.{}' offset", name.name, reg.name.name),
+            );
+            let offset_u64 = u64::from(offset_u32);
+
+            if offset_u64 % elem_bytes != 0 {
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::MmioViolation,
+                    reg.offset.span,
+                    format!(
+                        "MMIO register '{}.{}' at offset 0x{:X} is not naturally aligned to {}-byte `{}` boundary",
+                        name.name, reg.name.name, offset_u64, elem_bytes, elem_ty
+                    ),
+                ));
+            }
+
+            let count = u64::try_from(array_len.unwrap_or(1)).unwrap_or(u64::MAX);
+            let Some(reg_bytes) = elem_bytes.checked_mul(count) else {
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::MmioViolation,
+                    reg.ty.span,
+                    format!("MMIO register '{}.{}' size overflows u64", name.name, reg.name.name),
+                ));
+                continue;
+            };
+            let Some(end) = offset_u64.checked_add(reg_bytes) else {
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::MmioViolation,
+                    reg.span,
+                    format!("MMIO register '{}.{}' range overflows address space", name.name, reg.name.name),
+                ));
+                continue;
+            };
+
+            for (prev_start, prev_end, prev_name) in &ranges {
+                if offset_u64 < *prev_end && *prev_start < end {
+                    self.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        reg.span,
+                        format!(
+                            "MMIO register '{}.{}' (0x{:X}..0x{:X}) overlaps register '{}' (0x{:X}..0x{:X})",
+                            name.name, reg.name.name, offset_u64, end, prev_name, prev_start, prev_end
+                        ),
+                    ));
+                    break;
+                }
+            }
+
+            ranges.push((offset_u64, end, reg.name.name.clone()));
+            max_end = max_end.max(end);
+            resolved_regs.push(MmioRegInfo {
+                name: reg.name.name.clone(),
+                access: reg.access,
+                elem_ty,
+                array_len,
+                offset: offset_u32,
+                span: reg.span,
+            });
+        }
+
+        self.mmio_layouts.insert(
+            name.name.clone(),
+            MmioLayoutInfo {
+                name: name.name.clone(),
+                byte_size: usize::try_from(max_end).unwrap_or(usize::MAX),
+                regs: resolved_regs,
+                span,
+            },
+        );
+    }
+
+    fn collect_irq(&mut self, iq: &IrqDecl) {
+        if !self.check_top_level_name_unique(&iq.name) {
+            return;
+        }
+        let irq_num = self.eval_u32_const(
+            &iq.number,
+            DiagnosticKind::IrqAttachmentError,
+            &format!("IRQ '{}' vector number", iq.name.name),
+        );
+        self.irqs.insert(
+            iq.name.name.clone(),
+            IrqInfo {
+                name: iq.name.name.clone(),
+                irq_num,
+                span: iq.span,
+            },
+        );
+    }
+
+    fn eval_u32_const(&mut self, expr: &Expr, diag_kind: DiagnosticKind, what: &str) -> u32 {
+        let mut visiting = BTreeSet::new();
+        match self.eval_const_expr_i128(expr, &mut visiting) {
+            Some(v) => match u32::try_from(v) {
+                Ok(u) => u,
+                Err(_) => {
+                    self.emit(Diagnostic::new(
+                        diag_kind,
+                        expr.span,
+                        format!("{what} value {v} is outside valid `u32` range (0..=0xFFFF_FFFF)"),
+                    ));
+                    0
+                }
+            },
+            None => {
+                self.emit(Diagnostic::new(
+                    diag_kind,
+                    expr.span,
+                    format!("{what} must be a compile-time `u32` constant expression"),
+                ));
+                0
+            }
+        }
     }
 
     fn collect_const(&mut self, c: &ConstDecl) {
@@ -1017,6 +1408,13 @@ impl Analyzer {
 
         let kind = resolved.kind();
         let elem_ty = resolved.elem_ty().cloned();
+        if let Some(et) = &elem_ty {
+            self.check_type_no_byval_mmio(
+                et,
+                p.span,
+                &format!("element type of OS primitive '{}'", p.name.name),
+            );
+        }
         let capacity = resolved.capacity();
         self.primitives.insert(
             p.name.name.clone(),
@@ -1087,6 +1485,11 @@ impl Analyzer {
             return;
         }
         let ret_ty = self.resolve_type(&f.ret_type);
+        self.check_type_no_byval_mmio(
+            &ret_ty,
+            f.ret_type.span,
+            &format!("return type of function '{}'", f.name.name),
+        );
         let error_spec = match &f.error_spec {
             None => ResolvedErrorSpec::None,
             Some(ErrorSpec::Bare(_)) => ResolvedErrorSpec::Untyped,
@@ -1186,6 +1589,7 @@ impl Analyzer {
             ));
             return;
         }
+        let params = self.resolve_params(&i.params, &format!("isr {}", i.vector.name));
         let node_key = format!("isr::{}", i.vector.name);
         if let Some(cf) = &self.current_file {
             self.node_files.insert(node_key.clone(), cf.clone());
@@ -1197,6 +1601,7 @@ impl Analyzer {
             i.vector.name.clone(),
             IsrInfo {
                 vector: i.vector.name.clone(),
+                params,
                 callees: Vec::new(),
                 priority_boosts: Vec::new(),
                 span: i.span,
@@ -1223,6 +1628,11 @@ impl Analyzer {
                     format!("parameter '{}' in '{}' cannot have type 'void'", p.name.name, owner),
                 ));
             }
+            self.check_type_no_byval_mmio(
+                &ty,
+                p.ty.span,
+                &format!("parameter '{}' of '{}'", p.name.name, owner),
+            );
             out.push(ParamInfo {
                 name: p.name.name.clone(),
                 ty,
@@ -1230,6 +1640,19 @@ impl Analyzer {
             });
         }
         out
+    }
+
+    fn check_type_no_byval_mmio(&mut self, ty: &Ty, span: Span, context: &str) {
+        if let Some(layout_name) = ty_contains_byval_mmio(ty) {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::MmioViolation,
+                span,
+                format!(
+                    "cannot pass or store MMIO register layout '{}' by value in {} (use pointer `*{}`)",
+                    layout_name, context, layout_name
+                ),
+            ));
+        }
     }
 
     fn resolve_type(&mut self, te: &TypeExpr) -> Ty {
@@ -1244,6 +1667,11 @@ impl Analyzer {
                 }
                 if self.enums.contains_key(&ident.name) {
                     return Ty::Enum(ident.name.clone());
+                }
+                if self.mmio_layouts.contains_key(&ident.name)
+                    || self.mmio_layout_names.contains(&ident.name)
+                {
+                    return Ty::MmioLayout(ident.name.clone());
                 }
                 if self.chip_imports.contains_key(&ident.name) {
                     return Ty::HwPeripheral(ident.name.clone());
@@ -1327,25 +1755,18 @@ impl Analyzer {
             TypeKind::Array { elem, len } => {
                 let resolved_len = match len {
                     ArrayLen::Fixed(n) => *n,
-                    ArrayLen::Expr(expr) => match &expr.kind {
-                        ExprKind::Literal(Literal::Int(v)) => *v as usize,
-                        ExprKind::Ident(id) => self
-                            .consts
-                            .get(&id.name)
-                            .and_then(|c| c.int_value)
-                            .map(|v| v as usize)
-                            .unwrap_or_else(|| {
+                    ArrayLen::Expr(expr) => {
+                        let mut visiting = BTreeSet::new();
+                        if let Some(v) = self.eval_const_expr_i128(expr, &mut visiting) {
+                            usize::try_from(v).unwrap_or_else(|_| {
                                 self.emit(Diagnostic::new(
                                     DiagnosticKind::GenericInstantiationError,
                                     expr.span,
-                                    format!(
-                                        "array length '{}' is not a compile-time constant 'usize'",
-                                        id.name
-                                    ),
+                                    "array length must be a non-negative compile-time constant 'usize'",
                                 ));
                                 1
-                            }),
-                        _ => {
+                            })
+                        } else {
                             self.emit(Diagnostic::new(
                                 DiagnosticKind::GenericInstantiationError,
                                 expr.span,
@@ -1353,7 +1774,7 @@ impl Analyzer {
                             ));
                             1
                         }
-                    },
+                    }
                 };
                 if resolved_len == 0 {
                     self.emit(Diagnostic::new(
@@ -1506,15 +1927,11 @@ impl Analyzer {
         self.current_instantiation_note =
             self.mono_instantiation_notes.get(&f.name.name).cloned();
         let force_noyield = has_attr_noyield(item_attrs) || has_attr_noyield(&f.attrs);
-        let mut checker = BodyChecker::new(
-            self,
-            &f.name.name,
-            CallableKind::Fn,
-            ActiveBodyKind::Fn {
+        let mut checker =
+            BodyChecker::new(self, &f.name.name, CallableKind::Fn, ActiveBodyKind::Fn {
                 ret_ty: fn_info.ret_ty.clone(),
                 error_spec: fn_info.error_spec.clone(),
-            },
-        );
+            });
         if force_noyield {
             checker.noyield_depth += 1;
         }
@@ -1522,6 +1939,11 @@ impl Analyzer {
         let diverges = checker.check_block_stmts(&body.stmts);
         let ret_origins: Vec<usize> = checker.return_param_origins.into_iter().collect();
         let boot_steps = checker.boot_steps;
+        let irq_nodes = checker
+            .boot_block_stack
+            .into_iter()
+            .next()
+            .unwrap_or_default();
 
         if !fn_info.ret_ty.is_void() && !fn_info.ret_ty.is_error() && !diverges {
             let ret_ty = fn_info.ret_ty.clone();
@@ -1537,6 +1959,8 @@ impl Analyzer {
         self.current_instantiation_note = prev_note;
 
         self.fn_boot_steps.insert(f.name.name.clone(), boot_steps);
+        self.fn_irq_boot_nodes
+            .insert(f.name.name.clone(), irq_nodes);
         if let Some(info) = self.functions.get_mut(&f.name.name) {
             info.return_param_origins = ret_origins;
         }
@@ -1568,12 +1992,13 @@ impl Analyzer {
     }
 
     fn check_isr_body(&mut self, _item_attrs: &[Attr], i: &IsrDecl) {
-        if !self.isrs.contains_key(&i.vector.name) {
+        let Some(isr_info) = self.isrs.get(&i.vector.name).cloned() else {
             return;
-        }
+        };
         let node_key = format!("isr::{}", i.vector.name);
         let mut checker =
             BodyChecker::new(self, &node_key, CallableKind::Isr, ActiveBodyKind::Isr);
+        checker.bind_params(&isr_info.params);
         let _ = checker.check_block_stmts(&i.body.stmts);
         let boosts = checker.recorded_boosts;
         if let Some(info) = self.isrs.get_mut(&i.vector.name) {
@@ -1715,7 +2140,7 @@ impl Analyzer {
                                 edge.callee
                             ),
                         )
-                        .with_file(caller_file)
+                        .with_file(caller_file.clone())
                         .with_note(format!("spawn chain: {}", spawn_chain)),
                     );
                 } else if edge.caller_kind == CallableKind::Task {
@@ -1729,7 +2154,7 @@ impl Analyzer {
                                 edge.callee, task_name
                             ),
                         )
-                        .with_file(caller_file)
+                        .with_file(caller_file.clone())
                         .with_note(format!("spawn chain: {}", spawn_chain)),
                     );
                 } else if edge.caller_kind == CallableKind::Isr || edge.ctx.in_isr {
@@ -1743,7 +2168,7 @@ impl Analyzer {
                                 edge.callee, isr_name
                             ),
                         )
-                        .with_file(caller_file)
+                        .with_file(caller_file.clone())
                         .with_note(format!("spawn chain: {}", spawn_chain)),
                     );
                 } else if edge.ctx.in_loop {
@@ -1756,7 +2181,7 @@ impl Analyzer {
                                 edge.callee
                             ),
                         )
-                        .with_file(caller_file)
+                        .with_file(caller_file.clone())
                         .with_note(format!("spawn chain: {}", spawn_chain)),
                     );
                 } else if edge.ctx.after_diverge || edge.ctx.after_main_supervisor {
@@ -1769,14 +2194,87 @@ impl Analyzer {
                                 edge.callee
                             ),
                         )
-                        .with_file(caller_file)
+                        .with_file(caller_file.clone())
                         .with_note(format!("spawn chain: {}", spawn_chain)),
+                    );
+                }
+            }
+
+            // 1c. Boot-only `attaches_in_boot` call-site checks (`E0032`).
+            if callee_node.attaches_in_boot {
+                let attach_chain = callee_node.attach_chain.join(" -> ");
+                if edge.ctx.in_defer {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::IrqAttachmentError,
+                            edge.span,
+                            format!(
+                                "cannot call IRQ-attaching function '{}' inside 'defer' cleanup statement",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("attach chain: {}", attach_chain)),
+                    );
+                } else if edge.caller_kind == CallableKind::Task {
+                    let task_name = edge.caller.strip_prefix("task::").unwrap_or(&edge.caller);
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::IrqAttachmentError,
+                            edge.span,
+                            format!(
+                                "cannot call IRQ-attaching function '{}' inside task '{}'; IRQs must be attached during sequential boot",
+                                edge.callee, task_name
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("attach chain: {}", attach_chain)),
+                    );
+                } else if edge.caller_kind == CallableKind::Isr || edge.ctx.in_isr {
+                    let isr_name = edge.caller.strip_prefix("isr::").unwrap_or(&edge.caller);
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::IrqAttachmentError,
+                            edge.span,
+                            format!(
+                                "cannot call IRQ-attaching function '{}' inside ISR '{}'",
+                                edge.callee, isr_name
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("attach chain: {}", attach_chain)),
+                    );
+                } else if edge.ctx.in_loop {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::IrqAttachmentError,
+                            edge.span,
+                            format!(
+                                "cannot call IRQ-attaching function '{}' inside a loop; IRQ attachments must be deterministic in boot",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("attach chain: {}", attach_chain)),
+                    );
+                } else if edge.ctx.after_diverge || edge.ctx.after_main_supervisor {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::IrqAttachmentError,
+                            edge.span,
+                            format!(
+                                "cannot call IRQ-attaching function '{}' after 'main()' supervisor loop or diverging control flow",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file)
+                        .with_note(format!("attach chain: {}", attach_chain)),
                     );
                 }
             }
         }
 
-        // 2. Check all `extern "C"` callback arguments for yielding or boot-spawning functions.
+        // 2. Check all `extern "C"` callback arguments for yielding, boot-spawning, or boot-attaching functions.
         let cb_sites = self.call_graph.extern_callbacks.clone();
         for site in &cb_sites {
             if let Some(cb_node) = self.call_graph.nodes.get(&site.callback_fn).cloned() {
@@ -1817,10 +2315,24 @@ impl Analyzer {
                         .with_file(cb_file),
                     );
                 }
+                if cb_node.attaches_in_boot {
+                    let cb_file = self.node_files.get(&site.callback_fn).cloned();
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::IrqAttachmentError,
+                            site.span,
+                            format!(
+                                "cannot pass IRQ-attaching function '{}' as callback to extern \"C\" function '{}'",
+                                site.callback_fn, site.extern_fn
+                            ),
+                        )
+                        .with_file(cb_file),
+                    );
+                }
             }
         }
 
-        // 3. Detect recursive call cycles across boot-spawning functions (`E0027`) and yielding functions (`E0012`).
+        // 3. Detect recursive call cycles across boot-spawning (`E0027`), boot-attaching (`E0032`), and yielding (`E0012`) functions.
         let spawning_cycles = self.call_graph.find_spawning_cycles();
         for (cycle, span) in &spawning_cycles {
             let cycle_file = cycle
@@ -1840,6 +2352,28 @@ impl Analyzer {
                 .with_file(cycle_file)
                 .with_note(
                     "boot-tree `spawn` functions must form a static DAG so task slots are statically bounded at compile time",
+                ),
+            );
+        }
+        let attaching_cycles = self.call_graph.find_attaching_cycles();
+        for (cycle, span) in &attaching_cycles {
+            let cycle_file = cycle
+                .first()
+                .and_then(|f| self.node_files.get(f))
+                .cloned();
+            let cycle_str = cycle.join(" -> ");
+            self.emit(
+                Diagnostic::new(
+                    DiagnosticKind::IrqAttachmentError,
+                    *span,
+                    format!(
+                        "recursive call cycle across IRQ-attaching function: {}",
+                        cycle_str
+                    ),
+                )
+                .with_file(cycle_file)
+                .with_note(
+                    "boot-tree `irq.attach(...)` functions must form a static acyclic boot tree",
                 ),
             );
         }
@@ -1865,9 +2399,10 @@ impl Analyzer {
         }
 
         // 4. Verify interprocedural static-reference provenance for parameters forwarded into `spawn` (`E0010`),
-        //    then unroll `main()`'s static boot tree into `self.spawned_tasks`.
+        //    then unroll `main()`'s static boot tree into `self.spawned_tasks` and `self.irq_bindings` (`E0032`).
         self.verify_boot_spawn_arg_provenance();
         self.unroll_boot_spawn_tree();
+        self.unroll_irq_boot_tree();
 
         // 5. Compute 3-tier `SoftYielding` coroutine vs `noyield` dual specializations.
         let (soft_coro, soft_ny, dual_spec) = self.call_graph.compute_soft_specializations();
@@ -1995,7 +2530,8 @@ impl Analyzer {
             t.instance_count = 0;
         }
 
-        let roots: Vec<String> = if self.functions.contains_key("main") {
+        let has_main = self.functions.contains_key("main");
+        let roots: Vec<String> = if has_main {
             vec!["main".to_string()]
         } else {
             let mut called_by_fn = BTreeSet::new();
@@ -2024,6 +2560,321 @@ impl Analyzer {
             visiting.insert(root.clone());
             self.unroll_boot_fn(&root, &mut path, false, &[], &mut visiting);
         }
+    }
+
+    fn unroll_irq_boot_tree(&mut self) {
+        let mut called_by_fn = BTreeSet::new();
+        for e in &self.call_graph.edges {
+            if e.caller_kind == CallableKind::Fn {
+                called_by_fn.insert(e.callee.clone());
+            }
+        }
+        let has_main = self.functions.contains_key("main");
+        let roots: Vec<String> = if has_main {
+            vec!["main".to_string()]
+        } else {
+            self.fn_decl_order
+                .iter()
+                .filter(|name| {
+                    !called_by_fn.contains(*name)
+                        && self
+                            .call_graph
+                            .nodes
+                            .get(*name)
+                            .is_some_and(|n| n.attaches_in_boot)
+                })
+                .cloned()
+                .collect()
+        };
+
+        let mut irq_mode_seen: BTreeMap<u32, (bool, String, Span)> = BTreeMap::new();
+        let mut mixed_warned: BTreeSet<u32> = BTreeSet::new();
+        let mut next_branch_id: usize = 0;
+        let mut reached_fns: BTreeSet<String> = BTreeSet::new();
+
+        for root in roots {
+            let Some(nodes) = self.fn_irq_boot_nodes.get(&root).cloned() else {
+                continue;
+            };
+            let mut visiting = BTreeSet::new();
+            visiting.insert(root.clone());
+            reached_fns.insert(root.clone());
+            let initial_excl = BTreeSet::new();
+            let _ = self.unroll_irq_nodes(
+                &nodes,
+                &[],
+                None,
+                &initial_excl,
+                &mut visiting,
+                &mut reached_fns,
+                &mut irq_mode_seen,
+                &mut mixed_warned,
+                &mut next_branch_id,
+            );
+        }
+
+        // Also validate any uncalled helper functions that directly/transitively call `attach`
+        // (for instance `fn bad_helper(u32 x) { IRQ.attach(h(x)); } fn main() {}`).
+        if has_main {
+            let unreached: Vec<String> = self
+                .fn_decl_order
+                .iter()
+                .filter(|name| {
+                    !reached_fns.contains(*name)
+                        && !called_by_fn.contains(*name)
+                        && self
+                            .call_graph
+                            .nodes
+                            .get(*name)
+                            .is_some_and(|n| n.attaches_in_boot)
+                })
+                .cloned()
+                .collect();
+            for fname in unreached {
+                if let Some(nodes) = self.fn_irq_boot_nodes.get(&fname).cloned() {
+                    let mut visiting = BTreeSet::new();
+                    visiting.insert(fname.clone());
+                    let initial_excl = BTreeSet::new();
+                    let _ = self.unroll_irq_nodes(
+                        &nodes,
+                        &[],
+                        None,
+                        &initial_excl,
+                        &mut visiting,
+                        &mut reached_fns,
+                        &mut irq_mode_seen,
+                        &mut mixed_warned,
+                        &mut next_branch_id,
+                    );
+                }
+            }
+        }
+    }
+
+    fn irq_nodes_contain_attach(&self, nodes: &[IrqBootNode]) -> bool {
+        for n in nodes {
+            match n {
+                IrqBootNode::Attach(_) => return true,
+                IrqBootNode::Call { callee, .. } => {
+                    if self
+                        .call_graph
+                        .nodes
+                        .get(callee)
+                        .is_some_and(|node| node.attaches_in_boot)
+                    {
+                        return true;
+                    }
+                }
+                IrqBootNode::BranchGroup { arms } => {
+                    if arms
+                        .iter()
+                        .any(|(_, sub)| self.irq_nodes_contain_attach(sub))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn unroll_irq_nodes(
+        &mut self,
+        nodes: &[IrqBootNode],
+        param_args: &[Option<IrqBindingArg>],
+        cond_branch: Option<usize>,
+        active_exclusive: &BTreeSet<u32>,
+        visiting: &mut BTreeSet<String>,
+        reached_fns: &mut BTreeSet<String>,
+        irq_mode_seen: &mut BTreeMap<u32, (bool, String, Span)>,
+        mixed_warned: &mut BTreeSet<u32>,
+        next_branch_id: &mut usize,
+    ) -> (bool, BTreeSet<u32>) {
+        let mut cur_excl = active_exclusive.clone();
+        for node in nodes {
+            match node {
+                IrqBootNode::Attach(att) => {
+                    let mut resolved_args = Vec::with_capacity(att.args.len());
+                    let mut args_ok = true;
+                    for (spec_opt, arg_span, pname) in &att.args {
+                        match spec_opt {
+                            Some(BootAttachArgSpec::Static(arg)) => {
+                                resolved_args.push(arg.clone());
+                            }
+                            Some(BootAttachArgSpec::Param { index, .. }) => {
+                                if let Some(Some(forwarded)) = param_args.get(*index) {
+                                    resolved_args.push(forwarded.clone());
+                                } else {
+                                    self.emit(
+                                        Diagnostic::new(
+                                            DiagnosticKind::IrqAttachmentError,
+                                            *arg_span,
+                                            format!(
+                                                "parameter '{}' forwarded into '{}.attach({}(...))' in '{}' must be bound to a static primitive `&prim`, MMIO handle, or compile-time constant at every boot call site",
+                                                pname, att.irq_name, att.isr_name, att.in_caller
+                                            ),
+                                        )
+                                        .with_file(att.file.clone()),
+                                    );
+                                    args_ok = false;
+                                }
+                            }
+                            None => {
+                                args_ok = false;
+                            }
+                        }
+                    }
+
+                    if !att.invalid_ctx {
+                        if let Some((prev_shared, prev_name, prev_span)) =
+                            irq_mode_seen.get(&att.irq_num).cloned()
+                        {
+                            if prev_shared != att.is_shared && mixed_warned.insert(att.irq_num) {
+                                self.emit(
+                                    Diagnostic::new(
+                                        DiagnosticKind::IrqAttachmentError,
+                                        att.span,
+                                        format!(
+                                            "IRQ '{}' (#{}) cannot mix exclusive `.attach(...)` and shared `.attach_shared(...)`",
+                                            att.irq_name, att.irq_num
+                                        ),
+                                    )
+                                    .with_file(att.file.clone())
+                                    .with_note(format!(
+                                        "previously bound via `{}.{}(...)` at {}",
+                                        prev_name,
+                                        if prev_shared { "attach_shared" } else { "attach" },
+                                        prev_span
+                                    )),
+                                );
+                            }
+                        } else {
+                            irq_mode_seen.insert(
+                                att.irq_num,
+                                (att.is_shared, att.irq_name.clone(), att.span),
+                            );
+                        }
+
+                        if !att.is_shared && !cur_excl.insert(att.irq_num) {
+                            self.emit(
+                                Diagnostic::new(
+                                    DiagnosticKind::IrqAttachmentError,
+                                    att.span,
+                                    format!(
+                                        "IRQ '{}' (#{}) already has an exclusive `.attach(...)` handler on this boot path",
+                                        att.irq_name, att.irq_num
+                                    ),
+                                )
+                                .with_file(att.file.clone())
+                                .with_note(
+                                    "use `.attach_shared(...)` for multi-handler interrupts or guard mutually exclusive variants in `if`/`else`/`switch` branches",
+                                ),
+                            );
+                        } else if args_ok {
+                            self.irq_bindings.push(IrqBindingInfo {
+                                irq_name: att.irq_name.clone(),
+                                irq_num: att.irq_num,
+                                is_shared: att.is_shared,
+                                isr_name: att.isr_name.clone(),
+                                args: resolved_args,
+                                conditional_branch: cond_branch,
+                                span: att.span,
+                            });
+                        }
+                    }
+                }
+                IrqBootNode::Call {
+                    callee,
+                    args,
+                } => {
+                    let attaches = self
+                        .call_graph
+                        .nodes
+                        .get(callee)
+                        .is_some_and(|n| n.attaches_in_boot);
+                    if !attaches || !visiting.insert(callee.clone()) {
+                        continue;
+                    }
+                    reached_fns.insert(callee.clone());
+                    let child_params: Vec<Option<IrqBindingArg>> = args
+                        .iter()
+                        .map(|a| match &a.spec {
+                            Some(BootAttachArgSpec::Static(s)) => Some(s.clone()),
+                            Some(BootAttachArgSpec::Param { index, .. }) => {
+                                param_args.get(*index).cloned().flatten()
+                            }
+                            None => None,
+                        })
+                        .collect();
+                    if let Some(child_nodes) = self.fn_irq_boot_nodes.get(callee).cloned() {
+                        let (child_div, child_excl) = self.unroll_irq_nodes(
+                            &child_nodes,
+                            &child_params,
+                            cond_branch,
+                            &cur_excl,
+                            visiting,
+                            reached_fns,
+                            irq_mode_seen,
+                            mixed_warned,
+                            next_branch_id,
+                        );
+                        cur_excl = child_excl;
+                        visiting.remove(callee);
+                        if child_div {
+                            return (true, cur_excl);
+                        }
+                    } else {
+                        visiting.remove(callee);
+                    }
+                }
+                IrqBootNode::BranchGroup { arms } => {
+                    let group_has_attach = arms
+                        .iter()
+                        .any(|(_, sub)| self.irq_nodes_contain_attach(sub));
+                    if !group_has_attach {
+                        continue;
+                    }
+                    let mut post_union = cur_excl.clone();
+                    let mut all_arms_div = true;
+                    let mut any_non_div = false;
+                    for (arm_div, arm_nodes) in arms {
+                        let arm_branch = if cond_branch.is_some() {
+                            cond_branch
+                        } else {
+                            let id = *next_branch_id;
+                            *next_branch_id += 1;
+                            Some(id)
+                        };
+                        let (sub_div, arm_post) = self.unroll_irq_nodes(
+                            arm_nodes,
+                            param_args,
+                            arm_branch,
+                            &cur_excl,
+                            visiting,
+                            reached_fns,
+                            irq_mode_seen,
+                            mixed_warned,
+                            next_branch_id,
+                        );
+                        if !(*arm_div || sub_div) {
+                            all_arms_div = false;
+                            if !any_non_div {
+                                post_union = arm_post;
+                                any_non_div = true;
+                            } else {
+                                post_union.extend(arm_post);
+                            }
+                        }
+                    }
+                    if all_arms_div {
+                        return (true, cur_excl);
+                    }
+                    cur_excl = post_union;
+                }
+            }
+        }
+        (false, cur_excl)
     }
 
     fn unroll_boot_fn(
@@ -2119,6 +2970,7 @@ struct BodyChecker<'a> {
     caller_key: String,
     caller_kind: CallableKind,
     body_kind: ActiveBodyKind,
+    prog_idx: usize,
     /// Scope stack: `scopes.len()` equals lexical scope depth (`1` = fn/task body, `2..N` = nested blocks).
     scopes: Vec<BTreeMap<String, LocalVar>>,
     leases: LeaseEnv,
@@ -2130,7 +2982,9 @@ struct BodyChecker<'a> {
     after_diverge: bool,
     main_supervisor_started: bool,
     param_names: Vec<String>,
+    isr_state_names: BTreeSet<String>,
     boot_steps: Vec<BootStep>,
+    boot_block_stack: Vec<Vec<IrqBootNode>>,
     return_param_origins: BTreeSet<usize>,
     recorded_boosts: Vec<PriorityBoostSite>,
     proven_infallible_spans: BTreeSet<(u32, u32)>,
@@ -2147,11 +3001,13 @@ impl<'a> BodyChecker<'a> {
         caller_kind: CallableKind,
         body_kind: ActiveBodyKind,
     ) -> Self {
+        let prog_idx = sema.current_prog_idx;
         Self {
             sema,
             caller_key: caller_key.to_string(),
             caller_kind,
             body_kind,
+            prog_idx,
             scopes: vec![BTreeMap::new()], // depth 1 = top-level fn/task/isr body
             leases: LeaseEnv::new(),
             loop_depth: 0,
@@ -2162,7 +3018,9 @@ impl<'a> BodyChecker<'a> {
             after_diverge: false,
             main_supervisor_started: false,
             param_names: Vec::new(),
+            isr_state_names: BTreeSet::new(),
             boot_steps: Vec::new(),
+            boot_block_stack: vec![Vec::new()],
             return_param_origins: BTreeSet::new(),
             recorded_boosts: Vec::new(),
             proven_infallible_spans: BTreeSet::new(),
@@ -2252,6 +3110,7 @@ impl<'a> BodyChecker<'a> {
                     prov,
                     field_prov: BTreeMap::new(),
                     endpoint_alias,
+                    is_isr_state: false,
                 },
             );
         }
@@ -2455,6 +3314,11 @@ impl<'a> BodyChecker<'a> {
                         format!("local variable '{}' cannot have type 'void'", name.name),
                     ));
                 }
+                self.sema.check_type_no_byval_mmio(
+                    &resolved_ty,
+                    ty.span,
+                    &format!("local variable '{}'", name.name),
+                );
                 if self.scopes.last().unwrap().contains_key(&name.name) {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::DuplicateDefinition,
@@ -2494,14 +3358,25 @@ impl<'a> BodyChecker<'a> {
                         || resolved_ty.contains_fn_ptr(&self.sema.structs)
                     {
                         if decl_depth < val.prov.origin_depth {
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::ScopeDepthEscape,
-                                init_expr.span,
-                                format!(
-                                    "cannot store reference/slice of inner scope depth {} into variable '{}' at outer scope depth {}",
-                                    val.prov.origin_depth, name.name, decl_depth
-                                ),
-                            ));
+                            if !val.prov.isr_state_origins.is_empty() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::InvalidIsrState,
+                                    init_expr.span,
+                                    format!(
+                                        "cannot escape `&` of ISR `state` variable into outer variable '{}'",
+                                        name.name
+                                    ),
+                                ));
+                            } else {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::ScopeDepthEscape,
+                                    init_expr.span,
+                                    format!(
+                                        "cannot store reference/slice of inner scope depth {} into variable '{}' at outer scope depth {}",
+                                        val.prov.origin_depth, name.name, decl_depth
+                                    ),
+                                ));
+                            }
                         }
                         prov = val.prov;
                     }
@@ -2517,12 +3392,144 @@ impl<'a> BodyChecker<'a> {
                         prov,
                         field_prov,
                         endpoint_alias,
+                        is_isr_state: false,
                     },
                 );
                 false
             }
 
-            StmtKind::StateVar { .. } => false,
+            StmtKind::StateVar { ty, name, init } => {
+                if !matches!(self.body_kind, ActiveBodyKind::Isr) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidIsrState,
+                        stmt.span,
+                        format!(
+                            "`state` variable '{}' is only allowed inside an `isr` handler",
+                            name.name
+                        ),
+                    ));
+                }
+
+                let dup_in_isr = if matches!(self.body_kind, ActiveBodyKind::Isr) {
+                    !self.isr_state_names.insert(name.name.clone())
+                } else {
+                    self.scopes.last().unwrap().contains_key(&name.name)
+                };
+                if dup_in_isr {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidIsrState,
+                        name.span,
+                        format!(
+                            "duplicate `state` variable '{}' inside ISR '{}'",
+                            name.name,
+                            self.display_caller_name()
+                        ),
+                    ));
+                } else if matches!(self.body_kind, ActiveBodyKind::Isr)
+                    && self.param_names.iter().any(|p| p == &name.name)
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidIsrState,
+                        name.span,
+                        format!(
+                            "`state` variable '{}' shadows parameter of ISR '{}'",
+                            name.name,
+                            self.display_caller_name()
+                        ),
+                    ));
+                }
+
+                let resolved_ty = self.sema.resolve_type(ty);
+                if resolved_ty.is_void() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidIsrState,
+                        ty.span,
+                        format!("`state` variable '{}' cannot have type 'void'", name.name),
+                    ));
+                }
+                self.sema.check_type_no_byval_mmio(
+                    &resolved_ty,
+                    ty.span,
+                    &format!("`state` variable '{}'", name.name),
+                );
+                if resolved_ty.contains_reference(&self.sema.structs)
+                    || resolved_ty.contains_fn_ptr(&self.sema.structs)
+                    || matches!(
+                        resolved_ty,
+                        Ty::OsPrimitive(_) | Ty::MmioInstance { .. }
+                    )
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidIsrState,
+                        ty.span,
+                        format!(
+                            "`state` variable '{}' cannot have reference-bearing or handle type '{}'",
+                            name.name, resolved_ty
+                        ),
+                    ));
+                }
+
+                match init {
+                    None => {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidIsrState,
+                            stmt.span,
+                            format!(
+                                "`state` variable '{}' inside ISR requires a compile-time constant initializer",
+                                name.name
+                            ),
+                        ));
+                    }
+                    Some(init_expr) => {
+                        let val = self.check_expr_infallible(init_expr);
+                        if !val.ty.is_assignable_to(&resolved_ty) {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::TypeMismatch,
+                                init_expr.span,
+                                format!(
+                                    "`state` variable '{}' declared as '{}', but initialized with '{}'",
+                                    name.name, resolved_ty, val.ty
+                                ),
+                            ));
+                        } else {
+                            self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
+                        }
+                        if !self.sema.is_compile_time_const_expr(init_expr) {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidIsrState,
+                                init_expr.span,
+                                format!(
+                                    "`state` variable '{}' initializer must be a compile-time constant expression",
+                                    name.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                let decl_depth = self.current_depth();
+                self.scopes.last_mut().unwrap().insert(
+                    name.name.clone(),
+                    LocalVar {
+                        name: name.name.clone(),
+                        ty: resolved_ty.clone(),
+                        decl_depth,
+                        prov: Provenance::pure_static(),
+                        field_prov: BTreeMap::new(),
+                        endpoint_alias: None,
+                        is_isr_state: true,
+                    },
+                );
+                if matches!(self.body_kind, ActiveBodyKind::Isr) {
+                    self.sema.isr_states.push(IsrStateInfo {
+                        isr_name: self.display_caller_name().to_string(),
+                        name: name.name.clone(),
+                        ty: resolved_ty,
+                        span: stmt.span,
+                    });
+                }
+                false
+            }
             StmtKind::Assign { target, op, value } => {
                 let rhs = self.check_expr_infallible(value);
                 self.check_assignment(target, *op, value, rhs, stmt.span);
@@ -2806,7 +3813,9 @@ impl<'a> BodyChecker<'a> {
                 let base_leases = self.leases.clone();
 
                 self.branch_depth += 1;
+                self.boot_block_stack.push(Vec::new());
                 let then_div = self.check_nested_block(then_block);
+                let then_irq_nodes = self.boot_block_stack.pop().unwrap_or_default();
                 self.branch_depth -= 1;
                 let then_vars = self.snapshot_outer_vars();
                 let then_leases = self.leases.clone();
@@ -2816,10 +3825,25 @@ impl<'a> BodyChecker<'a> {
 
                 if let Some(eb) = else_block {
                     self.branch_depth += 1;
+                    self.boot_block_stack.push(Vec::new());
                     let else_div = self.check_nested_block(eb);
+                    let else_irq_nodes = self.boot_block_stack.pop().unwrap_or_default();
                     self.branch_depth -= 1;
                     let else_vars = self.snapshot_outer_vars();
                     let else_leases = self.leases.clone();
+
+                    if self.can_record_boot_step()
+                        && (!then_irq_nodes.is_empty() || !else_irq_nodes.is_empty())
+                    {
+                        if let Some(top) = self.boot_block_stack.last_mut() {
+                            top.push(IrqBootNode::BranchGroup {
+                                arms: vec![
+                                    (then_div, then_irq_nodes),
+                                    (else_div, else_irq_nodes),
+                                ],
+                            });
+                        }
+                    }
 
                     self.scopes = base_vars.clone();
                     let mut live_var_branches = Vec::new();
@@ -2837,6 +3861,13 @@ impl<'a> BodyChecker<'a> {
                     self.leases.join_branches(&live_lease_branches);
                     then_div && else_div
                 } else {
+                    if self.can_record_boot_step() && !then_irq_nodes.is_empty() {
+                        if let Some(top) = self.boot_block_stack.last_mut() {
+                            top.push(IrqBootNode::BranchGroup {
+                                arms: vec![(then_div, then_irq_nodes), (false, Vec::new())],
+                            });
+                        }
+                    }
                     let mut live_var_branches = vec![base_vars.clone()];
                     let mut live_lease_branches = vec![base_leases.clone()];
                     if !then_div {
@@ -3215,6 +4246,8 @@ impl<'a> BodyChecker<'a> {
                 let mut has_wildcard = false;
                 let mut covered_variants = BTreeSet::new();
                 let mut all_arms_diverge = !arms.is_empty();
+                let mut arm_irq_nodes: Vec<(bool, Vec<IrqBootNode>)> =
+                    Vec::with_capacity(arms.len());
 
                 for arm in arms {
                     match &arm.pat {
@@ -3307,8 +4340,11 @@ impl<'a> BodyChecker<'a> {
                     self.scopes = base_vars.clone();
                     self.leases = base_leases.clone();
                     self.branch_depth += 1;
+                    self.boot_block_stack.push(Vec::new());
                     let arm_div = self.check_nested_block(&arm.body);
+                    let this_arm_irq_nodes = self.boot_block_stack.pop().unwrap_or_default();
                     self.branch_depth -= 1;
+                    arm_irq_nodes.push((arm_div, this_arm_irq_nodes));
                     if !arm_div {
                         all_arms_diverge = false;
                         live_var_branches.push(self.snapshot_outer_vars());
@@ -3323,6 +4359,17 @@ impl<'a> BodyChecker<'a> {
                     all_arms_diverge = false;
                     live_var_branches.push(base_vars.clone());
                     live_lease_branches.push(base_leases.clone());
+                    arm_irq_nodes.push((false, Vec::new()));
+                }
+
+                if self.can_record_boot_step()
+                    && arm_irq_nodes.iter().any(|(_, n)| !n.is_empty())
+                {
+                    if let Some(top) = self.boot_block_stack.last_mut() {
+                        top.push(IrqBootNode::BranchGroup {
+                            arms: arm_irq_nodes,
+                        });
+                    }
                 }
 
                 self.scopes = base_vars.clone();
@@ -3410,6 +4457,7 @@ impl<'a> BodyChecker<'a> {
                     prov: var_prov.clone(),
                     field_prov: BTreeMap::new(),
                     endpoint_alias: None,
+                    is_isr_state: false,
                 },
             );
             let _ = this.check_block_stmts(&body.stmts);
@@ -3706,6 +4754,19 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return;
                 }
+                if self.sema.mmio_instances.contains_key(&ident.name)
+                    || self.sema.irqs.contains_key(&ident.name)
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        target.span,
+                        format!(
+                            "cannot reassign hardware handle '{}' directly",
+                            ident.name
+                        ),
+                    ));
+                    return;
+                }
                 if let Some(ig) = self.sema.illegal_globals.get(&ident.name).cloned() {
                     let ty_str = if ig.ty.is_error() {
                         "u32".to_string()
@@ -3769,20 +4830,31 @@ impl<'a> BodyChecker<'a> {
                     || var_info.ty.contains_fn_ptr(&self.sema.structs)
                 {
                     if var_info.decl_depth < rhs.prov.origin_depth {
-                        self.sema.emit(
-                            Diagnostic::new(
-                                DiagnosticKind::ScopeDepthEscape,
+                        if !rhs.prov.isr_state_origins.is_empty() {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidIsrState,
                                 stmt_span,
                                 format!(
-                                    "cannot escape temporary/leased value of scope depth {} into outer variable '{}' declared at scope depth {}",
-                                    rhs.prov.origin_depth, ident.name, var_info.decl_depth
+                                    "cannot escape `&` of ISR `state` variable into outer variable '{}' at depth {}",
+                                    ident.name, var_info.decl_depth
                                 ),
-                            )
-                            .with_note(format!(
-                                "origin depth is {} (nested block/DMA lease) while '{}' lives at outer depth {} (0=static, 1=fn/task body, 2+=nested block); pass the slice/struct down into a helper `fn`, decode into a value struct (`Type.from_bytes(slice)`), or copy bytes into a fixed `[N]u8` buffer",
-                                rhs.prov.origin_depth, ident.name, var_info.decl_depth
-                            )),
-                        );
+                            ));
+                        } else {
+                            self.sema.emit(
+                                Diagnostic::new(
+                                    DiagnosticKind::ScopeDepthEscape,
+                                    stmt_span,
+                                    format!(
+                                        "cannot escape temporary/leased value of scope depth {} into outer variable '{}' declared at scope depth {}",
+                                        rhs.prov.origin_depth, ident.name, var_info.decl_depth
+                                    ),
+                                )
+                                .with_note(format!(
+                                    "origin depth is {} (nested block/DMA lease) while '{}' lives at outer depth {} (0=static, 1=fn/task body, 2+=nested block); pass the slice/struct down into a helper `fn`, decode into a value struct (`Type.from_bytes(slice)`), or copy bytes into a fixed `[N]u8` buffer",
+                                    rhs.prov.origin_depth, ident.name, var_info.decl_depth
+                                )),
+                            );
+                        }
                     }
                     if let Some(v) = self.lookup_local_mut(&ident.name) {
                         v.prov = rhs.prov;
@@ -3796,12 +4868,38 @@ impl<'a> BodyChecker<'a> {
                 target: base,
                 field,
             } => {
-                // Check field write (`r.buf = half;` or `ptr_to_struct.field = val;`).
+                // Check field or MMIO register write (`r.buf = half;`, `USART1.icr = 1;`, `regs.cr1 |= 1;`).
                 let base_val = self.check_expr_infallible(base);
                 let (struct_name, via_ptr) = match &base_val.ty {
                     Ty::Struct(s) => (s.clone(), false),
+                    Ty::MmioLayout(layout_name) | Ty::MmioInstance { layout: layout_name, .. } => {
+                        let ln = layout_name.clone();
+                        self.check_mmio_reg_write_access(
+                            &ln,
+                            field,
+                            None,
+                            op,
+                            value_expr,
+                            &rhs,
+                            stmt_span,
+                        );
+                        return;
+                    }
                     Ty::Ptr(inner) => match &**inner {
                         Ty::Struct(s) => (s.clone(), true),
+                        Ty::MmioLayout(layout_name) => {
+                            let ln = layout_name.clone();
+                            self.check_mmio_reg_write_access(
+                                &ln,
+                                field,
+                                None,
+                                op,
+                                value_expr,
+                                &rhs,
+                                stmt_span,
+                            );
+                            return;
+                        }
                         _ => {
                             if !base_val.ty.is_error() {
                                 self.sema.emit(Diagnostic::new(
@@ -3871,26 +4969,48 @@ impl<'a> BodyChecker<'a> {
                             && rhs.prov.has_non_returning_origin())
                             || dest_depth < rhs.prov.origin_depth
                         {
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::ScopeDepthEscape,
-                                stmt_span,
-                                format!(
-                                    "cannot store inner/leased reference of depth {} into struct field '{}' through outer pointer (depth {})",
-                                    rhs.prov.origin_depth, field.name, dest_depth
-                                ),
-                            ));
-                        }
-                    } else if let Some(root_name) = root_ident_of(base) {
-                        if let Some(root_var) = self.lookup_local(&root_name).cloned() {
-                            if root_var.decl_depth < rhs.prov.origin_depth {
+                            if !rhs.prov.isr_state_origins.is_empty() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::InvalidIsrState,
+                                    stmt_span,
+                                    format!(
+                                        "cannot escape `&` of ISR `state` variable through pointer field '{}'",
+                                        field.name
+                                    ),
+                                ));
+                            } else {
                                 self.sema.emit(Diagnostic::new(
                                     DiagnosticKind::ScopeDepthEscape,
                                     stmt_span,
                                     format!(
-                                        "cannot escape value of scope depth {} into field '{}' of outer struct '{}' declared at scope depth {}",
-                                        rhs.prov.origin_depth, field.name, root_name, root_var.decl_depth
+                                        "cannot store inner/leased reference of depth {} into struct field '{}' through outer pointer (depth {})",
+                                        rhs.prov.origin_depth, field.name, dest_depth
                                     ),
                                 ));
+                            }
+                        }
+                    } else if let Some(root_name) = root_ident_of(base) {
+                        if let Some(root_var) = self.lookup_local(&root_name).cloned() {
+                            if root_var.decl_depth < rhs.prov.origin_depth {
+                                if !rhs.prov.isr_state_origins.is_empty() {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::InvalidIsrState,
+                                        stmt_span,
+                                        format!(
+                                            "cannot escape `&` of ISR `state` variable into outer field '{}.{}'",
+                                            root_name, field.name
+                                        ),
+                                    ));
+                                } else {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::ScopeDepthEscape,
+                                        stmt_span,
+                                        format!(
+                                            "cannot escape value of scope depth {} into field '{}' of outer struct '{}' declared at scope depth {}",
+                                            rhs.prov.origin_depth, field.name, root_name, root_var.decl_depth
+                                        ),
+                                    ));
+                                }
                             }
                             if let Some(v) = self.lookup_local_mut(&root_name) {
                                 v.field_prov.insert(field.name.clone(), rhs.prov.clone());
@@ -3920,6 +5040,17 @@ impl<'a> BodyChecker<'a> {
                     }
                     return;
                 };
+                if let Ty::MmioLayout(ln) = &**pointee_ty {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        target.span,
+                        format!(
+                            "cannot overwrite MMIO register block '{}' by value; assign individual registers instead",
+                            ln
+                        ),
+                    ));
+                    return;
+                }
                 if op == AssignOp::Assign {
                     if !rhs.ty.is_assignable_to(pointee_ty) {
                         self.sema.emit(Diagnostic::new(
@@ -3941,14 +5072,22 @@ impl<'a> BodyChecker<'a> {
                     if (pv.prov.pointee_is_caller_or_static && rhs.prov.has_non_returning_origin())
                         || dest_depth < rhs.prov.origin_depth
                     {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::ScopeDepthEscape,
-                            stmt_span,
-                            format!(
-                                "cannot store inner/leased reference of depth {} through pointer targeting outer depth {}",
-                                rhs.prov.origin_depth, dest_depth
-                            ),
-                        ));
+                        if !rhs.prov.isr_state_origins.is_empty() {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidIsrState,
+                                stmt_span,
+                                "cannot escape `&` of ISR `state` variable through outer or caller pointer",
+                            ));
+                        } else {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::ScopeDepthEscape,
+                                stmt_span,
+                                format!(
+                                    "cannot store inner/leased reference of depth {} through pointer targeting outer depth {}",
+                                    rhs.prov.origin_depth, dest_depth
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -3957,6 +5096,38 @@ impl<'a> BodyChecker<'a> {
                 target: seq_expr,
                 index,
             } => {
+                // Handle indexed MMIO array register writes (`regs.brr[i] = val;`, `regs.brr[i] |= mask;`)
+                // directly so `@wo` array registers are never misread before checking write qualifiers.
+                if let ExprKind::Field {
+                    target: mmio_base,
+                    field,
+                } = &seq_expr.kind
+                {
+                    let base_val = self.check_expr_infallible(mmio_base);
+                    let mmio_layout = match &base_val.ty {
+                        Ty::MmioLayout(ln) | Ty::MmioInstance { layout: ln, .. } => {
+                            Some(ln.clone())
+                        }
+                        Ty::Ptr(inner) => match &**inner {
+                            Ty::MmioLayout(ln) => Some(ln.clone()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(ln) = mmio_layout {
+                        self.check_mmio_reg_write_access(
+                            &ln,
+                            field,
+                            Some(index),
+                            op,
+                            value_expr,
+                            &rhs,
+                            stmt_span,
+                        );
+                        return;
+                    }
+                }
+
                 let sv = self.check_expr_infallible(seq_expr);
                 let iv = self.check_expr_infallible(index);
                 if !iv.ty.is_integer() && !iv.ty.is_error() {
@@ -3999,14 +5170,25 @@ impl<'a> BodyChecker<'a> {
                     if let Some(root_name) = root_ident_of(seq_expr) {
                         if let Some(root_var) = self.lookup_local(&root_name) {
                             if root_var.decl_depth < rhs.prov.origin_depth {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::ScopeDepthEscape,
-                                    stmt_span,
-                                    format!(
-                                        "cannot escape value of scope depth {} into array/slice '{}' at scope depth {}",
-                                        rhs.prov.origin_depth, root_name, root_var.decl_depth
-                                    ),
-                                ));
+                                if !rhs.prov.isr_state_origins.is_empty() {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::InvalidIsrState,
+                                        stmt_span,
+                                        format!(
+                                            "cannot escape `&` of ISR `state` variable into outer array/slice '{}'",
+                                            root_name
+                                        ),
+                                    ));
+                                } else {
+                                    self.sema.emit(Diagnostic::new(
+                                        DiagnosticKind::ScopeDepthEscape,
+                                        stmt_span,
+                                        format!(
+                                            "cannot escape value of scope depth {} into array/slice '{}' at scope depth {}",
+                                            rhs.prov.origin_depth, root_name, root_var.decl_depth
+                                        ),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -4129,6 +5311,8 @@ impl<'a> BodyChecker<'a> {
             ExprKind::Cast { expr: inner, ty } => {
                 let iv = self.check_expr_infallible(inner);
                 let target_ty = self.sema.resolve_type(ty);
+                self.sema
+                    .check_type_no_byval_mmio(&target_ty, ty.span, "cast target type");
                 if !iv.ty.is_error() && !target_ty.is_error() && !is_valid_cast(&iv.ty, &target_ty)
                 {
                     self.sema.emit(Diagnostic::new(
@@ -4250,7 +5434,17 @@ impl<'a> BodyChecker<'a> {
                         let mut prov = tv.prov;
                         if let Some(root) = root_ident_of(target) {
                             if let Some(var) = self.lookup_local(&root) {
-                                prov = prov.merge(&Provenance::addr_of_local(&var.name, var.decl_depth));
+                                if var.is_isr_state {
+                                    prov = prov.merge(&Provenance::addr_of_isr_state(
+                                        &var.name,
+                                        var.decl_depth,
+                                    ));
+                                } else {
+                                    prov = prov.merge(&Provenance::addr_of_local(
+                                        &var.name,
+                                        var.decl_depth,
+                                    ));
+                                }
                             }
                         }
                         ExprVal {
@@ -4629,8 +5823,31 @@ impl<'a> BodyChecker<'a> {
             return ExprVal::error(ident.span);
         }
 
-        // 6. Declared function (e.g. callback reference `register_cb(my_fn)`).
+        // 6. Declared function (e.g. callback reference `register_cb(my_fn)`),
+        //    MMIO peripheral instance (`USART1`), or hardware IRQ token (`IRQ_USART1`).
+        if let Some(inst) = self.sema.mmio_instances.get(&ident.name).cloned() {
+            return ExprVal {
+                ty: Ty::MmioInstance {
+                    name: inst.name.clone(),
+                    layout: inst.layout,
+                },
+                error_spec: ResolvedErrorSpec::None,
+                prov: Provenance::addr_of_static(),
+                endpoint_name: Some(inst.name),
+                span: ident.span,
+            };
+        }
+        if let Some(iq) = self.sema.irqs.get(&ident.name).cloned() {
+            return ExprVal {
+                ty: Ty::IrqToken,
+                error_spec: ResolvedErrorSpec::None,
+                prov: Provenance::pure_static(),
+                endpoint_name: Some(iq.name),
+                span: ident.span,
+            };
+        }
         if let Some(fn_info) = self.sema.functions.get(&ident.name).cloned() {
+            self.sema.check_extern_c_access(self.prog_idx, ident);
             let fn_ty = Ty::FnPtr {
                 params: fn_info.params.iter().map(|p| p.ty.clone()).collect(),
                 ret: Box::new(fn_info.ret_ty),
@@ -4682,9 +5899,27 @@ impl<'a> BodyChecker<'a> {
     fn check_unary_expr(&mut self, op: UnaryOp, inner: &Expr, span: Span) -> ExprVal {
         match op {
             UnaryOp::AddrOf => {
-                // `&fn_name` preserves callback provenance.
+                // `&fn_name`, `&MMIO_PERIPH`, `&irq`, `&const`.
                 if let ExprKind::Ident(id) = &inner.kind {
+                    if let Some(inst) = self.sema.mmio_instances.get(&id.name).cloned() {
+                        return ExprVal {
+                            ty: Ty::Ptr(Box::new(Ty::MmioLayout(inst.layout))),
+                            error_spec: ResolvedErrorSpec::None,
+                            prov: Provenance::addr_of_static(),
+                            endpoint_name: Some(id.name.clone()),
+                            span,
+                        };
+                    }
+                    if self.sema.irqs.contains_key(&id.name) {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::ImmutableAssignment,
+                            span,
+                            format!("cannot take address '&{}' of hardware IRQ token", id.name),
+                        ));
+                        return ExprVal::error(span);
+                    }
                     if let Some(fn_info) = self.sema.functions.get(&id.name).cloned() {
+                        self.sema.check_extern_c_access(self.prog_idx, id);
                         let fn_ty = Ty::FnPtr {
                             params: fn_info.params.iter().map(|p| p.ty.clone()).collect(),
                             ret: Box::new(fn_info.ret_ty),
@@ -4707,7 +5942,53 @@ impl<'a> BodyChecker<'a> {
                     }
                 }
 
-                let iv = self.check_expr_infallible(inner);
+                // Forbid taking raw `&regs.reg` or `&regs.arr[i]` of MMIO registers (`E0031`).
+                let iv = match &inner.kind {
+                    ExprKind::Field { target, field } => {
+                        let bv = self.check_expr_infallible(target);
+                        if is_mmio_ty(&bv.ty) {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::MmioViolation,
+                                span,
+                                format!(
+                                    "cannot take raw address `&` of MMIO register '{}'; access MMIO registers through `*Layout` pointers instead",
+                                    field.name
+                                ),
+                            ));
+                            return ExprVal::error(span);
+                        }
+                        self.check_resolved_field_val(bv, target, field, inner.span)
+                    }
+                    ExprKind::Index { target: seq, index } => {
+                        if let ExprKind::Field { target, field } = &seq.kind {
+                            let bv = self.check_expr_infallible(target);
+                            let idx_v = self.check_expr_infallible(index);
+                            if !idx_v.ty.is_integer() && !idx_v.ty.is_error() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    index.span,
+                                    format!("index must be an integer, found '{}'", idx_v.ty),
+                                ));
+                            }
+                            if is_mmio_ty(&bv.ty) {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::MmioViolation,
+                                    span,
+                                    format!(
+                                        "cannot take raw address `&` of MMIO register '{}'; access MMIO registers through `*Layout` pointers instead",
+                                        field.name
+                                    ),
+                                ));
+                                return ExprVal::error(span);
+                            }
+                            let fv = self.check_resolved_field_val(bv, target, field, seq.span);
+                            self.check_resolved_index_val(fv, seq, index.span, inner.span)
+                        } else {
+                            self.check_expr_infallible(inner)
+                        }
+                    }
+                    _ => self.check_expr_infallible(inner),
+                };
                 if iv.ty.is_error() {
                     return ExprVal::error(span);
                 }
@@ -4716,7 +5997,17 @@ impl<'a> BodyChecker<'a> {
                 let mut endpoint_name = iv.endpoint_name.clone();
                 if let Some(root_name) = root_ident_of(inner) {
                     if let Some(local) = self.lookup_local(&root_name) {
-                        prov = prov.merge(&Provenance::addr_of_local(&local.name, local.decl_depth));
+                        if local.is_isr_state {
+                            prov = prov.merge(&Provenance::addr_of_isr_state(
+                                &local.name,
+                                local.decl_depth,
+                            ));
+                        } else {
+                            prov = prov.merge(&Provenance::addr_of_local(
+                                &local.name,
+                                local.decl_depth,
+                            ));
+                        }
                         if endpoint_name.is_none() {
                             endpoint_name = local.endpoint_alias.clone();
                         }
@@ -4930,11 +6221,21 @@ impl<'a> BodyChecker<'a> {
 
     fn check_field_expr(&mut self, target: &Expr, field: &Ident, span: Span) -> ExprVal {
         let tv = self.check_expr_infallible(target);
+        self.check_resolved_field_val(tv, target, field, span)
+    }
+
+    fn check_resolved_field_val(
+        &mut self,
+        tv: ExprVal,
+        target: &Expr,
+        field: &Ident,
+        span: Span,
+    ) -> ExprVal {
         if tv.ty.is_error() {
             return ExprVal::error(span);
         }
 
-        // Auto-dereference `*Struct` / `*Slice` on field access.
+        // Auto-dereference `*Struct` / `*Slice` / `*MmioLayout` on field access.
         let deref_ty = match &tv.ty {
             Ty::Ptr(inner) => (**inner).clone(),
             other => other.clone(),
@@ -5045,6 +6346,53 @@ impl<'a> BodyChecker<'a> {
                 }
             }
 
+            Ty::MmioLayout(layout_name) | Ty::MmioInstance { layout: layout_name, .. } => {
+                let Some(layout_info) = self.sema.mmio_layouts.get(&layout_name).cloned() else {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::UndefinedSymbol,
+                        field.span,
+                        format!("unknown MMIO register layout '{}'", layout_name),
+                    ));
+                    return ExprVal::error(span);
+                };
+                let Some(reg) = layout_info.regs.iter().find(|r| r.name == field.name).cloned()
+                else {
+                    let candidates = layout_info.regs.iter().map(|r| r.name.as_str());
+                    let mut diag = Diagnostic::new(
+                        DiagnosticKind::UndefinedSymbol,
+                        field.span,
+                        format!(
+                            "MMIO layout '{}' has no register '{}'",
+                            layout_name, field.name
+                        ),
+                    );
+                    if let Some(best) = closest_match(&field.name, candidates, 2) {
+                        diag = diag.with_note(format!("did you mean register `.{}`?", best));
+                    }
+                    self.sema.emit(diag);
+                    return ExprVal::error(span);
+                };
+                if reg.access == MmioAccess::Wo {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        span,
+                        format!(
+                            "cannot read write-only `@wo` MMIO register '{}.{}'",
+                            layout_name, reg.name
+                        ),
+                    ));
+                }
+                let reg_ty = if let Some(len) = reg.array_len {
+                    Ty::Array {
+                        elem: Box::new(Ty::Prim(reg.elem_ty)),
+                        len,
+                    }
+                } else {
+                    Ty::Prim(reg.elem_ty)
+                };
+                ExprVal::scalar(reg_ty, span)
+            }
+
             Ty::Namespace(NamespaceKind::Chip(chip_name)) => {
                 ExprVal::scalar(Ty::HwPeripheral(format!("{}.{}", chip_name, field.name)), span)
             }
@@ -5118,6 +6466,7 @@ impl<'a> BodyChecker<'a> {
         if let ExprKind::Ident(ident) = &callee.kind {
             // 1. User-declared or `extern "C"` function.
             if let Some(fn_info) = self.sema.functions.get(&ident.name).cloned() {
+                self.sema.check_extern_c_access(self.prog_idx, ident);
                 return self.check_direct_fn_call(&fn_info, args, span);
             }
 
@@ -5241,6 +6590,7 @@ impl<'a> BodyChecker<'a> {
 
         let mut arg_vals = Vec::with_capacity(args.len());
         let mut boot_call_args = Vec::with_capacity(args.len());
+        let mut boot_attach_args = Vec::with_capacity(args.len());
         for (i, arg) in args.iter().enumerate() {
             let av = self.check_expr_infallible(&arg.value);
             if let Some(param) = fn_info.params.get(i) {
@@ -5286,6 +6636,9 @@ impl<'a> BodyChecker<'a> {
                 ref_param_origins: av.prov.param_origins.clone(),
                 span: arg.span,
             });
+            boot_attach_args.push(BootAttachCallArg {
+                spec: self.classify_irq_attach_arg(&arg.value, &av),
+            });
             arg_vals.push(av);
         }
 
@@ -5301,6 +6654,12 @@ impl<'a> BodyChecker<'a> {
                     conditional: self.branch_depth > 0,
                     args: boot_call_args,
                 });
+                if let Some(top) = self.boot_block_stack.last_mut() {
+                    top.push(IrqBootNode::Call {
+                        callee: fn_info.name.clone(),
+                        args: boot_attach_args,
+                    });
+                }
             }
         }
 
@@ -5732,6 +7091,8 @@ impl<'a> BodyChecker<'a> {
                 ExprVal::error(span)
             }
 
+            Ty::IrqToken => self.check_irq_method(&rv, method, args, span),
+
             other => {
                 self.sema.emit(Diagnostic::new(
                     DiagnosticKind::UndefinedSymbol,
@@ -5876,11 +7237,17 @@ impl<'a> BodyChecker<'a> {
                     }
                 } else {
                     let av = self.check_expr_infallible(&args[0].value);
-                    if !av.ty.is_assignable_to(&Ty::u32()) && !av.ty.is_error() {
+                    if av.ty != Ty::IrqToken
+                        && !av.ty.is_assignable_to(&Ty::u32())
+                        && !av.ty.is_error()
+                    {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
                             args[0].span,
-                            format!("'sys.pend_irq' expects `u32` IRQ number, found '{}'", av.ty),
+                            format!(
+                                "'sys.pend_irq' expects `u32` or `irq` vector token, found '{}'",
+                                av.ty
+                            ),
                         ));
                     }
                 }
@@ -6338,6 +7705,16 @@ impl<'a> BodyChecker<'a> {
             return;
         }
         let (val, arg_expr, arg_span) = &pos_vals[0];
+        if !val.prov.isr_state_origins.is_empty() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::InvalidIsrState,
+                *arg_span,
+                format!(
+                    "cannot pass `&` of ISR `state` variable to OS primitive method '{}'",
+                    method
+                ),
+            ));
+        }
         if !val.ty.is_assignable_to(elem) {
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::TypeMismatch,
@@ -6476,6 +7853,7 @@ impl<'a> BodyChecker<'a> {
                         prov: Provenance::pure_static(),
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
+                        is_isr_state: false,
                     },
                 );
             }
@@ -6498,6 +7876,7 @@ impl<'a> BodyChecker<'a> {
                         prov: iv.prov.clone(),
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
+                        is_isr_state: false,
                     },
                 );
             }
@@ -7275,6 +8654,9 @@ fn is_valid_cast(src: &Ty, dst: &Ty) -> bool {
         (Ty::Ptr(_) | Ty::HwPeripheral(_), Ty::Ptr(_)) => true,
         (Ty::Ptr(_) | Ty::HwPeripheral(_), b) if b.is_integer() => true,
         (a, Ty::Ptr(_) | Ty::HwPeripheral(_)) if a.is_integer() => true,
+        (Ty::MmioInstance { .. }, Ty::Ptr(_)) => true,
+        (Ty::MmioInstance { .. }, b) if b.is_integer() => true,
+        (Ty::IrqToken, b) if b.is_integer() => true,
         (Ty::Str, Ty::Ptr(inner))
             if inner.is_void() || matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>
         {
@@ -7429,5 +8811,684 @@ fn expr_has_break(expr: &Expr) -> bool {
         }
         ExprKind::Or { expr: a, fallback: b } => expr_has_break(a) || expr_has_break(b),
         _ => false,
+    }
+}
+
+fn is_mmio_ty(ty: &Ty) -> bool {
+    matches!(ty, Ty::MmioLayout(_) | Ty::MmioInstance { .. })
+        || matches!(ty, Ty::Ptr(inner) if matches!(&**inner, Ty::MmioLayout(_)))
+}
+
+fn ty_contains_byval_mmio(ty: &Ty) -> Option<&str> {
+    match ty {
+        Ty::MmioLayout(name) => Some(name.as_str()),
+        Ty::Array { elem, .. } | Ty::Slice(elem) => ty_contains_byval_mmio(elem),
+        Ty::OsPrimitive(os) => os.elem_ty().and_then(ty_contains_byval_mmio),
+        Ty::FnPtr { params, ret } => params
+            .iter()
+            .find_map(ty_contains_byval_mmio)
+            .or_else(|| ty_contains_byval_mmio(ret)),
+        _ => None,
+    }
+}
+
+impl Analyzer {
+    fn check_extern_c_access(&mut self, prog_idx: usize, ident: &Ident) {
+        if self.program_extern_c_scopes.is_empty()
+            || !self.non_root_extern_c_names.contains(&ident.name)
+        {
+            return;
+        }
+        let Some(fn_info) = self.functions.get(&ident.name) else {
+            return;
+        };
+        if !fn_info.is_extern_c {
+            return;
+        }
+        let declared_locally = self
+            .program_extern_c_scopes
+            .get(prog_idx)
+            .is_some_and(|s| s.contains(&ident.name));
+        let imported_pub = self
+            .rewritten_pub_extern_sites
+            .contains(&(prog_idx, ident.span.start, ident.span.end));
+        if !declared_locally && !imported_pub {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::ModuleError,
+                ident.span,
+                format!(
+                    "`extern \"C\"` function '{}' belongs to another module and is not declared here or imported as `pub`",
+                    ident.name
+                ),
+            ));
+        }
+    }
+
+    fn is_compile_time_const_expr(&self, expr: &Expr) -> bool {
+        let mut visiting = BTreeSet::new();
+        self.is_const_expr_inner(expr, &mut visiting)
+    }
+
+    fn is_const_expr_inner(&self, expr: &Expr, visiting: &mut BTreeSet<String>) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(_) | ExprKind::Priority(_) => true,
+            ExprKind::Ident(id) => {
+                if self.consts.contains_key(&id.name) {
+                    if let Some((raw, _)) = self.raw_const_exprs.get(&id.name) {
+                        if visiting.insert(id.name.clone()) {
+                            let ok = self.is_const_expr_inner(raw, visiting);
+                            visiting.remove(&id.name);
+                            return ok;
+                        }
+                    }
+                    true
+                } else {
+                    self.variant_to_enums
+                        .get(&id.name)
+                        .is_some_and(|v| v.len() == 1)
+                        || self.builtin_svd_consts.contains(&id.name)
+                }
+            }
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(en) = &target.kind {
+                    if self
+                        .enums
+                        .get(&en.name)
+                        .is_some_and(|e| e.has_variant(&field.name))
+                    {
+                        return true;
+                    }
+                }
+                false
+            }
+            ExprKind::Unary { op, expr: inner } => match op {
+                UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot => {
+                    self.is_const_expr_inner(inner, visiting)
+                }
+                UnaryOp::AddrOf | UnaryOp::Deref => false,
+            },
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.is_const_expr_inner(lhs, visiting) && self.is_const_expr_inner(rhs, visiting)
+            }
+            ExprKind::Cast { expr: inner, .. } => self.is_const_expr_inner(inner, visiting),
+            ExprKind::ArrayLit(elems) => elems
+                .iter()
+                .all(|e| self.is_const_expr_inner(e, visiting)),
+            ExprKind::StructLit { fields, .. } => fields
+                .iter()
+                .all(|f| self.is_const_expr_inner(&f.value, visiting)),
+            _ => false,
+        }
+    }
+
+    fn eval_const_bool(&self, expr: &Expr, visiting: &mut BTreeSet<String>) -> Option<bool> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Bool(b)) => Some(*b),
+            ExprKind::Ident(id) => {
+                if !visiting.insert(id.name.clone()) {
+                    return None;
+                }
+                let res = self
+                    .raw_const_exprs
+                    .get(&id.name)
+                    .and_then(|(raw, _)| self.eval_const_bool(raw, visiting));
+                visiting.remove(&id.name);
+                res
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => Some(!self.eval_const_bool(inner, visiting)?),
+            ExprKind::Binary { op, lhs, rhs } => match op {
+                BinaryOp::And => {
+                    Some(self.eval_const_bool(lhs, visiting)? && self.eval_const_bool(rhs, visiting)?)
+                }
+                BinaryOp::Or => {
+                    Some(self.eval_const_bool(lhs, visiting)? || self.eval_const_bool(rhs, visiting)?)
+                }
+                BinaryOp::Eq | BinaryOp::Ne => {
+                    if let (Some(a), Some(b)) = (
+                        self.eval_const_bool(lhs, visiting),
+                        self.eval_const_bool(rhs, visiting),
+                    ) {
+                        return Some(if matches!(op, BinaryOp::Eq) { a == b } else { a != b });
+                    }
+                    let a = self.eval_const_expr_i128(lhs, visiting)?;
+                    let b = self.eval_const_expr_i128(rhs, visiting)?;
+                    Some(if matches!(op, BinaryOp::Eq) { a == b } else { a != b })
+                }
+                BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                    let a = self.eval_const_expr_i128(lhs, visiting)?;
+                    let b = self.eval_const_expr_i128(rhs, visiting)?;
+                    Some(match op {
+                        BinaryOp::Lt => a < b,
+                        BinaryOp::Le => a <= b,
+                        BinaryOp::Gt => a > b,
+                        BinaryOp::Ge => a >= b,
+                        _ => unreachable!(),
+                    })
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn eval_compile_time_irq_arg(&self, expr: &Expr, ty: &Ty) -> Option<IrqBindingArg> {
+        if ty.is_bool() {
+            let mut visiting = BTreeSet::new();
+            if let Some(b) = self.eval_const_bool(expr, &mut visiting) {
+                return Some(IrqBindingArg::ConstBool(b));
+            }
+        }
+        if ty.is_integer() || matches!(ty, Ty::IntLit) {
+            let mut visiting = BTreeSet::new();
+            if let Some(value) = self.eval_const_expr_i128(expr, &mut visiting) {
+                let final_ty = if matches!(ty, Ty::IntLit) {
+                    Ty::u32()
+                } else {
+                    ty.clone()
+                };
+                return Some(IrqBindingArg::ConstInt {
+                    ty: final_ty,
+                    value,
+                });
+            }
+        }
+        if self.is_compile_time_const_expr(expr) {
+            return Some(IrqBindingArg::ConstExpr {
+                ty: ty.clone(),
+                expr: expr.clone(),
+            });
+        }
+        None
+    }
+}
+
+impl<'a> BodyChecker<'a> {
+    fn check_resolved_index_val(
+        &mut self,
+        tv: ExprVal,
+        target: &Expr,
+        _index_span: Span,
+        span: Span,
+    ) -> ExprVal {
+        match &tv.ty {
+            Ty::Slice(elem) | Ty::Array { elem, .. } => {
+                let elem_ty = (**elem).clone();
+                let prov = if elem_ty.contains_reference(&self.sema.structs) {
+                    tv.prov
+                } else {
+                    Provenance::pure_static()
+                };
+                ExprVal {
+                    ty: elem_ty,
+                    error_spec: ResolvedErrorSpec::None,
+                    prov,
+                    endpoint_name: None,
+                    span,
+                }
+            }
+            _ => {
+                if !tv.ty.is_error() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        target.span,
+                        format!("cannot index into type '{}'", tv.ty),
+                    ));
+                }
+                ExprVal::error(span)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_mmio_reg_write_access(
+        &mut self,
+        layout_name: &str,
+        field: &Ident,
+        elem_index: Option<&Expr>,
+        op: AssignOp,
+        value_expr: &Expr,
+        rhs: &ExprVal,
+        stmt_span: Span,
+    ) {
+        if let Some(idx_expr) = elem_index {
+            let iv = self.check_expr_infallible(idx_expr);
+            if !iv.ty.is_integer() && !iv.ty.is_error() {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    idx_expr.span,
+                    format!("array index must be an integer, found '{}'", iv.ty),
+                ));
+            }
+        }
+
+        let Some(layout_info) = self.sema.mmio_layouts.get(layout_name).cloned() else {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::UndefinedSymbol,
+                field.span,
+                format!("unknown MMIO register layout '{}'", layout_name),
+            ));
+            return;
+        };
+        let Some(reg) = layout_info.regs.iter().find(|r| r.name == field.name).cloned() else {
+            let candidates = layout_info.regs.iter().map(|r| r.name.as_str());
+            let mut diag = Diagnostic::new(
+                DiagnosticKind::UndefinedSymbol,
+                field.span,
+                format!(
+                    "MMIO layout '{}' has no register '{}'",
+                    layout_name, field.name
+                ),
+            );
+            if let Some(best) = closest_match(&field.name, candidates, 2) {
+                diag = diag.with_note(format!("did you mean register `.{}`?", best));
+            }
+            self.sema.emit(diag);
+            return;
+        };
+
+        let target_ty = if elem_index.is_some() {
+            if reg.array_len.is_none() {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    field.span,
+                    format!(
+                        "cannot index scalar MMIO register '{}.{}' of type '{}'",
+                        layout_name, reg.name, reg.elem_ty
+                    ),
+                ));
+                return;
+            }
+            Ty::Prim(reg.elem_ty)
+        } else if let Some(len) = reg.array_len {
+            Ty::Array {
+                elem: Box::new(Ty::Prim(reg.elem_ty)),
+                len,
+            }
+        } else {
+            Ty::Prim(reg.elem_ty)
+        };
+
+        match reg.access {
+            MmioAccess::Rw => {}
+            MmioAccess::Ro => {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::MmioViolation,
+                    stmt_span,
+                    format!(
+                        "cannot write to read-only `@ro` MMIO register '{}.{}'",
+                        layout_name, reg.name
+                    ),
+                ));
+                return;
+            }
+            MmioAccess::Wo => {
+                if op != AssignOp::Assign {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        stmt_span,
+                        format!(
+                            "cannot perform compound read-modify-write `{}` on write-only `@wo` MMIO register '{}.{}'; use plain `=`",
+                            op.as_str(),
+                            layout_name,
+                            reg.name
+                        ),
+                    ));
+                    return;
+                }
+            }
+            MmioAccess::W1c => {
+                if op != AssignOp::Assign {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        stmt_span,
+                        format!(
+                            "cannot perform compound read-modify-write `{}` on write-1-to-clear `@w1c` MMIO register '{}.{}'; write masks directly using `=`",
+                            op.as_str(),
+                            layout_name,
+                            reg.name
+                        ),
+                    ));
+                    return;
+                }
+            }
+        }
+
+        if op == AssignOp::Assign {
+            if !rhs.ty.is_assignable_to(&target_ty) {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    rhs.span,
+                    format!(
+                        "cannot assign '{}' to MMIO register '{}.{}' of type '{}'",
+                        rhs.ty, layout_name, reg.name, target_ty
+                    ),
+                ));
+            } else {
+                self.sema.check_f32_coercion_expr(value_expr, &target_ty);
+            }
+        } else {
+            self.check_compound_op_types(op, &target_ty, value_expr, &rhs.ty, stmt_span);
+        }
+    }
+
+    fn classify_irq_attach_arg(&self, expr: &Expr, val: &ExprVal) -> Option<BootAttachArgSpec> {
+        match &expr.kind {
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                expr: inner,
+            } => {
+                if let ExprKind::Ident(id) = &inner.kind {
+                    if self.sema.primitives.contains_key(&id.name) {
+                        return Some(BootAttachArgSpec::Static(IrqBindingArg::PrimAddr(
+                            id.name.clone(),
+                        )));
+                    }
+                    if self.sema.mmio_instances.contains_key(&id.name) {
+                        return Some(BootAttachArgSpec::Static(IrqBindingArg::MmioAddr(
+                            id.name.clone(),
+                        )));
+                    }
+                }
+                None
+            }
+            ExprKind::Ident(id) => {
+                if let Some(idx) = self.param_names.iter().position(|p| p == &id.name) {
+                    return Some(BootAttachArgSpec::Param { index: idx });
+                }
+                if self.sema.mmio_instances.contains_key(&id.name) {
+                    return Some(BootAttachArgSpec::Static(IrqBindingArg::MmioAddr(
+                        id.name.clone(),
+                    )));
+                }
+                self.sema
+                    .eval_compile_time_irq_arg(expr, &val.ty)
+                    .map(BootAttachArgSpec::Static)
+            }
+            _ => self
+                .sema
+                .eval_compile_time_irq_arg(expr, &val.ty)
+                .map(BootAttachArgSpec::Static),
+        }
+    }
+
+    fn check_irq_method(
+        &mut self,
+        rv: &ExprVal,
+        method: &Ident,
+        args: &[CallArg],
+        span: Span,
+    ) -> ExprVal {
+        let is_shared = match method.name.as_str() {
+            "attach" => false,
+            "attach_shared" => true,
+            other => {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::IrqAttachmentError,
+                    method.span,
+                    format!(
+                        "unknown method '{}' on hardware `irq` token; supported: `.attach(...)` and `.attach_shared(...)`",
+                        other
+                    ),
+                ));
+                for a in args {
+                    let _ = self.check_expr_infallible(&a.value);
+                }
+                return ExprVal::error(span);
+            }
+        };
+
+        let Some(irq_name) = rv.endpoint_name.clone() else {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                span,
+                "`.attach(...)` requires a named top-level `irq` declaration",
+            ));
+            return ExprVal::error(span);
+        };
+        let irq_num = self
+            .sema
+            .irqs
+            .get(&irq_name)
+            .map(|q| q.irq_num)
+            .unwrap_or(0);
+
+        let mut invalid_ctx = false;
+        if self.in_defer() {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                span,
+                format!(
+                    "cannot attach IRQ handler on '{}' inside a 'defer' cleanup statement",
+                    irq_name
+                ),
+            ));
+        } else if self.in_isr() {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                span,
+                format!(
+                    "cannot attach IRQ handler on '{}' inside ISR '{}'; IRQ bindings must happen during sequential boot",
+                    irq_name,
+                    self.display_caller_name()
+                ),
+            ));
+        } else if matches!(self.body_kind, ActiveBodyKind::Task) {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                span,
+                format!(
+                    "cannot attach IRQ handler on '{}' inside task '{}'; IRQ bindings must happen during sequential boot",
+                    irq_name,
+                    self.display_caller_name()
+                ),
+            ));
+        } else if self.loop_depth > 0 {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                span,
+                format!(
+                    "cannot attach IRQ handler on '{}' inside a loop; IRQ bindings must be static in the boot tree",
+                    irq_name
+                ),
+            ));
+        } else if self.after_diverge || self.main_supervisor_started {
+            invalid_ctx = true;
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                span,
+                format!(
+                    "cannot attach IRQ handler on '{}' after 'main()' supervisor loop or diverging control flow",
+                    irq_name
+                ),
+            ));
+        }
+
+        if args.len() != 1 || args[0].name.is_some() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                span,
+                format!(
+                    "`{}.{}(...)` expects 1 positional ISR handler argument (`handler(args...)` or `handler`)",
+                    irq_name, method.name
+                ),
+            ));
+            for a in args {
+                let _ = self.check_expr_infallible(&a.value);
+            }
+            return ExprVal::scalar(Ty::void(), span);
+        }
+
+        let handler_arg = &args[0];
+        let (isr_ident, isr_call_args): (&Ident, &[CallArg]) = match &handler_arg.value.kind {
+            ExprKind::Ident(id) => (id, &[]),
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args: call_args,
+            } => {
+                if !generic_args.is_empty() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::IrqAttachmentError,
+                        handler_arg.span,
+                        "`isr` handlers cannot accept generic type arguments",
+                    ));
+                }
+                match &callee.kind {
+                    ExprKind::Ident(id) => (id, call_args.as_slice()),
+                    _ => {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::IrqAttachmentError,
+                            callee.span,
+                            "expected named `isr` handler in `.attach(...)`",
+                        ));
+                        for a in call_args {
+                            let _ = self.check_expr_infallible(&a.value);
+                        }
+                        return ExprVal::scalar(Ty::void(), span);
+                    }
+                }
+            }
+            _ => {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::IrqAttachmentError,
+                    handler_arg.span,
+                    format!(
+                        "expected `isr` handler invocation `isr_name(args...)` or `isr_name` in `{}.{}(...)`",
+                        irq_name, method.name
+                    ),
+                ));
+                let _ = self.check_expr_infallible(&handler_arg.value);
+                return ExprVal::scalar(Ty::void(), span);
+            }
+        };
+
+        let Some(isr_info) = self.sema.isrs.get(&isr_ident.name).cloned() else {
+            if self.sema.functions.contains_key(&isr_ident.name) {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::IrqAttachmentError,
+                    isr_ident.span,
+                    format!(
+                        "'{}' is a `fn`, not an `isr` handler; declare `isr {}(...) {{ ... }}` instead",
+                        isr_ident.name, isr_ident.name
+                    ),
+                ));
+            } else if self.sema.tasks.contains_key(&isr_ident.name) {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::IrqAttachmentError,
+                    isr_ident.span,
+                    format!(
+                        "'{}' is a `task`, not an `isr` handler",
+                        isr_ident.name
+                    ),
+                ));
+            } else {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::UndefinedSymbol,
+                    isr_ident.span,
+                    format!("undeclared `isr` handler '{}'", isr_ident.name),
+                ));
+            }
+            for a in isr_call_args {
+                let _ = self.check_expr_infallible(&a.value);
+            }
+            return ExprVal::scalar(Ty::void(), span);
+        };
+
+        if isr_call_args.len() != isr_info.params.len() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::IrqAttachmentError,
+                handler_arg.span,
+                format!(
+                    "ISR handler '{}' expects {} argument(s), found {}",
+                    isr_info.vector,
+                    isr_info.params.len(),
+                    isr_call_args.len()
+                ),
+            ));
+        }
+
+        let mut arg_specs = Vec::with_capacity(isr_call_args.len());
+        for (idx, a) in isr_call_args.iter().enumerate() {
+            let av = self.check_expr_infallible(&a.value);
+            let param_name = isr_info
+                .params
+                .get(idx)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| format!("arg{idx}"));
+            if let Some(param) = isr_info.params.get(idx) {
+                if !av.ty.is_assignable_to(&param.ty) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        a.span,
+                        format!(
+                            "argument {} ('{}') to ISR handler '{}' has type '{}', expected '{}'",
+                            idx + 1,
+                            param.name,
+                            isr_info.vector,
+                            av.ty,
+                            param.ty
+                        ),
+                    ));
+                } else {
+                    self.sema.check_f32_coercion_expr(&a.value, &param.ty);
+                }
+            }
+            let spec = self.classify_irq_attach_arg(&a.value, &av);
+            if spec.is_none() {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::IrqAttachmentError,
+                    a.span,
+                    format!(
+                        "argument {} ('{}') passed to `{}.{}` handler '{}' must be a static OS primitive `&prim`, `mmio` instance, or compile-time constant expression",
+                        idx + 1,
+                        param_name,
+                        irq_name,
+                        method.name,
+                        isr_info.vector
+                    ),
+                ));
+            }
+            let forwarded_pname = match &spec {
+                Some(BootAttachArgSpec::Param { index, .. }) => self
+                    .param_names
+                    .get(*index)
+                    .cloned()
+                    .unwrap_or(param_name),
+                _ => param_name,
+            };
+            arg_specs.push((spec, a.span, forwarded_pname));
+        }
+
+        if !invalid_ctx && self.can_record_boot_step() {
+            self.sema
+                .call_graph
+                .mark_direct_attach(&self.caller_key, &irq_name);
+        }
+        if self.can_record_boot_step() {
+            let in_caller = self.display_caller_name().to_string();
+            let file = self.sema.current_file.clone();
+            if let Some(top) = self.boot_block_stack.last_mut() {
+                top.push(IrqBootNode::Attach(PendingIrqAttach {
+                    irq_name,
+                    irq_num,
+                    is_shared,
+                    isr_name: isr_info.vector,
+                    args: arg_specs,
+                    span,
+                    file,
+                    in_caller,
+                    invalid_ctx,
+                }));
+            }
+        }
+
+        ExprVal::scalar(Ty::void(), span)
     }
 }
