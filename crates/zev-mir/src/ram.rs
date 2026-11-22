@@ -58,6 +58,7 @@ pub struct VarRamInfo {
     pub role: VarRole,
     pub hoisted: bool,
     pub in_noyield_scope: bool,
+    pub singleton_folded: bool,
     pub bytes_32: usize,
     pub bytes_64: usize,
 }
@@ -87,6 +88,7 @@ pub struct FrameLayoutReport {
     pub hoisted_vars: Vec<VarRamInfo>,
     pub stack_vars: Vec<VarRamInfo>,
     pub child_slots: Vec<ChildSlotRamInfo>,
+    pub singleton_folded_vars: Vec<String>,
 }
 
 /// Static RAM allocation for a single `spawn`ed task slot (or `main` supervisor).
@@ -111,6 +113,9 @@ pub struct SpawnedTaskRam {
     pub hoisted_vars: Vec<VarRamInfo>,
     pub stack_vars: Vec<VarRamInfo>,
     pub child_slots: Vec<ChildSlotRamInfo>,
+    pub singleton_folded_vars: Vec<String>,
+    pub singleton_saved_bytes_32: usize,
+    pub singleton_saved_bytes_64: usize,
 }
 
 /// Static RAM visibility for a `SoftYielding` function compiled into both a coroutine
@@ -132,6 +137,7 @@ pub struct PrimitiveRam {
     pub holds_sleep_lock: bool,
     pub dead_stripped: bool,
     pub irq_mask_elided: bool,
+    pub singleton_folded: bool,
     pub bytes_32: usize,
     pub bytes_64: usize,
 }
@@ -142,6 +148,7 @@ pub struct ArchRamTotals {
     pub task_frames_bytes: usize,
     pub naive_task_frames_bytes: usize,
     pub union_bytes_saved: usize,
+    pub singleton_bytes_saved: usize,
     pub boot_frames_bytes: usize,
     pub tcb_table_bytes: usize,
     pub primitives_bytes: usize,
@@ -191,13 +198,19 @@ impl RamReport {
                     None => String::new(),
                 };
                 let cond_tag = if t.conditional { " [conditional]" } else { "" };
+                let singleton_tag =
+                    if !t.singleton_folded_vars.is_empty() || t.singleton_saved_bytes_32 > 0 {
+                        " [singleton -> folded]"
+                    } else {
+                        ""
+                    };
                 let label = if t.is_main_supervisor {
                     "main (supervisor)".to_string()
                 } else {
                     format!("{} ({})", t.instance_name, t.blueprint_name)
                 };
                 out.push_str(&format!(
-                    "  #{:<3} {:<24} {:<10} {:>8} B {:>8} B {:>9} B {:>7} B{}{}\n",
+                    "  #{:<3} {:<24} {:<10} {:>8} B {:>8} B {:>9} B {:>7} B{}{}{}\n",
                     t.slot_id,
                     label,
                     t.priority.label(),
@@ -206,7 +219,8 @@ impl RamReport {
                     t.union_saved_bytes_32,
                     t.frame_bytes_64,
                     core_tag,
-                    cond_tag
+                    cond_tag,
+                    singleton_tag
                 ));
 
                 if t.provenance_path.len() > 2 || t.conditional {
@@ -230,10 +244,22 @@ impl RamReport {
                     ));
                 }
 
+                if !t.singleton_folded_vars.is_empty() || t.singleton_saved_bytes_32 > 0 {
+                    let vars_list = if t.singleton_folded_vars.is_empty() {
+                        "child-frame".to_string()
+                    } else {
+                        t.singleton_folded_vars.join(", ")
+                    };
+                    out.push_str(&format!(
+                        "       singleton folded : {} (0 B in frame, saved {} B 32b / {} B 64b)\n",
+                        vars_list, t.singleton_saved_bytes_32, t.singleton_saved_bytes_64
+                    ));
+                }
+
                 let user_stack: Vec<String> = t
                     .stack_vars
                     .iter()
-                    .filter(|v| v.role == VarRole::UserLocal)
+                    .filter(|v| v.role == VarRole::UserLocal && !v.singleton_folded)
                     .map(|v| {
                         let tag = if v.in_noyield_scope { " [noyield]" } else { "" };
                         format!("{}: {}{}", v.name, v.ty_display, tag)
@@ -277,9 +303,35 @@ impl RamReport {
                 } else {
                     hoisted.join(", ")
                 };
+                let sf_tag = if f.singleton_folded_vars.is_empty() {
+                    String::new()
+                } else {
+                    let hoisted_names: BTreeSet<&str> =
+                        f.hoisted_vars.iter().map(|v| v.name.as_str()).collect();
+                    let eliminated: Vec<&str> = f
+                        .singleton_folded_vars
+                        .iter()
+                        .filter(|n| !hoisted_names.contains(n.as_str()))
+                        .map(String::as_str)
+                        .collect();
+                    let inlined: Vec<&str> = f
+                        .singleton_folded_vars
+                        .iter()
+                        .filter(|n| hoisted_names.contains(n.as_str()))
+                        .map(String::as_str)
+                        .collect();
+                    let mut parts = Vec::new();
+                    if !eliminated.is_empty() {
+                        parts.push(format!("{} -> 0 B", eliminated.join(", ")));
+                    }
+                    if !inlined.is_empty() {
+                        parts.push(format!("inlined: {}", inlined.join(", ")));
+                    }
+                    format!("  [singleton: {}]", parts.join("; "))
+                };
                 out.push_str(&format!(
-                    "  {:<28} {:>6} B (32b) / {:>6} B (64b)  [{}]\n",
-                    f.name, f.packed_bytes_32, f.packed_bytes_64, vars_desc
+                    "  {:<28} {:>6} B (32b) / {:>6} B (64b)  [{}]{}\n",
+                    f.name, f.packed_bytes_32, f.packed_bytes_64, vars_desc, sf_tag
                 ));
             }
             out.push('\n');
@@ -302,6 +354,9 @@ impl RamReport {
                     flags.push("dead watch stripped -> 0 B");
                 } else if p.irq_mask_elided {
                     flags.push("irq-mask elided");
+                }
+                if p.singleton_folded {
+                    flags.push("singleton -> folded");
                 }
                 let flag_str = if flags.is_empty() {
                     String::new()
@@ -334,6 +389,12 @@ impl RamReport {
             "Child-Frame Union Bytes Saved",
             self.mcu32.union_bytes_saved,
             self.host64.union_bytes_saved
+        ));
+        out.push_str(&format!(
+            "  {:<34} {:>10} B {:>12} B\n",
+            "Singleton Folding Bytes Saved",
+            self.mcu32.singleton_bytes_saved,
+            self.host64.singleton_bytes_saved
         ));
         if self.mcu32.boot_frames_bytes > 0 || self.host64.boot_frames_bytes > 0 {
             out.push_str(&format!(
@@ -787,6 +848,7 @@ pub fn compute_ram_report_with_subsystems(
                         hoisted_vars: vec![],
                         stack_vars: vec![],
                         child_slots: vec![],
+                        singleton_folded_vars: vec![],
                     },
                     DualFrameMetrics::default(),
                 )
@@ -815,6 +877,9 @@ pub fn compute_ram_report_with_subsystems(
             hoisted_vars: bp_rep.hoisted_vars,
             stack_vars: bp_rep.stack_vars,
             child_slots: bp_rep.child_slots,
+            singleton_folded_vars: Vec::new(),
+            singleton_saved_bytes_32: 0,
+            singleton_saved_bytes_64: 0,
         });
     }
 
@@ -851,6 +916,7 @@ pub fn compute_ram_report_with_subsystems(
             holds_sleep_lock: p.kind.holds_dma_sleep_lock(),
             dead_stripped: p.dead_stripped,
             irq_mask_elided: p.irq_mask_elided,
+            singleton_folded: false,
             bytes_32: s32,
             bytes_64: s64,
         });
@@ -876,6 +942,7 @@ pub fn compute_ram_report_with_subsystems(
             holds_sleep_lock: struct_holds_dma_sleep_lock(&sub.struct_name, &ctx.structs),
             dead_stripped: false,
             irq_mask_elided: false,
+            singleton_folded: false,
             bytes_32: s32,
             bytes_64: s64,
         });
@@ -993,6 +1060,7 @@ fn summarize_arch(
         task_frames_bytes,
         naive_task_frames_bytes,
         union_bytes_saved,
+        singleton_bytes_saved: 0,
         boot_frames_bytes,
         tcb_table_bytes,
         primitives_bytes,
@@ -1146,6 +1214,7 @@ fn build_frame_report(
             role: v.role,
             hoisted: v.hoisted,
             in_noyield_scope: v.in_noyield_scope,
+            singleton_folded: false,
             bytes_32: b32,
             bytes_64: b64,
         };
@@ -1181,6 +1250,7 @@ fn build_frame_report(
         hoisted_vars,
         stack_vars,
         child_slots: slot_infos,
+        singleton_folded_vars: Vec::new(),
     }
 }
 
@@ -1196,6 +1266,53 @@ pub fn populate_module_ram_report(module: &mut MirModule) {
         &module.irq_vectors,
         &module.boot.boot_yielding_callees,
     );
+    rep.mcu32.singleton_bytes_saved = module.visibility.singleton_bytes_saved_32;
+    rep.host64.singleton_bytes_saved = module.visibility.singleton_bytes_saved_64;
+    for t in &mut rep.spawned_tasks {
+        if let Some(vars) = module.visibility.folded_task_vars.get(&t.blueprint_name) {
+            t.singleton_folded_vars = vars.clone();
+        }
+        if let Some(&(s32, s64)) = module
+            .visibility
+            .singleton_task_bytes_saved
+            .get(&t.instance_name)
+        {
+            t.singleton_saved_bytes_32 = s32;
+            t.singleton_saved_bytes_64 = s64;
+        }
+        if let Some(folded_ids) = module.visibility.folded_task_var_ids.get(&t.blueprint_name) {
+            if let Some(bp) = module
+                .task_blueprints
+                .iter()
+                .find(|b| b.name == t.blueprint_name)
+            {
+                for (sv, mv) in t
+                    .stack_vars
+                    .iter_mut()
+                    .zip(bp.vars.iter().filter(|v| !v.hoisted))
+                {
+                    if folded_ids.contains(&mv.id.0) {
+                        sv.singleton_folded = true;
+                    }
+                }
+            }
+        }
+    }
+    for f in &mut rep.fn_frames {
+        if let Some(vars) = module.visibility.folded_fn_vars.get(&f.name) {
+            f.singleton_folded_vars = vars.clone();
+        }
+    }
+    for f in &mut rep.blueprint_frames {
+        if let Some(vars) = module.visibility.folded_task_vars.get(&f.name) {
+            f.singleton_folded_vars = vars.clone();
+        }
+    }
+    for p in &mut rep.primitives {
+        if module.visibility.singleton_subsystems.contains(&p.name) {
+            p.singleton_folded = true;
+        }
+    }
     if !module.monomorphized_instances.is_empty() {
         let ctx = LayoutCtx {
             structs: module

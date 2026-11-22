@@ -4995,12 +4995,14 @@ int main(void) {
             .find(|b| b.name == sp.blueprint_name)
         {
             for (idx, &pvid) in bp.params.iter().enumerate() {
-                if let Some(ae) = args.get(idx) {
-                    init_fields.push(format!(
-                        ".{} = {}",
-                        frame_var_name(&bp.vars[pvid.0]),
-                        self.fmt_expr(ae, vars)
-                    ));
+                if bp.vars[pvid.0].hoisted && !bp.vars[pvid.0].ty.is_void() {
+                    if let Some(ae) = args.get(idx) {
+                        init_fields.push(format!(
+                            ".{} = {}",
+                            frame_var_name(&bp.vars[pvid.0]),
+                            self.fmt_expr(ae, vars)
+                        ));
+                    }
                 }
             }
         }
