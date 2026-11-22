@@ -1,4 +1,4 @@
-//! Complete structured error explainers (`P0001`..`P0012` and `E0001`..`E0033`) for `zevc doc`.
+//! Complete structured error explainers (`P0001`..`P0013` and `E0001`..`E0034`) for `zevc doc`.
 
 pub struct ErrorDoc {
     pub code: &'static str,
@@ -10,7 +10,7 @@ pub struct ErrorDoc {
 }
 
 pub const ERROR_DOCS: &[ErrorDoc] = &[
-    // ── Parser Foreign-Idiom Traps (P0001..P0012) ───────────────────────────
+    // ── Parser Foreign-Idiom Traps (P0001..P0013) ───────────────────────────
     ErrorDoc {
         code: "P0001",
         summary: "Foreign `let` / `var` / `mut` variable binding instead of explicit C-style `Type name`",
@@ -335,13 +335,36 @@ fn main() {
     spawn consumer() @high;
 }",
     },
+    ErrorDoc {
+        code: "P0013",
+        summary: "Retired `lease<T, N>` type used instead of `@dma_safe pool<T, K>` + `Lease<T>` + `dma_slot<T>`",
+        topic: "dma",
+        why: "Standalone `lease<T, N>` has been replaced by static buffer pools `@dma_safe pool<T, K>`, move-only linear `Lease<T>` handles, and single-occupancy `dma_slot<T>` handoff cells (or `@dma_safe ping_pong<T, N>` for continuous alternating circular DMA).",
+        bad_zev: "\
+lease<u8, 64> spi_buf;
+fn main() {}",
+        good_zev: "\
+@dma_safe pool<[64]u8, 2> spi_pool;
+dma_slot<[64]u8> spi_dma;
 
-    // ── Semantic & Static-Verifier Diagnostics (E0001..E0033) ───────────────
+fn main() {
+    Lease<[64]u8> buf = spi_pool.try_alloc() catch { return; };
+    *[64]u8 raw = buf.get();
+    (*raw)[0] = 0xAAu8;
+    spi_dma.park(buf) catch { return; };
+    bool freed = spi_dma.release();
+    if (freed) {
+        return;
+    }
+}",
+    },
+
+    // ── Semantic & Static-Verifier Diagnostics (E0001..E0034) ───────────────
     ErrorDoc {
         code: "E0001",
         summary: "Illegal raw mutable global variable declared at top level",
         topic: "primitives",
-        why: "Raw mutable globals create data races between hardware ISRs, cooperative tasks, and symmetric multicore targets. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `signal`, `ping_pong<T, N>`, `lease<T, N>`).",
+        why: "Raw mutable globals create data races between hardware ISRs, cooperative tasks, and symmetric multicore targets. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `byte_ring<N>`, `signal`, `ping_pong<T, N>`, `pool<T, K>`, `dma_slot<T>`).",
         bad_zev: "\
 u32 latest_rpm = 0;
 
@@ -1286,6 +1309,35 @@ isr edge_isr(*watch<u32> out, u32 step) {
 
 fn main() {
     IRQ_EXTI0.attach(edge_isr(&irq_hits, 1));
+}",
+    },
+    ErrorDoc {
+        code: "E0034",
+        summary: "Linear `Lease<T>` ownership violation (leaked, double-moved, or invalidated)",
+        topic: "dma",
+        why: "`Lease<T>` is a compile-time move-only linear handle to a static `pool<T, K>` slot. Every live `Lease<T>` must be consumed exactly once across every control-flow path (via `.release()`, `slot.park(lease)`, `inbox.post(lease)` / `.try_send(lease)` / `.send(lease)`, `return lease;`, or passing into a function), cannot be read after move or overwritten while live, cannot disagree across `if`/`else` or `switch` arms, and cannot leak out of loops or early exits. Use `defer lease.release();` to keep `.get()` and `.addr()` accessible until scope exit without double-releasing.",
+        bad_zev: "\
+@dma_safe pool<[64]u8, 2> spi_pool;
+
+fn leak_lease() {
+    Lease<[64]u8> buf = spi_pool.try_alloc() catch { return; };
+}
+
+fn main() {
+    leak_lease();
+}",
+        good_zev: "\
+@dma_safe pool<[64]u8, 2> spi_pool;
+
+fn use_lease() {
+    Lease<[64]u8> buf = spi_pool.try_alloc() catch { return; };
+    defer buf.release();
+    *[64]u8 raw = buf.get();
+    (*raw)[0] = 0x55u8;
+}
+
+fn main() {
+    use_lease();
 }",
     },
 ];

@@ -730,15 +730,15 @@ mod tests {
     }
 
     #[test]
-    fn all_45_error_codes_resolve_and_bad_and_good_snippets_verify() {
-        for n in 1..=12 {
+    fn all_47_error_codes_resolve_and_bad_and_good_snippets_verify() {
+        for n in 1..=13 {
             let code = format!("P{n:04}");
             let lower = code.to_ascii_lowercase();
             let doc = lookup_doc(Some(&lower), false)
                 .unwrap_or_else(|e| panic!("missing {code}: {e}"));
             assert!(doc.contains(&code));
         }
-        for n in 1..=33 {
+        for n in 1..=34 {
             let code = format!("E{n:04}");
             let lower = code.to_ascii_lowercase();
             let doc = lookup_doc(Some(&lower), false)
@@ -746,7 +746,7 @@ mod tests {
             assert!(doc.contains(&code));
         }
 
-        assert_eq!(ERROR_DOCS.len(), 45);
+        assert_eq!(ERROR_DOCS.len(), 47);
         for e in ERROR_DOCS {
             // 1. Every GOOD snippet must parse, monomorphize & pass zev-sema, AND lower cleanly
             //    through zev-mir, zev-codegen-c (including clang -std=c99 syntax check), and zev-codegen-llvm!

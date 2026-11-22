@@ -17,10 +17,12 @@ pub fn c99_runtime_preamble(default_max_sim_ticks: u32) -> String {
 
 #if defined(__GNUC__) || defined(__clang__)
 #define SYN_DMA_ALIGN __attribute__((aligned(4)))
+#define SYN_DMA32_ALIGN __attribute__((aligned(32)))
 #define SYN_PACKED __attribute__((packed))
 #define SYN_UNUSED __attribute__((unused))
 #else
 #define SYN_DMA_ALIGN
+#define SYN_DMA32_ALIGN
 #define SYN_PACKED
 #define SYN_UNUSED
 #endif
@@ -362,6 +364,7 @@ typedef enum {{
 
 typedef struct {{
     volatile uint32_t dma_lock_mask;
+    volatile uint32_t dma_active_locks;
     uint32_t enter_count;
     uint32_t light_sleep_count;
     uint32_t deep_sleep_count;
@@ -375,6 +378,7 @@ static SYN_UNUSED volatile uint32_t g_syn_tick_ms = 0U;
 static SYN_UNUSED volatile uint32_t g_syn_crit_nesting = 0U;
 static SYN_UNUSED syn_sleep_coord_t g_syn_sleep = {{
     .dma_lock_mask = 0U,
+    .dma_active_locks = 0U,
     .enter_count = 0U,
     .light_sleep_count = 0U,
     .deep_sleep_count = 0U,
@@ -425,13 +429,14 @@ static SYN_UNUSED inline void syn_sleep_unlock_dma(uint32_t bit) {{
     syn_exit_critical();
 }}
 
-/* Active hardware DMA primitives (`ping_pong`, `lease`) automatically clamp
- * `allowed_sleep_depth` from `SYN_SLEEP_DEEP` down to `SYN_SLEEP_LIGHT`. */
+/* Active hardware DMA primitives (`ping_pong`, `@dma_safe pool`) automatically
+ * clamp `allowed_sleep_depth` from `SYN_SLEEP_DEEP` down to `SYN_SLEEP_LIGHT`. */
 static SYN_UNUSED inline syn_sleep_depth_t syn_allowed_sleep_depth(void) {{
     if (g_syn_sleep.max_depth == SYN_SLEEP_NONE) {{
         return SYN_SLEEP_NONE;
     }}
-    if (g_syn_sleep.dma_lock_mask != 0U && g_syn_sleep.max_depth > SYN_SLEEP_LIGHT) {{
+    if ((g_syn_sleep.dma_lock_mask != 0U || g_syn_sleep.dma_active_locks != 0U)
+        && g_syn_sleep.max_depth > SYN_SLEEP_LIGHT) {{
         return SYN_SLEEP_LIGHT;
     }}
     return g_syn_sleep.max_depth;
@@ -986,6 +991,61 @@ static SYN_UNUSED inline bool syn_inbox_hdr_rx_ready(void *obj) {{
 static SYN_UNUSED inline bool syn_inbox_hdr_tx_ready(void *obj) {{
     const syn_inbox_hdr_t *h = (const syn_inbox_hdr_t *)obj;
     return h != NULL && h->count < h->tx_cap;
+}}
+
+typedef struct {{
+    volatile uint32_t free_mask;
+    uint32_t full_mask;
+    syn_task_t *waiters;
+    uint8_t dma_safe;
+    uint8_t cap;
+}} syn_pool_hdr_t;
+
+static SYN_UNUSED inline bool syn_pool_hdr_has_free(void *obj) {{
+    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)obj;
+    return h != NULL && h->free_mask != 0U;
+}}
+
+static SYN_UNUSED inline uint32_t syn_pool_full_mask(uint8_t cap) {{
+    return (cap >= 32U) ? 0xFFFFFFFFU : ((1U << cap) - 1U);
+}}
+
+static SYN_UNUSED inline uint8_t syn_pool_ctz32(uint32_t m) {{
+    uint8_t i = 0U;
+    while ((m & 1U) == 0U && i < 31U) {{ m >>= 1U; i++; }}
+    return i;
+}}
+
+static SYN_UNUSED inline size_t syn_pool_popcount32(uint32_t m) {{
+    size_t c = 0U;
+    while (m != 0U) {{ m &= (m - 1U); c++; }}
+    return c;
+}}
+
+static SYN_UNUSED inline void __syn_pool_release(void *pool_hdr_raw, uint8_t slot_idx, int8_t boost_prio) {{
+    if (pool_hdr_raw == NULL) {{ return; }}
+    syn_pool_hdr_t *h = (syn_pool_hdr_t *)pool_hdr_raw;
+#if !defined(SYN_POOL_IRQ_ELIDED)
+    syn_enter_critical();
+#endif
+    if (slot_idx < h->cap) {{
+        uint32_t bit = (1U << slot_idx);
+        if ((h->free_mask & bit) == 0U) {{
+            h->free_mask |= bit;
+            if (h->dma_safe != 0U && g_syn_sleep.dma_active_locks > 0U) {{
+                g_syn_sleep.dma_active_locks--;
+            }}
+            syn_task_t *w = h->waiters;
+            h->waiters = NULL;
+            if (w != NULL) {{
+                uint8_t bp = (boost_prio >= 0) ? (uint8_t)boost_prio : SYN_NO_BOOST;
+                syn_task_wake_from_isr_or_task(w, bp);
+            }}
+        }}
+    }}
+#if !defined(SYN_POOL_IRQ_ELIDED)
+    syn_exit_critical();
+#endif
 }}
 
 typedef struct {{

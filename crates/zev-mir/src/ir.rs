@@ -82,6 +82,8 @@ pub enum MirType {
     },
     /// Pointer `*T`.
     Ptr(Box<MirType>),
+    /// Move-only linear DMA/pool buffer handle `Lease<T>`.
+    Lease(Box<MirType>),
     /// OS primitive endpoint type (usually accessed as global or via `*Primitive`).
     Primitive(MirPrimKind),
     /// Unsized fat-pointer view over any `byte_ring<N>` or `inbox<T, N>`.
@@ -181,6 +183,7 @@ impl MirType {
             MirType::Slice(inner) => format!("slice_{}", inner.mangle_name()),
             MirType::Array { elem, len } => format!("arr_{}_{}", len, elem.mangle_name()),
             MirType::Ptr(inner) => format!("ptr_{}", inner.mangle_name()),
+            MirType::Lease(inner) => format!("lease_{}", inner.mangle_name()),
             MirType::Primitive(pk) => pk.mangle_name(),
             MirType::PrimView(vk) => vk.mangle_name(),
             MirType::MmioPtr(n) => format!("mmio_ptr_{n}"),
@@ -230,6 +233,7 @@ impl MirType {
             MirType::Slice(inner) => format!("[]{}", inner.display_name()),
             MirType::Array { elem, len } => format!("[{len}]{}", elem.display_name()),
             MirType::Ptr(inner) => format!("*{}", inner.display_name()),
+            MirType::Lease(inner) => format!("Lease<{}>", inner.display_name()),
             MirType::Primitive(pk) => pk.display_name(),
             MirType::PrimView(vk) => vk.display_name(),
             MirType::MmioPtr(n) => format!("*{n}"),
@@ -249,7 +253,8 @@ pub enum MirPrimKind {
     Watch { elem: Box<MirType> },
     Inbox { elem: Box<MirType>, cap: usize },
     PingPong { elem: Box<MirType>, cap: usize },
-    Lease { elem: Box<MirType>, cap: usize },
+    Pool { elem: Box<MirType>, cap: usize },
+    DmaSlot { elem: Box<MirType> },
     ByteRing { cap: usize },
 }
 
@@ -260,7 +265,8 @@ impl MirPrimKind {
             MirPrimKind::Watch { elem } => format!("watch_{}", elem.mangle_name()),
             MirPrimKind::Inbox { elem, cap } => format!("inbox_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::PingPong { elem, cap } => format!("pp_{}_{}", elem.mangle_name(), cap),
-            MirPrimKind::Lease { elem, cap } => format!("lease_{}_{}", elem.mangle_name(), cap),
+            MirPrimKind::Pool { elem, cap } => format!("pool_{}_{}", elem.mangle_name(), cap),
+            MirPrimKind::DmaSlot { elem } => format!("dma_slot_{}", elem.mangle_name()),
             MirPrimKind::ByteRing { cap } => format!("byte_ring_{cap}"),
         }
     }
@@ -273,16 +279,15 @@ impl MirPrimKind {
             MirPrimKind::PingPong { elem, cap } => {
                 format!("ping_pong<{}, {cap}>", elem.display_name())
             }
-            MirPrimKind::Lease { elem, cap } => format!("lease<{}, {cap}>", elem.display_name()),
+            MirPrimKind::Pool { elem, cap } => format!("pool<{}, {cap}>", elem.display_name()),
+            MirPrimKind::DmaSlot { elem } => format!("dma_slot<{}>", elem.display_name()),
             MirPrimKind::ByteRing { cap } => format!("byte_ring<{cap}>"),
         }
     }
 
-    pub fn holds_dma_sleep_lock(&self) -> bool {
-        matches!(
-            self,
-            MirPrimKind::PingPong { .. } | MirPrimKind::Lease { .. }
-        )
+    pub fn holds_dma_sleep_lock(&self, dma_safe: bool) -> bool {
+        matches!(self, MirPrimKind::PingPong { .. })
+            || (dma_safe && matches!(self, MirPrimKind::Pool { .. }))
     }
 }
 
@@ -336,6 +341,7 @@ pub struct MirEnum {
 pub struct MirField {
     pub name: String,
     pub ty: MirType,
+    pub dma_safe: bool,
 }
 
 /// Top-level `struct` or `packed struct` item.
@@ -689,16 +695,16 @@ pub enum MirPrimNonBlockingOp {
         cap: usize,
         active: bool,
     },
-    LeaseComplete {
-        target: MirPrimTarget,
+    /// Move-consume `Lease<T>` back to its owning pool (`lease.release([boost: @prio])`).
+    LeaseRelease {
+        value: MirExpr,
         elem_ty: MirType,
-        cap: usize,
+        boost: Option<MirPriority>,
     },
-    LeaseSetActive {
-        target: MirPrimTarget,
+    /// Nullify `pool_hdr` on a moved `Lease<T>` place (defense-in-depth).
+    LeaseNullify {
+        target: MirPlace,
         elem_ty: MirType,
-        cap: usize,
-        active: bool,
     },
     ByteRingConsume {
         target: MirPrimTarget,
@@ -828,12 +834,14 @@ pub enum MirYieldKind {
         poll_bb: BlockId,
         resume_bb: BlockId,
     },
-    /// Zero-copy DMA buffer wait on `lease<T, N>`.
-    LeaseWaitChunk {
+    /// Allocate a linear `Lease<T>` from `pool<T, K>` (`pool.alloc([timeout: d])`).
+    PoolAlloc {
         target: MirPrimTarget,
         elem_ty: MirType,
         cap: usize,
-        dst_slice: VarId,
+        timeout_deadline_var: Option<VarId>,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
         poll_bb: BlockId,
         resume_bb: BlockId,
     },
@@ -951,7 +959,7 @@ impl MirTerminator {
                 | MirYieldKind::PingPongWaitChunk {
                     poll_bb, resume_bb, ..
                 }
-                | MirYieldKind::LeaseWaitChunk {
+                | MirYieldKind::PoolAlloc {
                     poll_bb, resume_bb, ..
                 }
                 | MirYieldKind::ByteRingWaitRead {
@@ -985,7 +993,7 @@ impl MirTerminator {
                 | MirYieldKind::InboxSend { poll_bb, .. }
                 | MirYieldKind::SignalWait { poll_bb, .. }
                 | MirYieldKind::PingPongWaitChunk { poll_bb, .. }
-                | MirYieldKind::LeaseWaitChunk { poll_bb, .. }
+                | MirYieldKind::PoolAlloc { poll_bb, .. }
                 | MirYieldKind::ByteRingWaitRead { poll_bb, .. }
                 | MirYieldKind::InboxViewRecv { poll_bb, .. }
                 | MirYieldKind::InboxViewSend { poll_bb, .. }
@@ -1103,6 +1111,16 @@ pub enum MirExprKind {
     },
     /// Non-blocking primitive read/query (`watch.read()`, `inbox.try_recv()`, `signal.is_set()`).
     PrimRead(Box<MirPrimReadOp>),
+    /// Borrow payload pointer `*T` from a `Lease<T>` (`lease.get()`).
+    LeaseGet {
+        lease: Box<MirExpr>,
+        elem_ty: MirType,
+    },
+    /// Borrow payload address `usize` from a `Lease<T>` (`lease.addr()`).
+    LeaseAddr {
+        lease: Box<MirExpr>,
+        elem_ty: MirType,
+    },
     /// Direct call to a non-yielding function or `extern "C"` function.
     CallDirect {
         callee: String,
@@ -1169,6 +1187,57 @@ pub enum MirPrimReadOp {
         target: MirPrimTarget,
         elem_ty: MirType,
         cap: usize,
+    },
+    PoolTryAlloc {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    PoolAvail {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    PoolInUse {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    PoolIsExhausted {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    PoolCap {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    DmaSlotPark {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        lease: Box<MirExpr>,
+    },
+    DmaSlotTake {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+    },
+    DmaSlotRelease {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        boost: Option<MirPriority>,
+    },
+    DmaSlotIsBusy {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+    },
+    DmaSlotIsEmpty {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+    },
+    DmaSlotAddr {
+        target: MirPrimTarget,
+        elem_ty: MirType,
     },
     ByteRingPush {
         target: MirPrimTarget,

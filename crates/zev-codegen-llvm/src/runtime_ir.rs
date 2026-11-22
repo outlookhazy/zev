@@ -76,6 +76,14 @@ pub fn emit_kernel_runtime_ir_with_features(
     );
     let _ = writeln!(
         out,
+        "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind readnone"
+    );
+    let _ = writeln!(
+        out,
+        "declare i32 @llvm.ctpop.i32(i32) nounwind readnone"
+    );
+    let _ = writeln!(
+        out,
         "declare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg) nounwind"
     );
     let _ = writeln!(
@@ -143,6 +151,7 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_tick_ms = global i32 0, align 4
 @__syn_systick_enabled = global i8 0, align 1
 @__syn_sleep_lock_mask = global i32 0, align 4
+@__syn_dma_locks = global i32 0, align 4
 @__syn_last_sleep_depth = global i32 2, align 4
 @__syn_wfi_count = global i32 0, align 4
 @__syn_irq_woke_urgent = global i8 0, align 1
@@ -423,9 +432,11 @@ check_sleep:
   br i1 %any_ready, label %restore, label %do_wfi
 
 do_wfi:
-  ; Clamp sleep depth: active ping_pong / lease DMA lock -> LIGHT (1), else DEEP (2)
+  ; Clamp sleep depth: active ping_pong / @dma_safe pool DMA lock -> LIGHT (1), else DEEP (2)
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
-  %locked = icmp ne i32 %locks, 0
+  %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
+  %any_locks = or i32 %locks, %dma_locks
+  %locked = icmp ne i32 %any_locks, 0
   %depth = select i1 %locked, i32 1, i32 2
   store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4
   ; Update Cortex-M3 SCB->SCR (0xE000ED10 = -536810224) SLEEPDEEP bit (bit 2 = 4)
@@ -496,7 +507,9 @@ entry:
 define void @__syn_idle_sleep() nounwind{sz} {{
 entry:
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
-  %locked = icmp ne i32 %locks, 0
+  %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
+  %any_locks = or i32 %locks, %dma_locks
+  %locked = icmp ne i32 %any_locks, 0
   %depth = select i1 %locked, i32 1, i32 2
   store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4
   %wc = load volatile i32, ptr @__syn_wfi_count, align 4

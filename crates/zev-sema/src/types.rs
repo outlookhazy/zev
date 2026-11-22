@@ -31,6 +31,8 @@ pub enum Ty {
     Ptr(Box<Ty>),
     /// Static scheduler/DMA OS primitive endpoint (`watch<u16>`, `ping_pong<u8, 64>`, etc.).
     OsPrimitive(ResolvedOsPrimitive),
+    /// Linear, move-only buffer lease `Lease<T>` allocated from a `pool<T, K>`.
+    Lease(Box<Ty>),
     /// Function pointer or function reference (`fn(T1, T2) -> Ret`).
     FnPtr {
         params: Vec<Ty>,
@@ -65,7 +67,8 @@ pub enum PrimitiveKind {
     Inbox,
     Watch,
     PingPong,
-    Lease,
+    Pool,
+    DmaSlot,
     ByteRing,
 }
 
@@ -76,15 +79,16 @@ impl PrimitiveKind {
             Self::Inbox => "inbox",
             Self::Watch => "watch",
             Self::PingPong => "ping_pong",
-            Self::Lease => "lease",
+            Self::Pool => "pool",
+            Self::DmaSlot => "dma_slot",
             Self::ByteRing => "byte_ring",
         }
     }
 
-    /// Active DMA primitives (`ping_pong`, `lease`) clamp tickless idle sleep depth
+    /// Active DMA primitives (`ping_pong`, `@dma_safe pool`) clamp tickless idle sleep depth
     /// from `DEEP` to `LIGHT` so peripheral clocks remain active during transfers.
     pub const fn clamps_sleep_depth(self) -> bool {
-        matches!(self, Self::PingPong | Self::Lease)
+        matches!(self, Self::PingPong | Self::Pool)
     }
 }
 
@@ -102,7 +106,8 @@ pub enum ResolvedOsPrimitive {
     InboxUnsized { elem: Box<Ty> },
     Watch { elem: Box<Ty> },
     PingPong { elem: Box<Ty>, cap: usize },
-    Lease { elem: Box<Ty>, cap: usize },
+    Pool { elem: Box<Ty>, cap: usize },
+    DmaSlot { elem: Box<Ty> },
     ByteRing { cap: usize },
     ByteRingUnsized,
 }
@@ -116,7 +121,8 @@ impl ResolvedOsPrimitive {
             Self::Inbox { .. } | Self::InboxUnsized { .. } => PrimitiveKind::Inbox,
             Self::Watch { .. } => PrimitiveKind::Watch,
             Self::PingPong { .. } => PrimitiveKind::PingPong,
-            Self::Lease { .. } => PrimitiveKind::Lease,
+            Self::Pool { .. } => PrimitiveKind::Pool,
+            Self::DmaSlot { .. } => PrimitiveKind::DmaSlot,
             Self::ByteRing { .. } | Self::ByteRingUnsized => PrimitiveKind::ByteRing,
         }
     }
@@ -132,7 +138,8 @@ impl ResolvedOsPrimitive {
             | Self::InboxUnsized { elem }
             | Self::Watch { elem }
             | Self::PingPong { elem, .. }
-            | Self::Lease { elem, .. } => Some(elem),
+            | Self::Pool { elem, .. }
+            | Self::DmaSlot { elem } => Some(elem),
             Self::ByteRing { .. } | Self::ByteRingUnsized => Some(&BYTE_RING_ELEM_U8),
         }
     }
@@ -141,11 +148,12 @@ impl ResolvedOsPrimitive {
         match self {
             Self::Signal
             | Self::Watch { .. }
+            | Self::DmaSlot { .. }
             | Self::InboxUnsized { .. }
             | Self::ByteRingUnsized => None,
             Self::Inbox { cap, .. }
             | Self::PingPong { cap, .. }
-            | Self::Lease { cap, .. }
+            | Self::Pool { cap, .. }
             | Self::ByteRing { cap } => Some(*cap),
         }
     }
@@ -159,7 +167,8 @@ impl fmt::Display for ResolvedOsPrimitive {
             Self::InboxUnsized { elem } => write!(f, "inbox<{}>", elem),
             Self::Watch { elem } => write!(f, "watch<{}>", elem),
             Self::PingPong { elem, cap } => write!(f, "ping_pong<{}, {}>", elem, cap),
-            Self::Lease { elem, cap } => write!(f, "lease<{}, {}>", elem, cap),
+            Self::Pool { elem, cap } => write!(f, "pool<{}, {}>", elem, cap),
+            Self::DmaSlot { elem } => write!(f, "dma_slot<{}>", elem),
             Self::ByteRing { cap } => write!(f, "byte_ring<{}>", cap),
             Self::ByteRingUnsized => write!(f, "byte_ring"),
         }
@@ -188,6 +197,7 @@ impl ResolvedErrorSpec {
 pub struct FieldInfo {
     pub name: String,
     pub ty: Ty,
+    pub dma_safe: bool,
     pub span: Span,
 }
 
@@ -284,6 +294,10 @@ impl Ty {
 
     pub const fn is_bool(&self) -> bool {
         matches!(self, Self::Prim(PrimType::Bool))
+    }
+
+    pub const fn is_linear_lease(&self) -> bool {
+        matches!(self, Self::Lease(_))
     }
 
     /// Normalize wire-endian scalar types (`u16be`/`u16le` -> `u16`, etc.) to their host scalar counterpart.
@@ -488,12 +502,14 @@ impl Ty {
                 ResolvedOsPrimitive::PingPong { elem, cap } => {
                     elem.byte_size(ptr_bytes, structs) * cap * 2 + 16
                 }
-                ResolvedOsPrimitive::Lease { elem, cap } => {
-                    elem.byte_size(ptr_bytes, structs) * cap + 16
+                ResolvedOsPrimitive::Pool { elem, cap } => {
+                    elem.byte_size(ptr_bytes, structs) * cap + ptr_bytes + 16
                 }
+                ResolvedOsPrimitive::DmaSlot { .. } => ptr_bytes * 2 + 8,
                 ResolvedOsPrimitive::ByteRing { cap } => cap + ptr_bytes + 28,
                 ResolvedOsPrimitive::ByteRingUnsized => ptr_bytes * 2,
             },
+            Self::Lease(_) => ptr_bytes * 3,
             Self::Namespace(_) | Self::Error => 0,
         }
     }
@@ -513,6 +529,7 @@ impl fmt::Display for Ty {
             Self::Array { elem, len } => write!(f, "[{}]{}", len, elem),
             Self::Ptr(inner) => write!(f, "*{}", inner),
             Self::OsPrimitive(p) => write!(f, "{}", p),
+            Self::Lease(elem) => write!(f, "Lease<{}>", elem),
             Self::FnPtr { params, ret } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {

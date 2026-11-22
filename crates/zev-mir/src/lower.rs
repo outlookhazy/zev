@@ -280,6 +280,7 @@ impl ModuleSymbols {
                 params: params.iter().map(|p| self.resolve_type(p)).collect(),
                 ret: Box::new(self.resolve_type(ret)),
             },
+            TypeKind::Lease(elem) => MirType::Lease(Box::new(self.resolve_type(elem))),
         }
     }
 
@@ -301,9 +302,12 @@ impl ModuleSymbols {
                 elem: Box::new(self.resolve_type(elem)),
                 cap: *cap,
             },
-            OsPrimitiveType::Lease { elem, cap } => MirPrimKind::Lease {
+            OsPrimitiveType::Pool { elem, cap } => MirPrimKind::Pool {
                 elem: Box::new(self.resolve_type(elem)),
                 cap: *cap,
+            },
+            OsPrimitiveType::DmaSlot { elem } => MirPrimKind::DmaSlot {
+                elem: Box::new(self.resolve_type(elem)),
             },
             OsPrimitiveType::ByteRing { cap } => MirPrimKind::ByteRing { cap: *cap },
             OsPrimitiveType::ByteRingUnsized => MirPrimKind::ByteRing { cap: 0 },
@@ -651,6 +655,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                 .map(|f| MirField {
                     name: f.name.name.clone(),
                     ty: syms.resolve_type(&f.ty),
+                    dma_safe: has_attr_dma_safe(&f.attrs),
                 })
                 .collect();
             let ms = MirStruct {
@@ -708,7 +713,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             ItemKind::OsPrimitive(pd) => {
                 let kind = syms.resolve_os_prim_type(&pd.ty);
                 let dma_safe = has_attr_dma_safe(&item.attrs) || has_attr_dma_safe(&pd.attrs);
-                let sleep_lock_bit = if kind.holds_dma_sleep_lock() {
+                let sleep_lock_bit = if matches!(kind, MirPrimKind::PingPong { .. }) {
                     let bit = next_sleep_lock_bit;
                     next_sleep_lock_bit = next_sleep_lock_bit.saturating_add(1).min(31);
                     Some(bit)
@@ -1792,7 +1797,7 @@ fn scan_expr_effect(
             }
             if matches!(
                 m,
-                "wait_chunk" | "recv" | "wait" | "send" | "delay" | "wait_change"
+                "wait_chunk" | "recv" | "wait" | "send" | "delay" | "wait_change" | "alloc"
             ) && !in_noyield
                 && !in_restricted
             {
@@ -3407,7 +3412,12 @@ impl<'a> DirectLowerCtx<'a> {
                 }
                 if let Some(ie) = init {
                     let val = self.lower_expr_with_stmts(ie, Some(&vty), &mut out)?;
-                    let coerced = coerce_expr_if_needed(val, &vty);
+                    let mut be = DirectBackend {
+                        ctx: self,
+                        stmts: &mut out,
+                    };
+                    let coerced =
+                        consume_moved_lease_be(coerce_expr_if_needed(val, &vty), &mut be);
                     if self.boot_state.is_some() {
                         let resolved = resolve_boot_const_expr(&coerced, &self.boot_const_env);
                         if is_const_mir_expr(&resolved) {
@@ -3474,10 +3484,18 @@ impl<'a> DirectLowerCtx<'a> {
                     }
                     let rhs =
                         self.lower_expr_with_stmts(value, Some(&pty.host_value_type()), &mut out)?;
+                    let mut be = DirectBackend {
+                        ctx: self,
+                        stmts: &mut out,
+                    };
+                    let rhs_moved = consume_moved_lease_be(
+                        coerce_expr_if_needed(rhs, &pty.host_value_type()),
+                        &mut be,
+                    );
                     out.push(MirStmt::Assign {
                         target: place,
                         op: convert_assign_op(*op),
-                        value: coerce_expr_if_needed(rhs, &pty.host_value_type()),
+                        value: rhs_moved,
                     });
                 }
             }
@@ -3494,11 +3512,17 @@ impl<'a> DirectLowerCtx<'a> {
                     let h_entry_depth = hframe.entry_defer_depth;
                     if let Some(e) = expr_opt {
                         let v = self.lower_expr_with_stmts(e, Some(&h_ret_ty), &mut out)?;
+                        let mut be = DirectBackend {
+                            ctx: self,
+                            stmts: &mut out,
+                        };
+                        let v_moved =
+                            consume_moved_lease_be(coerce_expr_if_needed(v, &h_ret_ty), &mut be);
                         if let Some(rv) = h_ret_val {
                             out.push(MirStmt::Assign {
                                 target: MirPlace::Var(rv),
                                 op: MirAssignOp::Assign,
-                                value: coerce_expr_if_needed(v, &h_ret_ty),
+                                value: v_moved,
                             });
                         }
                     }
@@ -3517,7 +3541,12 @@ impl<'a> DirectLowerCtx<'a> {
                 let has_defers = self.has_active_defers_from(0);
                 let val = if let Some(e) = expr_opt {
                     let raw = self.lower_expr_with_stmts(e, Some(&ret_ty), &mut out)?;
-                    let coerced = coerce_expr_if_needed(raw, &ret_ty);
+                    let mut be = DirectBackend {
+                        ctx: self,
+                        stmts: &mut out,
+                    };
+                    let coerced =
+                        consume_moved_lease_be(coerce_expr_if_needed(raw, &ret_ty), &mut be);
                     if has_defers && !ret_ty.is_void() {
                         // Evaluate return expression into a temp BEFORE running `defer` statements!
                         let tmp = self.alloc_temp("ret_val", ret_ty.clone());
@@ -4281,7 +4310,11 @@ impl<'a> DirectLowerCtx<'a> {
                 (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
                 _ => me,
             };
-            lowered_args.push(coerced);
+            let mut be = DirectBackend {
+                ctx: self,
+                stmts: out,
+            };
+            lowered_args.push(consume_moved_lease_be(coerced, &mut be));
         }
 
         // 2. Prepare optional structured return flag & value slot if helper contains `return`.
@@ -4463,10 +4496,15 @@ impl<'a> DirectLowerCtx<'a> {
         if rem.len() == 1 {
             let fb_val = self.lower_expr_with_stmts(rem[0], Some(ok_ty), &mut fb_stmts)?;
             if let Some(out_vid) = out_vid_opt {
+                let mut fb_be = DirectBackend {
+                    ctx: self,
+                    stmts: &mut fb_stmts,
+                };
+                let fb_val = consume_moved_lease_be(coerce_expr_if_needed(fb_val, ok_ty), &mut fb_be);
                 fb_stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(out_vid),
                     op: MirAssignOp::Assign,
-                    value: coerce_expr_if_needed(fb_val, ok_ty),
+                    value: fb_val,
                 });
             } else if !fb_val.ty.is_void() || matches!(fb_val.kind, MirExprKind::CallDirect { .. }) {
                 fb_stmts.push(MirStmt::Expr(fb_val));
@@ -4627,10 +4665,16 @@ impl<'a> DirectLowerCtx<'a> {
                     if tail_val.ty.is_void() {
                         err_stmts.push(MirStmt::Expr(tail_val));
                     } else {
+                        let mut err_be = DirectBackend {
+                            ctx: self,
+                            stmts: &mut err_stmts,
+                        };
+                        let tail_val =
+                            consume_moved_lease_be(coerce_expr_if_needed(tail_val, &ok_ty), &mut err_be);
                         err_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(out_vid),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(tail_val, &ok_ty),
+                            value: tail_val,
                         });
                     }
                 }
@@ -5131,10 +5175,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                 if let Some(ie) = init {
                     if !self.try_lower_yielding_into_var(ie, vid, &vty)? {
                         let val = self.lower_expr(ie, Some(&vty))?;
+                        let moved =
+                            consume_moved_lease_be(coerce_expr_if_needed(val, &vty), self);
                         self.cur_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(vid),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(val, &vty),
+                            value: moved,
                         });
                     }
                 }
@@ -5164,10 +5210,14 @@ impl<'a> CoroutineLowerCtx<'a> {
                 }
                 let (place, pty) = self.lower_place(target)?;
                 let rhs = self.lower_expr(value, Some(&pty.host_value_type()))?;
+                let moved = consume_moved_lease_be(
+                    coerce_expr_if_needed(rhs, &pty.host_value_type()),
+                    self,
+                );
                 self.cur_stmts.push(MirStmt::Assign {
                     target: place,
                     op: convert_assign_op(*op),
-                    value: coerce_expr_if_needed(rhs, &pty.host_value_type()),
+                    value: moved,
                 });
             }
             StmtKind::Defer(inner) => {
@@ -5180,7 +5230,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let has_defers = self.has_active_defers_from(0);
                 let val = if let Some(e) = expr_opt {
                     let raw = self.lower_expr(e, Some(&ret_ty))?;
-                    let coerced = coerce_expr_if_needed(raw, &ret_ty);
+                    let coerced =
+                        consume_moved_lease_be(coerce_expr_if_needed(raw, &ret_ty), self);
                     if has_defers && !ret_ty.is_void() {
                         let tmp = self.alloc_temp("ret_val", ret_ty.clone());
                         self.cur_stmts.push(MirStmt::Assign {
@@ -6065,16 +6116,20 @@ impl<'a> CoroutineLowerCtx<'a> {
                             );
                             return Ok(true);
                         }
-                        ("wait_chunk" | "wait", MirPrimKind::Lease { elem, cap }) => {
+                        ("alloc", MirPrimKind::Pool { elem, cap })
+                            if find_named_arg(args, "timeout").is_none() =>
+                        {
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
                             self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::LeaseWaitChunk {
+                                MirTerminator::Yield(MirYieldKind::PoolAlloc {
                                     target,
                                     elem_ty: *elem,
                                     cap,
-                                    dst_slice: dst_vid,
+                                    timeout_deadline_var: None,
+                                    dst_val: Some(dst_vid),
+                                    dst_res: None,
                                     poll_bb,
                                     resume_bb,
                                 }),
@@ -6238,6 +6293,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(0), elem.clone())
                             };
+                            let vexpr = consume_moved_lease_be(vexpr, self);
                             let val_var = self.alloc_temp("inbox_tx", elem.clone());
                             self.cur_stmts.push(MirStmt::Assign {
                                 target: MirPlace::Var(val_var),
@@ -6273,6 +6329,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                             };
+                            let vexpr = consume_moved_lease_be(vexpr, self);
                             let val_var = self.alloc_temp("inbox_tx", *elem.clone());
                             self.cur_stmts.push(MirStmt::Assign {
                                 target: MirPlace::Var(val_var),
@@ -6374,7 +6431,7 @@ impl<'a> CoroutineLowerCtx<'a> {
             } else {
                 me
             };
-            largs.push(coerced);
+            largs.push(consume_moved_lease_be(coerced, self));
         }
         let slot_idx = self.child_slots.len();
         let slot_name = format!("c{slot_idx}_{callee}");
@@ -6467,10 +6524,11 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 let fb_val = self.lower_expr(tail, Some(&ok_ty))?;
                 if let Some(out_vid) = out_vid_opt {
+                    let fb_val = consume_moved_lease_be(coerce_expr_if_needed(fb_val, &ok_ty), self);
                     self.cur_stmts.push(MirStmt::Assign {
                         target: MirPlace::Var(out_vid),
                         op: MirAssignOp::Assign,
-                        value: coerce_expr_if_needed(fb_val, &ok_ty),
+                        value: fb_val,
                     });
                     self.seal_bb(MirTerminator::Goto(join_bb), join_bb, false);
                     Ok(MirExpr::new(MirExprKind::Var(out_vid), ok_ty))
@@ -6601,10 +6659,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     self.cur_stmts.push(MirStmt::Expr(tail_val));
                                 }
                             } else {
+                                let tail_val =
+                                    consume_moved_lease_be(coerce_expr_if_needed(tail_val, &ok_ty), self);
                                 self.cur_stmts.push(MirStmt::Assign {
                                     target: MirPlace::Var(out_vid),
                                     op: MirAssignOp::Assign,
-                                    value: coerce_expr_if_needed(tail_val, &ok_ty),
+                                    value: tail_val,
                                 });
                             }
                         }
@@ -6683,6 +6743,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 } else {
                                     MirExpr::new(MirExprKind::IntLit(0), elem.clone())
                                 };
+                                let vexpr = consume_moved_lease_be(vexpr, self);
                                 let val_var = self.alloc_temp("inbox_tx", elem.clone());
                                 self.cur_stmts.push(MirStmt::Assign {
                                     target: MirPlace::Var(val_var),
@@ -6900,25 +6961,71 @@ impl<'a> CoroutineLowerCtx<'a> {
                             );
                             return Ok(MirExpr::new(MirExprKind::Var(dst_vid), sty));
                         }
-                        ("wait_chunk" | "wait", MirPrimKind::Lease { elem, cap }) => {
-                            let sty = MirType::Slice(elem.clone());
-                            let dst_vid = self.alloc_temp("lease_chunk", sty.clone());
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::LeaseWaitChunk {
-                                    target,
-                                    elem_ty: *elem,
-                                    cap,
-                                    dst_slice: dst_vid,
-                                    poll_bb,
+                        ("alloc", MirPrimKind::Pool { elem, cap }) => {
+                            if let Some(texpr) = find_named_arg(args, "timeout") {
+                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
+                                let dl_var = self.alloc_temp("pool_deadline", MirType::U32);
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(dl_var),
+                                    op: MirAssignOp::Assign,
+                                    value: MirExpr::new(
+                                        MirExprKind::Binary {
+                                            op: MirBinOp::Add,
+                                            lhs: Box::new(MirExpr::new(
+                                                MirExprKind::NowTicks,
+                                                MirType::U32,
+                                            )),
+                                            rhs: Box::new(ticks),
+                                        },
+                                        MirType::U32,
+                                    ),
+                                });
+                                let lease_ty = MirType::Lease(elem.clone());
+                                let rty = MirType::Result {
+                                    ok: Box::new(lease_ty),
+                                    err: None,
+                                };
+                                let dst_res = self.alloc_temp("pool_res", rty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::PoolAlloc {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        timeout_deadline_var: Some(dl_var),
+                                        dst_val: None,
+                                        dst_res: Some(dst_res),
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
                                     resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            return Ok(MirExpr::new(MirExprKind::Var(dst_vid), sty));
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                            } else {
+                                let lease_ty = MirType::Lease(elem.clone());
+                                let dst_val = self.alloc_temp("pool_lease", lease_ty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                                self.seal_bb(
+                                    MirTerminator::Yield(MirYieldKind::PoolAlloc {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        timeout_deadline_var: None,
+                                        dst_val: Some(dst_val),
+                                        dst_res: None,
+                                        poll_bb,
+                                        resume_bb,
+                                    }),
+                                    resume_bb,
+                                    false,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), lease_ty));
+                            }
                         }
                         ("send", MirPrimKind::Inbox { elem, cap }) => {
                             let vexpr = if let Some(first) = first_positional_arg(args) {
@@ -6927,6 +7034,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                             };
+                            let vexpr = consume_moved_lease_be(vexpr, self);
                             let val_var = self.alloc_temp("inbox_tx", *elem.clone());
                             self.cur_stmts.push(MirStmt::Assign {
                                 target: MirPlace::Var(val_var),
@@ -7773,6 +7881,49 @@ fn extract_subsystem_place_chain(place: &MirPlace) -> Option<(String, Vec<(Strin
     }
 }
 
+fn consume_moved_lease_be<B: LowerBackend>(expr: MirExpr, be: &mut B) -> MirExpr {
+    let MirType::Lease(elem_ty) = &expr.ty else {
+        return expr;
+    };
+    let elem_ty = elem_ty.as_ref().clone();
+    let ty = expr.ty.clone();
+    let target = match &expr.kind {
+        MirExprKind::Var(vid) => MirPlace::Var(*vid),
+        MirExprKind::FieldAccess {
+            base,
+            struct_name,
+            packed,
+            is_ptr: false,
+            field,
+            raw_field_ty,
+        } => {
+            if let MirExprKind::Var(bvid) = &base.kind {
+                MirPlace::Field {
+                    base: Box::new(MirPlace::Var(*bvid)),
+                    struct_name: struct_name.clone(),
+                    packed: *packed,
+                    field: field.clone(),
+                    field_ty: raw_field_ty.clone(),
+                }
+            } else {
+                return expr;
+            }
+        }
+        _ => return expr,
+    };
+    let tmp = be.alloc_temp_be("lease_mv", ty.clone());
+    be.emit_stmt_be(MirStmt::Assign {
+        target: MirPlace::Var(tmp),
+        op: MirAssignOp::Assign,
+        value: expr,
+    });
+    be.emit_stmt_be(MirStmt::PrimOp(MirPrimNonBlockingOp::LeaseNullify {
+        target,
+        elem_ty,
+    }));
+    MirExpr::new(MirExprKind::Var(tmp), ty)
+}
+
 fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
     if &expr.ty == target_ty || target_ty.is_void() {
         return expr;
@@ -8306,7 +8457,7 @@ fn lower_common_expr<B: LowerBackend>(
                             (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
                             _ => me,
                         };
-                        largs.push(coerced);
+                        largs.push(consume_moved_lease_be(coerced, be));
                     }
                     let ret = if sig.error_spec.has_error() {
                         MirType::Result {
@@ -8441,6 +8592,29 @@ fn lower_common_expr<B: LowerBackend>(
                 };
             }
             if let Ok(recv_me) = be.lower_sub(receiver, None) {
+                if let MirType::Lease(elem) = recv_me.ty.clone() {
+                    match method.name.as_str() {
+                        "get" => {
+                            return Ok(MirExpr::new(
+                                MirExprKind::LeaseGet {
+                                    lease: Box::new(recv_me),
+                                    elem_ty: *elem.clone(),
+                                },
+                                MirType::Ptr(elem),
+                            ));
+                        }
+                        "addr" => {
+                            return Ok(MirExpr::new(
+                                MirExprKind::LeaseAddr {
+                                    lease: Box::new(recv_me),
+                                    elem_ty: *elem,
+                                },
+                                MirType::Usize,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
                 let (st_name_opt, is_ptr) = match &recv_me.ty {
                     MirType::Struct(s) => (Some(s.clone()), false),
                     MirType::Ptr(inner) => match inner.as_ref() {
@@ -8518,7 +8692,7 @@ fn lower_indirect_fnptr_call_be<B: LowerBackend>(
             (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
             _ => unwrap_ok_result_expr(me),
         };
-        largs.push(coerced);
+        largs.push(consume_moved_lease_be(coerced, be));
     }
     Ok(MirExpr::new(
         MirExprKind::CallDirect {
@@ -9018,6 +9192,7 @@ fn finish_prim_read_method<B: LowerBackend>(
             } else {
                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
             };
+            let v = consume_moved_lease_be(v, be);
             let boost = extract_boost_arg(args);
             Ok(MirExpr::new(
                 MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxTrySend {
@@ -9189,6 +9364,112 @@ fn finish_prim_read_method<B: LowerBackend>(
             MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingIsFull { target, cap })),
             MirType::Bool,
         )),
+        ("try_alloc", MirPrimKind::Pool { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::PoolTryAlloc {
+                target,
+                elem_ty: *elem.clone(),
+                cap,
+            })),
+            MirType::Result {
+                ok: Box::new(MirType::Lease(elem)),
+                err: None,
+            },
+        )),
+        ("avail", MirPrimKind::Pool { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::PoolAvail {
+                target,
+                elem_ty: *elem,
+                cap,
+            })),
+            MirType::Usize,
+        )),
+        ("in_use", MirPrimKind::Pool { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::PoolInUse {
+                target,
+                elem_ty: *elem,
+                cap,
+            })),
+            MirType::Usize,
+        )),
+        ("cap", MirPrimKind::Pool { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::PoolCap {
+                target,
+                elem_ty: *elem,
+                cap,
+            })),
+            MirType::Usize,
+        )),
+        ("is_exhausted", MirPrimKind::Pool { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::PoolIsExhausted {
+                target,
+                elem_ty: *elem,
+                cap,
+            })),
+            MirType::Bool,
+        )),
+        ("park", MirPrimKind::DmaSlot { elem }) => {
+            let lease_ty = MirType::Lease(elem.clone());
+            let l = if let Some(first) = first_positional_arg(args) {
+                let raw = be.lower_sub(first, Some(&lease_ty))?;
+                coerce_expr_if_needed(raw, &lease_ty)
+            } else {
+                MirExpr::new(MirExprKind::IntLit(0), lease_ty.clone())
+            };
+            let l = consume_moved_lease_be(l, be);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::DmaSlotPark {
+                    target,
+                    elem_ty: *elem,
+                    lease: Box::new(l),
+                })),
+                MirType::Result {
+                    ok: Box::new(MirType::Void),
+                    err: None,
+                },
+            ))
+        }
+        ("take", MirPrimKind::DmaSlot { elem }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::DmaSlotTake {
+                target,
+                elem_ty: *elem.clone(),
+            })),
+            MirType::Result {
+                ok: Box::new(MirType::Lease(elem)),
+                err: None,
+            },
+        )),
+        ("release", MirPrimKind::DmaSlot { elem }) => {
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::DmaSlotRelease {
+                    target,
+                    elem_ty: *elem,
+                    boost,
+                })),
+                MirType::Bool,
+            ))
+        }
+        ("is_busy", MirPrimKind::DmaSlot { elem }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::DmaSlotIsBusy {
+                target,
+                elem_ty: *elem,
+            })),
+            MirType::Bool,
+        )),
+        ("is_empty", MirPrimKind::DmaSlot { elem }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::DmaSlotIsEmpty {
+                target,
+                elem_ty: *elem,
+            })),
+            MirType::Bool,
+        )),
+        ("addr", MirPrimKind::DmaSlot { elem }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::DmaSlotAddr {
+                target,
+                elem_ty: *elem,
+            })),
+            MirType::Usize,
+        )),
         _ => Err(MirLowerError {
             message: format!("unknown primitive read method `.{method}()`"),
             span,
@@ -9222,6 +9503,7 @@ fn finish_inbox_view_read_method<B: LowerBackend>(
             } else {
                 MirExpr::new(MirExprKind::IntLit(0), elem_ty.clone())
             };
+            let v = consume_moved_lease_be(v, be);
             let boost = extract_boost_arg(args);
             Ok(MirExpr::new(
                 MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewTrySend {
@@ -9589,11 +9871,12 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                                 MirExpr::new(MirExprKind::IntLit(0), elem.clone())
                             };
                             let boost = extract_boost_arg(args);
+                            let v = consume_moved_lease_be(coerce_expr_if_needed(v, &elem), be);
                             return Ok(Some(MirStmt::PrimOp(
                                 MirPrimNonBlockingOp::InboxViewPost {
                                     view,
                                     elem_ty: elem.clone(),
-                                    value: coerce_expr_if_needed(v, &elem),
+                                    value: v,
                                     boost,
                                 },
                             )));
@@ -9655,11 +9938,12 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                         };
                         let boost = extract_boost_arg(args);
+                        let v = consume_moved_lease_be(coerce_expr_if_needed(v, &elem), be);
                         return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::InboxPost {
                             target,
                             elem_ty: *elem.clone(),
                             cap,
-                            value: coerce_expr_if_needed(v, &elem),
+                            value: v,
                             boost,
                         })));
                     }
@@ -9702,32 +9986,16 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             },
                         )));
                     }
-                    ("complete" | "flip", MirPrimKind::Lease { elem, cap }) => {
-                        return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::LeaseComplete {
-                            target,
-                            elem_ty: *elem,
-                            cap,
-                        })));
-                    }
-                    ("acquire" | "start" | "activate", MirPrimKind::Lease { elem, cap }) => {
-                        return Ok(Some(MirStmt::PrimOp(
-                            MirPrimNonBlockingOp::LeaseSetActive {
+                    ("release", MirPrimKind::DmaSlot { elem }) => {
+                        let boost = extract_boost_arg(args);
+                        return Ok(Some(MirStmt::Expr(MirExpr::new(
+                            MirExprKind::PrimRead(Box::new(MirPrimReadOp::DmaSlotRelease {
                                 target,
                                 elem_ty: *elem,
-                                cap,
-                                active: true,
-                            },
-                        )));
-                    }
-                    ("release" | "stop" | "deactivate", MirPrimKind::Lease { elem, cap }) => {
-                        return Ok(Some(MirStmt::PrimOp(
-                            MirPrimNonBlockingOp::LeaseSetActive {
-                                target,
-                                elem_ty: *elem,
-                                cap,
-                                active: false,
-                            },
-                        )));
+                                boost,
+                            })),
+                            MirType::Bool,
+                        ))));
                     }
                     ("consume", MirPrimKind::ByteRing { cap }) => {
                         let len = if let Some(first) = first_positional_arg(args) {
@@ -9765,6 +10033,20 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                     }
                     _ => {}
                         }
+                    }
+                }
+            }
+
+            if method.name == "release" {
+                if let Ok(recv_me) = be.lower_sub(receiver, None) {
+                    if let MirType::Lease(elem) = recv_me.ty.clone() {
+                        let moved = consume_moved_lease_be(recv_me, be);
+                        let boost = extract_boost_arg(args);
+                        return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::LeaseRelease {
+                            value: moved,
+                            elem_ty: *elem,
+                            boost,
+                        })));
                     }
                 }
             }

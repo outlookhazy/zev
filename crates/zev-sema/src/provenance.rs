@@ -151,6 +151,29 @@ impl Provenance {
         }
     }
 
+    /// Provenance for a `*T` pointer borrowed via linear `Lease<T>.get()` at `scope_depth`.
+    pub fn dma_lease_get(source: String, generation: u64, scope_depth: u32, span: Span) -> Self {
+        let mut leases = BTreeSet::new();
+        leases.insert(LeaseToken {
+            source: source.clone(),
+            generation,
+            acq_method: "get",
+            acquired_at: span,
+        });
+        let mut local_origins = BTreeSet::new();
+        local_origins.insert(format!("<dma lease {}>", source));
+        Self {
+            origin_depth: scope_depth,
+            pointee_depth: Some(scope_depth),
+            pointee_is_caller_or_static: false,
+            local_origins,
+            param_origins: BTreeSet::new(),
+            leases,
+            fn_callbacks: BTreeSet::new(),
+            isr_state_origins: BTreeSet::new(),
+        }
+    }
+
     /// Provenance for a slice lease acquired via `byte_ring` (`read_slice`, `wait_read`, `grant_write`).
     pub fn ring_lease(
         source: String,

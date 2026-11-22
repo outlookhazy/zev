@@ -344,7 +344,7 @@ mod tests {
             const u32 MAX_CHAN = 16;
             signal irq_ready;
             inbox<u32, 16> work_q;
-            lease<u8, 128> spi_buf;
+            @dma_safe pool<u8, 8> spi_buf;
             u32 illegal_mutable_global = 42;
 
             struct ByteReader {
@@ -829,6 +829,86 @@ mod tests {
             "primitives",
             "inbox<T, N>",
         );
+    }
+
+    #[test]
+    fn trap_p0013_retired_lease() {
+        assert_trap(
+            "lease<u8, 128> spi_buf;",
+            "P0013",
+            "dma",
+            "@dma_safe pool",
+        );
+        assert_trap(
+            "task worker(lease<u8, 8> *l) { loop { checkpoint(); } }",
+            "P0013",
+            "dma",
+            "dma_slot",
+        );
+        assert_trap(
+            "fn f() { lease<u8, 8> x; }",
+            "P0013",
+            "dma",
+            "Lease<",
+        );
+        assert_trap(
+            "u8 f(lease<u8, 8> *l) { return 0; }",
+            "P0013",
+            "dma",
+            "Lease<",
+        );
+    }
+
+    #[test]
+    fn parses_pool_dma_slot_and_linear_lease_types() {
+        let src = r#"
+struct DmaSubsys {
+    @dma_safe pool<[16]u8, 4> rx_pool;
+    dma_slot<[16]u8> active_rx;
+    inbox<Lease<[16]u8>, 4> done_q;
+}
+pub @dma_safe pool<u32, 8> g_pool;
+
+Lease<[16]u8> process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> buf) error {
+    Lease<[16]u8> next = p.alloc();
+    return next;
+}
+"#;
+        let prog = parse_str(src).expect("pool/dma_slot/Lease program should parse");
+        let ItemKind::Struct(st) = &prog.items[0].kind else {
+            panic!("expected struct");
+        };
+        assert_eq!(st.fields[0].attrs.len(), 1);
+        assert_eq!(st.fields[0].attrs[0].kind, AttrKind::DmaSafe);
+        assert!(matches!(
+            st.fields[0].ty.kind,
+            TypeKind::OsPrimitive(OsPrimitiveType::Pool { cap: 4, .. })
+        ));
+        assert!(matches!(
+            st.fields[1].ty.kind,
+            TypeKind::OsPrimitive(OsPrimitiveType::DmaSlot { .. })
+        ));
+        let ItemKind::OsPrimitive(pool_decl) = &prog.items[1].kind else {
+            panic!("expected top-level os primitive");
+        };
+        assert_eq!(pool_decl.attrs.len(), 1);
+        assert_eq!(pool_decl.attrs[0].kind, AttrKind::DmaSafe);
+        assert!(matches!(pool_decl.ty, OsPrimitiveType::Pool { cap: 8, .. }));
+
+        let ItemKind::Fn(f) = &prog.items[2].kind else {
+            panic!("expected fn");
+        };
+        assert!(matches!(
+            f.params[0].ty.kind,
+            TypeKind::Ptr(ref inner) if matches!(inner.kind, TypeKind::OsPrimitive(OsPrimitiveType::Pool { cap: 4, .. }))
+        ));
+        assert!(matches!(
+            f.params[1].ty.kind,
+            TypeKind::Ptr(ref inner) if matches!(inner.kind, TypeKind::OsPrimitive(OsPrimitiveType::DmaSlot { .. }))
+        ));
+        assert!(matches!(f.params[2].ty.kind, TypeKind::Lease(_)));
+        assert!(matches!(f.error_spec, Some(ErrorSpec::Bare(_))));
+        assert!(matches!(f.ret_type.kind, TypeKind::Lease(_)));
     }
 
     #[test]
@@ -1835,7 +1915,7 @@ pub watch<u32> w_val = 0;
 pub inbox<u8, 4> rx_q;
 pub signal ready;
 pub ping_pong<u8, 8> pp;
-pub lease<u8, 16> pool;
+pub @dma_safe pool<u8, 16> pkt_pool;
 "#;
         let prog = parse_str(src).expect("all top-level pub declarations must parse");
         assert_eq!(prog.items.len(), 18);

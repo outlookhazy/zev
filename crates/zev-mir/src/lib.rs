@@ -2062,6 +2062,7 @@ mod tests {
                     generic_params: vec![],
                     fields: vec![
                         StructField {
+                            attrs: vec![],
                             ty: TypeExpr::new(
                                 TypeKind::Array {
                                     elem: Box::new(ty_prim(PrimType::F32)),
@@ -2073,6 +2074,7 @@ mod tests {
                             span: sp,
                         },
                         StructField {
+                            attrs: vec![],
                             ty: ty_prim(PrimType::Usize),
                             name: id("len"),
                             span: sp,
@@ -2092,11 +2094,13 @@ mod tests {
                     generic_params: vec![],
                     fields: vec![
                         StructField {
+                            attrs: vec![],
                             ty: ty_prim(PrimType::U8),
                             name: id("id"),
                             span: sp,
                         },
                         StructField {
+                            attrs: vec![],
                             ty: ty_prim(PrimType::F32),
                             name: id("temp"),
                             span: sp,
@@ -2434,11 +2438,13 @@ mod tests {
                     generic_params: vec![],
                     fields: vec![
                         StructField {
+                            attrs: vec![],
                             ty: ty_prim(PrimType::U32),
                             name: id("val"),
                             span: sp,
                         },
                         StructField {
+                            attrs: vec![],
                             ty: TypeExpr::new(
                                 TypeKind::Ptr(Box::new(TypeExpr::new(
                                     TypeKind::Named(id("Node")),
@@ -3724,5 +3730,357 @@ mod tests {
             )),
             "expected `local.ptr` to lower to AddrOfPlace: {stmts:?}"
         );
+    }
+
+    #[test]
+    fn pool_dma_slot_and_linear_lease_lowering_and_ram_layout() {
+        let sp = Span::default();
+        let ty_u8 = || ty_prim(PrimType::U8);
+        let ty_lease_u8 = || TypeExpr::new(TypeKind::Lease(Box::new(ty_u8())), sp);
+        let dma_attr = Attr {
+            kind: AttrKind::DmaSafe,
+            span: sp,
+        };
+        let prog = Program::new(
+            vec![
+                // @dma_safe pool<u8, 4> pkt_pool;
+                Item {
+                    attrs: vec![dma_attr.clone()],
+                    is_pub: false,
+                    kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                        attrs: vec![],
+                        ty: OsPrimitiveType::Pool {
+                            elem: Box::new(ty_u8()),
+                            cap: 4,
+                        },
+                        name: id("pkt_pool"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // dma_slot<u8> tx_slot;
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                        attrs: vec![],
+                        ty: OsPrimitiveType::DmaSlot {
+                            elem: Box::new(ty_u8()),
+                        },
+                        name: id("tx_slot"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // struct BusSub { @dma_safe pool<u8, 4> p; pool<u8, 4> cpu_p; }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Struct(StructDecl {
+                        is_packed: false,
+                        generic_params: vec![],
+                        name: id("BusSub"),
+                        fields: vec![
+                            StructField {
+                                attrs: vec![dma_attr],
+                                ty: TypeExpr::new(
+                                    TypeKind::OsPrimitive(OsPrimitiveType::Pool {
+                                        elem: Box::new(ty_u8()),
+                                        cap: 4,
+                                    }),
+                                    sp,
+                                ),
+                                name: id("p"),
+                                span: sp,
+                            },
+                            StructField {
+                                attrs: vec![],
+                                ty: TypeExpr::new(
+                                    TypeKind::OsPrimitive(OsPrimitiveType::Pool {
+                                        elem: Box::new(ty_u8()),
+                                        cap: 4,
+                                    }),
+                                    sp,
+                                ),
+                                name: id("cpu_p"),
+                                span: sp,
+                            },
+                        ],
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // BusSub bus;
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::GlobalVar(GlobalVarDecl {
+                        ty: TypeExpr::new(TypeKind::Named(id("BusSub")), sp),
+                        name: id("bus"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // fn id_lease(Lease<u8> x) -> Lease<u8> { return x; }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        is_extern_c: false,
+                        name: id("id_lease"),
+                        generic_params: vec![],
+                        params: vec![Param {
+                            ty: ty_lease_u8(),
+                            name: id("x"),
+                            span: sp,
+                        }],
+                        is_variadic: false,
+                        ret_type: ty_lease_u8(),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![Stmt::new(StmtKind::Return(Some(expr_id("x"))), sp)],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // task Worker() {
+                //   Lease<u8> a = pkt_pool.alloc();
+                //   *u8 p0 = a.get();
+                //   Lease<u8> b = id_lease(a);
+                //   tx_slot.park(b) catch { return; };
+                //   Lease<u8> c = tx_slot.take() catch { return; };
+                //   c.release();
+                // }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Task(TaskDecl {
+                        attrs: vec![],
+                        name: id("Worker"),
+                        params: vec![],
+                        body: Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_lease_u8(),
+                                        name: id("a"),
+                                        init: Some(Expr::new(
+                                            ExprKind::MethodCall {
+                                                receiver: Box::new(expr_id("pkt_pool")),
+                                                method: id("alloc"),
+                                                args: vec![],
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: TypeExpr::new(TypeKind::Ptr(Box::new(ty_u8())), sp),
+                                        name: id("p0"),
+                                        init: Some(Expr::new(
+                                            ExprKind::MethodCall {
+                                                receiver: Box::new(expr_id("a")),
+                                                method: id("get"),
+                                                args: vec![],
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_lease_u8(),
+                                        name: id("b"),
+                                        init: Some(expr_call("id_lease", vec![expr_id("a")])),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Expr(Expr::new(
+                                        ExprKind::Catch {
+                                            expr: Box::new(Expr::new(
+                                                ExprKind::MethodCall {
+                                                    receiver: Box::new(expr_id("tx_slot")),
+                                                    method: id("park"),
+                                                    args: vec![CallArg::positional(expr_id("b"))],
+                                                },
+                                                sp,
+                                            )),
+                                            clause: CatchClause {
+                                                err_param: None,
+                                                partial_param: None,
+                                                body: Block::new(
+                                                    vec![Stmt::new(StmtKind::Return(None), sp)],
+                                                    sp,
+                                                ),
+                                                span: sp,
+                                            },
+                                        },
+                                        sp,
+                                    )),
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_lease_u8(),
+                                        name: id("c"),
+                                        init: Some(Expr::new(
+                                            ExprKind::Catch {
+                                                expr: Box::new(Expr::new(
+                                                    ExprKind::MethodCall {
+                                                        receiver: Box::new(expr_id("tx_slot")),
+                                                        method: id("take"),
+                                                        args: vec![],
+                                                    },
+                                                    sp,
+                                                )),
+                                                clause: CatchClause {
+                                                    err_param: None,
+                                                    partial_param: None,
+                                                    body: Block::new(
+                                                        vec![Stmt::new(StmtKind::Return(None), sp)],
+                                                        sp,
+                                                    ),
+                                                    span: sp,
+                                                },
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Expr(Expr::new(
+                                        ExprKind::MethodCall {
+                                            receiver: Box::new(expr_id("c")),
+                                            method: id("release"),
+                                            args: vec![],
+                                        },
+                                        sp,
+                                    )),
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        ),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        is_extern_c: false,
+                        name: id("main"),
+                        generic_params: vec![],
+                        params: vec![],
+                        is_variadic: false,
+                        ret_type: ty_prim(PrimType::Void),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![Stmt::new(
+                                StmtKind::Spawn(SpawnStmt {
+                                    module: None,
+                                    task: id("Worker"),
+                                    args: vec![],
+                                    priority: None,
+                                    core: None,
+                                    span: sp,
+                                }),
+                                sp,
+                            )],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+            ],
+            sp,
+        );
+
+        let mir = lower_program(&prog).expect("pool/Lease/dma_slot lowering");
+        let pool_ram = mir
+            .ram_report
+            .primitives
+            .iter()
+            .find(|p| p.name == "pkt_pool")
+            .expect("pkt_pool ram");
+        assert!(pool_ram.dma_safe);
+        assert!(pool_ram.holds_sleep_lock);
+        assert_eq!(pool_ram.bytes_32, 32 + 4 * 32);
+        assert_eq!(pool_ram.bytes_64, 32 + 4 * 32);
+
+        let bus_ram = mir
+            .ram_report
+            .primitives
+            .iter()
+            .find(|s| s.name == "bus")
+            .expect("bus subsystem ram");
+        assert!(bus_ram.holds_sleep_lock);
+        // BusSub has @dma_safe pool<u8, 4> (160B, align 32) + non-dma pool<u8, 4> (20B/28B).
+        assert_eq!(bus_ram.bytes_32, 192);
+        assert_eq!(bus_ram.bytes_64, 192);
+
+        let id_fn = mir.functions.iter().find(|f| f.name == "id_lease").unwrap();
+        let MirFnBody::Direct(id_stmts) = &id_fn.body else {
+            panic!("expected direct fn body");
+        };
+        assert!(
+            id_stmts.iter().any(|s| matches!(
+                s,
+                MirStmt::PrimOp(MirPrimNonBlockingOp::LeaseNullify { .. })
+            )),
+            "returning Lease parameter must emit LeaseNullify: {id_stmts:?}"
+        );
+
+        let worker = &mir.task_blueprints[0];
+        let mut saw_alloc = false;
+        let mut saw_get = false;
+        let mut saw_park = false;
+        let mut saw_take = false;
+        let mut saw_release = false;
+        let mut nullify_count = 0usize;
+        for blk in &worker.blocks {
+            if matches!(
+                blk.terminator,
+                MirTerminator::Yield(MirYieldKind::PoolAlloc { .. })
+            ) {
+                saw_alloc = true;
+            }
+            for st in &blk.stmts {
+                match st {
+                    MirStmt::PrimOp(MirPrimNonBlockingOp::LeaseNullify { .. }) => {
+                        nullify_count += 1;
+                    }
+                    MirStmt::PrimOp(MirPrimNonBlockingOp::LeaseRelease { .. }) => {
+                        saw_release = true;
+                    }
+                    MirStmt::Assign { value, .. } => match &value.kind {
+                        MirExprKind::LeaseGet { .. } => saw_get = true,
+                        MirExprKind::PrimRead(ro) => match ro.as_ref() {
+                            MirPrimReadOp::DmaSlotPark { .. } => saw_park = true,
+                            MirPrimReadOp::DmaSlotTake { .. } => saw_take = true,
+                            _ => {}
+                        },
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_alloc && saw_get && saw_park && saw_take && saw_release);
+        assert!(nullify_count >= 3, "expected nullify on moves into call, park, release: {nullify_count}");
     }
 }
