@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, ConstDecl,
     DurationLit, EnumDecl, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec,
-    GlobalVarDecl, Ident, ImportDecl, IrqDecl, IsrDecl, Item, ItemKind, Literal, MmioAccess,
+    GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal, MmioAccess,
     MmioDecl, MmioDeclKind, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType, Priority, Program,
     SpawnStmt, Span, Stmt, StmtKind, StructDecl, SwitchPat, TaskDecl, TypeExpr, TypeKind,
     UnaryOp,
@@ -67,29 +67,6 @@ impl AnalysisOutput {
         }
     }
 }
-
-/// Built-in SVD bitmask/pin constants available when a `chip.*` hardware module is imported
-/// (unless shadowed by an explicit user `const` declaration).
-const BUILTIN_SVD_CONSTS: &[&str] = &[
-    "MOTOR_EN",
-    "FAULT_LED",
-    "HALF_TRANSFER",
-    "FULL_TRANSFER",
-    "TRANSFER_ERROR",
-    "TRANSFER_COMPLETE",
-    "TXE",
-    "RXNE",
-    "TC",
-    "IDLE",
-    "PIN_0",
-    "PIN_1",
-    "PIN_2",
-    "PIN_3",
-    "PIN_4",
-    "PIN_5",
-    "PIN_6",
-    "PIN_7",
-];
 
 #[derive(Clone, Debug)]
 struct IllegalGlobalInfo {
@@ -229,9 +206,6 @@ pub(crate) struct Analyzer {
     tick_period_us: u64,
     tick_configured_explicitly: bool,
     systick_hz: Option<u64>,
-    has_chip_import: bool,
-    chip_imports: BTreeMap<String, String>,
-    loaded_module_paths: BTreeSet<String>,
     display_names: BTreeMap<String, String>,
     program_extern_c_scopes: Vec<BTreeSet<String>>,
     rewritten_pub_extern_sites: BTreeSet<(usize, u32, u32)>,
@@ -243,7 +217,6 @@ pub(crate) struct Analyzer {
     variant_to_enums: BTreeMap<String, Vec<String>>,
     consts: BTreeMap<String, ConstInfo>,
     raw_const_exprs: BTreeMap<String, (Expr, Ty)>,
-    builtin_svd_consts: BTreeSet<String>,
     primitives: BTreeMap<String, PrimitiveInfo>,
     mmio_layout_names: BTreeSet<String>,
     mmio_layouts: BTreeMap<String, MmioLayoutInfo>,
@@ -280,9 +253,6 @@ impl Analyzer {
             tick_period_us: opts.default_tick_period_us.max(1),
             tick_configured_explicitly: false,
             systick_hz: None,
-            has_chip_import: false,
-            chip_imports: BTreeMap::new(),
-            loaded_module_paths: BTreeSet::new(),
             display_names: BTreeMap::new(),
             program_extern_c_scopes: Vec::new(),
             rewritten_pub_extern_sites: BTreeSet::new(),
@@ -293,7 +263,6 @@ impl Analyzer {
             variant_to_enums: BTreeMap::new(),
             consts: BTreeMap::new(),
             raw_const_exprs: BTreeMap::new(),
-            builtin_svd_consts: BTreeSet::new(),
             primitives: BTreeMap::new(),
             mmio_layout_names: BTreeSet::new(),
             mmio_layouts: BTreeMap::new(),
@@ -326,7 +295,6 @@ impl Analyzer {
     }
 
     pub(crate) fn with_linked_context(mut self, linked: &LinkedModulesOutput) -> Self {
-        self.loaded_module_paths = linked.loaded_module_paths.clone();
         self.display_names = linked.display_names.clone();
         self.program_extern_c_scopes = linked.program_extern_c_scopes.clone();
         self.rewritten_pub_extern_sites = linked.rewritten_pub_extern_sites.clone();
@@ -368,7 +336,19 @@ impl Analyzer {
             self.current_file = file.clone();
             self.current_prog_idx = *prog_idx;
             match &item.kind {
-                ItemKind::Import(imp) => self.collect_import(imp),
+                ItemKind::Import(imp) => {
+                    let dot = imp
+                        .path
+                        .iter()
+                        .map(|id| id.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".");
+                    self.emit(Diagnostic::new(
+                        DiagnosticKind::ModuleError,
+                        imp.span,
+                        format!("unresolved module import `{dot}`"),
+                    ));
+                }
                 ItemKind::Struct(st) => {
                     if !st.generic_params.is_empty() {
                         continue;
@@ -430,12 +410,6 @@ impl Analyzer {
             if !self.variant_to_enums.contains_key("Truncated") {
                 self.variant_to_enums
                     .insert("Truncated".to_string(), vec!["FmtErr".to_string()]);
-            }
-        }
-
-        if self.has_chip_import {
-            for &c in BUILTIN_SVD_CONSTS {
-                self.builtin_svd_consts.insert(c.to_string());
             }
         }
 
@@ -541,7 +515,6 @@ impl Analyzer {
         let model = SemanticModel {
             tick_period_us: self.tick_period_us,
             systick_hz: self.systick_hz,
-            chip_imports: self.chip_imports,
             structs: self.structs,
             enums: self.enums,
             consts: self.consts,
@@ -574,28 +547,6 @@ impl Analyzer {
     // ─────────────────────────────────────────────────────────────────────────
     // Pass 1 Helpers
     // ─────────────────────────────────────────────────────────────────────────
-
-    fn collect_import(&mut self, imp: &ImportDecl) {
-        let full_path = imp
-            .path
-            .iter()
-            .map(|id| id.name.as_str())
-            .collect::<Vec<_>>()
-            .join(".");
-        let alias = imp
-            .alias
-            .as_ref()
-            .map(|a| a.name.clone())
-            .or_else(|| imp.path.last().map(|l| l.name.clone()))
-            .unwrap_or_else(|| full_path.clone());
-
-        if imp.path.first().is_some_and(|p| p.name == "chip")
-            && !self.loaded_module_paths.contains(&full_path)
-        {
-            self.has_chip_import = true;
-            self.chip_imports.insert(alias, full_path);
-        }
-    }
 
     fn register_mmio_layout_name(&mut self, mm: &MmioDecl) {
         if self.structs.contains_key(&mm.name.name)
@@ -1128,8 +1079,6 @@ impl Analyzer {
         if !self.check_top_level_name_unique(&c.name) {
             return;
         }
-        // User const shadows any built-in SVD constant of the same name cleanly.
-        self.builtin_svd_consts.remove(&c.name.name);
 
         let ty = self.resolve_type(&c.ty);
         self.raw_const_exprs
@@ -1673,9 +1622,6 @@ impl Analyzer {
                 {
                     return Ty::MmioLayout(ident.name.clone());
                 }
-                if self.chip_imports.contains_key(&ident.name) {
-                    return Ty::HwPeripheral(ident.name.clone());
-                }
                 let hint = if let Some(z_ty) = suggest_foreign_type_name(&ident.name) {
                     format!(
                         "did you mean Zev built-in type `{}`? (Zev uses explicit fixed-width types: `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64`, `f32`, `f64`, `usize`, `bool`, `u16be`, `u32le`, `[]u8`)",
@@ -1708,16 +1654,6 @@ impl Analyzer {
                 Ty::Error
             }
             TypeKind::Path(segments) => {
-                if let Some(first) = segments.first() {
-                    if first.name == "chip" || self.chip_imports.contains_key(&first.name) {
-                        let path = segments
-                            .iter()
-                            .map(|s| s.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(".");
-                        return Ty::HwPeripheral(path);
-                    }
-                }
                 let joined = segments
                     .iter()
                     .map(|s| s.name.as_str())
@@ -3156,7 +3092,6 @@ impl<'a> BodyChecker<'a> {
         }
         pool.extend(self.sema.primitives.keys().map(String::as_str));
         pool.extend(self.sema.consts.keys().map(String::as_str));
-        pool.extend(self.sema.builtin_svd_consts.iter().map(String::as_str));
         pool.extend(self.sema.variant_to_enums.keys().map(String::as_str));
         pool.extend(self.sema.functions.keys().map(String::as_str));
         pool.extend(["set_priority", "checkpoint", "delay", "sys", "sim"]);
@@ -4733,9 +4668,7 @@ impl<'a> BodyChecker<'a> {
     ) {
         match &target.kind {
             ExprKind::Ident(ident) => {
-                if self.sema.consts.contains_key(&ident.name)
-                    || self.sema.builtin_svd_consts.contains(&ident.name)
-                {
+                if self.sema.consts.contains_key(&ident.name) {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::ImmutableAssignment,
                         target.span,
@@ -4901,18 +4834,17 @@ impl<'a> BodyChecker<'a> {
                             return;
                         }
                         _ => {
-                            if !base_val.ty.is_error() {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::TypeMismatch,
-                                    base.span,
-                                    format!("type '{}' has no field '{}'", base_val.ty, field.name),
-                                ));
-                            }
-                            return;
+                        if !base_val.ty.is_error() {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::TypeMismatch,
+                                base.span,
+                                format!("type '{}' has no field '{}'", base_val.ty, field.name),
+                            ));
                         }
-                    },
-                    Ty::HwPeripheral(_) => return,
-                    _ => {
+                        return;
+                    }
+                },
+                _ => {
                         if !base_val.ty.is_error() {
                             self.sema.emit(Diagnostic::new(
                                 DiagnosticKind::TypeMismatch,
@@ -5798,12 +5730,9 @@ impl<'a> BodyChecker<'a> {
             };
         }
 
-        // 4. Immutable `const` global or built-in SVD constant.
+        // 4. Immutable `const` global.
         if let Some(c) = self.sema.consts.get(&ident.name).cloned() {
             return ExprVal::scalar(c.ty, ident.span);
-        }
-        if self.sema.builtin_svd_consts.contains(&ident.name) {
-            return ExprVal::scalar(Ty::u32(), ident.span);
         }
 
         // 5. Unqualified enum variant (`Overcurrent`, `BadPacket`, `TooShort`, `BadCrc`, ...).
@@ -5861,15 +5790,12 @@ impl<'a> BodyChecker<'a> {
             };
         }
 
-        // 7. Built-in or imported namespaces (`sys`, `sim`, `hw`, `CmdFrame`, `ParseErr`).
+        // 7. Built-in or type namespaces (`sys`, `sim`, `CmdFrame`, `ParseErr`).
         if ident.name == "sys" {
             return ExprVal::scalar(Ty::Namespace(NamespaceKind::Sys), ident.span);
         }
         if ident.name == "sim" {
             return ExprVal::scalar(Ty::Namespace(NamespaceKind::Sim), ident.span);
-        }
-        if let Some(chip_path) = self.sema.chip_imports.get(&ident.name).cloned() {
-            return ExprVal::scalar(Ty::Namespace(NamespaceKind::Chip(chip_path)), ident.span);
         }
         if self.sema.structs.contains_key(&ident.name) {
             return ExprVal::scalar(
@@ -6391,14 +6317,6 @@ impl<'a> BodyChecker<'a> {
                     Ty::Prim(reg.elem_ty)
                 };
                 ExprVal::scalar(reg_ty, span)
-            }
-
-            Ty::Namespace(NamespaceKind::Chip(chip_name)) => {
-                ExprVal::scalar(Ty::HwPeripheral(format!("{}.{}", chip_name, field.name)), span)
-            }
-
-            Ty::HwPeripheral(path) => {
-                ExprVal::scalar(Ty::HwPeripheral(format!("{}.{}", path, field.name)), span)
             }
 
             Ty::Namespace(NamespaceKind::Enum(enum_name)) => {
@@ -6984,22 +6902,6 @@ impl<'a> BodyChecker<'a> {
                     }
                     ExprVal::error(span)
                 }
-            }
-
-            Ty::HwPeripheral(_) | Ty::Namespace(NamespaceKind::Chip(_)) => {
-                // Virtual CMSIS-SVD hardware register/peripheral operations are non-yielding (`noyield`).
-                for a in args {
-                    let _ = self.check_expr_infallible(&a.value);
-                }
-                let ret = if method.name.starts_with("read")
-                    || method.name.starts_with("get")
-                    || method.name.starts_with("is_")
-                {
-                    Ty::IntLit
-                } else {
-                    Ty::void()
-                };
-                ExprVal::scalar(ret, span)
             }
 
             Ty::OsPrimitive(os_prim) => {
@@ -8650,10 +8552,10 @@ fn is_valid_cast(src: &Ty, dst: &Ty) -> bool {
         (Ty::Prim(PrimType::Bool), b) if b.is_numeric() => true,
         // `enum` -> integer.
         (Ty::Enum(_), b) if b.is_integer() => true,
-        // Pointer <-> pointer or pointer <-> integer / hardware peripheral.
-        (Ty::Ptr(_) | Ty::HwPeripheral(_), Ty::Ptr(_)) => true,
-        (Ty::Ptr(_) | Ty::HwPeripheral(_), b) if b.is_integer() => true,
-        (a, Ty::Ptr(_) | Ty::HwPeripheral(_)) if a.is_integer() => true,
+        // Pointer <-> pointer or pointer <-> integer.
+        (Ty::Ptr(_), Ty::Ptr(_)) => true,
+        (Ty::Ptr(_), b) if b.is_integer() => true,
+        (a, Ty::Ptr(_)) if a.is_integer() => true,
         (Ty::MmioInstance { .. }, Ty::Ptr(_)) => true,
         (Ty::MmioInstance { .. }, b) if b.is_integer() => true,
         (Ty::IrqToken, b) if b.is_integer() => true,
@@ -8886,7 +8788,6 @@ impl Analyzer {
                     self.variant_to_enums
                         .get(&id.name)
                         .is_some_and(|v| v.len() == 1)
-                        || self.builtin_svd_consts.contains(&id.name)
                 }
             }
             ExprKind::Field { target, field } => {

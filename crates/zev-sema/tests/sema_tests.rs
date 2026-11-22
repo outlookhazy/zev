@@ -146,11 +146,16 @@ fn check_motor_controller_and_support_multifile() {
     assert!(u1.clamps_sleep_depth);
     assert_eq!(u1.capacity, Some(64));
 
-    // ISR boost metadata
-    let exti0 = &model.isrs["EXTI0"];
-    assert_eq!(exti0.priority_boosts.len(), 1);
-    assert_eq!(exti0.priority_boosts[0].primitive_name, "sup_inbox");
-    assert_eq!(exti0.priority_boosts[0].boost_priority, Priority::Critical);
+    // ISR boost metadata + Boot-Tree `irq` attachments
+    let oc = &model.isrs["overcurrent_isr"];
+    assert_eq!(oc.priority_boosts.len(), 1);
+    assert_eq!(oc.priority_boosts[0].primitive_name, "param:sup");
+    assert_eq!(oc.priority_boosts[0].boost_priority, Priority::Critical);
+    assert_eq!(model.irq_bindings.len(), 3);
+    assert_eq!(
+        model.irq_bindings[0].args.first(),
+        Some(&zev_sema::IrqBindingArg::PrimAddr("sup_inbox".to_string()))
+    );
 }
 
 #[test]
@@ -2271,8 +2276,8 @@ fn defer_and_bounded_for_in_verification() {
         watch<u32> last_sum = 0;
 
         u32 tx_frame([]u8 payload, bool fail) error SpiErr {
-            hw.GPIOA.clear_pin(PIN_0);
-            defer hw.GPIOA.set_pin(PIN_0);
+            hw.GPIOA.brr = 1;
+            defer hw.GPIOA.bsrr = 1;
 
             u32 acc = 0;
             for (usize i in 0..payload.len) {
@@ -2317,9 +2322,10 @@ fn defer_and_bounded_for_in_verification() {
         fn main() {
             critical {
                 for (u32 ch in 0..4) {
-                    hw.TIM1.set_compare(ch, 0);
+                    hw.TIM1.ccr[ch as usize] = 0;
                 }
             }
+            hw.IRQ_DMA1_CH5.attach(DMA1_CH5);
             spawn dma_reader() @normal;
         }
         "#,
@@ -4012,9 +4018,17 @@ fn wave1_module_errors_cycle_private_extern_leak_and_chip_override() {
             "expected disk chip/*.zev override to succeed, got: {:?}",
             out.diagnostics
         );
-        assert!(out.model.chip_imports.is_empty());
         assert_eq!(out.model.irq_bindings.len(), 1);
     }
+
+    // 7. Unknown `chip.<foo>` without a `.zev` file emits E0030 (no LegacyChip fallback).
+    expect_err_kind(
+        r#"
+        import chip.nonexistent_silicon as hw;
+        fn main() {}
+        "#,
+        DiagnosticKind::ModuleError,
+    );
 }
 
 #[test]

@@ -601,7 +601,7 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirStmt::Intrinsic(intr) => match intr {
                 MirIntrinsicOp::UseSystick { hz } => self.register_expr(hz),
                 MirIntrinsicOp::SetPriority { .. } => {}
-                MirIntrinsicOp::SysOp { args, .. } | MirIntrinsicOp::HwOp { args, .. } => {
+                MirIntrinsicOp::SysOp { args, .. } => {
                     for a in args {
                         self.register_expr(a);
                     }
@@ -925,7 +925,6 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             MirType::Array { .. } => format!("syn_{}_t", ty.mangle_name()),
             MirType::Ptr(inner) => format!("{} *", self.c_type(inner)),
             MirType::Primitive(pk) => format!("syn_{}_t", pk.mangle_name()),
-            MirType::HwPeripheral(_) => "syn_hw_periph_t".to_string(),
             MirType::MmioPtr(_) => "volatile uint8_t *".to_string(),
             MirType::FnPtr { .. } => format!("syn_{}_t", ty.mangle_name()),
             MirType::Result { .. } => format!("syn_{}_t", ty.mangle_name()),
@@ -944,8 +943,7 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             | MirType::U16
             | MirType::U32
             | MirType::U64
-            | MirType::Usize
-            | MirType::HwPeripheral(_) => format!("(({})0U)", self.c_type(ty)),
+            | MirType::Usize => format!("(({})0U)", self.c_type(ty)),
             MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64 | MirType::Isize => {
                 format!("(({})0)", self.c_type(ty))
             }
@@ -1915,19 +1913,33 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
         }
 
         // Synthesize convenience UART frame injection hooks when `uart1_dma` / `uart2_dma` exist
+        let find_dma_irq = |prim_name: &str| -> Option<u32> {
+            self.m.irq_vectors.iter().find_map(|v| {
+                v.bindings
+                    .iter()
+                    .any(|b| {
+                        b.baked_args
+                            .iter()
+                            .any(|a| matches!(a, MirBakedArg::PrimAddr(p) if p == prim_name))
+                    })
+                    .then_some(v.irq_num)
+            })
+        };
         let has_u1 = self.m.primitives.iter().any(|p| {
             p.name == "uart1_dma" && matches!(p.kind, MirPrimKind::PingPong { .. })
         });
         if has_u1 {
-            let has_ch5 = self
+            let trig = if let Some(irq_num) = find_dma_irq("uart1_dma") {
+                format!("__zev_irq_vec_{irq_num}();")
+            } else if self
                 .m
                 .isrs
                 .iter()
-                .any(|i| i.name == "DMA1_CH5" && i.params.is_empty() && i.state_vars.is_empty());
-            let trig = if has_ch5 {
-                "syn_sim_fire_isr_DMA1_CH5();"
+                .any(|i| i.name == "DMA1_CH5" && i.params.is_empty() && i.state_vars.is_empty())
+            {
+                "syn_sim_fire_isr_DMA1_CH5();".to_string()
             } else {
-                "syn_pp_hdr_flip(&uart1_dma.hdr);"
+                "syn_pp_hdr_flip(&uart1_dma.hdr);".to_string()
             };
             let _ = writeln!(
                 self.out,
@@ -1938,15 +1950,17 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             p.name == "uart2_dma" && matches!(p.kind, MirPrimKind::PingPong { .. })
         });
         if has_u2 {
-            let has_ch6 = self
+            let trig = if let Some(irq_num) = find_dma_irq("uart2_dma") {
+                format!("__zev_irq_vec_{irq_num}();")
+            } else if self
                 .m
                 .isrs
                 .iter()
-                .any(|i| i.name == "DMA1_CH6" && i.params.is_empty() && i.state_vars.is_empty());
-            let trig = if has_ch6 {
-                "syn_sim_fire_isr_DMA1_CH6();"
+                .any(|i| i.name == "DMA1_CH6" && i.params.is_empty() && i.state_vars.is_empty())
+            {
+                "syn_sim_fire_isr_DMA1_CH6();".to_string()
             } else {
-                "syn_pp_hdr_flip(&uart2_dma.hdr);"
+                "syn_pp_hdr_flip(&uart2_dma.hdr);".to_string()
             };
             let _ = writeln!(
                 self.out,
@@ -3094,80 +3108,6 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     }
                 }
             },
-            MirIntrinsicOp::HwOp {
-                periph_path,
-                method,
-                args,
-            } => {
-                let pname = periph_path.join(".");
-                match method.as_str() {
-                    "puts" | "print" | "write_str" => {
-                        let a0 = args
-                            .first()
-                            .map(|a| self.fmt_expr(a, vars))
-                            .unwrap_or_else(|| "\"\"".to_string());
-                        let _ = writeln!(self.out, "{pad}syn_hw_uart_puts({a0});");
-                    }
-                    "putc" | "write_byte" => {
-                        let a0 = args
-                            .first()
-                            .map(|a| self.fmt_expr(a, vars))
-                            .unwrap_or_else(|| "0U".to_string());
-                        let _ = writeln!(self.out, "{pad}syn_hw_uart_putc((uint32_t)({a0}));");
-                    }
-                    "clear_pin" => {
-                        let a0 = args
-                            .first()
-                            .map(|a| self.fmt_expr(a, vars))
-                            .unwrap_or_else(|| "0U".to_string());
-                        let _ = writeln!(self.out, "{pad}syn_hw_gpio_clear_pin((uint32_t)({a0}));");
-                    }
-                    "set_pin" => {
-                        let a0 = args
-                            .first()
-                            .map(|a| self.fmt_expr(a, vars))
-                            .unwrap_or_else(|| "0U".to_string());
-                        let _ = writeln!(self.out, "{pad}syn_hw_gpio_set_pin((uint32_t)({a0}));");
-                    }
-                    "clear_irq" => {
-                        let a0 = args
-                            .first()
-                            .map(|a| self.fmt_expr(a, vars))
-                            .unwrap_or_else(|| "0U".to_string());
-                        let _ = writeln!(self.out, "{pad}syn_hw_dma_clear_irq((uint32_t)({a0}));");
-                    }
-                    "set_compare" => {
-                        let ch = args
-                            .first()
-                            .map(|a| self.fmt_expr(a, vars))
-                            .unwrap_or_else(|| "0U".to_string());
-                        let duty = args
-                            .get(1)
-                            .map(|a| self.fmt_expr(a, vars))
-                            .unwrap_or_else(|| "0U".to_string());
-                        let _ = writeln!(
-                            self.out,
-                            "{pad}syn_hw_tim_set_compare((uint32_t)({ch}), (uint32_t)({duty}));"
-                        );
-                    }
-                    _ => {
-                        for a in args {
-                            let s = self.fmt_expr(a, vars);
-                            if let MirType::Ptr(inner) = &a.ty {
-                                if matches!(inner.as_ref(), MirType::Primitive(MirPrimKind::PingPong { .. })) {
-                                    let _ = writeln!(self.out, "{pad}syn_pp_hdr_set_active(&({s})->hdr, true);");
-                                    continue;
-                                }
-                            }
-                            let _ = writeln!(self.out, "{pad}(void)({s});");
-                        }
-                        let _ = writeln!(
-                            self.out,
-                            "{pad}syn_hw_generic_op(\"{pname}\", \"{method}\");"
-                        );
-                    }
-                }
-            }
         }
     }
 
@@ -3257,14 +3197,6 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             }
             MirExprKind::ConstRef(name) => c_ident(name),
             MirExprKind::GlobalPrimAddr(name) => format!("(&{})", c_ident(name)),
-            MirExprKind::HwPeriphVal(segs) => {
-                // Deterministic non-zero peripheral handle ID
-                let mut hash = 0x4000_0000u32;
-                for b in segs.join(".").bytes() {
-                    hash = hash.wrapping_mul(33).wrapping_add(b as u32);
-                }
-                format!("((syn_hw_periph_t)0x{hash:08X}U)")
-            }
             MirExprKind::MmioAddr(name) => mmio_c_macro_name(name),
             MirExprKind::MmioRead {
                 base,

@@ -1,0 +1,22 @@
+// Standard shared bus status & transaction statistics types
+
+pub enum BusStatus {
+    Ok,
+    Timeout,
+    BusBusy,
+    FrameErr,
+}
+
+pub struct BusStats {
+    u32 tx_frames;
+    u32 rx_frames;
+    u32 errors;
+}
+
+pub BusStats stats_zero() {
+    return BusStats {
+        tx_frames: 0,
+        rx_frames: 0,
+        errors: 0,
+    };
+}

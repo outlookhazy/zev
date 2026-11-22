@@ -46,7 +46,6 @@ enum ResolvedImport {
         key: ModuleKey,
         dot_path: String,
     },
-    LegacyChip,
 }
 
 #[derive(Clone, Debug)]
@@ -58,8 +57,6 @@ struct LoadedModule {
     exports: ModuleExports,
     /// `alias -> resolved import target` for imports declared in this module.
     imports: BTreeMap<String, ResolvedImport>,
-    /// Legacy fallback aliases kept as `ItemKind::Import`.
-    legacy_aliases: BTreeSet<String>,
     /// `extern "C"` prototypes/functions declared directly inside this module.
     declared_extern_c: BTreeSet<String>,
 }
@@ -84,12 +81,19 @@ pub struct LinkedModulesOutput {
 }
 
 /// Embedded fallback source lookup for built-in library modules when no disk override exists.
-///
-/// NOTE: `chip.*` targets intentionally do NOT register stubs here yet so pre-Step-2 tests keep
-/// using the legacy `NamespaceKind::Chip` fallback unless an actual `chip/*.zev` file exists on disk
-/// or in `include_dirs`.
-pub fn embedded_module_source(_dot_path: &str) -> Option<&'static str> {
-    None
+pub fn embedded_module_source(dot_path: &str) -> Option<&'static str> {
+    match dot_path {
+        "chip.stm32g4" => Some(include_str!("../../../chip/stm32g4.zev")),
+        "chip.lm3s6965" => Some(include_str!("../../../chip/lm3s6965.zev")),
+        "chip.esp32c6" => Some(include_str!("../../../chip/esp32c6.zev")),
+        "bsp.motor_drive" => Some(include_str!("../../../bsp/motor_drive.zev")),
+        "bsp.lm3s6965_evb" => Some(include_str!("../../../bsp/lm3s6965_evb.zev")),
+        "bsp.esp32c6_pico" => Some(include_str!("../../../bsp/esp32c6_pico.zev")),
+        "std.fmt" => Some(include_str!("../../../std/fmt.zev")),
+        "std.io" => Some(include_str!("../../../std/io.zev")),
+        "std.bus" => Some(include_str!("../../../std/bus.zev")),
+        _ => None,
+    }
 }
 
 /// Recursively resolve all `import` declarations across `programs` + `include_dirs`, enforce
@@ -171,7 +175,7 @@ impl ModuleLinker {
 
     fn run(&mut self, root_programs: &[(&Program, Option<&str>)]) -> LinkedModulesOutput {
         // 1. Resolve imports recursively for all root programs, loading dependencies bottom-up.
-        let mut root_imports: Vec<(BTreeMap<String, ResolvedImport>, BTreeSet<String>)> =
+        let mut root_imports: Vec<BTreeMap<String, ResolvedImport>> =
             Vec::with_capacity(root_programs.len());
         for (prog, fname) in root_programs {
             let importer_path = fname.and_then(real_file_path);
@@ -220,7 +224,6 @@ impl ModuleLinker {
                 Some(&m.dot_path),
                 &m.exports,
                 &m.imports,
-                &m.legacy_aliases,
                 &exports_by_key,
                 &mut self.display_names,
                 prog_idx,
@@ -241,7 +244,7 @@ impl ModuleLinker {
         }
 
         // 3. Desugar `Inline` mmio + rewrite imported module references in all root programs.
-        for (offset, ((prog, fname), (imports, legacy_aliases))) in root_programs
+        for (offset, ((prog, fname), imports)) in root_programs
             .iter()
             .zip(root_imports.into_iter())
             .enumerate()
@@ -258,7 +261,6 @@ impl ModuleLinker {
                 None,
                 &empty_exports,
                 &imports,
-                &legacy_aliases,
                 &exports_by_key,
                 &mut self.display_names,
                 prog_idx,
@@ -294,9 +296,8 @@ impl ModuleLinker {
         prog: &Program,
         importer_file: Option<&Path>,
         importer_label: Option<&str>,
-    ) -> (BTreeMap<String, ResolvedImport>, BTreeSet<String>) {
+    ) -> BTreeMap<String, ResolvedImport> {
         let mut imports = BTreeMap::new();
-        let mut legacy_aliases = BTreeSet::new();
 
         for item in &prog.items {
             let ItemKind::Import(imp) = &item.kind else {
@@ -371,29 +372,23 @@ impl ModuleLinker {
                     }
                 }
                 LocateResult::NotFound => {
-                    // Legacy pre-Step-2 fallback: unresolved `chip.*` uses `NamespaceKind::Chip`.
-                    if imp.path.first().is_some_and(|p| p.name == "chip") {
-                        legacy_aliases.insert(alias.clone());
-                        imports.insert(alias, ResolvedImport::LegacyChip);
-                    } else {
-                        self.emit(
-                            Diagnostic::new(
-                                DiagnosticKind::ModuleError,
-                                imp.span,
-                                format!("cannot resolve imported module `{dot_path}`"),
-                            )
-                            .with_note(
-                                "checked importing directory, workspace ancestors, include directories, and embedded modules",
-                            ),
-                            importer_label,
-                        );
-                    }
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::ModuleError,
+                            imp.span,
+                            format!("cannot resolve imported module `{dot_path}`"),
+                        )
+                        .with_note(
+                            "checked importing directory, workspace ancestors, include directories, and embedded modules",
+                        ),
+                        importer_label,
+                    );
                 }
                 LocateResult::Error => {}
             }
         }
 
-        (imports, legacy_aliases)
+        imports
     }
 
     fn ensure_loaded(
@@ -469,7 +464,7 @@ impl ModuleLinker {
         let declared_extern_c = collect_declared_extern_c(&desugared);
 
         self.visiting.push((key.clone(), dot_path.to_owned()));
-        let (imports, legacy_aliases) =
+        let imports =
             self.resolve_imports_in_program(&desugared, disk_path, Some(&file_display));
         self.visiting.pop();
 
@@ -482,7 +477,6 @@ impl ModuleLinker {
                 program: desugared,
                 exports,
                 imports,
-                legacy_aliases,
                 declared_extern_c,
             },
         );
@@ -843,7 +837,6 @@ struct AstRewriter<'a> {
     module_dot_path: Option<&'a str>,
     self_exports: &'a ModuleExports,
     imports: &'a BTreeMap<String, ResolvedImport>,
-    legacy_aliases: &'a BTreeSet<String>,
     exports_by_key: &'a BTreeMap<ModuleKey, (String, ModuleExports)>,
     display_names: &'a mut BTreeMap<String, String>,
     prog_idx: usize,
@@ -910,9 +903,7 @@ impl<'a> AstRewriter<'a> {
         let Some(res) = self.imports.get(alias) else {
             return None;
         };
-        let ResolvedImport::Module { key, dot_path } = res else {
-            return None;
-        };
+        let ResolvedImport::Module { key, dot_path } = res;
         let Some((_, exports)) = self.exports_by_key.get(key) else {
             return None;
         };
@@ -951,10 +942,6 @@ impl<'a> AstRewriter<'a> {
 
     fn is_resolved_module_alias(&self, alias: &str) -> bool {
         matches!(self.imports.get(alias), Some(ResolvedImport::Module { .. }))
-    }
-
-    fn is_legacy_chip_alias(&self, alias: &str) -> bool {
-        self.legacy_aliases.contains(alias)
     }
 
     fn canonicalize_top_name(&mut self, orig: &str) -> String {
@@ -1008,8 +995,6 @@ impl<'a> AstRewriter<'a> {
                         } else {
                             TypeKind::Path(segs.clone())
                         }
-                    } else if self.is_legacy_chip_alias(&first.name) {
-                        TypeKind::Path(segs.clone())
                     } else {
                         TypeKind::Path(segs.clone())
                     }
@@ -1524,8 +1509,6 @@ impl<'a> AstRewriter<'a> {
                         } else {
                             (Some(mod_id.clone()), name.clone())
                         }
-                    } else if self.is_legacy_chip_alias(&mod_id.name) {
-                        (Some(mod_id.clone()), name.clone())
                     } else {
                         self.emit(
                             mod_id.span,
@@ -1609,7 +1592,6 @@ fn rewrite_program(
     module_dot_path: Option<&str>,
     self_exports: &ModuleExports,
     imports: &BTreeMap<String, ResolvedImport>,
-    legacy_aliases: &BTreeSet<String>,
     exports_by_key: &BTreeMap<ModuleKey, (String, ModuleExports)>,
     display_names: &mut BTreeMap<String, String>,
     prog_idx: usize,
@@ -1624,7 +1606,6 @@ fn rewrite_program(
         module_dot_path,
         self_exports,
         imports,
-        legacy_aliases,
         exports_by_key,
         display_names,
         prog_idx,
@@ -1638,20 +1619,7 @@ fn rewrite_program(
     let mut out_items = Vec::with_capacity(prog.items.len());
     for item in &prog.items {
         let new_item = match &item.kind {
-            ItemKind::Import(imp) => {
-                // Keep only legacy unresolved `chip.*` imports so `zev-sema` fallback and `zev-mir`
-                // `import_aliases` stay intact without polluting namespaces with resolved `.zev` modules.
-                let alias = imp
-                    .alias
-                    .as_ref()
-                    .map(|a| a.name.as_str())
-                    .or_else(|| imp.path.last().map(|l| l.name.as_str()))
-                    .unwrap_or("");
-                if !rw.is_legacy_chip_alias(alias) {
-                    continue;
-                }
-                item.clone()
-            }
+            ItemKind::Import(_) => continue,
             ItemKind::Struct(st) => {
                 rw.generic_type_params = st
                     .generic_params

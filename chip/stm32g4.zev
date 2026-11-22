@@ -1,0 +1,95 @@
+// STM32G4xx Typed MMIO Register Maps & NVIC IRQ Tokens
+
+pub mmio GpioRegs {
+    @rw u32 moder   @ 0x00;
+    @rw u32 otyper  @ 0x04;
+    @rw u32 ospeedr @ 0x08;
+    @rw u32 pupdr   @ 0x0C;
+    @ro u32 idr     @ 0x10;
+    @rw u32 odr     @ 0x14;
+    @wo u32 bsrr    @ 0x18;
+    @wo u32 brr     @ 0x28;
+}
+
+pub mmio TimRegs {
+    @rw  u32    cr1  @ 0x00;
+    @rw  u32    dier @ 0x0C;
+    @w1c u32    sr   @ 0x10;
+    @rw  u32    psc  @ 0x28;
+    @rw  u32    arr  @ 0x2C;
+    @rw  [4]u32 ccr  @ 0x34;
+}
+
+pub mmio UsartRegs {
+    @rw  u32 cr1 @ 0x00;
+    @rw  u32 cr3 @ 0x08;
+    @rw  u32 brr @ 0x0C;
+    @ro  u32 isr @ 0x1C;
+    @w1c u32 icr @ 0x20;
+    @ro  u32 rdr @ 0x24;
+    @wo  u32 tdr @ 0x28;
+}
+
+pub mmio DmaRegs {
+    @ro  u32 isr    @ 0x00;
+    @w1c u32 ifcr   @ 0x04;
+    @rw  u32 ccr5   @ 0x58;
+    @rw  u32 cndtr5 @ 0x5C;
+    @rw  u32 cpar5  @ 0x60;
+    @rw  u32 cmar5  @ 0x64;
+    @rw  u32 ccr6   @ 0x6C;
+    @rw  u32 cndtr6 @ 0x70;
+    @rw  u32 cpar6  @ 0x74;
+    @rw  u32 cmar6  @ 0x78;
+}
+
+pub mmio RccRegs {
+    @rw u32 cr      @ 0x00;
+    @rw u32 cfgr    @ 0x08;
+    @rw u32 pllcfgr @ 0x0C;
+    @rw u32 ahb1enr @ 0x48;
+    @rw u32 ahb2enr @ 0x4C;
+    @rw u32 apb1enr @ 0x58;
+    @rw u32 apb2enr @ 0x60;
+}
+
+pub mmio ExtiRegs {
+    @rw  u32 imr1 @ 0x00;
+    @rw  u32 rtsr1 @ 0x08;
+    @rw  u32 ftsr1 @ 0x0C;
+    @w1c u32 pr1  @ 0x14;
+}
+
+pub mmio GPIOA  : GpioRegs  @ 0x4800_0000;
+pub mmio GPIOB  : GpioRegs  @ 0x4800_0400;
+pub mmio GPIOC  : GpioRegs  @ 0x4800_0800;
+pub mmio TIM1   : TimRegs   @ 0x4001_2C00;
+pub mmio TIM2   : TimRegs   @ 0x4000_0000;
+pub mmio USART1 : UsartRegs @ 0x4001_3800;
+pub mmio USART2 : UsartRegs @ 0x4000_4400;
+pub mmio DMA1   : DmaRegs   @ 0x4002_0000;
+pub mmio RCC    : RccRegs   @ 0x4002_1000;
+pub mmio EXTI   : ExtiRegs  @ 0x4001_0400;
+
+pub irq IRQ_EXTI0    = 6;
+pub irq IRQ_DMA1_CH5 = 15;
+pub irq IRQ_DMA1_CH6 = 16;
+pub irq IRQ_USART1   = 37;
+pub irq IRQ_USART2   = 38;
+
+pub const u32 PIN_0 = 0;
+pub const u32 PIN_1 = 1;
+pub const u32 PIN_2 = 2;
+pub const u32 PIN_3 = 3;
+
+pub const u32 RCC_AHB1_DMA1   = 1 << 0;
+pub const u32 RCC_AHB2_GPIOA  = 1 << 0;
+pub const u32 RCC_APB2_TIM1   = 1 << 11;
+pub const u32 RCC_APB2_USART1 = 1 << 14;
+pub const u32 RCC_APB1_USART2 = 1 << 17;
+
+pub const u32 DMA_HTIF5 = 1 << 18;
+pub const u32 DMA_TCIF5 = 1 << 17;
+pub const u32 DMA_HTIF6 = 1 << 22;
+pub const u32 DMA_TCIF6 = 1 << 21;
+pub const u32 EXTI_LINE0 = 1 << 0;

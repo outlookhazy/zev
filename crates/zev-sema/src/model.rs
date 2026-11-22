@@ -267,8 +267,6 @@ pub struct SemanticModel {
     pub tick_period_us: u64,
     /// Optional core clock frequency passed to `sys.use_systick(hz)`.
     pub systick_hz: Option<u64>,
-    /// Imported chip/SVD modules (`alias -> "chip.stm32g4"`).
-    pub chip_imports: BTreeMap<String, String>,
     /// User-defined `struct` and `packed struct` types.
     pub structs: BTreeMap<String, StructInfo>,
     /// User-defined `enum` types.

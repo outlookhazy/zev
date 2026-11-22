@@ -1,0 +1,49 @@
+// Standard zero-heap bounded byte slice readers and writers
+
+pub enum IoErr {
+    Eof,
+    Overflow,
+}
+
+pub struct ByteReader {
+    []u8  buf;
+    usize pos;
+}
+
+pub struct ByteWriter {
+    []u8  buf;
+    usize pos;
+}
+
+pub ByteReader reader_new([]u8 src) {
+    return ByteReader { buf: src, pos: 0 };
+}
+
+pub usize reader_remaining(*ByteReader r) {
+    if (r.pos >= r.buf.len) {
+        return 0;
+    }
+    return r.buf.len - r.pos;
+}
+
+pub u8 reader_u8(*ByteReader r) error IoErr {
+    if (r.pos >= r.buf.len) {
+        error Eof;
+    }
+    u8 b = r.buf[r.pos];
+    r.pos += 1;
+    return b;
+}
+
+pub ByteWriter writer_new([]u8 dst) {
+    return ByteWriter { buf: dst, pos: 0 };
+}
+
+pub fn writer_u8(*ByteWriter w, u8 b) error IoErr {
+    if (w.pos >= w.buf.len) {
+        error Overflow;
+    }
+    w.buf[w.pos] = b;
+    w.pos += 1;
+    return;
+}

@@ -733,37 +733,6 @@ entry:
   call void @__syn_esp32c6_ws2812_grb(i32 %grb)
   ret void
 }}
-
-define i32 @__syn_esp32c6_gpio_read(i32 %pin) nounwind{sz} {{
-entry:
-  ; GPIO_IN_REG (0x6009103C = 1611206716)
-  %in_reg = load volatile i32, ptr inttoptr (i32 1611206716 to ptr), align 4
-  %sh = and i32 %pin, 31
-  %shifted = lshr i32 %in_reg, %sh
-  %bit = and i32 %shifted, 1
-  ret i32 %bit
-}}
-
-define void @__syn_esp32c6_gpio_write(i32 %pin, i8 %high) nounwind{sz} {{
-entry:
-  %sh = and i32 %pin, 31
-  %msk = shl i32 1, %sh
-  ; Route GPIO_FUNCn_OUT_SEL_CFG_REG (0x60091554 + 4*pin) = 640 (OUT_SEL=128 + OEN_SEL=1)
-  %off4 = shl i32 %sh, 2
-  %fsel_addr = add i32 1611208020, %off4
-  %fsel_ptr = inttoptr i32 %fsel_addr to ptr
-  store volatile i32 640, ptr %fsel_ptr, align 4
-  ; Enable output on GPIO_ENABLE_W1TS_REG (0x60091024 = 1611206692)
-  store volatile i32 %msk, ptr inttoptr (i32 1611206692 to ptr), align 4
-  %is_hi = icmp ne i8 %high, 0
-  br i1 %is_hi, label %set_hi, label %set_lo
-set_hi:
-  store volatile i32 %msk, ptr inttoptr (i32 1611206664 to ptr), align 4
-  ret void
-set_lo:
-  store volatile i32 %msk, ptr inttoptr (i32 1611206668 to ptr), align 4
-  ret void
-}}
 "#
     );
 }

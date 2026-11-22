@@ -110,7 +110,7 @@ mod tests {
         let path = repo_root().join("examples/motor_controller.zev");
         let program = parse_workspace_example(&path);
 
-        // 1 import + 1 packed struct + 2 enums + 5 OS primitives + 3 ISRs + 1 helper fn + 2 tasks + 1 main fn = 16 items
+        // 2 imports + 1 packed struct + 2 enums + 5 OS primitives + 2 ISRs + 1 helper fn + 2 tasks + 1 main fn = 16 items
         assert_eq!(program.items.len(), 16, "unexpected item count");
 
         match &program.items[0].kind {
@@ -123,6 +123,15 @@ mod tests {
         }
 
         match &program.items[1].kind {
+            ItemKind::Import(imp) => {
+                let segs: Vec<&str> = imp.path.iter().map(|i| i.as_str()).collect();
+                assert_eq!(segs, vec!["bsp", "motor_drive"]);
+                assert_eq!(imp.alias.as_ref().unwrap().as_str(), "bsp");
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
+
+        match &program.items[2].kind {
             ItemKind::Struct(st) => {
                 assert!(st.is_packed);
                 assert_eq!(st.name.as_str(), "CmdFrame");
@@ -134,7 +143,7 @@ mod tests {
             other => panic!("expected Struct, got {other:?}"),
         }
 
-        match &program.items[2].kind {
+        match &program.items[3].kind {
             ItemKind::Enum(en) => {
                 assert_eq!(en.name.as_str(), "ParseErr");
                 assert_eq!(en.variants.len(), 2);
@@ -142,7 +151,7 @@ mod tests {
             other => panic!("expected Enum, got {other:?}"),
         }
 
-        match &program.items[4].kind {
+        match &program.items[5].kind {
             ItemKind::OsPrimitive(os) => {
                 assert_eq!(os.name.as_str(), "uart1_dma");
                 assert_eq!(os.attrs.len(), 1);
@@ -158,7 +167,7 @@ mod tests {
             other => panic!("expected OsPrimitive, got {other:?}"),
         }
 
-        match &program.items[6].kind {
+        match &program.items[7].kind {
             ItemKind::OsPrimitive(os) => {
                 assert_eq!(os.name.as_str(), "motor1_rpm");
                 assert!(os.init.is_some());
@@ -166,11 +175,12 @@ mod tests {
             other => panic!("expected Watch OsPrimitive, got {other:?}"),
         }
 
-        match &program.items[9].kind {
+        match &program.items[10].kind {
             ItemKind::Isr(isr) => {
-                assert_eq!(isr.vector.as_str(), "EXTI0");
-                assert_eq!(isr.body.stmts.len(), 2);
-                match &isr.body.stmts[1].kind {
+                assert_eq!(isr.vector.as_str(), "overcurrent_isr");
+                assert_eq!(isr.params.len(), 2);
+                assert_eq!(isr.body.stmts.len(), 4);
+                match &isr.body.stmts[3].kind {
                     StmtKind::Expr(Expr {
                         kind: ExprKind::MethodCall { method, args, .. },
                         ..

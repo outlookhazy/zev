@@ -1,0 +1,20 @@
+// Waveshare ESP32-C6-Pico Board Support Package
+import chip.esp32c6 as hw;
+
+pub const u32 PIN_WS2812_RGB = 8;
+pub const u32 PIN_BOOT_BTN   = 9;
+
+pub fn init_board_gpio() {
+    // IO_MUX_GPIO9_REG is at `0x6009_0000 + 0x04 + 9*4 = 0x6009_0028` (`gpio[9]`).
+    // Configure GPIO9 as input with internal pull-up (`FUN_IE=1<<9`, `FUN_WPU=1<<8`, `MCU_SEL=1<<12`).
+    hw.GPIO.enable_w1tc = 1 << PIN_BOOT_BTN;
+    hw.IO_MUX.gpio[9] = (1 << 12) | (1 << 9) | (1 << 8);
+}
+
+pub u32 read_boot_button() {
+    return (hw.GPIO.in_reg >> PIN_BOOT_BTN) & 1;
+}
+
+pub fn clear_gpio_irq() {
+    hw.GPIO.status_w1tc = 1 << PIN_BOOT_BTN;
+}

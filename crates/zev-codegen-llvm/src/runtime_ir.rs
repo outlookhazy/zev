@@ -143,8 +143,6 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_wfi_count = global i32 0, align 4
 @__syn_irq_woke_urgent = global i8 0, align 1
 @__syn_current_task = global ptr null, align 4
-@__syn_gpio_state = global i32 1, align 4
-@__syn_pwm_duty = global [8 x i32] zeroinitializer, align 4
 "#
     );
 

@@ -1,25 +1,26 @@
 // Bare-Metal Waveshare ESP32-C6-Pico Firmware (`riscv32imac` Direct-Boot, Zero-C / Zero-IDF)
 //
 // Targets physical ESP32-C6 silicon directly from LLVM 23 `riscv32-unknown-none-elf`:
+//   - Real `.zev` `chip.esp32c6` + `bsp.esp32c6_pico` + `std.fmt` modules with typed `mmio` (`GPIO.in_reg`, `IO_MUX`, `INTMTX`)
+//   - Parameterized `isr` + ISR-private `state` wired via Boot-Tree `hw.IRQ_GPIO.attach(...)` into RISC-V `INTMTX` + `mtvec`
 //   - ROM Direct-Boot (`0xAEDB041D` x2 at `0x42000000` -> `@_start` at `0x42000008`)
-//   - Disarms `TIMG0`, `TIMG1`, `LP_WDT`, and `SWD` watchdogs at reset
 //   - 16 MHz hardware `SYSTIMER` (`0x6000A000`) driving drift-free `loop every 20ms` / `loop every 500ms` / `1s` deadlines
 //   - 0-wait-state HP-SRAM (`.iram1`) WS2812B 800kHz addressable RGB LED driver on `GPIO8`
-//   - Debounced `BOOT` button (`GPIO9`) posting `ButtonPressed` with `boost: @critical`
 //   - Zero-heap `println(f"...")` + proven-fit `fmt_buf` + `<T, usize N>` generics + `f32` power telemetry
 
-// Synthesized directly in RISC-V LLVM 23 IR by `zev-codegen-llvm` (zero C / zero ESP-IDF):
+import chip.esp32c6 as hw;
+import bsp.esp32c6_pico as bsp;
+import std.fmt as fmt;
+
+// Hardware-timed .iram1 WS2812B pulse shifter & SYSTIMER telemetry hooks (zero GPIO shims!)
 extern "C" fn zev_ws2812_rgb(u8 r, u8 g, u8 b);
-extern "C" u32 zev_gpio_read(u32 pin);
 extern "C" u32 zev_now_ms();
 extern "C" u32 zev_current_prio();
 extern "C" u32 zev_cpu_calib_ticks();
 extern "C" u32 zev_ws2812_store_ns();
 extern "C" u32 zev_pad8_ok();
 
-const u32 PIN_WS2812_RGB = 8;
-const u32 PIN_BOOT_BTN   = 9;
-const u32 PALETTE_LEN    = 5;
+const u32 PALETTE_LEN = 5;
 
 enum SupEvent { ButtonPressed, Heartbeat }
 
@@ -40,17 +41,15 @@ watch<u32>            active_color   = 0;
 watch<u32>            diag_signature = 0;
 inbox<SupEvent, 8>    sup_inbox;
 
-// ── Monomorphized `<T>` & `<T, usize N>` Helpers (Zero Vtables, Zero Heap) ──
-T clamp<T>(T val, T lo, T hi) {
-    if (val < lo) {
-        return lo;
-    }
-    if (val > hi) {
-        return hi;
-    }
-    return val;
+// ── Synthesized RISC-V `INTMTX` + `mtvec` IRQ Handler ───────────────────────
+isr gpio_btn_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
+    state u32 irq_edges = 0;
+    irq_edges += 1;
+    gpio.status_w1tc = 1 << bsp.PIN_BOOT_BTN;
+    sup.post(ButtonPressed, boost: @critical);
 }
 
+// ── Monomorphized `<T, usize N>` Helpers (Zero Vtables, Zero Heap) ──────────
 fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
     if (v.len < N) {
         v.data[v.len] = item;
@@ -79,27 +78,22 @@ u32 drive_palette_slot(u32 slot) {
     u32 idx = slot % PALETTE_LEN;
     switch (idx) {
         0 => {
-            // Pure Red
             zev_ws2812_rgb(64, 0, 0);
             return 0x400000;
         }
         1 => {
-            // Pure Green
             zev_ws2812_rgb(0, 64, 0);
             return 0x004000;
         }
         2 => {
-            // Pure Blue
             zev_ws2812_rgb(0, 0, 64);
             return 0x000040;
         }
         3 => {
-            // Pure Cyan
             zev_ws2812_rgb(0, 56, 56);
             return 0x003838;
         }
         _ => {
-            // Pure Magenta
             zev_ws2812_rgb(56, 0, 56);
             return 0x380038;
         }
@@ -111,7 +105,7 @@ LedSample sample_led_power(u32 slot, u32 color_rgb) {
     u32 g = (color_rgb >> 8) & 0xFF;
     u32 b = color_rgb & 0xFF;
     f32 ch_sum = (r + g + b) as f32;
-    f32 mw = clamp<f32>(1.5f32 + (ch_sum * 0.24f32), 0.0f32, 180.0f32);
+    f32 mw = fmt.clamp<f32>(1.5f32 + (ch_sum * 0.24f32), 0.0f32, 180.0f32);
     return LedSample{ slot: (slot % PALETTE_LEN) as u8, mwatts: mw };
 }
 
@@ -178,13 +172,13 @@ task led_animator(watch<u32> *mode_off, watch<u32> *out_slot, watch<u32> *out_co
     }
 }
 
-// Polls GPIO9 (`BOOT` button, active-low) every 20ms with 2-sample debounce
+// Polls GPIO9 (`BOOT` button, active-low) directly via typed `mmio` every 20ms
 task button_monitor() {
     u32 low_streak = 0;
     bool latched = false;
 
     loop every 20ms {
-        u32 level = zev_gpio_read(PIN_BOOT_BTN);
+        u32 level = bsp.read_boot_button();
         if (level == 0) {
             if (low_streak < 10) {
                 low_streak += 1;
@@ -202,6 +196,9 @@ task button_monitor() {
 
 // ── Sequential Boot + Low-Priority Telemetry Supervisor ─────────────────────
 fn main() {
+    bsp.init_board_gpio();
+    hw.IRQ_GPIO.attach(gpio_btn_isr(&sup_inbox, hw.GPIO));
+
     // Immediate visual boot confirmation on GPIO8 WS2812B RGB LED
     u32 boot_rgb = drive_palette_slot(0);
     active_slot.publish(0);
@@ -260,15 +257,7 @@ fn main() {
                 vec_push_ring(&mw_window, sample.mwatts);
                 f32 avg_mw = vec_avg_f32(&mw_window);
 
-                print_telemetry_line(
-                    zev_now_ms(),
-                    cur_rgb,
-                    presses,
-                    zev_current_prio(),
-                    avg_mw,
-                    ev,
-                    sample
-                );
+                print_telemetry_line(zev_now_ms(), cur_rgb, presses, zev_current_prio(), avg_mw, ev, sample);
             }
         }
     }

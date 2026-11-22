@@ -147,6 +147,52 @@ mod tests {
         let sp = Span::dummy();
         let mut items = Vec::new();
 
+        // Typed MMIO blocks for `GPIOA` and `TIM1`
+        items.push(Item {
+            attrs: vec![],
+            is_pub: false,
+            kind: ItemKind::Mmio(MmioDecl {
+                name: id("GPIOA"),
+                kind: MmioDeclKind::Inline {
+                    base_addr: expr_int(0x4800_0000),
+                    regs: vec![MmioRegDecl {
+                        access: MmioAccess::Wo,
+                        ty: ty_prim(PrimType::U32),
+                        name: id("brr"),
+                        offset: expr_int(0x28),
+                        span: sp,
+                    }],
+                },
+                span: sp,
+            }),
+            span: sp,
+        });
+        items.push(Item {
+            attrs: vec![],
+            is_pub: false,
+            kind: ItemKind::Mmio(MmioDecl {
+                name: id("TIM1"),
+                kind: MmioDeclKind::Inline {
+                    base_addr: expr_int(0x4001_2C00),
+                    regs: vec![MmioRegDecl {
+                        access: MmioAccess::Rw,
+                        ty: TypeExpr::new(
+                            TypeKind::Array {
+                                elem: Box::new(ty_prim(PrimType::U32)),
+                                len: ArrayLen::Fixed(4),
+                            },
+                            sp,
+                        ),
+                        name: id("ccr"),
+                        offset: expr_int(0x34),
+                        span: sp,
+                    }],
+                },
+                span: sp,
+            }),
+            span: sp,
+        });
+
         // packed struct CmdFrame { u8 op; u16be setpoint; u16be crc; }
         items.push(Item {
             attrs: vec![],
@@ -309,7 +355,7 @@ mod tests {
             span: sp,
         });
 
-        // isr EXTI0 { hw.GPIOA.clear_pin(MOTOR_EN); sup_inbox.post(Overcurrent, boost: @critical); }
+        // isr EXTI0 { GPIOA.brr = 1; sup_inbox.post(Overcurrent, boost: @critical); }
         items.push(Item {
             attrs: vec![],
             is_pub: false,
@@ -320,20 +366,17 @@ mod tests {
                 body: Block::new(
                     vec![
                         Stmt::new(
-                            StmtKind::Expr(Expr::new(
-                                ExprKind::MethodCall {
-                                    receiver: Box::new(Expr::new(
-                                        ExprKind::Field {
-                                            target: Box::new(expr_id("hw")),
-                                            field: id("GPIOA"),
-                                        },
-                                        sp,
-                                    )),
-                                    method: id("clear_pin"),
-                                    args: vec![CallArg::positional(expr_id("MOTOR_EN"))],
-                                },
-                                sp,
-                            )),
+                            StmtKind::Assign {
+                                target: Expr::new(
+                                    ExprKind::Field {
+                                        target: Box::new(expr_id("GPIOA")),
+                                        field: id("brr"),
+                                    },
+                                    sp,
+                                ),
+                                op: AssignOp::Assign,
+                                value: expr_int(1),
+                            },
                             sp,
                         ),
                         Stmt::new(
@@ -882,29 +925,45 @@ mod tests {
                                                             sp,
                                                         ),
                                                         Stmt::new(
-                                                            StmtKind::Expr(Expr::new(
-                                                                ExprKind::MethodCall {
-                                                                    receiver: Box::new(Expr::new(
-                                                                        ExprKind::Field {
-                                                                            target: Box::new(
-                                                                                expr_id("hw"),
-                                                                            ),
-                                                                            field: id("TIM1"),
-                                                                        },
-                                                                        sp,
-                                                                    )),
-                                                                    method: id("set_compare"),
-                                                                    args: vec![
-                                                                        CallArg::positional(
-                                                                            expr_id("pwm_ch"),
-                                                                        ),
-                                                                        CallArg::positional(
-                                                                            expr_id("target"),
-                                                                        ),
-                                                                    ],
-                                                                },
-                                                                sp,
-                                                            )),
+                                                            StmtKind::Assign {
+                                                                target: Expr::new(
+                                                                    ExprKind::Index {
+                                                                        target: Box::new(Expr::new(
+                                                                            ExprKind::Field {
+                                                                                target: Box::new(
+                                                                                    expr_id("TIM1"),
+                                                                                ),
+                                                                                field: id("ccr"),
+                                                                            },
+                                                                            sp,
+                                                                        )),
+                                                                        index: Box::new(Expr::new(
+                                                                            ExprKind::Cast {
+                                                                                expr: Box::new(
+                                                                                    expr_id(
+                                                                                        "pwm_ch",
+                                                                                    ),
+                                                                                ),
+                                                                                ty: ty_prim(
+                                                                                    PrimType::Usize,
+                                                                                ),
+                                                                            },
+                                                                            sp,
+                                                                        )),
+                                                                    },
+                                                                    sp,
+                                                                ),
+                                                                op: AssignOp::Assign,
+                                                                value: Expr::new(
+                                                                    ExprKind::Cast {
+                                                                        expr: Box::new(expr_id(
+                                                                            "target",
+                                                                        )),
+                                                                        ty: ty_prim(PrimType::U32),
+                                                                    },
+                                                                    sp,
+                                                                ),
+                                                            },
                                                             sp,
                                                         ),
                                                     ],
@@ -1333,8 +1392,10 @@ int main(void) {
         fprintf(stderr, "Expected motor1_rpm == 1500, got %u\n", syn_watch_u16_read(&motor1_rpm));
         return 3;
     }
-    if (g_syn_hw.tim_compare[1] != 1500U) {
-        fprintf(stderr, "Expected TIM1 CCR1 == 1500, got %u\n", g_syn_hw.tim_compare[1]);
+    uint32_t ccr1 = 0U;
+    memcpy(&ccr1, (const void *)(__zev_mmio_buf_TIM1 + 0x34U + sizeof(uint32_t) * 1U), sizeof(uint32_t));
+    if (ccr1 != 1500U) {
+        fprintf(stderr, "Expected TIM1 CCR1 == 1500, got %u\n", (unsigned)ccr1);
         return 4;
     }
 
@@ -1546,7 +1607,7 @@ int main(void) {
         assert!(stdout.contains("PARTIAL_PROGRESS_OK"));
     }
 
-    fn parse_examples_compat(paths: &[&str]) -> Vec<Program> {
+    fn parse_examples_compat(paths: &[&str]) -> Vec<(Program, String)> {
         let mut raws = Vec::with_capacity(paths.len());
         let mut all_generics = std::collections::BTreeSet::new();
         for &path in paths {
@@ -1556,7 +1617,11 @@ int main(void) {
         }
         raws.into_iter()
             .map(|(path, raw)| {
-                match zev_parser::parse_str_named_with_generics(&raw, path, Some(&all_generics)) {
+                let prog = match zev_parser::parse_str_named_with_generics(
+                    &raw,
+                    path,
+                    Some(&all_generics),
+                ) {
                     Ok(prog) => prog,
                     Err(_) => {
                         let migrated = raw.replace("    every ", "    loop every ");
@@ -1567,7 +1632,8 @@ int main(void) {
                         )
                         .unwrap_or_else(|e| panic!("parse {path}: {e:?}"))
                     }
-                }
+                };
+                (prog, path.to_string())
             })
             .collect()
     }
@@ -1578,10 +1644,21 @@ int main(void) {
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/motor_controller.zev"),
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/motor_support.zev"),
         ]);
-        let mono_progs = zev_sema::monomorphize_programs(&progs)
-            .expect("monomorphize motor_controller + motor_support");
+        let named: Vec<(&Program, Option<&str>)> = progs
+            .iter()
+            .map(|(p, path)| (p, Some(path.as_str())))
+            .collect();
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+            &named,
+            &zev_sema::AnalyzeOptions::default(),
+        );
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema motor_controller + motor_support: {:?}",
+            analyzed.diagnostics
+        );
 
-        let mir = zev_mir::lower_programs(&mono_progs)
+        let mir = zev_mir::lower_programs(&analyzed.programs)
             .expect("lower motor_controller + motor_support");
 
         // Verify North Star static RAM invariants
@@ -1616,9 +1693,20 @@ int main(void) {
             env!("CARGO_MANIFEST_DIR"),
             "/../../examples/sim_demo.zev"
         )]);
-        let mono_progs =
-            zev_sema::monomorphize_programs(&progs).expect("monomorphize sim_demo.zev");
-        let mir = zev_mir::lower_programs(&mono_progs).expect("lower sim_demo.zev");
+        let named: Vec<(&Program, Option<&str>)> = progs
+            .iter()
+            .map(|(p, path)| (p, Some(path.as_str())))
+            .collect();
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+            &named,
+            &zev_sema::AnalyzeOptions::default(),
+        );
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema sim_demo.zev: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = zev_mir::lower_programs(&analyzed.programs).expect("lower sim_demo.zev");
         assert!(mir.ram_report.mcu32.union_bytes_saved > 0);
 
         let c_code = emit_c(&mir);
@@ -1801,8 +1889,6 @@ int main(void) {
     #[test]
     fn const_switch_multistmt_catch_signed_sub_and_io_parity() {
         let src = r#"
-import chip.stm32g4 as hw;
-
 const u8 CMD_READ = 1;
 const u8 CMD_SET  = 2;
 
@@ -1855,8 +1941,8 @@ task worker() {
     sys.log("syslog_ok");
     sys.log_kv("k=", -5);
     sys.log_hex("hex=", 0x1A2B);
-    hw.UART0.puts("uart0_ok\n");
-    hw.USART1.puts("usart1_ok\n");
+    print("uart0_ok\n");
+    print("usart1_ok\n");
     sys.log_kv("now=", sys.now_ms() as i32);
     sys.exit(0);
 }

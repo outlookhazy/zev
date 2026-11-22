@@ -163,7 +163,7 @@ impl ModuleSymbols {
         if let ExprKind::Field { target, field } = &expr.kind {
             if let ExprKind::Ident(alias) = &target.kind {
                 if scopes.lookup(&alias.name).is_none()
-                    && (alias.name == "hw" || self.import_aliases.contains_key(&alias.name))
+                    && self.import_aliases.contains_key(&alias.name)
                 {
                     for cand in self.candidate_module_names(&alias.name, &field.name) {
                         if self.mmio_instances.contains_key(&cand) {
@@ -180,7 +180,7 @@ impl ModuleSymbols {
         if let ExprKind::Field { target, field } = &expr.kind {
             if let ExprKind::Ident(alias) = &target.kind {
                 if scopes.lookup(&alias.name).is_none()
-                    && (alias.name == "hw" || self.import_aliases.contains_key(&alias.name))
+                    && self.import_aliases.contains_key(&alias.name)
                 {
                     for cand in self.candidate_module_names(&alias.name, &field.name) {
                         if let Some(&num) = self.irqs.get(&cand) {
@@ -212,8 +212,7 @@ impl ModuleSymbols {
                 } else if self.structs.contains_key(n) {
                     MirType::Struct(id.name.clone())
                 } else {
-                    // Could be hardware handle typedef or external opaque type
-                    MirType::HwPeripheral(id.name.clone())
+                    MirType::Usize
                 }
             }
             TypeKind::Path(segs) => {
@@ -236,7 +235,7 @@ impl ModuleSymbols {
                         }
                     }
                 }
-                MirType::HwPeripheral(joined.join("."))
+                MirType::Usize
             }
             TypeKind::Slice(inner) => MirType::Slice(Box::new(self.resolve_type(inner))),
             TypeKind::Array { elem, len } => {
@@ -252,17 +251,9 @@ impl ModuleSymbols {
                     len: resolved_len,
                 }
             }
-            TypeKind::Generic { base, .. } => {
-                let n = base.name.as_str();
-                if self.structs.contains_key(n) {
-                    MirType::Struct(base.name.clone())
-                } else {
-                    MirType::Struct(base.name.clone())
-                }
-            }
+            TypeKind::Generic { base, .. } => MirType::Struct(base.name.clone()),
             TypeKind::GenericPath { path, .. } => {
-                let joined: Vec<String> = path.iter().map(|s| s.name.clone()).collect();
-                MirType::HwPeripheral(joined.join("."))
+                MirType::Struct(path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join("__"))
             }
             TypeKind::Ptr(inner) => {
                 if let Some(layout) = self.resolve_mmio_layout_name(inner) {
@@ -323,10 +314,6 @@ impl ModuleSymbols {
             });
         }
         Ok(us / self.tick_period_us)
-    }
-
-    fn is_hw_root(&self, ident: &str) -> bool {
-        ident == "hw" || self.import_aliases.contains_key(ident)
     }
 }
 
@@ -2563,7 +2550,7 @@ fn is_pure_boot_setup_stmt(stmt: &Stmt) -> bool {
                 return true;
             }
             if let ExprKind::Ident(id) = &receiver.kind {
-                id.name == "sys" || id.name == "hw"
+                id.name == "sys"
             } else {
                 false
             }
@@ -2930,39 +2917,6 @@ fn mmio_elem_mir_type(elem_bits: u8) -> MirType {
     }
 }
 
-fn try_extract_hw_path(expr: &Expr, syms: &ModuleSymbols) -> Option<Vec<String>> {
-    match &expr.kind {
-        ExprKind::Ident(id) if syms.is_hw_root(&id.name) => Some(vec![id.name.clone()]),
-        ExprKind::Field { target, field } => {
-            let mut base = try_extract_hw_path(target, syms)?;
-            base.push(field.name.clone());
-            Some(base)
-        }
-        _ => None,
-    }
-}
-
-fn try_extract_hw_path_be<B: LowerBackend>(expr: &Expr, be: &B) -> Option<Vec<String>> {
-    let segs = try_extract_hw_path(expr, be.syms())?;
-    let root = segs.first()?;
-    if be.scopes().lookup(root).is_some() {
-        return None;
-    }
-    if segs.len() >= 2 {
-        let syms = be.syms();
-        for cand in syms.candidate_module_names(root, &segs[1]) {
-            if syms.mmio_instances.contains_key(&cand)
-                || syms.irqs.contains_key(&cand)
-                || syms.enums.contains_key(&cand)
-                || syms.consts.contains_key(&cand)
-            {
-                return None;
-            }
-        }
-    }
-    Some(segs)
-}
-
 fn find_named_arg<'a>(args: &'a [CallArg], name: &str) -> Option<&'a Expr> {
     args.iter()
         .find(|a| a.name.as_ref().map_or(false, |n| n.name == name))
@@ -2982,15 +2936,6 @@ fn extract_boost_arg(args: &[CallArg]) -> Option<MirPriority> {
     None
 }
 
-fn built_in_hw_const(name: &str) -> Option<i128> {
-    match name {
-        "MOTOR_EN" => Some(1 << 0),
-        "HALF_TRANSFER" => Some(1 << 1),
-        "FULL_TRANSFER" => Some(1 << 2),
-        _ => None,
-    }
-}
-
 fn eval_const_expr(expr: &Expr, syms: &ModuleSymbols) -> Option<ConstVal> {
     match &expr.kind {
         ExprKind::Literal(Literal::Int(v)) => Some(ConstVal::Int(*v as i128)),
@@ -2998,9 +2943,6 @@ fn eval_const_expr(expr: &Expr, syms: &ModuleSymbols) -> Option<ConstVal> {
         ExprKind::Ident(id) => {
             if let Some(&cv) = syms.const_vals.get(&id.name) {
                 return Some(cv);
-            }
-            if let Some(v) = built_in_hw_const(&id.name) {
-                return Some(ConstVal::Int(v));
             }
             if let Some((_, disc)) = syms.variant_to_enum.get(&id.name) {
                 return Some(ConstVal::Int(*disc as i128));
@@ -3093,9 +3035,6 @@ fn convert_switch_pat(
                     ConstVal::Int(v) => Some(MirSwitchPattern::Int(v)),
                     ConstVal::Bool(b) => Some(MirSwitchPattern::Bool(b)),
                 };
-            }
-            if let Some(v) = built_in_hw_const(&name.name) {
-                return Some(MirSwitchPattern::Int(v));
             }
             if let Some((en, _)) = syms.variant_to_enum.get(&name.name) {
                 return Some(MirSwitchPattern::EnumVariant {
@@ -7349,9 +7288,6 @@ fn lower_leaf_expr(
                     cty.clone(),
                 ));
             }
-            if let Some(val) = built_in_hw_const(&id.name) {
-                return Ok(MirExpr::new(MirExprKind::IntLit(val), MirType::U32));
-            }
             if let Some(pinfo) = syms.primitives.get(&id.name) {
                 return Ok(MirExpr::new(
                     MirExprKind::GlobalPrimAddr(id.name.clone()),
@@ -7480,12 +7416,6 @@ fn lower_common_expr<B: LowerBackend>(
                 return Ok(MirExpr::new(
                     MirExprKind::MmioAddr(inst_name),
                     MirType::MmioPtr(layout),
-                ));
-            }
-            if let Some(hw_path) = try_extract_hw_path_be(expr, be) {
-                return Ok(MirExpr::new(
-                    MirExprKind::HwPeriphVal(hw_path.clone()),
-                    MirType::HwPeripheral(hw_path.join(".")),
                 ));
             }
             if let ExprKind::Ident(id) = &target.kind {
@@ -8212,9 +8142,6 @@ fn resolve_prim_receiver_be<B: LowerBackend>(
         }
         return Ok(None);
     }
-    if try_extract_hw_path_be(receiver, be).is_some() {
-        return Ok(None);
-    }
     if let ExprKind::Field { .. } | ExprKind::Unary { op: UnaryOp::Deref, .. } = &receiver.kind {
         if let Ok(rv) = be.lower_sub(receiver, None) {
             match &rv.ty {
@@ -8595,27 +8522,7 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                 }
             }
 
-            // 2. `hw.<PERIPH>.<method>(...)` SVD operations
-            if let Some(periph_path) = try_extract_hw_path_be(receiver, be) {
-                if matches!(method.name.as_str(), "puts" | "print" | "write_str") {
-                    if let Some(first) = first_positional_arg(args) {
-                        if let Some(pfmt) = try_lower_print_arg_be(first, false, be)? {
-                            return Ok(Some(pfmt));
-                        }
-                    }
-                }
-                let mut largs = Vec::new();
-                for a in args {
-                    largs.push(be.lower_sub(&a.value, None)?);
-                }
-                return Ok(Some(MirStmt::Intrinsic(MirIntrinsicOp::HwOp {
-                    periph_path,
-                    method: method.name.clone(),
-                    args: largs,
-                })));
-            }
-
-            // 3. Non-blocking OS & DMA primitive operations
+            // 2. Non-blocking OS & DMA primitive operations
             if let Some((target, pkind)) = resolve_prim_receiver_be(receiver, be)? {
                 let m = method.name.as_str();
                 match (m, pkind) {

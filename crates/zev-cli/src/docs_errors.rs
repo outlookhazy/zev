@@ -1,4 +1,4 @@
-//! Complete structured error explainers (`P0001`..`P0012` and `E0001`..`E0029`) for `zevc doc`.
+//! Complete structured error explainers (`P0001`..`P0012` and `E0001`..`E0033`) for `zevc doc`.
 
 pub struct ErrorDoc {
     pub code: &'static str,
@@ -249,20 +249,20 @@ fn main() {
     },
     ErrorDoc {
         code: "P0010",
-        summary: "`static` variable or `pub` visibility modifier used instead of Zev task frames / primitives",
+        summary: "C-style `static` variable modifier used instead of Zev task frames, ISR `state`, or OS primitives",
         topic: "primitives",
-        why: "Zev v0.1 is whole-program compiled without `pub` visibility modifiers and forbids `static` mutable variables: persistent per-task state is declared as a normal local variable at the top of a `task` (automatically hoisted into that instance's static coroutine frame), immutable constants use `const`, and shared state uses `watch<T>` or `inbox<T, N>`.",
+        why: "Zev forbids C `static` storage specifiers on variables (`pub` is used strictly for top-level module exports): persistent per-task state is a normal local at the top of a `task`, ISR-private persistent counters use explicit `state Type x = init;` inside `isr`, immutable constants use `const`, and cross-context shared state uses `watch<T>` or `inbox<T, N>`.",
         bad_zev: "\
-pub static u32 counter = 0;
-pub task blink() {
+static u32 counter = 0;
+task blink() {
     static u32 ticks = 0;
     loop every 10ms { ticks += 1; }
 }",
         good_zev: "\
-const u32 LIMIT = 100;
+pub const u32 LIMIT = 100;
 watch<u32> counter = 0;
 
-task blink() {
+pub task blink() {
     u32 ticks = 0;
     loop every 10ms {
         if (ticks < LIMIT) {
@@ -336,7 +336,7 @@ fn main() {
 }",
     },
 
-    // ── Semantic & Static-Verifier Diagnostics (E0001..E0027) ───────────────
+    // ── Semantic & Static-Verifier Diagnostics (E0001..E0033) ───────────────
     ErrorDoc {
         code: "E0001",
         summary: "Illegal raw mutable global variable declared at top level",
@@ -371,12 +371,14 @@ fn main() {}",
         good_zev: "\
 enum FaultEv { Overcurrent }
 inbox<FaultEv, 4> fault_inbox;
+irq IRQ_EXTI0 = 0;
 
-isr EXTI0 {
+isr exti0_isr() {
     fault_inbox.post(Overcurrent, boost: @critical);
 }
 
 fn main() {
+    IRQ_EXTI0.attach(exti0_isr);
     FaultEv ev = fault_inbox.recv(timeout: 10ms) or Overcurrent;
     switch (ev) {
         Overcurrent => { return; }
@@ -427,7 +429,7 @@ fn main() {
 import chip.stm32g4 as hw;
 fn main() {
     critical {
-        hw.RCC.enable_pll_170mhz();
+        hw.RCC.cr |= 0x0100_0000;
         delay(1ms);
     }
 }",
@@ -436,7 +438,7 @@ import chip.stm32g4 as hw;
 
 fn main() {
     critical {
-        hw.RCC.enable_pll_170mhz();
+        hw.RCC.cr |= 0x0100_0000;
     }
     delay(1ms);
 }",
@@ -457,16 +459,18 @@ fn main() {}",
         good_zev: "\
 enum SupEv { Fault, Idle }
 inbox<SupEv, 4> sup_inbox;
+irq IRQ_EXTI0 = 0;
 
 fn write_flash_log() {
     checkpoint();
 }
 
-isr EXTI0 {
+isr fault_isr() {
     sup_inbox.post(Fault, boost: @critical);
 }
 
 fn main() {
+    IRQ_EXTI0.attach(fault_isr);
     SupEv ev = sup_inbox.recv(timeout: 5ms) or Idle;
     switch (ev) {
         Fault => { write_flash_log(); }
@@ -1185,6 +1189,103 @@ fn main() {
     if (samples.len == 4 && duty <= 1.0f32) {
         return;
     }
+}",
+    },
+    ErrorDoc {
+        code: "E0030",
+        summary: "Module resolution error (missing module, circular `import`, or private symbol access)",
+        topic: "runtime",
+        why: "Top-level items in `.zev` modules are private by default unless prefixed with `pub`. `import path.to.mod as alias;` resolves relative to the importing file, workspace roots, `-I` search directories, and built-in `chip`/`bsp`/`std` modules without circular dependencies.",
+        bad_zev: "\
+import drivers.nonexistent as drv;
+fn main() {}",
+        good_zev: "\
+import chip.stm32g4 as hw;
+import std.fmt as fmt;
+
+pub const u32 MAX_DUTY = 1000;
+
+fn main() {
+    hw.TIM1.ccr[0] = fmt.clamp<u32>(500, 0, MAX_DUTY);
+}",
+    },
+    ErrorDoc {
+        code: "E0031",
+        summary: "Unsafe `mmio` register access (RMW on `@w1c`/`@wo`, write to `@ro`, or alias escape)",
+        topic: "runtime",
+        why: "`@w1c` (write-1-to-clear) registers must be assigned directly (`dma.ifcr = mask;`), never read-modify-written (`|=` / `&=`), because reading pending bits and writing them back would accidentally clear unrelated active interrupts! Similarly, `@wo` registers cannot be read, `@ro` registers cannot be written, and hardware registers cannot be copied by value or taken via `&reg`.",
+        bad_zev: "\
+mmio DmaRegs {
+    @w1c u32 ifcr @ 0x04;
+}
+mmio DMA1 : DmaRegs @ 0x4002_0000;
+
+fn main() {
+    DMA1.ifcr |= 1 << 17;
+}",
+        good_zev: "\
+mmio DmaRegs {
+    @ro  u32 isr  @ 0x00;
+    @w1c u32 ifcr @ 0x04;
+}
+mmio DMA1 : DmaRegs @ 0x4002_0000;
+
+fn main() {
+    u32 pending = DMA1.isr;
+    DMA1.ifcr = (1 << 17) | (pending & 0);
+}",
+    },
+    ErrorDoc {
+        code: "E0032",
+        summary: "Invalid Boot-Tree `irq.attach(...)` / `irq.attach_shared(...)` delegation or signature",
+        topic: "runtime",
+        why: "Hardware `irq` vectors are attached once during sequential boot (`fn main()` or non-loop, non-recursive boot helpers) with baked static pointers/MMIO handles/constants. Duplicate `.attach()` on the same execution path, attaching inside a `task`/`isr`/loop/recursion, signature mismatches, or passing non-static stack pointers are rejected at compile time.",
+        bad_zev: "\
+irq IRQ_EXTI0 = 6;
+isr on_edge(u32 tag) {}
+
+fn main() {
+    IRQ_EXTI0.attach(on_edge(1));
+    IRQ_EXTI0.attach(on_edge(2));
+}",
+        good_zev: "\
+mmio GpioRegs {
+    @wo u32 brr @ 0x28;
+}
+mmio GPIOA : GpioRegs @ 0x4800_0000;
+irq IRQ_EXTI0 = 6;
+
+isr on_edge(*GpioRegs gpio, u32 pin_mask) {
+    gpio.brr = pin_mask;
+}
+
+fn main() {
+    IRQ_EXTI0.attach(on_edge(GPIOA, 1));
+}",
+    },
+    ErrorDoc {
+        code: "E0033",
+        summary: "Invalid ISR-private `state` declaration (`state` outside `isr`, uninitialized, or `&state` escape)",
+        topic: "yielding",
+        why: "Persistent per-attachment ISR storage uses `state Type x = init;` directly inside an `isr` body: every `state` variable must have an explicit initializer, cannot appear outside an `isr`, and cannot escape `&state_var` out of its declaring block (each Boot-Tree `vec.attach(...)` gets its own isolated `.bss`/`.data` instance automatically).",
+        bad_zev: "\
+u32 helper() {
+    state u32 count = 0;
+    count += 1;
+    return count;
+}",
+        good_zev: "\
+watch<u32> irq_hits = 0;
+irq IRQ_EXTI0 = 6;
+
+isr edge_isr(*watch<u32> out, u32 step) {
+    state u32 count = 0;
+    count += step;
+    out.publish(count);
+}
+
+fn main() {
+    IRQ_EXTI0.attach(edge_isr(&irq_hits, 1));
 }",
     },
 ];

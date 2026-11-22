@@ -22,7 +22,7 @@ use zev_mir::{
 };
 
 use crate::esp32c6::{Esp32C6IrqRoute, assign_esp32c6_irq_routes};
-use crate::nvic::{NvicMap, emit_cortex_m_startup_ir, preferred_nvic_irq, sanitize_ident};
+use crate::nvic::{NvicMap, emit_cortex_m_startup_ir, sanitize_ident};
 use crate::runtime_ir::{RuntimeIrFeatures, emit_kernel_runtime_ir_with_features};
 use crate::toolchain::{CodegenError, CodegenOptions, TargetArch};
 
@@ -123,11 +123,7 @@ pub fn emit_llvm_ir_with_options(
     module: &MirModule,
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
-    let nvic = if !module.irq_vectors.is_empty() {
-        NvicMap::from_irq_vectors(&module.irq_vectors)
-    } else {
-        NvicMap::from_isr_names(module.isrs.iter().map(|i| i.name.as_str()))
-    };
+    let nvic = NvicMap::from_irq_vectors(&module.irq_vectors);
     let esp32c6_irq_routes = assign_esp32c6_irq_routes(&module.irq_vectors);
     let mut rt_features = scan_module_runtime_features(module);
     rt_features.uses_rv_irqs =
@@ -234,33 +230,19 @@ fn emit_sw_irq_dispatch_ir(
     let _ = writeln!(out, "{comment}");
     let _ = writeln!(out, "define void {fn_name}(i32 %irq) nounwind {{");
     let _ = writeln!(out, "entry:");
-    if !ctx.module.irq_vectors.is_empty() {
-        let mut irqs = BTreeSet::new();
-        for vec in &ctx.module.irq_vectors {
-            irqs.insert(vec.irq_num);
-        }
-        let _ = writeln!(out, "  switch i32 %irq, label %done [");
-        for &irq in &irqs {
-            let _ = writeln!(out, "    i32 {irq}, label %irq_{irq}");
-        }
-        let _ = writeln!(out, "  ]");
-        for &irq in &irqs {
-            let _ = writeln!(out, "irq_{irq}:");
-            let _ = writeln!(out, "  call void @__syn_vec_irq_{irq}()");
-            let _ = writeln!(out, "  br label %done");
-        }
-    } else {
-        let _ = writeln!(out, "  switch i32 %irq, label %done [");
-        for &irq in ctx.nvic.by_name.values() {
-            let _ = writeln!(out, "    i32 {irq}, label %irq_{irq}");
-        }
-        let _ = writeln!(out, "  ]");
-        for (name, &irq) in &ctx.nvic.by_name {
-            let sym = format!("@__syn_isr_{}", sanitize_ident(name));
-            let _ = writeln!(out, "irq_{irq}:");
-            let _ = writeln!(out, "  call void {sym}()");
-            let _ = writeln!(out, "  br label %done");
-        }
+    let mut irqs = BTreeSet::new();
+    for vec in &ctx.module.irq_vectors {
+        irqs.insert(vec.irq_num);
+    }
+    let _ = writeln!(out, "  switch i32 %irq, label %done [");
+    for &irq in &irqs {
+        let _ = writeln!(out, "    i32 {irq}, label %irq_{irq}");
+    }
+    let _ = writeln!(out, "  ]");
+    for &irq in &irqs {
+        let _ = writeln!(out, "irq_{irq}:");
+        let _ = writeln!(out, "  call void @__syn_vec_irq_{irq}()");
+        let _ = writeln!(out, "  br label %done");
     }
     let _ = writeln!(out, "done:");
     let _ = writeln!(out, "  ret void");
@@ -543,7 +525,7 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                 },
                 MirStmt::Intrinsic(iop) => match iop {
                     MirIntrinsicOp::UseSystick { hz } => scan_expr(hz, feat),
-                    MirIntrinsicOp::SysOp { args, .. } | MirIntrinsicOp::HwOp { args, .. } => {
+                    MirIntrinsicOp::SysOp { args, .. } => {
                         for a in args {
                             scan_expr(a, feat);
                         }
@@ -1067,8 +1049,7 @@ impl<'a> ModuleCtx<'a> {
             | MirType::I32
             | MirType::F32
             | MirType::EndianInt { bits: 32, .. }
-            | MirType::Enum(_)
-            | MirType::HwPeripheral(_) => (4, 4),
+            | MirType::Enum(_) => (4, 4),
             MirType::U64 | MirType::I64 | MirType::F64 | MirType::EndianInt { bits: 64, .. } => {
                 (8, 8)
             }
@@ -1132,8 +1113,7 @@ impl<'a> ModuleCtx<'a> {
             MirType::U32
             | MirType::I32
             | MirType::EndianInt { bits: 32, .. }
-            | MirType::Enum(_)
-            | MirType::HwPeripheral(_) => "i32".to_string(),
+            | MirType::Enum(_) => "i32".to_string(),
             MirType::U64 | MirType::I64 | MirType::EndianInt { bits: 64, .. } => "i64".to_string(),
             MirType::F32 => "float".to_string(),
             MirType::F64 => "double".to_string(),
@@ -1504,7 +1484,6 @@ impl<'a> ModuleCtx<'a> {
             }
             MirType::I32
             | MirType::Enum(_)
-            | MirType::HwPeripheral(_)
             | MirType::EndianInt {
                 bits: 32,
                 signed: true,
@@ -2378,24 +2357,6 @@ none:
                     "define {ret_ty} @{name}() nounwind {{\nentry:\n  %d = load volatile i32, ptr @__syn_last_sleep_depth, align 4\n  ret {ret_ty} %d\n}}"
                 );
             }
-            "syn_gpio_state" | "zev_gpio_state" => {
-                let _ = writeln!(
-                    out,
-                    "define {ret_ty} @{name}() nounwind {{\nentry:\n  %g = load volatile i32, ptr @__syn_gpio_state, align 4\n  ret {ret_ty} %g\n}}"
-                );
-            }
-            "syn_pwm_duty" | "zev_pwm_duty" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                let _ = writeln!(
-                    out,
-                    "define {ret_ty} @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  %idx = and i32 %c0, 7\n  %dp = getelementptr inbounds [8 x i32], ptr @__syn_pwm_duty, i32 0, i32 %idx\n  %d = load volatile i32, ptr %dp, align 4\n  ret {ret_ty} %d\n}}"
-                );
-            }
             "syn_current_prio" | "zev_current_prio" => {
                 if ret_ty == "void" {
                     let _ = writeln!(out, "define void @{name}() nounwind {{\nentry:\n  ret void\n}}");
@@ -2548,14 +2509,28 @@ entry:
             }
             "syn_sim_push_uart1_frame" | "syn_sim_push_uart2_frame" => {
                 let is_u1 = ext.name == "syn_sim_push_uart1_frame";
+                let prim_name = if is_u1 { "uart1_dma" } else { "uart2_dma" };
                 let prim_sym = if is_u1 {
                     "@__syn_prim_uart1_dma"
                 } else {
                     "@__syn_prim_uart2_dma"
                 };
-                let irq_name = if is_u1 { "DMA1_CH5" } else { "DMA1_CH6" };
-                let irq_num = self.nvic.irq_for(irq_name).unwrap_or(if is_u1 { 5 } else { 6 });
-                if self.prim_globals.contains_key(if is_u1 { "uart1_dma" } else { "uart2_dma" }) {
+                let irq_num = self
+                    .module
+                    .irq_vectors
+                    .iter()
+                    .find_map(|v| {
+                        v.bindings
+                            .iter()
+                            .any(|b| {
+                                b.baked_args
+                                    .iter()
+                                    .any(|a| matches!(a, MirBakedArg::PrimAddr(p) if p == prim_name))
+                            })
+                            .then_some(v.irq_num as u8)
+                    })
+                    .unwrap_or(if is_u1 { 5 } else { 6 });
+                if self.prim_globals.contains_key(prim_name) {
                     let _ = writeln!(
                         out,
                         r#"define void @{name}({sig_args}) nounwind {{
@@ -2589,16 +2564,15 @@ entry:
             }
             other if other.starts_with("syn_sim_fire_isr_") => {
                 let isr_vec = &other["syn_sim_fire_isr_".len()..];
-                let irq_opt = if !self.module.irq_vectors.is_empty() {
-                    self.module
-                        .irq_vectors
-                        .iter()
-                        .find(|v| v.irq_name == isr_vec)
-                        .map(|v| v.irq_num)
-                        .or_else(|| self.nvic.irq_for(isr_vec).map(u32::from))
-                } else {
-                    self.nvic.irq_for(isr_vec).map(u32::from)
-                };
+                let irq_opt = self
+                    .module
+                    .irq_vectors
+                    .iter()
+                    .find(|v| {
+                        v.irq_name == isr_vec
+                            || v.bindings.iter().any(|b| b.isr_name == isr_vec)
+                    })
+                    .map(|v| v.irq_num);
                 if let Some(irq) = irq_opt {
                     let _ = writeln!(
                         out,
@@ -2637,38 +2611,6 @@ entry:
                     let _ = writeln!(
                         out,
                         "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_esp32c6_ws2812_grb(i32 %c0)\n  ret void\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n  ret void\n}}"
-                    );
-                }
-            }
-            "zev_gpio_read" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let p0_ty = ext.params.first().map(|(_, t)| self.llvm_ty(t)).unwrap_or_else(|| "i32".to_string());
-                    let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  %v = call i32 @__syn_esp32c6_gpio_read(i32 %c0)\n  ret {ret_ty} %v\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}({sig_args}) nounwind {{\nentry:\n  ret {ret_ty} 1\n}}"
-                    );
-                }
-            }
-            "zev_gpio_write" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let p0_ty = ext.params.first().map(|(_, t)| self.llvm_ty(t)).unwrap_or_else(|| "i32".to_string());
-                    let p1_ty = ext.params.get(1).map(|(_, t)| self.llvm_ty(t)).unwrap_or_else(|| "i8".to_string());
-                    let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                    let hi_b = if p1_ty == "i8" { "  %hb = add i8 %p1, 0".to_string() } else { format!("  %nz = icmp ne {p1_ty} %p1, 0\n  %hb = zext i1 %nz to i8") };
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n{hi_b}\n  call void @__syn_esp32c6_gpio_write(i32 %c0, i8 %hb)\n  ret void\n}}"
                     );
                 } else {
                     let _ = writeln!(
@@ -3095,10 +3037,6 @@ fn is_synthesized_extern_intrinsic(name: &str) -> bool {
                 | "zev_wfi_count"
                 | "syn_last_sleep_depth"
                 | "zev_last_sleep_depth"
-                | "syn_gpio_state"
-                | "zev_gpio_state"
-                | "syn_pwm_duty"
-                | "zev_pwm_duty"
                 | "syn_current_prio"
                 | "zev_current_prio"
                 | "syn_dma_write_u8"
@@ -3113,8 +3051,6 @@ fn is_synthesized_extern_intrinsic(name: &str) -> bool {
                 | "syn_sim_push_uart2_frame"
                 | "zev_ws2812_rgb"
                 | "zev_ws2812_grb"
-                | "zev_gpio_read"
-                | "zev_gpio_write"
                 | "zev_cpu_calib_ticks"
                 | "zev_ws2812_store_ns"
                 | "zev_ws2812_t0h"
@@ -5364,125 +5300,6 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     _ => {}
                 }
             }
-            MirIntrinsicOp::HwOp {
-                periph_path,
-                method,
-                args,
-            } => {
-                let mut ev = Vec::new();
-                for a in args {
-                    ev.push((self.emit_expr(a)?, a.ty.clone()));
-                }
-                let p0 = periph_path
-                    .iter()
-                    .find(|s| !matches!(s.as_str(), "hw" | "chip" | "stm32g4" | "lm3s6965"))
-                    .map_or("", String::as_str);
-                match (p0, method.as_str()) {
-                    ("GPIOA" | "GPIOB" | "GPIOC", "clear_pin") => {
-                        let bit_idx = if let Some((v, _)) = ev.first() {
-                            self.coerce(v.clone(), "i32", false).repr
-                        } else {
-                            "0".to_string()
-                        };
-                        let sh = self.next_tmp();
-                        let msk = self.next_tmp();
-                        let inv = self.next_tmp();
-                        let old = self.next_tmp();
-                        let nw = self.next_tmp();
-                        self.emit_line(format!("{sh} = and i32 {bit_idx}, 31"));
-                        self.emit_line(format!("{msk} = shl i32 1, {sh}"));
-                        self.emit_line(format!("{inv} = xor i32 {msk}, -1"));
-                        self.emit_line(format!(
-                            "{old} = load volatile i32, ptr @__syn_gpio_state, align 4"
-                        ));
-                        self.emit_line(format!("{nw} = and i32 {old}, {inv}"));
-                        self.emit_line(format!(
-                            "store volatile i32 {nw}, ptr @__syn_gpio_state, align 4"
-                        ));
-                    }
-                    ("GPIOA" | "GPIOB" | "GPIOC", "set_pin") => {
-                        let bit_idx = if let Some((v, _)) = ev.first() {
-                            self.coerce(v.clone(), "i32", false).repr
-                        } else {
-                            "0".to_string()
-                        };
-                        let sh = self.next_tmp();
-                        let msk = self.next_tmp();
-                        let old = self.next_tmp();
-                        let nw = self.next_tmp();
-                        self.emit_line(format!("{sh} = and i32 {bit_idx}, 31"));
-                        self.emit_line(format!("{msk} = shl i32 1, {sh}"));
-                        self.emit_line(format!(
-                            "{old} = load volatile i32, ptr @__syn_gpio_state, align 4"
-                        ));
-                        self.emit_line(format!("{nw} = or i32 {old}, {msk}"));
-                        self.emit_line(format!(
-                            "store volatile i32 {nw}, ptr @__syn_gpio_state, align 4"
-                        ));
-                    }
-                    ("TIM1" | "TIM2" | "PWM0", "set_compare") => {
-                        let ch = if let Some((v, _)) = ev.first() {
-                            self.coerce(v.clone(), "i32", false).repr
-                        } else {
-                            "0".to_string()
-                        };
-                        let duty = if let Some((v, _)) = ev.get(1) {
-                            self.coerce(v.clone(), "i32", false).repr
-                        } else {
-                            "0".to_string()
-                        };
-                        let idx = self.next_tmp();
-                        let dp = self.next_tmp();
-                        self.emit_line(format!("{idx} = and i32 {ch}, 7"));
-                        self.emit_line(format!(
-                            "{dp} = getelementptr inbounds [8 x i32], ptr @__syn_pwm_duty, i32 0, i32 {idx}"
-                        ));
-                        self.emit_line(format!("store volatile i32 {duty}, ptr {dp}, align 4"));
-                    }
-                    ("DMA1" | "DMA2", "bind_circular_rx") => {
-                        // Activate DMA wake-lock on the passed `ping_pong` ring!
-                        if let Some((ring_val, ring_ty)) = ev.get(2) {
-                            if let MirType::Ptr(inner) = ring_ty {
-                                if let MirType::Primitive(pk @ MirPrimKind::PingPong { .. }) =
-                                    inner.as_ref()
-                                {
-                                    let id = sanitize_ident(&pk.mangle_name());
-                                    let rptr = self.coerce(ring_val.clone(), "ptr", false);
-                                    self.emit_line(format!(
-                                        "call void @__syn_pp_set_active_{id}(ptr {}, i8 1)",
-                                        rptr.repr
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    ("NVIC", "pend_irq") => {
-                        if let Some((v, _)) = ev.first() {
-                            let irq = self.coerce(v.clone(), "i32", false);
-                            self.emit_line(format!(
-                                "call void @__syn_nvic_pend_irq(i32 {})",
-                                irq.repr
-                            ));
-                        }
-                    }
-                    ("UART0" | "USART1" | "UART1" | "USART2", "puts") => {
-                        if let Some((v, _)) = ev.first() {
-                            let p = self.coerce_str_ptr(v.clone());
-                            self.emit_line(format!("call void @__syn_uart_puts(ptr {})", p.repr));
-                        }
-                    }
-                    ("UART0" | "USART1" | "UART1" | "USART2", "putc") => {
-                        if let Some((v, _)) = ev.first() {
-                            let b = self.coerce(v.clone(), "i8", false);
-                            self.emit_line(format!("call void @__syn_uart_putc(i8 {})", b.repr));
-                        }
-                    }
-                    _ => {
-                        // Compiler memory barrier for general MMIO register op
-                        self.emit_line("call void asm sideeffect \"\", \"~{memory}\"()");
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -5801,20 +5618,6 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirExprKind::GlobalPrimAddr(name) => {
                 Ok(SsaVal::new("ptr", format!("@__syn_prim_{}", sanitize_ident(name))))
-            }
-            MirExprKind::HwPeriphVal(path) => {
-                let joined = path.join("_");
-                let id = preferred_nvic_irq(&joined).map_or_else(
-                    || {
-                        let mut h = 1u32;
-                        for b in joined.bytes() {
-                            h = h.wrapping_mul(31).wrapping_add(u32::from(b));
-                        }
-                        (h & 0x7FFF) as i32
-                    },
-                    |irq| irq as i32,
-                );
-                Ok(SsaVal::new("i32", format!("{id}")))
             }
             MirExprKind::MmioAddr(inst) => {
                 if !self.ctx.mmio_instances.contains_key(inst) {

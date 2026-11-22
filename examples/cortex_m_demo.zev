@@ -2,28 +2,23 @@
 //
 // End-to-end zero-C, zero-heap, zero-glue Language-OS demonstration running on real
 // emulated Cortex-M3 silicon in `qemu-system-arm`:
-//   1. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `loop every 1ms`, `noyield`, `clamp<T>`)
-//   2. Zero-copy `@dma_safe ping_pong<u8, 64>` UART DMA + `packed struct` `u16be` + `error`/`catch` + `{err}`
-//   3. Real NVIC IRQ5 (`DMA1_CH5`) & IRQ0 (`EXTI0`) hardware preemption via `NVIC_ISPR0`
-//   4. ISR `boost: @critical` priority elevation into `sup_inbox` + automatic `@low` restore
-//   5. Union-aliased disjoint child coroutine frames (`save_fault_record` w/ `defer` vs `scrub_flash_crc`)
-//   6. Tickless `wfi` idle sleep with automatic DMA wake-lock clamping (`LIGHT` vs `DEEP`) + `sys.exit(0)`
+//   1. Real `.zev` `chip.lm3s6965` + `bsp.lm3s6965_evb` + `std.fmt` modules with typed `mmio`
+//   2. Parameterized `isr` handlers + ISR-private `state` + Boot-Tree `hw.IRQ_*.attach(...)`
+//   3. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `loop every 1ms`, `noyield`, `fmt.clamp`)
+//   4. Zero-copy `@dma_safe ping_pong<u8, 64>` + `packed struct` `u16be` + `error`/`catch` + `{err}`
+//   5. Real NVIC IRQ5 (`UART0`) & IRQ0 (`GPIOA`) hardware preemption via `NVIC.ispr[0]` MMIO
+//   6. ISR `boost: @critical` priority elevation into `sup_inbox` + automatic `@low` restore + `wfi` sleep
 
-import chip.stm32g4 as hw;
+import chip.lm3s6965 as hw;
+import bsp.lm3s6965_evb as bsp;
+import std.fmt as fmt;
 
-// Synthesized directly in LLVM 23 IR by `zev-codegen-llvm` (zero C / zero libc):
-extern "C" fn syn_nvic_pend_irq(u32 irq);
+// Kernel telemetry & DMA simulation stimulus hooks (no peripheral register shims!)
 extern "C" fn syn_dma_write_u8(ping_pong<u8, 64> *pp, u32 idx, u8 val);
 extern "C" fn syn_dma_set_active(ping_pong<u8, 64> *pp, bool active);
 extern "C" u32 syn_last_sleep_depth();
 extern "C" u32 syn_wfi_count();
 extern "C" u32 syn_current_prio();
-extern "C" u32 syn_pwm_duty(u32 ch);
-extern "C" u32 syn_gpio_state();
-
-const u32 MOTOR_EN_PIN = 0;
-const u32 IRQ_EXTI0    = 0;
-const u32 IRQ_DMA1_CH5 = 5;
 
 packed struct CmdFrame {
     u8    op;
@@ -40,28 +35,22 @@ watch<u16>                  motor1_rpm = 0;
 watch<u32>                  flash_diag = 0;
 inbox<SupEvent, 8>          sup_inbox;
 
-// ── Cortex-M3 Hardware Interrupts (wired directly into `.isr_vector`) ───────
-isr EXTI0 {
-    hw.GPIOA.clear_pin(MOTOR_EN_PIN);
-    sup_inbox.post(Overcurrent, boost: @critical);
+// ── Cortex-M3 Hardware Interrupt Handlers (baked pointers + `state` into `.isr_vector`) ──
+isr gpio_fault_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
+    state u32 fault_count = 0;
+    fault_count += 1;
+    gpio.data = 0;
+    sup.post(Overcurrent, boost: @critical);
 }
 
-isr DMA1_CH5 {
-    hw.DMA1.CH5.clear_irq(1);
-    uart1_dma.flip();
+isr uart_dma_isr(*ping_pong<u8, 64> rx_dma, *hw.UartRegs uart) {
+    state u32 rx_frames = 0;
+    rx_frames += 1;
+    uart.icr = 0x10;
+    rx_dma.flip();
 }
 
-// ── Monomorphized `<T>` Helper & Dual-Exit Wire Parser ──────────────────────
-T clamp<T>(T val, T lo, T hi) {
-    if (val < lo) {
-        return lo;
-    }
-    if (val > hi) {
-        return hi;
-    }
-    return val;
-}
-
+// ── Wire Decoder & Control-Loop Helpers ─────────────────────────────────────
 u16 crc16_cmd([]u8 buf) {
     u16 s1 = 85;
     u16 s2 = 170;
@@ -85,7 +74,6 @@ u16 parse_setpoint([]u8 buf) error ParseErr {
     return frame.setpoint;
 }
 
-// ── Control-Loop Helpers ────────────────────────────────────────────────────
 u16 adc_read_rpm(u8 pwm_ch) {
     u16 base = 1000;
     u16 ch_off = pwm_ch;
@@ -95,11 +83,11 @@ u16 adc_read_rpm(u8 pwm_ch) {
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
     i32 err = (target as i32) - (actual as i32);
-    i32 next_i = clamp(*integral + err, -8000, 8000);
+    i32 next_i = fmt.clamp(*integral + err, -8000, 8000);
     *integral = next_i;
 
     i32 out = (err / 2) + (next_i / 8);
-    u16 duty = clamp(out, 0, 1000) as u16;
+    u16 duty = fmt.clamp(out, 0, 1000) as u16;
     return duty;
 }
 
@@ -143,7 +131,7 @@ task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
 
         noyield {
             u16 duty = pi_step(target, actual, &integral);
-            hw.TIM1.set_compare(pwm_ch, duty);
+            bsp.set_pwm_duty(pwm_ch, duty);
         }
     }
 }
@@ -164,12 +152,13 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
 
 // ── Sequential Boot + Low-Priority Fault Supervisor ─────────────────────────
 fn main() {
-    critical {
-        hw.GPIOA.set_pin(MOTOR_EN_PIN);
-    }
+    bsp.init_board();
     // 12 MHz Stellaris LM3S6965 clock -> exact 1 ms hardware SysTick interrupts
     sys.use_systick(12_000_000);
     syn_dma_set_active(&uart1_dma, true);
+
+    hw.IRQ_GPIOA.attach(gpio_fault_isr(&sup_inbox, hw.GPIOA));
+    hw.IRQ_UART0.attach(uart_dma_isr(&uart1_dma, hw.UART0));
 
     run_power_on_self_test();
     println("[BOOT] Cortex-M3 Language-OS booted");
@@ -183,19 +172,19 @@ fn main() {
 
     loop {
         if (stage == 0) {
-            // Stage valid u16be setpoint=1800 (0x0708), crc=0xC265 (194, 101) -> pend NVIC IRQ5
+            // Stage valid u16be setpoint=1800 (0x0708), crc=0xC265 (194, 101) -> pend NVIC IRQ5 (`UART0`)
             syn_dma_write_u8(&uart1_dma, 0, 1);
             syn_dma_write_u8(&uart1_dma, 1, 7);
             syn_dma_write_u8(&uart1_dma, 2, 8);
             syn_dma_write_u8(&uart1_dma, 3, 194);
             syn_dma_write_u8(&uart1_dma, 4, 101);
-            syn_nvic_pend_irq(IRQ_DMA1_CH5);
+            bsp.pend_nvic_irq(hw.IRQ_UART0_NUM);
             checkpoint();
 
             // Yield across 3 real SysTick interrupts (WFI clamped to LIGHT=1 by active DMA lock)
             delay(3ms);
             println(f"[TELEM] motor1_rpm={motor1_rpm.read()}");
-            println(f"[TELEM] pwm_duty={syn_pwm_duty(1)}");
+            println(f"[TELEM] pwm_duty={bsp.read_pwm_duty(1)}");
             println(f"[TELEM] sleep_depth_dma_active={syn_last_sleep_depth()}");
 
             // Stage corrupt-CRC frame -> triggers ParseErr::BadCrc -> sup_inbox.post(BadPacket)
@@ -204,7 +193,7 @@ fn main() {
             syn_dma_write_u8(&uart1_dma, 2, 8);
             syn_dma_write_u8(&uart1_dma, 3, 222);
             syn_dma_write_u8(&uart1_dma, 4, 173);
-            syn_nvic_pend_irq(IRQ_DMA1_CH5);
+            bsp.pend_nvic_irq(hw.IRQ_UART0_NUM);
             stage = 1;
         }
 
@@ -222,14 +211,14 @@ fn main() {
                 scrub_flash_crc();
                 if (stage == 1) {
                     stage = 2;
-                    // Trigger real Cortex-M3 NVIC IRQ0 (`EXTI0` overcurrent fault w/ boost: @critical)
-                    syn_nvic_pend_irq(IRQ_EXTI0);
+                    // Trigger real Cortex-M3 NVIC IRQ0 (`GPIOA` overcurrent fault w/ boost: @critical)
+                    bsp.pend_nvic_irq(hw.IRQ_GPIOA_NUM);
                 }
             }
             Overcurrent => {
                 u32 boosted_prio = syn_current_prio();
                 println(f"[TELEM] sup_boosted_prio={boosted_prio}");
-                println(f"[TELEM] gpio_safe_off={syn_gpio_state()}");
+                println(f"[TELEM] gpio_safe_off={bsp.read_motor_enable()}");
                 motor1_rpm.publish(0);
                 save_fault_record(bad_packets);
                 stage = 3;

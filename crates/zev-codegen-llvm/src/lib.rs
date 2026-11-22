@@ -19,7 +19,7 @@ use std::path::Path;
 
 pub use esp32c6::ESP32C6_DIRECT_BOOT_MAGIC;
 pub use mir_codegen::emit_llvm_ir_with_options;
-pub use nvic::{NvicMap, preferred_nvic_irq};
+pub use nvic::NvicMap;
 pub use toolchain::{
     CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
     Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, TargetArch,
@@ -121,14 +121,18 @@ mod tests {
             all_generics.extend(zev_parser::collect_declared_generic_names(&raw));
             sources.push((path.display().to_string(), raw));
         }
-        let mut progs = Vec::with_capacity(sources.len());
+        let mut named_progs = Vec::with_capacity(sources.len());
         for (name, src) in &sources {
             let prog = zev_parser::parse_str_named_with_generics(src, name, Some(&all_generics))
                 .unwrap_or_else(|errs| panic!("failed to parse {name}: {errs:#?}"));
-            progs.push(prog);
+            named_progs.push((prog, name.as_str()));
         }
-        let (mono_progs, _) = zev_sema::analyze_and_monomorphize_programs(
-            &progs,
+        let pairs: Vec<(&zev_ast::Program, Option<&str>)> = named_progs
+            .iter()
+            .map(|(p, n)| (p, Some(*n)))
+            .collect();
+        let (mono_progs, _) = zev_sema::analyze_and_monomorphize_named_programs(
+            &pairs,
             &zev_sema::AnalyzeOptions::default(),
         )
         .into_result()
@@ -283,14 +287,21 @@ mod tests {
                 .audit
                 .defined_symbols
                 .iter()
-                .any(|s| s == "__syn_isr_EXTI0")
+                .any(|s| s == "__syn_vec_irq_6")
         );
         assert!(
             res.build
                 .audit
                 .defined_symbols
                 .iter()
-                .any(|s| s == "__syn_isr_DMA1_CH5")
+                .any(|s| s == "__syn_vec_irq_15")
+        );
+        assert!(
+            res.build
+                .audit
+                .defined_symbols
+                .iter()
+                .any(|s| s == "__syn_vec_irq_16")
         );
     }
 
@@ -671,6 +682,7 @@ mod tests {
             signal fault_sig;
             signal idle_sig;
             inbox<u32, 4> telemetry_ch;
+            irq IRQ_EXTI1 = 1;
 
             isr EXTI1 {
                 fault_sig.notify(boost: @critical);
@@ -692,6 +704,7 @@ mod tests {
 
             fn main() {
                 sys.use_systick(12_000_000);
+                IRQ_EXTI1.attach(EXTI1);
                 spawn worker_producer() @normal;
                 set_priority(@low);
 
@@ -1051,6 +1064,7 @@ mod tests {
             watch<u32> actor_defers = 0;
             watch<u32> last_turn_prio = 99;
             signal restart_ack;
+            irq IRQ_EXTI2 = 2;
 
             isr EXTI2 {
                 actor_q.post(TriggerRestart, boost: @critical);
@@ -1133,6 +1147,7 @@ mod tests {
 
             fn main() {
                 sys.use_systick(12_000_000);
+                IRQ_EXTI2.attach(EXTI2);
                 spawn supervisor_actor(500, &actor_state) @low;
                 spawn driver() @normal;
             }

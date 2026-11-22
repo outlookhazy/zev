@@ -2,7 +2,7 @@
 //!
 //! Designed so an AI coding agent or embedded systems engineer can learn idiomatic Zev
 //! in 1 tool call (`zevc doc`), drill into focused ~60-line topic guides (`zevc doc <topic>`),
-//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0012`, `E0001`..`E0029`).
+//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0012`, `E0001`..`E0033`).
 
 use crate::docs_errors::{ErrorDoc, ERROR_DOCS};
 use std::fmt::Write;
@@ -57,12 +57,12 @@ SHARDED TOPIC GUIDES (`zevc doc <topic>`):
   zevc doc yielding     3-tier effects (`SoftYielding` dual-spec), `noyield`, `critical`, `isr`, FFI
   zevc doc primitives   Unified `inbox` (`.post`/`.send`/`.recv`), `watch`, `signal`, `boost: @critical`
   zevc doc dma          `@dma_safe ping_pong`, `lease`, zero-`'a` scope/lease rules, sleep locks
-  zevc doc runtime      Zero-heap `f\"...\"` (`println`, `fmt_buf`, `:.2`/`:e`/`:?`), `sys.*`, `hw.*`, NVIC
-  zevc doc targets      `zevc check [--json]`, `ram`, `run`, `run-qemu [--max-ticks]`, ESP32-C6
+  zevc doc runtime      Zero-heap `f\"...\"`, `import`/`pub` modules, typed `mmio`, `irq.attach`, `sys.*`
+  zevc doc targets      `zevc check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, ESP32-C6
 
 ERROR CODE EXPLAINERS (`zevc doc <code>` or `zevc doc --list`):
   Parser Traps   : P0001..P0012  (instant rewrites for `let`, `->`, `async`, `for(;;)`, bare `every`, `chan`)
-  Static Verifier: E0001..E0029  (isolation, 3-tier yields, DMA leases, `fmt_buf` fit, `<T, usize N>` generics)
+  Static Verifier: E0001..E0033  (isolation, 3-tier yields, DMA, `modules`/`pub`, `mmio`, `irq.attach`, `state`)
 ================================================================================
 ";
 
@@ -71,9 +71,10 @@ pub const TOPIC_DOCS: &[TopicDoc] = &[
         name: "syntax",
         aliases: &[
             "types", "struct", "structs", "enum", "enums", "packed", "endian", "fn", "functions",
-            "switch", "loops", "for", "defer", "generics", "float", "floats",
+            "switch", "loops", "for", "defer", "generics", "float", "floats", "modules", "pub",
+            "import",
         ],
-        summary: "Scalar/float/endian types, `<T, usize N>` generics, `packed struct`, `switch`, `for`/`defer`",
+        summary: "Types (`f32`/`f64`), `<T, usize N>` generics, `packed struct`, `import`/`pub`, `for`/`defer`",
         body: "\
 # Zev Topic Guide: `syntax`
 
@@ -121,6 +122,8 @@ T clamp<T>(T val, T lo, T hi) {
 - Bounded `for..in` loops support `for (usize i in 0..n)`, `0..=max`, and `for (u8 b in slice)` (3-clause `for (;;)` -> `P0008`).
 - `defer <stmt>;` and `defer { ... }` execute in strict LIFO order across scope exit, `return`, `error`, `break`,
   `continue`, `restart`, and `sys.exit` (`defer` bodies are implicitly non-yielding; dead code after exits -> `E0025`).
+- File/directory modules are **private by default**: prefix top-level exports with `pub` and import via
+  `import chip.stm32g4 as hw;` or `import bsp.motor_drive as bsp;` (pass `-I <dir>` for custom roots).
 ",
     },
     TopicDoc {
@@ -215,7 +218,7 @@ task motor_control(watch<u16> *target_rpm, u8 pwm_ch, u32 period_ms) {
         u16 actual = adc_read_rpm(pwm_ch);
         noyield {
             u16 duty = pi_step(target, actual, &integral);
-            hw.TIM1.set_compare(pwm_ch, duty);
+            hw.TIM1.ccr[(pwm_ch - 1) as usize] = duty as u32;
         }
     }
 }
@@ -250,7 +253,7 @@ fn main() {
         name: "yielding",
         aliases: &[
             "yield", "noyield", "critical", "isr", "isrs", "interrupt", "interrupts",
-            "checkpoint", "manual_yield", "extern", "ffi", "soft_yielding",
+            "checkpoint", "manual_yield", "extern", "ffi", "soft_yielding", "state",
         ],
         summary: "3-tier function effects (`SoftYielding` dual-spec), `noyield`, `critical`, `isr` & FFI",
         body: "\
@@ -289,16 +292,24 @@ noyield {
 
 // 2. `critical { ... }` — Hardware-atomic (masks IRQs; forbids ALL yields & unbounded `loop`)
 critical {
-    hw.RCC.enable_pll_170mhz();
+    hw.RCC.cr |= 0x0100_0000;
 }
 
-// 3. `@manual_yield` + `checkpoint()` — Suppresses auto-yield while SPI CS is asserted low
+// 3. Parameterized `isr` + ISR-private `state` (isolated `.bss` per Boot-Tree `.attach(...)`)
+isr overcurrent_isr(*inbox<SupEv, 8> sup, *hw.GpioRegs gpio) {
+    state u32 trips = 0;              // Private static counter scoped to this attachment
+    trips += 1;
+    gpio.brr = 1 << 0;
+    sup.post(Fault, boost: @critical);
+}
+
+// 4. `@manual_yield` + `checkpoint()` — Suppresses auto-yield while SPI CS is asserted low
 @manual_yield
-fn spi_burst_transfer([]u8 tx) {
-    defer hw.SPI1.deassert_cs();
+fn spi_burst_transfer([]u8 tx, *hw.GpioRegs cs_port, *hw.SpiRegs spi) {
+    defer cs_port.bsrr = 1 << 4;
     for (u8 byte in tx) {
-        hw.SPI1.assert_cs_and_send(byte);
-        hw.SPI1.deassert_cs();
+        spi.dr = byte as u32;
+        cs_port.bsrr = 1 << 4;
         checkpoint();                 // Yield ONLY at clean transaction boundaries!
     }
 }
@@ -340,12 +351,15 @@ enum SupEvent { Overcurrent, BadPacket, IdleCheck }
 watch<u16>         motor1_rpm = 0;
 inbox<SupEvent, 8> sup_inbox;
 
-isr EXTI0 {
-    hw.GPIOA.clear_pin(MOTOR_EN);
-    sup_inbox.post(Overcurrent, boost: @critical);   // Elevates `@low` receiver to `@critical`!
+isr overcurrent_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
+    state u32 trips = 0;
+    trips += 1;
+    gpio.brr = 1 << hw.PIN_0;
+    sup.post(Overcurrent, boost: @critical);   // Elevates `@low` receiver to `@critical`!
 }
 
 fn main() {
+    hw.IRQ_EXTI0.attach(overcurrent_isr(&sup_inbox, hw.GPIOA));
     set_priority(@low);
     loop {
         SupEvent ev = sup_inbox.recv(timeout: 5s) or IdleCheck;
@@ -412,10 +426,10 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
     TopicDoc {
         name: "runtime",
         aliases: &[
-            "io", "std", "sys", "hw", "chip", "irq", "nvic", "print", "println", "uart", "fmt",
-            "format", "fstring",
+            "io", "std", "sys", "hw", "chip", "bsp", "mmio", "irq", "attach", "nvic", "print",
+            "println", "uart", "fmt", "format", "fstring",
         ],
-        summary: "Zero-heap `f\"...\"` (`println`, `fmt_buf`), `sys.*` built-ins, `hw.*`, and NVIC `isr` map",
+        summary: "Zero-heap `f\"...\"`, typed `mmio` (`@rw`/`@ro`/`@wo`/`@w1c`), `irq.attach`, and `sys.*`",
         body: "\
 # Zev Topic Guide: `runtime`
 
@@ -443,21 +457,38 @@ format-string parser, zero global handler registry):
 - `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` in QEMU & host sim).
 - `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then exits host sim or QEMU).
 
-## 3. Virtual SVD Hardware (`import chip.stm32g4 as hw;`) & ARM Cortex-M3 NVIC Map
-- `hw.GPIOA.set_pin(pin)` / `clear_pin(pin)`, `hw.TIM1.set_compare(ch, duty)`, `hw.UART0.puts(...)`,
-  `hw.DMA1.CH5.clear_irq(...)`, `hw.DMA1.bind_circular_rx(...)`, `hw.RCC.enable_pll_170mhz()`
-- NVIC `isr <NAME>`: `EXTI0`/`GPIOA` -> `IRQ0`, `EXTI1`..`EXTI4` -> `IRQ1`..`IRQ4`,
-  `UART0`/`USART1`/`DMA1_CH5` -> `IRQ5`, `UART1`/`USART2`/`DMA1_CH6` -> `IRQ6`, `SSI0`/`SPI1` -> `IRQ7`,
-  `I2C0`/`I2C1` -> `IRQ8`, `ADC0`/`ADC1` -> `IRQ14`, `TIM0A`/`TIM1` -> `IRQ19`, `IRQ0`..`IRQ31` 1-to-1.
+## 3. Typed `mmio` Register Blocks & Boot-Tree `irq.attach(...)` / `attach_shared(...)`
+- **Core-vs-Library Hardware Drivers**: Chip register maps (`chip.stm32g4`, `chip.lm3s6965`, `chip.esp32c6`)
+  and board support (`bsp.*`) are plain `.zev` files (`pub mmio`, `pub irq`, `pub const`). Import them with
+  `import chip.stm32g4 as hw;` (or pass `-I <dir>` for custom module directories).
+- **Access Enforcement (`E0031`)**: `@rw` allows read/write/RMW (`|=`), `@ro` read-only, `@wo` write-only,
+  `@w1c` read or direct `=` only (forbids `|=`/`&=` read-modify-write). Widths: `u8`, `u16`, `u32`, arrays `[4]u32`.
+```zev
+pub mmio DmaRegs {
+    @ro  u32 isr  @ 0x00;
+    @w1c u32 ifcr @ 0x04;
+}
+pub mmio DMA1 : DmaRegs @ 0x4002_0000;
+pub irq IRQ_DMA1_CH5 = 15;
+
+isr dma_rx_isr(*DmaRegs dma, u32 clr) {
+    state u32 count = 0;       // Isolated per-attachment `.bss` static variable
+    count += 1;
+    dma.ifcr = clr;
+}
+// Inside boot-tree `fn main()`: `IRQ_DMA1_CH5.attach(dma_rx_isr(DMA1, 1 << 18));`
+```
+- **Target Vector Mapping**: Boot-Tree `vec.attach(...)` and `vec.attach_shared(...)` synthesize Flash
+  `.isr_vector` + `NVIC_ISER0..7` on Cortex-M3 and `INTMTX` + `INTPRI` + `.iram1` `mtvec` on ESP32-C6.
 ",
     },
     TopicDoc {
         name: "targets",
         aliases: &[
             "target", "cli", "ram", "sim", "c99", "llvm", "elf", "qemu", "cortex-m", "cortex-m3",
-            "esp32", "esp32c6", "riscv",
+            "esp32", "esp32c6", "riscv", "svd", "import-svd",
         ],
-        summary: "CLI workflow: `check [--json]`, `ram`, `run`, `run-qemu [--max-ticks]`, and ESP32-C6",
+        summary: "CLI workflow: `check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, and ESP32-C6",
         body: "\
 # Zev Topic Guide: `targets`
 
@@ -469,12 +500,12 @@ zevc check examples/motor_controller.zev examples/motor_support.zev
 zevc check --json app.zev             # Structured JSON diagnostics + dual-spec & monomorphized lists
 ```
 
-## 2. Zero-Heap Static SRAM, Provenance & Monomorphization Report (`zevc ram`)
-Computes exact 32-bit MCU and 64-bit host byte counts per spawned task slot (including full Boot-Tree
-`spawn` provenance `main -> helper -> worker` and `[conditional]` tags), hoisted vs stack-local `[noyield]`
-variables, disjoint child `union` bytes saved, OS primitives, dual-specialized `SoftYielding` functions,
-concrete `<T, usize N>` monomorphizations, and `0 B` dynamic heap:
+## 2. SVD Hardware Generation & Static SRAM Provenance (`zevc import-svd`, `zevc ram`)
+Generate typed `.zev` `pub mmio` layouts, peripheral base addresses, and `pub irq` tokens directly
+from any vendor CMSIS-SVD file, and inspect exact 32-bit/64-bit `.bss`/ISR `state`/union RAM budgets:
 ```bash
+zevc import-svd vendor/STM32G474.svd -o chip/stm32g474.zev
+zevc check -I chip examples/motor_controller.zev examples/motor_support.zev
 zevc ram examples/motor_controller.zev examples/motor_support.zev
 ```
 
@@ -569,7 +600,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
         }
     }
 
-    // 2. Error code match (`P0001`..`P0012`, `E0001`..`E0029`, case-insensitive)
+    // 2. Error code match (`P0001`..`P0012`, `E0001`..`E0033`, case-insensitive)
     let upper = q.to_ascii_uppercase();
     for err_doc in ERROR_DOCS {
         if err_doc.code == upper {
@@ -578,7 +609,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
     }
 
     Err(format!(
-        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0012 / E0001..E0029 codes)"
+        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0012 / E0001..E0033 codes)"
     ))
 }
 
@@ -593,14 +624,14 @@ mod tests {
         assert!(primer.contains("zevc doc syntax"));
         assert!(primer.contains("zevc doc runtime"));
         assert!(primer.contains("P0001..P0012"));
-        assert!(primer.contains("E0001..E0029"));
+        assert!(primer.contains("E0001..E0033"));
 
         let list = lookup_doc(None, true).unwrap();
         assert!(list.contains("runtime"));
         assert!(list.contains("P0001"));
         assert!(list.contains("P0012"));
         assert!(list.contains("E0001"));
-        assert!(list.contains("E0029"));
+        assert!(list.contains("E0033"));
     }
 
     #[test]
@@ -624,13 +655,22 @@ mod tests {
             "restart",
             "loop_every",
             "soft_yielding",
+            "modules",
+            "pub",
+            "import",
             "io",
             "std",
             "sys",
             "hw",
             "chip",
+            "bsp",
+            "mmio",
             "irq",
+            "attach",
             "nvic",
+            "state",
+            "svd",
+            "import-svd",
             "print",
             "println",
             "uart",
@@ -652,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn all_41_error_codes_resolve_and_bad_and_good_snippets_verify() {
+    fn all_45_error_codes_resolve_and_bad_and_good_snippets_verify() {
         for n in 1..=12 {
             let code = format!("P{n:04}");
             let lower = code.to_ascii_lowercase();
@@ -660,7 +700,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("missing {code}: {e}"));
             assert!(doc.contains(&code));
         }
-        for n in 1..=29 {
+        for n in 1..=33 {
             let code = format!("E{n:04}");
             let lower = code.to_ascii_lowercase();
             let doc = lookup_doc(Some(&lower), false)
@@ -668,7 +708,7 @@ mod tests {
             assert!(doc.contains(&code));
         }
 
-        assert_eq!(ERROR_DOCS.len(), 41);
+        assert_eq!(ERROR_DOCS.len(), 45);
         for e in ERROR_DOCS {
             // 1. Every GOOD snippet must parse, monomorphize & pass zev-sema, AND lower cleanly
             //    through zev-mir, zev-codegen-c (including clang -std=c99 syntax check), and zev-codegen-llvm!

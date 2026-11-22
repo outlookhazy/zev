@@ -341,8 +341,7 @@ fn transfer_stmt(stmt: &MirStmt, live: &mut BTreeSet<VarId>) {
         MirStmt::Intrinsic(intr) => match intr {
             crate::ir::MirIntrinsicOp::UseSystick { hz } => collect_expr_uses(hz, live),
             crate::ir::MirIntrinsicOp::SetPriority { .. } => {}
-            crate::ir::MirIntrinsicOp::SysOp { args, .. }
-            | crate::ir::MirIntrinsicOp::HwOp { args, .. } => {
+            crate::ir::MirIntrinsicOp::SysOp { args, .. } => {
                 for a in args {
                     collect_expr_uses(a, live);
                 }
@@ -519,7 +518,6 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
         | MirExprKind::EnumVariant { .. }
         | MirExprKind::ConstRef(_)
         | MirExprKind::GlobalPrimAddr(_)
-        | MirExprKind::HwPeriphVal(_)
         | MirExprKind::MmioAddr(_)
         | MirExprKind::FnAddr(_)
         | MirExprKind::ArrayLen(_)
@@ -844,8 +842,7 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
                 collect_addr_of_vars(hz, &mut taken);
             }
             crate::ir::MirIntrinsicOp::SetPriority { .. } => {}
-            crate::ir::MirIntrinsicOp::SysOp { args, .. }
-            | crate::ir::MirIntrinsicOp::HwOp { args, .. } => {
+            crate::ir::MirIntrinsicOp::SysOp { args, .. } => {
                 for a in args {
                     collect_addr_of_vars(a, &mut taken);
                 }

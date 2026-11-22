@@ -492,7 +492,7 @@ impl<'a> LayoutCtx<'a> {
             MirType::Void => SizeAlign::new(0, 1),
             MirType::Bool | MirType::U8 | MirType::I8 => SizeAlign::new(1, 1),
             MirType::U16 | MirType::I16 => SizeAlign::new(2, 2),
-            MirType::U32 | MirType::I32 | MirType::F32 | MirType::HwPeripheral(_) => {
+            MirType::U32 | MirType::I32 | MirType::F32 => {
                 SizeAlign::new(4, 4)
             }
             MirType::U64 | MirType::I64 | MirType::F64 => SizeAlign::new(8, 8),

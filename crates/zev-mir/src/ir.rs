@@ -84,8 +84,6 @@ pub enum MirType {
     Ptr(Box<MirType>),
     /// OS primitive endpoint type (usually accessed as global or via `*Primitive`).
     Primitive(MirPrimKind),
-    /// Hardware SVD peripheral handle (e.g., `hw.DMA1.CH5`, `hw.USART1`).
-    HwPeripheral(String),
     /// Typed pointer to an `mmio` register layout (`*UartRegs`).
     MmioPtr(String),
     /// Function pointer type (for C interop callbacks).
@@ -182,7 +180,6 @@ impl MirType {
             MirType::Array { elem, len } => format!("arr_{}_{}", len, elem.mangle_name()),
             MirType::Ptr(inner) => format!("ptr_{}", inner.mangle_name()),
             MirType::Primitive(pk) => pk.mangle_name(),
-            MirType::HwPeripheral(_) => "hw_periph".to_string(),
             MirType::MmioPtr(n) => format!("mmio_ptr_{n}"),
             MirType::FnPtr { params, ret } => {
                 if params.is_empty() {
@@ -231,7 +228,6 @@ impl MirType {
             MirType::Array { elem, len } => format!("[{len}]{}", elem.display_name()),
             MirType::Ptr(inner) => format!("*{}", inner.display_name()),
             MirType::Primitive(pk) => pk.display_name(),
-            MirType::HwPeripheral(p) => format!("hw.{p}"),
             MirType::MmioPtr(n) => format!("*{n}"),
             MirType::FnPtr { .. } => "fn(...)".to_string(),
             MirType::Result { ok, err } => match err {
@@ -437,7 +433,7 @@ pub enum MirStmt {
     /// Non-blocking primitive operation: `watch.publish(v)`, `inbox.post(v, boost)`,
     /// `ping_pong.flip()`, `ping_pong.start()`, `ping_pong.stop()`, `signal.notify(boost)`.
     PrimOp(MirPrimNonBlockingOp),
-    /// Hardware / runtime intrinsic operation (`hw.GPIOA.clear_pin(...)`, `sys.use_systick(...)`, `set_priority(...)`).
+    /// Runtime intrinsic operation (`sys.use_systick(...)`, `set_priority(...)`, etc.).
     Intrinsic(MirIntrinsicOp),
     /// Enter hardware critical section (`PRIMASK` / IRQ mask).
     EnterCritical,
@@ -669,11 +665,6 @@ pub enum MirIntrinsicOp {
         method: String,
         args: Vec<MirExpr>,
     },
-    HwOp {
-        periph_path: Vec<String>,
-        method: String,
-        args: Vec<MirExpr>,
-    },
 }
 
 /// Switch arm pattern (`Variant` or integer literal or wildcard `_`).
@@ -897,7 +888,6 @@ pub enum MirExprKind {
     },
     ConstRef(String),
     GlobalPrimAddr(String),
-    HwPeriphVal(Vec<String>),
     /// Base address of a typed `mmio` peripheral instance (`MirType::MmioPtr(layout)`).
     MmioAddr(String),
     /// Volatile MMIO register read (`regs.isr` or `regs.arr[i]`).

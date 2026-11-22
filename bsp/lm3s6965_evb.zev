@@ -1,0 +1,49 @@
+// TI Stellaris LM3S6965 EVB Board Support Package (QEMU `lm3s6965evb`)
+import chip.lm3s6965 as hw;
+
+pub const u32 MOTOR_EN_PIN = 0;
+
+pub fn init_board() {
+    critical {
+        hw.SYSCTL.rcgc2 |= hw.SYSCTL_RCGC2_GPIOA;
+        hw.SYSCTL.rcgc1 |= hw.SYSCTL_RCGC1_TIMER0 | hw.SYSCTL_RCGC1_UART0;
+        u32 settle = hw.SYSCTL.rcgc2;
+        if (settle != 0) {
+            hw.GPIOA.dir |= 1 << MOTOR_EN_PIN;
+            hw.GPIOA.den |= 1 << MOTOR_EN_PIN;
+            hw.GPIOA.data = 1 << MOTOR_EN_PIN;
+            hw.TIMER0.ctl = 0;
+            hw.TIMER0.cfg = 0x4;
+            hw.TIMER0.tamr = 0x0A;
+            hw.TIMER0.tailr = 1000;
+            hw.TIMER0.tamatchr = 0;
+        }
+    }
+}
+
+pub fn clear_motor_enable() {
+    hw.GPIOA.data = 0;
+}
+
+pub u32 read_motor_enable() {
+    return hw.GPIOA.data & 1;
+}
+
+pub fn set_pwm_duty(u8 ch, u16 duty) {
+    if (ch == 1) {
+        hw.TIMER0.tamatchr = duty as u32;
+    }
+}
+
+pub u32 read_pwm_duty(u8 ch) {
+    if (ch == 1) {
+        return hw.TIMER0.tamatchr;
+    }
+    return 0;
+}
+
+pub fn pend_nvic_irq(u32 irq_num) {
+    if (irq_num < 32) {
+        hw.NVIC.ispr[0] = 1 << irq_num;
+    }
+}

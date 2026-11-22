@@ -1,0 +1,57 @@
+// STM32G4 Dual-Bus Motor Drive Board Support Package
+import chip.stm32g4 as hw;
+
+pub const u32 MOTOR_EN_PIN = 0;
+
+pub fn init_clocks() {
+    critical {
+        hw.RCC.ahb1enr |= hw.RCC_AHB1_DMA1;
+        hw.RCC.ahb2enr |= hw.RCC_AHB2_GPIOA;
+        hw.RCC.apb2enr |= hw.RCC_APB2_TIM1 | hw.RCC_APB2_USART1;
+        hw.RCC.apb1enr |= hw.RCC_APB1_USART2;
+        hw.RCC.cr |= 0x0100_0000; // PLLON
+    }
+}
+
+pub fn enable_motor_gate() {
+    critical {
+        hw.GPIOA.bsrr = 1 << MOTOR_EN_PIN;
+    }
+}
+
+pub fn safe_off_motor_gate() {
+    hw.GPIOA.brr = 1 << MOTOR_EN_PIN;
+}
+
+pub fn set_pwm_duty(u8 ch, u16 duty) {
+    if (ch >= 1 && ch <= 4) {
+        usize idx = (ch - 1) as usize;
+        hw.TIM1.ccr[idx] = duty as u32;
+    }
+}
+
+pub u32 read_pwm_duty(u8 ch) {
+    if (ch >= 1 && ch <= 4) {
+        usize idx = (ch - 1) as usize;
+        return hw.TIM1.ccr[idx];
+    }
+    return 0;
+}
+
+pub fn configure_uart1_rx_dma() {
+    critical {
+        hw.USART1.brr = 0x05C3; // 115200 @ 170 MHz
+        hw.USART1.cr3 |= 0x0040; // DMAR
+        hw.DMA1.cndtr5 = 128;
+        hw.DMA1.ccr5 = 0x00A7; // EN | CIRC | HTIE | TCIE
+    }
+}
+
+pub fn configure_uart2_rx_dma() {
+    critical {
+        hw.USART2.brr = 0x05C3;
+        hw.USART2.cr3 |= 0x0040;
+        hw.DMA1.cndtr6 = 128;
+        hw.DMA1.ccr6 = 0x00A7;
+    }
+}

@@ -1,29 +1,27 @@
-// Self-Contained End-to-End Deterministic Simulation Demo (`zevc run examples/sim_demo.zev`)
+// Complete Self-Contained Simulation Demo (`zevc run --sanitize examples/sim_demo.zev`)
 //
-// Exercises all v0 Language-OS pillars on a scripted host timeline:
-//   1. Sequential phased boot (`main()`) + multi-instance static `spawn` (x2 motor_control, x2 fieldbus_listener)
-//   2. Drift-free `loop every 1ms` PI control loops with task-atomic `noyield` blocks & generic `clamp<T>`
-//   3. Zero-copy `@dma_safe ping_pong` UART DMA + `packed struct` `u16be` decoding + `error`/`catch` + `{err}`
-//   4. `EXTI0` overcurrent ISR with `boost: @critical` waking `@low` supervisor at `@critical` & restoring `@low`
-//   5. Disjoint child coroutine frame `union` aliasing (`save_fault_record` w/ `defer` vs `scrub_flash_crc`)
-//   6. Monomorphized `FixedVec<u16, 4>` RPM window, `f32` duty formatting, proven-fit `fmt_buf`, and `sys.exit(0)`
+// Exercises ALL v0 + Wave 1/Wave 2 + §6.3 Wave 1 invariants deterministically under Clang ASan/UBSan:
+//   1. Real `.zev` `chip.*`, `bsp.*`, and `std.*` modules + typed `mmio` (`@rw`, `@ro`, `@wo`, `@w1c`)
+//   2. Parameterized `isr` handlers + ISR-private `state` + Boot-Tree `irq.attach(...)`
+//   3. Boot-Tree `spawn`, `loop every 1ms`, `noyield`, `critical`, `defer`, `for (..)`
+//   4. Zero-copy `@dma_safe ping_pong<u8, 64>` + `packed struct` `u16be` + `error`/`catch`
+//   5. `BadCrc` recovery, ISR `boost: @critical` elevation & restore, and `LIGHT -> DEEP` sleep-lock clamping
 
 import chip.stm32g4 as hw;
+import bsp.motor_drive as bsp;
+import std.fmt as fmt;
 
-// ── Host Deterministic Simulation Hooks (provided by synthesized C99 / LLVM runtime) ─
-extern "C" fn syn_sim_enable_trace(bool en);
+// Simulation stimulus hooks (synthesized by `zev-codegen-c` host simulation runtime)
+extern "C" fn syn_sim_enable_trace(bool on);
 extern "C" fn syn_sim_log(u32 tag, u32 a, u32 b);
+extern "C" fn syn_sim_set_dma_active(u32 active);
+extern "C" u32 syn_sim_sleep_depth();
 extern "C" fn syn_sim_push_uart1_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
 extern "C" fn syn_sim_push_uart2_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
-extern "C" fn syn_sim_fire_isr_EXTI0();
-extern "C" u32 syn_sim_sleep_depth();
-extern "C" fn syn_sim_set_dma_active(u32 active);
-
-// ── Wire Protocol, Bounded Containers & Event Types ─────────────────────────
 
 packed struct CmdFrame {
     u8    op;
-    u16be setpoint;   // Big-endian wire encoding decoded natively
+    u16be setpoint;
     u16be crc;
 }
 
@@ -35,7 +33,7 @@ struct FixedVec<T, usize N> {
 enum ParseErr { TooShort, BadCrc }
 enum SupEvent { Overcurrent, BadPacket, IdleCheck }
 
-// ── Static Zero-Heap OS & Hardware Primitives ───────────────────────────────
+// ── Static OS & DMA Primitives (100% .bss, zero heap) ───────────────────────
 
 @dma_safe ping_pong<u8, 64> uart1_dma;
 @dma_safe ping_pong<u8, 64> uart2_dma;
@@ -47,34 +45,23 @@ watch<u16>         motor2_duty = 0;
 watch<u32>         diag_telemetry = 0;
 inbox<SupEvent, 8> sup_inbox;
 
-// ── Hardware Interrupt Service Routines (`noyield` + ISR isolation enforced) ─
+// ── Parameterized Hardware Interrupt Handlers (baked pointers + `state`) ───
 
-isr EXTI0 {
-    hw.GPIOA.clear_pin(MOTOR_EN);                      // Immediate <1us hardware safe-off
-    sup_inbox.post(Overcurrent, boost: @critical);     // Elevates supervisor to @critical for 1 turn
+isr overcurrent_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
+    state u32 fault_count = 0;
+    fault_count += 1;
+    gpio.brr = 1 << bsp.MOTOR_EN_PIN;                 // Immediate <1us @wo safe-off
+    sup.post(Overcurrent, boost: @critical);           // Elevates supervisor to @critical for 1 turn
 }
 
-isr DMA1_CH5 {
-    hw.DMA1.CH5.clear_irq(HALF_TRANSFER | FULL_TRANSFER);
-    uart1_dma.flip();                                  // Zero-copy buffer swap + wakes UART1 listener
+isr dma_rx_isr(*ping_pong<u8, 64> rx_dma, *hw.DmaRegs dma, u32 clear_mask) {
+    state u32 rx_irqs = 0;
+    rx_irqs += 1;
+    dma.ifcr = clear_mask;                             // @w1c direct clear
+    rx_dma.flip();                                     // Zero-copy buffer swap + wakes listener
 }
 
-isr DMA1_CH6 {
-    hw.DMA1.CH6.clear_irq(HALF_TRANSFER | FULL_TRANSFER);
-    uart2_dma.flip();                                  // Zero-copy buffer swap + wakes UART2 listener
-}
-
-// ── Monomorphized `<T>` / `<T, usize N>`, Pure & Yielding Helpers ───────────
-
-T clamp<T>(T val, T lo, T hi) {
-    if (val < lo) {
-        return lo;
-    }
-    if (val > hi) {
-        return hi;
-    }
-    return val;
-}
+// ── Monomorphized `<T, usize N>`, Pure & Yielding Helpers ──────────────────
 
 fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
     if (v.len < N) {
@@ -89,15 +76,8 @@ fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
 }
 
 fn setup_clocks() {
-    critical {
-        hw.RCC.enable_pll_170mhz();
-    }
-}
-
-fn configure_circular_uart_dma(u32 dma_ch, u32 usart, ping_pong<u8, 64> *rx_ring) {
-    critical {
-        hw.DMA1.bind_circular_rx(dma_ch, usart, rx_ring);
-    }
+    bsp.init_clocks();
+    bsp.enable_motor_gate();
 }
 
 fn run_power_on_self_test() {
@@ -139,11 +119,11 @@ u16 adc_read_rpm(u8 pwm_ch) {
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
     i32 err = (target as i32) - (actual as i32);
-    i32 next_int = clamp(*integral + err, -10000, 10000);
+    i32 next_int = fmt.clamp(*integral + err, -10000, 10000);
     *integral = next_int;
 
     i32 out = (err / 2) + (next_int / 16);
-    u16 duty = clamp(out, 0, 1000) as u16;
+    u16 duty = fmt.clamp(out, 0, 1000) as u16;
     return duty;
 }
 
@@ -197,7 +177,7 @@ task motor_control(watch<u16> *target_rpm, watch<u16> *out_duty, u8 pwm_ch) {
 
         noyield {
             u16 duty = pi_step(target, actual, &integral);
-            hw.TIM1.set_compare(pwm_ch, duty);
+            bsp.set_pwm_duty(pwm_ch, duty);
             out_duty.publish(duty);
         }
     }
@@ -257,8 +237,8 @@ task sim_stimulus() {
         }
 
         if (tick == 9) {
-            // Milestone 5: Fire hardware Overcurrent EXTI0 ISR (boosts @low supervisor to @critical!)
-            syn_sim_fire_isr_EXTI0();
+            // Milestone 5: Pend hardware Overcurrent IRQ (`EXTI0` -> boosts @low supervisor to @critical!)
+            sys.pend_irq(hw.IRQ_EXTI0);
         }
 
         if (tick == 11) {
@@ -288,8 +268,13 @@ fn main() {
     syn_sim_enable_trace(true);
     setup_clocks();
     sys.use_systick(170_000_000);
-    configure_circular_uart_dma(hw.DMA1.CH5, hw.USART1, &uart1_dma);
-    configure_circular_uart_dma(hw.DMA1.CH6, hw.USART2, &uart2_dma);
+    bsp.configure_uart1_rx_dma();
+    bsp.configure_uart2_rx_dma();
+    syn_sim_set_dma_active(1);
+
+    hw.IRQ_EXTI0.attach(overcurrent_isr(&sup_inbox, hw.GPIOA));
+    hw.IRQ_DMA1_CH5.attach(dma_rx_isr(&uart1_dma, hw.DMA1, hw.DMA_HTIF5 | hw.DMA_TCIF5));
+    hw.IRQ_DMA1_CH6.attach(dma_rx_isr(&uart2_dma, hw.DMA1, hw.DMA_HTIF6 | hw.DMA_TCIF6));
 
     run_power_on_self_test();
 

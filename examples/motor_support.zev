@@ -1,25 +1,20 @@
 // Companion support module for examples/motor_controller.zev
-// Implements clock/DMA setup, power-on self-test, monomorphized `clamp<T>`,
-// yielding ADC readout, task-atomic PI controller + wire checksum, and disjoint
+// Implements clock/DMA setup via real `.zev` `chip/` + `bsp/` + `std/` modules,
+// power-on self-test, yielding ADC readout, task-atomic PI controller, wire CRC, and disjoint
 // yielding flash helpers (`save_fault_record` w/ `defer` and `scrub_flash_crc`)
 // whose coroutine frames union-overlap inside `main`'s static supervisor frame.
 
 import chip.stm32g4 as hw;
+import bsp.motor_drive as bsp;
+import std.fmt as fmt;
 
 watch<u32> flash_diag_status = 0;
 
 // ── Hardware Boot & Peripheral Setup (Sequential / Non-Yielding) ────────────
 
 fn setup_clocks() {
-    critical {
-        hw.RCC.enable_pll_170mhz();
-    }
-}
-
-fn configure_circular_uart_dma(u32 dma_ch, u32 usart, ping_pong<u8, 64> *rx_ring) {
-    critical {
-        hw.DMA1.bind_circular_rx(dma_ch, usart, rx_ring);
-    }
+    bsp.init_clocks();
+    bsp.enable_motor_gate();
 }
 
 fn run_power_on_self_test() {
@@ -30,17 +25,7 @@ fn run_power_on_self_test() {
     flash_diag_status.publish(boot_sig);
 }
 
-// ── Monomorphized `<T>` & Control-Loop / Fieldbus Helpers ───────────────────
-
-T clamp<T>(T val, T lo, T hi) {
-    if (val < lo) {
-        return lo;
-    }
-    if (val > hi) {
-        return hi;
-    }
-    return val;
-}
+// ── Control-Loop & Fieldbus Helpers ─────────────────────────────────────────
 
 u16 crc16([]u8 buf) {
     u16 s1 = 85;
@@ -62,11 +47,11 @@ u16 adc_read_rpm(u8 pwm_ch) {
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
     i32 err = (target as i32) - (actual as i32);
-    i32 next_int = clamp(*integral + err, -10000, 10000);
+    i32 next_int = fmt.clamp(*integral + err, -10000, 10000);
     *integral = next_int;
 
     i32 out = (err / 2) + (next_int / 16);
-    u16 duty = clamp(out, 0, 1000) as u16;
+    u16 duty = fmt.clamp(out, 0, 1000) as u16;
     return duty;
 }
 

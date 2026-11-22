@@ -1661,6 +1661,16 @@ mod tests {
             zev.contains("pub const u32 USART1_ICR_ORECF_MASK = 0x0000_0008;"),
             "{zev}"
         );
+
+        // Round-trip: generated .zev must parse and pass zev-sema cleanly!
+        let parsed = zev_parser::parse_str_named(&zev, "stm32_svd.zev")
+            .unwrap_or_else(|e| panic!("SVD output failed to parse: {e:?}\n{zev}"));
+        let res = zev_sema::analyze_program(&parsed);
+        assert!(
+            res.is_ok(),
+            "SVD output failed zev-sema: {:?}\n{zev}",
+            res.err()
+        );
     }
 
     #[test]
@@ -1754,6 +1764,16 @@ mod tests {
         assert!(zev.contains("@rw u32 ch_2_ctrl @ 0x20;"), "{zev}");
         assert!(zev.contains("@w1c u32 ch_2_cfg_clear @ 0x24;"), "{zev}");
         assert!(zev.contains("@rw u16 ch_2_cfg_half @ 0x28;"), "{zev}");
+
+        // Round-trip: generated .zev must parse and pass zev-sema cleanly!
+        let parsed = zev_parser::parse_str_named(&zev, "cluster_svd.zev")
+            .unwrap_or_else(|e| panic!("SVD output failed to parse: {e:?}\n{zev}"));
+        let res = zev_sema::analyze_program(&parsed);
+        assert!(
+            res.is_ok(),
+            "SVD output failed zev-sema: {:?}\n{zev}",
+            res.err()
+        );
     }
 
     #[test]

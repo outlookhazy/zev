@@ -36,15 +36,13 @@ pub enum Ty {
         params: Vec<Ty>,
         ret: Box<Ty>,
     },
-    /// SVD / virtual hardware peripheral handle or register path (`hw.GPIOA`, `hw.DMA1.CH5`, `hw.USART1`).
-    HwPeripheral(String),
     /// Typed MMIO register block layout (`UartRegs`), usable behind pointer `*UartRegs` (`mmio` values cannot be copied by value).
     MmioLayout(String),
     /// Typed physical MMIO peripheral instance (`USART1 : UartRegs @ 0x4001_1000`), coercing implicitly to `*UartRegs`.
     MmioInstance { name: String, layout: String },
     /// Hardware interrupt vector token (`irq IRQ_USART1 = 37;`).
     IrqToken,
-    /// Built-in namespace (`sys`, `sim`, imported module/chip alias, or type name for associated calls).
+    /// Built-in namespace (`sys`, `sim`, imported module alias, or type name for associated calls).
     Namespace(NamespaceKind),
     /// Error recovery sentinel to prevent cascading duplicate diagnostics.
     Error,
@@ -55,7 +53,6 @@ pub enum Ty {
 pub enum NamespaceKind {
     Sys,
     Sim,
-    Chip(String),
     Module(String),
     Type(String),
     Enum(String),
@@ -358,17 +355,6 @@ impl Ty {
             // firmware expressions, while keeping strict separation from bool, floats, enums, durations, and pointers.
             (Ty::Prim(a), Ty::Prim(b)) if a.is_integer() && b.is_integer() => true,
 
-            // Hardware peripheral handles (`hw.DMA1.CH5`, `hw.USART1`) can be passed to
-            // peripheral parameters, integer register/address parameters, or opaque pointers.
-            (Ty::HwPeripheral(_), Ty::HwPeripheral(_)) => true,
-            (Ty::HwPeripheral(_), Ty::Prim(p)) if p.is_integer() => true,
-            (Ty::HwPeripheral(_), Ty::Ptr(inner))
-                if inner.is_void() || matches!(**inner, Ty::Prim(PrimType::U32 | PrimType::U8)) =>
-            {
-                true
-            }
-            (Ty::IntLit, Ty::HwPeripheral(_)) => true,
-
             // Fixed-array `[N]T` coerces elementwise for literal arrays (`[1, 2]` -> `[2]u32`,
             // `[0.5, 1.0]` -> `[2]f32`) and `[N]T` coerces to slice `[]T` when element types match.
             (Ty::Array { elem: a, len: la }, Ty::Array { elem: b, len: lb }) => {
@@ -427,10 +413,7 @@ impl Ty {
             Self::Duration => 8,
             Self::Priority | Self::Enum(_) => 1,
             Self::Str | Self::Slice(_) => ptr_bytes * 2,
-            Self::Ptr(_)
-            | Self::FnPtr { .. }
-            | Self::HwPeripheral(_)
-            | Self::MmioInstance { .. } => ptr_bytes,
+            Self::Ptr(_) | Self::FnPtr { .. } | Self::MmioInstance { .. } => ptr_bytes,
             Self::IrqToken => 4,
             Self::MmioLayout(_) => 0,
             Self::Array { elem, len } => elem.byte_size(ptr_bytes, structs) * len,
@@ -486,14 +469,12 @@ impl fmt::Display for Ty {
                 }
                 write!(f, ") -> {}", ret)
             }
-            Self::HwPeripheral(path) => write!(f, "hw::{}", path),
             Self::MmioLayout(name) => write!(f, "mmio {name}"),
             Self::MmioInstance { name, layout } => write!(f, "mmio {name} : {layout}"),
             Self::IrqToken => write!(f, "irq"),
             Self::Namespace(ns) => match ns {
                 NamespaceKind::Sys => write!(f, "sys"),
                 NamespaceKind::Sim => write!(f, "sim"),
-                NamespaceKind::Chip(c) => write!(f, "chip.{}", c),
                 NamespaceKind::Module(m) => write!(f, "module {}", m),
                 NamespaceKind::Type(t) | NamespaceKind::Enum(t) => write!(f, "type {}", t),
             },

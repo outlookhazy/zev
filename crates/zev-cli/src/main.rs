@@ -28,7 +28,15 @@ struct CheckFailure {
     json_diags: Vec<JsonDiag>,
 }
 
+#[cfg(test)]
 fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFailure> {
+    load_and_check_detailed_with_includes(files, &[])
+}
+
+fn load_and_check_detailed_with_includes(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+) -> Result<CheckedBundle, CheckFailure> {
     let mut source_files: Vec<(String, SourceFile)> = Vec::with_capacity(files.len());
     let mut seen_canon: HashSet<PathBuf> = HashSet::with_capacity(files.len());
     let mut all_generics: BTreeSet<String> = BTreeSet::new();
@@ -104,10 +112,13 @@ fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFail
         .map(|(name, _, prog)| (prog, Some(name.as_str())))
         .collect();
 
-    let out = analyze_and_monomorphize_named_programs(&named_refs, &AnalyzeOptions::default());
+    let mut opts = AnalyzeOptions::default();
+    opts.include_dirs = include_dirs.to_vec();
+    let out = analyze_and_monomorphize_named_programs(&named_refs, &opts);
     if !out.diagnostics.is_empty() {
         let mut rendered = String::new();
         let mut json_diags = Vec::with_capacity(out.diagnostics.len());
+        let mut imported_sfs: HashMap<String, SourceFile> = HashMap::new();
 
         for d in &out.diagnostics {
             let code = d.code();
@@ -115,12 +126,22 @@ fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFail
             let help_str = d.help_text();
             let doc_cmd = primary_doc_cmd(Some(code), Some(topic));
 
-            let matched_sf: Option<&SourceFile> = d
-                .file
-                .as_ref()
-                .and_then(|fname| by_name.get(fname))
-                .map(|&idx| &loaded[idx].1)
-                .or_else(|| if loaded.len() == 1 { Some(&loaded[0].1) } else { None });
+            let matched_sf: Option<&SourceFile> = if let Some(fname) = d.file.as_ref() {
+                if let Some(&idx) = by_name.get(fname) {
+                    Some(&loaded[idx].1)
+                } else {
+                    if !imported_sfs.contains_key(fname) {
+                        if let Ok(sf) = SourceFile::load(Path::new(fname)) {
+                            imported_sfs.insert(fname.clone(), sf);
+                        }
+                    }
+                    imported_sfs.get(fname)
+                }
+            } else if loaded.len() == 1 {
+                Some(&loaded[0].1)
+            } else {
+                None
+            };
 
             if let Some(sf) = matched_sf {
                 let (line, col) = sf.line_col(d.span.start as usize);
@@ -167,15 +188,19 @@ fn load_and_check_detailed(files: &[PathBuf]) -> Result<CheckedBundle, CheckFail
     })
 }
 
-fn load_and_check(files: &[PathBuf]) -> Result<CheckedBundle, String> {
-    load_and_check_detailed(files).map_err(|f| f.human)
-}
-
-fn compile_to_mir(files: &[PathBuf]) -> Result<(CheckedBundle, MirModule), String> {
-    let bundle = load_and_check(files)?;
+fn compile_to_mir_with_includes(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+) -> Result<(CheckedBundle, MirModule), String> {
+    let bundle = load_and_check_detailed_with_includes(files, include_dirs).map_err(|f| f.human)?;
     let mir = zev_mir::lower_programs(&bundle.programs)
         .map_err(|e| format!("error: {e}\n  = docs: run 'zevc doc tasks'"))?;
     Ok((bundle, mir))
+}
+
+#[cfg(test)]
+fn compile_to_mir(files: &[PathBuf]) -> Result<(CheckedBundle, MirModule), String> {
+    compile_to_mir_with_includes(files, &[])
 }
 
 fn write_output(output: Option<&Path>, text: &str) -> Result<(), String> {
@@ -278,8 +303,7 @@ fn main() -> ExitCode {
             include_dirs,
             json,
         } => {
-            let _ = include_dirs;
-            match load_and_check_detailed(&files) {
+            match load_and_check_detailed_with_includes(&files, &include_dirs) {
             Ok(bundle) => {
                 let verified_files = bundle.programs.len();
                 let dual_vec: Vec<String> =
@@ -325,8 +349,7 @@ fn main() -> ExitCode {
             files,
             include_dirs,
         } => {
-            let _ = include_dirs;
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 print!("{}", mir.ram_report.format_table());
                 ExitCode::SUCCESS
@@ -342,8 +365,7 @@ fn main() -> ExitCode {
             include_dirs,
             output,
         } => {
-            let _ = include_dirs;
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 let c_src = zev_codegen_c::emit_c(&mir);
                 if let Err(err) = write_output(output.as_deref(), &c_src) {
@@ -365,8 +387,7 @@ fn main() -> ExitCode {
             max_ticks,
             run_args,
         } => {
-            let _ = include_dirs;
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 let c_src = zev_codegen_c::emit_c(&mir);
                 match runner::compile_and_run_c99(&c_src, sanitize, max_ticks, &run_args) {
@@ -391,7 +412,6 @@ fn main() -> ExitCode {
             opt_level,
             output,
         } => {
-            let _ = include_dirs;
             let mut opts = match resolve_llvm_options(target.as_deref()) {
                 Ok(o) => o,
                 Err(err) => {
@@ -402,7 +422,7 @@ fn main() -> ExitCode {
             if let Some(ref lvl) = opt_level {
                 opts.opt_level = lvl.clone();
             }
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
                 Ok((_, mir)) => match zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &opts) {
                     Ok(raw_ll) => {
                         let final_ll = match opt_level.as_deref() {
@@ -459,8 +479,7 @@ fn main() -> ExitCode {
             opt_level,
             output,
         } => {
-            let _ = include_dirs;
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 let out_elf = output.unwrap_or_else(|| default_output_with_ext(&files, "elf"));
                 let mut opts = zev_codegen_llvm::CodegenOptions::default();
@@ -498,8 +517,7 @@ fn main() -> ExitCode {
             max_ticks,
             opt_level,
         } => {
-            let _ = include_dirs;
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 let temp = match TempWorkDir::create("zevc-qemu") {
                     Ok(t) => t,
@@ -547,8 +565,7 @@ fn main() -> ExitCode {
             opt_level,
             output,
         } => {
-            let _ = include_dirs;
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
                 let out_elf = out_bin.with_extension("elf");
@@ -580,8 +597,7 @@ fn main() -> ExitCode {
             opt_level,
             output,
         } => {
-            let _ = include_dirs;
-            match compile_to_mir(&files) {
+            match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 let mut temp_holder: Option<TempWorkDir> = None;
                 let out_bin = match output {
@@ -722,7 +738,7 @@ mod tests {
             ("p8.zev", "fn main() { for (u32 i = 0; i < 4; i += 1) {} }\n", "P0008"),
             ("p9a.zev", "struct Reader<'a> { []u8 buf; }\n", "P0009"),
             ("p9b.zev", "fn step(&mut i32 acc) {}\n", "P0009"),
-            ("p10.zev", "pub fn main() {}\n", "P0010"),
+            ("p10.zev", "static u32 x = 0;\nfn main() {}\n", "P0010"),
             (
                 "p11.zev",
                 "task ctrl() { every 5ms { checkpoint(); } }\nfn main() { spawn ctrl() @normal; }\n",
@@ -988,9 +1004,9 @@ fn main() {
         let c_exit = runner::compile_and_run_c99(&c_src, true, Some(10), &[]).unwrap();
         assert_eq!(c_exit, 0);
 
-        // 4. Verify E0028 & E0029 diagnostics and `zevc doc` explainers (41 total)
+        // 4. Verify E0028..E0033 diagnostics and `zevc doc` explainers (45 total)
         let doc_list = docs::lookup_doc(None, true).unwrap();
-        assert!(doc_list.contains("E0028") && doc_list.contains("E0029"));
+        assert!(doc_list.contains("E0028") && doc_list.contains("E0033"));
 
         let wave2_errs = [
             (

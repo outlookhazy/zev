@@ -75,9 +75,24 @@ mod tests {
         items.push(Item {
             attrs: vec![],
             is_pub: false,
-            kind: ItemKind::Import(ImportDecl {
-                path: vec![id("chip"), id("stm32g4")],
-                alias: Some(id("hw")),
+            kind: ItemKind::Mmio(MmioDecl {
+                name: id("TIM1"),
+                kind: MmioDeclKind::Inline {
+                    base_addr: expr_int(0x4001_2C00),
+                    regs: vec![MmioRegDecl {
+                        access: MmioAccess::Rw,
+                        ty: TypeExpr::new(
+                            TypeKind::Array {
+                                elem: Box::new(ty_prim(PrimType::U32)),
+                                len: ArrayLen::Fixed(4),
+                            },
+                            sp,
+                        ),
+                        name: id("ccr"),
+                        offset: expr_int(0x34),
+                        span: sp,
+                    }],
+                },
                 span: sp,
             }),
             span: sp,
@@ -500,29 +515,45 @@ mod tests {
                                                             sp,
                                                         ),
                                                         Stmt::new(
-                                                            StmtKind::Expr(Expr::new(
-                                                                ExprKind::MethodCall {
-                                                                    receiver: Box::new(Expr::new(
-                                                                        ExprKind::Field {
-                                                                            target: Box::new(
-                                                                                expr_id("hw"),
-                                                                            ),
-                                                                            field: id("TIM1"),
-                                                                        },
-                                                                        sp,
-                                                                    )),
-                                                                    method: id("set_compare"),
-                                                                    args: vec![
-                                                                        CallArg::positional(
-                                                                            expr_id("pwm_ch"),
-                                                                        ),
-                                                                        CallArg::positional(
-                                                                            expr_id("duty"),
-                                                                        ),
-                                                                    ],
-                                                                },
-                                                                sp,
-                                                            )),
+                                                            StmtKind::Assign {
+                                                                target: Expr::new(
+                                                                    ExprKind::Index {
+                                                                        target: Box::new(Expr::new(
+                                                                            ExprKind::Field {
+                                                                                target: Box::new(
+                                                                                    expr_id("TIM1"),
+                                                                                ),
+                                                                                field: id("ccr"),
+                                                                            },
+                                                                            sp,
+                                                                        )),
+                                                                        index: Box::new(Expr::new(
+                                                                            ExprKind::Cast {
+                                                                                expr: Box::new(
+                                                                                    expr_id(
+                                                                                        "pwm_ch",
+                                                                                    ),
+                                                                                ),
+                                                                                ty: ty_prim(
+                                                                                    PrimType::Usize,
+                                                                                ),
+                                                                            },
+                                                                            sp,
+                                                                        )),
+                                                                    },
+                                                                    sp,
+                                                                ),
+                                                                op: AssignOp::Assign,
+                                                                value: Expr::new(
+                                                                    ExprKind::Cast {
+                                                                        expr: Box::new(expr_id(
+                                                                            "duty",
+                                                                        )),
+                                                                        ty: ty_prim(PrimType::U32),
+                                                                    },
+                                                                    sp,
+                                                                ),
+                                                            },
                                                             sp,
                                                         ),
                                                     ],

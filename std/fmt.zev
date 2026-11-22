@@ -1,0 +1,27 @@
+// Standard formatting and numeric clamping utilities
+
+pub T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
+
+pub u8 hex_nibble_lower(u8 nibble) {
+    u8 n = nibble & 15;
+    if (n < 10) {
+        return 48 + n;
+    }
+    return 87 + n;
+}
+
+pub u8 hex_nibble_upper(u8 nibble) {
+    u8 n = nibble & 15;
+    if (n < 10) {
+        return 48 + n;
+    }
+    return 55 + n;
+}

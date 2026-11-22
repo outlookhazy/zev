@@ -633,71 +633,7 @@ static SYN_UNUSED inline void syn_sys_use_systick(uint32_t hz) {{
     g_syn_sleep.systick_configured = true;
 }}
 
-/* ── Virtual Hardware SVD State (Observable in Host Tests & Sim) ─────────── */
-
-typedef uint32_t syn_hw_periph_t;
-
-typedef struct {{
-    uint32_t gpio_odr;
-    uint32_t gpio_cleared_mask;
-    uint32_t gpio_set_mask;
-    uint32_t dma_irq_cleared;
-    uint16_t tim_compare[8];
-    uint32_t op_count;
-}} syn_hw_sim_state_t;
-
-static SYN_UNUSED syn_hw_sim_state_t g_syn_hw = {{ .gpio_odr = 0xFFFFFFFFU }};
-
-static SYN_UNUSED inline void syn_hw_gpio_clear_pin(uint32_t pin_mask) {{
-    g_syn_hw.gpio_odr &= ~pin_mask;
-    g_syn_hw.gpio_cleared_mask |= pin_mask;
-    g_syn_hw.op_count++;
-    if (g_syn_sim_trace) {{
-#if !defined(SYN_FREESTANDING)
-        printf("[t=%ums] hw.GPIO.clear_pin(0x%x)\n", (unsigned)g_syn_tick_ms, (unsigned)pin_mask);
-#endif
-    }}
-}}
-
-static SYN_UNUSED inline void syn_hw_gpio_set_pin(uint32_t pin_mask) {{
-    g_syn_hw.gpio_odr |= pin_mask;
-    g_syn_hw.gpio_set_mask |= pin_mask;
-    g_syn_hw.op_count++;
-}}
-
-static SYN_UNUSED inline void syn_hw_dma_clear_irq(uint32_t flags) {{
-    g_syn_hw.dma_irq_cleared |= flags;
-    g_syn_hw.op_count++;
-}}
-
-static SYN_UNUSED inline void syn_hw_tim_set_compare(uint32_t ch, uint32_t duty) {{
-    if (ch < 8U) {{
-        g_syn_hw.tim_compare[ch] = (uint16_t)duty;
-    }}
-    g_syn_hw.op_count++;
-}}
-
-static SYN_UNUSED inline void syn_hw_uart_puts(const void *s) {{
-#if !defined(SYN_FREESTANDING)
-    if (s != NULL) {{
-        fputs((const char *)s, stdout);
-        fflush(stdout);
-    }}
-#else
-    (void)s;
-#endif
-    g_syn_hw.op_count++;
-}}
-
-static SYN_UNUSED inline void syn_hw_uart_putc(uint32_t ch) {{
-#if !defined(SYN_FREESTANDING)
-    fputc((int)(ch & 0xFFU), stdout);
-    fflush(stdout);
-#else
-    (void)ch;
-#endif
-    g_syn_hw.op_count++;
-}}
+/* ── System Diagnostics & Logging Helpers ────────────────────────────────── */
 
 static SYN_UNUSED inline void syn_sys_log(const void *msg) {{
 #if !defined(SYN_FREESTANDING)
@@ -726,12 +662,6 @@ static SYN_UNUSED inline void syn_sys_log_hex(const void *label, uint32_t val) {
     (void)label;
     (void)val;
 #endif
-}}
-
-static SYN_UNUSED inline void syn_hw_generic_op(const char *periph, const char *method) {{
-    (void)periph;
-    (void)method;
-    g_syn_hw.op_count++;
 }}
 
 /* ── Cooperative Scheduler (`Overdue -> Work (MORE) -> Poll -> Sleep`) ──── */

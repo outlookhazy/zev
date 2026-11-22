@@ -1,0 +1,53 @@
+// TI Stellaris LM3S6965 (ARM Cortex-M3 / QEMU `lm3s6965evb`) Typed MMIO & NVIC Map
+
+pub mmio SysctlRegs {
+    @rw u32 rcgc1 @ 0x104;
+    @rw u32 rcgc2 @ 0x108;
+}
+
+pub mmio GpioRegs {
+    @rw  u32 data @ 0x3FC;
+    @rw  u32 dir  @ 0x400;
+    @w1c u32 icr  @ 0x41C;
+    @rw  u32 den  @ 0x51C;
+}
+
+pub mmio TimerRegs {
+    @rw  u32 cfg      @ 0x000;
+    @rw  u32 tamr     @ 0x004;
+    @rw  u32 ctl      @ 0x00C;
+    @w1c u32 icr      @ 0x024;
+    @rw  u32 tailr    @ 0x028;
+    @rw  u32 tamatchr @ 0x030;
+}
+
+pub mmio UartRegs {
+    @rw  u32 dr  @ 0x000;
+    @ro  u32 fr  @ 0x018;
+    @w1c u32 icr @ 0x044;
+}
+
+pub mmio NvicRegs {
+    @rw  [8]u32 iser @ 0x000;
+    @w1c [8]u32 icer @ 0x080;
+    @rw  [8]u32 ispr @ 0x100;
+    @w1c [8]u32 icpr @ 0x180;
+}
+
+pub mmio SYSCTL : SysctlRegs @ 0x400F_E000;
+pub mmio GPIOA  : GpioRegs   @ 0x4000_4000;
+pub mmio TIMER0 : TimerRegs  @ 0x4003_0000;
+pub mmio UART0  : UartRegs   @ 0x4000_C000;
+pub mmio NVIC   : NvicRegs   @ 0xE000_E100;
+
+pub irq IRQ_GPIOA   = 0;
+pub irq IRQ_UART0   = 5;
+pub irq IRQ_TIMER0A = 19;
+
+pub const u32 IRQ_GPIOA_NUM   = 0;
+pub const u32 IRQ_UART0_NUM   = 5;
+pub const u32 IRQ_TIMER0A_NUM = 19;
+
+pub const u32 SYSCTL_RCGC2_GPIOA  = 1 << 0;
+pub const u32 SYSCTL_RCGC1_TIMER0 = 1 << 16;
+pub const u32 SYSCTL_RCGC1_UART0  = 1 << 0;
