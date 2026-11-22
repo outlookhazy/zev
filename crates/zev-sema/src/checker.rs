@@ -7305,7 +7305,7 @@ impl<'a> BodyChecker<'a> {
                 ExprVal::scalar(Ty::void(), span)
             }
 
-            "now_ticks" | "now_ms" => {
+            "now_ticks" | "now_ms" | "current_prio" | "sleep_depth" | "wfi_count" => {
                 if !args.is_empty() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -7317,6 +7317,29 @@ impl<'a> BodyChecker<'a> {
                     }
                 }
                 ExprVal::scalar(Ty::u32(), span)
+            }
+
+            "trace_sleep" => {
+                if args.len() != 1 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!("'sys.trace_sleep(bool on)' expects 1 argument, found {}", args.len()),
+                    ));
+                    for a in args {
+                        let _ = self.check_expr_infallible(&a.value);
+                    }
+                } else {
+                    let av = self.check_expr_infallible(&args[0].value);
+                    if av.ty != Ty::bool() && !av.ty.is_error() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            args[0].span,
+                            format!("'sys.trace_sleep' expects 'bool', found '{}'", av.ty),
+                        ));
+                    }
+                }
+                ExprVal::scalar(Ty::void(), span)
             }
 
             "pend_irq" => {
@@ -7455,6 +7478,10 @@ impl<'a> BodyChecker<'a> {
                     "use_systick",
                     "now_ms",
                     "now_ticks",
+                    "current_prio",
+                    "sleep_depth",
+                    "wfi_count",
+                    "trace_sleep",
                     "pend_irq",
                     "exit",
                     "log",
@@ -8670,7 +8697,7 @@ impl<'a> BodyChecker<'a> {
 // Small Pure Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.pend_irq(u32 irq)`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
+const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
 
 fn is_string_arg_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Str)

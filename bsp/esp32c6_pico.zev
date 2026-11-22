@@ -4,11 +4,32 @@ import chip.esp32c6 as hw;
 pub const u32 PIN_WS2812_RGB = 8;
 pub const u32 PIN_BOOT_BTN   = 9;
 
+// RMT TX0 base config: mem_size=1 block (bit 16), div_cnt=4 -> 10 MHz (100 ns tick, bits 15:8), idle_out_en=1 (bit 6), idle_lv=0
+const u32 RMT_CH0_BASE_CFG = 0x0001_0440;
+// Bit 0: 400 ns HIGH + 800 ns LOW; Bit 1: 800 ns HIGH + 400 ns LOW (100 ns RMT ticks)
+const u32 RMT_WS2812_SYM0  = 4 | (1 << 15) | (8 << 16);
+const u32 RMT_WS2812_SYM1  = 8 | (1 << 15) | (4 << 16);
+
 pub fn init_board_gpio() {
-    // IO_MUX_GPIO9_REG is at `0x6009_0000 + 0x04 + 9*4 = 0x6009_0028` (`gpio[9]`).
-    // Configure GPIO9 as input with internal pull-up (`FUN_IE=1<<9`, `FUN_WPU=1<<8`, `MCU_SEL=1<<12`).
+    // 1. Configure GPIO9 (BOOT button) as input with pull-up and falling-edge CPU interrupt.
     hw.GPIO.enable_w1tc = 1 << PIN_BOOT_BTN;
     hw.IO_MUX.gpio[9] = (1 << 12) | (1 << 9) | (1 << 8);
+    hw.GPIO.status_w1tc = 1 << PIN_BOOT_BTN;
+    hw.GPIO.pin[9] = 0x2100;
+
+    // 2. Initialize hardware RMT TX Channel 0 for 800 kHz WS2812B timing on GPIO8:
+    //    40 MHz XTAL root -> sclk_div=1 -> RMT ch0 div_cnt=4 => exact 10 MHz (100 ns/tick).
+    hw.PCR.rmt_conf = 3;
+    hw.PCR.rmt_conf = 1;
+    hw.PCR.rmt_sclk_conf = 0x0070_0000;
+    hw.RMT.sys_conf = 0x8700_000B;
+    hw.RMT.ref_cnt_rst = 1;
+    hw.RMT.ch0conf0 = RMT_CH0_BASE_CFG | (1 << 24);
+
+    // 3. Route RMT_SIG_OUT0_IDX (71) through GPIO matrix to GPIO8 (20 mA drive).
+    hw.IO_MUX.gpio[8] = (1 << 12) | (2 << 10);
+    hw.GPIO.func_out_sel_cfg[8] = hw.RMT_SIG_OUT0_IDX | (1 << 9);
+    hw.GPIO.enable_w1ts = 1 << PIN_WS2812_RGB;
 }
 
 pub u32 read_boot_button() {
@@ -17,4 +38,40 @@ pub u32 read_boot_button() {
 
 pub fn clear_gpio_irq() {
     hw.GPIO.status_w1tc = 1 << PIN_BOOT_BTN;
+}
+
+pub u32 read_systimer_ticks() {
+    hw.SYSTIMER.unit0_op = 1 << 30;
+    for (u32 i in 0..64) {
+        if ((hw.SYSTIMER.unit0_op & (1 << 29)) != 0) {
+            break;
+        }
+    }
+    return hw.SYSTIMER.unit0_value_lo;
+}
+
+pub fn ws2812_rgb(u8 r, u8 g, u8 b) {
+    u32 grb = ((g as u32) << 16) | ((r as u32) << 8) | (b as u32);
+    for (usize bit in 0..24) {
+        u32 sh = 23 - (bit as u32);
+        if (((grb >> sh) & 1) != 0) {
+            hw.RMTMEM.ch0[bit] = RMT_WS2812_SYM1;
+        } else {
+            hw.RMTMEM.ch0[bit] = RMT_WS2812_SYM0;
+        }
+    }
+    // 100 us LOW reset latch (500 + 500 ticks @ 100 ns) + EOF marker
+    hw.RMTMEM.ch0[24] = 500 | (500 << 16);
+    hw.RMTMEM.ch0[25] = 0;
+
+    hw.RMT.int_clr = 1;
+    hw.RMT.ch0conf0 = RMT_CH0_BASE_CFG | (1 << 1) | (1 << 2);
+    hw.RMT.ch0conf0 = RMT_CH0_BASE_CFG | (1 << 24);
+    hw.RMT.ch0conf0 = RMT_CH0_BASE_CFG | 1;
+
+    for (u32 spin in 0..20000) {
+        if ((hw.RMT.int_raw & 1) != 0) {
+            break;
+        }
+    }
 }

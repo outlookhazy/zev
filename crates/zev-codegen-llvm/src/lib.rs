@@ -237,9 +237,10 @@ mod tests {
             "expected watchdog disarm routine in .text:\n{disasm}"
         );
         assert!(
-            disasm.contains("40800000 <__syn_esp32c6_iram_delay>:")
-                || disasm.contains("<__syn_esp32c6_ws2812_grb>:"),
-            "expected WS2812B driver linked into HP-SRAM 0x40800000 (.iram1):\n{disasm}"
+            disasm.contains("40800000 <__syn_rv_vector_table>:")
+                && disasm.contains("<__syn_fn_drive_palette_slot>:")
+                && disasm.contains("60006"),
+            "expected RV vector table at 0x40800000 and pure-.zev RMT (0x60006...) WS2812B driver in disasm:\n{disasm}"
         );
     }
 
@@ -359,9 +360,6 @@ mod tests {
     #[test]
     fn dual_exit_partial_progress_and_register_return_in_qemu() {
         let src = r#"
-            extern "C" fn syn_uart_kv(*u8 label, i32 val);
-            extern "C" fn syn_semihost_exit(i32 code);
-
             enum IoErr { Timeout, BusFault }
 
             u32 read_burst(u32 count) error IoErr {
@@ -373,7 +371,7 @@ mod tests {
 
             fn main() {
                 u32 ok_val = read_burst(3) catch (IoErr e, u32 partial) {
-                    syn_semihost_exit(1);
+                    sys.exit(1);
                 };
                 u32 saved_partial = 0;
                 u32 recov = read_burst(9) catch (IoErr e, u32 partial) {
@@ -381,11 +379,11 @@ mod tests {
                     partial + 100;
                 };
                 u32 fallback = read_burst(9) or 77;
-                syn_uart_kv("partial=", saved_partial);
-                syn_uart_kv("ok_val=", ok_val);
-                syn_uart_kv("recov=", recov);
-                syn_uart_kv("fallback=", fallback);
-                syn_semihost_exit(0);
+                sys.log_kv("partial=", saved_partial);
+                sys.log_kv("ok_val=", ok_val);
+                sys.log_kv("recov=", recov);
+                sys.log_kv("fallback=", fallback);
+                sys.exit(0);
             }
         "#;
         let prog = zev_parser::parse_str(src).expect("parse partial error test");
@@ -706,11 +704,6 @@ mod tests {
     #[test]
     fn signal_chan_and_should_share_on_cortex_m_qemu() {
         let src = r#"
-            extern "C" fn syn_uart_kv(*u8 label, i32 val);
-            extern "C" u32 syn_current_prio();
-            extern "C" fn syn_nvic_pend_irq(u32 irq);
-            extern "C" fn syn_semihost_exit(i32 code);
-
             signal fault_sig;
             signal idle_sig;
             inbox<u32, 4> telemetry_ch;
@@ -743,12 +736,12 @@ mod tests {
                 u32 a = telemetry_ch.recv();
                 u32 b = telemetry_ch.recv();
                 u32 c = telemetry_ch.recv();
-                syn_uart_kv("chan_sum=", a + b + c);
+                sys.log_kv("chan_sum=", a + b + c);
 
-                syn_nvic_pend_irq(1);
+                sys.pend_irq(1);
                 fault_sig.wait();
-                syn_uart_kv("sig_boosted_prio=", syn_current_prio());
-                syn_semihost_exit(0);
+                sys.log_kv("sig_boosted_prio=", sys.current_prio());
+                sys.exit(0);
             }
         "#;
         let prog = zev_parser::parse_str(src).expect("parse signal+chan test");
@@ -785,8 +778,8 @@ mod tests {
 
         assert_eq!(res.exec.exit_code, 0);
         assert!(res.build.audit.is_zero_heap_freestanding());
-        assert!(res.exec.stdout.contains("[2] 2400,1800"), "out={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("[4] 0,0"), "out={}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("milestone=2 a=2400 b=1800"), "out={}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("milestone=4 a=0 b=0"), "out={}", res.exec.stdout);
     }
 
     #[test]
@@ -1086,9 +1079,6 @@ mod tests {
     #[test]
     fn wave1_restart_preserves_task_params_and_resets_locals_in_qemu() {
         let src = r#"
-            extern "C" u32 syn_current_prio();
-            extern "C" fn syn_nvic_pend_irq(u32 irq);
-
             enum ActorCmd { AddWork, TriggerRestart }
 
             inbox<ActorCmd, 4> actor_q;
@@ -1110,7 +1100,7 @@ mod tests {
                 out_state.publish(base_id + local_acc);
                 loop {
                     ActorCmd cmd = actor_q.recv();
-                    last_turn_prio.publish(syn_current_prio());
+                    last_turn_prio.publish(sys.current_prio());
                     switch (cmd) {
                         AddWork => {
                             local_acc += 25;
@@ -1138,7 +1128,7 @@ mod tests {
                 u32 work1_prio = last_turn_prio.read();
 
                 /* Fire NVIC EXTI2 -> posts TriggerRestart with boost: @critical */
-                syn_nvic_pend_irq(2);
+                sys.pend_irq(2);
                 restart_ack.wait();
                 while (actor_state.read() != 510) {
                     delay(2ms);

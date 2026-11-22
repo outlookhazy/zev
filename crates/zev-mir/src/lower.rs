@@ -17,9 +17,9 @@ use crate::ir::{
     MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl, MirIsrStateVar,
     MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPlace, MirPrimKind,
     MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimitive, MirPriority,
-    MirSpawnInstance, MirStmt, MirStruct, MirSwitchPattern, MirTaskBlueprint, MirTerminator,
-    MirType, MirUnaryOp, MirVar, MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem,
-    VarId, VarRole,
+    MirSpawnInstance, MirStmt, MirStruct, MirSwitchPattern, MirSysQuery, MirTaskBlueprint,
+    MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, MonomorphizedItemKind,
+    MonomorphizedMirItem, VarId, VarRole,
 };
 use crate::liveness::{analyze_fn_frame, analyze_isr_frame, analyze_task_frame};
 use crate::ram::{populate_module_ram_report, RamReport};
@@ -7769,8 +7769,31 @@ fn lower_common_expr<B: LowerBackend>(
                         },
                     ));
                 }
-                if id.name == "sys" && matches!(method.name.as_str(), "now_ms" | "now_ticks") {
-                    return Ok(MirExpr::new(MirExprKind::NowTicks, MirType::U32));
+                if id.name == "sys" {
+                    match method.name.as_str() {
+                        "now_ms" | "now_ticks" => {
+                            return Ok(MirExpr::new(MirExprKind::NowTicks, MirType::U32));
+                        }
+                        "current_prio" => {
+                            return Ok(MirExpr::new(
+                                MirExprKind::SysQuery(MirSysQuery::CurrentPrio),
+                                MirType::U32,
+                            ));
+                        }
+                        "sleep_depth" => {
+                            return Ok(MirExpr::new(
+                                MirExprKind::SysQuery(MirSysQuery::SleepDepth),
+                                MirType::U32,
+                            ));
+                        }
+                        "wfi_count" => {
+                            return Ok(MirExpr::new(
+                                MirExprKind::SysQuery(MirSysQuery::WfiCount),
+                                MirType::U32,
+                            ));
+                        }
+                        _ => {}
+                    }
                 }
             }
             if let Some((target, pkind)) = resolve_prim_receiver_be(receiver, be)? {
@@ -8364,6 +8387,17 @@ fn finish_prim_read_method<B: LowerBackend>(
         ("half_len" | "cap", MirPrimKind::PingPong { cap, .. }) => {
             Ok(MirExpr::new(MirExprKind::IntLit(cap as i128), MirType::Usize))
         }
+        ("dma_buf" | "active_buf", MirPrimKind::PingPong { elem, cap }) => {
+            let slice_ty = MirType::Slice(elem.clone());
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::PingPongDmaBuf {
+                    target,
+                    elem_ty: *elem,
+                    cap,
+                })),
+                slice_ty,
+            ))
+        }
         _ => Err(MirLowerError {
             message: format!("unknown primitive read method `.{method}()`"),
             span,
@@ -8512,9 +8546,14 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
             method,
             args,
         } => {
-            // 1. `sys.*` intrinsics (excluding pure value queries `now_ms` / `now_ticks`)
+            // 1. `sys.*` intrinsics (excluding pure value queries `now_ms`, `now_ticks`, `current_prio`, `sleep_depth`, `wfi_count`)
             if let ExprKind::Ident(id) = &receiver.kind {
-                if id.name == "sys" && !matches!(method.name.as_str(), "now_ms" | "now_ticks") {
+                if id.name == "sys"
+                    && !matches!(
+                        method.name.as_str(),
+                        "now_ms" | "now_ticks" | "current_prio" | "sleep_depth" | "wfi_count"
+                    )
+                {
                     if matches!(method.name.as_str(), "log" | "println" | "print" | "puts") {
                         let newline = matches!(method.name.as_str(), "log" | "println");
                         if let Some(first) = first_positional_arg(args) {

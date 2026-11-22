@@ -5,20 +5,12 @@
 //   - Parameterized `isr` + ISR-private `state` wired via Boot-Tree `hw.IRQ_GPIO.attach(...)` into RISC-V `INTMTX` + `mtvec`
 //   - ROM Direct-Boot (`0xAEDB041D` x2 at `0x42000000` -> `@_start` at `0x42000008`)
 //   - 16 MHz hardware `SYSTIMER` (`0x6000A000`) driving drift-free `loop every 20ms` / `loop every 500ms` / `1s` deadlines
-//   - 0-wait-state HP-SRAM (`.iram1`) WS2812B 800kHz addressable RGB LED driver on `GPIO8`
+//   - Hardware-timed RMT TX0 800 kHz WS2812B addressable RGB LED driver on `GPIO8` (`bsp.ws2812_rgb`)
 //   - Zero-heap `println(f"...")` + proven-fit `fmt_buf` + `<T, usize N>` generics + `f32` power telemetry
 
 import chip.esp32c6 as hw;
 import bsp.esp32c6_pico as bsp;
 import std.fmt as fmt;
-
-// Hardware-timed .iram1 WS2812B pulse shifter & SYSTIMER telemetry hooks (zero GPIO shims!)
-extern "C" fn zev_ws2812_rgb(u8 r, u8 g, u8 b);
-extern "C" u32 zev_now_ms();
-extern "C" u32 zev_current_prio();
-extern "C" u32 zev_cpu_calib_ticks();
-extern "C" u32 zev_ws2812_store_ns();
-extern "C" u32 zev_pad8_ok();
 
 const u32 PALETTE_LEN = 5;
 
@@ -78,23 +70,23 @@ u32 drive_palette_slot(u32 slot) {
     u32 idx = slot % PALETTE_LEN;
     switch (idx) {
         0 => {
-            zev_ws2812_rgb(64, 0, 0);
+            bsp.ws2812_rgb(64, 0, 0);
             return 0x400000;
         }
         1 => {
-            zev_ws2812_rgb(0, 64, 0);
+            bsp.ws2812_rgb(0, 64, 0);
             return 0x004000;
         }
         2 => {
-            zev_ws2812_rgb(0, 0, 64);
+            bsp.ws2812_rgb(0, 0, 64);
             return 0x000040;
         }
         3 => {
-            zev_ws2812_rgb(0, 56, 56);
+            bsp.ws2812_rgb(0, 56, 56);
             return 0x003838;
         }
         _ => {
-            zev_ws2812_rgb(56, 0, 56);
+            bsp.ws2812_rgb(56, 0, 56);
             return 0x380038;
         }
     }
@@ -121,21 +113,19 @@ fn print_telemetry_line(
     u8 status_buf[96];
     // Statically proven worst-case fit (`37 B <= 96 B`) — zero `or` / `catch` boilerplate!
     []u8 status = fmt_buf(status_buf, f"avg={avg_mw:.2}mW ev={ev}");
-    u32 store_ns = zev_ws2812_store_ns();
-    u32 pad8_ok = zev_pad8_ok();
-    println(f"[Zev on ESP32-C6 rv32imac] uptime={uptime_ms}ms color=0x{color_rgb:06x} presses={presses} prio={prio} {status} led={sample:?} store_ns={store_ns} pad8_ok={pad8_ok}");
+    println(f"[Zev on ESP32-C6 rv32imac] uptime={uptime_ms}ms color=0x{color_rgb:06x} presses={presses} prio={prio} {status} led={sample:?}");
 }
 
 // ── Disjoint Yielding Supervisor Helpers (Union-Aliased Static Frames) ──────
 fn run_soc_self_test() {
     u32 rom_magic = 0xAEDB_041D;
-    u32 calib = zev_cpu_calib_ticks();
+    u32 ticks = bsp.read_systimer_ticks();
     checkpoint();
-    diag_signature.publish(rom_magic ^ calib);
+    diag_signature.publish(rom_magic ^ ticks);
 }
 
 fn record_button_event(u32 press_count) {
-    u32 stamp = zev_now_ms();
+    u32 stamp = sys.now_ms();
     u32 tag = 0xC6B0_0000 + press_count;
     checkpoint();
     u32 digest = tag ^ stamp;
@@ -208,8 +198,8 @@ fn main() {
 
     println("");
     println("[BOOT] Zev Language-OS on ESP32-C6 (rv32imac Direct-Boot, zero C)");
-    u32 calib_ticks = zev_cpu_calib_ticks();
-    println(f"[BOOT] systimer_16mhz_calib_ticks={calib_ticks}");
+    u32 boot_ticks = bsp.read_systimer_ticks();
+    println(f"[BOOT] systimer_16mhz_boot_ticks={boot_ticks}");
 
     spawn led_animator(&palette_offset, &active_slot, &active_color) @normal;
     spawn button_monitor() @high;
@@ -227,7 +217,7 @@ fn main() {
 
         switch (ev) {
             ButtonPressed => {
-                u32 boosted_prio = zev_current_prio();
+                u32 boosted_prio = sys.current_prio();
                 presses += 1;
                 u32 next_off = (palette_offset.read() + 1) % PALETTE_LEN;
                 palette_offset.publish(next_off);
@@ -244,7 +234,7 @@ fn main() {
                 f32 avg_mw = vec_avg_f32(&mw_window);
 
                 print("[EVENT] BOOT Button (GPIO9) -> instant color shift! ");
-                print_telemetry_line(zev_now_ms(), cur_rgb, presses, boosted_prio, avg_mw, ev, sample);
+                print_telemetry_line(sys.now_ms(), cur_rgb, presses, boosted_prio, avg_mw, ev, sample);
                 record_button_event(presses);
             }
             Heartbeat => {
@@ -257,7 +247,7 @@ fn main() {
                 vec_push_ring(&mw_window, sample.mwatts);
                 f32 avg_mw = vec_avg_f32(&mw_window);
 
-                print_telemetry_line(zev_now_ms(), cur_rgb, presses, zev_current_prio(), avg_mw, ev, sample);
+                print_telemetry_line(sys.now_ms(), cur_rgb, presses, sys.current_prio(), avg_mw, ev, sample);
             }
         }
     }

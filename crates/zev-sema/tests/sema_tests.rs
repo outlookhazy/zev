@@ -175,8 +175,7 @@ fn check_sim_demo_clean() {
     });
 
     assert_eq!(model.spawned_tasks.len(), 5);
-    assert!(model.functions["syn_sim_log"].is_extern_c);
-    assert!(!model.can_yield("syn_sim_log"));
+    assert!(model.functions.values().all(|f| !f.is_extern_c));
     assert!(model.can_yield("sim_stimulus"));
 }
 

@@ -14,11 +14,11 @@ use std::fmt::Write;
 
 use zev_mir::{
     BlockId, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootStep, MirCallDst,
-    MirChildCallSlot, MirErrorSpec, MirExpr, MirExprKind, MirExternFn, MirFloatFmt, MirFmtChunk,
-    MirFnBody, MirFunction, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
+    MirChildCallSlot, MirErrorSpec, MirExpr, MirExprKind, MirFloatFmt, MirFmtChunk, MirFnBody,
+    MirFunction, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
     MirMmioInstance, MirMmioLayout, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
-    MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern, MirTaskBlueprint,
-    MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
+    MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern, MirSysQuery,
+    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
 };
 
 use crate::esp32c6::{Esp32C6IrqRoute, assign_esp32c6_irq_routes};
@@ -470,6 +470,15 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                 }
                 MirPrimReadOp::SignalIsSet { target } | MirPrimReadOp::SignalTryWait { target } => {
                     scan_prim_target(target, feat);
+                }
+                MirPrimReadOp::PingPongDmaBuf {
+                    target,
+                    elem_ty,
+                    cap,
+                } => {
+                    scan_prim_target(target, feat);
+                    scan_ty(elem_ty, feat);
+                    let _ = cap;
                 }
             },
             MirExprKind::MmioRead { base, index, .. } => {
@@ -2237,490 +2246,22 @@ none:
         if self.module.extern_fns.is_empty() {
             return;
         }
-        let _ = writeln!(out, "; ── Extern \"C\" & Synthesized Bare-Metal Intrinsics ──");
+        let _ = writeln!(out, "; ── Genuine External \"C\" FFI Declarations ──");
         for ext in &self.module.extern_fns {
-            if is_synthesized_extern_intrinsic(&ext.name) {
-                self.emit_synthesized_extern_ir(out, ext);
-            } else {
-                let ret = self.llvm_ty(&ext.ret_ty);
-                let mut ps: Vec<String> =
-                    ext.params.iter().map(|(_, t)| self.llvm_ty(t)).collect();
-                if ext.variadic {
-                    ps.push("...".to_string());
-                }
-                let _ = writeln!(
-                    out,
-                    "declare {ret} @{}({}) nounwind",
-                    sanitize_ident(&ext.name),
-                    ps.join(", ")
-                );
+            let ret = self.llvm_ty(&ext.ret_ty);
+            let mut ps: Vec<String> =
+                ext.params.iter().map(|(_, t)| self.llvm_ty(t)).collect();
+            if ext.variadic {
+                ps.push("...".to_string());
             }
+            let _ = writeln!(
+                out,
+                "declare {ret} @{}({}) nounwind",
+                sanitize_ident(&ext.name),
+                ps.join(", ")
+            );
         }
         let _ = writeln!(out);
-    }
-
-    fn emit_synthesized_extern_ir(&self, out: &mut String, ext: &MirExternFn) {
-        let name = sanitize_ident(&ext.name);
-        let ret_ty = self.llvm_ty(&ext.ret_ty);
-        let params_decl: Vec<String> = ext
-            .params
-            .iter()
-            .enumerate()
-            .map(|(i, (_, t))| format!("{} %p{i}", self.llvm_ty(t)))
-            .collect();
-        let sig_args = params_decl.join(", ");
-
-        match ext.name.as_str() {
-            "print" | "syn_uart_puts" | "syn_print" | "zev_uart_puts" | "zev_print" => {
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n  call void @__syn_uart_puts(ptr %p0)\n  ret void\n}}"
-                );
-            }
-            "println" | "syn_println" | "zev_println" => {
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n  call void @__syn_uart_println(ptr %p0)\n  ret void\n}}"
-                );
-            }
-            "syn_uart_putc" | "zev_uart_putc" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i8".to_string());
-                let body = if p0_ty == "i8" {
-                    "  call void @__syn_uart_putc(i8 %p0)".to_string()
-                } else {
-                    format!("  %b = trunc {p0_ty} %p0 to i8\n  call void @__syn_uart_putc(i8 %b)")
-                };
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{body}\n  ret void\n}}"
-                );
-            }
-            "syn_uart_u32" | "zev_uart_u32" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_uart_u32(i32 %c0)\n  ret void\n}}"
-                );
-            }
-            "syn_uart_i32" | "zev_uart_i32" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p0_ty, "%p0", "i32", true);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_uart_i32(i32 %c0)\n  ret void\n}}"
-                );
-            }
-            "syn_uart_hex" | "zev_uart_hex" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_uart_hex(i32 %c0)\n  ret void\n}}"
-                );
-            }
-            "syn_uart_kv" | "zev_uart_kv" | "syn_log_kv" | "zev_log_kv" => {
-                let p1_ty = ext
-                    .params
-                    .get(1)
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let p1_signed = ext
-                    .params
-                    .get(1)
-                    .map_or(true, |(_, t)| !t.is_unsigned());
-                let cast = cast_int_expr(&p1_ty, "%p1", "i32", p1_signed);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_uart_kv(ptr %p0, i32 %c0)\n  ret void\n}}"
-                );
-            }
-            "syn_log_hex" | "zev_log_hex" => {
-                let p1_ty = ext
-                    .params
-                    .get(1)
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p1_ty, "%p1", "i32", false);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_uart_log_hex(ptr %p0, i32 %c0)\n  ret void\n}}"
-                );
-            }
-            "syn_nvic_pend_irq" | "zev_pend_irq" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_nvic_pend_irq(i32 %c0)\n  ret void\n}}"
-                );
-            }
-            "syn_semihost_exit" | "syn_exit" | "zev_exit" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p0_ty, "%p0", "i32", true);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) noreturn nounwind {{\nentry:\n{cast}\n  call void @__syn_platform_exit(i32 %c0)\n  unreachable\n}}"
-                );
-            }
-            "syn_now_ms" | "zev_now_ms" => {
-                let _ = writeln!(
-                    out,
-                    "define {ret_ty} @{name}() nounwind {{\nentry:\n  %t = call i32 @__syn_now_ms()\n  ret {ret_ty} %t\n}}"
-                );
-            }
-            "syn_wfi_count" | "zev_wfi_count" => {
-                let _ = writeln!(
-                    out,
-                    "define {ret_ty} @{name}() nounwind {{\nentry:\n  %c = load volatile i32, ptr @__syn_wfi_count, align 4\n  ret {ret_ty} %c\n}}"
-                );
-            }
-            "syn_last_sleep_depth" | "zev_last_sleep_depth" => {
-                let _ = writeln!(
-                    out,
-                    "define {ret_ty} @{name}() nounwind {{\nentry:\n  %d = load volatile i32, ptr @__syn_last_sleep_depth, align 4\n  ret {ret_ty} %d\n}}"
-                );
-            }
-            "syn_current_prio" | "zev_current_prio" => {
-                if ret_ty == "void" {
-                    let _ = writeln!(out, "define void @{name}() nounwind {{\nentry:\n  ret void\n}}");
-                } else {
-                    let _ = writeln!(
-                        out,
-                        r#"define {ret_ty} @{name}() nounwind {{
-entry:
-  %cur = load ptr, ptr @__syn_current_task, align 4
-  %isnull = icmp eq ptr %cur, null
-  br i1 %isnull, label %none, label %ok
-none:
-  ret {ret_ty} 255
-ok:
-  %ep_p = getelementptr inbounds %SynTask, ptr %cur, i32 0, i32 4
-  %ep = load i8, ptr %ep_p, align 1
-  %ep32 = zext i8 %ep to {ret_ty}
-  ret {ret_ty} %ep32
-}}"#
-                    );
-                }
-            }
-            "syn_dma_write_u8" => {
-                // syn_dma_write_u8(ping_pong<u8, N> *pp, u32 idx, u8 val)
-                // Writes `val` into the active `write_half` buffer of `*pp`.
-                let pp_ty = ext
-                    .params
-                    .first()
-                    .and_then(|(_, t)| match t {
-                        MirType::Ptr(inner) => Some(self.llvm_ty(inner)),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "%prim.pp_u8_64".to_string());
-                let p1_ty = ext
-                    .params
-                    .get(1)
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let p2_ty = ext
-                    .params
-                    .get(2)
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i8".to_string());
-                let cast_idx = cast_int_expr(&p1_ty, "%p1", "i32", false);
-                let val_expr = if p2_ty == "i8" {
-                    "  %vb = add i8 %p2, 0".to_string()
-                } else {
-                    format!("  %vb = trunc {p2_ty} %p2 to i8")
-                };
-                let _ = writeln!(
-                    out,
-                    r#"define void @{name}({sig_args}) nounwind {{
-entry:
-{cast_idx}
-{val_expr}
-  %wh_p = getelementptr inbounds {pp_ty}, ptr %p0, i32 0, i32 0
-  %wh = load i8, ptr %wh_p, align 1
-  %is_b0 = icmp eq i8 %wh, 0
-  %b0 = getelementptr inbounds {pp_ty}, ptr %p0, i32 0, i32 4, i32 %c0
-  %b1 = getelementptr inbounds {pp_ty}, ptr %p0, i32 0, i32 5, i32 %c0
-  %dst = select i1 %is_b0, ptr %b0, ptr %b1
-  store i8 %vb, ptr %dst, align 1
-  ret void
-}}"#
-                );
-            }
-            "syn_dma_set_active" => {
-                let pp_id = ext
-                    .params
-                    .first()
-                    .and_then(|(_, t)| match t {
-                        MirType::Ptr(inner) => match inner.as_ref() {
-                            MirType::Primitive(pk) => Some(sanitize_ident(&pk.mangle_name())),
-                            _ => None,
-                        },
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| "pp_u8_64".to_string());
-                let p1_ty = ext
-                    .params
-                    .get(1)
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i8".to_string());
-                let act_expr = if p1_ty == "i8" {
-                    "  %ab = add i8 %p1, 0".to_string()
-                } else {
-                    format!("  %nz = icmp ne {p1_ty} %p1, 0\n  %ab = zext i1 %nz to i8")
-                };
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{act_expr}\n  call void @__syn_pp_set_active_{pp_id}(ptr %p0, i8 %ab)\n  ret void\n}}"
-                );
-            }
-            "syn_sim_enable_trace" => {
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n  ret void\n}}"
-                );
-            }
-            "syn_sim_log" => {
-                let _ = writeln!(
-                    out,
-                    r#"define void @{name}({sig_args}) nounwind {{
-entry:
-  call void @__syn_uart_putc(i8 91) ; '['
-  call void @__syn_uart_u32(i32 %p0)
-  call void @__syn_uart_putc(i8 93) ; ']'
-  call void @__syn_uart_putc(i8 32) ; ' '
-  call void @__syn_uart_u32(i32 %p1)
-  call void @__syn_uart_putc(i8 44) ; ','
-  call void @__syn_uart_u32(i32 %p2)
-  call void @__syn_uart_putc(i8 10)
-  ret void
-}}"#
-                );
-            }
-            "syn_sim_sleep_depth" => {
-                let _ = writeln!(
-                    out,
-                    "define {ret_ty} @{name}() nounwind {{\nentry:\n  %d = load volatile i32, ptr @__syn_last_sleep_depth, align 4\n  ret {ret_ty} %d\n}}"
-                );
-            }
-            "syn_sim_set_dma_active" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  %nz = icmp ne i32 %c0, 0\n  %msk = select i1 %nz, i32 1, i32 0\n  store volatile i32 %msk, ptr @__syn_sleep_lock_mask, align 4\n  ret void\n}}"
-                );
-            }
-            "syn_sim_exit" | "syn_sim_stop" => {
-                let p0_ty = ext
-                    .params
-                    .first()
-                    .map(|(_, t)| self.llvm_ty(t))
-                    .unwrap_or_else(|| "i32".to_string());
-                let cast = if ext.params.is_empty() {
-                    "  %c0 = add i32 0, 0".to_string()
-                } else {
-                    cast_int_expr(&p0_ty, "%p0", "i32", true)
-                };
-                let _ = writeln!(
-                    out,
-                    "define void @{name}({sig_args}) noreturn nounwind {{\nentry:\n{cast}\n  call void @__syn_platform_exit(i32 %c0)\n  unreachable\n}}"
-                );
-            }
-            "syn_sim_push_uart1_frame" | "syn_sim_push_uart2_frame" => {
-                let is_u1 = ext.name == "syn_sim_push_uart1_frame";
-                let prim_name = if is_u1 { "uart1_dma" } else { "uart2_dma" };
-                let prim_sym = if is_u1 {
-                    "@__syn_prim_uart1_dma"
-                } else {
-                    "@__syn_prim_uart2_dma"
-                };
-                let irq_num = self
-                    .module
-                    .irq_vectors
-                    .iter()
-                    .find_map(|v| {
-                        v.bindings
-                            .iter()
-                            .any(|b| {
-                                b.baked_args
-                                    .iter()
-                                    .any(|a| matches!(a, MirBakedArg::PrimAddr(p) if p == prim_name))
-                            })
-                            .then_some(v.irq_num as u8)
-                    })
-                    .unwrap_or(if is_u1 { 5 } else { 6 });
-                if self.prim_globals.contains_key(prim_name) {
-                    let _ = writeln!(
-                        out,
-                        r#"define void @{name}({sig_args}) nounwind {{
-entry:
-  %wh_p = getelementptr inbounds %prim.pp_u8_64, ptr {prim_sym}, i32 0, i32 0
-  %wh = load i8, ptr %wh_p, align 1
-  %is_b0 = icmp eq i8 %wh, 0
-  %b0 = getelementptr inbounds %prim.pp_u8_64, ptr {prim_sym}, i32 0, i32 4, i32 0
-  %b1 = getelementptr inbounds %prim.pp_u8_64, ptr {prim_sym}, i32 0, i32 5, i32 0
-  %dst = select i1 %is_b0, ptr %b0, ptr %b1
-  %d0 = getelementptr i8, ptr %dst, i32 0
-  %d1 = getelementptr i8, ptr %dst, i32 1
-  %d2 = getelementptr i8, ptr %dst, i32 2
-  %d3 = getelementptr i8, ptr %dst, i32 3
-  %d4 = getelementptr i8, ptr %dst, i32 4
-  store i8 %p0, ptr %d0, align 1
-  store i8 %p1, ptr %d1, align 1
-  store i8 %p2, ptr %d2, align 1
-  store i8 %p3, ptr %d3, align 1
-  store i8 %p4, ptr %d4, align 1
-  call void @__syn_nvic_pend_irq(i32 {irq_num})
-  ret void
-}}"#
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n  ret void\n}}"
-                    );
-                }
-            }
-            other if other.starts_with("syn_sim_fire_isr_") => {
-                let isr_vec = &other["syn_sim_fire_isr_".len()..];
-                let irq_opt = self
-                    .module
-                    .irq_vectors
-                    .iter()
-                    .find(|v| {
-                        v.irq_name == isr_vec
-                            || v.bindings.iter().any(|b| b.isr_name == isr_vec)
-                    })
-                    .map(|v| v.irq_num);
-                if let Some(irq) = irq_opt {
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n  call void @__syn_nvic_pend_irq(i32 {irq})\n  ret void\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n  ret void\n}}"
-                    );
-                }
-            }
-            "zev_ws2812_rgb" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let p0_ty = ext.params.first().map(|(_, t)| self.llvm_ty(t)).unwrap_or_else(|| "i8".to_string());
-                    let p1_ty = ext.params.get(1).map(|(_, t)| self.llvm_ty(t)).unwrap_or_else(|| "i8".to_string());
-                    let p2_ty = ext.params.get(2).map(|(_, t)| self.llvm_ty(t)).unwrap_or_else(|| "i8".to_string());
-                    let r_b = if p0_ty == "i8" { "  %rb = add i8 %p0, 0".to_string() } else { format!("  %rb = trunc {p0_ty} %p0 to i8") };
-                    let g_b = if p1_ty == "i8" { "  %gb = add i8 %p1, 0".to_string() } else { format!("  %gb = trunc {p1_ty} %p1 to i8") };
-                    let b_b = if p2_ty == "i8" { "  %bb = add i8 %p2, 0".to_string() } else { format!("  %bb = trunc {p2_ty} %p2 to i8") };
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n{r_b}\n{g_b}\n{b_b}\n  call void @__syn_esp32c6_ws2812_rgb(i8 %rb, i8 %gb, i8 %bb)\n  ret void\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n  ret void\n}}"
-                    );
-                }
-            }
-            "zev_ws2812_grb" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let p0_ty = ext.params.first().map(|(_, t)| self.llvm_ty(t)).unwrap_or_else(|| "i32".to_string());
-                    let cast = cast_int_expr(&p0_ty, "%p0", "i32", false);
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n{cast}\n  call void @__syn_esp32c6_ws2812_grb(i32 %c0)\n  ret void\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define void @{name}({sig_args}) nounwind {{\nentry:\n  ret void\n}}"
-                    );
-                }
-            }
-            "zev_cpu_calib_ticks" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  %v = load volatile i32, ptr @__syn_cpu_calib_dt, align 4\n  ret {ret_ty} %v\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  ret {ret_ty} 0\n}}"
-                    );
-                }
-            }
-            "zev_ws2812_store_ns" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  %v = load volatile i32, ptr @__syn_ws2812_store_ns, align 4\n  ret {ret_ty} %v\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  ret {ret_ty} 0\n}}"
-                    );
-                }
-            }
-            "zev_ws2812_t0h" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  %v = load volatile i32, ptr @__syn_ws2812_t0h, align 4\n  ret {ret_ty} %v\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  ret {ret_ty} 0\n}}"
-                    );
-                }
-            }
-            "zev_pad8_ok" => {
-                if self.opts.target == TargetArch::Riscv32Esp32C6 {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  %v = load volatile i32, ptr @__syn_pad8_ok, align 4\n  ret {ret_ty} %v\n}}"
-                    );
-                } else {
-                    let _ = writeln!(
-                        out,
-                        "define {ret_ty} @{name}() nounwind {{\nentry:\n  ret {ret_ty} 1\n}}"
-                    );
-                }
-            }
-            _ => {}
-        }
     }
 
     fn emit_isr_ir(&mut self, out: &mut String, isr: &MirIsr) -> Result<(), CodegenError> {
@@ -3065,80 +2606,6 @@ fn mask_int_to_target_i128(v: i128, target_ty: &MirType, ptr_bits: u32) -> i128 
         Some((false, 64)) => (v as u64) as i128,
         Some((true, 64)) => (v as i64) as i128,
         _ => v,
-    }
-}
-
-fn is_synthesized_extern_intrinsic(name: &str) -> bool {
-    name.starts_with("syn_sim_fire_isr_")
-        || matches!(
-            name,
-            "print"
-                | "println"
-                | "syn_uart_puts"
-                | "syn_print"
-                | "syn_println"
-                | "zev_uart_puts"
-                | "zev_print"
-                | "zev_println"
-                | "syn_uart_putc"
-                | "zev_uart_putc"
-                | "syn_uart_u32"
-                | "zev_uart_u32"
-                | "syn_uart_i32"
-                | "zev_uart_i32"
-                | "syn_uart_hex"
-                | "zev_uart_hex"
-                | "syn_uart_kv"
-                | "zev_uart_kv"
-                | "syn_log_kv"
-                | "zev_log_kv"
-                | "syn_log_hex"
-                | "zev_log_hex"
-                | "syn_nvic_pend_irq"
-                | "zev_pend_irq"
-                | "syn_semihost_exit"
-                | "syn_exit"
-                | "zev_exit"
-                | "syn_now_ms"
-                | "zev_now_ms"
-                | "syn_wfi_count"
-                | "zev_wfi_count"
-                | "syn_last_sleep_depth"
-                | "zev_last_sleep_depth"
-                | "syn_current_prio"
-                | "zev_current_prio"
-                | "syn_dma_write_u8"
-                | "syn_dma_set_active"
-                | "syn_sim_enable_trace"
-                | "syn_sim_log"
-                | "syn_sim_sleep_depth"
-                | "syn_sim_set_dma_active"
-                | "syn_sim_exit"
-                | "syn_sim_stop"
-                | "syn_sim_push_uart1_frame"
-                | "syn_sim_push_uart2_frame"
-                | "zev_ws2812_rgb"
-                | "zev_ws2812_grb"
-                | "zev_cpu_calib_ticks"
-                | "zev_ws2812_store_ns"
-                | "zev_ws2812_t0h"
-                | "zev_pad8_ok"
-        )
-}
-
-fn cast_int_expr(src_ty: &str, src_val: &str, dst_ty: &str, signed: bool) -> String {
-    if src_ty == dst_ty {
-        return format!("  %c0 = add {dst_ty} {src_val}, 0");
-    }
-    let sb = llvm_int_bits(src_ty);
-    let db = llvm_int_bits(dst_ty);
-    if sb < db {
-        let op = if signed { "sext" } else { "zext" };
-        format!("  %c0 = {op} {src_ty} {src_val} to {dst_ty}")
-    } else if sb > db {
-        format!("  %c0 = trunc {src_ty} {src_val} to {dst_ty}")
-    } else {
-        format!("  %c0 = add {dst_ty} {src_val}, 0")
     }
 }
 
@@ -6149,6 +5616,29 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{t} = call i32 @__syn_now_ms()"));
                 Ok(self.coerce(SsaVal::new("i32", t), &dst_lty, false))
             }
+            MirExprKind::SysQuery(q) => {
+                let v = self.next_tmp();
+                match q {
+                    MirSysQuery::CurrentPrio => {
+                        self.emit_line(format!("{v} = call i32 @__syn_current_prio()"));
+                    }
+                    MirSysQuery::SleepDepth => {
+                        let m = self.next_tmp();
+                        let locked = self.next_tmp();
+                        self.emit_line(format!(
+                            "{m} = load volatile i32, ptr @__syn_sleep_lock_mask, align 4"
+                        ));
+                        self.emit_line(format!("{locked} = icmp ne i32 {m}, 0"));
+                        self.emit_line(format!("{v} = select i1 {locked}, i32 1, i32 2"));
+                    }
+                    MirSysQuery::WfiCount => {
+                        self.emit_line(format!(
+                            "{v} = load volatile i32, ptr @__syn_wfi_count, align 4"
+                        ));
+                    }
+                }
+                Ok(self.coerce(SsaVal::new("i32", v), &dst_lty, false))
+            }
         }
     }
 
@@ -6290,6 +5780,44 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{ok} = call i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr {task_arg})"
                 ));
                 Ok(SsaVal::new("i8", ok))
+            }
+            MirPrimReadOp::PingPongDmaBuf {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::PingPong {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let pp_ty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
+                let pptr = self.resolve_prim_ptr(target)?;
+                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let sl_ty = format!("{{ ptr, {usize_ty} }}");
+                let n = (*cap).max(1);
+                let wh_p = self.next_tmp();
+                let wh = self.next_tmp();
+                let is_b0 = self.next_tmp();
+                let b0 = self.next_tmp();
+                let b1 = self.next_tmp();
+                let buf_p = self.next_tmp();
+                let s0 = self.next_tmp();
+                let s1 = self.next_tmp();
+                self.emit_line(format!(
+                    "{wh_p} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 0"
+                ));
+                self.emit_line(format!("{wh} = load i8, ptr {wh_p}, align 1"));
+                self.emit_line(format!("{is_b0} = icmp eq i8 {wh}, 0"));
+                self.emit_line(format!(
+                    "{b0} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 4, i32 0"
+                ));
+                self.emit_line(format!(
+                    "{b1} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 5, i32 0"
+                ));
+                self.emit_line(format!("{buf_p} = select i1 {is_b0}, ptr {b0}, ptr {b1}"));
+                self.emit_line(format!("{s0} = insertvalue {sl_ty} poison, ptr {buf_p}, 0"));
+                self.emit_line(format!("{s1} = insertvalue {sl_ty} {s0}, {usize_ty} {n}, 1"));
+                Ok(SsaVal::new(sl_ty, s1))
             }
         }
     }

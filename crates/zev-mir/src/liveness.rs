@@ -521,7 +521,8 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
         | MirExprKind::MmioAddr(_)
         | MirExprKind::FnAddr(_)
         | MirExprKind::ArrayLen(_)
-        | MirExprKind::NowTicks => {}
+        | MirExprKind::NowTicks
+        | MirExprKind::SysQuery(_) => {}
         MirExprKind::Var(vid)
         | MirExprKind::ResultIsErr(vid)
         | MirExprKind::ResultErr(vid)
@@ -580,7 +581,8 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             | MirPrimReadOp::InboxIsEmpty { target, .. }
             | MirPrimReadOp::InboxIsFull { target, .. }
             | MirPrimReadOp::SignalIsSet { target }
-            | MirPrimReadOp::SignalTryWait { target } => {
+            | MirPrimReadOp::SignalTryWait { target }
+            | MirPrimReadOp::PingPongDmaBuf { target, .. } => {
                 collect_prim_target_uses(target, uses);
             }
         },

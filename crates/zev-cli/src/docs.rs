@@ -529,7 +529,7 @@ zevc run-qemu --max-ticks 50 app.zev  # Deterministic SysTick cap for non-termin
 
 ## 5. Stage 1B: Bare-Metal Espressif ESP32-C6 (`riscv32imac` Direct-Boot)
 Synthesizes `0xAEDB041D` x2 ROM Direct-Boot header, `@_start` at `0x42000008`, watchdog disarm
-(`TIMG0`/`TIMG1`/`LP_WDT`/`SWD`), 16 MHz `SYSTIMER`, `USB_DEVICE` serial, and `.iram1` WS2812B driver:
+(`TIMG0`/`TIMG1`/`LP_WDT`/`SWD`), 16 MHz `SYSTIMER`, `USB_DEVICE` serial, and RMT WS2812B driver (GPIO8):
 ```bash
 zevc emit-llvm --target esp32c6 examples/esp32c6_demo.zev -o build/esp32c6.ll
 zevc build-esp32c6 -Oz examples/esp32c6_demo.zev -o build/esp32c6_demo.bin

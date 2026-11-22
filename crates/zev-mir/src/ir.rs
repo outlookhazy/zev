@@ -969,6 +969,15 @@ pub enum MirExprKind {
     ResultVal(VarId),
     /// Current scheduler tick (`syn_now_ms()`).
     NowTicks,
+    /// Portable kernel state query (`sys.current_prio()`, `sys.sleep_depth()`, `sys.wfi_count()`).
+    SysQuery(MirSysQuery),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirSysQuery {
+    CurrentPrio,
+    SleepDepth,
+    WfiCount,
 }
 
 #[derive(Debug, Clone)]
@@ -1009,6 +1018,11 @@ pub enum MirPrimReadOp {
     },
     SignalTryWait {
         target: MirPrimTarget,
+    },
+    PingPongDmaBuf {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
     },
 }
 

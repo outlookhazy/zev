@@ -9,7 +9,7 @@ use zev_mir::{
     MirChildCallSlot, MirErrorSpec, MirExpr, MirExprKind, MirFloatFmt, MirFmtChunk, MirFnBody,
     MirFunction, MirIntFmt, MirIntrinsicOp, MirIsr, MirModule, MirPlace, MirPrimKind,
     MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirStmt, MirStruct, MirSwitchPattern,
-    MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
+    MirSysQuery, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
 };
 
 use crate::runtime::c99_runtime_preamble;
@@ -81,8 +81,6 @@ impl<'a> C99Emitter<'a> {
             "syn_sim_set_dma_active",
             "syn_sim_push_dma_bytes",
             "syn_sim_push_dma_half",
-            "syn_sim_push_uart1_frame",
-            "syn_sim_push_uart2_frame",
             "syn_sim_pump_ready",
             "syn_sim_advance_ms",
         ]
@@ -852,6 +850,18 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                     self.register_prim_target(target);
                     self.register_prim_kind(&MirPrimKind::Signal);
                 }
+                MirPrimReadOp::PingPongDmaBuf {
+                    target,
+                    elem_ty,
+                    cap,
+                } => {
+                    self.register_prim_target(target);
+                    self.register_prim_kind(&MirPrimKind::PingPong {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    });
+                    self.register_type(&MirType::Slice(Box::new(elem_ty.clone())));
+                }
             },
             MirExprKind::MmioRead { base, index, .. } => {
                 self.register_expr(base);
@@ -1441,7 +1451,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     let n = (*cap).max(1);
                     let _ = writeln!(
                         self.out,
-                        "struct syn_{mangle}_t {{\n    syn_pp_hdr_t hdr;\n    SYN_DMA_ALIGN {ec} buf[2][{n}];\n}};\n\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *pp, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!pp->hdr.chunk_ready) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t ridx = pp->hdr.ready_idx;\n    uint16_t rlen = pp->hdr.ready_len;\n    pp->hdr.chunk_ready = false;\n    syn_exit_critical();\n    out_slice->ptr = &pp->buf[ridx][0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *pp, syn_task_t *task) {{\n    syn_enter_critical();\n    if (pp->hdr.chunk_ready) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    pp->hdr.waiter = task;\n    task->wait_check = syn_pp_hdr_is_ready;\n    task->wait_obj = &pp->hdr;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    syn_pp_hdr_t hdr;\n    SYN_DMA_ALIGN {ec} buf[2][{n}];\n}};\n\nstatic SYN_UNUSED inline {slice_c} syn_{mangle}_dma_buf(syn_{mangle}_t *pp) {{\n    return ({slice_c}){{ .ptr = &pp->buf[pp->hdr.write_idx & 1U][0], .len = (size_t){n}U }};\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *pp, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!pp->hdr.chunk_ready) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t ridx = pp->hdr.ready_idx;\n    uint16_t rlen = pp->hdr.ready_len;\n    pp->hdr.chunk_ready = false;\n    syn_exit_critical();\n    out_slice->ptr = &pp->buf[ridx][0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *pp, syn_task_t *task) {{\n    syn_enter_critical();\n    if (pp->hdr.chunk_ready) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    pp->hdr.waiter = task;\n    task->wait_check = syn_pp_hdr_is_ready;\n    task->wait_obj = &pp->hdr;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
                     );
                 }
                 MirPrimKind::Lease { elem, cap } => {
@@ -1910,62 +1920,6 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                 }
                 self.out.push_str("}\n\n");
             }
-        }
-
-        // Synthesize convenience UART frame injection hooks when `uart1_dma` / `uart2_dma` exist
-        let find_dma_irq = |prim_name: &str| -> Option<u32> {
-            self.m.irq_vectors.iter().find_map(|v| {
-                v.bindings
-                    .iter()
-                    .any(|b| {
-                        b.baked_args
-                            .iter()
-                            .any(|a| matches!(a, MirBakedArg::PrimAddr(p) if p == prim_name))
-                    })
-                    .then_some(v.irq_num)
-            })
-        };
-        let has_u1 = self.m.primitives.iter().any(|p| {
-            p.name == "uart1_dma" && matches!(p.kind, MirPrimKind::PingPong { .. })
-        });
-        if has_u1 {
-            let trig = if let Some(irq_num) = find_dma_irq("uart1_dma") {
-                format!("__zev_irq_vec_{irq_num}();")
-            } else if self
-                .m
-                .isrs
-                .iter()
-                .any(|i| i.name == "DMA1_CH5" && i.params.is_empty() && i.state_vars.is_empty())
-            {
-                "syn_sim_fire_isr_DMA1_CH5();".to_string()
-            } else {
-                "syn_pp_hdr_flip(&uart1_dma.hdr);".to_string()
-            };
-            let _ = writeln!(
-                self.out,
-                "void syn_sim_push_uart1_frame(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4) {{\n    uint8_t _pkt[5] = {{ b0, b1, b2, b3, b4 }};\n    syn_sim_push_dma_bytes(&uart1_dma, _pkt, 5U);\n    {trig}\n}}\n"
-            );
-        }
-        let has_u2 = self.m.primitives.iter().any(|p| {
-            p.name == "uart2_dma" && matches!(p.kind, MirPrimKind::PingPong { .. })
-        });
-        if has_u2 {
-            let trig = if let Some(irq_num) = find_dma_irq("uart2_dma") {
-                format!("__zev_irq_vec_{irq_num}();")
-            } else if self
-                .m
-                .isrs
-                .iter()
-                .any(|i| i.name == "DMA1_CH6" && i.params.is_empty() && i.state_vars.is_empty())
-            {
-                "syn_sim_fire_isr_DMA1_CH6();".to_string()
-            } else {
-                "syn_pp_hdr_flip(&uart2_dma.hdr);".to_string()
-            };
-            let _ = writeln!(
-                self.out,
-                "void syn_sim_push_uart2_frame(uint8_t b0, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4) {{\n    uint8_t _pkt[5] = {{ b0, b1, b2, b3, b4 }};\n    syn_sim_push_dma_bytes(&uart2_dma, _pkt, 5U);\n    {trig}\n}}\n"
-            );
         }
 
         // Synthesize `syn_sim_pend_irq(uint32_t irq)` mapping NVIC vector IDs to user ISRs / vectors
@@ -3101,6 +3055,13 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                         .unwrap_or_else(|| "0U".to_string());
                     let _ = writeln!(self.out, "{pad}syn_sim_pend_irq((uint32_t)({irq}));");
                 }
+                "trace_sleep" => {
+                    let on = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "false".to_string());
+                    let _ = writeln!(self.out, "{pad}syn_sim_enable_trace((bool)({on}));");
+                }
                 _ => {
                     for a in args {
                         let s = self.fmt_expr(a, vars);
@@ -3459,6 +3420,18 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                         self.fmt_prim_ptr(target, vars)
                     )
                 }
+                MirPrimReadOp::PingPongDmaBuf {
+                    target,
+                    elem_ty,
+                    cap,
+                } => {
+                    let mangle = MirPrimKind::PingPong {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    }
+                    .mangle_name();
+                    format!("syn_{mangle}_dma_buf({})", self.fmt_prim_ptr(target, vars))
+                }
             },
             MirExprKind::CallDirect {
                 callee,
@@ -3487,6 +3460,14 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
             MirExprKind::ResultErr(vid) => format!("({}.err)", self.var_ref(*vid, vars)),
             MirExprKind::ResultVal(vid) => format!("({}.val)", self.var_ref(*vid, vars)),
             MirExprKind::NowTicks => "syn_now_ms()".to_string(),
+            MirExprKind::SysQuery(q) => match q {
+                MirSysQuery::CurrentPrio => {
+                    "(g_syn_sched.running != NULL ? (uint32_t)g_syn_sched.running->priority : 255U)"
+                        .to_string()
+                }
+                MirSysQuery::SleepDepth => "(uint32_t)syn_allowed_sleep_depth()".to_string(),
+                MirSysQuery::WfiCount => "g_syn_sleep.enter_count".to_string(),
+            },
         }
     }
 

@@ -11,14 +11,6 @@ import chip.stm32g4 as hw;
 import bsp.motor_drive as bsp;
 import std.fmt as fmt;
 
-// Simulation stimulus hooks (synthesized by `zev-codegen-c` host simulation runtime)
-extern "C" fn syn_sim_enable_trace(bool on);
-extern "C" fn syn_sim_log(u32 tag, u32 a, u32 b);
-extern "C" fn syn_sim_set_dma_active(u32 active);
-extern "C" u32 syn_sim_sleep_depth();
-extern "C" fn syn_sim_push_uart1_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
-extern "C" fn syn_sim_push_uart2_frame(u8 b0, u8 b1, u8 b2, u8 b3, u8 b4);
-
 packed struct CmdFrame {
     u8    op;
     u16be setpoint;
@@ -199,6 +191,27 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
 
 // ── Deterministic Host Simulation Stimulus Task ─────────────────────────────
 
+fn stage_dma_frame(*ping_pong<u8, 64> pp, u8 b0, u8 b1, u8 b2, u8 b3, u8 b4) {
+    []u8 wb = pp.dma_buf();
+    wb[0] = b0;
+    wb[1] = b1;
+    wb[2] = b2;
+    wb[3] = b3;
+    wb[4] = b4;
+}
+
+fn sim_milestone(u32 tag, u32 a, u32 b) {
+    u32 d = sys.sleep_depth();
+    u32 t = sys.now_ms();
+    if (d == 1) {
+        println(f"[SIM t={t}ms] milestone={tag} a={a} b={b} (allowed_sleep=Light)");
+    } else if (d == 2) {
+        println(f"[SIM t={t}ms] milestone={tag} a={a} b={b} (allowed_sleep=Deep)");
+    } else {
+        println(f"[SIM t={t}ms] milestone={tag} a={a} b={b} (allowed_sleep=None)");
+    }
+}
+
 task sim_stimulus() {
     u32 tick = 0;
     FixedVec<u16, 4> rpm_hist = FixedVec<u16, 4> { data: [0, 0, 0, 0], len: 0 };
@@ -208,27 +221,30 @@ task sim_stimulus() {
 
         if (tick == 1) {
             // Milestone 1: Active @dma_safe ping_pong clamps sleep depth to Light
-            u32 depth_locked = syn_sim_sleep_depth();
-            syn_sim_log(1, depth_locked, 0);
+            u32 depth_locked = sys.sleep_depth();
+            sim_milestone(1, depth_locked, 0);
 
             // Inject valid big-endian u16be frame on UART1: setpoint = 0x0960 (2400 RPM), crc = 0x1EBF
-            syn_sim_push_uart1_frame(1, 9, 96, 30, 191);
+            stage_dma_frame(&uart1_dma, 1, 9, 96, 30, 191);
+            sys.pend_irq(hw.IRQ_DMA1_CH5);
             // Inject valid big-endian u16be frame on UART2: setpoint = 0x0708 (1800 RPM), crc = 0xC265
-            syn_sim_push_uart2_frame(1, 7, 8, 194, 101);
+            stage_dma_frame(&uart2_dma, 1, 7, 8, 194, 101);
+            sys.pend_irq(hw.IRQ_DMA1_CH6);
         }
 
         if (tick == 4) {
             // Milestone 2: Verify u16be decoded RPMs & 1ms PI duties
             u16 r1 = motor1_rpm.read();
             u16 r2 = motor2_rpm.read();
-            syn_sim_log(2, r1 as u32, r2 as u32);
+            sim_milestone(2, r1 as u32, r2 as u32);
             u16 d1 = motor1_duty.read();
             u16 d2 = motor2_duty.read();
-            syn_sim_log(3, d1 as u32, d2 as u32);
+            sim_milestone(3, d1 as u32, d2 as u32);
             log_sim_duty_snapshot(&rpm_hist, r1, r2, d1, d2);
 
             // Milestone 3: Inject corrupted CRC frame on UART1 -> triggers error BadCrc -> catch -> BadPacket
-            syn_sim_push_uart1_frame(1, 11, 184, 222, 173);
+            stage_dma_frame(&uart1_dma, 1, 11, 184, 222, 173);
+            sys.pend_irq(hw.IRQ_DMA1_CH5);
         }
 
         if (tick == 6) {
@@ -245,16 +261,17 @@ task sim_stimulus() {
             // Milestone 6: Verify motors safely zeroed, fault record committed, and release DMA wake-lock
             u32 r1_after = motor1_rpm.read();
             u32 r2_after = motor2_rpm.read();
-            syn_sim_log(4, r1_after, r2_after);
+            sim_milestone(4, r1_after, r2_after);
 
-            syn_sim_set_dma_active(0);
+            uart1_dma.stop();
+            uart2_dma.stop();
         }
 
         if (tick == 12) {
             // Milestone 7: Confirm tickless idle entered DEEP sleep after DMA release & exit cleanly
-            u32 depth_unlocked = syn_sim_sleep_depth();
+            u32 depth_unlocked = sys.sleep_depth();
             u32 diag = diag_telemetry.read();
-            syn_sim_log(5, depth_unlocked, diag);
+            sim_milestone(5, depth_unlocked, diag);
             println(f"[SIM] complete: sleep_depth={depth_unlocked} fault_diag=0x{diag:08x}");
 
             sys.exit(0);
@@ -265,12 +282,13 @@ task sim_stimulus() {
 // ── Sequential Entry Point & @low Supervisor Loop ───────────────────────────
 
 fn main() {
-    syn_sim_enable_trace(true);
+    sys.trace_sleep(true);
     setup_clocks();
     sys.use_systick(170_000_000);
     bsp.configure_uart1_rx_dma();
     bsp.configure_uart2_rx_dma();
-    syn_sim_set_dma_active(1);
+    uart1_dma.start();
+    uart2_dma.start();
 
     hw.IRQ_EXTI0.attach(overcurrent_isr(&sup_inbox, hw.GPIOA));
     hw.IRQ_DMA1_CH5.attach(dma_rx_isr(&uart1_dma, hw.DMA1, hw.DMA_HTIF5 | hw.DMA_TCIF5));

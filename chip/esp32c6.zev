@@ -6,9 +6,10 @@ pub mmio GpioRegs {
     @wo  u32     out_w1tc    @ 0x0C;
     @wo  u32     enable_w1ts @ 0x24;
     @wo  u32     enable_w1tc @ 0x28;
-    @ro  u32     in_reg      @ 0x3C;
-    @w1c u32     status_w1tc @ 0x4C;
-    @rw  [31]u32 pin         @ 0x74;
+    @ro  u32     in_reg           @ 0x3C;
+    @w1c u32     status_w1tc      @ 0x4C;
+    @rw  [31]u32 pin              @ 0x74;
+    @rw  [31]u32 func_out_sel_cfg @ 0x554;
 }
 
 pub mmio IoMuxRegs {
@@ -50,8 +51,29 @@ pub mmio PlicMxRegs {
     @rw  u32     thresh     @ 0x90;
 }
 
+pub mmio PcrRegs {
+    @rw u32 rmt_conf      @ 0x2C;
+    @rw u32 rmt_sclk_conf @ 0x30;
+    @rw u32 systimer_conf @ 0x54;
+}
+
+pub mmio RmtRegs {
+    @rw  u32 ch0conf0    @ 0x10;
+    @ro  u32 int_raw     @ 0x38;
+    @w1c u32 int_clr     @ 0x44;
+    @rw  u32 sys_conf    @ 0x68;
+    @wo  u32 ref_cnt_rst @ 0x70;
+}
+
+pub mmio RmtMemRegs {
+    @rw [48]u32 ch0 @ 0x00;
+}
+
 pub mmio GPIO       : GpioRegs      @ 0x6009_1000;
 pub mmio IO_MUX     : IoMuxRegs     @ 0x6009_0000;
+pub mmio PCR        : PcrRegs       @ 0x6009_6000;
+pub mmio RMT        : RmtRegs       @ 0x6000_6000;
+pub mmio RMTMEM     : RmtMemRegs    @ 0x6000_6400;
 pub mmio SYSTIMER   : SystimerRegs  @ 0x6000_A000;
 pub mmio USB_DEVICE : UsbDeviceRegs @ 0x6000_F000;
 pub mmio INTMTX     : IntmtxRegs    @ 0x6001_0000;
@@ -65,5 +87,6 @@ pub irq IRQ_GPIO             = 30;
 pub irq IRQ_UART0            = 43;
 pub irq IRQ_SYSTIMER_TARGET0 = 57;
 
-pub const u32 PIN_RGB_LED  = 8;
-pub const u32 PIN_BOOT_BTN = 9;
+pub const u32 PIN_RGB_LED      = 8;
+pub const u32 PIN_BOOT_BTN     = 9;
+pub const u32 RMT_SIG_OUT0_IDX = 71;

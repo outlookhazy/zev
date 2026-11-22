@@ -802,6 +802,20 @@ done:
   ret void
 }}
 
+define i32 @__syn_current_prio() nounwind{sz} {{
+entry:
+  %cur = load ptr, ptr @__syn_current_task, align 4
+  %isnull = icmp eq ptr %cur, null
+  br i1 %isnull, label %none, label %ok
+none:
+  ret i32 255
+ok:
+  %ep_p = getelementptr inbounds %SynTask, ptr %cur, i32 0, i32 4
+  %ep = load i8, ptr %ep_p, align 1
+  %ep32 = zext i8 %ep to i32
+  ret i32 %ep32
+}}
+
 define void @__syn_wake_waiters(ptr %prim, i32 %boost_prio) nounwind{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4

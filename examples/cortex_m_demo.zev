@@ -13,13 +13,6 @@ import chip.lm3s6965 as hw;
 import bsp.lm3s6965_evb as bsp;
 import std.fmt as fmt;
 
-// Kernel telemetry & DMA simulation stimulus hooks (no peripheral register shims!)
-extern "C" fn syn_dma_write_u8(ping_pong<u8, 64> *pp, u32 idx, u8 val);
-extern "C" fn syn_dma_set_active(ping_pong<u8, 64> *pp, bool active);
-extern "C" u32 syn_last_sleep_depth();
-extern "C" u32 syn_wfi_count();
-extern "C" u32 syn_current_prio();
-
 packed struct CmdFrame {
     u8    op;
     u16be setpoint;
@@ -150,12 +143,21 @@ task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
     }
 }
 
+fn stage_uart_frame(*ping_pong<u8, 64> pp, u8 b0, u8 b1, u8 b2, u8 b3, u8 b4) {
+    []u8 wb = pp.dma_buf();
+    wb[0] = b0;
+    wb[1] = b1;
+    wb[2] = b2;
+    wb[3] = b3;
+    wb[4] = b4;
+}
+
 // ── Sequential Boot + Low-Priority Fault Supervisor ─────────────────────────
 fn main() {
     bsp.init_board();
     // 12 MHz Stellaris LM3S6965 clock -> exact 1 ms hardware SysTick interrupts
     sys.use_systick(12_000_000);
-    syn_dma_set_active(&uart1_dma, true);
+    uart1_dma.start();
 
     hw.IRQ_GPIOA.attach(gpio_fault_isr(&sup_inbox, hw.GPIOA));
     hw.IRQ_UART0.attach(uart_dma_isr(&uart1_dma, hw.UART0));
@@ -173,11 +175,7 @@ fn main() {
     loop {
         if (stage == 0) {
             // Stage valid u16be setpoint=1800 (0x0708), crc=0xC265 (194, 101) -> pend NVIC IRQ5 (`UART0`)
-            syn_dma_write_u8(&uart1_dma, 0, 1);
-            syn_dma_write_u8(&uart1_dma, 1, 7);
-            syn_dma_write_u8(&uart1_dma, 2, 8);
-            syn_dma_write_u8(&uart1_dma, 3, 194);
-            syn_dma_write_u8(&uart1_dma, 4, 101);
+            stage_uart_frame(&uart1_dma, 1, 7, 8, 194, 101);
             bsp.pend_nvic_irq(hw.IRQ_UART0_NUM);
             checkpoint();
 
@@ -185,14 +183,10 @@ fn main() {
             delay(3ms);
             println(f"[TELEM] motor1_rpm={motor1_rpm.read()}");
             println(f"[TELEM] pwm_duty={bsp.read_pwm_duty(1)}");
-            println(f"[TELEM] sleep_depth_dma_active={syn_last_sleep_depth()}");
+            println(f"[TELEM] sleep_depth_dma_active={sys.sleep_depth()}");
 
             // Stage corrupt-CRC frame -> triggers ParseErr::BadCrc -> sup_inbox.post(BadPacket)
-            syn_dma_write_u8(&uart1_dma, 0, 1);
-            syn_dma_write_u8(&uart1_dma, 1, 7);
-            syn_dma_write_u8(&uart1_dma, 2, 8);
-            syn_dma_write_u8(&uart1_dma, 3, 222);
-            syn_dma_write_u8(&uart1_dma, 4, 173);
+            stage_uart_frame(&uart1_dma, 1, 7, 8, 222, 173);
             bsp.pend_nvic_irq(hw.IRQ_UART0_NUM);
             stage = 1;
         }
@@ -204,10 +198,10 @@ fn main() {
                 bad_packets += 1;
                 println(f"[TELEM] bad_packets={bad_packets}");
                 // Release DMA wake-lock so next WFI enters DEEP (2) sleep and triggers IdleCheck
-                syn_dma_set_active(&uart1_dma, false);
+                uart1_dma.stop();
             }
             IdleCheck => {
-                println(f"[TELEM] sleep_depth_dma_idle={syn_last_sleep_depth()}");
+                println(f"[TELEM] sleep_depth_dma_idle={sys.sleep_depth()}");
                 scrub_flash_crc();
                 if (stage == 1) {
                     stage = 2;
@@ -216,7 +210,7 @@ fn main() {
                 }
             }
             Overcurrent => {
-                u32 boosted_prio = syn_current_prio();
+                u32 boosted_prio = sys.current_prio();
                 println(f"[TELEM] sup_boosted_prio={boosted_prio}");
                 println(f"[TELEM] gpio_safe_off={bsp.read_motor_enable()}");
                 motor1_rpm.publish(0);
@@ -231,8 +225,8 @@ fn main() {
     }
 
     // EndInboxTurn runs automatically on break, restoring supervisor priority to @low (3)!
-    println(f"[TELEM] sup_restored_prio={syn_current_prio()}");
-    println(f"[TELEM] wfi_sleeps={syn_wfi_count()}");
+    println(f"[TELEM] sup_restored_prio={sys.current_prio()}");
+    println(f"[TELEM] wfi_sleeps={sys.wfi_count()}");
     println(f"[TELEM] fault_diag=0x{flash_diag.read():08x}");
     println("[PASS] CORTEX-M3 BARE-METAL DEMO OK");
     sys.exit(0);

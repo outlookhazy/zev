@@ -11,8 +11,6 @@
 import chip.atmega328p as hw;
 import bsp.arduino_uno as bsp;
 
-extern "C" u32 zev_now_ms();
-
 inbox<u32, 8> t1_inbox;
 watch<u32>    pad_edges = 0;
 
@@ -52,7 +50,7 @@ task uno_telemetry() {
                 last_t1 = v;
             }
         }
-        u32 ms = zev_now_ms();
+        u32 ms = sys.now_ms();
         u8 led = bsp.read_led();
         u8 d2 = bsp.read_d2_pin();
         u32 edges = pad_edges.read();
