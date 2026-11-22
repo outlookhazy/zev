@@ -30,6 +30,10 @@ SerialPort               uart_port;
 dma_slot<SpiBurst>       spi_inflight;
 inbox<Lease<SpiBurst>, 2> spi_done_q;
 
+isr timer0_tick_isr() {
+    sys.tick();
+}
+
 isr timer1_isr(*inbox<u32, 8> q, *hw.TifrRegs tifr) {
     state u32 seq = 0;
     seq += 1;
@@ -211,8 +215,10 @@ task serial_cmd_worker(*SerialPort port, *watch<u32> edges_w) {
 }
 
 fn main() {
+    bsp.init_mcu_core();
     bsp.init_board_gpio();
     bsp.init_adc();
+    hw.IRQ_TIMER0_COMPA.attach(timer0_tick_isr());
     hw.IRQ_TIMER1_COMPA.attach(timer1_isr(&t1_inbox, hw.TIFR));
     hw.IRQ_PCINT0.attach_shared(pcint_isr_a(hw.PCIFR));
     hw.IRQ_PCINT0.attach_shared(pcint_isr_b(&pad_edges));

@@ -1,0 +1,587 @@
+// Raspberry Pi Pico W (RP2040) Board Support Package (100% Pure .zev, Zero C)
+//
+// Owns RP2040 clock synthesis (`XOSC` -> 125 MHz `PLL_SYS`, 48 MHz `PLL_USB`, `RESETS`),
+// Full-Speed USB 1.1 CDC-ACM device enumeration & transfers, `ADC` temperature sensor,
+// `TIMER` `ALARM0`, and `PIO0` + `DMA` orchestration directly in typed `.zev`.
+import chip.rp2040 as hw;
+
+pub struct UsbCdcState {
+    u32   ep0_pid;
+    u32   ep1_pid;
+    u32   ep2_pid;
+    u32   ep0_off;
+    u32   ep0_rem;
+    u32   baud;
+    u8    ep0_desc_id;
+    bool  ep2_busy;
+    bool  should_addr;
+    u8    pending_addr;
+    bool  expect_lc;
+    bool  boot_rst;
+    bool  was_data_in;
+    bool  need_zlp;
+    bool  configured;
+    bool  dtr;
+    [7]u8 line_coding;
+}
+
+pub fn init_clocks() {
+    critical {
+        // 1. Disable clock resus and bring up 12 MHz crystal oscillator (XOSC).
+        hw.CLOCKS.clk_sys_resus_ctrl = 0;
+        hw.XOSC.startup = 47;
+        hw.XOSC.ctrl = 0x00FA_BAA0;
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.XOSC.status & 0x8000_0000) != 0) {
+                break;
+            }
+        }
+
+        // 2. Switch CLK_SYS cleanly onto CLK_REF, then switch CLK_REF to XOSC (12 MHz).
+        hw.CLOCKS.clk_sys_ctrl = hw.CLOCKS.clk_sys_ctrl & (~1u32);
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.CLOCKS.clk_sys_selected & 1) != 0) {
+                break;
+            }
+        }
+        hw.CLOCKS.clk_ref_div = 0x100;
+        hw.CLOCKS.clk_ref_ctrl = 2;
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.CLOCKS.clk_ref_selected & 4) != 0) {
+                break;
+            }
+        }
+
+        // 3. Reset & unreset PLL_SYS and PLL_USB (0x3000 = bits 12 | 13).
+        hw.RESETS_SET.reset = 0x3000;
+        hw.RESETS_CLR.reset = 0x3000;
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.RESETS.reset_done & 0x3000) == 0x3000) {
+                break;
+            }
+        }
+
+        // 4. Configure PLL_SYS for 125 MHz (12 MHz * 125 = 1500 MHz VCO / 6 / 2).
+        hw.PLL_SYS.cs = 1;
+        hw.PLL_SYS.fbdiv_int = 125;
+        hw.PLL_SYS_CLR.pwr = 0x21;
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.PLL_SYS.cs & 0x8000_0000) != 0) {
+                break;
+            }
+        }
+        hw.PLL_SYS.prim = (6 << 16) | (2 << 12);
+        hw.PLL_SYS_CLR.pwr = 0x08;
+
+        // 5. Configure PLL_USB for 48 MHz (12 MHz * 100 = 1200 MHz VCO / 5 / 5).
+        hw.PLL_USB.cs = 1;
+        hw.PLL_USB.fbdiv_int = 100;
+        hw.PLL_USB_CLR.pwr = 0x21;
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.PLL_USB.cs & 0x8000_0000) != 0) {
+                break;
+            }
+        }
+        hw.PLL_USB.prim = (5 << 16) | (5 << 12);
+        hw.PLL_USB_CLR.pwr = 0x08;
+
+        // 6. Switch CLK_SYS to PLL_SYS (125 MHz), enable PERI/USB/ADC clocks, and start 1 MHz tick.
+        hw.CLOCKS.clk_sys_div = 0x100;
+        hw.CLOCKS.clk_sys_ctrl = 0;
+        hw.CLOCKS.clk_sys_ctrl = 1;
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.CLOCKS.clk_sys_selected & 2) != 0) {
+                break;
+            }
+        }
+        hw.CLOCKS.clk_peri_ctrl = 0x800;
+        hw.CLOCKS.clk_usb_div = 0x100;
+        hw.CLOCKS.clk_usb_ctrl = 0x800;
+        hw.CLOCKS.clk_adc_div = 0x100;
+        hw.CLOCKS.clk_adc_ctrl = 0x800;
+        hw.WATCHDOG.tick = (1 << 9) | 12;
+
+        // 7. Reset & unreset ADC | DMA | IO_BANK0 | PADS_BANK0 | PIO0 | TIMER | USBCTRL (0x0120_0525).
+        hw.RESETS_SET.reset = 0x0120_0525;
+        hw.RESETS_CLR.reset = 0x0120_0525;
+        for (u32 spin in 0..1_000_000) {
+            if ((hw.RESETS.reset_done & 0x0120_0525) == 0x0120_0525) {
+                break;
+            }
+        }
+    }
+}
+
+pub fn init_usb_cdc() {
+    for (usize i in 0..15) {
+        hw.USB_DPRAM.ep_ctrl[i] = 0;
+    }
+    for (usize i in 0..16) {
+        hw.USB_DPRAM.ep_buf_ctrl[i] = 0;
+    }
+    // EP1_OUT Bulk @ 0x180, EP2_IN Bulk @ 0x1C0, EP3_IN Interrupt @ 0x200
+    hw.USB_DPRAM.ep_ctrl[1] = 0xA800_0180;
+    hw.USB_DPRAM.ep_ctrl[2] = 0xA800_01C0;
+    hw.USB_DPRAM.ep_ctrl[4] = 0xAC00_0200;
+
+    hw.USBCTRL.usb_muxing = 9;
+    hw.USBCTRL.usb_pwr = 12;
+    hw.USBCTRL.main_ctrl = 1;
+    hw.USBCTRL.sie_ctrl = 0x2000_0000;
+    hw.USBCTRL.inte = 0x0001_1010;
+    hw.USBCTRL_SET.sie_ctrl = 0x0001_0000;
+}
+
+fn write_buf_ctrl(usize idx, u32 val_no_avail) {
+    hw.USB_DPRAM.ep_buf_ctrl[idx] = val_no_avail;
+    // RP2040 Datasheet 4.1.2.5.1: allow >= 12 clk_sys cycles before setting BUF_CTRL_AVAIL (0x0400).
+    u32 _d0 = hw.USBCTRL.ints;
+    u32 _d1 = hw.USBCTRL.ints;
+    u32 _d2 = hw.USBCTRL.ints;
+    u32 _d3 = hw.USBCTRL.ints;
+    u32 _d_acc = _d0 ^ _d1 ^ _d2 ^ _d3;
+    if (_d_acc == 0xFFFF_FFFF) {
+        hw.USB_DPRAM.ep_buf_ctrl[idx] = val_no_avail;
+    }
+    hw.USB_DPRAM.ep_buf_ctrl[idx] = val_no_avail | 0x0400;
+}
+
+u8 utf16_str_desc_byte([]u8 txt, usize idx) {
+    if (idx == 0) {
+        return (2 + (txt.len * 2)) as u8;
+    }
+    if (idx == 1) {
+        return 3u8;
+    }
+    if ((idx & 1usize) == 0usize) {
+        usize ci = (idx - 2usize) >> 1;
+        if (ci < txt.len) {
+            return txt[ci];
+        }
+    }
+    return 0u8;
+}
+
+u8 ep0_desc_byte(*UsbCdcState st, usize idx) {
+    // 18-byte USB 2.0 CDC Device Descriptor (VID=0x2E8A, PID=0x000A, maxpkt0=64, 1 config)
+    []u8 dev_desc = "\x12\x01\x00\x02\x02\x00\x00\x40\x8A\x2E\x0A\x00\x00\x01\x01\x02\x03\x01";
+    // 67-byte CDC-ACM Configuration Descriptor (IF0+EP3 INT 0x83, IF1+EP1 OUT 0x01+EP2 IN 0x82)
+    []u8 cfg_desc = "\x09\x02\x43\x00\x02\x01\x00\x80\x7D\x09\x04\x00\x00\x01\x02\x02\x00\x00\x05\x24\x00\x10\x01\x05\x24\x01\x00\x01\x04\x24\x02\x02\x05\x24\x06\x00\x01\x07\x05\x83\x03\x08\x00\x10\x09\x04\x01\x00\x02\x0A\x00\x00\x00\x07\x05\x01\x02\x40\x00\x00\x07\x05\x82\x02\x40\x00\x00";
+    []u8 str0 = "\x04\x03\x09\x04";
+
+    if (st.ep0_desc_id == 1u8) {
+        if (idx < dev_desc.len) {
+            return dev_desc[idx];
+        }
+        return 0u8;
+    }
+    if (st.ep0_desc_id == 2u8) {
+        if (idx < cfg_desc.len) {
+            return cfg_desc[idx];
+        }
+        return 0u8;
+    }
+    if (st.ep0_desc_id == 10u8) {
+        if (idx < str0.len) {
+            return str0[idx];
+        }
+        return 0u8;
+    }
+    if (st.ep0_desc_id == 11u8) {
+        return utf16_str_desc_byte("Zev", idx);
+    }
+    if (st.ep0_desc_id == 12u8) {
+        return utf16_str_desc_byte("Zev RP2040 Pico W", idx);
+    }
+    if (st.ep0_desc_id == 13u8) {
+        return utf16_str_desc_byte("ZEV2040", idx);
+    }
+    if (st.ep0_desc_id == 4u8) {
+        if (st.configured) {
+            return 1u8;
+        }
+        return 0u8;
+    }
+    if (st.ep0_desc_id == 6u8 && idx < 7usize) {
+        return st.line_coding[idx];
+    }
+    return 0u8;
+}
+
+fn ep0_in_next(*UsbCdcState st) {
+    if (st.ep0_rem > 0u32) {
+        u32 n = st.ep0_rem;
+        if (n > 64u32) {
+            n = 64u32;
+        }
+        for (u32 i in 0..64) {
+            if (i >= n) {
+                break;
+            }
+            hw.USB_DPRAM.ep0_buf[i as usize] = ep0_desc_byte(st, (st.ep0_off + i) as usize);
+        }
+        st.ep0_off += n;
+        st.ep0_rem -= n;
+        u32 pid = st.ep0_pid;
+        st.ep0_pid = pid ^ 8192u32;
+        write_buf_ctrl(0, pid | 32768u32 | n);
+        return;
+    }
+    if (st.need_zlp) {
+        st.need_zlp = false;
+        u32 zpid = st.ep0_pid;
+        st.ep0_pid = zpid ^ 8192u32;
+        write_buf_ctrl(0, zpid | 32768u32);
+        return;
+    }
+    if (st.was_data_in) {
+        st.was_data_in = false;
+        write_buf_ctrl(1, 8256u32);
+    }
+}
+
+fn ep0_start_in(*UsbCdcState st, u8 desc_id, u32 desc_len, u32 wlen) {
+    u32 n = desc_len;
+    if (wlen < n) {
+        n = wlen;
+    }
+    st.need_zlp = (n == 64u32) && (wlen > desc_len);
+    st.ep0_desc_id = desc_id;
+    st.ep0_off = 0u32;
+    st.ep0_rem = n;
+    st.ep0_pid = 8192u32;
+    st.was_data_in = true;
+    ep0_in_next(st);
+}
+
+fn ep0_ack_out(*UsbCdcState st) {
+    st.was_data_in = false;
+    st.ep0_rem = 0u32;
+    st.need_zlp = false;
+    write_buf_ctrl(0, 40960u32);
+}
+
+fn ep0_stall() {
+    hw.USBCTRL.ep_stall_arm = 3u32;
+    hw.USB_DPRAM.ep_buf_ctrl[0] = 2048u32;
+    hw.USB_DPRAM.ep_buf_ctrl[1] = 2048u32;
+}
+
+fn usb_handle_setup(*UsbCdcState st) {
+    hw.USB_DPRAM.ep_buf_ctrl[0] = 0u32;
+    hw.USB_DPRAM.ep_buf_ctrl[1] = 0u32;
+    st.expect_lc = false;
+
+    u8 bm = hw.USB_DPRAM.setup_packet[0];
+    u8 req = hw.USB_DPRAM.setup_packet[1];
+    u8 wvl = hw.USB_DPRAM.setup_packet[2];
+    u8 wvh = hw.USB_DPRAM.setup_packet[3];
+    u32 wval = (wvl as u32) | ((wvh as u32) << 8);
+    u32 wlen = (hw.USB_DPRAM.setup_packet[6] as u32) | ((hw.USB_DPRAM.setup_packet[7] as u32) << 8);
+
+    if (bm == 0u8) {
+        if (req == 5u8) {
+            st.pending_addr = wvl;
+            st.should_addr = true;
+            ep0_ack_out(st);
+            return;
+        }
+        if (req == 9u8) {
+            st.ep1_pid = 0u32;
+            st.ep2_pid = 0u32;
+            st.ep2_busy = false;
+            st.configured = (wval & 0xFFu32) != 0u32;
+            write_buf_ctrl(3, 64u32);
+            ep0_ack_out(st);
+            return;
+        }
+        if (wlen == 0u32) {
+            ep0_ack_out(st);
+        } else {
+            ep0_stall();
+        }
+        return;
+    }
+
+    if (bm == 128u8) {
+        if (req == 6u8) {
+            if (wvh == 1u8) {
+                ep0_start_in(st, 1u8, 18u32, wlen);
+                return;
+            }
+            if (wvh == 2u8) {
+                ep0_start_in(st, 2u8, 67u32, wlen);
+                return;
+            }
+            if (wvh == 3u8) {
+                if (wvl == 0u8) {
+                    ep0_start_in(st, 10u8, 4u32, wlen);
+                    return;
+                }
+                if (wvl == 1u8) {
+                    ep0_start_in(st, 11u8, 8u32, wlen);
+                    return;
+                }
+                if (wvl == 2u8) {
+                    ep0_start_in(st, 12u8, 36u32, wlen);
+                    return;
+                }
+                if (wvl == 3u8) {
+                    ep0_start_in(st, 13u8, 16u32, wlen);
+                    return;
+                }
+            }
+            ep0_stall();
+            return;
+        }
+        if (req == 8u8) {
+            ep0_start_in(st, 4u8, 1u32, wlen);
+            return;
+        }
+        if (req == 0u8) {
+            ep0_start_in(st, 5u8, 2u32, wlen);
+            return;
+        }
+        ep0_stall();
+        return;
+    }
+
+    if (bm == 33u8) {
+        if (req == 32u8) {
+            st.expect_lc = true;
+            write_buf_ctrl(1, 8256u32);
+            return;
+        }
+        if (req == 34u8) {
+            st.dtr = (wval & 1u32) != 0u32;
+            if (st.baud == 1200u32 && !st.dtr) {
+                st.boot_rst = true;
+            }
+            ep0_ack_out(st);
+            return;
+        }
+        if (wlen == 0u32) {
+            ep0_ack_out(st);
+        } else {
+            ep0_stall();
+        }
+        return;
+    }
+
+    if (bm == 161u8) {
+        if (req == 33u8) {
+            ep0_start_in(st, 6u8, 7u32, wlen);
+            return;
+        }
+        ep0_stall();
+        return;
+    }
+
+    if ((bm & 128u8) == 0u8 && wlen == 0u32) {
+        ep0_ack_out(st);
+    } else {
+        ep0_stall();
+    }
+}
+
+fn usb_cdc_pump_tx(*UsbCdcState st, *byte_ring tx) {
+    if (!st.configured || !st.dtr || st.ep2_busy) {
+        return;
+    }
+    u32 cnt = 0u32;
+    for (u32 i in 0..64) {
+        u8 b = tx.try_pop_byte() catch {
+            break;
+        };
+        hw.USB_DPRAM.ep2_in_buf[i as usize] = b;
+        cnt += 1u32;
+    }
+    if (cnt == 0u32) {
+        return;
+    }
+    st.ep2_busy = true;
+    u32 pid = st.ep2_pid;
+    st.ep2_pid = pid ^ 8192u32;
+    write_buf_ctrl(4, pid | 32768u32 | cnt);
+}
+
+pub bool usb_cdc_irq_step(*UsbCdcState st, *byte_ring rx, *byte_ring tx) {
+    bool boot_now = false;
+    u32 ints = hw.USBCTRL.ints;
+
+    if ((ints & 4096u32) != 0u32) {
+        hw.USBCTRL_CLR.sie_status = 0x0008_0000u32;
+        hw.USBCTRL.addr_endp = 0u32;
+        st.should_addr = false;
+        st.expect_lc = false;
+        st.boot_rst = false;
+        st.was_data_in = false;
+        st.need_zlp = false;
+        st.ep0_rem = 0u32;
+        st.ep1_pid = 0u32;
+        st.ep2_pid = 0u32;
+        st.ep2_busy = false;
+        st.configured = false;
+        st.dtr = false;
+        hw.USB_DPRAM.ep_buf_ctrl[0] = 0u32;
+        hw.USB_DPRAM.ep_buf_ctrl[1] = 0u32;
+        hw.USB_DPRAM.ep_buf_ctrl[3] = 0u32;
+        hw.USB_DPRAM.ep_buf_ctrl[4] = 0u32;
+    }
+
+    if ((ints & 16u32) != 0u32) {
+        u32 bufs = hw.USBCTRL.buff_status;
+        hw.USBCTRL_CLR.buff_status = bufs;
+
+        if ((bufs & 1u32) != 0u32) {
+            if (st.should_addr) {
+                st.should_addr = false;
+                hw.USBCTRL.addr_endp = st.pending_addr as u32;
+            } else if (st.boot_rst) {
+                boot_now = true;
+            } else {
+                ep0_in_next(st);
+            }
+        }
+
+        if ((bufs & 2u32) != 0u32) {
+            if (st.expect_lc) {
+                st.expect_lc = false;
+                for (usize li in 0..7) {
+                    st.line_coding[li] = hw.USB_DPRAM.ep0_buf[li];
+                }
+                u32 b0 = st.line_coding[0] as u32;
+                u32 b1 = (st.line_coding[1] as u32) << 8;
+                u32 b2 = (st.line_coding[2] as u32) << 16;
+                u32 b3 = (st.line_coding[3] as u32) << 24;
+                u32 baud = b0 | b1 | b2 | b3;
+                st.baud = baud;
+                if (baud == 1200u32) {
+                    st.boot_rst = true;
+                }
+                ep0_ack_out(st);
+            }
+        }
+
+        if ((bufs & 8u32) != 0u32) {
+            u32 rx_len = hw.USB_DPRAM.ep_buf_ctrl[3] & 1023u32;
+            for (u32 ri in 0..64) {
+                if (ri >= rx_len) {
+                    break;
+                }
+                u8 ch = hw.USB_DPRAM.ep1_out_buf[ri as usize];
+                rx.push_byte(ch, boost: @high);
+            }
+            st.ep1_pid = st.ep1_pid ^ 8192u32;
+            write_buf_ctrl(3, st.ep1_pid | 64u32);
+        }
+
+        if ((bufs & 16u32) != 0u32) {
+            st.ep2_busy = false;
+        }
+    }
+
+    if ((ints & 65536u32) != 0u32) {
+        hw.USBCTRL_CLR.sie_status = 0x0002_0000u32;
+        usb_handle_setup(st);
+    }
+
+    usb_cdc_pump_tx(st, tx);
+    return boot_now;
+}
+
+pub fn usb_kick_tx() {
+    hw.PPB.nvic_ispr = 1 << 5;
+}
+
+pub u32 read_chip_id() {
+    return hw.SYSINFO.chip_id;
+}
+
+pub u32 read_core_id() {
+    return hw.SIO.cpuid;
+}
+
+pub u32 read_timer_us() {
+    return hw.TIMER.timerawl;
+}
+
+pub fn init_temp_sensor() {
+    // Enable ADC + onboard temperature diode bias (TS_EN) and wait for READY (bit 8).
+    hw.ADC.cs = 3;
+    for (u32 spin in 0..4096) {
+        if ((hw.ADC.cs & (1 << 8)) != 0) {
+            break;
+        }
+    }
+}
+
+pub u32 read_die_temp_raw() {
+    // Select channel 4 (temp sensor), START_ONCE (bit 2), TS_EN (bit 1), EN (bit 0).
+    hw.ADC.cs = (4 << 12) | 7;
+    for (u32 spin in 0..4096) {
+        if ((hw.ADC.cs & (1 << 8)) != 0) {
+            break;
+        }
+    }
+    return hw.ADC.result & 0xFFF;
+}
+
+pub f32 read_die_temp_c() {
+    f32 v = (read_die_temp_raw() as f32) * (3.3f32 / 4096.0f32);
+    return 27.0f32 - ((v - 0.706f32) / 0.001721f32);
+}
+
+pub fn start_timer_alarm0(u32 period_us) {
+    hw.TIMER.intr = 1;
+    hw.TIMER.alarm[0] = hw.TIMER.timerawl + period_us;
+    hw.TIMER.inte = hw.TIMER.inte | 1;
+}
+
+pub fn rearm_timer_alarm0(u32 period_us) {
+    hw.TIMER.intr = 1;
+    hw.TIMER.alarm[0] = hw.TIMER.timerawl + period_us;
+}
+
+pub fn init_pio0_inverter() {
+    // Configure PIO0 State Machine 0 as a 4-instruction 32-bit hardware stream inverter:
+    //   0: pull block       (0x80A0)
+    //   1: mov isr, ~osr    (0xA0CF)
+    //   2: push block       (0x8020)
+    //   3: jmp 0            (0x0000)
+    hw.PIO0.ctrl = 0;
+    hw.PIO0.instr_mem[0] = 0x80A0;
+    hw.PIO0.instr_mem[1] = 0xA0CF;
+    hw.PIO0.instr_mem[2] = 0x8020;
+    hw.PIO0.instr_mem[3] = 0x0000;
+    hw.PIO0.sm0_clkdiv = 1 << 16;
+    hw.PIO0.sm0_execctrl = (3 << 12) | (0 << 7);
+    hw.PIO0.sm0_shiftctrl = (1 << 19) | (1 << 18);
+    for (u32 i in 0..4) {
+        u32 _drain = hw.PIO0.rxf[0];
+    }
+    hw.PIO0.ctrl = 1 << 4;
+    hw.PIO0.sm0_instr = 0x0000;
+    hw.PIO0.ctrl = (1 << 8) | 1;
+}
+
+pub fn start_pio0_dma_burst(usize tx_addr, usize rx_addr, u32 words) {
+    // Arm CH0 (RX: PIO0.rxf[0] -> rx_addr, fires IRQ_DMA_0 on completion)
+    // before triggering CH1 (TX: tx_addr -> PIO0.txf[0], IRQ_QUIET=1).
+    hw.DMA.ints0 = 1;
+    hw.DMA.inte0 = hw.DMA.inte0 | 1;
+
+    hw.DMA.ch0_read_addr = hw.PIO0_RXF0_ADDR;
+    hw.DMA.ch0_write_addr = rx_addr as u32;
+    hw.DMA.ch0_trans_count = words;
+    hw.DMA.ch0_ctrl_trig = (hw.DREQ_PIO0_RX0 << 15) | (0 << 11) | (1 << 5) | (2 << 2) | 1;
+
+    hw.DMA.ch1_read_addr = tx_addr as u32;
+    hw.DMA.ch1_write_addr = hw.PIO0_TXF0_ADDR;
+    hw.DMA.ch1_trans_count = words;
+    hw.DMA.ch1_ctrl_trig = (1 << 21) | (hw.DREQ_PIO0_TX0 << 15) | (1 << 11) | (1 << 4) | (2 << 2) | 1;
+}
+
+pub fn clear_dma0_irq() {
+    hw.DMA.ints0 = 1;
+}

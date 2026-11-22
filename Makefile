@@ -2,7 +2,7 @@ CARGO ?= cargo
 PORT  ?= /dev/ttyACM0
 ZEVC  := $(CARGO) run --quiet --bin zevc --
 
-.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every
+.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every pico flash-pico
 
 all: test
 
@@ -24,6 +24,7 @@ check:
 	$(ZEVC) check examples/esp32c6_demo.zev
 	$(ZEVC) check examples/arduino_uno_demo.zev
 	$(ZEVC) check examples/arduino_nano_every_demo.zev
+	$(ZEVC) check examples/pico_w_demo.zev
 
 ram:
 	$(ZEVC) ram examples/motor_controller.zev examples/motor_support.zev
@@ -51,6 +52,12 @@ nano-every:
 
 flash-nano-every:
 	$(ZEVC) flash-nano-every examples/arduino_nano_every_demo.zev --port $(PORT)
+
+pico:
+	$(ZEVC) build-rp2040 examples/pico_w_demo.zev -o /tmp/zev-rp2040/pico_w_demo.uf2
+
+flash-pico:
+	$(ZEVC) flash-rp2040 examples/pico_w_demo.zev --port $(PORT)
 
 test:
 	$(CARGO) test --workspace -- --test-threads=2

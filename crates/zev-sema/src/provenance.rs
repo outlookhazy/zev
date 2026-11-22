@@ -256,6 +256,39 @@ impl Provenance {
         Self::pure_static()
     }
 
+    /// Preserve backing-buffer provenance (leases, stack depth, local/param/ISR origins) when
+    /// projecting an address inside a pointer, slice, or lease (`&sl[i]`, `sl.ptr`, `&(*p)`).
+    pub fn as_backing_ptr(mut self) -> Self {
+        if self.pointee_depth.is_none() {
+            if (self.origin_depth == 0 || !self.param_origins.is_empty())
+                && self.local_origins.is_empty()
+                && self.leases.is_empty()
+                && self.isr_state_origins.is_empty()
+                && self.origin_depth <= 1
+            {
+                self.pointee_depth = Some(0);
+                self.pointee_is_caller_or_static = true;
+            } else {
+                self.pointee_depth = Some(self.origin_depth);
+            }
+        }
+        self
+    }
+
+    /// Merge a memory location's `place` provenance (`self`, keeping its `pointee_depth` and
+    /// `pointee_is_caller_or_static`) with the provenance origins of the value stored inside that
+    /// place.
+    pub fn merge_place_with_val_origins(mut self, val: &Self) -> Self {
+        self.origin_depth = self.origin_depth.max(val.origin_depth);
+        self.local_origins.extend(val.local_origins.iter().cloned());
+        self.param_origins.extend(val.param_origins.iter().copied());
+        self.leases.extend(val.leases.iter().cloned());
+        self.fn_callbacks.extend(val.fn_callbacks.iter().cloned());
+        self.isr_state_origins
+            .extend(val.isr_state_origins.iter().cloned());
+        self
+    }
+
     /// Returns `true` if this value carries any local stack origin or active DMA lease that
     /// cannot outlive the current function frame.
     pub fn has_non_returning_origin(&self) -> bool {

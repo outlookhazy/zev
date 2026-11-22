@@ -83,6 +83,19 @@ pub enum Command {
         opt_level: String,
         output: Option<PathBuf>,
     },
+    BuildRp2040 {
+        files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
+        opt_level: String,
+        output: Option<PathBuf>,
+    },
+    FlashRp2040 {
+        files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
+        port: String,
+        opt_level: String,
+        output: Option<PathBuf>,
+    },
     ImportSvd {
         svd_path: PathBuf,
         output: Option<PathBuf>,
@@ -96,7 +109,7 @@ pub enum Command {
 }
 
 pub const HELP_TEXT: &str = "\
-zevc 0.1.0 — Zev Bare-Metal Cooperative Language-OS Compiler (C99 + LLVM/ARM + ESP32-C6 RISC-V + AVR)
+zevc 0.1.0 — Zev Bare-Metal Cooperative Language-OS Compiler (C99 + LLVM/ARM/RISC-V/AVR/RP2040)
 
 USAGE:
     zevc <COMMAND> [OPTIONS] [FILES...]
@@ -117,18 +130,20 @@ COMMANDS:
     flash-avr [OPT] <files...> [--port]     Build AVR .bin and flash Arduino Uno R3 via STK500v1 Optiboot (aliases: build-uno/flash-uno)
     build-nano-every [OPT] <files...> [-o]  Synthesize 40-slot vectors + ATmega4809 .elf/.bin for Arduino Nano Every (alias: build-atmega4809)
     flash-nano-every [OPT] <files...> [-p]  Build ATmega4809 .bin and flash Arduino Nano Every via MuxTO UPDI (alias: flash-atmega4809)
+    build-rp2040 [OPT] <files...> [-o <uf2>] Synthesize ARMv6-M vectors + SRAM UF2 for RP2040 Pico/Pico W (alias: build-pico)
+    flash-rp2040 [OPT] <files...> [--port]  Build SRAM UF2 and flash RP2040 Pico via 1200-baud + RPI-RP2 (alias: flash-pico)
     help                                    Show this help message
 
-MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr, build-nano-every, flash-nano-every):
+MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr, build-nano-every, flash-nano-every, build-rp2040, flash-rp2040):
     -I <dir> | --include <dir>              Add a module search root directory for `import` resolution (repeatable)
 
 CHECK OPTIONS:
     --json                                  Emit structured machine-readable JSON diagnostics
 
-LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr, build-nano-every, flash-nano-every):
+LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr, build-nano-every, flash-nano-every, build-rp2040, flash-rp2040):
     -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default -O2; -Os on AVR; raw on emit-llvm)
     --opt-level <O0|O1|O2|O3|Os|Oz>         Explicit long-form optimization level selector
-    --target <cortex-m3|esp32c6|avr|nano-every|host> Target selector (`ram`: cortex-m3/esp32c6/avr/nano-every; `emit-llvm`: +host)
+    --target <cortex-m3|esp32c6|avr|nano-every|rp2040|host> Target selector (`ram`: MCUs; `emit-llvm`: +host)
 
 RUN & RUN-QEMU OPTIONS:
     --sanitize                              Compile C99 host binary with -fsanitize=address,undefined (`run` only)
@@ -253,9 +268,30 @@ where
                 None => Ok(Command::Help),
             }
         }
+        "build-rp2040" | "build-pico" => {
+            match parse_files_with_output_and_opt_default(&raw[1..], &raw[0], "-O2")? {
+                Some((files, include_dirs, opt_level, output)) => Ok(Command::BuildRp2040 {
+                    files,
+                    include_dirs,
+                    opt_level,
+                    output,
+                }),
+                None => Ok(Command::Help),
+            }
+        }
+        "flash-rp2040" | "flash-pico" => match parse_flash_serial(&raw[1..], &raw[0], "-O2")? {
+            Some((files, include_dirs, port, opt_level, output)) => Ok(Command::FlashRp2040 {
+                files,
+                include_dirs,
+                port,
+                opt_level,
+                output,
+            }),
+            None => Ok(Command::Help),
+        },
         "run" => parse_run(&raw[1..]),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, or `flash-nano-every`; try `zevc --help`)"
+            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, `flash-nano-every`, `build-rp2040`, or `flash-rp2040`; try `zevc --help`)"
         )),
     }
 }
@@ -428,7 +464,7 @@ fn parse_ram(args: &[String]) -> Result<Command, String> {
                 i += 1;
                 if i >= args.len() {
                     return Err(
-                        "`--target` requires a target name (`cortex-m3`, `esp32c6`, `avr`, or `nano-every`)"
+                        "`--target` requires a target name (`cortex-m3`, `esp32c6`, `avr`, `nano-every`, or `rp2040`)"
                             .to_string(),
                     );
                 }
@@ -608,7 +644,7 @@ fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
             "--target" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("`--target` requires a target name (`cortex-m3`, `esp32c6`, `avr`, `nano-every`, or `host`)".to_string());
+                    return Err("`--target` requires a target name (`cortex-m3`, `esp32c6`, `avr`, `nano-every`, `rp2040`, or `host`)".to_string());
                 }
                 target = Some(args[i].clone());
             }
@@ -1126,6 +1162,10 @@ mod tests {
             assert!(parse_args(["build-atmega4809", bad, "a.zev"]).is_err(), "expected err on {bad}");
             assert!(parse_args(["flash-nano-every", bad, "a.zev"]).is_err(), "expected err on {bad}");
             assert!(parse_args(["flash-atmega4809", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["build-rp2040", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["build-pico", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["flash-rp2040", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(parse_args(["flash-pico", bad, "a.zev"]).is_err(), "expected err on {bad}");
         }
         assert!(parse_args(["build-elf", "--opt-level", "O9", "a.zev"]).is_err());
         assert!(parse_args(["build-elf", "--opt-level=fast", "a.zev"]).is_err());
@@ -1395,6 +1435,37 @@ mod tests {
             );
         }
 
+        for alias in ["build-rp2040", "build-pico"] {
+            let mut pico_build_args = vec![alias, "-O2", "-o", "pico.uf2"];
+            pico_build_args.extend_from_slice(&include_flags);
+            pico_build_args.push("app.zev");
+            assert_eq!(
+                parse_args(pico_build_args).unwrap(),
+                Command::BuildRp2040 {
+                    files: vec![PathBuf::from("app.zev")],
+                    include_dirs: expected_dirs.clone(),
+                    opt_level: "-O2".to_string(),
+                    output: Some(PathBuf::from("pico.uf2")),
+                }
+            );
+        }
+
+        for alias in ["flash-rp2040", "flash-pico"] {
+            let mut pico_flash_args = vec![alias, "--port", "/dev/ttyACM2", "-Oz", "-o", "pico.uf2"];
+            pico_flash_args.extend_from_slice(&include_flags);
+            pico_flash_args.push("app.zev");
+            assert_eq!(
+                parse_args(pico_flash_args).unwrap(),
+                Command::FlashRp2040 {
+                    files: vec![PathBuf::from("app.zev")],
+                    include_dirs: expected_dirs.clone(),
+                    port: "/dev/ttyACM2".to_string(),
+                    opt_level: "-Oz".to_string(),
+                    output: Some(PathBuf::from("pico.uf2")),
+                }
+            );
+        }
+
         assert_eq!(
             parse_args(["emit-llvm", "--target", "avr", "app.zev"]).unwrap(),
             Command::EmitLlvm {
@@ -1414,6 +1485,27 @@ mod tests {
                 target: Some("nano-every".to_string()),
                 opt_level: None,
                 output: None,
+            }
+        );
+
+        assert_eq!(
+            parse_args(["emit-llvm", "--target", "rp2040", "app.zev"]).unwrap(),
+            Command::EmitLlvm {
+                files: vec![PathBuf::from("app.zev")],
+                include_dirs: Vec::new(),
+                target: Some("rp2040".to_string()),
+                opt_level: None,
+                output: None,
+            }
+        );
+
+        assert_eq!(
+            parse_args(["ram", "--target", "rp2040", "-O2", "examples/pico_w_demo.zev"]).unwrap(),
+            Command::Ram {
+                files: vec![PathBuf::from("examples/pico_w_demo.zev")],
+                include_dirs: Vec::new(),
+                target: Some("rp2040".to_string()),
+                opt_level: Some("-O2".to_string()),
             }
         );
 
@@ -1444,6 +1536,10 @@ mod tests {
         assert!(parse_args(["build-atmega4809", "-o", "nano.bin"]).is_err());
         assert!(parse_args(["flash-nano-every", "--port", "/dev/ttyACM0"]).is_err());
         assert!(parse_args(["flash-atmega4809", "--port", "/dev/ttyACM0"]).is_err());
+        assert!(parse_args(["build-rp2040", "-o", "pico.uf2"]).is_err());
+        assert!(parse_args(["build-pico", "-o", "pico.uf2"]).is_err());
+        assert!(parse_args(["flash-rp2040", "--port", "/dev/ttyACM2"]).is_err());
+        assert!(parse_args(["flash-pico", "--port", "/dev/ttyACM2"]).is_err());
         assert!(parse_args(["run"]).is_err());
     }
 }

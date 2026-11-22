@@ -509,9 +509,69 @@ impl fmt::Display for RamReport {
     }
 }
 
+fn collect_struct_names_in_ty(ty: &MirType, out: &mut Vec<String>) {
+    match ty {
+        MirType::Struct(name) => out.push(name.clone()),
+        MirType::Array { elem, .. } => collect_struct_names_in_ty(elem, out),
+        _ => {}
+    }
+}
+
+/// Collect the set of struct names whose layout requires 32-byte DMA alignment for
+/// embedded `pool<T, K>` fields (seeded from `@dma_safe` subsystem globals and
+/// `@dma_safe` struct fields, then transitively closed over nested struct fields).
+pub fn collect_dma_layout_structs_from(
+    structs: &[MirStruct],
+    subsystems: &[MirSubsystemGlobal],
+) -> BTreeSet<String> {
+    let struct_map: BTreeMap<&str, &MirStruct> =
+        structs.iter().map(|s| (s.name.as_str(), s)).collect();
+    let mut dma_structs = BTreeSet::new();
+    let mut queue = std::collections::VecDeque::new();
+
+    for sub in subsystems {
+        if sub.dma_safe && dma_structs.insert(sub.struct_name.clone()) {
+            queue.push_back(sub.struct_name.clone());
+        }
+    }
+    for st in structs {
+        for f in &st.fields {
+            if f.dma_safe {
+                let mut names = Vec::new();
+                collect_struct_names_in_ty(&f.ty, &mut names);
+                for name in names {
+                    if dma_structs.insert(name.clone()) {
+                        queue.push_back(name);
+                    }
+                }
+            }
+        }
+    }
+    while let Some(sname) = queue.pop_front() {
+        if let Some(st) = struct_map.get(sname.as_str()) {
+            for f in &st.fields {
+                let mut names = Vec::new();
+                collect_struct_names_in_ty(&f.ty, &mut names);
+                for child in names {
+                    if dma_structs.insert(child.clone()) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+    dma_structs
+}
+
+/// Collect the set of struct names in `module` that require 32-byte DMA pool field layouts.
+pub fn collect_dma_layout_structs(module: &MirModule) -> BTreeSet<String> {
+    collect_dma_layout_structs_from(&module.structs, &module.subsystems)
+}
+
 struct LayoutCtx<'a> {
     structs: BTreeMap<&'a str, &'a MirStruct>,
     enums: BTreeSet<&'a str>,
+    dma_layout_structs: BTreeSet<String>,
 }
 
 impl<'a> LayoutCtx<'a> {
@@ -555,6 +615,15 @@ impl<'a> LayoutCtx<'a> {
     }
 
     fn type_layout(&self, ty: &MirType, abi: TargetAbi) -> SizeAlign {
+        self.type_layout_with_dma(ty, false, abi)
+    }
+
+    fn type_layout_with_dma(
+        &self,
+        ty: &MirType,
+        parent_dma_safe: bool,
+        abi: TargetAbi,
+    ) -> SizeAlign {
         let ptr = abi.ptr_bytes();
         match ty {
             MirType::Void => SizeAlign::new(0, 1),
@@ -581,12 +650,17 @@ impl<'a> LayoutCtx<'a> {
             MirType::Enum(_) => SizeAlign::new(4, 4),
             MirType::Struct(name) => {
                 if let Some(st) = self.structs.get(name.as_str()) {
+                    let struct_dma =
+                        parent_dma_safe || self.dma_layout_structs.contains(name.as_str());
                     let fl: Vec<SizeAlign> = st
                         .fields
                         .iter()
-                        .map(|f| match &f.ty {
-                            MirType::Primitive(pk) => self.prim_layout(pk, f.dma_safe, abi),
-                            other => self.type_layout(other, abi),
+                        .map(|f| {
+                            let eff_dma = struct_dma || f.dma_safe;
+                            match &f.ty {
+                                MirType::Primitive(pk) => self.prim_layout(pk, eff_dma, abi),
+                                other => self.type_layout_with_dma(other, eff_dma, abi),
+                            }
                         })
                         .collect();
                     self.struct_layout(&fl, st.packed)
@@ -600,21 +674,21 @@ impl<'a> LayoutCtx<'a> {
                 SizeAlign::new(ptr * 2, ptr)
             }
             MirType::Array { elem, len } => {
-                let el = self.type_layout(elem, abi);
+                let el = self.type_layout_with_dma(elem, parent_dma_safe, abi);
                 SizeAlign::new(el.size * len, el.align)
             }
-            MirType::Primitive(pk) => self.prim_layout(pk, false, abi),
+            MirType::Primitive(pk) => self.prim_layout(pk, parent_dma_safe, abi),
             MirType::PrimView(MirPrimViewKind::ByteRing) => SizeAlign::new(ptr * 2, ptr),
             MirType::PrimView(MirPrimViewKind::Inbox { .. }) => SizeAlign::new(ptr * 3, ptr),
             MirType::Result { ok, err } => {
                 let mut fields = vec![SizeAlign::new(1, 1)]; // bool is_err
                 if let Some(et) = err {
                     if !et.is_void() {
-                        fields.push(self.type_layout(et, abi));
+                        fields.push(self.type_layout_with_dma(et, false, abi));
                     }
                 }
                 if !ok.is_void() {
-                    fields.push(self.type_layout(ok, abi));
+                    fields.push(self.type_layout_with_dma(ok, false, abi));
                 }
                 self.struct_layout(&fields, false)
             }
@@ -820,6 +894,7 @@ pub fn compute_ram_report_with_subsystems(
     let ctx = LayoutCtx {
         structs: structs.iter().map(|s| (s.name.as_str(), s)).collect(),
         enums: BTreeSet::new(),
+        dma_layout_structs: collect_dma_layout_structs_from(structs, subsystems),
     };
 
     let fn_map: BTreeMap<&str, &MirFunction> =
@@ -954,8 +1029,8 @@ pub fn compute_ram_report_with_subsystems(
     }
     for sub in subsystems {
         let ty = MirType::Struct(sub.struct_name.clone());
-        let l32 = ctx.type_layout(&ty, TargetAbi::Mcu32);
-        let l64 = ctx.type_layout(&ty, TargetAbi::Host64);
+        let l32 = ctx.type_layout_with_dma(&ty, sub.dma_safe, TargetAbi::Mcu32);
+        let l64 = ctx.type_layout_with_dma(&ty, sub.dma_safe, TargetAbi::Host64);
         let s32 = if sub.dma_safe {
             align_up(l32.size, l32.align.max(4))
         } else {
@@ -1352,6 +1427,7 @@ pub fn populate_module_ram_report(module: &mut MirModule) {
                 .map(|s| (s.name.as_str(), s))
                 .collect(),
             enums: BTreeSet::new(),
+            dma_layout_structs: collect_dma_layout_structs(module),
         };
         for item in &mut module.monomorphized_instances {
             match item.kind {

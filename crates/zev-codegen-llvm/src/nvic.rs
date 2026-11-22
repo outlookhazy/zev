@@ -208,6 +208,7 @@ entry:
 
 define void @Reset_Handler() #98 {{
 entry:
+  call void asm sideeffect "cpsid i", "~{{memory}}"()
   ; 1. Zero .bss [__sbss .. __ebss) in integer address domain (avoids provenance UB & memset idiom)
   %sbss_a = ptrtoint ptr @__sbss to i32
   %ebss_a = ptrtoint ptr @__ebss to i32

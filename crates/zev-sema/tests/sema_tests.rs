@@ -5233,6 +5233,706 @@ fn sys_tick_and_set_putc_hooks_validation() {
     );
 }
 
+#[test]
+fn regression_s_h1_place_addr_provenance_preserving_scalar_reads() {
+    // 1. Positive: scalar rvalue read `u8 x = sl[0]` does NOT carry ring lease past consume(),
+    //    and `&p.hdr` / `&(*p)` on caller parameter `*Packet` can return cleanly.
+    expect_ok(
+        r#"
+        byte_ring<16> rx;
+
+        struct Packet {
+            u32 hdr;
+            [4]u8 payload;
+        }
+
+        *u32 get_hdr(*Packet p) {
+            return &p.hdr;
+        }
+
+        *Packet id_pkt(*Packet p) {
+            return &(*p);
+        }
+
+        u8 read_once() {
+            []u8 sl = rx.read_slice();
+            u8 first = sl[0];
+            rx.consume(1);
+            return first + 1;
+        }
+
+        fn main() {
+            Packet pkt = Packet { hdr: 42, payload: [1, 2, 3, 4] };
+            *Packet p = id_pkt(&pkt);
+            *u32 h = get_hdr(p);
+            u8 b = read_once();
+            sys.log_kv("h=", *h);
+            sys.log_kv("b=", b);
+        }
+        "#,
+    );
+
+    // 2. `&slice[i]` from ring.read_slice() read after consume() -> E0011 (`StaleDmaLease`)
+    expect_err_kind(
+        r#"
+        byte_ring<16> rx;
+        fn main() {
+            []u8 sl = rx.read_slice();
+            *u8 p = &sl[0];
+            rx.consume(1);
+            u8 bad = *p;
+            sys.log_kv("bad=", bad);
+        }
+        "#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 3. `&grant[0]` from grant_write() read after commit_write() -> E0011 (`StaleDmaLease`)
+    expect_err_kind(
+        r#"
+        byte_ring<16> tx;
+        fn main() {
+            []u8 g = tx.grant_write(4) catch { return; };
+            *u8 p = &g[0];
+            tx.commit_write(1);
+            *p = 7;
+        }
+        "#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 4. `&l.get().hdr` escaped / read after park -> E0011 (`StaleDmaLease`) or E0009
+    expect_err_kind(
+        r#"
+        struct Packet { u32 hdr; }
+        pool<Packet, 2> pkt_pool;
+        fn main() {
+            Lease<Packet> l = pkt_pool.alloc() catch { return; };
+            *u32 hp = &l.get().hdr;
+            *u32 hp2 = &l.get().hdr;
+            u32 stale = *hp;
+            sys.log_kv("s=", stale);
+            sys.log_kv("s2=", *hp2);
+            l.release();
+        }
+        "#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 5. Escaping local `&p.field`, `&(*p)`, `&sl[0]`, `sl.ptr` -> E0009 (`DanglingReference`)
+    for bad in [
+        r#"
+        struct Packet { u32 hdr; }
+        *u32 esc_field() {
+            Packet pkt = Packet { hdr: 1 };
+            *Packet p = &pkt;
+            return &p.hdr;
+        }
+        fn main() {}
+        "#,
+        r#"
+        *u32 esc_deref() {
+            u32 x = 5;
+            *u32 p = &x;
+            return &(*p);
+        }
+        fn main() {}
+        "#,
+        r#"
+        byte_ring<16> rx;
+        *u8 esc_slice_elem() {
+            []u8 sl = rx.read_slice();
+            return &sl[0];
+        }
+        fn main() {}
+        "#,
+        r#"
+        byte_ring<16> rx;
+        *u8 esc_slice_ptr() {
+            []u8 sl = rx.read_slice();
+            return sl.ptr;
+        }
+        fn main() {}
+        "#,
+    ] {
+        expect_err_kind(bad, DiagnosticKind::ReturnLocalReference);
+    }
+
+    // 6. `&MMIO.reg`, `&MMIO.arr[i]`, `MMIO.arr.ptr`, `MMIO.arr[0..2]` -> E0031 (`MmioViolation`)
+    for bad_mmio in [
+        "mmio R { @rw u32 cr @ 0; } mmio D : R @ 0x4000_0000; fn main() { *u32 p = &D.cr; }",
+        "mmio R { @rw [4]u32 arr @ 0; } mmio D : R @ 0x4000_0000; fn main() { *u32 p = &D.arr[0]; }",
+        "mmio R { @rw [4]u32 arr @ 0; } mmio D : R @ 0x4000_0000; fn main() { *u32 p = D.arr.ptr; }",
+        "mmio R { @rw [4]u32 arr @ 0; } mmio D : R @ 0x4000_0000; fn main() { []u32 s = D.arr[0..2]; }",
+    ] {
+        expect_err_kind(bad_mmio, DiagnosticKind::MmioViolation);
+    }
+}
+
+#[test]
+fn regression_s_h2_short_circuit_and_or_lease_control_flow() {
+    // 1. Moving linear `Lease<T>` only on RHS of `&&` or `||` -> E0034 (`LinearLeaseViolation`)
+    for op in ["&&", "||"] {
+        let src = format!(
+            r#"
+            struct Pkt {{ u32 id; }}
+            pool<Pkt, 2> p;
+            bool take_it(Lease<Pkt> l) {{
+                l.release();
+                return true;
+            }}
+            fn run(bool cond) {{
+                Lease<Pkt> l = p.alloc() catch {{ return; }};
+                if (cond {op} take_it(l)) {{
+                    sys.log("yes");
+                }}
+            }}
+            fn main() {{ run(false); }}
+            "#
+        );
+        expect_err_kind(&src, DiagnosticKind::LinearLeaseViolation);
+    }
+
+    // 2. Invalidating byte_ring lease on RHS of `&&` / `||` makes earlier slice stale -> E0011 (`StaleDmaLease`)
+    for op in ["&&", "||"] {
+        let src = format!(
+            r#"
+            byte_ring<16> rx;
+            fn check(bool cond) {{
+                []u8 sl = rx.read_slice();
+                if (cond {op} ((rx.try_pop_byte() catch {{ 0 }}) > 0)) {{
+                    sys.log("hit");
+                }}
+                u8 b = sl[0];
+                sys.log_kv("b=", b);
+            }}
+            fn main() {{ check(false); }}
+            "#
+        );
+        expect_err_kind(&src, DiagnosticKind::StaleDmaLease);
+    }
+}
+
+#[test]
+fn regression_s_h3_catch_mmio_and_linear_lease_bindings() {
+    // 1. By-value MMIO in catch error param -> E0031 (`MmioViolation`)
+    expect_err_kind(
+        r#"
+        mmio Regs { @rw u32 cr @ 0; }
+        u32 fall() error u32 { error 1; }
+        fn main() {
+            u32 r = fall() catch (Regs e) { return; };
+        }
+        "#,
+        DiagnosticKind::MmioViolation,
+    );
+
+    // 2. Linear `Lease<T>` in catch partial parameter -> E0034 (`LinearLeaseViolation`), NO spurious unused-lease cascade!
+    let diags = expect_err_kind(
+        r#"
+        struct Pkt { u32 x; }
+        pool<Pkt, 2> p;
+        enum AllocErr { Empty }
+        Lease<Pkt> try_get() error AllocErr {
+            Lease<Pkt> l = p.alloc(timeout: 1ms) catch { error Empty; };
+            return l;
+        }
+        fn main() {
+            Lease<Pkt> out = try_get() catch (AllocErr e, Lease<Pkt> partial) {
+                return;
+            };
+            out.release();
+        }
+        "#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected single clean E0034 without double-free/leak cascade, got {diags:?}"
+    );
+}
+
+#[test]
+fn regression_s_h4_s_h5_mmio_and_os_primitive_void_coercion_and_casts() {
+    // 1. Positive allowed casts
+    expect_ok(
+        r#"
+        mmio Regs { @rw u32 cr @ 0; }
+        mmio DEV : Regs @ 0x4000_0000;
+        signal sig;
+        byte_ring<16> br;
+        inbox<u32, 4> q;
+
+        fn main() {
+            *Regs p1 = DEV as *Regs;
+            *Regs p2 = p1 as *Regs;
+            usize addr = (usize)DEV;
+            *signal sp = &sig as *signal;
+            *byte_ring<16> bp1 = &br as *byte_ring<16>;
+            *byte_ring bp2 = &br as *byte_ring;
+            *inbox<u32> qp = &q as *inbox<u32>;
+            sys.log_kv("a=", addr);
+            p2.cr = 1;
+            sp.notify();
+            bp1.push_byte(1);
+            usize _cap = bp2.cap() + qp.cap();
+        }
+        "#,
+    );
+
+    // 2. Forbidden MMIO coercion to `*void` & casts -> E0031 (`MmioViolation`)
+    for bad_mmio in [
+        "mmio A { @rw u32 r @ 0; } mmio D : A @ 0x4000_0000; fn take(*void v) {} fn main() { take(D as *A); }",
+        "mmio A { @rw u32 r @ 0; } mmio D : A @ 0x4000_0000; fn take(*void v) {} fn main() { take(&D); }",
+        "mmio A { @rw u32 r @ 0; } mmio D : A @ 0x4000_0000; fn main() { *void v = (D as *A) as *void; }",
+        "mmio A { @rw u32 r @ 0; } mmio D : A @ 0x4000_0000; fn main() { *u32 p = (D as *A) as *u32; }",
+        "mmio A { @rw u32 r @ 0; } mmio B { @rw u32 r @ 0; } mmio D : A @ 0x4000_0000; fn main() { *B p = (D as *A) as *B; }",
+        "mmio A { @rw u32 r @ 0; } fn main() { *A p = 0x4000_0000 as *A; }",
+        "mmio A { @rw u32 r @ 0; } fn main() { *void vp = 0 as *void; *A p = vp as *A; }",
+        "mmio A { @rw u32 r @ 0; } mmio D : A @ 0x4000_0000; fn main() { *A p = D as *A; usize u = p as usize; }",
+        "mmio A { @rw u32 r @ 0; } mmio B { @rw u32 r @ 0; } mmio D : A @ 0x4000_0000; fn main() { *B p = D as *B; }",
+    ] {
+        expect_err_kind(bad_mmio, DiagnosticKind::MmioViolation);
+    }
+
+    // 3. Forbidden `*OsPrimitive` coercion to `*void` & raw casts -> E0019 (`TypeMismatch`)
+    for bad_prim in [
+        "signal s; fn take(*void v) {} fn main() { take(&s); }",
+        "byte_ring<8> r; fn take(*void v) {} fn main() { take(&r); }",
+        "signal s; fn main() { *void v = &s as *void; }",
+        "signal s; fn main() { *u8 p = &s as *u8; }",
+        "signal s; fn main() { usize u = &s as usize; }",
+        "fn main() { *void v = 0 as *void; *byte_ring r = v as *byte_ring; }",
+        "fn main() { *signal s = 0x2000 as *signal; }",
+        "byte_ring<8> r; fn main() { *byte_ring<16> p = &r as *byte_ring<16>; }",
+        "fn bad(*byte_ring r) { *byte_ring<8> p = r as *byte_ring<8>; }",
+    ] {
+        expect_err_kind(bad_prim, DiagnosticKind::TypeMismatch);
+    }
+}
+
+#[test]
+fn regression_s_h6_byval_deref_vs_projection() {
+    // 1. Positive: projected `(*p).field`, `(*p).method()`, `&(*p).field` MUST remain valid!
+    expect_ok(
+        r#"
+        mmio Regs { @rw u32 cr @ 0; }
+        mmio DEV : Regs @ 0x4000_0000;
+
+        struct UartSub {
+            byte_ring<16> tx;
+        }
+        UartSub uart0;
+
+        struct Pkt {
+            u32 hdr;
+        }
+
+        fn work(*Regs r, *UartSub s, *byte_ring<16> br, *Pkt pkt) {
+            (*r).cr = 1;
+            u32 v = (*r).cr;
+            (*s).tx.push_byte(1);
+            usize n = (*br).len();
+            *u32 hp = &(*pkt).hdr;
+            sys.log_kv("v=", v + *hp + (u32)n);
+        }
+
+        fn main() {
+            Pkt pkt = Pkt { hdr: 9 };
+            work(DEV as *Regs, &uart0, &uart0.tx, &pkt);
+        }
+        "#,
+    );
+
+    // 2. Negative: by-value deref read and write on MMIO layout -> E0031 (`MmioViolation`)
+    expect_err_kind(
+        r#"
+        mmio Regs { @rw u32 cr @ 0; }
+        fn f(*Regs a) { *a; }
+        fn main() {}
+        "#,
+        DiagnosticKind::MmioViolation,
+    );
+    expect_err_kind(
+        r#"
+        mmio Regs { @rw u32 cr @ 0; }
+        fn f(*Regs a, *Regs b) { *a = *b; }
+        fn main() {}
+        "#,
+        DiagnosticKind::MmioViolation,
+    );
+
+    // 3. Negative: by-value deref read and write on subsystem struct & OS primitive -> E0024 (`InvalidOperation`)
+    for bad in [
+        "struct Sub { signal s; } fn f(*Sub a) { *a; } fn main() {}",
+        "struct Sub { signal s; } fn f(*Sub a, *Sub b) { *a = *b; } fn main() {}",
+        "fn f(*byte_ring<8> a) { *a; } fn main() {}",
+        "fn f(*byte_ring<8> a, *byte_ring<8> b) { *a = *b; } fn main() {}",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::InvalidOperation);
+    }
+}
+
+#[test]
+fn regression_s_h7_fmt_ring_invalidation_and_byte_ring_spsc() {
+    // 1. S-H7a: `fmt_ring(&tx, ...)` invalidates any outstanding `tx.grant_write(...)` slice -> E0011!
+    expect_err_kind(
+        r#"
+        byte_ring<32> tx;
+        fn main() {
+            []u8 g = tx.grant_write(8) catch { return; };
+            usize _n = fmt_ring(&tx, f"hi") catch { 0 };
+            g[0] = 65;
+        }
+        "#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 2. S-H7b Positive: Single producer task + single consumer ISR via view bundle `DuplexStream`,
+    //    sequential pre-spawn selftest in `main()`, plus multi-actor pure inspection ops (`.len()` / `.is_empty()`).
+    expect_ok(
+        r#"
+        irq IRQ_TX = 10;
+        byte_ring<64> rx_ring;
+        byte_ring<64> tx_ring;
+
+        struct DuplexStream {
+            *byte_ring rx;
+            *byte_ring tx;
+        }
+
+        fn boot_check(*byte_ring r) {
+            r.push_byte(0xAA);
+            u8 _v = r.try_pop_byte() catch { 0 };
+        }
+
+        fn write_helper(DuplexStream s) {
+            usize _n = fmt_ring(s.tx, f"ok") catch { 0 };
+        }
+
+        task app_task(DuplexStream io_stream) {
+            loop {
+                u8 b = io_stream.rx.try_pop_byte() catch {
+                    delay(1ms);
+                    continue;
+                };
+                write_helper(io_stream);
+                usize _free = io_stream.tx.free_space();
+                sys.log_kv("b=", b);
+            }
+        }
+
+        isr tx_isr(*byte_ring r) {
+            if (!r.is_empty()) {
+                u8 _b = r.try_pop_byte() catch { return; };
+            }
+            usize _cap = r.cap();
+        }
+
+        fn main() {
+            // Sequential pre-spawn boot check on both producer & consumer operations:
+            boot_check(&tx_ring);
+            rx_ring.push_byte(1);
+
+            DuplexStream s = DuplexStream { rx: &rx_ring, tx: &tx_ring };
+            IRQ_TX.attach(tx_isr(&tx_ring));
+            spawn app_task(s) @normal;
+
+            // Main post-boot acts only as single producer for `rx_ring` and inspects `tx_ring.len()`:
+            loop {
+                rx_ring.push_byte(2);
+                usize _n = tx_ring.len();
+                delay(5ms);
+            }
+        }
+        "#,
+    );
+
+    // 3. S-H7b Negative: two producers -> E0002 (`GlobalIsolationViolation`)
+    expect_err_kind(
+        r#"
+        byte_ring<16> r;
+        task p1() { loop { r.push_byte(1); delay(1ms); } }
+        task p2() { loop { r.push_byte(2); delay(1ms); } }
+        fn main() {
+            spawn p1();
+            spawn p2();
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 4. S-H7b Negative: producer ISR + post-spawn `main()` producer -> E0002
+    expect_err_kind(
+        r#"
+        irq IRQ0 = 3;
+        byte_ring<16> r;
+        isr rx_isr(*byte_ring p) { p.push_byte(1); }
+        fn main() {
+            IRQ0.attach(rx_isr(&r));
+            r.push_byte(2);
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 5. S-H7b Negative: consumer task + post-spawn `main()` consumer -> E0002
+    expect_err_kind(
+        r#"
+        byte_ring<16> r;
+        task c1() { loop { []u8 s = r.wait_read(); r.consume(s.len); } }
+        fn main() {
+            spawn c1();
+            u8 _b = r.try_pop_byte() catch { 0 };
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 6. S-H7b Negative: transitive helper + `DuplexStream` aliasing two writers -> E0002
+    expect_err_kind(
+        r#"
+        byte_ring<16> tx;
+        struct DuplexStream { *byte_ring tx; }
+        fn helper_write(DuplexStream s) { s.tx.push_byte(1); }
+        task w1(DuplexStream s) { loop { helper_write(s); delay(1ms); } }
+        task w2(*byte_ring r) { loop { usize _n = fmt_ring(r, f"x") catch { 0 }; delay(1ms); } }
+        fn main() {
+            DuplexStream s = DuplexStream { tx: &tx };
+            spawn w1(s);
+            spawn w2(&tx);
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 7. S-H7b Negative: `clear()` counts as both producer & consumer -> conflicts with writer task -> E0002
+    expect_err_kind(
+        r#"
+        byte_ring<16> r;
+        task writer() { loop { r.push_byte(1); delay(1ms); } }
+        task cleaner() { loop { r.clear(); delay(10ms); } }
+        fn main() {
+            spawn writer();
+            spawn cleaner();
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+}
+
+#[test]
+fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
+    // 1. S-M1 + S-L2 positive: private and public enum variants in different modules do NOT collide,
+    //    and identical `extern "C"` prototypes across multiple roots + modules deduplicate cleanly!
+    {
+        let ws = TempWorkspace::new("s_m1_l2_ok");
+        ws.write("Zev.toml", "[package]\nname = \"app\"\n");
+        ws.write(
+            "mod_a.zev",
+            r#"
+            pub extern "C" u32 hal_init(u32 v);
+            enum PrivA { Shared, OnlyA }
+            pub enum PubA { Common, ExtraA }
+            pub u32 pick_a() {
+                PrivA x = Shared;
+                PubA y = Common;
+                return (u32)x + (u32)y;
+            }
+            "#,
+        );
+        ws.write(
+            "mod_b.zev",
+            r#"
+            pub extern "C" u32 hal_init(u32 v);
+            pub enum PubB { Shared, Common, ExtraB }
+            pub u32 pick_b() {
+                PubB x = Shared;
+                return (u32)x;
+            }
+            "#,
+        );
+        let root1 = ws.write(
+            "main.zev",
+            r#"
+            import mod_a as ma;
+            import mod_b as mb;
+            extern "C" u32 hal_init(u32 v);
+            enum RootMode { Shared = 1 }
+            fn main() {
+                RootMode m = Shared;
+                u32 x = hal_init((u32)m + ma.pick_a() + mb.pick_b());
+                sys.log_kv("x=", x);
+            }
+            "#,
+        );
+        let root2 = ws.write(
+            "extra.zev",
+            r#"
+            pub extern "C" u32 hal_init(u32 v);
+            "#,
+        );
+        let p1 = zev_parser::parse_str_named(
+            &std::fs::read_to_string(&root1).unwrap(),
+            root1.to_str().unwrap(),
+        )
+        .unwrap();
+        let p2 = zev_parser::parse_str_named(
+            &std::fs::read_to_string(&root2).unwrap(),
+            root2.to_str().unwrap(),
+        )
+        .unwrap();
+        let out = analyze_and_monomorphize_named_programs(
+            &[(&p1, root1.to_str()), (&p2, root2.to_str())],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            out.diagnostics.is_empty(),
+            "unexpected diagnostics in S-M1/S-L2 positive test: {:?}",
+            out.diagnostics
+        );
+    }
+
+    // 2. S-M2: Reject private local struct/enum/mmio exposed in `pub` items -> E0030 (`ModuleError`)
+    for priv_pub_mod in [
+        "struct Priv { u32 x; } pub struct Wrap { Priv p; }",
+        "struct Priv { u32 x; } pub fn f(Priv p) {}",
+        "struct Priv { u32 x; } pub Priv f() { return Priv { x: 1 }; }",
+        "enum PrivE { E0 } pub fn f() error PrivE { error E0; }",
+        "struct Priv { u32 x; } pub extern \"C\" fn c_f(Priv p);",
+        "enum PrivE { E0 } pub const PrivE C = PrivE.E0;",
+        "struct Priv { u32 x; } pub inbox<Priv, 4> q;",
+        "struct Priv { u32 x; } pub task t(Priv p) {}",
+        "struct Priv { u32 x; } pub isr my_isr(*Priv p) {}",
+        "mmio PrivRegs { @rw u32 cr @ 0; } pub mmio DEV : PrivRegs @ 0x4000_0000;",
+    ] {
+        let ws = TempWorkspace::new("s_m2_err");
+        ws.write("Zev.toml", "[package]\nname = \"app\"\n");
+        ws.write("badmod.zev", priv_pub_mod);
+        let main_path = ws.write(
+            "main.zev",
+            "import badmod as b;\nfn main() {}\n",
+        );
+        let prog = zev_parser::parse_str_named(
+            &std::fs::read_to_string(&main_path).unwrap(),
+            main_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let out = analyze_and_monomorphize_named_programs(
+            &[(&prog, main_path.to_str())],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::ModuleError),
+            "expected E0030 ModuleError for `{priv_pub_mod}`, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // 3. S-L2 negative: same-file duplicate `extern "C"` -> E0021, cross-file mismatch -> E0030
+    expect_err_kind(
+        r#"
+        extern "C" fn c_dup();
+        extern "C" fn c_dup();
+        fn main() {}
+        "#,
+        DiagnosticKind::DuplicateDefinition,
+    );
+
+    {
+        let ws = TempWorkspace::new("s_l2_conflict");
+        ws.write("Zev.toml", "[package]\nname = \"app\"\n");
+        ws.write("other.zev", "pub extern \"C\" fn mismatch(u32 a);\n");
+        let main_path = ws.write(
+            "main.zev",
+            "import other as o;\nextern \"C\" fn mismatch(i32 a);\nfn main() {}\n",
+        );
+        let prog = zev_parser::parse_str_named(
+            &std::fs::read_to_string(&main_path).unwrap(),
+            main_path.to_str().unwrap(),
+        )
+        .unwrap();
+        let out = analyze_and_monomorphize_named_programs(
+            &[(&prog, main_path.to_str())],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::ModuleError),
+            "expected E0030 cross-file extern C conflict, got {:?}",
+            out.diagnostics
+        );
+    }
+}
+
+#[test]
+fn regression_s_m5a_mmio_u32_overflow() {
+    // 1. Register end offset overflowing u32 -> E0031 (`MmioViolation`)
+    expect_err_kind(
+        r#"
+        mmio TooHigh {
+            @rw u32 r @ 0xFFFF_FFFC;
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::MmioViolation,
+    );
+
+    // 2. Register array size overflowing u32 -> E0031 (`MmioViolation`)
+    expect_err_kind(
+        r#"
+        mmio HugeArr {
+            @rw [0x4000_0001]u32 r @ 0x0;
+        }
+        fn main() {}
+        "#,
+        DiagnosticKind::MmioViolation,
+    );
+
+    // 3. MMIO instance base + layout byte_size overflowing u32 -> E0031 (`MmioViolation`)
+    expect_err_kind(
+        r#"
+        mmio Block16 {
+            @rw [4]u32 regs @ 0x0;
+        }
+        mmio BAD_INST : Block16 @ 0xFFFF_FFF8;
+        fn main() {}
+        "#,
+        DiagnosticKind::MmioViolation,
+    );
+
+    // 4. Exact boundary fitting inside 32-bit address space is accepted cleanly
+    expect_ok(
+        r#"
+        mmio Reg4 {
+            @rw u32 reg @ 0x0;
+        }
+        mmio GOOD_INST : Reg4 @ 0xFFFF_FFF0;
+        fn main() {}
+        "#,
+    );
+}
+
+#[test]
+fn regression_l_h1_shift_preserves_lhs_integer_type() {
+    expect_ok(
+        r#"
+        fn main() {
+            u32 a = 0x8000_0000u32 >> 4i32;
+            u32 b = 0x8000_0000u32 >> 4u64;
+            u8 c = 1u8 << 3u32;
+            u16 d = 0x8000u16 >> 1usize;
+            i8 e = (-8i8) >> 1u32;
+            sys.log_kv("a=", a + b + (u32)c + (u32)d + (u32)e);
+        }
+        "#,
+    );
+}
+
 
 
 

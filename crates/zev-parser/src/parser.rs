@@ -25,8 +25,14 @@ pub struct Parser<'a> {
     known_generics: Option<&'a BTreeSet<String>>,
     /// Top-level generic `struct` and `fn` names declared in this file.
     local_generics: BTreeSet<String>,
+    /// `pub` top-level generic `struct` and `fn` names declared in this file.
+    pub_local_generics: BTreeSet<String>,
     /// Top-level value bindings (`const`, OS primitives, and global variables) declared in this file.
     top_level_values: BTreeSet<String>,
+    /// Top-level value bindings that are NOT `const usize` (`mmio`, `irq`, globals, OS primitives, and non-`usize` `const`s).
+    non_usize_top_level_values: BTreeSet<String>,
+    /// Active generic `usize` constant parameter names in scope (`<usize N>`).
+    generic_const_params: BTreeSet<String>,
     /// Module alias names bound by `import a.b as alias;` (or `import m;`).
     import_aliases: BTreeSet<String>,
     /// Active lexical value scopes inside `fn` / `task` / `isr` bodies.
@@ -53,7 +59,10 @@ impl<'a> Parser<'a> {
             allow_struct_lit: true,
             known_generics,
             local_generics: BTreeSet::new(),
+            pub_local_generics: BTreeSet::new(),
             top_level_values: BTreeSet::new(),
+            non_usize_top_level_values: BTreeSet::new(),
+            generic_const_params: BTreeSet::new(),
             import_aliases: BTreeSet::new(),
             value_scopes: Vec::new(),
         };
@@ -71,7 +80,10 @@ impl<'a> Parser<'a> {
             allow_struct_lit: true,
             known_generics: self.known_generics,
             local_generics: self.local_generics.clone(),
+            pub_local_generics: self.pub_local_generics.clone(),
             top_level_values: self.top_level_values.clone(),
+            non_usize_top_level_values: self.non_usize_top_level_values.clone(),
+            generic_const_params: self.generic_const_params.clone(),
             import_aliases: self.import_aliases.clone(),
             value_scopes: self.value_scopes.clone(),
         }
@@ -80,6 +92,14 @@ impl<'a> Parser<'a> {
     pub(crate) fn collect_declared_generics(source: &str, tokens: Vec<Token>) -> BTreeSet<String> {
         let p = Parser::new(source, None, tokens);
         p.local_generics
+    }
+
+    pub(crate) fn collect_pub_declared_generics(
+        source: &str,
+        tokens: Vec<Token>,
+    ) -> BTreeSet<String> {
+        let p = Parser::new(source, None, tokens);
+        p.pub_local_generics
     }
 
     fn prescan_top_level(&mut self) {
@@ -91,7 +111,14 @@ impl<'a> Parser<'a> {
         while !self.at(&TokenKind::Eof) {
             let iter_start = self.pos;
             let _ = self.parse_attrs();
-            while self.eat(&TokenKind::KwPub) || self.eat(&TokenKind::KwStatic) {}
+            let mut is_pub = false;
+            while self.at(&TokenKind::KwPub) || self.at(&TokenKind::KwStatic) {
+                if self.eat(&TokenKind::KwPub) {
+                    is_pub = true;
+                } else {
+                    self.bump();
+                }
+            }
             let _ = self.parse_attrs();
 
             match self.peek_kind() {
@@ -112,6 +139,7 @@ impl<'a> Parser<'a> {
                     if let TokenKind::Ident(name) = self.peek_kind() {
                         self.bump();
                         if !self.at(&TokenKind::LBrace) {
+                            self.non_usize_top_level_values.insert(name.clone());
                             self.top_level_values.insert(name);
                         }
                     }
@@ -121,6 +149,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                     if let TokenKind::Ident(name) = self.peek_kind() {
                         self.bump();
+                        self.non_usize_top_level_values.insert(name.clone());
                         self.top_level_values.insert(name);
                     }
                     self.prescan_skip_until_semi_depth0();
@@ -131,6 +160,9 @@ impl<'a> Parser<'a> {
                     if let TokenKind::Ident(name) = self.peek_kind() {
                         self.bump();
                         if self.at(&TokenKind::Lt) {
+                            if is_pub {
+                                self.pub_local_generics.insert(name.clone());
+                            }
                             self.local_generics.insert(name);
                         }
                     }
@@ -141,7 +173,10 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::KwConst => {
                     self.bump();
-                    if let Ok((_, name)) = self.parse_field_or_param("prescan") {
+                    if let Ok((ty, name)) = self.parse_field_or_param("prescan") {
+                        if !is_usize_type_expr(&ty) {
+                            self.non_usize_top_level_values.insert(name.name.clone());
+                        }
                         self.top_level_values.insert(name.name);
                     }
                     self.prescan_skip_until_semi_depth0();
@@ -160,11 +195,17 @@ impl<'a> Parser<'a> {
                     if is_std {
                         if let TokenKind::Ident(name) = self.bump().kind {
                             if self.at(&TokenKind::Lt) {
+                                if is_pub {
+                                    self.pub_local_generics.insert(name.clone());
+                                }
                                 self.local_generics.insert(name);
                             }
                         }
                     } else if let Ok((_, name)) = self.parse_typed_declarator("prescan") {
                         if self.at(&TokenKind::Lt) {
+                            if is_pub {
+                                self.pub_local_generics.insert(name.name.clone());
+                            }
                             self.local_generics.insert(name.name);
                         }
                     }
@@ -173,11 +214,15 @@ impl<'a> Parser<'a> {
                 _ => {
                     if let Ok((_, name)) = self.parse_typed_declarator("prescan") {
                         if self.at(&TokenKind::Lt) {
+                            if is_pub {
+                                self.pub_local_generics.insert(name.name.clone());
+                            }
                             self.local_generics.insert(name.name);
                             self.prescan_skip_item();
                         } else if self.at(&TokenKind::LParen) {
                             self.prescan_skip_item();
                         } else {
+                            self.non_usize_top_level_values.insert(name.name.clone());
                             self.top_level_values.insert(name.name);
                             self.prescan_skip_until_semi_depth0();
                         }
@@ -276,18 +321,121 @@ impl<'a> Parser<'a> {
         if self.pending_gt.is_some() {
             return None;
         }
-        // A bare identifier in local `value_scopes` (e.g. `b` in `a < b, c > (d + 1)`)
-        // cannot be a valid compile-time generic type or constant parameter (`E0029`).
+        // A bare identifier in local `value_scopes` or a non-`usize` top-level value
+        // (e.g. `b` or `const u32 HI` in `a < b, HI > (d + 1)`) cannot be a valid
+        // compile-time generic type or `usize` constant parameter (`E0029`).
         for arg in &args {
-            if let GenericArg::Type(te) = arg {
-                if let TypeKind::Named(id) = &te.kind {
-                    if self.value_scopes.iter().rev().any(|s| s.contains(&id.name)) {
+            match arg {
+                GenericArg::Type(te) => match &te.kind {
+                    TypeKind::Named(id) => {
+                        if !self.generic_const_params.contains(&id.name)
+                            && (self.value_scopes.iter().rev().any(|s| s.contains(&id.name))
+                                || self.non_usize_top_level_values.contains(&id.name))
+                        {
+                            return None;
+                        }
+                    }
+                    TypeKind::Path(segs) => {
+                        if segs.first().is_some_and(|id| self.is_value_name(&id.name)) {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                },
+                GenericArg::Const(expr) => {
+                    if self.expr_contains_disallowed_speculative_value(expr, false) {
                         return None;
                     }
                 }
             }
         }
         Some(args)
+    }
+
+    fn expr_contains_disallowed_speculative_value(
+        &self,
+        expr: &Expr,
+        allow_non_usize_top: bool,
+    ) -> bool {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                if self.generic_const_params.contains(&id.name) {
+                    return false;
+                }
+                if self.value_scopes.iter().rev().any(|s| s.contains(&id.name)) {
+                    return true;
+                }
+                !allow_non_usize_top && self.non_usize_top_level_values.contains(&id.name)
+            }
+            ExprKind::Cast { expr: inner, ty } => {
+                let inner_allow = allow_non_usize_top || is_usize_type_expr(ty);
+                self.expr_contains_disallowed_speculative_value(inner, inner_allow)
+            }
+            ExprKind::Unary { expr: inner, .. } => {
+                self.expr_contains_disallowed_speculative_value(inner, allow_non_usize_top)
+            }
+            ExprKind::Binary { lhs, rhs, .. } => {
+                self.expr_contains_disallowed_speculative_value(lhs, allow_non_usize_top)
+                    || self.expr_contains_disallowed_speculative_value(rhs, allow_non_usize_top)
+            }
+            ExprKind::Field { target, .. } => {
+                self.expr_contains_disallowed_speculative_value(target, allow_non_usize_top)
+            }
+            ExprKind::Index { target, index } => {
+                self.expr_contains_disallowed_speculative_value(target, allow_non_usize_top)
+                    || self.expr_contains_disallowed_speculative_value(index, allow_non_usize_top)
+            }
+            ExprKind::Slice { target, start, end } => {
+                self.expr_contains_disallowed_speculative_value(target, allow_non_usize_top)
+                    || start.as_ref().is_some_and(|e| {
+                        self.expr_contains_disallowed_speculative_value(e, allow_non_usize_top)
+                    })
+                    || end.as_ref().is_some_and(|e| {
+                        self.expr_contains_disallowed_speculative_value(e, allow_non_usize_top)
+                    })
+            }
+            ExprKind::ArrayLit(elems) => elems
+                .iter()
+                .any(|e| self.expr_contains_disallowed_speculative_value(e, allow_non_usize_top)),
+            ExprKind::StructLit { fields, .. } => fields.iter().any(|f| {
+                self.expr_contains_disallowed_speculative_value(&f.value, allow_non_usize_top)
+            }),
+            ExprKind::Call { callee, args, .. } => {
+                self.expr_contains_disallowed_speculative_value(callee, allow_non_usize_top)
+                    || args.iter().any(|a| {
+                        self.expr_contains_disallowed_speculative_value(
+                            &a.value,
+                            allow_non_usize_top,
+                        )
+                    })
+            }
+            ExprKind::MethodCall { receiver, args, .. } => {
+                self.expr_contains_disallowed_speculative_value(receiver, allow_non_usize_top)
+                    || args.iter().any(|a| {
+                        self.expr_contains_disallowed_speculative_value(
+                            &a.value,
+                            allow_non_usize_top,
+                        )
+                    })
+            }
+            ExprKind::Or {
+                expr: a,
+                fallback: b,
+            } => {
+                self.expr_contains_disallowed_speculative_value(a, allow_non_usize_top)
+                    || self.expr_contains_disallowed_speculative_value(b, allow_non_usize_top)
+            }
+            ExprKind::Catch { expr: inner, .. } => {
+                self.expr_contains_disallowed_speculative_value(inner, allow_non_usize_top)
+            }
+            ExprKind::FormatString(parts) => parts.iter().any(|p| match p {
+                FormatPart::Literal(_) => false,
+                FormatPart::Hole { expr, .. } => {
+                    self.expr_contains_disallowed_speculative_value(expr, allow_non_usize_top)
+                }
+            }),
+            ExprKind::Literal(_) | ExprKind::Priority(_) => false,
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1444,12 +1592,21 @@ impl<'a> Parser<'a> {
 
         let ret_type = TypeExpr::void(fn_tok.span);
         let error_spec = self.parse_optional_error_spec()?;
+        let prev_const_params = self.generic_const_params.clone();
         self.push_value_scope();
+        for gp in &generic_params {
+            if gp.kind == GenericParamKind::ConstUsize {
+                self.generic_const_params.insert(gp.name.name.clone());
+                self.record_local_value(&gp.name.name);
+            }
+        }
         for p in &params {
+            self.generic_const_params.remove(&p.name.name);
             self.record_local_value(&p.name.name);
         }
         let body_res = self.parse_fn_body(is_extern_c, &name);
         self.pop_value_scope();
+        self.generic_const_params = prev_const_params;
         let (body, end_span) = body_res?;
 
         Ok(FnDecl {
@@ -1488,12 +1645,21 @@ impl<'a> Parser<'a> {
         }
 
         let error_spec = self.parse_optional_error_spec()?;
+        let prev_const_params = self.generic_const_params.clone();
         self.push_value_scope();
+        for gp in &generic_params {
+            if gp.kind == GenericParamKind::ConstUsize {
+                self.generic_const_params.insert(gp.name.name.clone());
+                self.record_local_value(&gp.name.name);
+            }
+        }
         for p in &params {
+            self.generic_const_params.remove(&p.name.name);
             self.record_local_value(&p.name.name);
         }
         let body_res = self.parse_fn_body(is_extern_c, &name);
         self.pop_value_scope();
+        self.generic_const_params = prev_const_params;
         let (body, end_span) = body_res?;
 
         Ok(FnDecl {
@@ -3709,12 +3875,12 @@ impl<'a> Parser<'a> {
     }
 
     /// Speculatively check if `(` starts a C-style cast involving a built-in `PrimType`
-    /// (e.g. `(u16)x`, `(i32)(a - b)`, `(*u8)addr`, `(u32*)addr`).
+    /// or a pointer type (`*T`, `T*`, `(*MyStruct)vp`, `(MyStruct*)vp`, `(*mod.MyStruct)vp`).
     fn try_parse_c_cast_type(&mut self) -> Option<TypeExpr> {
         let cp = self.save();
         self.bump(); // `(`
         let ty = match self.parse_type() {
-            Ok(t) if type_contains_builtin_prim(&t) => t,
+            Ok(t) if self.is_valid_c_cast_type(&t) => t,
             _ => {
                 self.restore(cp);
                 return None;
@@ -3725,6 +3891,33 @@ impl<'a> Parser<'a> {
             return None;
         }
         Some(ty)
+    }
+
+    fn is_valid_c_cast_type(&self, ty: &TypeExpr) -> bool {
+        if type_contains_builtin_prim(ty) {
+            return true;
+        }
+        let mut inner = ty;
+        let mut saw_ptr = false;
+        while let TypeKind::Ptr(next) = &inner.kind {
+            saw_ptr = true;
+            inner = next;
+        }
+        if !saw_ptr {
+            return false;
+        }
+        match &inner.kind {
+            TypeKind::Named(id) | TypeKind::Generic { base: id, .. } => {
+                !self.is_value_name(&id.name)
+            }
+            TypeKind::Path(segs) | TypeKind::GenericPath { path: segs, .. } => {
+                segs.len() == 2
+                    && !self.is_value_name(&segs[0].name)
+                    && self.import_aliases.contains(&segs[0].name)
+            }
+            TypeKind::OsPrimitive(_) => true,
+            _ => false,
+        }
     }
 
     fn can_start_unary_expr(&self) -> bool {
@@ -3773,22 +3966,37 @@ impl<'a> Parser<'a> {
                     // `::` turbofish and module-qualified struct literals (`mod.Box<u32> { ... }`) also handled).
                     let is_mod_ident = dot_tok.kind == TokenKind::Dot
                         && matches!(&expr.kind, ExprKind::Ident(_));
+                    let qualified_known = if let (Some(known), ExprKind::Ident(id)) =
+                        (self.known_generics, &expr.kind)
+                    {
+                        if known.contains("#import_scoped") {
+                            Some(known.contains(&format!("{}.{}", id.name, field.name)))
+                        } else {
+                            Some(known.contains(&field.name))
+                        }
+                    } else {
+                        None
+                    };
                     let allow_bare_lt_call = match dot_tok.kind {
                         TokenKind::Dot => matches!(
                             &expr.kind,
                             ExprKind::Ident(id)
                                 if !self.is_value_name(&id.name)
                                     && self.import_aliases.contains(&id.name)
-                                    && self.can_speculate_bare_generic_call(&field.name)
+                                    && qualified_known.unwrap_or(true)
                         ),
-                        TokenKind::ColonColon => self
-                            .known_generics
-                            .map_or(true, |set| set.contains(&field.name)),
+                        TokenKind::ColonColon => qualified_known.unwrap_or(true),
                         _ => false,
                     };
                     let allow_bare_lt_struct_lit = is_mod_ident
                         && self.allow_struct_lit
-                        && matches!(&expr.kind, ExprKind::Ident(id) if !self.is_value_name(&id.name));
+                        && matches!(
+                            &expr.kind,
+                            ExprKind::Ident(id)
+                                if !self.is_value_name(&id.name)
+                                    && (!self.import_aliases.contains(&id.name)
+                                        || qualified_known.unwrap_or(true))
+                        );
 
                     if self.at(&TokenKind::ColonColon) && self.peek_n_kind(1) == TokenKind::Lt {
                         self.bump(); // `::`
@@ -4389,6 +4597,11 @@ impl<'a> Parser<'a> {
             start.merge(rb.span),
         ))
     }
+}
+
+fn is_usize_type_expr(ty: &TypeExpr) -> bool {
+    matches!(&ty.kind, TypeKind::Prim(PrimType::Usize))
+        || matches!(&ty.kind, TypeKind::Named(id) if id.name == "usize")
 }
 
 fn type_contains_builtin_prim(ty: &TypeExpr) -> bool {

@@ -84,6 +84,13 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
             .ok_or_else(|| "missing `<name>` in `<peripheral>`".to_string())?
             .to_string();
 
+        let stripped = strip_dim_placeholder(&name);
+        let base_periph_name = if stripped.is_empty() {
+            name.clone()
+        } else {
+            stripped
+        };
+
         let derived_from = p_el
             .attr("derivedFrom")
             .map(str::trim)
@@ -93,6 +100,23 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
         let base_address = match p_el.child_text("baseAddress") {
             Some(raw) => Some(parse_svd_u32(raw, "<baseAddress>")?),
             None => None,
+        };
+
+        let dim = if let Some(dim_raw) = p_el.child_text("dim") {
+            let count = parse_svd_dim(dim_raw, "<peripheral><dim>")?;
+            let dim_inc = match p_el.child_text("dimIncrement") {
+                Some(inc_raw) => parse_svd_u64(inc_raw, "<peripheral><dimIncrement>")?,
+                None if count <= 1 => 0,
+                None => {
+                    return Err(format!(
+                        "missing `<dimIncrement>` on `<peripheral>` `{name}` with `<dim>` {count}"
+                    ));
+                }
+            };
+            let indices = parse_dim_indices(count, p_el.child_text("dimIndex"));
+            Some(PeripheralDim { dim_inc, indices })
+        } else {
+            None
         };
 
         let mut interrupts = Vec::new();
@@ -115,12 +139,12 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
             });
         }
 
-        let idx = raw_periphs.len();
-        name_to_idx.entry(name.clone()).or_insert(idx);
         raw_periphs.push(RawPeripheral {
             name,
+            base_periph_name,
             derived_from,
             base_address,
+            dim,
             el: p_el,
             props: RegProps::default(),
             registers_el: p_el.child("registers"),
@@ -128,42 +152,65 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
         });
     }
 
-    for i in 0..raw_periphs.len() {
-        let resolved_props =
-            resolve_peripheral_props(i, &raw_periphs, &name_to_idx, &device_props)?;
-        raw_periphs[i].props = resolved_props;
+    // Register exact `<name>` first, then stripped base names and expanded `<dim>` instance names
+    // so explicit `<peripheral><name>` always takes precedence over derived/expanded aliases.
+    for (idx, p) in raw_periphs.iter().enumerate() {
+        name_to_idx.entry(p.name.clone()).or_insert(idx);
+    }
+    for (idx, p) in raw_periphs.iter().enumerate() {
+        if p.base_periph_name != p.name {
+            name_to_idx.entry(p.base_periph_name.clone()).or_insert(idx);
+        }
+        if let Some(dim) = &p.dim {
+            for idx_str in &dim.indices {
+                let expanded = substitute_dim_name(&p.name, idx_str, true);
+                name_to_idx.entry(expanded).or_insert(idx);
+            }
+        }
     }
 
-    // Resolve `derivedFrom` chains cleanly and detect cycles or missing bases.
-    let mut resolved_base_idx: Vec<Option<usize>> = Vec::with_capacity(raw_periphs.len());
+    // Resolve `derivedFrom` chains cleanly and detect cycles or missing targets.
+    let mut chains: Vec<Vec<usize>> = Vec::with_capacity(raw_periphs.len());
+    for i in 0..raw_periphs.len() {
+        chains.push(resolve_peripheral_chain(i, &raw_periphs, &name_to_idx)?);
+    }
+
+    for i in 0..raw_periphs.len() {
+        let mut props = device_props.clone();
+        for &c_idx in &chains[i] {
+            props = props.merge(raw_periphs[c_idx].el)?;
+        }
+        raw_periphs[i].props = props;
+    }
+
+    let mut resolved_owner_idx: Vec<Option<usize>> = Vec::with_capacity(raw_periphs.len());
     let mut resolved_addrs: Vec<u32> = Vec::with_capacity(raw_periphs.len());
-
     for i in 0..raw_periphs.len() {
-        let layout_owner = resolve_layout_owner(i, &raw_periphs, &name_to_idx)?;
-        let base_addr = resolve_base_address(i, &raw_periphs, &name_to_idx)?;
-        resolved_base_idx.push(layout_owner);
-        resolved_addrs.push(base_addr);
+        resolved_owner_idx.push(resolve_layout_owner_from_chain(&chains[i], &raw_periphs));
+        resolved_addrs.push(resolve_base_address_from_chain(&chains[i], &raw_periphs)?);
     }
 
-    // Collect deduplicated interrupts across all peripherals.
+    // Collect deduplicated interrupts across all peripherals (expanding `%s` on dimmed ones).
     let mut irqs: Vec<(String, u32)> = Vec::new();
     let mut seen_irq_names: BTreeMap<String, u32> = BTreeMap::new();
     for p in &raw_periphs {
-        for irq in &p.interrupts {
-            let ident = format_irq_ident(&irq.name);
-            match seen_irq_names.get(&ident).copied() {
-                Some(existing) if existing == irq.num => {}
-                Some(_) => {
-                    let disambig = format!("{ident}_{}", irq.num);
-                    if !seen_irq_names.contains_key(&disambig) {
-                        seen_irq_names.insert(disambig.clone(), irq.num);
-                        irqs.push((disambig, irq.num));
+        if let Some(dim) = &p.dim {
+            if dim.indices.is_empty() {
+                continue;
+            }
+            for irq in &p.interrupts {
+                if irq.name.contains("%s") {
+                    for idx_str in &dim.indices {
+                        let expanded = substitute_dim_name(&irq.name, idx_str, false);
+                        record_irq(&expanded, irq.num, &mut seen_irq_names, &mut irqs);
                     }
+                } else {
+                    record_irq(&irq.name, irq.num, &mut seen_irq_names, &mut irqs);
                 }
-                None => {
-                    seen_irq_names.insert(ident.clone(), irq.num);
-                    irqs.push((ident, irq.num));
-                }
+            }
+        } else {
+            for irq in &p.interrupts {
+                record_irq(&irq.name, irq.num, &mut seen_irq_names, &mut irqs);
             }
         }
     }
@@ -175,51 +222,122 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
         used_top_names.insert(irq_name.clone());
     }
 
-    // Determine instance identifiers first so layouts never collide with instances.
-    let mut inst_names: Vec<String> = Vec::with_capacity(raw_periphs.len());
-    for p in &raw_periphs {
-        let mut inst = sanitize_ident(&p.name);
-        if used_top_names.contains(&inst) {
-            inst = make_unique_name(&inst, &used_top_names);
+    // Determine expanded instance identifiers first so layouts never collide with instances.
+    let mut inst_entries: Vec<Vec<BuiltInstance>> = Vec::with_capacity(raw_periphs.len());
+    for (i, p) in raw_periphs.iter().enumerate() {
+        let base_addr = resolved_addrs[i];
+        let mut list = Vec::new();
+        if let Some(dim) = &p.dim {
+            for (k, idx_str) in dim.indices.iter().enumerate() {
+                let addr = (k as u64)
+                    .checked_mul(dim.dim_inc)
+                    .and_then(|d| u64::from(base_addr).checked_add(d))
+                    .and_then(|a| u32::try_from(a).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "peripheral `{}` `<dim>` instance address overflows 32-bit range",
+                            p.name
+                        )
+                    })?;
+                let expanded = substitute_dim_name(&p.name, idx_str, true);
+                let mut inst = sanitize_ident(&expanded);
+                if used_top_names.contains(&inst) {
+                    inst = make_unique_name(&inst, &used_top_names);
+                }
+                used_top_names.insert(inst.clone());
+                list.push(BuiltInstance {
+                    name: inst,
+                    base_addr: addr,
+                });
+            }
+        } else {
+            let mut inst = sanitize_ident(&p.name);
+            if used_top_names.contains(&inst) {
+                inst = make_unique_name(&inst, &used_top_names);
+            }
+            used_top_names.insert(inst.clone());
+            list.push(BuiltInstance {
+                name: inst,
+                base_addr,
+            });
         }
-        used_top_names.insert(inst.clone());
-        inst_names.push(inst);
+        inst_entries.push(list);
     }
 
-    // Build shared layouts for every peripheral that owns `<registers>`.
+    // Build shared/merged layouts for every peripheral that owns a layout.
     let mut layouts_by_owner: BTreeMap<usize, BuiltLayout> = BTreeMap::new();
     let mut used_consts: HashSet<String> = used_top_names.clone();
 
     for (idx, p) in raw_periphs.iter().enumerate() {
-        let Some(regs_el) = p.registers_el else {
+        if resolved_owner_idx[idx] != Some(idx) {
             continue;
-        };
+        }
+        let has_instances = resolved_owner_idx
+            .iter()
+            .enumerate()
+            .any(|(j, o)| *o == Some(idx) && !inst_entries[j].is_empty());
+        if !has_instances {
+            continue;
+        }
 
-        let mut layout_name = to_layout_name(&p.name);
+        let reg_containers: Vec<&XmlElement> = chains[idx]
+            .iter()
+            .filter_map(|&c_idx| raw_periphs[c_idx].registers_el)
+            .collect();
+        if reg_containers.is_empty() {
+            continue;
+        }
+
+        let mut layout_name = to_layout_name(&p.base_periph_name);
         if used_top_names.contains(&layout_name) {
             layout_name = make_unique_name(&layout_name, &used_top_names);
         }
         used_top_names.insert(layout_name.clone());
         used_consts.insert(layout_name.clone());
 
-        let mut candidates = Vec::new();
         let mut seq = 0usize;
-        let sym_index = PeriphSymIndex::build(regs_el);
-        collect_registers_from_container(
-            regs_el,
-            0,
-            "",
-            "",
-            "",
-            &p.props,
-            &p.name,
-            true,
-            &sym_index,
-            &mut candidates,
-            &mut seq,
-        )?;
+        let mut sym_index = PeriphSymIndex::new();
+        let mut merged_candidates: Vec<(CandidateReg, (u32, u32))> = Vec::new();
 
-        let (regs, consts) = finalize_layout_registers(candidates, &mut used_consts);
+        for regs_el in reg_containers {
+            sym_index.push_container(regs_el);
+            let mut layer_raw = Vec::new();
+            collect_registers_from_container(
+                regs_el,
+                0,
+                "",
+                "",
+                "",
+                &p.props,
+                &p.base_periph_name,
+                true,
+                &sym_index,
+                &mut layer_raw,
+                &mut seq,
+            )?;
+            let layer_valid = dedup_layer_candidates(layer_raw);
+            if !merged_candidates.is_empty() && !layer_valid.is_empty() {
+                let new_names: HashSet<&str> =
+                    layer_valid.iter().map(|(c, _)| c.name.as_str()).collect();
+                merged_candidates.retain(|(prev, (ps, pe))| {
+                    if new_names.contains(prev.name.as_str()) {
+                        return false;
+                    }
+                    let pos = layer_valid.partition_point(|(_, (_, ne))| *ne <= *ps);
+                    if let Some((_, (ns, _))) = layer_valid.get(pos) {
+                        if *ns < *pe {
+                            return false;
+                        }
+                    }
+                    true
+                });
+            }
+            merged_candidates.extend(layer_valid);
+        }
+
+        let final_candidates: Vec<CandidateReg> =
+            merged_candidates.into_iter().map(|(c, _)| c).collect();
+        let (regs, consts) = finalize_layout_registers(final_candidates, &mut used_consts);
         if !regs.is_empty() {
             layouts_by_owner.insert(
                 idx,
@@ -233,14 +351,11 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
         }
     }
 
-    // Attach all peripheral instances (including `derivedFrom` ones) to their shared layout.
-    for (idx, owner_opt) in resolved_base_idx.iter().enumerate() {
+    // Attach all peripheral instances (including `derivedFrom` and `<dim>` ones) to their layout.
+    for (idx, owner_opt) in resolved_owner_idx.iter().enumerate() {
         if let Some(owner_idx) = owner_opt {
             if let Some(layout) = layouts_by_owner.get_mut(owner_idx) {
-                layout.instances.push(BuiltInstance {
-                    name: inst_names[idx].clone(),
-                    base_addr: resolved_addrs[idx],
-                });
+                layout.instances.append(&mut inst_entries[idx]);
             }
         }
     }
@@ -372,43 +487,79 @@ impl RegProps {
     }
 }
 
+const MAX_SVD_DIM: u64 = 16_384;
+const MAX_LAYOUT_CANDIDATES: usize = 65_536;
+
 fn resolve_access_with_fields(props: &RegProps, fields_el: Option<&XmlElement>) -> MmioAccess {
-    let access = props.access.as_deref().unwrap_or("read-write").trim();
-    if access == "read-only" {
-        MmioAccess::Ro
-    } else if props
+    let reg_acc = props
+        .access
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("read-write");
+    let reg_mwv = props
         .modified_write_values
         .as_deref()
         .map(str::trim)
-        == Some("oneToClear")
-    {
-        MmioAccess::W1c
-    } else if props.modified_write_values.is_none()
-        && fields_has_unanimous_w1c(fields_el)
-    {
-        MmioAccess::W1c
-    } else if access == "write-only" || access == "writeOnce" {
+        .filter(|s| !s.is_empty());
+
+    let fields: Vec<&XmlElement> = fields_el
+        .map(|el| el.children("field").collect())
+        .unwrap_or_default();
+
+    let (can_read, can_write, unanimous_w1c) = if fields.is_empty() {
+        let (r, w) = access_rw_flags(reg_acc);
+        (r, w, w && reg_mwv == Some("oneToClear"))
+    } else {
+        let mut any_read = false;
+        let mut any_write = false;
+        let mut all_writable_w1c = true;
+        let mut saw_writable_w1c = false;
+        for f in &fields {
+            let f_acc = f
+                .child_text("access")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(reg_acc);
+            let (fr, fw) = access_rw_flags(f_acc);
+            any_read |= fr;
+            any_write |= fw;
+            if fw {
+                let f_mwv = f
+                    .child_text("modifiedWriteValues")
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or(reg_mwv);
+                if f_mwv == Some("oneToClear") {
+                    saw_writable_w1c = true;
+                } else {
+                    all_writable_w1c = false;
+                }
+            }
+        }
+        (any_read, any_write, all_writable_w1c && saw_writable_w1c)
+    };
+
+    if !can_write {
+        MmioAccess::Ro
+    } else if !can_read {
+        // Write-only registers always emit `@wo` even when `modifiedWriteValues` is `oneToClear`,
+        // so Zev statically forbids illegal reads.
         MmioAccess::Wo
+    } else if unanimous_w1c {
+        MmioAccess::W1c
     } else {
         MmioAccess::Rw
     }
 }
 
-fn fields_has_unanimous_w1c(fields_el: Option<&XmlElement>) -> bool {
-    let Some(fields) = fields_el else {
-        return false;
-    };
-    let mut saw_w1c = false;
-    for f in fields.children("field") {
-        if let Some(mwv) = f.child_text("modifiedWriteValues").map(str::trim) {
-            if mwv == "oneToClear" {
-                saw_w1c = true;
-            } else if !mwv.is_empty() {
-                return false;
-            }
-        }
+fn access_rw_flags(acc: &str) -> (bool, bool) {
+    match acc.trim() {
+        "read-only" => (true, false),
+        "write-only" | "writeOnce" => (false, true),
+        "read-write" | "read-writeOnce" => (true, true),
+        _ => (true, true),
     }
-    saw_w1c
 }
 
 struct RawInterrupt {
@@ -416,33 +567,69 @@ struct RawInterrupt {
     num: u32,
 }
 
+struct PeripheralDim {
+    dim_inc: u64,
+    indices: Vec<String>,
+}
+
 struct RawPeripheral<'a> {
     name: String,
+    base_periph_name: String,
     derived_from: Option<String>,
     base_address: Option<u32>,
+    dim: Option<PeripheralDim>,
     el: &'a XmlElement,
     props: RegProps,
     registers_el: Option<&'a XmlElement>,
     interrupts: Vec<RawInterrupt>,
 }
 
-fn resolve_peripheral_props(
+fn record_irq(
+    raw_name: &str,
+    num: u32,
+    seen_irq_names: &mut BTreeMap<String, u32>,
+    irqs: &mut Vec<(String, u32)>,
+) {
+    let ident = format_irq_ident(raw_name);
+    match seen_irq_names.get(&ident).copied() {
+        Some(existing) if existing == num => {}
+        Some(_) => {
+            let disambig = format!("{ident}_{num}");
+            if let Some(existing) = seen_irq_names.get(&disambig).copied() {
+                if existing == num {
+                    return;
+                }
+                let unique = format!("{disambig}_{}", irqs.len());
+                seen_irq_names.insert(unique.clone(), num);
+                irqs.push((unique, num));
+            } else {
+                seen_irq_names.insert(disambig.clone(), num);
+                irqs.push((disambig, num));
+            }
+        }
+        None => {
+            seen_irq_names.insert(ident.clone(), num);
+            irqs.push((ident, num));
+        }
+    }
+}
+
+fn resolve_peripheral_chain(
     start: usize,
     periphs: &[RawPeripheral<'_>],
     by_name: &BTreeMap<String, usize>,
-    device_props: &RegProps,
-) -> Result<RegProps, String> {
-    let mut chain = Vec::new();
+) -> Result<Vec<usize>, String> {
+    let mut rev_chain = Vec::new();
     let mut visited = HashSet::new();
     let mut cur = start;
     loop {
         if !visited.insert(cur) {
             return Err(format!(
-                "cyclic `derivedFrom` chain resolving properties at peripheral `{}`",
+                "cyclic `derivedFrom` chain starting at peripheral `{}`",
                 periphs[start].name
             ));
         }
-        chain.push(periphs[cur].el);
+        rev_chain.push(cur);
         let Some(ref target) = periphs[cur].derived_from else {
             break;
         };
@@ -453,11 +640,42 @@ fn resolve_peripheral_props(
             )
         })?;
     }
-    let mut props = device_props.clone();
-    for el in chain.into_iter().rev() {
-        props = props.merge(el)?;
+    rev_chain.reverse();
+    Ok(rev_chain)
+}
+
+fn resolve_layout_owner_from_chain(
+    chain: &[usize],
+    periphs: &[RawPeripheral<'_>],
+) -> Option<usize> {
+    let mut owner: Option<usize> = None;
+    for &idx in chain {
+        let p = &periphs[idx];
+        let overrides_reg_props = owner.is_some()
+            && (p.el.child_text("size").is_some()
+                || p.el.child_text("access").is_some()
+                || p.el.child_text("modifiedWriteValues").is_some());
+        if p.registers_el.is_some() || overrides_reg_props {
+            owner = Some(idx);
+        }
     }
-    Ok(props)
+    owner
+}
+
+fn resolve_base_address_from_chain(
+    chain: &[usize],
+    periphs: &[RawPeripheral<'_>],
+) -> Result<u32, String> {
+    for &idx in chain.iter().rev() {
+        if let Some(addr) = periphs[idx].base_address {
+            return Ok(addr);
+        }
+    }
+    let leaf = *chain.last().unwrap_or(&0);
+    Err(format!(
+        "missing `<baseAddress>` on peripheral `{}`",
+        periphs[leaf].name
+    ))
 }
 
 #[derive(Clone)]
@@ -497,65 +715,32 @@ struct BuiltLayout {
     instances: Vec<BuiltInstance>,
 }
 
-fn resolve_layout_owner(
-    start: usize,
-    periphs: &[RawPeripheral<'_>],
-    by_name: &BTreeMap<String, usize>,
-) -> Result<Option<usize>, String> {
-    let mut cur = start;
-    let mut visited = HashSet::new();
-    loop {
-        if !visited.insert(cur) {
-            return Err(format!(
-                "cyclic `derivedFrom` chain starting at peripheral `{}`",
-                periphs[start].name
-            ));
-        }
-        if periphs[cur].registers_el.is_some() {
-            return Ok(Some(cur));
-        }
-        let Some(ref target) = periphs[cur].derived_from else {
-            return Ok(None);
-        };
-        cur = *by_name.get(target).ok_or_else(|| {
-            format!(
-                "peripheral `{}` has `derivedFrom=\"{target}\"`, which does not exist",
-                periphs[cur].name
-            )
-        })?;
+fn cand_byte_range(cand: &CandidateReg) -> Option<(u32, u32)> {
+    let elem_bytes = (cand.elem_bits / 8) as u32;
+    if elem_bytes == 0 || cand.offset % elem_bytes != 0 {
+        return None;
     }
+    let count = u32::try_from(cand.array_len.unwrap_or(1)).ok()?;
+    let total_bytes = elem_bytes.checked_mul(count)?;
+    let end = cand.offset.checked_add(total_bytes)?;
+    Some((cand.offset, end))
 }
 
-fn resolve_base_address(
-    start: usize,
-    periphs: &[RawPeripheral<'_>],
-    by_name: &BTreeMap<String, usize>,
-) -> Result<u32, String> {
-    let mut cur = start;
-    let mut visited = HashSet::new();
-    loop {
-        if !visited.insert(cur) {
-            return Err(format!(
-                "cyclic `derivedFrom` chain resolving `<baseAddress>` at `{}`",
-                periphs[start].name
-            ));
-        }
-        if let Some(addr) = periphs[cur].base_address {
-            return Ok(addr);
-        }
-        let Some(ref target) = periphs[cur].derived_from else {
-            return Err(format!(
-                "missing `<baseAddress>` on peripheral `{}`",
-                periphs[start].name
-            ));
+fn dedup_layer_candidates(mut layer: Vec<CandidateReg>) -> Vec<(CandidateReg, (u32, u32))> {
+    layer.sort_by(|a, b| a.offset.cmp(&b.offset).then_with(|| a.seq.cmp(&b.seq)));
+    let mut valid: Vec<(CandidateReg, (u32, u32))> = Vec::new();
+    for cand in layer {
+        let Some((s, e)) = cand_byte_range(&cand) else {
+            continue;
         };
-        cur = *by_name.get(target).ok_or_else(|| {
-            format!(
-                "peripheral `{}` references unknown `derivedFrom=\"{target}\"`",
-                periphs[cur].name
-            )
-        })?;
+        if let Some((_, (_, prev_end))) = valid.last() {
+            if s < *prev_end {
+                continue;
+            }
+        }
+        valid.push((cand, (s, e)));
     }
+    valid
 }
 
 struct PeriphSymIndex<'a> {
@@ -564,13 +749,15 @@ struct PeriphSymIndex<'a> {
 }
 
 impl<'a> PeriphSymIndex<'a> {
-    fn build(container: &'a XmlElement) -> Self {
-        let mut idx = Self {
+    fn new() -> Self {
+        Self {
             regs: BTreeMap::new(),
             clusters: BTreeMap::new(),
-        };
-        idx.visit(container, "");
-        idx
+        }
+    }
+
+    fn push_container(&mut self, container: &'a XmlElement) {
+        self.visit(container, "");
     }
 
     fn visit(&mut self, container: &'a XmlElement, prefix: &str) {
@@ -583,7 +770,7 @@ impl<'a> PeriphSymIndex<'a> {
                         } else {
                             format!("{prefix}.{raw_name}")
                         };
-                        self.regs.entry(key).or_insert(child);
+                        self.regs.insert(key, child);
                         let stripped = strip_dim_placeholder(raw_name);
                         if !stripped.is_empty() && stripped != raw_name {
                             let skey = if prefix.is_empty() {
@@ -591,7 +778,7 @@ impl<'a> PeriphSymIndex<'a> {
                             } else {
                                 format!("{prefix}.{stripped}")
                             };
-                            self.regs.entry(skey).or_insert(child);
+                            self.regs.insert(skey, child);
                         }
                     }
                 }
@@ -602,7 +789,7 @@ impl<'a> PeriphSymIndex<'a> {
                         } else {
                             format!("{prefix}.{raw_name}")
                         };
-                        self.clusters.entry(key.clone()).or_insert(child);
+                        self.clusters.insert(key.clone(), child);
                         let stripped = strip_dim_placeholder(raw_name);
                         if !stripped.is_empty() && stripped != raw_name {
                             let skey = if prefix.is_empty() {
@@ -610,7 +797,7 @@ impl<'a> PeriphSymIndex<'a> {
                             } else {
                                 format!("{prefix}.{stripped}")
                             };
-                            self.clusters.entry(skey).or_insert(child);
+                            self.clusters.insert(skey, child);
                         }
                         self.visit(child, &key);
                     }
@@ -729,7 +916,7 @@ where
                 };
 
                 if let Some(dim_raw) = first_text("dim") {
-                    let dim = parse_svd_u64(dim_raw, "<dim>")? as usize;
+                    let dim = parse_svd_dim(dim_raw, "<dim>")?;
                     if dim == 0 {
                         continue;
                     }
@@ -750,6 +937,11 @@ where
                         let Ok(offset_u32) = u32::try_from(abs_offset) else {
                             continue;
                         };
+                        if out.len() >= MAX_LAYOUT_CANDIDATES {
+                            return Err(format!(
+                                "peripheral `{periph_name}` exceeds maximum expanded register count ({MAX_LAYOUT_CANDIDATES})"
+                            ));
+                        }
                         let joined = join_prefix(cluster_prefix, &base_reg);
                         let reg_ident = sanitize_reg_ident(&joined);
                         *seq += 1;
@@ -773,6 +965,11 @@ where
                             let Ok(offset_u32) = u32::try_from(elem_offset) else {
                                 continue;
                             };
+                            if out.len() >= MAX_LAYOUT_CANDIDATES {
+                                return Err(format!(
+                                    "peripheral `{periph_name}` exceeds maximum expanded register count ({MAX_LAYOUT_CANDIDATES})"
+                                ));
+                            }
                             let expanded = substitute_dim_name(raw_name, idx_str, true);
                             let joined = join_prefix(cluster_prefix, &expanded);
                             let reg_ident = sanitize_reg_ident(&joined);
@@ -792,6 +989,11 @@ where
                     let Ok(offset_u32) = u32::try_from(abs_offset) else {
                         continue;
                     };
+                    if out.len() >= MAX_LAYOUT_CANDIDATES {
+                        return Err(format!(
+                            "peripheral `{periph_name}` exceeds maximum expanded register count ({MAX_LAYOUT_CANDIDATES})"
+                        ));
+                    }
                     let joined = join_prefix(cluster_prefix, raw_name);
                     let reg_ident = sanitize_reg_ident(&joined);
                     let const_reg_name = join_prefix(const_cluster_prefix, raw_name);
@@ -859,7 +1061,7 @@ where
                 };
 
                 if let Some(dim_raw) = first_text("dim") {
-                    let dim = parse_svd_u64(dim_raw, "<cluster><dim>")? as usize;
+                    let dim = parse_svd_dim(dim_raw, "<cluster><dim>")?;
                     if dim == 0 {
                         continue;
                     }
@@ -938,12 +1140,12 @@ fn collect_fields_consts(
         }
 
         if let Some(dim_raw) = field_el.child_text("dim") {
-            let dim = parse_svd_u64(dim_raw, "<field><dim>")? as usize;
+            let dim = parse_svd_dim(dim_raw, "<field><dim>")?;
             if dim == 0 {
                 continue;
             }
             let dim_inc = match field_el.child_text("dimIncrement") {
-                Some(inc) => parse_svd_u64(inc, "<field><dimIncrement>")? as u32,
+                Some(inc) => parse_svd_u32(inc, "<field><dimIncrement>")?,
                 None => width,
             };
             let indices = parse_dim_indices(dim, field_el.child_text("dimIndex"));
@@ -1066,25 +1268,14 @@ fn finalize_layout_registers(
     let mut emitted_consts: Vec<CandidateConst> = Vec::new();
 
     for cand in candidates {
-        let elem_bytes = (cand.elem_bits / 8) as u32;
-        if elem_bytes == 0 || cand.offset % elem_bytes != 0 {
-            continue;
-        }
-        let count = cand.array_len.unwrap_or(1) as u32;
-        let Some(total_bytes) = elem_bytes.checked_mul(count) else {
-            continue;
-        };
-        let Some(end) = cand.offset.checked_add(total_bytes) else {
+        let Some((s, end)) = cand_byte_range(&cand) else {
             continue;
         };
 
-        if occupied
-            .iter()
-            .any(|&(s, e)| cand.offset < e && end > s)
-        {
+        if occupied.iter().any(|&(os, oe)| s < oe && end > os) {
             continue;
         }
-        occupied.push((cand.offset, end));
+        occupied.push((s, end));
 
         let name = if used_reg_names.contains(&cand.name) {
             make_unique_name(&cand.name, &used_reg_names)
@@ -1198,6 +1389,26 @@ const ZEV_KEYWORDS: &[&str] = &[
     "inbox",
     "ping_pong",
     "lease",
+    "pool",
+    "dma_slot",
+    "byte_ring",
+    "Lease",
+    "chan",
+    "Result",
+    "FmtErr",
+    "Err",
+    "checkpoint",
+    "delay",
+    "sleep",
+    "print",
+    "println",
+    "assert",
+    "fmt_buf",
+    "fmt_ring",
+    "set_priority",
+    "now_ticks",
+    "now_ms",
+    "main",
 ];
 
 fn is_zev_keyword(s: &str) -> bool {
@@ -1218,7 +1429,8 @@ fn sanitize_chars(raw: &str) -> String {
 
 fn sanitize_ident(raw: &str) -> String {
     let mut out = sanitize_chars(raw);
-    if out.is_empty() {
+    if out.is_empty() || out.bytes().all(|b| b == b'_') {
+        out.clear();
         out.push_str("_ident");
         return out;
     }
@@ -1404,27 +1616,57 @@ fn format_hex_u32(val: u32) -> String {
     format!("0x{:04X}_{:04X}", val >> 16, val & 0xFFFF)
 }
 
+fn parse_svd_dim(raw: &str, ctx: &str) -> Result<usize, String> {
+    let val = parse_svd_u64(raw, ctx)?;
+    if val > MAX_SVD_DIM {
+        return Err(format!(
+            "`{ctx}` value {val} exceeds maximum supported SVD dimension ({MAX_SVD_DIM})"
+        ));
+    }
+    Ok(val as usize)
+}
+
 fn parse_svd_u64(raw: &str, ctx: &str) -> Result<u64, String> {
     let cleaned: String = raw.trim().chars().filter(|&c| c != '_').collect();
     if cleaned.is_empty() {
         return Err(format!("empty integer in `{ctx}`"));
     }
-    let (radix, digits) = if let Some(h) = cleaned
+    let unsigned = cleaned.strip_prefix('+').unwrap_or(cleaned.as_str());
+    let (radix, rest) = if let Some(h) = unsigned
         .strip_prefix("0x")
-        .or_else(|| cleaned.strip_prefix("0X"))
+        .or_else(|| unsigned.strip_prefix("0X"))
     {
         (16, h)
-    } else if let Some(b) = cleaned
+    } else if let Some(b) = unsigned
         .strip_prefix("0b")
-        .or_else(|| cleaned.strip_prefix("0B"))
-        .or_else(|| cleaned.strip_prefix('#'))
+        .or_else(|| unsigned.strip_prefix("0B"))
+        .or_else(|| unsigned.strip_prefix('#'))
     {
         (2, b)
     } else {
-        (10, cleaned.as_str())
+        (10, unsigned)
     };
-    u64::from_str_radix(digits, radix)
-        .map_err(|e| format!("invalid integer `{raw}` in `{ctx}`: {e}"))
+
+    let (digits, mult) = match rest.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&rest[..rest.len() - 1], 1024u64),
+        Some(b'm' | b'M') => (&rest[..rest.len() - 1], 1024u64 * 1024),
+        Some(b'g' | b'G') => (&rest[..rest.len() - 1], 1024u64 * 1024 * 1024),
+        Some(b't' | b'T') => (&rest[..rest.len() - 1], 1024u64 * 1024 * 1024 * 1024),
+        _ => (rest, 1u64),
+    };
+
+    if !digits
+        .bytes()
+        .next()
+        .is_some_and(|b| b.is_ascii_alphanumeric())
+    {
+        return Err(format!("invalid integer `{raw}` in `{ctx}`"));
+    }
+
+    let base = u64::from_str_radix(digits, radix)
+        .map_err(|e| format!("invalid integer `{raw}` in `{ctx}`: {e}"))?;
+    base.checked_mul(mult)
+        .ok_or_else(|| format!("integer `{raw}` in `{ctx}` overflows 64-bit range"))
 }
 
 fn parse_svd_u32(raw: &str, ctx: &str) -> Result<u32, String> {
@@ -1872,10 +2114,10 @@ mod tests {
         assert_eq!(zev.matches("pub irq IRQ_SHARED = 40;").count(), 1, "{zev}");
         assert!(!zev.contains("IRQ_IRQ_"), "{zev}");
 
-        // Access qualifiers & sanitized `isr` keyword
+        // Access qualifiers & sanitized `isr` keyword (`write-only` + `oneToClear` stays `@wo`)
         assert!(zev.contains("@rw u32 cr1 @ 0x00;"), "{zev}");
         assert!(zev.contains("@ro u32 isr_ @ 0x1C;"), "{zev}");
-        assert!(zev.contains("@w1c u32 icr @ 0x20;"), "{zev}");
+        assert!(zev.contains("@wo u32 icr @ 0x20;"), "{zev}");
         assert!(zev.contains("@wo u32 tdr @ 0x28;"), "{zev}");
 
         // Contiguous dim array & strided expansion
@@ -2261,5 +2503,179 @@ mod tests {
           <register derivedFrom="A"><name>B</name><addressOffset>4</addressOffset></register>
         </registers></peripheral></peripherals></device>"#;
         assert!(svd_to_zev(cyc_reg).is_err());
+    }
+
+    #[test]
+    fn resolves_field_level_access_mixed_w1c_wo_and_peripheral_dim_and_partial_derived() {
+        // Covers S-M3 (a, b, c) and S-M4 (peripheral <dim> + derivedFrom partial <registers> overrides)
+        let svd = r#"<?xml version="1.0" encoding="utf-8"?>
+<device>
+  <name>SM34_DEV</name>
+  <size>32</size>
+  <access>read-write</access>
+  <peripherals>
+    <peripheral>
+      <name>TIM%s</name>
+      <dim>2</dim>
+      <dimIncrement>0x1000</dimIncrement>
+      <dimIndex>2,3</dimIndex>
+      <baseAddress>0x40000000</baseAddress>
+      <interrupt>
+        <name>TIM%s</name>
+        <value>28</value>
+      </interrupt>
+      <registers>
+        <register>
+          <name>CR1</name>
+          <addressOffset>0x00</addressOffset>
+        </register>
+        <register>
+          <name>MIXED_SR</name>
+          <addressOffset>0x04</addressOffset>
+          <fields>
+            <field>
+              <name>EN</name>
+              <bitOffset>0</bitOffset>
+              <bitWidth>1</bitWidth>
+            </field>
+            <field>
+              <name>UIF</name>
+              <bitOffset>1</bitOffset>
+              <bitWidth>1</bitWidth>
+              <modifiedWriteValues>oneToClear</modifiedWriteValues>
+            </field>
+          </fields>
+        </register>
+        <register>
+          <name>ALL_RO_FIELDS</name>
+          <addressOffset>0x08</addressOffset>
+          <fields>
+            <field>
+              <name>F0</name>
+              <bitOffset>0</bitOffset>
+              <bitWidth>1</bitWidth>
+              <access>read-only</access>
+            </field>
+          </fields>
+        </register>
+        <register>
+          <name>ALL_WO_FIELDS</name>
+          <addressOffset>0x0C</addressOffset>
+          <fields>
+            <field>
+              <name>CMD</name>
+              <bitOffset>0</bitOffset>
+              <bitWidth>1</bitWidth>
+              <access>writeOnce</access>
+              <modifiedWriteValues>oneToClear</modifiedWriteValues>
+            </field>
+          </fields>
+        </register>
+        <register>
+          <name>W1C_PLUS_RO</name>
+          <addressOffset>0x10</addressOffset>
+          <fields>
+            <field>
+              <name>OVR</name>
+              <bitOffset>0</bitOffset>
+              <bitWidth>1</bitWidth>
+              <access>read-only</access>
+            </field>
+            <field>
+              <name>ACK</name>
+              <bitOffset>1</bitOffset>
+              <bitWidth>1</bitWidth>
+              <modifiedWriteValues>oneToClear</modifiedWriteValues>
+            </field>
+          </fields>
+        </register>
+      </registers>
+    </peripheral>
+    <peripheral derivedFrom="TIM2">
+      <name>TIM4</name>
+      <baseAddress>0x40004000</baseAddress>
+      <registers>
+        <register>
+          <name>CR1</name>
+          <addressOffset>0x00</addressOffset>
+          <access>read-only</access>
+        </register>
+        <register derivedFrom="ALL_RO_FIELDS">
+          <name>DERIVED_RO</name>
+          <addressOffset>0x20</addressOffset>
+        </register>
+        <register>
+          <name>OR</name>
+          <addressOffset>0x50</addressOffset>
+        </register>
+      </registers>
+    </peripheral>
+    <peripheral derivedFrom="TIM4">
+      <name>TIM5</name>
+      <baseAddress>0x40005000</baseAddress>
+    </peripheral>
+  </peripherals>
+</device>"#;
+
+        let zev = svd_to_zev(svd).expect("SM34 SVD must convert");
+
+        // TIM2 & TIM3 share TimRegs; TIM4 & TIM5 share Tim4Regs with overridden CR1 + base regs + OR
+        assert!(zev.contains("pub mmio TIM2 : TimRegs @ 0x4000_0000;"), "{zev}");
+        assert!(zev.contains("pub mmio TIM3 : TimRegs @ 0x4000_1000;"), "{zev}");
+        assert!(zev.contains("pub mmio TIM4 : Tim4Regs @ 0x4000_4000;"), "{zev}");
+        assert!(zev.contains("pub mmio TIM5 : Tim4Regs @ 0x4000_5000;"), "{zev}");
+        assert!(zev.contains("pub irq IRQ_TIM2 = 28;"), "{zev}");
+        assert!(zev.contains("pub irq IRQ_TIM3 = 28;"), "{zev}");
+
+        // S-M3 checks on TimRegs
+        assert!(zev.contains("@rw u32 cr1 @ 0x00;"), "{zev}");
+        assert!(zev.contains("@rw u32 mixed_sr @ 0x04;"), "{zev}");
+        assert!(zev.contains("@ro u32 all_ro_fields @ 0x08;"), "{zev}");
+        assert!(zev.contains("@wo u32 all_wo_fields @ 0x0C;"), "{zev}");
+        assert!(zev.contains("@w1c u32 w1c_plus_ro @ 0x10;"), "{zev}");
+
+        // S-M4 partial override checks on Tim4Regs (inherits MIXED_SR etc. + overrides CR1 to @ro + resolves derivedFrom="ALL_RO_FIELDS")
+        let tim4_section = zev.split("pub mmio Tim4Regs {").nth(1).expect("Tim4Regs");
+        let tim4_body = tim4_section.split('}').next().unwrap();
+        assert!(tim4_body.contains("@ro u32 cr1 @ 0x00;"), "{tim4_body}");
+        assert!(tim4_body.contains("@rw u32 mixed_sr @ 0x04;"), "{tim4_body}");
+        assert!(tim4_body.contains("@ro u32 derived_ro @ 0x20;"), "{tim4_body}");
+        assert!(tim4_body.contains("@rw u32 or_ @ 0x50;"), "{tim4_body}");
+    }
+
+    #[test]
+    fn parses_svd_scaled_ints_caps_hostile_dims_and_sanitizes_all_keywords() {
+        // S-L3: +, k/K/m/M/g/G/t/T, hex+suffix vs 0x1B, overflow rejection
+        assert_eq!(parse_svd_u64("+0x10", "t").unwrap(), 16);
+        assert_eq!(parse_svd_u64("4k", "t").unwrap(), 4096);
+        assert_eq!(parse_svd_u64("+2K", "t").unwrap(), 2048);
+        assert_eq!(parse_svd_u64("0x1K", "t").unwrap(), 1024);
+        assert_eq!(parse_svd_u64("0x10K", "t").unwrap(), 16 * 1024);
+        assert_eq!(parse_svd_u64("0x1B", "t").unwrap(), 0x1B);
+        assert_eq!(parse_svd_u64("1M", "t").unwrap(), 1024 * 1024);
+        assert_eq!(parse_svd_u64("2g", "t").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_svd_u64("1T", "t").unwrap(), 1024u64 * 1024 * 1024 * 1024);
+        assert!(parse_svd_u64("+", "t").is_err());
+        assert!(parse_svd_u64("++1", "t").is_err());
+        assert!(parse_svd_u64("0x100000000T", "t").is_err());
+
+        // S-M5b: hostile oversized <dim> rejected before OOM
+        let huge_dim = "<device><name>D</name><peripherals><peripheral><name>P</name><baseAddress>0x1000</baseAddress><registers><register><name>R[%s]</name><addressOffset>0</addressOffset><dim>0xFFFFFFFF</dim><dimIncrement>4</dimIncrement></register></registers></peripheral></peripherals></device>";
+        assert!(svd_to_zev(huge_dim).is_err());
+
+        let nested_boom = "<device><name>D</name><peripherals><peripheral><name>P</name><baseAddress>0x1000</baseAddress><registers><cluster><name>C%s</name><addressOffset>0</addressOffset><dim>512</dim><dimIncrement>512</dimIncrement><register><name>R%s</name><addressOffset>0</addressOffset><dim>256</dim><dimIncrement>8</dimIncrement></register></cluster></registers></peripheral></peripherals></device>";
+        assert!(svd_to_zev(nested_boom).is_err());
+
+        // S-L4: new ZEV_KEYWORDS & all-underscore sanitization
+        assert_eq!(sanitize_ident("___"), "_ident");
+        assert_eq!(sanitize_ident(""), "_ident");
+        for pascal_or_snake in [
+            "pool", "dma_slot", "byte_ring", "Lease", "chan", "Result", "FmtErr", "Err",
+            "checkpoint", "delay", "sleep", "print", "println", "assert", "fmt_buf", "fmt_ring",
+            "set_priority", "now_ticks", "now_ms", "main",
+        ] {
+            let s = sanitize_ident(pascal_or_snake);
+            assert!(s.ends_with('_'), "expected keyword {pascal_or_snake} -> {s}");
+        }
     }
 }

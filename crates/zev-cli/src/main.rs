@@ -255,13 +255,19 @@ fn resolve_llvm_options(
         | Some("atmega4809")
         | Some("avr-mega0")
         | Some("avrxmega3") => Ok(zev_codegen_llvm::CodegenOptions::avr_nano_every()),
+        Some("rp2040")
+        | Some("pico")
+        | Some("pico-w")
+        | Some("cortex-m0plus")
+        | Some("thumbv6m")
+        | Some("thumbv6m-none-eabi") => Ok(zev_codegen_llvm::CodegenOptions::rp2040()),
         Some("host") | Some("x86_64") | Some("x86_64-unknown-linux-gnu") => {
             let mut opts = zev_codegen_llvm::CodegenOptions::default();
             opts.target = zev_codegen_llvm::TargetArch::HostX86_64Linux;
             Ok(opts)
         }
         Some(other) => Err(format!(
-            "unsupported `--target {other}` (expected `cortex-m3`, `esp32c6`, `avr`, `nano-every`, or `host`)"
+            "unsupported `--target {other}` (expected `cortex-m3`, `esp32c6`, `avr`, `nano-every`, `rp2040`, or `host`)"
         )),
     }
 }
@@ -311,6 +317,22 @@ fn print_avr_nano_every_summary(res: &zev_codegen_llvm::AvrImageResult) {
     );
 }
 
+fn print_rp2040_summary(res: &zev_codegen_llvm::Rp2040ImageResult) {
+    println!(
+        "Built RP2040 SRAM UF2 image: {} ({} bytes / {} block(s), raw bin={} bytes / 270336 B SRAM)",
+        res.uf2_path.display(),
+        res.uf2_size,
+        res.uf2_blocks,
+        res.bin_size
+    );
+    print!("{}", res.elf.sizes.raw_output);
+    println!(
+        "Zero-heap audit: undefined_symbols={}, allocator_symbols={}",
+        res.elf.audit.undefined_symbols.len(),
+        res.elf.audit.heap_or_libc_symbols.len()
+    );
+}
+
 enum RamExecOutcome {
     Output { text: String, within_budget: bool },
     UsageErr(String),
@@ -329,7 +351,7 @@ fn execute_ram_command(
             Ok(mut o) => {
                 if o.target == zev_codegen_llvm::TargetArch::HostX86_64Linux {
                     return RamExecOutcome::UsageErr(format!(
-                        "unsupported `--target {t}` for `zevc ram` (expected `cortex-m3`, `esp32c6`, `avr`, or `nano-every`)"
+                        "unsupported `--target {t}` for `zevc ram` (expected `cortex-m3`, `esp32c6`, `avr`, `nano-every`, or `rp2040`)"
                     ));
                 }
                 if let Some(lvl) = opt_level {
@@ -913,6 +935,90 @@ fn main() -> ExitCode {
                     "Flashing Arduino Nano Every (ATmega4809) on `{port}` via MuxTO UPDI..."
                 );
                 match zev_codegen_llvm::flash_avr_nano_every_bin(&res.bin_path, &port) {
+                    Ok(flash_out) => {
+                        print!("{flash_out}");
+                        drop(temp_holder);
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::BuildRp2040 {
+            files,
+            include_dirs,
+            opt_level,
+            output,
+        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+            Ok((_, mir)) => {
+                let out_uf2 = output.unwrap_or_else(|| default_output_with_ext(&files, "uf2"));
+                let out_elf = out_uf2.with_extension("elf");
+                let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
+                opts.opt_level = opt_level;
+                match zev_codegen_llvm::build_rp2040_image_with_options(
+                    &mir, &out_elf, &out_uf2, &opts,
+                ) {
+                    Ok(res) => {
+                        print_rp2040_summary(&res);
+                        ExitCode::SUCCESS
+                    }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::FlashRp2040 {
+            files,
+            include_dirs,
+            port,
+            opt_level,
+            output,
+        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+            Ok((_, mir)) => {
+                let mut temp_holder: Option<TempWorkDir> = None;
+                let out_uf2 = match output {
+                    Some(p) => p,
+                    None => {
+                        let temp = match TempWorkDir::create("zevc-rp2040") {
+                            Ok(t) => t,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let p = temp.dir.join("firmware.uf2");
+                        temp_holder = Some(temp);
+                        p
+                    }
+                };
+                let out_elf = out_uf2.with_extension("elf");
+                let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
+                opts.opt_level = opt_level;
+                let res = match zev_codegen_llvm::build_rp2040_image_with_options(
+                    &mir, &out_elf, &out_uf2, &opts,
+                ) {
+                    Ok(r) => r,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                print_rp2040_summary(&res);
+                println!("Flashing Raspberry Pi RP2040 (`{port}` -> `RPI-RP2`)...");
+                match zev_codegen_llvm::flash_rp2040_uf2(&res.uf2_path, &port) {
                     Ok(flash_out) => {
                         print!("{flash_out}");
                         drop(temp_holder);
@@ -1530,11 +1636,37 @@ fn main() {
     }
 
     #[test]
+    fn pico_w_example_checks_and_rp2040_target_resolves() {
+        for alias in [
+            "rp2040",
+            "pico",
+            "pico-w",
+            "cortex-m0plus",
+            "thumbv6m",
+            "thumbv6m-none-eabi",
+        ] {
+            let opts = resolve_llvm_options(Some(alias))
+                .unwrap_or_else(|e| panic!("target {alias} failed: {e}"));
+            assert_eq!(opts.target, zev_codegen_llvm::TargetArch::Thumbv6mRp2040);
+        }
+
+        let demo_path = repo_root().join("examples/pico_w_demo.zev");
+        assert!(
+            load_and_check_detailed(std::slice::from_ref(&demo_path)).is_ok(),
+            "examples/pico_w_demo.zev must check cleanly"
+        );
+        let (_, mir) = compile_to_mir(&[demo_path]).expect("pico_w_demo checks & lowers to MIR");
+        assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
+    }
+
+    #[test]
     fn ram_command_preserves_plain_output_and_prints_target_stack_proofs() {
         let root = repo_root();
         let cm3_path = root.join("examples/cortex_m_demo.zev");
         let esp_path = root.join("examples/esp32c6_demo.zev");
         let uno_path = root.join("examples/arduino_uno_demo.zev");
+        let nano_path = root.join("examples/arduino_nano_every_demo.zev");
+        let pico_path = root.join("examples/pico_w_demo.zev");
 
         // 1. Plain `zevc ram` (target = None) matches `mir.ram_report.format_table()` identically
         let (_, cm3_mir) = compile_to_mir(std::slice::from_ref(&cm3_path)).unwrap();
@@ -1550,11 +1682,13 @@ fn main() {
             _ => panic!("expected plain ram output"),
         }
 
-        // 2. Targeted `zevc ram --target <cortex-m3|esp32c6|avr>` appends hardware proof and passes budget
+        // 2. Targeted `zevc ram --target <cortex-m3|esp32c6|avr|nano-every|rp2040>` appends hardware proof and passes budget
         for (path, tgt, budget_str) in [
             (cm3_path, "cortex-m3", "65536 B"),
             (esp_path, "esp32c6", "524288 B"),
             (uno_path, "avr", "2048 B"),
+            (nano_path, "nano-every", "6144 B"),
+            (pico_path, "rp2040", "270336 B"),
         ] {
             match execute_ram_command(&[path], &[], Some(tgt), None) {
                 RamExecOutcome::Output {

@@ -300,6 +300,28 @@ impl Ty {
         matches!(self, Self::Lease(_))
     }
 
+    /// Returns `true` if this type is or wraps an `mmio` register layout or peripheral instance.
+    pub fn contains_mmio(&self) -> bool {
+        match self {
+            Self::MmioLayout(_) | Self::MmioInstance { .. } => true,
+            Self::Ptr(inner) | Self::Slice(inner) | Self::Lease(inner) => inner.contains_mmio(),
+            Self::Array { elem, .. } => elem.contains_mmio(),
+            _ => false,
+        }
+    }
+
+    /// Returns `true` if this type is or wraps a static scheduler/DMA OS primitive endpoint.
+    pub fn contains_os_primitive(&self) -> bool {
+        match self {
+            Self::OsPrimitive(_) => true,
+            Self::Ptr(inner) | Self::Slice(inner) | Self::Lease(inner) => {
+                inner.contains_os_primitive()
+            }
+            Self::Array { elem, .. } => elem.contains_os_primitive(),
+            _ => false,
+        }
+    }
+
     /// Normalize wire-endian scalar types (`u16be`/`u16le` -> `u16`, etc.) to their host scalar counterpart.
     pub const fn host_prim(p: PrimType) -> PrimType {
         match p {
@@ -424,9 +446,15 @@ impl Ty {
                 true
             }
 
-            // Any pointer `*T` coerces to opaque `*void` (e.g. for extern "C" or generic DMA helpers),
+            // Any non-MMIO, non-OS-primitive pointer `*T` coerces to opaque `*void` (e.g. for extern "C" or generic DMA helpers),
             // and string literals coerce to `*u8` / `*i8` / `[]u8` / `*void` for trace/C helpers.
-            (Ty::Ptr(_), Ty::Ptr(inner)) if inner.is_void() => true,
+            (Ty::Ptr(src_inner), Ty::Ptr(inner))
+                if inner.is_void()
+                    && !src_inner.contains_mmio()
+                    && !src_inner.contains_os_primitive() =>
+            {
+                true
+            }
             (Ty::Str, Ty::Ptr(inner))
                 if inner.is_void()
                     || matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>

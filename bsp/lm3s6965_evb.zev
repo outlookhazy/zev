@@ -43,7 +43,11 @@ pub u32 read_pwm_duty(u8 ch) {
 }
 
 pub fn pend_nvic_irq(u32 irq_num) {
-    if (irq_num < 32) {
-        hw.NVIC.ispr[0] = 1 << irq_num;
+    if (irq_num < 44) {
+        hw.NVIC.ispr[(irq_num >> 5) as usize] = 1u32 << (irq_num & 31u32);
     }
+}
+
+pub fn console_putc(u8 b) {
+    hw.UART0.dr = b as u32;
 }

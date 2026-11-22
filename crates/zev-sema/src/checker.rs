@@ -91,6 +91,7 @@ struct LocalVar {
     prov: Provenance,
     field_prov: BTreeMap<String, Provenance>,
     endpoint_alias: Option<String>,
+    field_endpoints: BTreeMap<String, String>,
     is_isr_state: bool,
     lease_state: Option<LinearLeaseState>,
     lease_gen_key: Option<String>,
@@ -102,6 +103,7 @@ struct ExprVal {
     error_spec: ResolvedErrorSpec,
     prov: Provenance,
     endpoint_name: Option<String>,
+    field_endpoints: BTreeMap<String, String>,
     span: Span,
 }
 
@@ -112,6 +114,7 @@ impl ExprVal {
             error_spec: ResolvedErrorSpec::None,
             prov: Provenance::pure_static(),
             endpoint_name: None,
+            field_endpoints: BTreeMap::new(),
             span,
         }
     }
@@ -122,9 +125,36 @@ impl ExprVal {
             error_spec: ResolvedErrorSpec::None,
             prov: Provenance::pure_static(),
             endpoint_name: None,
+            field_endpoints: BTreeMap::new(),
             span,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EndpointSpec {
+    Static(String),
+    Param {
+        index: usize,
+        suffix: Option<String>,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ByteRingOpRole {
+    Producer,
+    Consumer,
+    Both,
+}
+
+#[derive(Clone, Debug)]
+struct RecordedByteRingOp {
+    caller: String,
+    role: ByteRingOpRole,
+    method: String,
+    target: EndpointSpec,
+    span: Span,
+    file: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +171,7 @@ enum ActiveBodyKind {
 struct BootArgBinding {
     static_endpoint: Option<String>,
     endpoint_from_param: Option<(usize, Option<String>)>,
+    field_endpoints: BTreeMap<String, EndpointSpec>,
     ref_param_origins: BTreeSet<usize>,
 }
 
@@ -148,6 +179,7 @@ struct BootArgBinding {
 struct BootCallArg {
     static_endpoint: Option<String>,
     endpoint_from_param: Option<(usize, Option<String>)>,
+    field_endpoints: BTreeMap<String, EndpointSpec>,
     has_non_static_local_ref: bool,
     has_isr_state_ref: bool,
     ref_param_origins: BTreeSet<usize>,
@@ -215,6 +247,7 @@ struct RecordedCallArgs {
     caller: String,
     callee: String,
     args: Vec<BootCallArg>,
+    in_main_post_boot: bool,
 }
 
 pub(crate) struct Analyzer {
@@ -225,13 +258,15 @@ pub(crate) struct Analyzer {
     program_extern_c_scopes: Vec<BTreeSet<String>>,
     rewritten_pub_extern_sites: BTreeSet<(usize, u32, u32)>,
     non_root_extern_c_names: BTreeSet<String>,
+    non_root_prog_count: usize,
     structs: BTreeMap<String, StructInfo>,
     struct_files: BTreeMap<String, Option<String>>,
     enums: BTreeMap<String, EnumInfo>,
+    enum_prog_idx: BTreeMap<String, Option<usize>>,
     /// Maps unqualified enum variant name -> list of enums defining that variant.
     variant_to_enums: BTreeMap<String, Vec<String>>,
     consts: BTreeMap<String, ConstInfo>,
-    raw_const_exprs: BTreeMap<String, (Expr, Ty)>,
+    raw_const_exprs: BTreeMap<String, (Expr, Ty, usize)>,
     primitives: BTreeMap<String, PrimitiveInfo>,
     subsystems: BTreeMap<String, SubsystemInfo>,
     mmio_layout_names: BTreeSet<String>,
@@ -246,6 +281,8 @@ pub(crate) struct Analyzer {
     fn_decl_order: Vec<String>,
     fn_boot_steps: BTreeMap<String, Vec<BootStep>>,
     recorded_call_args: Vec<RecordedCallArgs>,
+    recorded_byte_ring_ops: Vec<RecordedByteRingOp>,
+    spawned_task_field_endpoints: BTreeMap<usize, Vec<BTreeMap<String, String>>>,
     prim_escaping_ref_params: BTreeMap<String, BTreeSet<usize>>,
     tasks: BTreeMap<String, TaskInfo>,
     isrs: BTreeMap<String, IsrInfo>,
@@ -274,9 +311,11 @@ impl Analyzer {
             program_extern_c_scopes: Vec::new(),
             rewritten_pub_extern_sites: BTreeSet::new(),
             non_root_extern_c_names: BTreeSet::new(),
+            non_root_prog_count: 0,
             structs: BTreeMap::new(),
             struct_files: BTreeMap::new(),
             enums: BTreeMap::new(),
+            enum_prog_idx: BTreeMap::new(),
             variant_to_enums: BTreeMap::new(),
             consts: BTreeMap::new(),
             raw_const_exprs: BTreeMap::new(),
@@ -294,6 +333,8 @@ impl Analyzer {
             fn_decl_order: Vec::new(),
             fn_boot_steps: BTreeMap::new(),
             recorded_call_args: Vec::new(),
+            recorded_byte_ring_ops: Vec::new(),
+            spawned_task_field_endpoints: BTreeMap::new(),
             prim_escaping_ref_params: BTreeMap::new(),
             tasks: BTreeMap::new(),
             isrs: BTreeMap::new(),
@@ -318,6 +359,7 @@ impl Analyzer {
         self.program_extern_c_scopes = linked.program_extern_c_scopes.clone();
         self.rewritten_pub_extern_sites = linked.rewritten_pub_extern_sites.clone();
         self.non_root_extern_c_names = linked.non_root_extern_c_names.clone();
+        self.non_root_prog_count = linked.non_root_program_count;
         self
     }
 
@@ -426,6 +468,7 @@ impl Analyzer {
                     span: Span::dummy(),
                 },
             );
+            self.enum_prog_idx.insert("FmtErr".to_string(), None);
             if !self.variant_to_enums.contains_key("Truncated") {
                 self.variant_to_enums
                     .insert("Truncated".to_string(), vec!["FmtErr".to_string()]);
@@ -490,6 +533,36 @@ impl Analyzer {
                 ItemKind::Task(t) => self.collect_task_sig(&item.attrs, t),
                 ItemKind::Isr(i) => self.collect_isr_sig(&item.attrs, i),
                 _ => {}
+            }
+        }
+
+        // Validate every MMIO instance's [base_addr .. base_addr + byte_size] fits within 32-bit address space
+        // after all layouts have been collected (handles forward-declared layouts).
+        for (item, file, prog_idx) in &all_items {
+            self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
+            if let ItemKind::Mmio(mm) = &item.kind {
+                if matches!(
+                    mm.kind,
+                    MmioDeclKind::Instance { .. } | MmioDeclKind::Inline { .. }
+                ) {
+                    if let Some(inst) = self.mmio_instances.get(&mm.name.name) {
+                        if let Some(layout_info) = self.mmio_layouts.get(&inst.layout) {
+                            let size_u32 =
+                                u32::try_from(layout_info.byte_size).unwrap_or(u32::MAX);
+                            if inst.base_addr.checked_add(size_u32).is_none() {
+                                self.emit(Diagnostic::new(
+                                    DiagnosticKind::MmioViolation,
+                                    mm.span,
+                                    format!(
+                                        "MMIO instance '{}' at base 0x{:08X} with layout '{}' ({} bytes) overflows 32-bit address space",
+                                        inst.name, inst.base_addr, inst.layout, layout_info.byte_size
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -646,6 +719,51 @@ impl Analyzer {
                 span: en.span,
             },
         );
+        let scope_idx = if self.current_prog_idx < self.non_root_prog_count {
+            Some(self.current_prog_idx)
+        } else {
+            None
+        };
+        self.enum_prog_idx.insert(en.name.name.clone(), scope_idx);
+    }
+
+    fn visible_enums_for_variant(&self, prog_idx: usize, variant: &str) -> Vec<String> {
+        let Some(all) = self.variant_to_enums.get(variant) else {
+            return Vec::new();
+        };
+        all.iter()
+            .filter(|en| match self.enum_prog_idx.get(*en).copied().flatten() {
+                Some(decl_idx) => decl_idx == prog_idx,
+                None => prog_idx >= self.non_root_prog_count,
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn check_assignable_or_emit(
+        &mut self,
+        actual: &Ty,
+        expected: &Ty,
+        span: Span,
+        default_kind: DiagnosticKind,
+        default_msg: impl FnOnce() -> String,
+    ) -> bool {
+        if actual.is_assignable_to(expected) {
+            return true;
+        }
+        if matches!(expected, Ty::Ptr(inner) if inner.is_void()) && actual.contains_mmio() {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::MmioViolation,
+                span,
+                format!(
+                    "cannot coerce MMIO handle '{}' to raw '*void' pointer",
+                    actual
+                ),
+            ));
+        } else {
+            self.emit(Diagnostic::new(default_kind, span, default_msg()));
+        }
+        false
     }
 
     fn resolve_struct_fields(&mut self, st: &StructDecl) {
@@ -1128,23 +1246,43 @@ impl Analyzer {
                 ));
             }
 
-            let count = u64::try_from(array_len.unwrap_or(1)).unwrap_or(u64::MAX);
-            let Some(reg_bytes) = elem_bytes.checked_mul(count) else {
+            let Ok(count_u32) = u32::try_from(array_len.unwrap_or(1)) else {
                 self.emit(Diagnostic::new(
                     DiagnosticKind::MmioViolation,
                     reg.ty.span,
-                    format!("MMIO register '{}.{}' size overflows u64", name.name, reg.name.name),
+                    format!(
+                        "MMIO register array '{}.{}' length {} exceeds `u32` address space",
+                        name.name,
+                        reg.name.name,
+                        array_len.unwrap_or(1)
+                    ),
                 ));
                 continue;
             };
-            let Some(end) = offset_u64.checked_add(reg_bytes) else {
+            let elem_bytes_u32 = elem_bytes as u32;
+            let Some(reg_bytes_u32) = elem_bytes_u32.checked_mul(count_u32) else {
+                self.emit(Diagnostic::new(
+                    DiagnosticKind::MmioViolation,
+                    reg.ty.span,
+                    format!(
+                        "MMIO register '{}.{}' byte size overflows 32-bit MMIO address space",
+                        name.name, reg.name.name
+                    ),
+                ));
+                continue;
+            };
+            let Some(end_u32) = offset_u32.checked_add(reg_bytes_u32) else {
                 self.emit(Diagnostic::new(
                     DiagnosticKind::MmioViolation,
                     reg.span,
-                    format!("MMIO register '{}.{}' range overflows address space", name.name, reg.name.name),
+                    format!(
+                        "MMIO register '{}.{}' at offset 0x{:X} (size {} bytes) overflows 32-bit MMIO address space",
+                        name.name, reg.name.name, offset_u32, reg_bytes_u32
+                    ),
                 ));
                 continue;
             };
+            let end = u64::from(end_u32);
 
             for (prev_start, prev_end, prev_name) in &ranges {
                 if offset_u64 < *prev_end && *prev_start < end {
@@ -1234,7 +1372,7 @@ impl Analyzer {
 
         let ty = self.resolve_type(&c.ty);
         self.raw_const_exprs
-            .insert(c.name.name.clone(), (c.value.clone(), ty.clone()));
+            .insert(c.name.name.clone(), (c.value.clone(), ty.clone(), self.current_prog_idx));
         let int_value = match &c.value.kind {
             ExprKind::Literal(Literal::Int(v)) => Some(*v),
             _ => None,
@@ -1292,7 +1430,7 @@ impl Analyzer {
         name: &str,
         visiting: &mut BTreeSet<String>,
     ) -> Option<i128> {
-        let (expr, ty) = self.raw_const_exprs.get(name)?;
+        let (expr, ty, _) = self.raw_const_exprs.get(name)?;
         if !visiting.insert(name.to_string()) {
             return None;
         }
@@ -2713,11 +2851,12 @@ impl Analyzer {
 
         // 4. Verify interprocedural reference provenance for `spawn` (`E0010`) and ISR `state`
         //    escapes into OS primitives (`E0033`), then unroll `main()`'s static boot tree into
-        //    `self.spawned_tasks` and `self.irq_bindings` (`E0032`).
+        //    `self.spawned_tasks` and `self.irq_bindings` (`E0032`), and verify `byte_ring` SPSC (`E0002`).
         self.verify_boot_spawn_arg_provenance();
         self.verify_isr_state_escape_provenance();
         self.unroll_boot_spawn_tree();
         self.unroll_irq_boot_tree();
+        self.verify_byte_ring_spsc();
 
         // 5. Compute 3-tier `SoftYielding` coroutine vs `noyield` dual specializations.
         let (soft_coro, soft_ny, dual_spec) = self.call_graph.compute_soft_specializations();
@@ -2877,6 +3016,380 @@ impl Analyzer {
         }
     }
 
+    fn fn_boot_flags(&self, fn_name: &str) -> (bool, bool) {
+        let mut visiting = BTreeSet::new();
+        let mut stack = vec![fn_name.to_string()];
+        visiting.insert(fn_name.to_string());
+        let mut spawns = false;
+        let mut attaches = false;
+        while let Some(cur) = stack.pop() {
+            if let Some(node) = self.call_graph.nodes.get(&cur) {
+                spawns |= node.spawns_in_boot;
+                attaches |= node.attaches_in_boot;
+            }
+            for e in &self.call_graph.edges {
+                if e.caller == cur && visiting.insert(e.callee.clone()) {
+                    stack.push(e.callee.clone());
+                }
+            }
+        }
+        (spawns, attaches)
+    }
+
+    fn resolve_field_chain_map(
+        fields: &BTreeMap<String, String>,
+        chain: &str,
+    ) -> Option<String> {
+        if let Some(exact) = fields.get(chain) {
+            return Some(exact.clone());
+        }
+        let mut prefix_len = 0;
+        let mut best: Option<(usize, String)> = None;
+        for (k, v) in fields {
+            if let Some(rest) = chain.strip_prefix(k).and_then(|r| r.strip_prefix('.')) {
+                if k.len() > prefix_len {
+                    prefix_len = k.len();
+                    best = Some((k.len(), format!("{v}.{rest}")));
+                }
+            }
+        }
+        best.map(|(_, s)| s)
+    }
+
+    fn resolve_endpoint_spec_with_bindings(
+        spec: &EndpointSpec,
+        param_endpoints: &[Option<String>],
+        param_field_endpoints: &[BTreeMap<String, String>],
+    ) -> Option<String> {
+        match spec {
+            EndpointSpec::Static(s) => Some(s.clone()),
+            EndpointSpec::Param { index, suffix } => match suffix {
+                Some(suf) => param_field_endpoints
+                    .get(*index)
+                    .and_then(|m| Self::resolve_field_chain_map(m, suf))
+                    .or_else(|| {
+                        param_endpoints
+                            .get(*index)
+                            .cloned()
+                            .flatten()
+                            .map(|base| format!("{base}.{suf}"))
+                    }),
+                None => param_endpoints.get(*index).cloned().flatten(),
+            },
+        }
+    }
+
+    fn resolve_boot_arg_endpoint_and_fields(
+        static_endpoint: &Option<String>,
+        endpoint_from_param: &Option<(usize, Option<String>)>,
+        field_endpoints: &BTreeMap<String, EndpointSpec>,
+        param_endpoints: &[Option<String>],
+        param_field_endpoints: &[BTreeMap<String, String>],
+    ) -> (Option<String>, BTreeMap<String, String>) {
+        let ep = static_endpoint.clone().or_else(|| {
+            endpoint_from_param.as_ref().and_then(|(idx, suffix)| {
+                Self::resolve_endpoint_spec_with_bindings(
+                    &EndpointSpec::Param {
+                        index: *idx,
+                        suffix: suffix.clone(),
+                    },
+                    param_endpoints,
+                    param_field_endpoints,
+                )
+            })
+        });
+        let mut f_map = BTreeMap::new();
+        if let Some((idx, suffix)) = endpoint_from_param {
+            if let Some(src_fields) = param_field_endpoints.get(*idx) {
+                match suffix {
+                    None => {
+                        for (k, v) in src_fields {
+                            f_map.insert(k.clone(), v.clone());
+                        }
+                    }
+                    Some(suf) => {
+                        let prefix = format!("{suf}.");
+                        for (k, v) in src_fields {
+                            if let Some(rest) = k.strip_prefix(&prefix) {
+                                f_map.insert(rest.to_string(), v.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (fname, fspec) in field_endpoints {
+            if let Some(resolved_f) = Self::resolve_endpoint_spec_with_bindings(
+                fspec,
+                param_endpoints,
+                param_field_endpoints,
+            ) {
+                f_map.insert(fname.clone(), resolved_f);
+            }
+        }
+        (ep, f_map)
+    }
+
+    fn verify_byte_ring_spsc(&mut self) {
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        enum ActorId {
+            Task(usize),
+            Isr(usize),
+            MainPostBoot,
+        }
+
+        #[derive(Clone, Debug)]
+        struct ActorAccess {
+            actor_id: ActorId,
+            actor_desc: String,
+            method: String,
+            span: Span,
+            file: Option<String>,
+        }
+
+        let mut ops_by_caller: BTreeMap<String, Vec<RecordedByteRingOp>> = BTreeMap::new();
+        for op in &self.recorded_byte_ring_ops {
+            ops_by_caller
+                .entry(op.caller.clone())
+                .or_default()
+                .push(op.clone());
+        }
+        let mut calls_by_caller: BTreeMap<String, Vec<RecordedCallArgs>> = BTreeMap::new();
+        for call in &self.recorded_call_args {
+            calls_by_caller
+                .entry(call.caller.clone())
+                .or_default()
+                .push(call.clone());
+        }
+
+        type RingActorsMap = BTreeMap<String, Vec<ActorAccess>>;
+        let mut producers_by_ring: RingActorsMap = BTreeMap::new();
+        let mut consumers_by_ring: RingActorsMap = BTreeMap::new();
+
+        let record_access =
+            |map: &mut RingActorsMap, ring: String, access: ActorAccess| {
+                let list = map.entry(ring).or_default();
+                if !list.iter().any(|a| a.actor_id == access.actor_id) {
+                    list.push(access);
+                }
+            };
+
+        let mut actors: Vec<(
+            ActorId,
+            String,
+            String,
+            Vec<Option<String>>,
+            Vec<BTreeMap<String, String>>,
+            bool,
+        )> = Vec::new();
+
+        for inst in &self.spawned_tasks {
+            let caller_key = format!("task::{}", inst.task_name);
+            let field_eps = self
+                .spawned_task_field_endpoints
+                .get(&inst.instance_id)
+                .cloned()
+                .unwrap_or_else(|| vec![BTreeMap::new(); inst.endpoint_bindings.len()]);
+            actors.push((
+                ActorId::Task(inst.instance_id),
+                format!("task '{}' (spawned via {})", inst.task_name, inst.format_provenance()),
+                caller_key,
+                inst.endpoint_bindings.clone(),
+                field_eps,
+                false,
+            ));
+        }
+
+        for (idx, binding) in self.irq_bindings.iter().enumerate() {
+            let caller_key = format!("isr::{}", binding.isr_name);
+            let mut param_eps = Vec::with_capacity(binding.args.len());
+            for arg in &binding.args {
+                let ep = match arg {
+                    IrqBindingArg::PrimAddr(name) => Some(name.clone()),
+                    IrqBindingArg::SubsystemPath {
+                        root, field_chain, ..
+                    } => {
+                        if field_chain.is_empty() {
+                            Some(root.clone())
+                        } else {
+                            let chain = field_chain
+                                .iter()
+                                .map(|(f, _)| f.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            Some(format!("{root}.{chain}"))
+                        }
+                    }
+                    _ => None,
+                };
+                param_eps.push(ep);
+            }
+            let field_eps = vec![BTreeMap::new(); param_eps.len()];
+            actors.push((
+                ActorId::Isr(idx),
+                format!("ISR '{}' (IRQ '{}')", binding.isr_name, binding.irq_name),
+                caller_key,
+                param_eps,
+                field_eps,
+                false,
+            ));
+        }
+
+        let has_main_post_boot = ops_by_caller.contains_key("main::post_boot")
+            || self
+                .recorded_call_args
+                .iter()
+                .any(|c| c.caller == "main" && c.in_main_post_boot);
+        if has_main_post_boot {
+            actors.push((
+                ActorId::MainPostBoot,
+                "main() (post-boot)".to_string(),
+                "main".to_string(),
+                Vec::new(),
+                Vec::new(),
+                true,
+            ));
+        }
+
+        for (actor_id, actor_desc, root_caller, root_params, root_fields, is_main_post) in actors {
+            let mut visited: BTreeSet<(
+                String,
+                Vec<Option<String>>,
+                Vec<BTreeMap<String, String>>,
+            )> = BTreeSet::new();
+            let mut worklist = vec![(root_caller.clone(), root_params, root_fields, is_main_post)];
+            visited.insert((worklist[0].0.clone(), worklist[0].1.clone(), worklist[0].2.clone()));
+
+            while let Some((caller, param_eps, param_fields, post_boot_only)) = worklist.pop() {
+                let op_lookup_key = if post_boot_only {
+                    "main::post_boot"
+                } else {
+                    caller.as_str()
+                };
+                if let Some(ops) = ops_by_caller.get(op_lookup_key) {
+                    for op in ops {
+                        let Some(concrete_ring) = Self::resolve_endpoint_spec_with_bindings(
+                            &op.target,
+                            &param_eps,
+                            &param_fields,
+                        ) else {
+                            continue;
+                        };
+                        if concrete_ring == "<anon_endpoint>" {
+                            continue;
+                        }
+                        let access = ActorAccess {
+                            actor_id: actor_id.clone(),
+                            actor_desc: actor_desc.clone(),
+                            method: op.method.clone(),
+                            span: op.span,
+                            file: op.file.clone(),
+                        };
+                        match op.role {
+                            ByteRingOpRole::Producer => {
+                                record_access(&mut producers_by_ring, concrete_ring, access);
+                            }
+                            ByteRingOpRole::Consumer => {
+                                record_access(&mut consumers_by_ring, concrete_ring, access);
+                            }
+                            ByteRingOpRole::Both => {
+                                record_access(
+                                    &mut producers_by_ring,
+                                    concrete_ring.clone(),
+                                    access.clone(),
+                                );
+                                record_access(&mut consumers_by_ring, concrete_ring, access);
+                            }
+                        }
+                    }
+                }
+
+                if visited.len() >= 4096 {
+                    continue;
+                }
+                if let Some(calls) = calls_by_caller.get(&caller) {
+                    for call in calls {
+                        if post_boot_only && !call.in_main_post_boot {
+                            continue;
+                        }
+                        let mut child_eps = Vec::with_capacity(call.args.len());
+                        let mut child_fields = Vec::with_capacity(call.args.len());
+                        for arg in &call.args {
+                            let (ep, f_map) = Self::resolve_boot_arg_endpoint_and_fields(
+                                &arg.static_endpoint,
+                                &arg.endpoint_from_param,
+                                &arg.field_endpoints,
+                                &param_eps,
+                                &param_fields,
+                            );
+                            child_eps.push(ep);
+                            child_fields.push(f_map);
+                        }
+                        let state = (call.callee.clone(), child_eps.clone(), child_fields.clone());
+                        if visited.insert(state) {
+                            worklist.push((call.callee.clone(), child_eps, child_fields, false));
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut all_rings: BTreeSet<String> = producers_by_ring.keys().cloned().collect();
+        all_rings.extend(consumers_by_ring.keys().cloned());
+
+        for ring in all_rings {
+            let disp_ring = self
+                .display_names
+                .get(&ring)
+                .cloned()
+                .unwrap_or_else(|| ring.clone());
+            if let Some(prods) = producers_by_ring.get(&ring) {
+                if prods.len() > 1 {
+                    let first = &prods[0];
+                    for extra in &prods[1..] {
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::GlobalIsolationViolation,
+                                extra.span,
+                                format!(
+                                    "byte_ring '{}' SPSC violation: multiple concurrent producers ('{}' and '{}' both call `{}`)",
+                                    disp_ring, first.actor_desc, extra.actor_desc, extra.method
+                                ),
+                            )
+                            .with_file(extra.file.clone())
+                            .with_note(format!(
+                                "first producer '{}' called `{}` at {}; `byte_ring` is strictly single-producer single-consumer (SPSC) — use a separate `byte_ring` per producer or an `inbox<T, N>` for MPSC",
+                                first.actor_desc, first.method, first.span
+                            )),
+                        );
+                    }
+                }
+            }
+            if let Some(cons) = consumers_by_ring.get(&ring) {
+                if cons.len() > 1 {
+                    let first = &cons[0];
+                    for extra in &cons[1..] {
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::GlobalIsolationViolation,
+                                extra.span,
+                                format!(
+                                    "byte_ring '{}' SPSC violation: multiple concurrent consumers ('{}' and '{}' both call `{}`)",
+                                    disp_ring, first.actor_desc, extra.actor_desc, extra.method
+                                ),
+                            )
+                            .with_file(extra.file.clone())
+                            .with_note(format!(
+                                "first consumer '{}' called `{}` at {}; `byte_ring` is strictly single-producer single-consumer (SPSC) — use a separate `byte_ring` per consumer",
+                                first.actor_desc, first.method, first.span
+                            )),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn unroll_boot_spawn_tree(&mut self) {
         self.spawned_tasks.clear();
         for t in self.tasks.values_mut() {
@@ -2911,7 +3424,7 @@ impl Analyzer {
             let mut path = vec![root.clone()];
             let mut visiting = BTreeSet::new();
             visiting.insert(root.clone());
-            self.unroll_boot_fn(&root, &mut path, false, &[], &mut visiting);
+            self.unroll_boot_fn(&root, &mut path, false, &[], &[], &mut visiting);
         }
     }
 
@@ -3284,6 +3797,7 @@ impl Analyzer {
         path: &mut Vec<String>,
         cond_active: bool,
         param_endpoints: &[Option<String>],
+        param_field_endpoints: &[BTreeMap<String, String>],
         visiting: &mut BTreeSet<String>,
     ) {
         let Some(steps) = self.fn_boot_steps.get(fn_name).cloned() else {
@@ -3300,22 +3814,25 @@ impl Analyzer {
                     span,
                 } => {
                     let mut endpoint_bindings = Vec::with_capacity(arg_bindings.len());
+                    let mut resolved_arg_fields = Vec::with_capacity(arg_bindings.len());
                     for b in &arg_bindings {
-                        let resolved = b.static_endpoint.clone().or_else(|| {
-                            b.endpoint_from_param.as_ref().and_then(|(idx, suffix)| {
-                                param_endpoints.get(*idx).cloned().flatten().map(|base| {
-                                    match suffix {
-                                        Some(suf) => format!("{base}.{suf}"),
-                                        None => base,
-                                    }
-                                })
-                            })
-                        });
+                        let (resolved, f_map) = Self::resolve_boot_arg_endpoint_and_fields(
+                            &b.static_endpoint,
+                            &b.endpoint_from_param,
+                            &b.field_endpoints,
+                            param_endpoints,
+                            param_field_endpoints,
+                        );
                         endpoint_bindings.push(resolved);
+                        resolved_arg_fields.push(f_map);
                     }
                     let mut provenance_path = path.clone();
                     provenance_path.push(task_name.clone());
                     let instance_id = self.spawned_tasks.len();
+                    if resolved_arg_fields.iter().any(|m| !m.is_empty()) {
+                        self.spawned_task_field_endpoints
+                            .insert(instance_id, resolved_arg_fields);
+                    }
                     self.spawned_tasks.push(SpawnedTaskInstance {
                         instance_id,
                         task_name: task_name.clone(),
@@ -3345,18 +3862,17 @@ impl Analyzer {
                         continue;
                     }
                     let mut child_endpoints = Vec::with_capacity(args.len());
+                    let mut child_field_endpoints = Vec::with_capacity(args.len());
                     for a in &args {
-                        let resolved = a.static_endpoint.clone().or_else(|| {
-                            a.endpoint_from_param.as_ref().and_then(|(idx, suffix)| {
-                                param_endpoints.get(*idx).cloned().flatten().map(|base| {
-                                    match suffix {
-                                        Some(suf) => format!("{base}.{suf}"),
-                                        None => base,
-                                    }
-                                })
-                            })
-                        });
+                        let (resolved, f_map) = Self::resolve_boot_arg_endpoint_and_fields(
+                            &a.static_endpoint,
+                            &a.endpoint_from_param,
+                            &a.field_endpoints,
+                            param_endpoints,
+                            param_field_endpoints,
+                        );
                         child_endpoints.push(resolved);
+                        child_field_endpoints.push(f_map);
                     }
                     path.push(callee.clone());
                     self.unroll_boot_fn(
@@ -3364,6 +3880,7 @@ impl Analyzer {
                         path,
                         cond_active || conditional,
                         &child_endpoints,
+                        &child_field_endpoints,
                         visiting,
                     );
                     path.pop();
@@ -3394,6 +3911,8 @@ struct BodyChecker<'a> {
     branch_depth: u32,
     after_diverge: bool,
     main_supervisor_started: bool,
+    has_spawned: bool,
+    has_attached_irq: bool,
     param_names: Vec<String>,
     isr_state_names: BTreeSet<String>,
     boot_steps: Vec<BootStep>,
@@ -3436,6 +3955,8 @@ impl<'a> BodyChecker<'a> {
             branch_depth: 0,
             after_diverge: false,
             main_supervisor_started: false,
+            has_spawned: false,
+            has_attached_irq: false,
             param_names: Vec::new(),
             isr_state_names: BTreeSet::new(),
             boot_steps: Vec::new(),
@@ -3489,6 +4010,68 @@ impl<'a> BodyChecker<'a> {
             && !self.main_supervisor_started
     }
 
+    fn in_main_post_boot(&self) -> bool {
+        self.caller_key == "main" && (self.has_spawned || self.has_attached_irq)
+    }
+
+    fn resolve_endpoint_spec(&self, ep: &str) -> EndpointSpec {
+        if let Some(rest) = ep.strip_prefix("param:") {
+            let (pname, suffix) = match rest.split_once('.') {
+                Some((head, tail)) => (head, Some(tail.to_string())),
+                None => (rest, None),
+            };
+            if let Some(idx) = self.param_names.iter().position(|n| n == pname) {
+                return EndpointSpec::Param {
+                    index: idx,
+                    suffix,
+                };
+            }
+        }
+        EndpointSpec::Static(ep.to_string())
+    }
+
+    fn extract_field_endpoint_specs(
+        &self,
+        val: &ExprVal,
+    ) -> BTreeMap<String, EndpointSpec> {
+        let mut out = BTreeMap::new();
+        for (fname, ep) in &val.field_endpoints {
+            if ep != "<anon_endpoint>" {
+                out.insert(fname.clone(), self.resolve_endpoint_spec(ep));
+            }
+        }
+        out
+    }
+
+    fn record_byte_ring_op(
+        &mut self,
+        role: ByteRingOpRole,
+        method: &str,
+        source_key: &str,
+        span: Span,
+    ) {
+        if source_key == "<anon_endpoint>" {
+            return;
+        }
+        let caller = if self.caller_key == "main" {
+            if !self.in_main_post_boot() {
+                return;
+            }
+            "main::post_boot".to_string()
+        } else {
+            self.caller_key.clone()
+        };
+        let target = self.resolve_endpoint_spec(source_key);
+        self.sema.recorded_byte_ring_ops.push(RecordedByteRingOp {
+            caller,
+            role,
+            method: method.to_string(),
+            target,
+            span,
+            file: self.sema.current_file.clone(),
+        });
+    }
+
     fn resolve_param_endpoint_index(
         &self,
         endpoint_name: &Option<String>,
@@ -3528,25 +4111,10 @@ impl<'a> BodyChecker<'a> {
         self.param_names = params.iter().map(|p| p.name.clone()).collect();
         for (idx, p) in params.iter().enumerate() {
             let is_ptr = matches!(p.ty, Ty::Ptr(_));
-            let endpoint_alias = match &p.ty {
-                Ty::OsPrimitive(_) => Some(format!("param:{}", p.name)),
-                Ty::Ptr(inner) if matches!(**inner, Ty::OsPrimitive(_)) => {
-                    Some(format!("param:{}", p.name))
-                }
-                Ty::Struct(s)
-                    if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem) =>
-                {
-                    Some(format!("param:{}", p.name))
-                }
-                Ty::Ptr(inner)
-                    if matches!(
-                        &**inner,
-                        Ty::Struct(s) if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem)
-                    ) =>
-                {
-                    Some(format!("param:{}", p.name))
-                }
-                _ => None,
+            let endpoint_alias = if ty_contains_os_prim_view(&p.ty, &self.sema.structs, &mut BTreeSet::new()) {
+                Some(format!("param:{}", p.name))
+            } else {
+                None
             };
             let prov = if p.ty.contains_reference(&self.sema.structs) {
                 Provenance::for_param(idx, is_ptr, endpoint_alias.clone())
@@ -3580,6 +4148,7 @@ impl<'a> BodyChecker<'a> {
                     prov,
                     field_prov: BTreeMap::new(),
                     endpoint_alias,
+                    field_endpoints: BTreeMap::new(),
                     is_isr_state: false,
                     lease_state,
                     lease_gen_key,
@@ -3628,7 +4197,13 @@ impl<'a> BodyChecker<'a> {
         }
         pool.extend(self.sema.primitives.keys().map(String::as_str));
         pool.extend(self.sema.consts.keys().map(String::as_str));
-        pool.extend(self.sema.variant_to_enums.keys().map(String::as_str));
+        pool.extend(
+            self.sema
+                .variant_to_enums
+                .keys()
+                .filter(|v| !self.sema.visible_enums_for_variant(self.prog_idx, v).is_empty())
+                .map(String::as_str),
+        );
         pool.extend(self.sema.functions.keys().map(String::as_str));
         pool.extend(["set_priority", "checkpoint", "delay", "sys", "sim"]);
         closest_match(needle, pool, 2).map(|m| format!("did you mean `{}`?", m))
@@ -4055,6 +4630,7 @@ impl<'a> BodyChecker<'a> {
                 let mut prov = Provenance::pure_static();
                 let mut field_prov = BTreeMap::new();
                 let mut endpoint_alias = None;
+                let mut field_endpoints = BTreeMap::new();
                 let mut lease_state = if resolved_ty.is_linear_lease() {
                     Some(LinearLeaseState::Uninit)
                 } else {
@@ -4080,16 +4656,19 @@ impl<'a> BodyChecker<'a> {
                             field_prov = fp;
                         }
                     }
-                    if !val.ty.is_assignable_to(&resolved_ty) {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            init_expr.span,
+                    field_endpoints = val.field_endpoints.clone();
+                    if self.sema.check_assignable_or_emit(
+                        &val.ty,
+                        &resolved_ty,
+                        init_expr.span,
+                        DiagnosticKind::TypeMismatch,
+                        || {
                             format!(
                                 "variable '{}' declared as '{}', but initialized with '{}'",
                                 name.name, resolved_ty, val.ty
-                            ),
-                        ));
-                    } else {
+                            )
+                        },
+                    ) {
                         self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
                     }
                     if resolved_ty.is_linear_lease() {
@@ -4141,6 +4720,7 @@ impl<'a> BodyChecker<'a> {
                         prov,
                         field_prov,
                         endpoint_alias,
+                        field_endpoints,
                         is_isr_state: false,
                         lease_state,
                         lease_gen_key,
@@ -4252,10 +4832,11 @@ impl<'a> BodyChecker<'a> {
                             self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
                         }
                         let shadowed = self.active_local_names();
-                        if !self
-                            .sema
-                            .is_compile_time_const_expr_with_shadowed(init_expr, &shadowed)
-                        {
+                        if !self.sema.is_compile_time_const_expr_with_shadowed(
+                            init_expr,
+                            &shadowed,
+                            self.prog_idx,
+                        ) {
                             self.sema.emit(Diagnostic::new(
                                 DiagnosticKind::InvalidIsrState,
                                 init_expr.span,
@@ -4278,6 +4859,7 @@ impl<'a> BodyChecker<'a> {
                         prov: Provenance::pure_static(),
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
+                        field_endpoints: BTreeMap::new(),
                         is_isr_state: true,
                         lease_state: None,
                         lease_gen_key: None,
@@ -4368,16 +4950,18 @@ impl<'a> BodyChecker<'a> {
                                 if val.ty.is_linear_lease() {
                                     self.consume_lease_value(e, &val, "return", e.span);
                                 }
-                                if !val.ty.is_assignable_to(ret_ty) {
-                                    self.sema.emit(Diagnostic::new(
-                                        DiagnosticKind::ReturnMismatch,
-                                        e.span,
+                                if self.sema.check_assignable_or_emit(
+                                    &val.ty,
+                                    ret_ty,
+                                    e.span,
+                                    DiagnosticKind::ReturnMismatch,
+                                    || {
                                         format!(
                                             "return value has type '{}', expected '{}'",
                                             val.ty, ret_ty
-                                        ),
-                                    ));
-                                } else {
+                                        )
+                                    },
+                                ) {
                                     self.sema.check_f32_coercion_expr(e, ret_ty);
                                 }
                                 if ret_ty.contains_reference(&self.sema.structs) {
@@ -5371,6 +5955,7 @@ impl<'a> BodyChecker<'a> {
                     prov: var_prov.clone(),
                     field_prov: BTreeMap::new(),
                     endpoint_alias: None,
+                    field_endpoints: BTreeMap::new(),
                     is_isr_state: false,
                     lease_state: None,
                     lease_gen_key: None,
@@ -5663,19 +6248,21 @@ impl<'a> BodyChecker<'a> {
             let val = self.check_expr_infallible(&arg.value);
             let mut ref_param_origins = BTreeSet::new();
             if let Some(param) = task_info.params.get(i) {
-                if !val.ty.is_assignable_to(&param.ty) {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        arg.span,
+                if self.sema.check_assignable_or_emit(
+                    &val.ty,
+                    &param.ty,
+                    arg.span,
+                    DiagnosticKind::TypeMismatch,
+                    || {
                         format!(
                             "argument {} to 'spawn {}' has type '{}', expected '{}'",
                             i + 1,
                             sp.task.name,
                             val.ty,
                             param.ty
-                        ),
-                    ));
-                } else {
+                        )
+                    },
+                ) {
                     self.sema.check_f32_coercion_expr(&arg.value, &param.ty);
                 }
                 if param.ty.contains_reference(&self.sema.structs) {
@@ -5694,6 +6281,7 @@ impl<'a> BodyChecker<'a> {
                     }
                 }
             }
+            let field_endpoints = self.extract_field_endpoint_specs(&val);
             let endpoint_from_param = self.resolve_param_endpoint_index(&val.endpoint_name);
             let static_endpoint = val
                 .endpoint_name
@@ -5701,8 +6289,13 @@ impl<'a> BodyChecker<'a> {
             arg_bindings.push(BootArgBinding {
                 static_endpoint,
                 endpoint_from_param,
+                field_endpoints,
                 ref_param_origins,
             });
+        }
+
+        if self.caller_key == "main" {
+            self.has_spawned = true;
         }
 
         if !invalid_ctx && self.can_record_boot_step() {
@@ -5819,16 +6412,18 @@ impl<'a> BodyChecker<'a> {
                     return;
                 };
 
-                if !rhs.ty.is_assignable_to(&var_info.ty) {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        rhs.span,
+                if self.sema.check_assignable_or_emit(
+                    &rhs.ty,
+                    &var_info.ty,
+                    rhs.span,
+                    DiagnosticKind::TypeMismatch,
+                    || {
                         format!(
                             "cannot assign '{}' to variable '{}' of type '{}'",
                             rhs.ty, ident.name, var_info.ty
-                        ),
-                    ));
-                } else {
+                        )
+                    },
+                ) {
                     self.sema.check_f32_coercion_expr(value_expr, &var_info.ty);
                 }
 
@@ -5914,6 +6509,7 @@ impl<'a> BodyChecker<'a> {
                         v.prov = rhs.prov;
                         v.field_prov.clear();
                         v.endpoint_alias = rhs.endpoint_name;
+                        v.field_endpoints = rhs.field_endpoints;
                     }
                 }
             }
@@ -5923,7 +6519,7 @@ impl<'a> BodyChecker<'a> {
                 field,
             } => {
                 // Check field or MMIO register write (`r.buf = half;`, `USART1.icr = 1;`, `regs.cr1 |= 1;`).
-                let base_val = self.check_expr_infallible(base);
+                let base_val = self.check_projection_base(base);
                 let (struct_name, via_ptr) = match &base_val.ty {
                     Ty::Struct(s) => (s.clone(), false),
                     Ty::MmioLayout(layout_name) | Ty::MmioInstance { layout: layout_name, .. } => {
@@ -6014,16 +6610,18 @@ impl<'a> BodyChecker<'a> {
                 }
 
                 if op == AssignOp::Assign {
-                    if !rhs.ty.is_assignable_to(&field_ty) {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            rhs.span,
+                    if self.sema.check_assignable_or_emit(
+                        &rhs.ty,
+                        &field_ty,
+                        rhs.span,
+                        DiagnosticKind::TypeMismatch,
+                        || {
                             format!(
                                 "cannot assign '{}' to field '{}.{}' of type '{}'",
                                 rhs.ty, struct_name, field.name, field_ty
-                            ),
-                        ));
-                    } else {
+                            )
+                        },
+                    ) {
                         self.sema.check_f32_coercion_expr(value_expr, &field_ty);
                     }
                 } else {
@@ -6089,6 +6687,19 @@ impl<'a> BodyChecker<'a> {
                                     combined = combined.merge(fp);
                                 }
                                 v.prov = combined;
+                                if matches!(&base.kind, ExprKind::Ident(_)) {
+                                    if let Some(ep) = &rhs.endpoint_name {
+                                        v.field_endpoints.insert(field.name.clone(), ep.clone());
+                                    } else {
+                                        v.field_endpoints.remove(&field.name);
+                                    }
+                                    let prefix = format!("{}.", field.name);
+                                    v.field_endpoints.retain(|k, _| !k.starts_with(&prefix));
+                                    for (sub_k, sub_ep) in &rhs.field_endpoints {
+                                        v.field_endpoints
+                                            .insert(format!("{}.{}", field.name, sub_k), sub_ep.clone());
+                                    }
+                                }
                             }
                         }
                     }
@@ -6110,7 +6721,7 @@ impl<'a> BodyChecker<'a> {
                     }
                     return;
                 };
-                if let Ty::MmioLayout(ln) = &**pointee_ty {
+                if let Some(ln) = ty_contains_byval_mmio(pointee_ty) {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::MmioViolation,
                         target.span,
@@ -6121,17 +6732,43 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return;
                 }
+                if let Some(sub) = ty_contains_byval_subsys(pointee_ty, &self.sema.structs) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        target.span,
+                        format!(
+                            "cannot overwrite subsystem struct '{}' by value; operate on its fields via methods",
+                            sub
+                        ),
+                    ));
+                    return;
+                }
+                if ty_embeds_os_primitive(pointee_ty)
+                    || ty_contains_bare_unsized_prim(pointee_ty).is_some()
+                {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        target.span,
+                        format!(
+                            "cannot overwrite static OS primitive '{}' by value; use its methods instead",
+                            pointee_ty
+                        ),
+                    ));
+                    return;
+                }
                 if op == AssignOp::Assign {
-                    if !rhs.ty.is_assignable_to(pointee_ty) {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            rhs.span,
+                    if self.sema.check_assignable_or_emit(
+                        &rhs.ty,
+                        pointee_ty,
+                        rhs.span,
+                        DiagnosticKind::TypeMismatch,
+                        || {
                             format!(
                                 "cannot assign '{}' to dereferenced '*{}'",
                                 rhs.ty, pointee_ty
-                            ),
-                        ));
-                    } else {
+                            )
+                        },
+                    ) {
                         self.sema.check_f32_coercion_expr(value_expr, pointee_ty);
                     }
                 } else {
@@ -6173,7 +6810,7 @@ impl<'a> BodyChecker<'a> {
                     field,
                 } = &seq_expr.kind
                 {
-                    let base_val = self.check_expr_infallible(mmio_base);
+                    let base_val = self.check_projection_base(mmio_base);
                     let mmio_layout = match &base_val.ty {
                         Ty::MmioLayout(ln) | Ty::MmioInstance { layout: ln, .. } => {
                             Some(ln.clone())
@@ -6221,16 +6858,18 @@ impl<'a> BodyChecker<'a> {
                     }
                 };
                 if op == AssignOp::Assign {
-                    if !rhs.ty.is_assignable_to(&elem_ty) {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            rhs.span,
+                    if self.sema.check_assignable_or_emit(
+                        &rhs.ty,
+                        &elem_ty,
+                        rhs.span,
+                        DiagnosticKind::TypeMismatch,
+                        || {
                             format!(
                                 "cannot assign '{}' to element of type '{}'",
                                 rhs.ty, elem_ty
-                            ),
-                        ));
-                    } else {
+                            )
+                        },
+                    ) {
                         self.sema.check_f32_coercion_expr(value_expr, &elem_ty);
                     }
                 } else {
@@ -6423,10 +7062,18 @@ impl<'a> BodyChecker<'a> {
                 let target_ty = self.sema.resolve_type(ty);
                 self.sema
                     .check_type_no_byval_mmio(&target_ty, ty.span, "cast target type");
-                if !iv.ty.is_error() && !target_ty.is_error() && !is_valid_cast(&iv.ty, &target_ty)
+                if !iv.ty.is_error()
+                    && !target_ty.is_error()
+                    && ty_contains_byval_mmio(&target_ty).is_none()
+                    && !is_valid_cast(&iv.ty, &target_ty)
                 {
+                    let kind = if iv.ty.contains_mmio() || target_ty.contains_mmio() {
+                        DiagnosticKind::MmioViolation
+                    } else {
+                        DiagnosticKind::TypeMismatch
+                    };
                     self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
+                        kind,
                         expr.span,
                         format!("cannot cast value of type '{}' to '{}'", iv.ty, target_ty),
                     ));
@@ -6442,6 +7089,7 @@ impl<'a> BodyChecker<'a> {
                     error_spec: ResolvedErrorSpec::None,
                     prov,
                     endpoint_name: None,
+                    field_endpoints: BTreeMap::new(),
                     span: expr.span,
                 }
             }
@@ -6511,6 +7159,7 @@ impl<'a> BodyChecker<'a> {
                             error_spec: ResolvedErrorSpec::None,
                             prov,
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span: expr.span,
                         }
                     }
@@ -6548,7 +7197,7 @@ impl<'a> BodyChecker<'a> {
                         ));
                     }
                 }
-                let tv = self.check_expr_infallible(target);
+                let (tv, place_prov, _) = self.check_addr_of_place(target, expr.span);
                 match &tv.ty {
                     // Sub-slice of an existing slice `buf[0..5]` inherits `buf`'s exact scope depth and DMA lease!
                     Ty::Slice(elem) => ExprVal {
@@ -6556,40 +7205,25 @@ impl<'a> BodyChecker<'a> {
                         error_spec: ResolvedErrorSpec::None,
                         prov: tv.prov,
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span: expr.span,
                     },
-                    // Slicing a fixed array `arr[0..5]` creates a slice bound to `arr`'s lexical scope depth!
-                    Ty::Array { elem, .. } => {
-                        let mut prov = tv.prov;
-                        if let Some(root) = root_ident_of(target) {
-                            if let Some(var) = self.lookup_local(&root) {
-                                if var.is_isr_state {
-                                    prov = prov.merge(&Provenance::addr_of_isr_state(
-                                        &var.name,
-                                        var.decl_depth,
-                                    ));
-                                } else {
-                                    prov = prov.merge(&Provenance::addr_of_local(
-                                        &var.name,
-                                        var.decl_depth,
-                                    ));
-                                }
-                            }
-                        }
-                        ExprVal {
-                            ty: Ty::Slice(elem.clone()),
-                            error_spec: ResolvedErrorSpec::None,
-                            prov,
-                            endpoint_name: None,
-                            span: expr.span,
-                        }
-                    }
+                    // Slicing a fixed array `arr[0..5]` / `s.arr[0..5]` / `(*p).arr[0..5]` preserves backing provenance!
+                    Ty::Array { elem, .. } => ExprVal {
+                        ty: Ty::Slice(elem.clone()),
+                        error_spec: ResolvedErrorSpec::None,
+                        prov: place_prov,
+                        endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
+                        span: expr.span,
+                    },
                     Ty::Ptr(inner) => match &**inner {
                         Ty::Array { elem, .. } => ExprVal {
                             ty: Ty::Slice(elem.clone()),
                             error_spec: ResolvedErrorSpec::None,
                             prov: tv.prov,
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span: expr.span,
                         },
                         _ => {
@@ -6662,6 +7296,7 @@ impl<'a> BodyChecker<'a> {
                 let mut seen = BTreeSet::new();
                 let mut combined_prov = Provenance::pure_static();
                 let mut per_field_prov = BTreeMap::new();
+                let mut field_endpoints = BTreeMap::new();
 
                 for fi in fields {
                     if !seen.insert(fi.name.name.clone()) {
@@ -6675,17 +7310,26 @@ impl<'a> BodyChecker<'a> {
                         ));
                     }
                     let fv = self.check_expr_infallible(&fi.value);
+                    if let Some(ep) = &fv.endpoint_name {
+                        field_endpoints.insert(fi.name.name.clone(), ep.clone());
+                    }
+                    for (sub_k, sub_ep) in &fv.field_endpoints {
+                        field_endpoints
+                            .insert(format!("{}.{}", fi.name.name, sub_k), sub_ep.clone());
+                    }
                     if let Some(decl_field) = st_info.field(&fi.name.name) {
-                        if !fv.ty.is_assignable_to(&decl_field.ty) {
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::TypeMismatch,
-                                fi.value.span,
+                        if self.sema.check_assignable_or_emit(
+                            &fv.ty,
+                            &decl_field.ty,
+                            fi.value.span,
+                            DiagnosticKind::TypeMismatch,
+                            || {
                                 format!(
                                     "field '{}.{}' expects '{}', found '{}'",
                                     name.name, fi.name.name, decl_field.ty, fv.ty
-                                ),
-                            ));
-                        } else {
+                                )
+                            },
+                        ) {
                             self.sema.check_f32_coercion_expr(&fi.value, &decl_field.ty);
                         }
                         if decl_field.ty.contains_reference(&self.sema.structs)
@@ -6728,6 +7372,7 @@ impl<'a> BodyChecker<'a> {
                     error_spec: ResolvedErrorSpec::None,
                     prov: combined_prov,
                     endpoint_name: None,
+                    field_endpoints,
                     span: expr.span,
                 }
             }
@@ -6759,16 +7404,13 @@ impl<'a> BodyChecker<'a> {
                             elem_ty = Some(ev.ty);
                         }
                         Some(cur) => {
-                            if !ev.ty.is_assignable_to(cur) {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::TypeMismatch,
-                                    e.span,
-                                    format!(
-                                        "array element has type '{}', expected '{}'",
-                                        ev.ty, cur
-                                    ),
-                                ));
-                            }
+                            let _ = self.sema.check_assignable_or_emit(
+                                &ev.ty,
+                                cur,
+                                e.span,
+                                DiagnosticKind::TypeMismatch,
+                                || format!("array element has type '{}', expected '{}'", ev.ty, cur),
+                            );
                         }
                     }
                 }
@@ -6786,6 +7428,7 @@ impl<'a> BodyChecker<'a> {
                     error_spec: ResolvedErrorSpec::None,
                     prov: combined_prov,
                     endpoint_name: None,
+                    field_endpoints: BTreeMap::new(),
                     span: expr.span,
                 }
             }
@@ -6863,6 +7506,7 @@ impl<'a> BodyChecker<'a> {
                     error_spec: fv.error_spec,
                     prov,
                     endpoint_name: None,
+                    field_endpoints: BTreeMap::new(),
                     span: expr.span,
                 }
             }
@@ -7003,6 +7647,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: ResolvedErrorSpec::None,
                 prov: var.prov,
                 endpoint_name: var.endpoint_alias,
+                field_endpoints: var.field_endpoints,
                 span: ident.span,
             };
         }
@@ -7041,6 +7686,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: ResolvedErrorSpec::None,
                 prov: Provenance::pure_static(),
                 endpoint_name: Some(ident.name.clone()),
+                field_endpoints: BTreeMap::new(),
                 span: ident.span,
             };
         }
@@ -7071,6 +7717,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: ResolvedErrorSpec::None,
                 prov: Provenance::addr_of_static(),
                 endpoint_name: Some(ident.name.clone()),
+                field_endpoints: BTreeMap::new(),
                 span: ident.span,
             };
         }
@@ -7080,10 +7727,12 @@ impl<'a> BodyChecker<'a> {
             return ExprVal::scalar(c.ty, ident.span);
         }
 
-        // 5. Unqualified enum variant (`Overcurrent`, `BadPacket`, `TooShort`, `BadCrc`, ...).
-        if let Some(enum_names) = self.sema.variant_to_enums.get(&ident.name).cloned() {
-            if enum_names.len() == 1 {
-                return ExprVal::scalar(Ty::Enum(enum_names[0].clone()), ident.span);
+        // 5. Unqualified enum variant (`Overcurrent`, `BadPacket`, `TooShort`, `BadCrc`, ...),
+        //    scoped to enums visible in the current module.
+        let visible_enums = self.sema.visible_enums_for_variant(self.prog_idx, &ident.name);
+        if !visible_enums.is_empty() {
+            if visible_enums.len() == 1 {
+                return ExprVal::scalar(Ty::Enum(visible_enums[0].clone()), ident.span);
             }
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::InvalidOperation,
@@ -7091,7 +7740,7 @@ impl<'a> BodyChecker<'a> {
                 format!(
                     "ambiguous enum variant '{}'; qualify with enum name (candidates: {})",
                     ident.name,
-                    enum_names.join(", ")
+                    visible_enums.join(", ")
                 ),
             ));
             return ExprVal::error(ident.span);
@@ -7108,6 +7757,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: ResolvedErrorSpec::None,
                 prov: Provenance::addr_of_static(),
                 endpoint_name: Some(inst.name),
+                field_endpoints: BTreeMap::new(),
                 span: ident.span,
             };
         }
@@ -7117,6 +7767,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: ResolvedErrorSpec::None,
                 prov: Provenance::pure_static(),
                 endpoint_name: Some(iq.name),
+                field_endpoints: BTreeMap::new(),
                 span: ident.span,
             };
         }
@@ -7131,6 +7782,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: ResolvedErrorSpec::None,
                 prov: Provenance::fn_callback(ident.name.clone()),
                 endpoint_name: None,
+                field_endpoints: BTreeMap::new(),
                 span: ident.span,
             };
         }
@@ -7178,6 +7830,7 @@ impl<'a> BodyChecker<'a> {
                             error_spec: ResolvedErrorSpec::None,
                             prov: Provenance::addr_of_static(),
                             endpoint_name: Some(id.name.clone()),
+                            field_endpoints: BTreeMap::new(),
                             span,
                         };
                     }
@@ -7200,6 +7853,7 @@ impl<'a> BodyChecker<'a> {
                             error_spec: ResolvedErrorSpec::None,
                             prov: Provenance::fn_callback(id.name.clone()),
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span,
                         };
                     }
@@ -7213,53 +7867,7 @@ impl<'a> BodyChecker<'a> {
                     }
                 }
 
-                // Forbid taking raw `&regs.reg` or `&regs.arr[i]` of MMIO registers (`E0031`).
-                let iv = match &inner.kind {
-                    ExprKind::Field { target, field } => {
-                        let bv = self.check_expr_infallible(target);
-                        if is_mmio_ty(&bv.ty) {
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::MmioViolation,
-                                span,
-                                format!(
-                                    "cannot take raw address `&` of MMIO register '{}'; access MMIO registers through `*Layout` pointers instead",
-                                    field.name
-                                ),
-                            ));
-                            return ExprVal::error(span);
-                        }
-                        self.check_resolved_field_val(bv, target, field, inner.span)
-                    }
-                    ExprKind::Index { target: seq, index } => {
-                        if let ExprKind::Field { target, field } = &seq.kind {
-                            let bv = self.check_expr_infallible(target);
-                            let idx_v = self.check_expr_infallible(index);
-                            if !idx_v.ty.is_integer() && !idx_v.ty.is_error() {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::TypeMismatch,
-                                    index.span,
-                                    format!("index must be an integer, found '{}'", idx_v.ty),
-                                ));
-                            }
-                            if is_mmio_ty(&bv.ty) {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::MmioViolation,
-                                    span,
-                                    format!(
-                                        "cannot take raw address `&` of MMIO register '{}'; access MMIO registers through `*Layout` pointers instead",
-                                        field.name
-                                    ),
-                                ));
-                                return ExprVal::error(span);
-                            }
-                            let fv = self.check_resolved_field_val(bv, target, field, seq.span);
-                            self.check_resolved_index_val(fv, seq, index.span, inner.span)
-                        } else {
-                            self.check_expr_infallible(inner)
-                        }
-                    }
-                    _ => self.check_expr_infallible(inner),
-                };
+                let (iv, prov, endpoint_name) = self.check_addr_of_place(inner, span);
                 if iv.ty.is_error() {
                     return ExprVal::error(span);
                 }
@@ -7272,45 +7880,19 @@ impl<'a> BodyChecker<'a> {
                     return ExprVal::error(span);
                 }
 
-                let (prov, endpoint_name) =
-                    self.resolve_addr_of_provenance(inner, iv.prov, iv.endpoint_name);
-
                 ExprVal {
                     ty: Ty::Ptr(Box::new(iv.ty)),
                     error_spec: ResolvedErrorSpec::None,
                     prov,
                     endpoint_name,
+                    field_endpoints: iv.field_endpoints,
                     span,
                 }
             }
 
             UnaryOp::Deref => {
                 let iv = self.check_expr_infallible(inner);
-                match iv.ty {
-                    Ty::Ptr(pointee) => {
-                        let prov = if pointee.contains_reference(&self.sema.structs) {
-                            iv.prov
-                        } else {
-                            Provenance::pure_static()
-                        };
-                        ExprVal {
-                            ty: *pointee,
-                            error_spec: ResolvedErrorSpec::None,
-                            prov,
-                            endpoint_name: iv.endpoint_name,
-                            span,
-                        }
-                    }
-                    Ty::Error => ExprVal::error(span),
-                    other => {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            span,
-                            format!("cannot dereference non-pointer type '{}'", other),
-                        ));
-                        ExprVal::error(span)
-                    }
-                }
+                self.finish_deref_expr(iv, span, true)
             }
 
             UnaryOp::Not => {
@@ -7356,6 +7938,41 @@ impl<'a> BodyChecker<'a> {
     }
 
     fn check_binary_expr(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> ExprVal {
+        // S-H2: Short-circuit `&&` and `||` conditionally evaluate `rhs` only when `lhs` does not
+        // short-circuit, so snapshot/fork variable move states & lease generations around `rhs`!
+        if matches!(op, BinaryOp::And | BinaryOp::Or) {
+            let lv = self.check_expr_infallible(lhs);
+            let after_lhs_vars = self.snapshot_outer_vars();
+            let after_lhs_leases = self.leases.clone();
+            self.branch_depth += 1;
+            let rv = self.check_expr_infallible(rhs);
+            self.branch_depth -= 1;
+            let after_rhs_vars = self.snapshot_outer_vars();
+            let after_rhs_leases = self.leases.clone();
+
+            self.scopes = after_lhs_vars.clone();
+            self.merge_branch_vars(&after_lhs_vars, &[after_lhs_vars.clone(), after_rhs_vars], span);
+            self.leases = after_lhs_leases.clone();
+            self.leases.join_branches(&[after_lhs_leases, after_rhs_leases]);
+
+            if lv.ty.is_error() || rv.ty.is_error() {
+                return ExprVal::error(span);
+            }
+            if !lv.ty.is_bool() || !rv.ty.is_bool() {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!(
+                        "logical '{}' requires 'bool' operands, found '{}' and '{}'",
+                        op.as_str(),
+                        lv.ty,
+                        rv.ty
+                    ),
+                ));
+            }
+            return ExprVal::scalar(Ty::bool(), span);
+        }
+
         let lv = self.check_expr_infallible(lhs);
         let rv = self.check_expr_infallible(rhs);
         if lv.ty.is_error() || rv.ty.is_error() {
@@ -7363,21 +7980,7 @@ impl<'a> BodyChecker<'a> {
         }
 
         match op {
-            BinaryOp::And | BinaryOp::Or => {
-                if !lv.ty.is_bool() || !rv.ty.is_bool() {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        span,
-                        format!(
-                            "logical '{}' requires 'bool' operands, found '{}' and '{}'",
-                            op.as_str(),
-                            lv.ty,
-                            rv.ty
-                        ),
-                    ));
-                }
-                ExprVal::scalar(Ty::bool(), span)
-            }
+            BinaryOp::And | BinaryOp::Or => unreachable!(),
 
             BinaryOp::Eq | BinaryOp::Ne => {
                 if lv.ty.is_linear_lease() || rv.ty.is_linear_lease() {
@@ -7458,11 +8061,7 @@ impl<'a> BodyChecker<'a> {
                 }
             }
 
-            BinaryOp::BitOr
-            | BinaryOp::BitAnd
-            | BinaryOp::BitXor
-            | BinaryOp::Shl
-            | BinaryOp::Shr => {
+            BinaryOp::BitOr | BinaryOp::BitAnd | BinaryOp::BitXor => {
                 if !lv.ty.is_integer() || !rv.ty.is_integer() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -7479,74 +8078,349 @@ impl<'a> BodyChecker<'a> {
                 let res_ty = unify_integer_arith(&lv.ty, &rv.ty);
                 ExprVal::scalar(res_ty, span)
             }
-        }
-    }
 
-    fn expr_walks_through_ptr(&self, expr: &Expr) -> bool {
-        let mut cur = expr;
-        let mut walked_member = false;
-        loop {
-            match &cur.kind {
-                ExprKind::Field { target, .. } | ExprKind::Index { target, .. } => {
-                    walked_member = true;
-                    cur = target;
+            BinaryOp::Shl | BinaryOp::Shr => {
+                if !lv.ty.is_integer() || !rv.ty.is_integer() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "operator '{}' requires integer operands, found '{}' and '{}'",
+                            op.as_str(),
+                            lv.ty,
+                            rv.ty
+                        ),
+                    ));
+                    return ExprVal::error(span);
                 }
-                ExprKind::Unary {
-                    op: UnaryOp::Deref,
-                    ..
-                } => return true,
-                ExprKind::Ident(id) => {
-                    return walked_member
-                        && self
-                            .lookup_local(&id.name)
-                            .is_some_and(|v| matches!(v.ty, Ty::Ptr(_) | Ty::Slice(_)));
-                }
-                _ => return false,
+                // L-H1: Shift result takes the host integer type of the shifted left operand
+                // rather than promoting to a wider right-hand shift amount (`0x8000_0000u32 >> 4i32` -> `u32`).
+                let res_ty = match &lv.ty {
+                    Ty::Prim(p) => Ty::Prim(Ty::host_prim(*p)),
+                    Ty::IntLit => Ty::IntLit,
+                    _ => lv.ty.clone(),
+                };
+                ExprVal::scalar(res_ty, span)
             }
         }
     }
 
-    fn resolve_addr_of_provenance(
-        &self,
-        inner: &Expr,
-        mut prov: Provenance,
-        mut endpoint_name: Option<String>,
-    ) -> (Provenance, Option<String>) {
-        if let Some(root_name) = root_ident_of(inner) {
-            if let Some(local) = self.lookup_local(&root_name) {
-                if !self.expr_walks_through_ptr(inner) {
-                    if local.is_isr_state {
-                        prov = prov.merge(&Provenance::addr_of_isr_state(
-                            &local.name,
-                            local.decl_depth,
+    fn finish_deref_expr(&mut self, iv: ExprVal, span: Span, reject_byval: bool) -> ExprVal {
+        match iv.ty {
+            Ty::Ptr(pointee) => {
+                if reject_byval {
+                    if let Some(ln) = ty_contains_byval_mmio(&pointee) {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::MmioViolation,
+                            span,
+                            format!(
+                                "cannot dereference MMIO layout pointer '*{}' by value (access its registers via '.reg' projection)",
+                                ln
+                            ),
                         ));
-                    } else {
-                        prov = prov.merge(&Provenance::addr_of_local(
-                            &local.name,
-                            local.decl_depth,
+                        return ExprVal::error(span);
+                    }
+                    if let Some(sub) = ty_contains_byval_subsys(&pointee, &self.sema.structs) {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            format!(
+                                "cannot dereference subsystem struct '{}' by value (access its fields or methods via pointer)",
+                                sub
+                            ),
                         ));
+                        return ExprVal::error(span);
+                    }
+                    if ty_embeds_os_primitive(&pointee)
+                        || ty_contains_bare_unsized_prim(&pointee).is_some()
+                    {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            format!(
+                                "cannot dereference OS primitive pointer '*{}' by value (use its methods via pointer)",
+                                pointee
+                            ),
+                        ));
+                        return ExprVal::error(span);
                     }
                 }
-                if endpoint_name.is_none() {
-                    endpoint_name = local.endpoint_alias.clone();
-                }
-            } else if self.sema.primitives.contains_key(&root_name)
-                || self.sema.subsystems.contains_key(&root_name)
-            {
-                prov = Provenance::addr_of_static();
-                if endpoint_name.is_none() {
-                    endpoint_name = Some(root_name);
+                let prov = if pointee.contains_reference(&self.sema.structs)
+                    || pointee.contains_fn_ptr(&self.sema.structs)
+                {
+                    iv.prov
+                } else {
+                    Provenance::pure_static()
+                };
+                ExprVal {
+                    ty: *pointee,
+                    error_spec: ResolvedErrorSpec::None,
+                    prov,
+                    endpoint_name: iv.endpoint_name,
+                    field_endpoints: iv.field_endpoints,
+                    span,
                 }
             }
-        } else {
-            // Taking address of temporary expression at current lexical depth.
-            prov = prov.merge(&Provenance::addr_of_local("<temp>", self.current_depth()));
+            Ty::Error => ExprVal::error(span),
+            other => {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!("cannot dereference non-pointer type '{}'", other),
+                ));
+                ExprVal::error(span)
+            }
         }
-        (prov, endpoint_name)
+    }
+
+    fn check_projection_base_allow_mmio_array(
+        &mut self,
+        expr: &Expr,
+    ) -> (ExprVal, Option<(String, String, usize)>) {
+        if let ExprKind::Unary {
+            op: UnaryOp::Deref,
+            expr: inner,
+        } = &expr.kind
+        {
+            let iv = self.check_expr_infallible(inner);
+            (self.finish_deref_expr(iv, expr.span, false), None)
+        } else {
+            self.check_expr_infallible_allow_mmio_array(expr)
+        }
+    }
+
+    fn check_projection_base(&mut self, expr: &Expr) -> ExprVal {
+        if let ExprKind::Unary {
+            op: UnaryOp::Deref,
+            expr: inner,
+        } = &expr.kind
+        {
+            let iv = self.check_expr_infallible(inner);
+            self.finish_deref_expr(iv, expr.span, false)
+        } else {
+            self.check_expr_infallible(expr)
+        }
+    }
+
+    fn check_addr_of_place(
+        &mut self,
+        place: &Expr,
+        addr_span: Span,
+    ) -> (ExprVal, Provenance, Option<String>) {
+        let (val, prov, ep, _) = self.check_addr_of_place_impl(place, addr_span, false);
+        (val, prov, ep)
+    }
+
+    fn check_addr_of_place_impl(
+        &mut self,
+        place: &Expr,
+        addr_span: Span,
+        allow_mmio_array: bool,
+    ) -> (
+        ExprVal,
+        Provenance,
+        Option<String>,
+        Option<(String, String, usize)>,
+    ) {
+        match &place.kind {
+            ExprKind::Ident(id) => {
+                let iv = self.check_expr_infallible(place);
+                if iv.ty.is_error() {
+                    return (iv, Provenance::pure_static(), None, None);
+                }
+                let mut endpoint_name = iv.endpoint_name.clone();
+                let base_place_prov = if let Some(local) = self.lookup_local(&id.name) {
+                    if endpoint_name.is_none() {
+                        endpoint_name = local.endpoint_alias.clone();
+                    }
+                    if local.is_isr_state {
+                        Provenance::addr_of_isr_state(&local.name, local.decl_depth)
+                    } else {
+                        Provenance::addr_of_local(&local.name, local.decl_depth)
+                    }
+                } else if self.sema.primitives.contains_key(&id.name)
+                    || self.sema.subsystems.contains_key(&id.name)
+                    || self.sema.mmio_instances.contains_key(&id.name)
+                    || self.sema.consts.contains_key(&id.name)
+                {
+                    if endpoint_name.is_none() {
+                        endpoint_name = Some(id.name.clone());
+                    }
+                    Provenance::addr_of_static()
+                } else {
+                    Provenance::addr_of_local("<temp>", self.current_depth())
+                };
+                let prov = base_place_prov.merge_place_with_val_origins(&iv.prov);
+                (iv, prov, endpoint_name, None)
+            }
+
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                expr: inner,
+            } => {
+                // `&(*p)` yields `p` directly without triggering by-value deref rejection and
+                // preserves `p`'s backing pointer provenance (`leases`, depth, origins, endpoint).
+                let ptr_v = self.check_expr_infallible(inner);
+                let val = self.finish_deref_expr(ptr_v.clone(), place.span, false);
+                if val.ty.is_error() {
+                    return (val, Provenance::pure_static(), None, None);
+                }
+                let prov = ptr_v.prov.as_backing_ptr();
+                let ep = val.endpoint_name.clone();
+                (val, prov, ep, None)
+            }
+
+            ExprKind::Field { target, field } => {
+                let (bv, target_place_prov, target_ep, target_mmio_arr) =
+                    self.check_addr_of_place_impl(target, addr_span, true);
+                if let Some((layout_name, reg_name, _)) = target_mmio_arr {
+                    if field.name != "len" {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::MmioViolation,
+                            place.span,
+                            format!(
+                                "cannot access '.{}' on MMIO register array '{}.{}' (only element indexing '[i]' and '.len' are allowed)",
+                                field.name, layout_name, reg_name
+                            ),
+                        ));
+                        return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                    }
+                }
+                if bv.ty.is_error() {
+                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                }
+                if is_mmio_ty(&bv.ty) {
+                    let layout_name = match &bv.ty {
+                        Ty::MmioLayout(ln) | Ty::MmioInstance { layout: ln, .. } => {
+                            Some(ln.as_str())
+                        }
+                        Ty::Ptr(inner) => match &**inner {
+                            Ty::MmioLayout(ln) => Some(ln.as_str()),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if allow_mmio_array {
+                        if let Some(ln) = layout_name {
+                            if let Some(reg) = self
+                                .sema
+                                .mmio_layouts
+                                .get(ln)
+                                .and_then(|l| l.regs.iter().find(|r| r.name == field.name))
+                                .cloned()
+                            {
+                                if let Some(len) = reg.array_len {
+                                    let reg_ty = Ty::Array {
+                                        elem: Box::new(Ty::Prim(reg.elem_ty)),
+                                        len,
+                                    };
+                                    return (
+                                        ExprVal::scalar(reg_ty, place.span),
+                                        Provenance::pure_static(),
+                                        None,
+                                        Some((ln.to_string(), reg.name, len)),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        addr_span,
+                        format!(
+                            "cannot take raw address `&` of MMIO register '{}'; access MMIO registers through `*Layout` pointers instead",
+                            field.name
+                        ),
+                    ));
+                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                }
+                let fv = self.check_resolved_field_val_with_place(
+                    bv.clone(),
+                    Some(target_place_prov.clone()),
+                    target,
+                    field,
+                    place.span,
+                );
+                if fv.ty.is_error() {
+                    return (fv, Provenance::pure_static(), None, None);
+                }
+                let base_place_prov = if matches!(bv.ty, Ty::Ptr(_)) {
+                    bv.prov.as_backing_ptr()
+                } else {
+                    target_place_prov
+                };
+                let prov = base_place_prov.merge_place_with_val_origins(&fv.prov);
+                let ep = fv.endpoint_name.clone().or(target_ep);
+                (fv, prov, ep, None)
+            }
+
+            ExprKind::Index { target: seq, index } => {
+                let (seq_v, seq_place_prov, seq_ep, mmio_arr) =
+                    self.check_addr_of_place_impl(seq, addr_span, true);
+                let idx_v = self.check_expr_infallible(index);
+                if !idx_v.ty.is_integer() && !idx_v.ty.is_error() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        index.span,
+                        format!("index must be an integer, found '{}'", idx_v.ty),
+                    ));
+                }
+                if let Some((_, reg_name, _)) = mmio_arr {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::MmioViolation,
+                        addr_span,
+                        format!(
+                            "cannot take raw address `&` of MMIO register '{}'; access MMIO registers through `*Layout` pointers instead",
+                            reg_name
+                        ),
+                    ));
+                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                }
+                if seq_v.ty.is_error() {
+                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                }
+                let elem_v =
+                    self.check_resolved_index_val(seq_v.clone(), seq, index.span, place.span);
+                if elem_v.ty.is_error() {
+                    return (elem_v, Provenance::pure_static(), None, None);
+                }
+                let base_place_prov = match &seq_v.ty {
+                    Ty::Slice(_) | Ty::Ptr(_) => seq_v.prov.as_backing_ptr(),
+                    _ => seq_place_prov,
+                };
+                let prov = base_place_prov.merge_place_with_val_origins(&elem_v.prov);
+                let ep = elem_v.endpoint_name.clone().or(seq_ep);
+                (elem_v, prov, ep, None)
+            }
+
+            _ => {
+                let iv = self.check_expr_infallible(place);
+                if iv.ty.is_error() {
+                    return (iv, Provenance::pure_static(), None, None);
+                }
+                let base = Provenance::addr_of_local("<temp>", self.current_depth());
+                let prov = base.merge_place_with_val_origins(&iv.prov);
+                let ep = iv.endpoint_name.clone();
+                (iv, prov, ep, None)
+            }
+        }
     }
 
     fn check_field_expr(&mut self, target: &Expr, field: &Ident, span: Span) -> ExprVal {
-        let (tv, mmio_arr) = self.check_expr_infallible_allow_mmio_array(target);
+        if field.name == "ptr" {
+            let (tv, target_place_prov, _) = self.check_addr_of_place(target, span);
+            if tv.ty.is_error() {
+                return ExprVal::error(span);
+            }
+            return self.check_resolved_field_val_with_place(
+                tv,
+                Some(target_place_prov),
+                target,
+                field,
+                span,
+            );
+        }
+        let (tv, mmio_arr) = self.check_projection_base_allow_mmio_array(target);
         if let Some((layout_name, reg_name, _)) = mmio_arr {
             if field.name != "len" {
                 self.sema.emit(Diagnostic::new(
@@ -7560,12 +8434,13 @@ impl<'a> BodyChecker<'a> {
                 return ExprVal::error(span);
             }
         }
-        self.check_resolved_field_val(tv, target, field, span)
+        self.check_resolved_field_val_with_place(tv, None, target, field, span)
     }
 
-    fn check_resolved_field_val(
+    fn check_resolved_field_val_with_place(
         &mut self,
         tv: ExprVal,
+        target_place_prov: Option<Provenance>,
         target: &Expr,
         field: &Ident,
         span: Span,
@@ -7589,8 +8464,9 @@ impl<'a> BodyChecker<'a> {
                         ExprVal {
                             ty: Ty::Ptr(elem),
                             error_spec: ResolvedErrorSpec::None,
-                            prov: tv.prov,
+                            prov: tv.prov.as_backing_ptr(),
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span,
                         }
                     } else {
@@ -7620,12 +8496,17 @@ impl<'a> BodyChecker<'a> {
                 if field.name == "len" {
                     ExprVal::scalar(Ty::usize(), span)
                 } else if field.name == "ptr" {
-                    let (prov, _) = self.resolve_addr_of_provenance(target, tv.prov, None);
+                    let prov = if matches!(tv.ty, Ty::Ptr(_)) {
+                        tv.prov.as_backing_ptr()
+                    } else {
+                        target_place_prov.unwrap_or(tv.prov)
+                    };
                     ExprVal {
                         ty: Ty::Ptr(elem),
                         error_spec: ResolvedErrorSpec::None,
                         prov,
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 } else {
@@ -7668,16 +8549,22 @@ impl<'a> BodyChecker<'a> {
                         &f_info.ty,
                         Ty::Ptr(inner) if matches!(&**inner, Ty::Struct(s) if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem))
                     );
-                let prov = if is_subsys_field
+                let is_view_field = is_subsys_field
+                    || ty_contains_os_prim_view(&f_info.ty, &self.sema.structs, &mut BTreeSet::new());
+                let prov = if is_view_field
                     || f_info.ty.contains_reference(&self.sema.structs)
                     || f_info.ty.contains_fn_ptr(&self.sema.structs)
                 {
                     if let Some(root) = root_ident_of(target) {
                         if let Some(v) = self.lookup_local(&root) {
-                            v.field_prov
-                                .get(&field.name)
-                                .cloned()
-                                .unwrap_or_else(|| tv.prov.clone())
+                            if !matches!(v.ty, Ty::Ptr(_)) {
+                                v.field_prov
+                                    .get(&field.name)
+                                    .cloned()
+                                    .unwrap_or_else(|| tv.prov.clone())
+                            } else {
+                                tv.prov.clone()
+                            }
                         } else {
                             tv.prov.clone()
                         }
@@ -7688,7 +8575,17 @@ impl<'a> BodyChecker<'a> {
                     Provenance::pure_static()
                 };
 
-                let endpoint_name = if is_subsys_field {
+                let mut out_field_endpoints = BTreeMap::new();
+                let prefix = format!("{}.", field.name);
+                for (k, v) in &tv.field_endpoints {
+                    if let Some(rest) = k.strip_prefix(&prefix) {
+                        out_field_endpoints.insert(rest.to_string(), v.clone());
+                    }
+                }
+
+                let endpoint_name = if let Some(ep) = tv.field_endpoints.get(&field.name) {
+                    Some(ep.clone())
+                } else if is_view_field {
                     tv.endpoint_name
                         .as_ref()
                         .cloned()
@@ -7703,6 +8600,7 @@ impl<'a> BodyChecker<'a> {
                     error_spec: ResolvedErrorSpec::None,
                     prov,
                     endpoint_name,
+                    field_endpoints: out_field_endpoints,
                     span,
                 }
             }
@@ -7870,18 +8768,13 @@ impl<'a> BodyChecker<'a> {
                         self.consume_lease_value(&arg.value, &av, "function pointer argument", arg.span);
                     }
                     if let Some(expected) = params.get(i) {
-                        if !av.ty.is_assignable_to(expected) {
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::TypeMismatch,
-                                arg.span,
-                                format!(
-                                    "argument {} has type '{}', expected '{}'",
-                                    i + 1,
-                                    av.ty,
-                                    expected
-                                ),
-                            ));
-                        } else {
+                        if self.sema.check_assignable_or_emit(
+                            &av.ty,
+                            expected,
+                            arg.span,
+                            DiagnosticKind::TypeMismatch,
+                            || format!("argument {} has type '{}', expected '{}'", i + 1, av.ty, expected),
+                        ) {
                             self.sema.check_f32_coercion_expr(&arg.value, expected);
                         }
                     }
@@ -7957,10 +8850,12 @@ impl<'a> BodyChecker<'a> {
                 self.consume_lease_value(&arg.value, &av, "function argument", arg.span);
             }
             if let Some(param) = fn_info.params.get(i) {
-                if !av.ty.is_assignable_to(&param.ty) {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        arg.span,
+                if self.sema.check_assignable_or_emit(
+                    &av.ty,
+                    &param.ty,
+                    arg.span,
+                    DiagnosticKind::TypeMismatch,
+                    || {
                         format!(
                             "argument {} ('{}') to '{}' has type '{}', expected '{}'",
                             i + 1,
@@ -7968,9 +8863,9 @@ impl<'a> BodyChecker<'a> {
                             fn_info.name,
                             av.ty,
                             param.ty
-                        ),
-                    ));
-                } else {
+                        )
+                    },
+                ) {
                     self.sema.check_f32_coercion_expr(&arg.value, &param.ty);
                 }
             }
@@ -7991,11 +8886,13 @@ impl<'a> BodyChecker<'a> {
                 .endpoint_name
                 .clone()
                 .filter(|ep| !ep.starts_with("param:"));
+            let field_endpoints = self.extract_field_endpoint_specs(&av);
             let has_non_static_local_ref = av.prov.has_non_returning_origin();
             let has_isr_state_ref = !av.prov.isr_state_origins.is_empty();
             boot_call_args.push(BootCallArg {
                 static_endpoint,
                 endpoint_from_param,
+                field_endpoints,
                 has_non_static_local_ref,
                 has_isr_state_ref,
                 ref_param_origins: av.prov.param_origins.clone(),
@@ -8008,11 +8905,22 @@ impl<'a> BodyChecker<'a> {
         }
 
         if !fn_info.is_extern_c {
+            let in_main_post_boot = self.in_main_post_boot();
             self.sema.recorded_call_args.push(RecordedCallArgs {
                 caller: self.caller_key.clone(),
                 callee: fn_info.name.clone(),
                 args: boot_call_args.clone(),
+                in_main_post_boot,
             });
+            if self.caller_key == "main" {
+                let (spawns, attaches) = self.sema.fn_boot_flags(&fn_info.name);
+                if spawns {
+                    self.has_spawned = true;
+                }
+                if attaches {
+                    self.has_attached_irq = true;
+                }
+            }
             if self.can_record_boot_step() {
                 self.boot_steps.push(BootStep::HelperCall {
                     callee: fn_info.name.clone(),
@@ -8057,6 +8965,7 @@ impl<'a> BodyChecker<'a> {
             error_spec: fn_info.error_spec.clone(),
             prov: ret_prov,
             endpoint_name: None,
+            field_endpoints: BTreeMap::new(),
             span,
         }
     }
@@ -8246,7 +9155,7 @@ impl<'a> BodyChecker<'a> {
         args: &[CallArg],
         span: Span,
     ) -> ExprVal {
-        let rv = self.check_expr_infallible(receiver);
+        let rv = self.check_projection_base(receiver);
         if rv.ty.is_error() {
             for a in args {
                 let _ = self.check_expr_infallible(&a.value);
@@ -8342,6 +9251,7 @@ impl<'a> BodyChecker<'a> {
                         error_spec: ResolvedErrorSpec::Untyped,
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 } else {
@@ -8449,6 +9359,7 @@ impl<'a> BodyChecker<'a> {
                                         error_spec: ResolvedErrorSpec::None,
                                         prov,
                                         endpoint_name: None,
+                                        field_endpoints: BTreeMap::new(),
                                         span,
                                     };
                                 }
@@ -9067,6 +9978,7 @@ impl<'a> BodyChecker<'a> {
                         },
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9106,6 +10018,7 @@ impl<'a> BodyChecker<'a> {
                         },
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9152,6 +10065,7 @@ impl<'a> BodyChecker<'a> {
                         },
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9171,6 +10085,7 @@ impl<'a> BodyChecker<'a> {
                         },
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9181,6 +10096,7 @@ impl<'a> BodyChecker<'a> {
                         error_spec: ResolvedErrorSpec::Untyped,
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9219,6 +10135,7 @@ impl<'a> BodyChecker<'a> {
                         },
                         prov,
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9255,6 +10172,7 @@ impl<'a> BodyChecker<'a> {
                         error_spec: ResolvedErrorSpec::Untyped,
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9281,6 +10199,7 @@ impl<'a> BodyChecker<'a> {
                         },
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9327,6 +10246,7 @@ impl<'a> BodyChecker<'a> {
                         error_spec: ResolvedErrorSpec::Untyped,
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9344,6 +10264,7 @@ impl<'a> BodyChecker<'a> {
                         error_spec: ResolvedErrorSpec::Untyped,
                         prov: Provenance::pure_static(),
                         endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
                         span,
                     }
                 }
@@ -9370,6 +10291,19 @@ impl<'a> BodyChecker<'a> {
             },
 
             ResolvedOsPrimitive::ByteRing { .. } | ResolvedOsPrimitive::ByteRingUnsized => {
+                let spsc_role = match m {
+                    "push" | "push_byte" | "grant_write" | "commit_write" => {
+                        Some(ByteRingOpRole::Producer)
+                    }
+                    "wait_read" | "read_slice" | "pop" | "try_pop_byte" | "consume" => {
+                        Some(ByteRingOpRole::Consumer)
+                    }
+                    "clear" => Some(ByteRingOpRole::Both),
+                    _ => None,
+                };
+                if let Some(role) = spsc_role {
+                    self.record_byte_ring_op(role, m, source_key, span);
+                }
                 let u8_slice = Ty::Slice(Box::new(Ty::u8()));
                 match m {
                     "push" => {
@@ -9400,6 +10334,7 @@ impl<'a> BodyChecker<'a> {
                             error_spec: ResolvedErrorSpec::Untyped,
                             prov,
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span,
                         }
                     }
@@ -9424,6 +10359,7 @@ impl<'a> BodyChecker<'a> {
                             error_spec: ResolvedErrorSpec::None,
                             prov,
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span,
                         }
                     }
@@ -9451,6 +10387,7 @@ impl<'a> BodyChecker<'a> {
                             },
                             prov,
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span,
                         }
                     }
@@ -9482,6 +10419,7 @@ impl<'a> BodyChecker<'a> {
                             error_spec: ResolvedErrorSpec::Untyped,
                             prov: Provenance::pure_static(),
                             endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
                             span,
                         }
                     }
@@ -9565,16 +10503,18 @@ impl<'a> BodyChecker<'a> {
                 .or_default()
                 .extend(val.prov.param_origins.iter().copied());
         }
-        if !val.ty.is_assignable_to(elem) {
-            self.sema.emit(Diagnostic::new(
-                DiagnosticKind::TypeMismatch,
-                *arg_span,
+        if self.sema.check_assignable_or_emit(
+            &val.ty,
+            elem,
+            *arg_span,
+            DiagnosticKind::TypeMismatch,
+            || {
                 format!(
                     "argument to '{}' has type '{}', expected '{}'",
                     method, val.ty, elem
-                ),
-            ));
-        } else {
+                )
+            },
+        ) {
             self.sema.check_f32_coercion_expr(arg_expr, elem);
         }
     }
@@ -9627,6 +10567,14 @@ impl<'a> BodyChecker<'a> {
 
         if let Some(ep) = &clause.err_param {
             let decl_err_ty = self.sema.resolve_type(&ep.ty);
+            self.sema
+                .check_type_no_byval_mmio(&decl_err_ty, ep.ty.span, "'catch' error parameter");
+            self.sema.check_disallowed_lease_type(
+                &decl_err_ty,
+                ep.ty.span,
+                "'catch' error parameter",
+                false,
+            );
             match &iv.error_spec {
                 ResolvedErrorSpec::None => {}
                 ResolvedErrorSpec::Untyped => {
@@ -9664,6 +10612,28 @@ impl<'a> BodyChecker<'a> {
                 ));
             }
             let decl_part_ty = self.sema.resolve_type(&pp.ty);
+            self.sema.check_type_no_byval_mmio(
+                &decl_part_ty,
+                pp.ty.span,
+                "'catch' partial-progress parameter",
+            );
+            if decl_part_ty.is_linear_lease()
+                || iv.ty.is_linear_lease()
+                || ty_contains_linear_lease(&decl_part_ty)
+            {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::LinearLeaseViolation,
+                    pp.ty.span,
+                    "cannot bind linear Lease<T> in 'catch' partial-progress parameter (linear leases cannot be partially produced on error)",
+                ));
+            } else {
+                self.sema.check_disallowed_lease_type(
+                    &decl_part_ty,
+                    pp.ty.span,
+                    "'catch' partial-progress parameter",
+                    false,
+                );
+            }
             if matches!(iv.error_spec, ResolvedErrorSpec::Untyped) {
                 self.sema.emit(Diagnostic::new(
                     DiagnosticKind::InvalidCatchSignature,
@@ -9694,7 +10664,15 @@ impl<'a> BodyChecker<'a> {
 
         let (catch_div, trailing_val) = self.with_nested_scope(|this| {
             let depth = this.current_depth();
-            if let Some((ename, ety, _)) = bound_err {
+            if let Some((ename, ety, espan)) = bound_err {
+                let init_lease_state = if ety.is_linear_lease() {
+                    Some(LinearLeaseState::Moved {
+                        moved_at: espan,
+                        reason: "invalid catch error binding",
+                    })
+                } else {
+                    None
+                };
                 this.scopes.last_mut().unwrap().insert(
                     ename.clone(),
                     LocalVar {
@@ -9704,8 +10682,9 @@ impl<'a> BodyChecker<'a> {
                         prov: Provenance::pure_static(),
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
+                        field_endpoints: BTreeMap::new(),
                         is_isr_state: false,
-                        lease_state: None,
+                        lease_state: init_lease_state,
                         lease_gen_key: None,
                     },
                 );
@@ -9720,6 +10699,14 @@ impl<'a> BodyChecker<'a> {
                         ));
                     }
                 }
+                let init_lease_state = if pty.is_linear_lease() {
+                    Some(LinearLeaseState::Moved {
+                        moved_at: pspan,
+                        reason: "invalid catch partial binding",
+                    })
+                } else {
+                    None
+                };
                 this.scopes.last_mut().unwrap().insert(
                     pname.clone(),
                     LocalVar {
@@ -9729,8 +10716,9 @@ impl<'a> BodyChecker<'a> {
                         prov: iv.prov.clone(),
                         field_prov: BTreeMap::new(),
                         endpoint_alias: None,
+                        field_endpoints: BTreeMap::new(),
                         is_isr_state: false,
-                        lease_state: None,
+                        lease_state: init_lease_state,
                         lease_gen_key: None,
                     },
                 );
@@ -9841,6 +10829,7 @@ impl<'a> BodyChecker<'a> {
             error_spec: ResolvedErrorSpec::None,
             prov: merged_prov,
             endpoint_name: None,
+            field_endpoints: BTreeMap::new(),
             span,
         }
     }
@@ -9875,6 +10864,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: fmt_err_spec,
                 prov: Provenance::pure_static(),
                 endpoint_name: None,
+                field_endpoints: BTreeMap::new(),
                 span,
             };
         }
@@ -9961,6 +10951,7 @@ impl<'a> BodyChecker<'a> {
             error_spec: fmt_err_spec,
             prov: ret_prov,
             endpoint_name: None,
+            field_endpoints: BTreeMap::new(),
             span,
         }
     }
@@ -10024,6 +11015,7 @@ impl<'a> BodyChecker<'a> {
                 error_spec: fmt_err_spec,
                 prov: Provenance::pure_static(),
                 endpoint_name: None,
+                field_endpoints: BTreeMap::new(),
                 span,
             };
         }
@@ -10031,11 +11023,11 @@ impl<'a> BodyChecker<'a> {
         let ring_arg = pos_args[0];
         let fmt_arg = pos_args[1];
         let rv = self.check_expr_infallible(&ring_arg.value);
-        let ring_cap = match &rv.ty {
+        let (is_byte_ring, ring_cap) = match &rv.ty {
             Ty::Ptr(inner) => match &**inner {
-                Ty::OsPrimitive(ResolvedOsPrimitive::ByteRing { cap }) => Some(*cap),
-                Ty::OsPrimitive(ResolvedOsPrimitive::ByteRingUnsized) => None,
-                Ty::Error => None,
+                Ty::OsPrimitive(ResolvedOsPrimitive::ByteRing { cap }) => (true, Some(*cap)),
+                Ty::OsPrimitive(ResolvedOsPrimitive::ByteRingUnsized) => (true, None),
+                Ty::Error => (false, None),
                 _ => {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -10045,10 +11037,10 @@ impl<'a> BodyChecker<'a> {
                             rv.ty
                         ),
                     ));
-                    None
+                    (false, None)
                 }
             },
-            Ty::Error => None,
+            Ty::Error => (false, None),
             _ => {
                 let mut diag = Diagnostic::new(
                     DiagnosticKind::TypeMismatch,
@@ -10065,21 +11057,26 @@ impl<'a> BodyChecker<'a> {
                     diag = diag.with_note("pass `&ring` or a `*byte_ring` view pointer");
                 }
                 self.sema.emit(diag);
-                None
+                (false, None)
             }
         };
 
-        if let Some((prio, boost_span)) = boost_prio {
+        if is_byte_ring {
             let source_key = rv
                 .endpoint_name
                 .clone()
                 .or_else(|| root_ident_of(&ring_arg.value))
                 .unwrap_or_else(|| "<anon_endpoint>".to_string());
-            self.recorded_boosts.push(PriorityBoostSite {
-                primitive_name: source_key,
-                boost_priority: prio,
-                span: boost_span,
-            });
+            if let Some((prio, boost_span)) = boost_prio {
+                self.recorded_boosts.push(PriorityBoostSite {
+                    primitive_name: source_key.clone(),
+                    boost_priority: prio,
+                    span: boost_span,
+                });
+            }
+            self.record_byte_ring_op(ByteRingOpRole::Producer, "fmt_ring", &source_key, span);
+            let wkey = format!("{source_key}#write");
+            let _ = self.leases.invalidate(&wkey, span, "fmt_ring");
         }
 
         let min_len = if let ExprKind::FormatString(parts) = &fmt_arg.value.kind {
@@ -10122,6 +11119,7 @@ impl<'a> BodyChecker<'a> {
             error_spec: fmt_err_spec,
             prov: Provenance::pure_static(),
             endpoint_name: None,
+            field_endpoints: BTreeMap::new(),
             span,
         }
     }
@@ -10810,7 +11808,75 @@ fn extract_instantiated_from_attr(attrs: &[Attr]) -> Option<String> {
     None
 }
 
+fn ty_contains_os_prim_view(
+    ty: &Ty,
+    structs: &BTreeMap<String, StructInfo>,
+    visiting: &mut BTreeSet<String>,
+) -> bool {
+    match ty {
+        Ty::OsPrimitive(_) => true,
+        Ty::Ptr(inner) | Ty::Slice(inner) | Ty::Array { elem: inner, .. } | Ty::Lease(inner) => {
+            ty_contains_os_prim_view(inner, structs, visiting)
+        }
+        Ty::Struct(name) => {
+            if !visiting.insert(name.clone()) {
+                return false;
+            }
+            let has = structs
+                .get(name)
+                .is_some_and(|st| {
+                    st.fields
+                        .iter()
+                        .any(|f| ty_contains_os_prim_view(&f.ty, structs, visiting))
+                });
+            visiting.remove(name);
+            has
+        }
+        _ => false,
+    }
+}
+
 fn is_valid_cast(src: &Ty, dst: &Ty) -> bool {
+    if ty_contains_linear_lease(src) || ty_contains_linear_lease(dst) {
+        return false;
+    }
+    if src.contains_mmio() || dst.contains_mmio() {
+        return match (src, dst) {
+            (Ty::Ptr(a), Ty::Ptr(b)) => {
+                matches!((&**a, &**b), (Ty::MmioLayout(la), Ty::MmioLayout(lb)) if la == lb)
+            }
+            (Ty::MmioInstance { layout: la, .. }, Ty::Ptr(b)) => {
+                matches!(&**b, Ty::MmioLayout(lb) if la == lb)
+            }
+            (Ty::MmioInstance { .. }, b) => b.is_integer(),
+            _ => false,
+        };
+    }
+    if src.contains_os_primitive() || dst.contains_os_primitive() {
+        return match (src, dst) {
+            (Ty::Ptr(a), Ty::Ptr(b)) => match (&**a, &**b) {
+                (Ty::OsPrimitive(sa), Ty::OsPrimitive(sb)) => {
+                    sa == sb
+                        || matches!(
+                            (sa, sb),
+                            (
+                                ResolvedOsPrimitive::ByteRing { .. },
+                                ResolvedOsPrimitive::ByteRingUnsized
+                            )
+                        )
+                        || matches!(
+                            (sa, sb),
+                            (
+                                ResolvedOsPrimitive::Inbox { elem: ea, .. },
+                                ResolvedOsPrimitive::InboxUnsized { elem: eb }
+                            ) if ea == eb
+                        )
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+    }
     if src == dst {
         return true;
     }
@@ -10825,8 +11891,6 @@ fn is_valid_cast(src: &Ty, dst: &Ty) -> bool {
         (Ty::Ptr(_), Ty::Ptr(_)) => true,
         (Ty::Ptr(_), b) if b.is_integer() => true,
         (a, Ty::Ptr(_)) if a.is_integer() => true,
-        (Ty::MmioInstance { .. }, Ty::Ptr(_)) => true,
-        (Ty::MmioInstance { .. }, b) if b.is_integer() => true,
         (Ty::IrqToken, b) if b.is_integer() => true,
         (Ty::Str, Ty::Ptr(inner))
             if inner.is_void() || matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>
@@ -11193,9 +12257,10 @@ impl Analyzer {
         &self,
         expr: &Expr,
         shadowed: &BTreeSet<String>,
+        prog_idx: usize,
     ) -> bool {
         let mut visiting = BTreeSet::new();
-        self.is_const_expr_inner(expr, &mut visiting, shadowed)
+        self.is_const_expr_inner(expr, &mut visiting, shadowed, prog_idx)
     }
 
     fn is_const_expr_inner(
@@ -11203,6 +12268,7 @@ impl Analyzer {
         expr: &Expr,
         visiting: &mut BTreeSet<String>,
         shadowed: &BTreeSet<String>,
+        prog_idx: usize,
     ) -> bool {
         match &expr.kind {
             ExprKind::Literal(_) | ExprKind::Priority(_) => true,
@@ -11211,18 +12277,21 @@ impl Analyzer {
                     return false;
                 }
                 if self.consts.contains_key(&id.name) {
-                    if let Some((raw, _)) = self.raw_const_exprs.get(&id.name) {
+                    if let Some((raw, _, const_prog)) = self.raw_const_exprs.get(&id.name) {
                         if visiting.insert(id.name.clone()) {
-                            let ok = self.is_const_expr_inner(raw, visiting, &BTreeSet::new());
+                            let ok = self.is_const_expr_inner(
+                                raw,
+                                visiting,
+                                &BTreeSet::new(),
+                                *const_prog,
+                            );
                             visiting.remove(&id.name);
                             return ok;
                         }
                     }
                     true
                 } else {
-                    self.variant_to_enums
-                        .get(&id.name)
-                        .is_some_and(|v| v.len() == 1)
+                    self.visible_enums_for_variant(prog_idx, &id.name).len() == 1
                 }
             }
             ExprKind::Field { target, field } => {
@@ -11240,23 +12309,23 @@ impl Analyzer {
             }
             ExprKind::Unary { op, expr: inner } => match op {
                 UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot => {
-                    self.is_const_expr_inner(inner, visiting, shadowed)
+                    self.is_const_expr_inner(inner, visiting, shadowed, prog_idx)
                 }
                 UnaryOp::AddrOf | UnaryOp::Deref => false,
             },
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.is_const_expr_inner(lhs, visiting, shadowed)
-                    && self.is_const_expr_inner(rhs, visiting, shadowed)
+                self.is_const_expr_inner(lhs, visiting, shadowed, prog_idx)
+                    && self.is_const_expr_inner(rhs, visiting, shadowed, prog_idx)
             }
             ExprKind::Cast { expr: inner, .. } => {
-                self.is_const_expr_inner(inner, visiting, shadowed)
+                self.is_const_expr_inner(inner, visiting, shadowed, prog_idx)
             }
             ExprKind::ArrayLit(elems) => elems
                 .iter()
-                .all(|e| self.is_const_expr_inner(e, visiting, shadowed)),
+                .all(|e| self.is_const_expr_inner(e, visiting, shadowed, prog_idx)),
             ExprKind::StructLit { fields, .. } => fields
                 .iter()
-                .all(|f| self.is_const_expr_inner(&f.value, visiting, shadowed)),
+                .all(|f| self.is_const_expr_inner(&f.value, visiting, shadowed, prog_idx)),
             _ => false,
         }
     }
@@ -11279,7 +12348,7 @@ impl Analyzer {
                 let res = self
                     .raw_const_exprs
                     .get(&id.name)
-                    .and_then(|(raw, _)| {
+                    .and_then(|(raw, _, _)| {
                         self.eval_const_bool_shadowed(raw, visiting, &BTreeSet::new())
                     });
                 visiting.remove(&id.name);
@@ -11331,6 +12400,7 @@ impl Analyzer {
         expr: &Expr,
         ty: &Ty,
         shadowed: &BTreeSet<String>,
+        prog_idx: usize,
     ) -> Option<IrqBindingArg> {
         if ty.is_bool() {
             let mut visiting = BTreeSet::new();
@@ -11353,7 +12423,7 @@ impl Analyzer {
                 });
             }
         }
-        if self.is_compile_time_const_expr_with_shadowed(expr, shadowed) {
+        if self.is_compile_time_const_expr_with_shadowed(expr, shadowed, prog_idx) {
             return Some(IrqBindingArg::ConstExpr {
                 ty: ty.clone(),
                 expr: expr.clone(),
@@ -11384,6 +12454,7 @@ impl<'a> BodyChecker<'a> {
                     error_spec: ResolvedErrorSpec::None,
                     prov,
                     endpoint_name: None,
+                    field_endpoints: BTreeMap::new(),
                     span,
                 }
             }
@@ -11646,13 +12717,23 @@ impl<'a> BodyChecker<'a> {
                 }
                 let shadowed = self.active_local_names();
                 self.sema
-                    .eval_compile_time_irq_arg_with_shadowed(expr, &val.ty, &shadowed)
+                    .eval_compile_time_irq_arg_with_shadowed(
+                        expr,
+                        &val.ty,
+                        &shadowed,
+                        self.prog_idx,
+                    )
                     .map(BootAttachArgSpec::Static)
             }
             _ => {
                 let shadowed = self.active_local_names();
                 self.sema
-                    .eval_compile_time_irq_arg_with_shadowed(expr, &val.ty, &shadowed)
+                    .eval_compile_time_irq_arg_with_shadowed(
+                        expr,
+                        &val.ty,
+                        &shadowed,
+                        self.prog_idx,
+                    )
                     .map(BootAttachArgSpec::Static)
             }
         }
@@ -11933,6 +13014,9 @@ impl<'a> BodyChecker<'a> {
             }
         }
 
+        if self.caller_key == "main" {
+            self.has_attached_irq = true;
+        }
         ExprVal::scalar(Ty::void(), span)
     }
 }

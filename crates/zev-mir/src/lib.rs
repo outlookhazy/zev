@@ -16,9 +16,9 @@ pub mod ram;
 pub use ir::*;
 pub use lower::{lower_program, lower_programs, MirLowerError};
 pub use ram::{
-    compute_ram_report, populate_module_ram_report, ArchRamTotals, ChildSlotRamInfo,
-    DualSpecializedFnRam, FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign, SpawnedTaskRam,
-    TargetAbi, VarRamInfo,
+    collect_dma_layout_structs, compute_ram_report, populate_module_ram_report, ArchRamTotals,
+    ChildSlotRamInfo, DualSpecializedFnRam, FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign,
+    SpawnedTaskRam, TargetAbi, VarRamInfo,
 };
 pub use zev_ast::{decoded_string_byte_len, decoded_string_bytes};
 
@@ -4082,5 +4082,594 @@ mod tests {
         }
         assert!(saw_alloc && saw_get && saw_park && saw_take && saw_release);
         assert!(nullify_count >= 3, "expected nullify on moves into call, park, release: {nullify_count}");
+    }
+
+    #[test]
+    fn b_m3_pool_contended_via_dma_slot_release_disables_irq_elision() {
+        let sp = Span::dummy();
+        let ty_u16 = || ty_prim(PrimType::U16);
+        let ty_u32 = || ty_prim(PrimType::U32);
+        let prog = Program::new(
+            vec![
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                        attrs: vec![],
+                        ty: OsPrimitiveType::Pool {
+                            elem: Box::new(ty_u32()),
+                            cap: 2,
+                        },
+                        name: id("dma_pool"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                        attrs: vec![],
+                        ty: OsPrimitiveType::Pool {
+                            elem: Box::new(ty_u16()),
+                            cap: 2,
+                        },
+                        name: id("task_pool"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                        attrs: vec![],
+                        ty: OsPrimitiveType::DmaSlot {
+                            elem: Box::new(ty_u32()),
+                        },
+                        name: id("tx_slot"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Irq(IrqDecl {
+                        name: id("IRQ_DMA"),
+                        number: expr_int(2),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Isr(IsrDecl {
+                        attrs: vec![],
+                        vector: id("dma_done_isr"),
+                        params: vec![Param {
+                            ty: TypeExpr::new(
+                                TypeKind::Ptr(Box::new(TypeExpr::new(
+                                    TypeKind::OsPrimitive(OsPrimitiveType::DmaSlot {
+                                        elem: Box::new(ty_u32()),
+                                    }),
+                                    sp,
+                                ))),
+                                sp,
+                            ),
+                            name: id("slot"),
+                            span: sp,
+                        }],
+                        body: Block::new(
+                            vec![Stmt::new(
+                                StmtKind::Expr(Expr::new(
+                                    ExprKind::MethodCall {
+                                        receiver: Box::new(expr_id("slot")),
+                                        method: id("release"),
+                                        args: vec![],
+                                    },
+                                    sp,
+                                )),
+                                sp,
+                            )],
+                            sp,
+                        ),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Task(TaskDecl {
+                        attrs: vec![],
+                        name: id("worker"),
+                        params: vec![],
+                        body: Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: TypeExpr::new(TypeKind::Lease(Box::new(ty_u32())), sp),
+                                        name: id("l"),
+                                        init: Some(Expr::new(
+                                            ExprKind::MethodCall {
+                                                receiver: Box::new(expr_id("dma_pool")),
+                                                method: id("alloc"),
+                                                args: vec![],
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Expr(Expr::new(
+                                        ExprKind::MethodCall {
+                                            receiver: Box::new(expr_id("tx_slot")),
+                                            method: id("park"),
+                                            args: vec![CallArg::positional(expr_id("l"))],
+                                        },
+                                        sp,
+                                    )),
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: TypeExpr::new(TypeKind::Lease(Box::new(ty_u16())), sp),
+                                        name: id("tl"),
+                                        init: Some(Expr::new(
+                                            ExprKind::MethodCall {
+                                                receiver: Box::new(expr_id("task_pool")),
+                                                method: id("alloc"),
+                                                args: vec![],
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Expr(Expr::new(
+                                        ExprKind::MethodCall {
+                                            receiver: Box::new(expr_id("tl")),
+                                            method: id("release"),
+                                            args: vec![],
+                                        },
+                                        sp,
+                                    )),
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        ),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        is_extern_c: false,
+                        generic_params: vec![],
+                        name: id("main"),
+                        params: vec![],
+                        is_variadic: false,
+                        ret_type: ty_prim(PrimType::Void),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::Expr(Expr::new(
+                                        ExprKind::MethodCall {
+                                            receiver: Box::new(expr_id("IRQ_DMA")),
+                                            method: id("attach"),
+                                            args: vec![CallArg::positional(Expr::new(
+                                                ExprKind::Call {
+                                                    generic_args: vec![],
+                                                    callee: Box::new(expr_id("dma_done_isr")),
+                                                    args: vec![CallArg::positional(Expr::new(
+                                                        ExprKind::Unary {
+                                                            op: UnaryOp::AddrOf,
+                                                            expr: Box::new(expr_id("tx_slot")),
+                                                        },
+                                                        sp,
+                                                    ))],
+                                                },
+                                                sp,
+                                            ))],
+                                        },
+                                        sp,
+                                    )),
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Spawn(SpawnStmt {
+                                        module: None,
+                                        task: id("worker"),
+                                        args: vec![],
+                                        priority: Some(Priority::Normal),
+                                        core: None,
+                                        span: sp,
+                                    }),
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+            ],
+            sp,
+        );
+
+        let mir = lower_program(&prog).expect("lower B-M3");
+        let dma_prim = mir.primitives.iter().find(|p| p.name == "dma_pool").unwrap();
+        let task_prim = mir.primitives.iter().find(|p| p.name == "task_pool").unwrap();
+        assert!(
+            !dma_prim.irq_mask_elided,
+            "dma_pool contended via dma_slot.release must NOT mark irq_mask_elided"
+        );
+        assert!(
+            task_prim.irq_mask_elided,
+            "task_pool not touched by ISR must mark irq_mask_elided"
+        );
+        let dma_ram = mir
+            .ram_report
+            .primitives
+            .iter()
+            .find(|p| p.name == "dma_pool")
+            .unwrap();
+        assert!(!dma_ram.irq_mask_elided);
+    }
+
+    #[test]
+    fn b_h3_l_h1_and_b_h2_lowering_regressions() {
+        let sp = Span::dummy();
+        let ty_u8 = || ty_prim(PrimType::U8);
+        let ty_u32 = || ty_prim(PrimType::U32);
+        let ty_i32 = || ty_prim(PrimType::I32);
+        let ty_usize = || ty_prim(PrimType::Usize);
+        let dma_attr = Attr {
+            kind: AttrKind::DmaSafe,
+            span: sp,
+        };
+        let prog = Program::new(
+            vec![
+                // struct Inner { pool<u8, 2> np; }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Struct(StructDecl {
+                        is_packed: false,
+                        generic_params: vec![],
+                        name: id("Inner"),
+                        fields: vec![StructField {
+                            attrs: vec![],
+                            ty: TypeExpr::new(
+                                TypeKind::OsPrimitive(OsPrimitiveType::Pool {
+                                    elem: Box::new(ty_u8()),
+                                    cap: 2,
+                                }),
+                                sp,
+                            ),
+                            name: id("np"),
+                            span: sp,
+                        }],
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // struct Outer { Inner inner; pool<u8, 2> op; }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Struct(StructDecl {
+                        is_packed: false,
+                        generic_params: vec![],
+                        name: id("Outer"),
+                        fields: vec![
+                            StructField {
+                                attrs: vec![],
+                                ty: ty_named("Inner"),
+                                name: id("inner"),
+                                span: sp,
+                            },
+                            StructField {
+                                attrs: vec![],
+                                ty: TypeExpr::new(
+                                    TypeKind::OsPrimitive(OsPrimitiveType::Pool {
+                                        elem: Box::new(ty_u8()),
+                                        cap: 2,
+                                    }),
+                                    sp,
+                                ),
+                                name: id("op"),
+                                span: sp,
+                            },
+                        ],
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // @dma_safe Outer d_outer;
+                Item {
+                    attrs: vec![dma_attr],
+                    is_pub: false,
+                    kind: ItemKind::GlobalVar(GlobalVarDecl {
+                        ty: ty_named("Outer"),
+                        name: id("d_outer"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // Outer p_outer;
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::GlobalVar(GlobalVarDecl {
+                        ty: ty_named("Outer"),
+                        name: id("p_outer"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // byte_ring<16> rx;
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                        attrs: vec![],
+                        ty: OsPrimitiveType::ByteRing { cap: 16 },
+                        name: id("rx"),
+                        init: None,
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // fn wait_bytes() -> usize { []u8 ch = rx.wait_read(); return ch.len; }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        is_extern_c: false,
+                        generic_params: vec![],
+                        name: id("wait_bytes"),
+                        params: vec![],
+                        is_variadic: false,
+                        ret_type: ty_usize(),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: TypeExpr::new(
+                                            TypeKind::Slice(Box::new(ty_u8())),
+                                            sp,
+                                        ),
+                                        name: id("ch"),
+                                        init: Some(Expr::new(
+                                            ExprKind::MethodCall {
+                                                receiver: Box::new(expr_id("rx")),
+                                                method: id("wait_read"),
+                                                args: vec![],
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Return(Some(Expr::new(
+                                        ExprKind::Field {
+                                            target: Box::new(expr_id("ch")),
+                                            field: id("len"),
+                                        },
+                                        sp,
+                                    ))),
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // task helper_user() {
+                //   usize got = wait_bytes();
+                //   u32 raw = 0x80000000 as u32;
+                //   i32 sh = 4 as i32;
+                //   u32 shifted = raw >> sh;
+                // }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Task(TaskDecl {
+                        attrs: vec![],
+                        name: id("helper_user"),
+                        params: vec![],
+                        body: Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_usize(),
+                                        name: id("got"),
+                                        init: Some(Expr::new(
+                                            ExprKind::Call {
+                                                generic_args: vec![],
+                                                callee: Box::new(expr_id("wait_bytes")),
+                                                args: vec![],
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_u32(),
+                                        name: id("raw"),
+                                        init: Some(Expr::new(
+                                            ExprKind::Cast {
+                                                expr: Box::new(expr_int(0x8000_0000)),
+                                                ty: ty_u32(),
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_i32(),
+                                        name: id("sh"),
+                                        init: Some(Expr::new(
+                                            ExprKind::Cast {
+                                                expr: Box::new(expr_int(4)),
+                                                ty: ty_i32(),
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: ty_u32(),
+                                        name: id("shifted"),
+                                        init: Some(Expr::new(
+                                            ExprKind::Binary {
+                                                op: BinaryOp::Shr,
+                                                lhs: Box::new(expr_id("raw")),
+                                                rhs: Box::new(expr_id("sh")),
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        ),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                // fn main() { spawn helper_user(); []u8 tail_ch = rx.wait_read(); }
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        is_extern_c: false,
+                        generic_params: vec![],
+                        name: id("main"),
+                        params: vec![],
+                        is_variadic: false,
+                        ret_type: ty_prim(PrimType::Void),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::Spawn(SpawnStmt {
+                                        module: None,
+                                        task: id("helper_user"),
+                                        args: vec![],
+                                        priority: Some(Priority::Normal),
+                                        core: None,
+                                        span: sp,
+                                    }),
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: TypeExpr::new(
+                                            TypeKind::Slice(Box::new(ty_u8())),
+                                            sp,
+                                        ),
+                                        name: id("tail_ch"),
+                                        init: Some(Expr::new(
+                                            ExprKind::MethodCall {
+                                                receiver: Box::new(expr_id("rx")),
+                                                method: id("wait_read"),
+                                                args: vec![],
+                                            },
+                                            sp,
+                                        )),
+                                    },
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+            ],
+            sp,
+        );
+
+        let mir = lower_program(&prog).expect("lower B-H3/L-H1/B-H2");
+
+        let wb = mir.functions.iter().find(|f| f.name == "wait_bytes").unwrap();
+        assert!(wb.is_yielding);
+        assert!(mir.task_blueprints.iter().any(|b| b.is_main_supervisor));
+
+        let dma_structs = collect_dma_layout_structs(&mir);
+        assert!(dma_structs.contains("Outer"));
+        assert!(dma_structs.contains("Inner"));
+        let d_ram = mir
+            .ram_report
+            .primitives
+            .iter()
+            .find(|p| p.name == "d_outer")
+            .unwrap();
+        let p_ram = mir
+            .ram_report
+            .primitives
+            .iter()
+            .find(|p| p.name == "p_outer")
+            .unwrap();
+        assert!(d_ram.holds_sleep_lock);
+        assert!(!p_ram.holds_sleep_lock);
+        assert_eq!(d_ram.bytes_32, p_ram.bytes_32);
+        // Two DMA pools of `u8 x 2`: each is 32B hdr + 2*32B slots = 96B; total = 192B!
+        assert_eq!(d_ram.bytes_32, 192);
+
+        let hu = mir
+            .task_blueprints
+            .iter()
+            .find(|b| b.name == "helper_user")
+            .unwrap();
+        let mut saw_unsigned_shr = false;
+        for blk in &hu.blocks {
+            for st in &blk.stmts {
+                if let MirStmt::Assign { value, .. } = st {
+                    if let MirExprKind::Binary {
+                        op: MirBinOp::Shr,
+                        lhs,
+                        ..
+                    } = &value.kind
+                    {
+                        assert_eq!(lhs.ty, MirType::U32, "Shr lhs must stay U32: {value:?}");
+                        assert_eq!(value.ty, MirType::U32);
+                        saw_unsigned_shr = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_unsigned_shr);
     }
 }

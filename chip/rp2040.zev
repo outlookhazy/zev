@@ -1,0 +1,181 @@
+// Raspberry Pi RP2040 (Dual Cortex-M0+) Typed MMIO Register Map & NVIC Interrupts
+// Register addresses per Raspberry Pi RP2040 Datasheet / pico-sdk hardware_regs.
+
+pub mmio SysinfoRegs {
+    @ro u32 chip_id       @ 0x00;
+    @ro u32 platform      @ 0x04;
+    @ro u32 gitref_rp2040 @ 0x40;
+}
+
+pub mmio ClocksRegs {
+    @rw u32 clk_ref_ctrl       @ 0x30;
+    @rw u32 clk_ref_div        @ 0x34;
+    @ro u32 clk_ref_selected   @ 0x38;
+    @rw u32 clk_sys_ctrl       @ 0x3C;
+    @rw u32 clk_sys_div        @ 0x40;
+    @ro u32 clk_sys_selected   @ 0x44;
+    @rw u32 clk_peri_ctrl      @ 0x48;
+    @rw u32 clk_usb_ctrl       @ 0x54;
+    @rw u32 clk_usb_div        @ 0x58;
+    @rw u32 clk_adc_ctrl       @ 0x60;
+    @rw u32 clk_adc_div        @ 0x64;
+    @rw u32 clk_sys_resus_ctrl @ 0x78;
+}
+
+pub mmio ResetsRegs {
+    @rw u32 reset      @ 0x00;
+    @rw u32 wdsel      @ 0x04;
+    @ro u32 reset_done @ 0x08;
+}
+
+pub mmio XoscRegs {
+    @rw u32 ctrl    @ 0x00;
+    @ro u32 status  @ 0x04;
+    @rw u32 startup @ 0x0C;
+}
+
+pub mmio PllRegs {
+    @rw u32 cs        @ 0x00;
+    @rw u32 pwr       @ 0x04;
+    @rw u32 fbdiv_int @ 0x08;
+    @rw u32 prim      @ 0x0C;
+}
+
+pub mmio AdcRegs {
+    @rw u32 cs     @ 0x00;
+    @ro u32 result @ 0x04;
+    @rw u32 fcs    @ 0x08;
+    @ro u32 fifo   @ 0x0C;
+    @rw u32 div    @ 0x10;
+    @ro u32 intr   @ 0x14;
+    @rw u32 inte   @ 0x18;
+    @rw u32 intf   @ 0x1C;
+    @ro u32 ints   @ 0x20;
+}
+
+pub mmio TimerRegs {
+    @wo  u32    timehw   @ 0x00;
+    @wo  u32    timelw   @ 0x04;
+    @ro  u32    timehr   @ 0x08;
+    @ro  u32    timelr   @ 0x0C;
+    @rw  [4]u32 alarm    @ 0x10;
+    @rw  u32    armed    @ 0x20;
+    @ro  u32    timerawh @ 0x24;
+    @ro  u32    timerawl @ 0x28;
+    @w1c u32    intr     @ 0x34;
+    @rw  u32    inte     @ 0x38;
+    @rw  u32    intf     @ 0x3C;
+    @ro  u32    ints     @ 0x40;
+}
+
+pub mmio WatchdogRegs {
+    @rw u32 ctrl @ 0x00;
+    @rw u32 tick @ 0x2C;
+}
+
+pub mmio DmaRegs {
+    @rw  u32 ch0_read_addr   @ 0x00;
+    @rw  u32 ch0_write_addr  @ 0x04;
+    @rw  u32 ch0_trans_count @ 0x08;
+    @rw  u32 ch0_ctrl_trig   @ 0x0C;
+    @rw  u32 ch1_read_addr   @ 0x40;
+    @rw  u32 ch1_write_addr  @ 0x44;
+    @rw  u32 ch1_trans_count @ 0x48;
+    @rw  u32 ch1_ctrl_trig   @ 0x4C;
+    @w1c u32 intr            @ 0x400;
+    @rw  u32 inte0           @ 0x404;
+    @rw  u32 intf0           @ 0x408;
+    @w1c u32 ints0           @ 0x40C;
+}
+
+pub mmio UsbDpramRegs {
+    @rw [8]u8   setup_packet @ 0x000;
+    @rw [15]u32 ep_ctrl      @ 0x008;
+    @rw [16]u32 ep_buf_ctrl  @ 0x080;
+    @rw [64]u8  ep0_buf      @ 0x100;
+    @rw [64]u8  ep1_out_buf  @ 0x180;
+    @rw [64]u8  ep2_in_buf   @ 0x1C0;
+    @rw [64]u8  ep3_in_buf   @ 0x200;
+}
+
+pub mmio UsbCtrlRegs {
+    @rw u32 addr_endp    @ 0x00;
+    @rw u32 main_ctrl    @ 0x40;
+    @rw u32 sie_ctrl     @ 0x4C;
+    @rw u32 sie_status   @ 0x50;
+    @rw u32 buff_status  @ 0x58;
+    @rw u32 ep_stall_arm @ 0x68;
+    @rw u32 usb_muxing   @ 0x74;
+    @rw u32 usb_pwr      @ 0x78;
+    @rw u32 inte         @ 0x90;
+    @ro u32 ints         @ 0x98;
+}
+
+pub mmio PioRegs {
+    @rw  u32     ctrl          @ 0x00;
+    @ro  u32     fstat         @ 0x04;
+    @w1c u32     fdebug        @ 0x08;
+    @ro  u32     flevel        @ 0x0C;
+    @wo  [4]u32  txf           @ 0x10;
+    @ro  [4]u32  rxf           @ 0x20;
+    @wo  [32]u32 instr_mem     @ 0x48;
+    @rw  u32     sm0_clkdiv    @ 0xC8;
+    @rw  u32     sm0_execctrl  @ 0xCC;
+    @rw  u32     sm0_shiftctrl @ 0xD0;
+    @ro  u32     sm0_addr      @ 0xD4;
+    @rw  u32     sm0_instr     @ 0xD8;
+    @rw  u32     sm0_pinctrl   @ 0xDC;
+}
+
+pub mmio SioRegs {
+    @ro  u32 cpuid        @ 0x00;
+    @ro  u32 gpio_in      @ 0x04;
+    @rw  u32 gpio_out     @ 0x10;
+    @wo  u32 gpio_out_set @ 0x14;
+    @wo  u32 gpio_out_clr @ 0x18;
+    @wo  u32 gpio_out_xor @ 0x1C;
+}
+
+pub mmio PpbRegs {
+    @wo u32 nvic_ispr @ 0x200;
+}
+
+pub mmio SYSINFO     : SysinfoRegs  @ 0x4000_0000;
+pub mmio CLOCKS      : ClocksRegs   @ 0x4000_8000;
+pub mmio RESETS      : ResetsRegs   @ 0x4000_C000;
+pub mmio RESETS_SET  : ResetsRegs   @ 0x4000_E000;
+pub mmio RESETS_CLR  : ResetsRegs   @ 0x4000_F000;
+pub mmio XOSC        : XoscRegs     @ 0x4002_4000;
+pub mmio PLL_SYS     : PllRegs      @ 0x4002_8000;
+pub mmio PLL_SYS_CLR : PllRegs      @ 0x4002_B000;
+pub mmio PLL_USB     : PllRegs      @ 0x4002_C000;
+pub mmio PLL_USB_CLR : PllRegs      @ 0x4002_F000;
+pub mmio ADC         : AdcRegs      @ 0x4004_C000;
+pub mmio TIMER       : TimerRegs    @ 0x4005_4000;
+pub mmio WATCHDOG    : WatchdogRegs @ 0x4005_8000;
+pub mmio DMA         : DmaRegs      @ 0x5000_0000;
+pub mmio USB_DPRAM   : UsbDpramRegs @ 0x5010_0000;
+pub mmio USBCTRL     : UsbCtrlRegs  @ 0x5011_0000;
+pub mmio USBCTRL_SET : UsbCtrlRegs  @ 0x5011_2000;
+pub mmio USBCTRL_CLR : UsbCtrlRegs  @ 0x5011_3000;
+pub mmio PIO0        : PioRegs      @ 0x5020_0000;
+pub mmio SIO         : SioRegs      @ 0xD000_0000;
+pub mmio PPB         : PpbRegs      @ 0xE000_E000;
+
+// RP2040 Cortex-M0+ NVIC IRQ indices (hardware/regs/intctrl.h)
+pub irq IRQ_TIMER_0  = 0;
+pub irq IRQ_TIMER_1  = 1;
+pub irq IRQ_USBCTRL  = 5;
+pub irq IRQ_PIO0_0   = 7;
+pub irq IRQ_DMA_0    = 11;
+pub irq IRQ_DMA_1    = 12;
+pub irq IRQ_IO_BANK0 = 13;
+pub irq IRQ_SPI0     = 18;
+pub irq IRQ_UART0    = 20;
+pub irq IRQ_ADC_FIFO = 22;
+pub irq IRQ_I2C0     = 23;
+
+pub const u32 PIO0_TXF0_ADDR = 0x5020_0010;
+pub const u32 PIO0_RXF0_ADDR = 0x5020_0020;
+pub const u32 DREQ_PIO0_TX0  = 0;
+pub const u32 DREQ_PIO0_RX0  = 4;

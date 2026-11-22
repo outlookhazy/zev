@@ -70,7 +70,14 @@ pub fn monomorphize_programs(programs: &[Program]) -> Result<Vec<Program>, Vec<D
 pub fn monomorphize_named_programs<'a>(
     programs: &[(&'a Program, Option<&'a str>)],
 ) -> MonomorphizeOutput {
-    Monomorphizer::new(programs).run()
+    monomorphize_named_programs_with_non_root_count(programs, 0)
+}
+
+pub(crate) fn monomorphize_named_programs_with_non_root_count<'a>(
+    programs: &[(&'a Program, Option<&'a str>)],
+    non_root_prog_count: usize,
+) -> MonomorphizeOutput {
+    Monomorphizer::new(programs, non_root_prog_count).run()
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +99,7 @@ struct SubstEnv {
     types: BTreeMap<String, TypeExpr>,
     consts: BTreeMap<String, usize>,
     depth: usize,
+    prog_idx: usize,
     file: Option<String>,
 }
 
@@ -129,7 +137,9 @@ struct Monomorphizer<'a> {
     const_types: BTreeMap<String, TypeExpr>,
     known_structs: BTreeMap<String, StructDecl>,
     known_enums: BTreeMap<String, Vec<String>>,
+    enum_prog_idx: BTreeMap<String, Option<usize>>,
     variant_to_enums: BTreeMap<String, Vec<String>>,
+    non_root_prog_count: usize,
     prim_types: BTreeMap<String, OsPrimitiveType>,
     mmio_layouts: BTreeMap<String, BTreeMap<String, TypeExpr>>,
     mmio_instances: BTreeMap<String, TypeExpr>,
@@ -152,10 +162,12 @@ struct Monomorphizer<'a> {
 }
 
 impl<'a> Monomorphizer<'a> {
-    fn new(inputs: &'a [(&'a Program, Option<&'a str>)]) -> Self {
+    fn new(inputs: &'a [(&'a Program, Option<&'a str>)], non_root_prog_count: usize) -> Self {
         let n = inputs.len().max(1);
         let mut known_enums = BTreeMap::new();
         known_enums.insert("FmtErr".to_string(), vec!["Truncated".to_string()]);
+        let mut enum_prog_idx = BTreeMap::new();
+        enum_prog_idx.insert("FmtErr".to_string(), None);
         Self {
             inputs,
             raw_consts: BTreeMap::new(),
@@ -163,7 +175,9 @@ impl<'a> Monomorphizer<'a> {
             const_types: BTreeMap::new(),
             known_structs: BTreeMap::new(),
             known_enums,
+            enum_prog_idx,
             variant_to_enums: BTreeMap::new(),
+            non_root_prog_count,
             prim_types: BTreeMap::new(),
             mmio_layouts: BTreeMap::new(),
             mmio_instances: BTreeMap::new(),
@@ -205,6 +219,12 @@ impl<'a> Monomorphizer<'a> {
                         self.const_types.insert(c.name.name.clone(), c.ty.clone());
                     }
                     ItemKind::Enum(en) => {
+                        let scope_idx = if prog_idx < self.non_root_prog_count {
+                            Some(prog_idx)
+                        } else {
+                            None
+                        };
+                        self.enum_prog_idx.insert(en.name.name.clone(), scope_idx);
                         let mut vars = Vec::new();
                         for v in &en.variants {
                             vars.push(v.name.name.clone());
@@ -366,6 +386,7 @@ impl<'a> Monomorphizer<'a> {
                 types: BTreeMap::new(),
                 consts: BTreeMap::new(),
                 depth: 0,
+                prog_idx,
                 file: file_opt.map(str::to_string),
             };
             for (item_idx, item) in prog.items.iter().enumerate() {
@@ -417,6 +438,7 @@ impl<'a> Monomorphizer<'a> {
                 types: BTreeMap::new(),
                 consts: BTreeMap::new(),
                 depth: 0,
+                prog_idx,
                 file: file_opt.map(str::to_string),
             };
             let mut out_items = Vec::new();
@@ -1465,6 +1487,7 @@ impl<'a> Monomorphizer<'a> {
             types: BTreeMap::new(),
             consts: BTreeMap::new(),
             depth: caller_env.depth + 1,
+            prog_idx: tmpl.prog_idx,
             file: tmpl.file.clone(),
         };
         for (gp, ga) in tmpl.decl.generic_params.iter().zip(resolved_args.iter()) {
@@ -1572,6 +1595,7 @@ impl<'a> Monomorphizer<'a> {
             types: BTreeMap::new(),
             consts: BTreeMap::new(),
             depth: caller_env.depth + 1,
+            prog_idx: tmpl.prog_idx,
             file: tmpl.file.clone(),
         };
         for (gp, ga) in tmpl.decl.generic_params.iter().zip(resolved_args.iter()) {
@@ -1925,9 +1949,16 @@ impl<'a> Monomorphizer<'a> {
             return InferTy::Concrete(mmio_ptr_ty.clone());
         }
         if let Some(enums) = self.variant_to_enums.get(name) {
-            if enums.len() == 1 {
+            let visible: Vec<&String> = enums
+                .iter()
+                .filter(|en| match self.enum_prog_idx.get(*en).copied().flatten() {
+                    Some(decl_idx) => decl_idx == env.prog_idx,
+                    None => env.prog_idx >= self.non_root_prog_count,
+                })
+                .collect();
+            if visible.len() == 1 {
                 return InferTy::Concrete(TypeExpr::new(
-                    TypeKind::Named(Ident::dummy(enums[0].clone())),
+                    TypeKind::Named(Ident::dummy(visible[0].clone())),
                     Span::dummy(),
                 ));
             }

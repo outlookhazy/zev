@@ -98,10 +98,14 @@ struct ModuleCtx<'a> {
     distinct_inbox_views: BTreeMap<String, MirType>,
     uses_byte_ring_view: bool,
     uses_pool_lease: bool,
+    dma_layout_structs: BTreeSet<String>,
+    vis: zev_mir::opt::VisibilityReport,
     rt_features: RuntimeIrFeatures,
     avr_mega0_putc: AvrMega0PutcMode,
     strings: Vec<String>,
     string_dedup: HashMap<String, usize>,
+    const_blobs: Vec<String>,
+    const_blob_dedup: HashMap<String, usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +135,16 @@ struct ExternLlvmSig {
     variadic: bool,
 }
 
+impl<'a> ModuleCtx<'a> {
+    const fn fn_as(&self) -> &'static str {
+        self.opts.target.fn_addrspace_attr()
+    }
+
+    const fn call_kw(&self) -> &'static str {
+        self.opts.target.call_kw()
+    }
+}
+
 const fn align_up(offset: usize, align: usize) -> usize {
     if align <= 1 {
         offset
@@ -145,6 +159,9 @@ pub fn emit_llvm_ir_with_options(
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
     let nvic = NvicMap::from_irq_vectors(&module.irq_vectors);
+    if opts.target == TargetArch::Thumbv6mRp2040 {
+        crate::rp2040::validate_rp2040_irq_vectors(&module.irq_vectors)?;
+    }
     let esp32c6_irq_routes = if opts.target == TargetArch::Riscv32Esp32C6 {
         assign_esp32c6_irq_routes(&module.irq_vectors)?
     } else {
@@ -183,26 +200,42 @@ pub fn emit_llvm_ir_with_options(
         distinct_inbox_views: BTreeMap::new(),
         uses_byte_ring_view: false,
         uses_pool_lease: false,
+        dma_layout_structs: zev_mir::collect_dma_layout_structs(module),
+        vis: zev_mir::opt::VisibilityReport::effective_for(module),
         rt_features,
         avr_mega0_putc: AvrMega0PutcMode::Noop,
         strings: Vec::new(),
         string_dedup: HashMap::new(),
+        const_blobs: Vec::new(),
+        const_blob_dedup: HashMap::new(),
     };
 
     ctx.prepare()?;
-    if opts.target == TargetArch::AvrAtmega4809 {
+    ctx.rt_features.console_putc_sym = ctx.find_console_putc_symbol();
+    ctx.rt_features.now_ms_sym = ctx.find_sys_now_ms_symbol();
+    if opts.target.is_avr() {
         ctx.avr_mega0_putc = ctx.resolve_avr_mega0_putc();
     }
 
     let mut out = String::with_capacity(64 * 1024);
 
     // 1. Target header + cooperative OS kernel & HAL (emitting soft-float & fmt helpers on demand)
-    emit_kernel_runtime_ir_with_features(&mut out, module.spawned_tasks.len(), opts, rt_features);
+    emit_kernel_runtime_ir_with_features(&mut out, module.spawned_tasks.len(), opts, &ctx.rt_features);
 
-    // 2. Cortex-M3 vector table, ESP32-C6 Direct-Boot entry, or host `main` entry wrapper
+    // 2. Cortex-M vector table, ESP32-C6 Direct-Boot entry, AVR vector tables, or host `main` entry wrapper
     match opts.target {
         TargetArch::Thumbv7mNoneEabi => {
             emit_cortex_m_startup_ir(&mut out, opts.initial_sp(), &ctx.nvic);
+            emit_cm_irq_dispatch_ir(&mut out, &ctx);
+        }
+        TargetArch::Thumbv6mRp2040 => {
+            crate::rp2040::emit_rp2040_startup_ir(
+                &mut out,
+                opts.initial_sp(),
+                opts.fn_size_attrs(),
+                &ctx.nvic,
+            );
+            emit_cm_irq_dispatch_ir(&mut out, &ctx);
         }
         TargetArch::Riscv32Esp32C6 => {
             crate::esp32c6::emit_esp32c6_startup_ir(
@@ -220,6 +253,7 @@ pub fn emit_llvm_ir_with_options(
                 opts.fn_size_attrs(),
                 &ctx.avr_irq_vectors,
             );
+            ctx.emit_avr_mega0_uart_putc_ir(&mut out);
             emit_avr_irq_dispatch_ir(&mut out, &ctx);
         }
         TargetArch::AvrAtmega4809 => {
@@ -277,10 +311,6 @@ pub fn emit_llvm_ir_with_options(
     // 12. Pooled string literal constants (`@.str.<k>`)
     ctx.emit_string_constants_ir(&mut out);
 
-    if opts.target.is_avr() {
-        return Ok(crate::avr::apply_avr_program_addrspace(&out));
-    }
-
     Ok(out)
 }
 
@@ -290,8 +320,10 @@ fn emit_sw_irq_dispatch_ir(
     comment: &str,
     ctx: &ModuleCtx<'_>,
 ) {
+    let fn_as = ctx.fn_as();
+    let call_kw = ctx.call_kw();
     let _ = writeln!(out, "{comment}");
-    let _ = writeln!(out, "define void {fn_name}(i32 %irq) nounwind {{");
+    let _ = writeln!(out, "define void {fn_name}(i32 %irq){fn_as} nounwind {{");
     let _ = writeln!(out, "entry:");
     let mut irqs = BTreeSet::new();
     for vec in &ctx.module.irq_vectors {
@@ -304,12 +336,21 @@ fn emit_sw_irq_dispatch_ir(
     let _ = writeln!(out, "  ]");
     for &irq in &irqs {
         let _ = writeln!(out, "irq_{irq}:");
-        let _ = writeln!(out, "  call void @__syn_vec_irq_{irq}()");
+        let _ = writeln!(out, "  {call_kw} void @__syn_vec_irq_{irq}()");
         let _ = writeln!(out, "  br label %done");
     }
     let _ = writeln!(out, "done:");
     let _ = writeln!(out, "  ret void");
     let _ = writeln!(out, "}}\n");
+}
+
+fn emit_cm_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
+    emit_sw_irq_dispatch_ir(
+        out,
+        "@__syn_cm_dispatch_irq",
+        "; ── ARM Cortex-M Software/Boot IRQ Dispatcher ──",
+        ctx,
+    );
 }
 
 fn emit_esp32c6_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
@@ -359,6 +400,8 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
         uses_rv_irqs: false,
         uses_sys_tick: false,
         uses_set_putc: false,
+        console_putc_sym: None,
+        now_ms_sym: None,
     };
 
     fn scan_ty(ty: &MirType, feat: &mut RuntimeIrFeatures) {
@@ -1165,6 +1208,31 @@ impl<'a> ModuleCtx<'a> {
         candidates.into_iter().next().map(|(_, _, sym)| sym)
     }
 
+    fn find_sys_now_ms_symbol(&self) -> Option<String> {
+        let mut candidates: Vec<(u8, &str, String)> = Vec::new();
+        for f in &self.module.functions {
+            if (f.name == "sys_now_ms" || f.name.ends_with("__sys_now_ms"))
+                && !f.is_yielding
+                && !f.error_spec.has_error()
+                && f.ret_ty == MirType::U32
+                && f.params.is_empty()
+            {
+                if let Some(sig) = self.fn_sigs.get(&f.name) {
+                    let rank = if f.name == "sys_now_ms" {
+                        0
+                    } else if f.name.starts_with("bsp__") {
+                        1
+                    } else {
+                        2
+                    };
+                    candidates.push((rank, f.name.as_str(), sig.symbol.clone()));
+                }
+            }
+        }
+        candidates.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+        candidates.into_iter().next().map(|(_, _, sym)| sym)
+    }
+
     fn resolve_avr_mega0_putc(&self) -> AvrMega0PutcMode {
         let console_sym = self.find_console_putc_symbol();
         if !self.rt_features.uses_set_putc {
@@ -1260,22 +1328,24 @@ impl<'a> ModuleCtx<'a> {
 
     fn emit_avr_mega0_uart_putc_ir(&self, out: &mut String) {
         let fn_sz = self.opts.fn_size_attrs();
+        let fn_as = self.fn_as();
+        let call_kw = self.call_kw();
         match &self.avr_mega0_putc {
             AvrMega0PutcMode::Noop => {
                 let _ = writeln!(
                     out,
-                    "define void @__syn_uart_putc(i8 %c) nounwind noinline{fn_sz} {{\nentry:\n  ret void\n}}\n"
+                    "define void @__syn_uart_putc(i8 %c){fn_as} nounwind noinline{fn_sz} {{\nentry:\n  ret void\n}}\n"
                 );
             }
             AvrMega0PutcMode::DirectStatic { symbol, .. } => {
                 let _ = writeln!(
                     out,
-                    "define void @__syn_uart_putc(i8 %c) nounwind noinline{fn_sz} {{\nentry:\n  call void {symbol}(i8 %c)\n  ret void\n}}\n"
+                    "define void @__syn_uart_putc(i8 %c){fn_as} nounwind noinline{fn_sz} {{\nentry:\n  {call_kw} void {symbol}(i8 %c)\n  ret void\n}}\n"
                 );
             }
             AvrMega0PutcMode::DynamicGlobal { fallback_symbol } => {
                 let fb = if let Some(sym) = fallback_symbol {
-                    format!("  call void {sym}(i8 %c)\n  ret void")
+                    format!("  {call_kw} void {sym}(i8 %c)\n  ret void")
                 } else {
                     "  ret void".to_string()
                 };
@@ -1283,13 +1353,13 @@ impl<'a> ModuleCtx<'a> {
                     out,
                     r#"@__syn_user_putc_fn = internal global ptr addrspace(1) null, align 1
 
-define void @__syn_uart_putc(i8 %c) nounwind noinline{fn_sz} {{
+define void @__syn_uart_putc(i8 %c){fn_as} nounwind noinline{fn_sz} {{
 entry:
   %fp = load ptr addrspace(1), ptr @__syn_user_putc_fn, align 1
   %has = icmp ne ptr addrspace(1) %fp, null
   br i1 %has, label %do_call, label %fallback
 do_call:
-  call void %fp(i8 %c)
+  {call_kw} void %fp(i8 %c)
   ret void
 fallback:
 {fb}
@@ -1325,8 +1395,10 @@ fallback:
         let mut llvm_max_nat_al = 1usize;
         let mut field_indices = HashMap::new();
         let mut llvm_fields = Vec::new();
+        let struct_dma = self.dma_layout_structs.contains(&decl.name);
         for (idx, fld) in decl.fields.iter().enumerate() {
-            let is_dma_pool = fld.dma_safe
+            let eff_fld_dma = fld.dma_safe || struct_dma;
+            let is_dma_pool = eff_fld_dma
                 && matches!(fld.ty, MirType::Primitive(MirPrimKind::Pool { .. }));
             let (fsize, mut falign) = self.size_align(&fld.ty, ptr_bytes);
             let fsize = if is_dma_pool {
@@ -1349,7 +1421,7 @@ fallback:
             }
             offset += fsize;
 
-            let (nat_sz, nat_al) = self.llvm_abi_size_align(&fld.ty, fld.dma_safe);
+            let (nat_sz, nat_al) = self.llvm_abi_size_align(&fld.ty, eff_fld_dma);
             let req_al = if decl.is_subsystem {
                 falign
             } else if decl.packed {
@@ -1369,7 +1441,7 @@ fallback:
                 llvm_max_nat_al = llvm_max_nat_al.max(nat_al);
             }
             let llvm_idx = llvm_fields.len();
-            llvm_fields.push((Some(idx), self.llvm_field_ty(fld)));
+            llvm_fields.push((Some(idx), self.llvm_field_ty(&decl.name, fld)));
             llvm_off += nat_sz;
             field_indices.insert(fld.name.clone(), (llvm_idx, fld.ty.clone()));
         }
@@ -1914,7 +1986,7 @@ fallback:
 
         let mut hoisted_var_gep = HashMap::new();
         for v in vars {
-            if v.hoisted || v.role == VarRole::Param {
+            if v.hoisted && !v.ty.is_void() {
                 let gep_idx = field_llvm_tys.len();
                 let (sz, al) = self.size_align(&v.ty, ptr_bytes);
                 offset = align_up(offset, al);
@@ -2059,7 +2131,9 @@ fallback:
     fn pool_hdr_llvm_size(&self) -> (usize, usize) {
         match self.opts.target {
             TargetArch::HostX86_64Linux => (24, 8),
-            TargetArch::Thumbv7mNoneEabi | TargetArch::Riscv32Esp32C6 => (16, 4),
+            TargetArch::Thumbv7mNoneEabi
+            | TargetArch::Thumbv6mRp2040
+            | TargetArch::Riscv32Esp32C6 => (16, 4),
             TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => (12, 1),
         }
     }
@@ -2156,8 +2230,9 @@ fallback:
         }
     }
 
-    fn llvm_field_ty(&self, fld: &zev_mir::MirField) -> String {
-        if fld.dma_safe {
+    fn llvm_field_ty(&self, struct_name: &str, fld: &zev_mir::MirField) -> String {
+        let eff_dma = fld.dma_safe || self.dma_layout_structs.contains(struct_name);
+        if eff_dma {
             if let MirType::Primitive(pk @ MirPrimKind::Pool { .. }) = &fld.ty {
                 return format!("%prim.{}_dma", sanitize_ident(&pk.mangle_name()));
             }
@@ -2213,6 +2288,16 @@ fallback:
         let idx = self.strings.len();
         self.strings.push(s.to_string());
         self.string_dedup.insert(s.to_string(), idx);
+        idx
+    }
+
+    fn intern_const_blob(&mut self, decl_body: &str) -> usize {
+        if let Some(&idx) = self.const_blob_dedup.get(decl_body) {
+            return idx;
+        }
+        let idx = self.const_blobs.len();
+        self.const_blobs.push(decl_body.to_string());
+        self.const_blob_dedup.insert(decl_body.to_string(), idx);
         idx
     }
 
@@ -2278,7 +2363,26 @@ fallback:
                     MirBinOp::BitAnd => l & r,
                     MirBinOp::BitXor => l ^ r,
                     MirBinOp::Shl => l << (r & 63),
-                    MirBinOp::Shr => l >> (r & 63),
+                    MirBinOp::Shr => {
+                        let sh = (r as u32) & 63;
+                        if lhs.ty.is_unsigned() {
+                            let ptr_bits = self.opts.target.ptr_bits();
+                            let masked = if lhs.ty == MirType::Bool {
+                                (l as u128) & 1
+                            } else {
+                                match target_int_signed_and_bits(&lhs.ty, ptr_bits) {
+                                    Some((_, 8)) => (l as u8) as u128,
+                                    Some((_, 16)) => (l as u16) as u128,
+                                    Some((_, 32)) => (l as u32) as u128,
+                                    Some((_, 64)) => (l as u64) as u128,
+                                    _ => l as u128,
+                                }
+                            };
+                            (masked >> sh) as i128
+                        } else {
+                            l >> sh
+                        }
+                    }
                     MirBinOp::Eq => i128::from(l == r),
                     MirBinOp::Ne => i128::from(l != r),
                     MirBinOp::Lt => i128::from(l < r),
@@ -2490,6 +2594,17 @@ fallback:
     }
 
     fn const_expr_to_llvm(&mut self, expr: &MirExpr, target_ty: &MirType) -> String {
+        if let MirExprKind::ConstRef(cname) = &expr.kind {
+            if let Some(init) = self
+                .module
+                .consts
+                .iter()
+                .find(|c| c.name == *cname)
+                .map(|c| c.init.clone())
+            {
+                return self.const_expr_to_llvm(&init, target_ty);
+            }
+        }
         let ptr_bits = self.opts.target.ptr_bits();
         match target_ty {
             MirType::Bool => {
@@ -2646,6 +2761,17 @@ fallback:
                     MirExprKind::Cast { expr: sub, .. } => sub.as_ref(),
                     _ => expr,
                 };
+                if let MirExprKind::ConstRef(cname) = &inner.kind {
+                    if let Some(init) = self
+                        .module
+                        .consts
+                        .iter()
+                        .find(|c| c.name == *cname)
+                        .map(|c| c.init.clone())
+                    {
+                        return self.const_expr_to_llvm(&init, target_ty);
+                    }
+                }
                 match &inner.kind {
                     MirExprKind::GlobalPrimAddr(name) => {
                         format!("@__syn_prim_{}", sanitize_ident(name))
@@ -2696,14 +2822,45 @@ fallback:
                     _ => "null".to_string(),
                 }
             }
-            MirType::Slice(_) => {
-                if let MirExprKind::StringLit(s) = &expr.kind {
-                    let idx = self.intern_string(s);
-                    let slen = zev_ast::decoded_string_byte_len(s);
-                    let usize_ty = self.opts.target.usize_llvm_ty();
-                    format!("{{ ptr @.str.{idx}, {usize_ty} {slen} }}")
-                } else {
-                    "zeroinitializer".to_string()
+            MirType::Slice(elem) => {
+                let usize_ty = self.opts.target.usize_llvm_ty();
+                match &expr.kind {
+                    MirExprKind::Cast { expr: sub, .. } => self.const_expr_to_llvm(sub, target_ty),
+                    MirExprKind::StringLit(s) => {
+                        let idx = self.intern_string(s);
+                        let slen = zev_ast::decoded_string_byte_len(s);
+                        format!("{{ ptr @.str.{idx}, {usize_ty} {slen} }}")
+                    }
+                    MirExprKind::ArrayLit { elems, .. } => {
+                        let n = elems.len();
+                        if n == 0 {
+                            format!("{{ ptr null, {usize_ty} 0 }}")
+                        } else {
+                            let ety = self.llvm_ty(elem);
+                            let (_, eal) = self.size_align(elem, (ptr_bits / 8) as usize);
+                            let mut parts = Vec::with_capacity(n);
+                            for el in elems {
+                                let cv = self.const_expr_to_llvm(el, elem);
+                                parts.push(format!("{ety} {cv}"));
+                            }
+                            let decl_body = format!(
+                                "private unnamed_addr constant [{n} x {ety}] [{}], align {eal}",
+                                parts.join(", ")
+                            );
+                            let idx = self.intern_const_blob(&decl_body);
+                            format!("{{ ptr @.cblob.{idx}, {usize_ty} {n} }}")
+                        }
+                    }
+                    MirExprKind::ArrayToSlice {
+                        array_place, len, ..
+                    } => {
+                        if let Some(aptr) = self.const_place_to_llvm_ptr(array_place) {
+                            format!("{{ ptr {aptr}, {usize_ty} {len} }}")
+                        } else {
+                            "zeroinitializer".to_string()
+                        }
+                    }
+                    _ => "zeroinitializer".to_string(),
                 }
             }
             MirType::Array { elem, len } => {
@@ -2828,19 +2985,19 @@ fallback:
         }
     }
 
-    fn struct_has_signal(&self, struct_name: &str) -> bool {
+    fn struct_needs_const_init(&self, struct_name: &str) -> bool {
         let Some(si) = self.structs.get(struct_name) else {
             return false;
         };
         si.decl.fields.iter().any(|f| match &f.ty {
-            MirType::Primitive(MirPrimKind::Signal) => true,
-            MirType::Struct(sub) => self.struct_has_signal(sub),
+            MirType::Primitive(MirPrimKind::Signal | MirPrimKind::PingPong { .. }) => true,
+            MirType::Struct(sub) => self.struct_needs_const_init(sub),
             _ => false,
         })
     }
 
-    fn subsystem_zero_init_const(&self, struct_name: &str) -> String {
-        if !self.struct_has_signal(struct_name) {
+    fn subsystem_zero_init_const(&self, struct_name: &str, next_pp_bit: &mut u8) -> String {
+        if !self.struct_needs_const_init(struct_name) {
             return "zeroinitializer".to_string();
         }
         let Some(si) = self.structs.get(struct_name) else {
@@ -2859,8 +3016,17 @@ fallback:
                         MirType::Primitive(MirPrimKind::Signal) => {
                             format!("{lty} {{ i8 0, i8 127 }}")
                         }
+                        MirType::Primitive(MirPrimKind::PingPong { elem, cap }) => {
+                            let ety = self.llvm_ty(elem);
+                            let c = (*cap).max(1);
+                            let lbit = *next_pp_bit;
+                            *next_pp_bit = next_pp_bit.saturating_add(1).min(31);
+                            format!(
+                                "{lty} {{ i8 0, i8 0, i8 0, i8 {lbit}, [{c} x {ety}] zeroinitializer, [{c} x {ety}] zeroinitializer }}"
+                            )
+                        }
                         MirType::Struct(sub) => {
-                            format!("{lty} {}", self.subsystem_zero_init_const(sub))
+                            format!("{lty} {}", self.subsystem_zero_init_const(sub, next_pp_bit))
                         }
                         _ => format!("{lty} zeroinitializer"),
                     }
@@ -2904,6 +3070,7 @@ fallback:
         }
         let usize_ty = self.opts.target.usize_llvm_ty();
         let fn_sz = self.opts.fn_size_attrs();
+        let fn_as = self.fn_as();
         let tmp_al = if self.opts.target.is_avr() {
             1
         } else {
@@ -2919,7 +3086,7 @@ fallback:
             let sz = si.byte_size;
             let _ = writeln!(
                 out,
-                r#"define {{ {sty}, i32 }} @__syn_from_bytes_{sname}({{ ptr, {usize_ty} }} %slice) nounwind{fn_sz} {{
+                r#"define {{ {sty}, i32 }} @__syn_from_bytes_{sname}({{ ptr, {usize_ty} }} %slice){fn_as} nounwind{fn_sz} {{
 entry:
   %tmp = alloca {sty}, align {tmp_al}
   %ptr = extractvalue {{ ptr, {usize_ty} }} %slice, 0
@@ -2945,6 +3112,7 @@ ok_bb:
             return;
         }
         let fn_sz = self.opts.fn_size_attrs().to_string();
+        let fn_as = self.fn_as();
         let formatted: Vec<String> = self.module.formatted_enums.clone();
         let _ = writeln!(out, "; ── On-Demand Enum Variant-Name `.rodata` Lookup Helpers ──");
         for ename in &formatted {
@@ -2963,7 +3131,7 @@ ok_bb:
             }
             let _ = writeln!(
                 out,
-                "define ptr @__syn_enum_name_{eid}(i32 %v) nounwind{fn_sz} {{"
+                "define ptr @__syn_enum_name_{eid}(i32 %v){fn_as} nounwind{fn_sz} {{"
             );
             let _ = writeln!(out, "entry:");
             let _ = writeln!(out, "  switch i32 %v, label %def [");
@@ -2981,7 +3149,7 @@ ok_bb:
         }
     }
 
-    fn emit_primitives_ir(&self, out: &mut String) {
+    fn emit_primitives_ir(&mut self, out: &mut String) {
         if self.distinct_prims.is_empty()
             && self.module.primitives.is_empty()
             && !self.uses_pool_lease
@@ -2990,6 +3158,9 @@ ok_bb:
         {
             return;
         }
+        let fn_as = self.fn_as();
+        let call_kw = self.call_kw();
+        let vis = self.vis.clone();
         let _ = writeln!(out, "; ── Static OS & Zero-Copy DMA Primitive Endpoints ──");
         if self.uses_pool_lease {
             let _ = writeln!(out, "%prim.pool_hdr = type {{ i32, i32, ptr, i8, i8 }}");
@@ -3086,11 +3257,24 @@ ok_bb:
         let _ = writeln!(out);
 
         // Emit static subsystem instances
+        let mut next_pp_bit: u8 = self
+            .module
+            .primitives
+            .iter()
+            .filter_map(|p| p.sleep_lock_bit)
+            .map(|b| b.saturating_add(1))
+            .max()
+            .unwrap_or(0)
+            .min(31);
         for sub in &self.module.subsystems {
             let gsym = format!("@__zev_subsys_{}", sanitize_ident(&sub.name));
             let si = &self.structs[&sub.struct_name];
-            let init = self.subsystem_zero_init_const(&sub.struct_name);
-            let align = si.align.max(4);
+            let init = self.subsystem_zero_init_const(&sub.struct_name, &mut next_pp_bit);
+            let align = if sub.dma_safe {
+                si.align.max(16)
+            } else {
+                si.align.max(4)
+            };
             let _ = writeln!(
                 out,
                 "{gsym} = internal global {} {init}, align {align}",
@@ -3099,7 +3283,9 @@ ok_bb:
         }
 
         // Emit static global primitive instances
-        for p in &self.module.primitives {
+        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let prims = self.module.primitives.clone();
+        for p in &prims {
             if p.dead_stripped {
                 let _ = writeln!(out, "; dead watch stripped: @__syn_prim_{}", sanitize_ident(&p.name));
                 continue;
@@ -3121,46 +3307,14 @@ ok_bb:
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
-                    let watch_align = if matches!(elem.as_ref(), MirType::F64 | MirType::U64 | MirType::I64) {
-                        align.max(8)
-                    } else {
-                        align
-                    };
-                    if let Some(init_expr) = &p.init {
-                        if matches!(elem.as_ref(), MirType::F32 | MirType::F64) {
-                            let mut fbits = self.eval_const_float_bits(init_expr);
-                            if **elem == MirType::F32 {
-                                fbits = ((f64::from_bits(fbits) as f32) as f64).to_bits();
-                            }
-                            let _ = writeln!(
-                                out,
-                                "{gsym} = global {pty} {{ {ety} 0x{fbits:016X}, i32 0 }}, align {watch_align}"
-                            );
-                        } else if matches!(
-                            elem.as_ref(),
-                            MirType::Bool
-                                | MirType::U8
-                                | MirType::I8
-                                | MirType::U16
-                                | MirType::I16
-                                | MirType::U32
-                                | MirType::I32
-                                | MirType::U64
-                                | MirType::I64
-                                | MirType::Usize
-                                | MirType::Enum(_)
-                        ) {
-                            let iv = self.eval_const_int(init_expr);
-                            let _ = writeln!(
-                                out,
-                                "{gsym} = global {pty} {{ {ety} {iv}, i32 0 }}, align {watch_align}"
-                            );
-                        } else {
-                            let _ = writeln!(
-                                out,
-                                "{gsym} = global {pty} zeroinitializer, align {watch_align}"
-                            );
-                        }
+                    let (_, elem_align) = self.size_align(elem, ptr_bytes);
+                    let watch_align = align.max(elem_align);
+                    if let Some(init_expr) = p.init.clone() {
+                        let iv = self.const_expr_to_llvm(&init_expr, elem);
+                        let _ = writeln!(
+                            out,
+                            "{gsym} = global {pty} {{ {ety} {iv}, i32 0 }}, align {watch_align}"
+                        );
                     } else {
                         let _ = writeln!(
                             out,
@@ -3191,21 +3345,20 @@ ok_bb:
         }
         let _ = writeln!(out);
 
-        let vis = zev_mir::opt::VisibilityReport::effective_for(self.module);
         // Emit shared pool lease release helper if pools, dma_slots, or Lease<T> values exist.
         let fn_sz = self.opts.fn_size_attrs();
         if self.uses_pool_lease {
-            let ptr_al = self.ptr_align();
-            let mut rel_sec = format!(
-                r#"define void @__syn_pool_release(ptr %pool_hdr, i8 %slot_idx, i8 %boost) nounwind{fn_sz} {{
+            let (crit_enter, crit_exit) = crit_pair(vis.any_pool_or_lease_contended(), call_kw);
+            let _ = write!(
+                out,
+                r#"define void @__syn_pool_release(ptr %pool_hdr, i8 %slot_idx, i8 %boost){fn_as} nounwind{fn_sz} {{
 entry:
   %is_null = icmp eq ptr %pool_hdr, null
   br i1 %is_null, label %done_null, label %chk_bounds
 done_null:
   ret void
 chk_bounds:
-  %pm = call i32 @__syn_crit_enter()
-  %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %pool_hdr, i32 0, i32 4
+{crit_enter}  %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %pool_hdr, i32 0, i32 4
   %cap = load i8, ptr %cap_p, align 1
   %valid = icmp ult i8 %slot_idx, %cap
   br i1 %valid, label %chk_bit, label %unlock_exit
@@ -3222,7 +3375,8 @@ free_slot:
   store i32 %new_fm, ptr %fm_p, align 4
   %dma_p = getelementptr inbounds %prim.pool_hdr, ptr %pool_hdr, i32 0, i32 3
   %dma = load i8, ptr %dma_p, align 1
-  %is_dma = icmp ne i8 %dma, 0
+  %dma_lock = and i8 %dma, 1
+  %is_dma = icmp ne i8 %dma_lock, 0
   br i1 %is_dma, label %dec_dma, label %wake
 dec_dma:
   %dl = load volatile i32, ptr @__syn_dma_locks, align 4
@@ -3234,34 +3388,27 @@ do_dec:
   br label %wake
 wake:
   %b32 = sext i8 %boost to i32
-  call void @__syn_wake_waiters(ptr %pool_hdr, i32 %b32)
+  {call_kw} void @__syn_wake_one_waiter(ptr %pool_hdr, i32 %b32)
   br label %unlock_exit
 unlock_exit:
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_exit}  ret void
 }}
+
 "#
             );
-            let _ = ptr_al;
-            if !vis.any_pool_or_lease_contended() {
-                elide_llvm_crit(&mut rel_sec);
-            }
-            out.push_str(&rel_sec);
-            out.push('\n');
         }
         // Emit typed primitive runtime helpers for each distinct primitive kind
         for (mangled, pk) in &self.distinct_prims {
             let id = sanitize_ident(mangled);
             let pty = format!("%prim.{id}");
-            let mut sec = String::new();
+            let (crit_enter, crit_exit) = crit_pair(vis.is_prim_family_contended(pk), call_kw);
             match pk {
                 MirPrimKind::Signal => {
                     let _ = writeln!(
-                        sec,
-                        r#"define void @__syn_sig_notify_{id}(ptr %s, i32 %boost) nounwind{fn_sz} {{
+                        out,
+                        r#"define void @__syn_sig_notify_{id}(ptr %s, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %fp = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
+{crit_enter}  %fp = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
   store i8 1, ptr %fp, align 1
   %has_b = icmp sge i32 %boost, 0
   br i1 %has_b, label %upd_b, label %wake
@@ -3274,15 +3421,13 @@ upd_b:
   store i8 %min_b, ptr %pb_ptr, align 1
   br label %wake
 wake:
-  call void @__syn_wake_waiters(ptr %s, i32 %boost)
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+  {call_kw} void @__syn_wake_waiters(ptr %s, i32 %boost)
+{crit_exit}  ret void
 }}
 
-define i8 @__syn_sig_poll_{id}(ptr %s, ptr %task) nounwind{fn_sz} {{
+define i8 @__syn_sig_poll_{id}(ptr %s, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %fp = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
+{crit_enter}  %fp = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
   %f = load i8, ptr %fp, align 1
   %set = icmp ne i8 %f, 0
   br i1 %set, label %take, label %empty
@@ -3294,46 +3439,38 @@ take:
   br i1 %has_pb, label %apply_pb, label %done_ok
 apply_pb:
   store i8 127, ptr %pb_ptr, align 1
-  %now = call i32 @__syn_now_ms()
+  %now = {call_kw} i32 @__syn_now_ms()
   %pb32 = zext i8 %pb to i32
-  call void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
+  {call_kw} void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
   br label %done_ok
 done_ok:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 1
+{crit_exit}  ret i8 1
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
-}}
-"#
+{crit_exit}  ret i8 0
+}}"#
                     );
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
                     let _ = writeln!(
-                        sec,
-                        r#"define void @__syn_watch_pub_{id}(ptr %w, {ety} %val) nounwind{fn_sz} {{
+                        out,
+                        r#"define void @__syn_watch_pub_{id}(ptr %w, {ety} %val){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %vp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 0
+{crit_enter}  %vp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 0
   store {ety} %val, ptr %vp, align 1
   %gp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 1
   %g = load i32, ptr %gp, align 4
   %g1 = add i32 %g, 1
   store i32 %g1, ptr %gp, align 4
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_exit}  ret void
 }}
 
-define {ety} @__syn_watch_read_{id}(ptr %w) nounwind{fn_sz} {{
+define {ety} @__syn_watch_read_{id}(ptr %w){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %vp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 0
+{crit_enter}  %vp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 0
   %v = load {ety}, ptr %vp, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  ret {ety} %v
-}}
-"#
+{crit_exit}  ret {ety} %v
+}}"#
                     );
                 }
                 MirPrimKind::Inbox { elem, cap } => {
@@ -3351,11 +3488,10 @@ entry:
                         String::new()
                     };
                     let _ = writeln!(
-                        sec,
-                        r#"define i8 {push_fn}(ptr %q, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+                        out,
+                        r#"define i8 {push_fn}(ptr %q, {ety} %val, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cnt_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 2
+{crit_enter}  %cnt_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 2
   %cnt = load i32, ptr %cnt_p, align 4
   %space = icmp slt i32 %cnt, {c}
   br i1 %space, label %do_push, label %full
@@ -3377,18 +3513,15 @@ do_push:
   store i32 %tnext, ptr %tail_p, align 4
   %c1 = add i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
-  call void @__syn_wake_waiters(ptr %q, i32 %boost)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 1
+  {call_kw} void @__syn_wake_waiters(ptr %q, i32 %boost)
+{crit_exit}  ret i8 1
 full:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
+{crit_exit}  ret i8 0
 }}
 
-define i8 @__syn_q_pop_{id}(ptr %q, ptr %out_val, ptr %task) nounwind{fn_sz} {{
+define i8 @__syn_q_pop_{id}(ptr %q, ptr %out_val, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cnt_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 2
+{crit_enter}  %cnt_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 2
   %cnt = load i32, ptr %cnt_p, align 4
   %avail = icmp sgt i32 %cnt, 0
   br i1 %avail, label %do_pop, label %empty
@@ -3411,49 +3544,44 @@ do_pop:
   %has_pb = icmp ne i8 %sb, 0
   br i1 %has_pb, label %apply_pb, label %wake_senders
 apply_pb:
-  %now = call i32 @__syn_now_ms()
+  %now = {call_kw} i32 @__syn_now_ms()
   %sb32 = zext i8 %sb to i32
   %pb32 = sub i32 %sb32, 1
-  call void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
+  {call_kw} void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
   br label %wake_senders
 wake_senders:
   %q_tx = getelementptr inbounds {pty}, ptr %q, i32 0, i32 1
-  call void @__syn_wake_waiters(ptr %q_tx, i32 -1)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 1
+  {call_kw} void @__syn_wake_waiters(ptr %q_tx, i32 -1)
+{crit_exit}  ret i8 1
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
-}}
-"#
+{crit_exit}  ret i8 0
+}}"#
                     );
                     if is_lease {
                         let _ = writeln!(
-                            sec,
-                            r#"define i8 @__syn_q_push_{id}(ptr %q, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+                            out,
+                            r#"define i8 @__syn_q_push_{id}(ptr %q, {ety} %val, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %ok = call i8 @__syn_q_push_keep_{id}(ptr %q, {ety} %val, i32 %boost)
+  %ok = {call_kw} i8 @__syn_q_push_keep_{id}(ptr %q, {ety} %val, i32 %boost)
   %ok_b = icmp ne i8 %ok, 0
   br i1 %ok_b, label %done, label %drop_lease
 drop_lease:
   %ph = extractvalue {ety} %val, 1
   %idx = extractvalue {ety} %val, 2
-  call void @__syn_pool_release(ptr %ph, i8 %idx, i8 -1)
+  {call_kw} void @__syn_pool_release(ptr %ph, i8 %idx, i8 -1)
   ret i8 0
 done:
   ret i8 1
-}}
-"#
+}}"#
                         );
                     }
                 }
                 MirPrimKind::PingPong { .. } => {
                     let _ = writeln!(
-                        sec,
-                        r#"define void @__syn_pp_set_active_{id}(ptr %pp, i8 %active) nounwind{fn_sz} {{
+                        out,
+                        r#"define void @__syn_pp_set_active_{id}(ptr %pp, i8 %active){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %lb_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 3
+{crit_enter}  %lb_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 3
   %lb = load i8, ptr %lb_p, align 1
   %lb32 = zext i8 %lb to i32
   %sh = and i32 %lb32, 31
@@ -3465,14 +3593,12 @@ entry:
   %setv = or i32 %old, %bit
   %newv = select i1 %is_on, i32 %setv, i32 %cleared
   store volatile i32 %newv, ptr @__syn_sleep_lock_mask, align 4
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_exit}  ret void
 }}
 
-define void @__syn_pp_flip_{id}(ptr %pp) nounwind{fn_sz} {{
+define void @__syn_pp_flip_{id}(ptr %pp){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %wh_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 0
+{crit_enter}  %wh_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 0
   %rh_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 1
   %cr_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 2
   %wh = load i8, ptr %wh_p, align 1
@@ -3480,15 +3606,13 @@ entry:
   %next = xor i8 %wh, 1
   store i8 %next, ptr %wh_p, align 1
   store i8 1, ptr %cr_p, align 1
-  call void @__syn_wake_waiters(ptr %pp, i32 -1)
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+  {call_kw} void @__syn_wake_waiters(ptr %pp, i32 -1)
+{crit_exit}  ret void
 }}
 
-define ptr @__syn_pp_poll_{id}(ptr %pp) nounwind{fn_sz} {{
+define ptr @__syn_pp_poll_{id}(ptr %pp){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cr_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 2
+{crit_enter}  %cr_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 2
   %cr = load i8, ptr %cr_p, align 1
   %rdy = icmp ne i8 %cr, 0
   br i1 %rdy, label %take, label %none
@@ -3500,13 +3624,10 @@ take:
   %b0 = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 4, i32 0
   %b1 = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 5, i32 0
   %buf = select i1 %is_b0, ptr %b0, ptr %b1
-  call void @__syn_crit_exit(i32 %pm)
-  ret ptr %buf
+{crit_exit}  ret ptr %buf
 none:
-  call void @__syn_crit_exit(i32 %pm)
-  ret ptr null
-}}
-"#
+{crit_exit}  ret ptr null
+}}"#
                     );
                 }
                 MirPrimKind::Pool { .. } => {
@@ -3529,8 +3650,8 @@ none:
                     let conv_used = conv_usize("%used", "%used_u");
                     let conv_cap = conv_usize("%cap32", "%cap_u");
                     let _ = writeln!(
-                        sec,
-                        r#"define ptr @__syn_pool_slot_ptr_{id}(ptr %p, i8 %idx) nounwind{fn_sz} {{
+                        out,
+                        r#"define ptr @__syn_pool_slot_ptr_{id}(ptr %p, i8 %idx){fn_as} nounwind{fn_sz} {{
 entry:
   %dma_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 3
   %dma = load i8, ptr %dma_p, align 1
@@ -3542,10 +3663,9 @@ entry:
   ret ptr %res
 }}
 
-define i8 @__syn_pool_try_alloc_raw_{id}(ptr %p, ptr %out_lease) nounwind{fn_sz} {{
+define i8 @__syn_pool_try_alloc_raw_{id}(ptr %p, ptr %out_lease){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
+{crit_enter}  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
   %fm = load i32, ptr %fm_p, align 4
   %has = icmp ne i32 %fm, 0
   br i1 %has, label %take, label %empty
@@ -3557,7 +3677,8 @@ take:
   store i32 %new_fm, ptr %fm_p, align 4
   %dma_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 3
   %dma = load i8, ptr %dma_p, align 1
-  %is_dma = icmp ne i8 %dma, 0
+  %dma_lock = and i8 %dma, 1
+  %is_dma = icmp ne i8 %dma_lock, 0
   br i1 %is_dma, label %inc_dma, label %finish
 inc_dma:
   %dl = load volatile i32, ptr @__syn_dma_locks, align 4
@@ -3566,8 +3687,7 @@ inc_dma:
   br label %finish
 finish:
   %idx8 = trunc i32 %idx32 to i8
-  call void @__syn_crit_exit(i32 %pm)
-  %dp = call ptr @__syn_pool_slot_ptr_{id}(ptr %p, i8 %idx8)
+{crit_exit}  %dp = {call_kw} ptr @__syn_pool_slot_ptr_{id}(ptr %p, i8 %idx8)
   %f0 = getelementptr inbounds {{ ptr, ptr, i8 }}, ptr %out_lease, i32 0, i32 0
   store ptr %dp, ptr %f0, align {ptr_al}
   %f1 = getelementptr inbounds {{ ptr, ptr, i8 }}, ptr %out_lease, i32 0, i32 1
@@ -3576,15 +3696,14 @@ finish:
   store i8 %idx8, ptr %f2, align 1
   ret i8 1
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
+{crit_exit}  ret i8 0
 }}
 
-define {{ {{ ptr, ptr, i8 }}, i32 }} @__syn_pool_try_alloc_{id}(ptr %p) nounwind{fn_sz} {{
+define {{ {{ ptr, ptr, i8 }}, i32 }} @__syn_pool_try_alloc_{id}(ptr %p){fn_as} nounwind{fn_sz} {{
 entry:
   %tmp = alloca {{ ptr, ptr, i8 }}, align {ptr_al}
   store {{ ptr, ptr, i8 }} zeroinitializer, ptr %tmp, align {ptr_al}
-  %ok = call i8 @__syn_pool_try_alloc_raw_{id}(ptr %p, ptr %tmp)
+  %ok = {call_kw} i8 @__syn_pool_try_alloc_raw_{id}(ptr %p, ptr %tmp)
   %got = icmp ne i8 %ok, 0
   %ls = load {{ ptr, ptr, i8 }}, ptr %tmp, align {ptr_al}
   %tag = select i1 %got, i32 0, i32 1
@@ -3593,33 +3712,29 @@ entry:
   ret {{ {{ ptr, ptr, i8 }}, i32 }} %r1
 }}
 
-define {usize_ty} @__syn_pool_avail_{id}(ptr %p) nounwind{fn_sz} {{
+define {usize_ty} @__syn_pool_avail_{id}(ptr %p){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
+{crit_enter}  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
   %fm = load i32, ptr %fm_p, align 4
-  call void @__syn_crit_exit(i32 %pm)
-  %cnt = call i32 @llvm.ctpop.i32(i32 %fm)
+{crit_exit}  %cnt = call i32 @llvm.ctpop.i32(i32 %fm)
 {conv_av}
   ret {usize_ty} %cnt_u
 }}
 
-define {usize_ty} @__syn_pool_in_use_{id}(ptr %p) nounwind{fn_sz} {{
+define {usize_ty} @__syn_pool_in_use_{id}(ptr %p){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 4
+{crit_enter}  %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 4
   %cap = load i8, ptr %cap_p, align 1
   %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
   %fm = load i32, ptr %fm_p, align 4
-  call void @__syn_crit_exit(i32 %pm)
-  %avail = call i32 @llvm.ctpop.i32(i32 %fm)
+{crit_exit}  %avail = call i32 @llvm.ctpop.i32(i32 %fm)
   %cap32 = zext i8 %cap to i32
   %used = sub i32 %cap32, %avail
 {conv_used}
   ret {usize_ty} %used_u
 }}
 
-define {usize_ty} @__syn_pool_cap_{id}(ptr %p) nounwind{fn_sz} {{
+define {usize_ty} @__syn_pool_cap_{id}(ptr %p){fn_as} nounwind{fn_sz} {{
 entry:
   %cap_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 4
   %cap = load i8, ptr %cap_p, align 1
@@ -3628,35 +3743,30 @@ entry:
   ret {usize_ty} %cap_u
 }}
 
-define i8 @__syn_pool_is_exhausted_{id}(ptr %p) nounwind{fn_sz} {{
+define i8 @__syn_pool_is_exhausted_{id}(ptr %p){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
+{crit_enter}  %fm_p = getelementptr inbounds %prim.pool_hdr, ptr %p, i32 0, i32 0
   %fm = load i32, ptr %fm_p, align 4
-  call void @__syn_crit_exit(i32 %pm)
-  %empty = icmp eq i32 %fm, 0
+{crit_exit}  %empty = icmp eq i32 %fm, 0
   %b8 = zext i1 %empty to i8
   ret i8 %b8
-}}
-"#
+}}"#
                     );
                 }
                 MirPrimKind::DmaSlot { .. } => {
                     let usize_ty = self.opts.target.usize_llvm_ty();
                     let _ = writeln!(
-                        sec,
-                        r#"define {{ i32, i32 }} @__syn_slot_park_{id}(ptr %s, {{ ptr, ptr, i8 }} %lease) nounwind{fn_sz} {{
+                        out,
+                        r#"define {{ i32, i32 }} @__syn_slot_park_{id}(ptr %s, {{ ptr, ptr, i8 }} %lease){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+{crit_enter}  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
   %occ = load i8, ptr %occ_p, align 1
   %busy = icmp ne i8 %occ, 0
   br i1 %busy, label %is_busy, label %do_park
 is_busy:
-  call void @__syn_crit_exit(i32 %pm)
-  %ph_b = extractvalue {{ ptr, ptr, i8 }} %lease, 1
+{crit_exit}  %ph_b = extractvalue {{ ptr, ptr, i8 }} %lease, 1
   %idx_b = extractvalue {{ ptr, ptr, i8 }} %lease, 2
-  call void @__syn_pool_release(ptr %ph_b, i8 %idx_b, i8 -1)
+  {call_kw} void @__syn_pool_release(ptr %ph_b, i8 %idx_b, i8 -1)
   ret {{ i32, i32 }} {{ i32 0, i32 1 }}
 do_park:
   %dp = extractvalue {{ ptr, ptr, i8 }} %lease, 0
@@ -3669,20 +3779,17 @@ do_park:
   store ptr %ph, ptr %f1, align 1
   store i8 %idx, ptr %f2, align 1
   store i8 1, ptr %occ_p, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  ret {{ i32, i32 }} zeroinitializer
+{crit_exit}  ret {{ i32, i32 }} zeroinitializer
 }}
 
-define {{ {{ ptr, ptr, i8 }}, i32 }} @__syn_slot_take_{id}(ptr %s) nounwind{fn_sz} {{
+define {{ {{ ptr, ptr, i8 }}, i32 }} @__syn_slot_take_{id}(ptr %s){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+{crit_enter}  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
   %occ = load i8, ptr %occ_p, align 1
   %empty = icmp eq i8 %occ, 0
   br i1 %empty, label %is_empty, label %do_take
 is_empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret {{ {{ ptr, ptr, i8 }}, i32 }} {{ {{ ptr, ptr, i8 }} zeroinitializer, i32 1 }}
+{crit_exit}  ret {{ {{ ptr, ptr, i8 }}, i32 }} {{ {{ ptr, ptr, i8 }} zeroinitializer, i32 1 }}
 do_take:
   %f0 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
   %f1 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 1
@@ -3694,8 +3801,7 @@ do_take:
   store ptr null, ptr %f1, align 1
   store i8 0, ptr %f2, align 1
   store i8 0, ptr %occ_p, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  %l0 = insertvalue {{ ptr, ptr, i8 }} poison, ptr %dp, 0
+{crit_exit}  %l0 = insertvalue {{ ptr, ptr, i8 }} poison, ptr %dp, 0
   %l1 = insertvalue {{ ptr, ptr, i8 }} %l0, ptr %ph, 1
   %l2 = insertvalue {{ ptr, ptr, i8 }} %l1, i8 %idx, 2
   %r0 = insertvalue {{ {{ ptr, ptr, i8 }}, i32 }} poison, {{ ptr, ptr, i8 }} %l2, 0
@@ -3703,16 +3809,14 @@ do_take:
   ret {{ {{ ptr, ptr, i8 }}, i32 }} %r1
 }}
 
-define i8 @__syn_slot_release_{id}(ptr %s, i8 %boost) nounwind{fn_sz} {{
+define i8 @__syn_slot_release_{id}(ptr %s, i8 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+{crit_enter}  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
   %occ = load i8, ptr %occ_p, align 1
   %empty = icmp eq i8 %occ, 0
   br i1 %empty, label %is_empty, label %do_rel
 is_empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
+{crit_exit}  ret i8 0
 do_rel:
   %f0 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
   %f1 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 1
@@ -3723,47 +3827,39 @@ do_rel:
   store ptr null, ptr %f1, align 1
   store i8 0, ptr %f2, align 1
   store i8 0, ptr %occ_p, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  call void @__syn_pool_release(ptr %ph, i8 %idx, i8 %boost)
+{crit_exit}  {call_kw} void @__syn_pool_release(ptr %ph, i8 %idx, i8 %boost)
   ret i8 1
 }}
 
-define i8 @__syn_slot_is_busy_{id}(ptr %s) nounwind{fn_sz} {{
+define i8 @__syn_slot_is_busy_{id}(ptr %s){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+{crit_enter}  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
   %occ = load i8, ptr %occ_p, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  %b = icmp ne i8 %occ, 0
+{crit_exit}  %b = icmp ne i8 %occ, 0
   %b8 = zext i1 %b to i8
   ret i8 %b8
 }}
 
-define i8 @__syn_slot_is_empty_{id}(ptr %s) nounwind{fn_sz} {{
+define i8 @__syn_slot_is_empty_{id}(ptr %s){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+{crit_enter}  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
   %occ = load i8, ptr %occ_p, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  %e = icmp eq i8 %occ, 0
+{crit_exit}  %e = icmp eq i8 %occ, 0
   %b8 = zext i1 %e to i8
   ret i8 %b8
 }}
 
-define {usize_ty} @__syn_slot_addr_{id}(ptr %s) nounwind{fn_sz} {{
+define {usize_ty} @__syn_slot_addr_{id}(ptr %s){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
+{crit_enter}  %occ_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 3
   %occ = load i8, ptr %occ_p, align 1
   %f0 = getelementptr inbounds {pty}, ptr %s, i32 0, i32 0
   %dp = load ptr, ptr %f0, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  %busy = icmp ne i8 %occ, 0
+{crit_exit}  %busy = icmp ne i8 %occ, 0
   %p_sel = select i1 %busy, ptr %dp, ptr null
   %addr = ptrtoint ptr %p_sel to {usize_ty}
   ret {usize_ty} %addr
-}}
-"#
+}}"#
                     );
                 }
                 MirPrimKind::ByteRing { cap } => {
@@ -3791,8 +3887,8 @@ entry:
                     let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
                     let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
                     let _ = writeln!(
-                        sec,
-                        r#"define i32 @__syn_ring_seg1_{id}(ptr %r) nounwind{fn_sz} {{
+                        out,
+                        r#"define i32 @__syn_ring_seg1_{id}(ptr %r){fn_as} nounwind{fn_sz} {{
 entry:
   %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
@@ -3820,7 +3916,7 @@ no_se:
   ret i32 %res
 }}
 
-define i32 @__syn_ring_free_nolock_{id}(ptr %r) nounwind{fn_sz} {{
+define i32 @__syn_ring_free_nolock_{id}(ptr %r){fn_as} nounwind{fn_sz} {{
 entry:
   %sp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 3
   %se = load i32, ptr %sp, align 4
@@ -3840,15 +3936,13 @@ no_se:
   ret i32 %fs1
 }}
 
-define i32 @__syn_ring_free_space_{id}(ptr %r) nounwind{fn_sz} {{
+define i32 @__syn_ring_free_space_{id}(ptr %r){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %fs = call i32 @__syn_ring_free_nolock_{id}(ptr %r)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 %fs
+{crit_enter}  %fs = {call_kw} i32 @__syn_ring_free_nolock_{id}(ptr %r)
+{crit_exit}  ret i32 %fs
 }}
 
-define void @__syn_ring_advance_{id}(ptr %r, i32 %req) nounwind{fn_sz} {{
+define void @__syn_ring_advance_{id}(ptr %r, i32 %req){fn_as} nounwind{fn_sz} {{
 entry:
   %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
@@ -3857,7 +3951,7 @@ entry:
   %is_z = icmp eq i32 %rem, 0
   br i1 %is_z, label %done, label %chk_all
 chk_all:
-  %s1 = call i32 @__syn_ring_seg1_{id}(ptr %r)
+  %s1 = {call_kw} i32 @__syn_ring_seg1_{id}(ptr %r)
   %is_all = icmp eq i32 %rem, %cnt
   br i1 %is_all, label %all_empty, label %partial
 all_empty:
@@ -3901,7 +3995,7 @@ done:
   ret void
 }}
 
-define void @__syn_ring_wake_{id}(ptr %r, i32 %boost) nounwind{fn_sz} {{
+define void @__syn_ring_wake_{id}(ptr %r, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
   %has_b = icmp sge i32 %boost, 0
   br i1 %has_b, label %chk_b, label %do_wake
@@ -3918,11 +4012,11 @@ set_b:
   store i8 %enc, ptr %bp, align 1
   br label %do_wake
 do_wake:
-  call void @__syn_wake_waiters(ptr %r, i32 %boost)
+  {call_kw} void @__syn_wake_waiters(ptr %r, i32 %boost)
   ret void
 }}
 
-define void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task) nounwind{fn_sz} {{
+define void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
   %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 6
   %enc = load i8, ptr %bp, align 1
@@ -3934,19 +4028,18 @@ apply:
   store i8 0, ptr %bp, align 1
   %enc32 = zext i8 %enc to i32
   %prio = sub i32 %enc32, 1
-  %now = call i32 @__syn_now_ms()
-  call void @__syn_boost_task_ptr(ptr %task, i32 %prio, i32 %now)
+  %now = {call_kw} i32 @__syn_now_ms()
+  {call_kw} void @__syn_boost_task_ptr(ptr %task, i32 %prio, i32 %now)
   br label %done
 done:
   ret void
 }}
 
-define i8 @__syn_ring_push_byte_{id}(ptr %r, i8 %b, i32 %boost) nounwind{fn_sz} {{
+define i8 @__syn_ring_push_byte_{id}(ptr %r, i8 %b, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %gp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
+{crit_enter}  %gp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
   store i32 0, ptr %gp, align 4
-  %fs = call i32 @__syn_ring_free_nolock_{id}(ptr %r)
+  %fs = {call_kw} i32 @__syn_ring_free_nolock_{id}(ptr %r)
   %has = icmp ugt i32 %fs, 0
   br i1 %has, label %do_wr, label %full
 do_wr:
@@ -3966,20 +4059,17 @@ do_wr:
   %cnt = load i32, ptr %cp, align 4
   %nc = add i32 %cnt, 1
   store i32 %nc, ptr %cp, align 4
-  call void @__syn_ring_wake_{id}(ptr %r, i32 %boost)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 1
+  {call_kw} void @__syn_ring_wake_{id}(ptr %r, i32 %boost)
+{crit_exit}  ret i8 1
 full:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
+{crit_exit}  ret i8 0
 }}
 
-define i32 @__syn_ring_push_{id}(ptr %r, ptr %src_ptr, i32 %src_len, i32 %boost) nounwind{fn_sz} {{
+define i32 @__syn_ring_push_{id}(ptr %r, ptr %src_ptr, i32 %src_len, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %gp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
+{crit_enter}  %gp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
   store i32 0, ptr %gp, align 4
-  %fs = call i32 @__syn_ring_free_nolock_{id}(ptr %r)
+  %fs = {call_kw} i32 @__syn_ring_free_nolock_{id}(ptr %r)
   %is_null = icmp eq ptr %src_ptr, null
   %lt = icmp ult i32 %src_len, %fs
   %nw_raw = select i1 %lt, i32 %src_len, i32 %fs
@@ -4015,17 +4105,15 @@ finish:
   %any = icmp ugt i32 %nw, 0
   br i1 %any, label %wake, label %exit
 wake:
-  call void @__syn_ring_wake_{id}(ptr %r, i32 %boost)
+  {call_kw} void @__syn_ring_wake_{id}(ptr %r, i32 %boost)
   br label %exit
 exit:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 %nw
+{crit_exit}  ret i32 %nw
 }}
 
-define {res_slice_ty} @__syn_ring_grant_write_{id}(ptr %r, i32 %req) nounwind{fn_sz} {{
+define {res_slice_ty} @__syn_ring_grant_write_{id}(ptr %r, i32 %req){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-{conv_req}
+{crit_enter}{conv_req}
   %is_z = icmp eq i32 %req, 0
   br i1 %is_z, label %ret_z, label %chk_cap
 ret_z:
@@ -4036,8 +4124,7 @@ ret_z:
   store i32 %tz, ptr %gop_z, align 4
   store i32 0, ptr %gcp_z, align 4
   %pz = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 0
-  call void @__syn_crit_exit(i32 %pm)
-{ok_z}
+{crit_exit}{ok_z}
 chk_cap:
   %too_big = icmp ugt i32 %req, {c}
   br i1 %too_big, label %fail, label %chk_empty
@@ -4058,8 +4145,7 @@ empty_ok:
   store i32 0, ptr %gop0, align 4
   store i32 %req, ptr %gcp0, align 4
   %pz_ok = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 0
-  call void @__syn_crit_exit(i32 %pm)
-  %sl0_e = insertvalue {slice_ty} poison, ptr %pz_ok, 0
+{crit_exit}  %sl0_e = insertvalue {slice_ty} poison, ptr %pz_ok, 0
   %sl1_e = insertvalue {slice_ty} %sl0_e, {usize_ty} %req_u, 1
   %ok_e = insertvalue {res_slice_ty} zeroinitializer, {slice_ty} %sl1_e, 0
   ret {res_slice_ty} %ok_e
@@ -4084,8 +4170,7 @@ ok_b:
   store i32 %t, ptr %gop_b, align 4
   store i32 %req, ptr %gcp_b, align 4
   %pb = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %t
-  call void @__syn_crit_exit(i32 %pm)
-{ok_back}
+{crit_exit}{ok_back}
 try_wrap:
   %fit_wrap = icmp ule i32 %req, %h
   br i1 %fit_wrap, label %ok_w, label %fail
@@ -4095,8 +4180,7 @@ ok_w:
   store i32 0, ptr %gop_w, align 4
   store i32 %req, ptr %gcp_w, align 4
   %pw = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 0
-  call void @__syn_crit_exit(i32 %pm)
-{ok_wrap}
+{crit_exit}{ok_wrap}
 mid_gap:
   %has_se = icmp ugt i32 %se, 0
   %h_gt_t = icmp ugt i32 %h, %t
@@ -4111,18 +4195,15 @@ ok_g:
   store i32 %t, ptr %gop_g, align 4
   store i32 %req, ptr %gcp_g, align 4
   %pg = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %t
-  call void @__syn_crit_exit(i32 %pm)
-{ok_gap}
+{crit_exit}{ok_gap}
 fail:
-  call void @__syn_crit_exit(i32 %pm)
-  %err_r = insertvalue {res_slice_ty} zeroinitializer, i32 1, 1
+{crit_exit}  %err_r = insertvalue {res_slice_ty} zeroinitializer, i32 1, 1
   ret {res_slice_ty} %err_r
 }}
 
-define void @__syn_ring_commit_write_{id}(ptr %r, i32 %req, i32 %boost) nounwind{fn_sz} {{
+define void @__syn_ring_commit_write_{id}(ptr %r, i32 %req, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %gcp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
+{crit_enter}  %gcp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
   %gc = load i32, ptr %gcp, align 4
   store i32 0, ptr %gcp, align 4
   %lt = icmp ult i32 %req, %gc
@@ -4169,62 +4250,53 @@ linear:
   store i32 %nc_l, ptr %cp, align 4
   br label %wake
 wake:
-  call void @__syn_ring_wake_{id}(ptr %r, i32 %boost)
+  {call_kw} void @__syn_ring_wake_{id}(ptr %r, i32 %boost)
   br label %done
 done:
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_exit}  ret void
 }}
 
-define {slice_ty} @__syn_ring_read_slice_{id}(ptr %r) nounwind{fn_sz} {{
+define {slice_ty} @__syn_ring_read_slice_{id}(ptr %r){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %s1 = call i32 @__syn_ring_seg1_{id}(ptr %r)
+{crit_enter}  %s1 = {call_kw} i32 @__syn_ring_seg1_{id}(ptr %r)
   %has = icmp ugt i32 %s1, 0
   %hp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
   %idx = select i1 %has, i32 %h, i32 0
   %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %idx
-  call void @__syn_crit_exit(i32 %pm)
-{conv_s1_r}
+{crit_exit}{conv_s1_r}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
   %sl1 = insertvalue {slice_ty} %sl0, {usize_ty} %s1_u, 1
   ret {slice_ty} %sl1
 }}
 
-define {slice_ty} @__syn_ring_poll_read_{id}(ptr %r, ptr %task) nounwind{fn_sz} {{
+define {slice_ty} @__syn_ring_poll_read_{id}(ptr %r, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %s1 = call i32 @__syn_ring_seg1_{id}(ptr %r)
+{crit_enter}  %s1 = {call_kw} i32 @__syn_ring_seg1_{id}(ptr %r)
   %has = icmp ugt i32 %s1, 0
   br i1 %has, label %ready, label %empty
 ready:
   %hp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
   %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %h
-  call void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
-  call void @__syn_crit_exit(i32 %pm)
-{conv_s1_p}
+  {call_kw} void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
+{crit_exit}{conv_s1_p}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
   %sl1 = insertvalue {slice_ty} %sl0, {usize_ty} %s1_u, 1
   ret {slice_ty} %sl1
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret {slice_ty} zeroinitializer
+{crit_exit}  ret {slice_ty} zeroinitializer
 }}
 
-define void @__syn_ring_consume_{id}(ptr %r, i32 %req) nounwind{fn_sz} {{
+define void @__syn_ring_consume_{id}(ptr %r, i32 %req){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  call void @__syn_ring_advance_{id}(ptr %r, i32 %req)
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_enter}  {call_kw} void @__syn_ring_advance_{id}(ptr %r, i32 %req)
+{crit_exit}  ret void
 }}
 
-define i32 @__syn_ring_pop_{id}(ptr %r, ptr %dst_ptr, i32 %dst_len, ptr %task) nounwind{fn_sz} {{
+define i32 @__syn_ring_pop_{id}(ptr %r, ptr %dst_ptr, i32 %dst_len, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
+{crit_enter}  %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
   %lt = icmp ult i32 %dst_len, %cnt
   %rem_raw = select i1 %lt, i32 %dst_len, i32 %cnt
@@ -4233,7 +4305,7 @@ entry:
   %has = icmp ugt i32 %rem, 0
   br i1 %has, label %do_pop, label %empty
 do_pop:
-  %s1 = call i32 @__syn_ring_seg1_{id}(ptr %r)
+  %s1 = {call_kw} i32 @__syn_ring_seg1_{id}(ptr %r)
   %lt_s1 = icmp ult i32 %rem, %s1
   %c1 = select i1 %lt_s1, i32 %rem, i32 %s1
   %c2 = sub i32 %rem, %c1
@@ -4267,19 +4339,16 @@ b2:
   %i2n = add i32 %i2, 1
   br label %l2
 adv:
-  call void @__syn_ring_advance_{id}(ptr %r, i32 %rem)
-  call void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 %rem
+  {call_kw} void @__syn_ring_advance_{id}(ptr %r, i32 %rem)
+  {call_kw} void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
+{crit_exit}  ret i32 %rem
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 0
+{crit_exit}  ret i32 0
 }}
 
-define {{ i8, i32 }} @__syn_ring_try_pop_byte_{id}(ptr %r, ptr %task) nounwind{fn_sz} {{
+define {{ i8, i32 }} @__syn_ring_try_pop_byte_{id}(ptr %r, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
+{crit_enter}  %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
   %has = icmp ugt i32 %cnt, 0
   br i1 %has, label %ok, label %empty
@@ -4288,21 +4357,18 @@ ok:
   %h = load i32, ptr %hp, align 4
   %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %h
   %b = load i8, ptr %bp, align 1
-  call void @__syn_ring_advance_{id}(ptr %r, i32 1)
-  call void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
-  call void @__syn_crit_exit(i32 %pm)
-  %r0 = insertvalue {{ i8, i32 }} zeroinitializer, i8 %b, 0
+  {call_kw} void @__syn_ring_advance_{id}(ptr %r, i32 1)
+  {call_kw} void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
+{crit_exit}  %r0 = insertvalue {{ i8, i32 }} zeroinitializer, i8 %b, 0
   ret {{ i8, i32 }} %r0
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  %re = insertvalue {{ i8, i32 }} zeroinitializer, i32 1, 1
+{crit_exit}  %re = insertvalue {{ i8, i32 }} zeroinitializer, i32 1, 1
   ret {{ i8, i32 }} %re
 }}
 
-define void @__syn_ring_clear_{id}(ptr %r) nounwind{fn_sz} {{
+define void @__syn_ring_clear_{id}(ptr %r){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %hp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
+{crit_enter}  %hp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %tp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 1
   %cp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 2
   %sp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 3
@@ -4316,17 +4382,11 @@ entry:
   store i32 0, ptr %gop, align 4
   store i32 0, ptr %gcp, align 4
   store i8 0, ptr %bp, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
-}}
-"#
+{crit_exit}  ret void
+}}"#
                     );
                 }
             }
-            if !vis.is_prim_family_contended(pk) {
-                elide_llvm_crit(&mut sec);
-            }
-            out.push_str(&sec);
         }
 
         // Emit capacity-erased unsized `*inbox<T>` view helpers
@@ -4343,13 +4403,12 @@ entry:
             } else {
                 String::new()
             };
-            let mut sec = String::new();
+            let (crit_enter, crit_exit) = crit_pair(vis.is_inbox_view_contended(elem), call_kw);
             let _ = writeln!(
-                sec,
-                r#"define i8 {push_fn}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+                out,
+                r#"define i8 {push_fn}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cnt_p = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 2
+{crit_enter}  %cnt_p = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 2
   %cnt = load i32, ptr %cnt_p, align 4
   %has_c = icmp sgt i32 %cap, 0
   %space = icmp slt i32 %cnt, %cap
@@ -4373,18 +4432,15 @@ do_push:
   store i32 %tnext, ptr %tail_p, align 4
   %c1 = add i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
-  call void @__syn_wake_waiters(ptr %hdr, i32 %boost)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 1
+  {call_kw} void @__syn_wake_waiters(ptr %hdr, i32 %boost)
+{crit_exit}  ret i8 1
 full:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
+{crit_exit}  ret i8 0
 }}
 
-define i8 @__syn_q_view_pop_{key}(ptr %hdr, ptr %items_base, i32 %cap, ptr %out_val, ptr %task) nounwind{fn_sz} {{
+define i8 @__syn_q_view_pop_{key}(ptr %hdr, ptr %items_base, i32 %cap, ptr %out_val, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cnt_p = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 2
+{crit_enter}  %cnt_p = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 2
   %cnt = load i32, ptr %cnt_p, align 4
   %has_c = icmp sgt i32 %cap, 0
   %avail = icmp sgt i32 %cnt, 0
@@ -4409,50 +4465,42 @@ do_pop:
   %has_pb = icmp ne i8 %sb, 0
   br i1 %has_pb, label %apply_pb, label %wake_senders
 apply_pb:
-  %now = call i32 @__syn_now_ms()
+  %now = {call_kw} i32 @__syn_now_ms()
   %sb32 = zext i8 %sb to i32
   %pb32 = sub i32 %sb32, 1
-  call void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
+  {call_kw} void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
   br label %wake_senders
 wake_senders:
   %q_tx = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 1
-  call void @__syn_wake_waiters(ptr %q_tx, i32 -1)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 1
+  {call_kw} void @__syn_wake_waiters(ptr %q_tx, i32 -1)
+{crit_exit}  ret i8 1
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
-}}
-"#
+{crit_exit}  ret i8 0
+}}"#
             );
             if is_lease {
                 let _ = writeln!(
-                    sec,
-                    r#"define i8 @__syn_q_view_push_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost) nounwind{fn_sz} {{
+                    out,
+                    r#"define i8 @__syn_q_view_push_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %ok = call i8 @__syn_q_view_push_keep_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost)
+  %ok = {call_kw} i8 @__syn_q_view_push_keep_{key}(ptr %hdr, ptr %items_base, i32 %cap, {ety} %val, i32 %boost)
   %ok_b = icmp ne i8 %ok, 0
   br i1 %ok_b, label %done, label %drop_lease
 drop_lease:
   %ph = extractvalue {ety} %val, 1
   %idx = extractvalue {ety} %val, 2
-  call void @__syn_pool_release(ptr %ph, i8 %idx, i8 -1)
+  {call_kw} void @__syn_pool_release(ptr %ph, i8 %idx, i8 -1)
   ret i8 0
 done:
   ret i8 1
-}}
-"#
+}}"#
                 );
             }
-            if !vis.is_inbox_view_contended(elem) {
-                elide_llvm_crit(&mut sec);
-            }
-            out.push_str(&sec);
         }
 
         // Emit capacity-erased unsized `*byte_ring` view helpers (pure SSA, zero non-entry allocas)
         if self.uses_byte_ring_view {
-            let mut sec = String::new();
+            let (crit_enter, crit_exit) = crit_pair(vis.is_byte_ring_view_contended(), call_kw);
             let usize_ty = self.opts.target.usize_llvm_ty();
             let slice_ty = format!("{{ ptr, {usize_ty} }}");
             let res_slice_ty = format!("{{ {slice_ty}, i32 }}");
@@ -4476,8 +4524,8 @@ done:
             let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
             let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
             let _ = writeln!(
-                sec,
-                r#"define i32 @__syn_ring_view_seg1(ptr %r, i32 %cap) nounwind{fn_sz} {{
+                out,
+                r#"define i32 @__syn_ring_view_seg1(ptr %r, i32 %cap){fn_as} nounwind{fn_sz} {{
 entry:
   %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
@@ -4505,7 +4553,7 @@ no_se:
   ret i32 %res
 }}
 
-define i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap) nounwind{fn_sz} {{
+define i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap){fn_as} nounwind{fn_sz} {{
 entry:
   %sp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 3
   %se = load i32, ptr %sp, align 4
@@ -4525,15 +4573,13 @@ no_se:
   ret i32 %fs1
 }}
 
-define i32 @__syn_ring_view_free_space(ptr %r, i32 %cap) nounwind{fn_sz} {{
+define i32 @__syn_ring_view_free_space(ptr %r, i32 %cap){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %fs = call i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 %fs
+{crit_enter}  %fs = {call_kw} i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap)
+{crit_exit}  ret i32 %fs
 }}
 
-define void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 %req) nounwind{fn_sz} {{
+define void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 %req){fn_as} nounwind{fn_sz} {{
 entry:
   %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
@@ -4542,7 +4588,7 @@ entry:
   %is_z = icmp eq i32 %rem, 0
   br i1 %is_z, label %done, label %chk_all
 chk_all:
-  %s1 = call i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
+  %s1 = {call_kw} i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
   %is_all = icmp eq i32 %rem, %cnt
   br i1 %is_all, label %all_empty, label %partial
 all_empty:
@@ -4586,7 +4632,7 @@ done:
   ret void
 }}
 
-define void @__syn_ring_view_wake(ptr %r, i32 %boost) nounwind{fn_sz} {{
+define void @__syn_ring_view_wake(ptr %r, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
   %has_b = icmp sge i32 %boost, 0
   br i1 %has_b, label %chk_b, label %do_wake
@@ -4603,19 +4649,17 @@ set_b:
   store i8 %enc, ptr %bp, align 1
   br label %do_wake
 do_wake:
-  call void @__syn_wake_waiters(ptr %r, i32 %boost)
+  {call_kw} void @__syn_wake_waiters(ptr %r, i32 %boost)
   ret void
 }}
 
-define void @__syn_ring_hdr_wake(ptr %r, i32 %boost) nounwind{fn_sz} {{
+define void @__syn_ring_hdr_wake(ptr %r, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  call void @__syn_ring_view_wake(ptr %r, i32 %boost)
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_enter}  {call_kw} void @__syn_ring_view_wake(ptr %r, i32 %boost)
+{crit_exit}  ret void
 }}
 
-define void @__syn_ring_view_apply_boost(ptr %r, ptr %task) nounwind{fn_sz} {{
+define void @__syn_ring_view_apply_boost(ptr %r, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
   %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 6
   %enc = load i8, ptr %bp, align 1
@@ -4627,19 +4671,18 @@ apply:
   store i8 0, ptr %bp, align 1
   %enc32 = zext i8 %enc to i32
   %prio = sub i32 %enc32, 1
-  %now = call i32 @__syn_now_ms()
-  call void @__syn_boost_task_ptr(ptr %task, i32 %prio, i32 %now)
+  %now = {call_kw} i32 @__syn_now_ms()
+  {call_kw} void @__syn_boost_task_ptr(ptr %task, i32 %prio, i32 %now)
   br label %done
 done:
   ret void
 }}
 
-define i8 @__syn_ring_view_push_byte(ptr %r, i32 %cap, i8 %b, i32 %boost) nounwind{fn_sz} {{
+define i8 @__syn_ring_view_push_byte(ptr %r, i32 %cap, i8 %b, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %gp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
+{crit_enter}  %gp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
   store i32 0, ptr %gp, align 4
-  %fs = call i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap)
+  %fs = {call_kw} i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap)
   %has = icmp ugt i32 %fs, 0
   br i1 %has, label %do_wr, label %full
 do_wr:
@@ -4659,20 +4702,17 @@ do_wr:
   %cnt = load i32, ptr %cp, align 4
   %nc = add i32 %cnt, 1
   store i32 %nc, ptr %cp, align 4
-  call void @__syn_ring_view_wake(ptr %r, i32 %boost)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 1
+  {call_kw} void @__syn_ring_view_wake(ptr %r, i32 %boost)
+{crit_exit}  ret i8 1
 full:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i8 0
+{crit_exit}  ret i8 0
 }}
 
-define i32 @__syn_ring_view_push(ptr %r, i32 %cap, ptr %src_ptr, i32 %src_len, i32 %boost) nounwind{fn_sz} {{
+define i32 @__syn_ring_view_push(ptr %r, i32 %cap, ptr %src_ptr, i32 %src_len, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %gp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
+{crit_enter}  %gp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
   store i32 0, ptr %gp, align 4
-  %fs = call i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap)
+  %fs = {call_kw} i32 @__syn_ring_view_free_nolock(ptr %r, i32 %cap)
   %is_null = icmp eq ptr %src_ptr, null
   %lt = icmp ult i32 %src_len, %fs
   %nw_raw = select i1 %lt, i32 %src_len, i32 %fs
@@ -4708,17 +4748,15 @@ finish:
   %any = icmp ugt i32 %nw, 0
   br i1 %any, label %wake, label %exit
 wake:
-  call void @__syn_ring_view_wake(ptr %r, i32 %boost)
+  {call_kw} void @__syn_ring_view_wake(ptr %r, i32 %boost)
   br label %exit
 exit:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 %nw
+{crit_exit}  ret i32 %nw
 }}
 
-define {res_slice_ty} @__syn_ring_view_grant_write(ptr %r, i32 %cap, i32 %req) nounwind{fn_sz} {{
+define {res_slice_ty} @__syn_ring_view_grant_write(ptr %r, i32 %cap, i32 %req){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-{conv_req}
+{crit_enter}{conv_req}
   %is_z = icmp eq i32 %req, 0
   br i1 %is_z, label %ret_z, label %chk_cap
 ret_z:
@@ -4729,8 +4767,7 @@ ret_z:
   store i32 %tz, ptr %gop_z, align 4
   store i32 0, ptr %gcp_z, align 4
   %pz = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 0
-  call void @__syn_crit_exit(i32 %pm)
-{ok_z}
+{crit_exit}{ok_z}
 chk_cap:
   %too_big = icmp ugt i32 %req, %cap
   br i1 %too_big, label %fail, label %chk_empty
@@ -4751,8 +4788,7 @@ empty_ok:
   store i32 0, ptr %gop0, align 4
   store i32 %req, ptr %gcp0, align 4
   %pz_ok = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 0
-  call void @__syn_crit_exit(i32 %pm)
-  %sl0_e = insertvalue {slice_ty} poison, ptr %pz_ok, 0
+{crit_exit}  %sl0_e = insertvalue {slice_ty} poison, ptr %pz_ok, 0
   %sl1_e = insertvalue {slice_ty} %sl0_e, {usize_ty} %req_u, 1
   %ok_e = insertvalue {res_slice_ty} zeroinitializer, {slice_ty} %sl1_e, 0
   ret {res_slice_ty} %ok_e
@@ -4777,8 +4813,7 @@ ok_b:
   store i32 %t, ptr %gop_b, align 4
   store i32 %req, ptr %gcp_b, align 4
   %pb = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %t
-  call void @__syn_crit_exit(i32 %pm)
-{ok_back}
+{crit_exit}{ok_back}
 try_wrap:
   %fit_wrap = icmp ule i32 %req, %h
   br i1 %fit_wrap, label %ok_w, label %fail
@@ -4788,8 +4823,7 @@ ok_w:
   store i32 0, ptr %gop_w, align 4
   store i32 %req, ptr %gcp_w, align 4
   %pw = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 0
-  call void @__syn_crit_exit(i32 %pm)
-{ok_wrap}
+{crit_exit}{ok_wrap}
 mid_gap:
   %has_se = icmp ugt i32 %se, 0
   %h_gt_t = icmp ugt i32 %h, %t
@@ -4804,18 +4838,15 @@ ok_g:
   store i32 %t, ptr %gop_g, align 4
   store i32 %req, ptr %gcp_g, align 4
   %pg = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %t
-  call void @__syn_crit_exit(i32 %pm)
-{ok_gap}
+{crit_exit}{ok_gap}
 fail:
-  call void @__syn_crit_exit(i32 %pm)
-  %err_r = insertvalue {res_slice_ty} zeroinitializer, i32 1, 1
+{crit_exit}  %err_r = insertvalue {res_slice_ty} zeroinitializer, i32 1, 1
   ret {res_slice_ty} %err_r
 }}
 
-define void @__syn_ring_view_commit_write(ptr %r, i32 %cap, i32 %req, i32 %boost) nounwind{fn_sz} {{
+define void @__syn_ring_view_commit_write(ptr %r, i32 %cap, i32 %req, i32 %boost){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %gcp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
+{crit_enter}  %gcp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
   %gc = load i32, ptr %gcp, align 4
   store i32 0, ptr %gcp, align 4
   %lt = icmp ult i32 %req, %gc
@@ -4862,62 +4893,53 @@ linear:
   store i32 %nc_l, ptr %cp, align 4
   br label %wake
 wake:
-  call void @__syn_ring_view_wake(ptr %r, i32 %boost)
+  {call_kw} void @__syn_ring_view_wake(ptr %r, i32 %boost)
   br label %done
 done:
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_exit}  ret void
 }}
 
-define {slice_ty} @__syn_ring_view_read_slice(ptr %r, i32 %cap) nounwind{fn_sz} {{
+define {slice_ty} @__syn_ring_view_read_slice(ptr %r, i32 %cap){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %s1 = call i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
+{crit_enter}  %s1 = {call_kw} i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
   %has = icmp ugt i32 %s1, 0
   %hp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
   %idx = select i1 %has, i32 %h, i32 0
   %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %idx
-  call void @__syn_crit_exit(i32 %pm)
-{conv_s1_r}
+{crit_exit}{conv_s1_r}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
   %sl1 = insertvalue {slice_ty} %sl0, {usize_ty} %s1_u, 1
   ret {slice_ty} %sl1
 }}
 
-define {slice_ty} @__syn_ring_view_poll_read(ptr %r, i32 %cap, ptr %task) nounwind{fn_sz} {{
+define {slice_ty} @__syn_ring_view_poll_read(ptr %r, i32 %cap, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %s1 = call i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
+{crit_enter}  %s1 = {call_kw} i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
   %has = icmp ugt i32 %s1, 0
   br i1 %has, label %ready, label %empty
 ready:
   %hp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
   %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %h
-  call void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
-  call void @__syn_crit_exit(i32 %pm)
-{conv_s1_p}
+  {call_kw} void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
+{crit_exit}{conv_s1_p}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
   %sl1 = insertvalue {slice_ty} %sl0, {usize_ty} %s1_u, 1
   ret {slice_ty} %sl1
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret {slice_ty} zeroinitializer
+{crit_exit}  ret {slice_ty} zeroinitializer
 }}
 
-define void @__syn_ring_view_consume(ptr %r, i32 %cap, i32 %req) nounwind{fn_sz} {{
+define void @__syn_ring_view_consume(ptr %r, i32 %cap, i32 %req){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  call void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 %req)
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
+{crit_enter}  {call_kw} void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 %req)
+{crit_exit}  ret void
 }}
 
-define i32 @__syn_ring_view_pop(ptr %r, i32 %cap, ptr %dst_ptr, i32 %dst_len, ptr %task) nounwind{fn_sz} {{
+define i32 @__syn_ring_view_pop(ptr %r, i32 %cap, ptr %dst_ptr, i32 %dst_len, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
+{crit_enter}  %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
   %lt = icmp ult i32 %dst_len, %cnt
   %rem_raw = select i1 %lt, i32 %dst_len, i32 %cnt
@@ -4926,7 +4948,7 @@ entry:
   %has = icmp ugt i32 %rem, 0
   br i1 %has, label %do_pop, label %empty
 do_pop:
-  %s1 = call i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
+  %s1 = {call_kw} i32 @__syn_ring_view_seg1(ptr %r, i32 %cap)
   %lt_s1 = icmp ult i32 %rem, %s1
   %c1 = select i1 %lt_s1, i32 %rem, i32 %s1
   %c2 = sub i32 %rem, %c1
@@ -4960,19 +4982,16 @@ b2:
   %i2n = add i32 %i2, 1
   br label %l2
 adv:
-  call void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 %rem)
-  call void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 %rem
+  {call_kw} void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 %rem)
+  {call_kw} void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
+{crit_exit}  ret i32 %rem
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  ret i32 0
+{crit_exit}  ret i32 0
 }}
 
-define {{ i8, i32 }} @__syn_ring_view_try_pop_byte(ptr %r, i32 %cap, ptr %task) nounwind{fn_sz} {{
+define {{ i8, i32 }} @__syn_ring_view_try_pop_byte(ptr %r, i32 %cap, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
+{crit_enter}  %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
   %cnt = load i32, ptr %cp, align 4
   %has = icmp ugt i32 %cnt, 0
   br i1 %has, label %ok, label %empty
@@ -4981,21 +5000,18 @@ ok:
   %h = load i32, ptr %hp, align 4
   %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %h
   %b = load i8, ptr %bp, align 1
-  call void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 1)
-  call void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
-  call void @__syn_crit_exit(i32 %pm)
-  %r0 = insertvalue {{ i8, i32 }} zeroinitializer, i8 %b, 0
+  {call_kw} void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 1)
+  {call_kw} void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
+{crit_exit}  %r0 = insertvalue {{ i8, i32 }} zeroinitializer, i8 %b, 0
   ret {{ i8, i32 }} %r0
 empty:
-  call void @__syn_crit_exit(i32 %pm)
-  %re = insertvalue {{ i8, i32 }} zeroinitializer, i32 1, 1
+{crit_exit}  %re = insertvalue {{ i8, i32 }} zeroinitializer, i32 1, 1
   ret {{ i8, i32 }} %re
 }}
 
-define void @__syn_ring_view_clear(ptr %r) nounwind{fn_sz} {{
+define void @__syn_ring_view_clear(ptr %r){fn_as} nounwind{fn_sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  %hp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
+{crit_enter}  %hp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %tp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 1
   %cp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 2
   %sp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 3
@@ -5009,15 +5025,9 @@ entry:
   store i32 0, ptr %gop, align 4
   store i32 0, ptr %gcp, align 4
   store i8 0, ptr %bp, align 1
-  call void @__syn_crit_exit(i32 %pm)
-  ret void
-}}
-"#
+{crit_exit}  ret void
+}}"#
             );
-            if !vis.is_byte_ring_view_contended() {
-                elide_llvm_crit(&mut sec);
-            }
-            out.push_str(&sec);
         }
     }
 
@@ -5061,6 +5071,7 @@ entry:
         if self.module.extern_fns.is_empty() {
             return;
         }
+        let fn_as = self.fn_as();
         let _ = writeln!(out, "; ── Genuine External \"C\" FFI Declarations ──");
         for ext in &self.module.extern_fns {
             let ret = self.llvm_ty(&ext.ret_ty);
@@ -5071,7 +5082,7 @@ entry:
             }
             let _ = writeln!(
                 out,
-                "declare {ret} @{}({}) nounwind",
+                "declare {ret} @{}({}){fn_as} nounwind",
                 sanitize_ident(&ext.name),
                 ps.join(", ")
             );
@@ -5082,6 +5093,7 @@ entry:
     fn emit_isr_ir(&mut self, out: &mut String, isr: &MirIsr) -> Result<(), CodegenError> {
         let sym = format!("@__syn_isr_{}", sanitize_ident(&isr.name));
         let fn_sz = self.opts.fn_size_attrs();
+        let fn_as = self.fn_as();
         let mut param_sig = Vec::new();
         for (idx, &vid) in isr.params.iter().enumerate() {
             let pty = self.llvm_ty(&isr.vars[vid.0].ty);
@@ -5105,7 +5117,7 @@ entry:
         let _ = writeln!(out, "; ── Hardware ISR `{}` ──", isr.name);
         let _ = writeln!(
             out,
-            "define void {sym}({}) nounwind{fn_sz} {{\n{body}}}\n",
+            "define void {sym}({}){fn_as} nounwind{fn_sz} {{\n{body}}}\n",
             param_sig.join(", ")
         );
         Ok(())
@@ -5193,7 +5205,8 @@ entry:
             args.push(format!("ptr @{sym}"));
         }
 
-        Ok(format!("call void {isr_sym}({})", args.join(", ")))
+        let call_kw = self.call_kw();
+        Ok(format!("{call_kw} void {isr_sym}({})", args.join(", ")))
     }
 
     fn emit_irq_vector_dispatchers_ir(&mut self, out: &mut String) -> Result<(), CodegenError> {
@@ -5201,13 +5214,14 @@ entry:
             return Ok(());
         }
         let fn_sz = self.opts.fn_size_attrs().to_string();
+        let fn_as = self.fn_as();
         let vectors: Vec<MirIrqVector> = self.module.irq_vectors.clone();
         let _ = writeln!(out, "; ── Zero-RAM Static Flash IRQ Vector Dispatchers ──");
         for vec in &vectors {
             let irq_num = vec.irq_num;
             let _ = writeln!(
                 out,
-                "define void @__syn_vec_irq_{irq_num}() nounwind{fn_sz} {{"
+                "define void @__syn_vec_irq_{irq_num}(){fn_as} nounwind{fn_sz} {{"
             );
             let _ = writeln!(out, "entry:");
 
@@ -5287,6 +5301,7 @@ entry:
     ) -> Result<(), CodegenError> {
         let sig = self.fn_sigs[&func.name].clone();
         let fn_sz = self.opts.fn_size_attrs();
+        let fn_as = self.fn_as();
         match &func.body {
             MirFnBody::Direct(stmts) => {
                 let mut param_sig = Vec::new();
@@ -5309,7 +5324,7 @@ entry:
                 let body = fb.finish();
                 let _ = writeln!(
                     out,
-                    "define {} {}({}) nounwind{fn_sz} {{\n{body}}}\n",
+                    "define {} {}({}){fn_as} nounwind{fn_sz} {{\n{body}}}\n",
                     sig.ret_llvm_ty,
                     sig.symbol,
                     param_sig.join(", ")
@@ -5328,7 +5343,7 @@ entry:
                 let body = fb.finish();
                 let _ = writeln!(
                     out,
-                    "define i32 {}(ptr %__frame, ptr %__task) nounwind{fn_sz} {{\n{body}}}\n",
+                    "define i32 {}(ptr %__frame, ptr %__task){fn_as} nounwind{fn_sz} {{\n{body}}}\n",
                     sig.symbol
                 );
             }
@@ -5343,6 +5358,7 @@ entry:
     ) -> Result<(), CodegenError> {
         let layout = self.bp_frames[&bp.name].clone();
         let fn_sz = self.opts.fn_size_attrs();
+        let fn_as = self.fn_as();
         let sym = format!("@__syn_task_step_{}", sanitize_ident(&bp.name));
         let mut fb = FnIrBuilder::new(
             self,
@@ -5355,7 +5371,7 @@ entry:
         let body = fb.finish();
         let _ = writeln!(
             out,
-            "define i32 {sym}(ptr %__frame, ptr %__task) nounwind{fn_sz} {{\n{body}}}\n"
+            "define i32 {sym}(ptr %__frame, ptr %__task){fn_as} nounwind{fn_sz} {{\n{body}}}\n"
         );
         Ok(())
     }
@@ -5365,6 +5381,7 @@ entry:
         let boot_present = self.module.boot.present;
         let steps = self.module.boot.steps.clone();
         let fn_sz = self.opts.fn_size_attrs();
+        let fn_as = self.fn_as();
         let mut fb = FnIrBuilder::new(
             self,
             &boot_vars,
@@ -5391,15 +5408,18 @@ entry:
         fb.ensure_terminated_void();
         let body = fb.finish();
         let _ = writeln!(out, "; ── Sequential `fn main()` Boot Phase ──");
-        let _ = writeln!(out, "define void @__syn_boot() nounwind{fn_sz} {{\n{body}}}\n");
+        let _ = writeln!(
+            out,
+            "define void @__syn_boot(){fn_as} nounwind{fn_sz} {{\n{body}}}\n"
+        );
         Ok(())
     }
 
     fn emit_string_constants_ir(&self, out: &mut String) {
-        if self.strings.is_empty() {
+        if self.strings.is_empty() && self.const_blobs.is_empty() {
             return;
         }
-        let _ = writeln!(out, "; ── Pooled String Constants (Flash .rodata) ──");
+        let _ = writeln!(out, "; ── Pooled String & Slice Constants (Flash .rodata) ──");
         for (idx, s) in self.strings.iter().enumerate() {
             let bytes = zev_ast::decoded_string_bytes(s);
             let len = bytes.len() + 1;
@@ -5416,6 +5436,9 @@ entry:
                 out,
                 "@.str.{idx} = private unnamed_addr constant [{len} x i8] c\"{esc}\", align 1"
             );
+        }
+        for (idx, decl_body) in self.const_blobs.iter().enumerate() {
+            let _ = writeln!(out, "@.cblob.{idx} = {decl_body}");
         }
     }
 }
@@ -5596,7 +5619,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             self.emit_line(format!("%__fmt_sink = alloca %SynFmtSink, align {crit_al}"));
         }
         for v in &self.vars.clone() {
-            if v.role == VarRole::IsrState || self.isr_state_ptrs.contains_key(&v.id) {
+            if v.role == VarRole::IsrState
+                || self.isr_state_ptrs.contains_key(&v.id)
+                || v.ty.is_void()
+                || (self.coroutine.is_some() && v.role == VarRole::Param)
+            {
                 continue;
             }
             if let Some(coro) = &self.coroutine {
@@ -5614,6 +5641,24 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let al = self.stack_align(&lty);
             self.emit_line(format!("store {lty} %arg{idx}, ptr %v_{}, align {al}", vid.0));
         }
+    }
+
+    fn call_kw(&self) -> &'static str {
+        self.ctx.call_kw()
+    }
+
+    fn emit_avr_safe_i32_load(&mut self, ptr_repr: &str, contended: bool) -> String {
+        let val = self.next_tmp();
+        if self.ctx.opts.target.is_avr() && contended {
+            let call_kw = self.call_kw();
+            let pm = self.next_tmp();
+            self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
+            self.emit_line(format!("{val} = load volatile i32, ptr {ptr_repr}, align 4"));
+            self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+        } else {
+            self.emit_line(format!("{val} = load volatile i32, ptr {ptr_repr}, align 4"));
+        }
+        val
     }
 
     fn var_ptr(&mut self, vid: VarId) -> String {
@@ -5802,12 +5847,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let eff_p = self.next_tmp();
                 self.emit_line(format!("{p_zero} = icmp eq i32 {}, 0", pv32.repr));
                 self.emit_line(format!("{eff_p} = select i1 {p_zero}, i32 1, i32 {}", pv32.repr));
+                let call_kw = self.call_kw();
                 let dv = self.next_tmp();
                 let now = self.next_tmp();
                 let wdiff = self.next_tmp();
                 let is_over = self.next_tmp();
                 self.emit_line(format!("{dv} = load i32, ptr {dl_ptr}, align 4"));
-                self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                 self.emit_line(format!("{wdiff} = sub i32 {now}, {dv}"));
                 self.emit_line(format!("{is_over} = icmp sge i32 {wdiff}, {eff_p}"));
                 let resync_lbl = self.next_label("every_wresync");
@@ -5872,12 +5918,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn park_task_prim(&mut self, prim_ptr: &str, timeout_tick: Option<&SsaVal>) {
+        let call_kw = self.call_kw();
         let is_null = self.next_tmp();
         let park_lbl = self.next_label("park_prim");
         let after_lbl = self.next_label("after_prim");
         self.emit_line(format!("{is_null} = icmp eq ptr %__task, null"));
         self.emit_term(format!("br i1 {is_null}, label %{after_lbl}, label %{park_lbl}"));
         self.start_block(&park_lbl);
+        self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
         let st_p = self.next_tmp();
         let ht_p = self.next_tmp();
         let wt_p = self.next_tmp();
@@ -5991,8 +6039,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{next_dl} = add i32 {cur_dl}, {eff_p}"));
                 self.emit_line(format!("store i32 {next_dl}, ptr {dl_ptr}, align 4"));
 
+                let call_kw = self.call_kw();
                 let now = self.next_tmp();
-                self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                 let diff = self.next_tmp();
                 self.emit_line(format!("{diff} = sub i32 {now}, {next_dl}"));
                 let is_early = self.next_tmp();
@@ -6012,7 +6061,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("store i32 {resync_dl}, ptr {dl_ptr}, align 4"));
 
                 let share = self.next_tmp();
-                self.emit_line(format!("{share} = call i1 @__syn_should_share(ptr %__task)"));
+                self.emit_line(format!("{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"));
                 let yield_more = self.next_label("every_more");
                 self.emit_term(format!(
                     "br i1 {share}, label %{yield_more}, label %bb_{}",
@@ -6033,11 +6082,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 poll_bb,
                 resume_bb,
             } => {
+                let call_kw = self.call_kw();
                 let dl_ptr = self.var_ptr(*deadline_var);
                 let dl = self.next_tmp();
                 self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                 let now = self.next_tmp();
-                self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                 let diff = self.next_tmp();
                 self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                 let done = self.next_tmp();
@@ -6055,8 +6105,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_term("ret i32 1");
             }
             MirYieldKind::ShareCheckpoint { resume_bb } => {
+                let call_kw = self.call_kw();
                 let share = self.next_tmp();
-                self.emit_line(format!("{share} = call i1 @__syn_should_share(ptr %__task)"));
+                self.emit_line(format!("{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"));
                 let yield_lbl = self.next_label("share_yield");
                 self.emit_term(format!(
                     "br i1 {share}, label %{yield_lbl}, label %bb_{}",
@@ -6115,12 +6166,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 } else {
                     format!("@__syn_q_push_{id}")
                 };
+                let call_kw = self.call_kw();
                 let ptr_al = self.ctx.ptr_align();
                 let v = self.next_tmp();
                 self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 {push_fn}(ptr {qptr}, {ety} {v}, i32 -1)"
+                    "{ok} = {call_kw} i8 {push_fn}(ptr {qptr}, {ety} {v}, i32 -1)"
                 ));
                 let ok_b = self.next_tmp();
                 self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
@@ -6149,7 +6201,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let dl = self.next_tmp();
                     self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                     let now = self.next_tmp();
-                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                     let diff = self.next_tmp();
                     self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                     let exp = self.next_tmp();
@@ -6166,7 +6218,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         self.emit_line(format!("{ph} = extractvalue {ety} {v}, 1"));
                         self.emit_line(format!("{sidx} = extractvalue {ety} {v}, 2"));
                         self.emit_line(format!(
-                            "call void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
+                            "{call_kw} void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
                         ));
                         self.emit_line(format!(
                             "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
@@ -6212,11 +6264,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 poll_bb,
                 resume_bb,
             } => {
+                let call_kw = self.call_kw();
                 let id = sanitize_ident(&MirPrimKind::Signal.mangle_name());
                 let sptr = self.resolve_prim_ptr(target)?;
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr %__task)"
+                    "{ok} = {call_kw} i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr %__task)"
                 ));
                 let got = self.next_tmp();
                 self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
@@ -6238,7 +6291,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let dl = self.next_tmp();
                     self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                     let now = self.next_tmp();
-                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                     let diff = self.next_tmp();
                     self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                     let exp = self.next_tmp();
@@ -6248,6 +6301,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
                     self.start_block(&to_lbl);
+                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
                         let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -6277,6 +6331,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 poll_bb,
                 resume_bb,
             } => {
+                let call_kw = self.call_kw();
                 let pk = MirPrimKind::ByteRing { cap: *cap };
                 let id = sanitize_ident(&pk.mangle_name());
                 let rptr = self.resolve_prim_ptr(target)?;
@@ -6284,7 +6339,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let slice_ty = format!("{{ ptr, {usize_ty} }}");
                 let sl_val = self.next_tmp();
                 self.emit_line(format!(
-                    "{sl_val} = call {slice_ty} @__syn_ring_poll_read_{id}(ptr {rptr}, ptr %__task)"
+                    "{sl_val} = {call_kw} {slice_ty} @__syn_ring_poll_read_{id}(ptr {rptr}, ptr %__task)"
                 ));
                 let sl_len = self.next_tmp();
                 self.emit_line(format!("{sl_len} = extractvalue {slice_ty} {sl_val}, 1"));
@@ -6316,7 +6371,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let dl = self.next_tmp();
                     self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                     let now = self.next_tmp();
-                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                     let diff = self.next_tmp();
                     self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                     let exp = self.next_tmp();
@@ -6326,6 +6381,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
                     self.start_block(&to_lbl);
+                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
                         let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -6355,6 +6411,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 poll_bb,
                 resume_bb,
             } => {
+                let call_kw = self.call_kw();
                 let (hdr, items_base, cap32) = self.emit_inbox_view_parts(view)?;
                 let key = sanitize_ident(&elem_ty.mangle_name());
                 let ety = self.ctx.llvm_ty(elem_ty);
@@ -6363,7 +6420,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_q_view_pop_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, ptr {tmp_elem}, ptr %__task)"
+                    "{ok} = {call_kw} i8 @__syn_q_view_pop_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, ptr {tmp_elem}, ptr %__task)"
                 ));
                 let got = self.next_tmp();
                 self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
@@ -6395,7 +6452,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let dl = self.next_tmp();
                     self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                     let now = self.next_tmp();
-                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                     let diff = self.next_tmp();
                     self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                     let exp = self.next_tmp();
@@ -6405,6 +6462,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
                     self.start_block(&to_lbl);
+                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
                         let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -6444,12 +6502,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 } else {
                     format!("@__syn_q_view_push_{key}")
                 };
+                let call_kw = self.call_kw();
                 let ptr_al = self.ctx.ptr_align();
                 let v = self.next_tmp();
                 self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 {push_fn}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {v}, i32 -1)"
+                    "{ok} = {call_kw} i8 {push_fn}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {v}, i32 -1)"
                 ));
                 let ok_b = self.next_tmp();
                 self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
@@ -6478,7 +6537,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let dl = self.next_tmp();
                     self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                     let now = self.next_tmp();
-                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                     let diff = self.next_tmp();
                     self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                     let exp = self.next_tmp();
@@ -6495,7 +6554,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         self.emit_line(format!("{ph} = extractvalue {ety} {v}, 1"));
                         self.emit_line(format!("{sidx} = extractvalue {ety} {v}, 2"));
                         self.emit_line(format!(
-                            "call void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
+                            "{call_kw} void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
                         ));
                         self.emit_line(format!(
                             "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
@@ -6538,12 +6597,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 poll_bb,
                 resume_bb,
             } => {
+                let call_kw = self.call_kw();
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 let slice_ty = format!("{{ ptr, {usize_ty} }}");
                 let sl_val = self.next_tmp();
                 self.emit_line(format!(
-                    "{sl_val} = call {slice_ty} @__syn_ring_view_poll_read(ptr {hdr}, i32 {cap32}, ptr %__task)"
+                    "{sl_val} = {call_kw} {slice_ty} @__syn_ring_view_poll_read(ptr {hdr}, i32 {cap32}, ptr %__task)"
                 ));
                 let sl_len = self.next_tmp();
                 self.emit_line(format!("{sl_len} = extractvalue {slice_ty} {sl_val}, 1"));
@@ -6575,7 +6635,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let dl = self.next_tmp();
                     self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                     let now = self.next_tmp();
-                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                     let diff = self.next_tmp();
                     self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                     let exp = self.next_tmp();
@@ -6585,6 +6645,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
                     self.start_block(&to_lbl);
+                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
                         let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -6613,6 +6674,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 poll_bb,
                 resume_bb,
             } => {
+                let call_kw = self.call_kw();
                 let pk = MirPrimKind::PingPong {
                     elem: Box::new(elem_ty.clone()),
                     cap: *cap,
@@ -6620,7 +6682,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let id = sanitize_ident(&pk.mangle_name());
                 let pptr = self.resolve_prim_ptr(target)?;
                 let chunk_ptr = self.next_tmp();
-                self.emit_line(format!("{chunk_ptr} = call ptr @__syn_pp_poll_{id}(ptr {pptr})"));
+                self.emit_line(format!("{chunk_ptr} = {call_kw} ptr @__syn_pp_poll_{id}(ptr {pptr})"));
                 let got = self.next_tmp();
                 self.emit_line(format!("{got} = icmp ne ptr {chunk_ptr}, null"));
                 let ok_lbl = self.next_label("pp_ok");
@@ -6653,6 +6715,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 poll_bb,
                 resume_bb,
             } => {
+                let call_kw = self.call_kw();
                 let pk = MirPrimKind::Pool {
                     elem: Box::new(elem_ty.clone()),
                     cap: *cap,
@@ -6665,7 +6728,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_pool_try_alloc_raw_{id}(ptr {pptr}, ptr {tmp})"
+                    "{ok} = {call_kw} i8 @__syn_pool_try_alloc_raw_{id}(ptr {pptr}, ptr {tmp})"
                 ));
                 let got = self.next_tmp();
                 self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
@@ -6697,12 +6760,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_term(format!("br label %bb_{}", resume_bb.0));
 
                 self.start_block(&empty_lbl);
-                if let Some(dl_var) = timeout_deadline_var {
+                let dl_ssa = if let Some(dl_var) = timeout_deadline_var {
                     let dl_ptr = self.var_ptr(*dl_var);
                     let dl = self.next_tmp();
                     self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
                     let now = self.next_tmp();
-                    self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
                     let diff = self.next_tmp();
                     self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
                     let exp = self.next_tmp();
@@ -6712,6 +6775,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
                     self.start_block(&to_lbl);
+                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
                         let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -6724,15 +6788,35 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_term(format!("br label %bb_{}", resume_bb.0));
 
                     self.start_block(&park_lbl);
-                    let dl_ssa = SsaVal::new("i32", dl);
-                    self.park_task_prim(&pptr, Some(&dl_ssa));
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
+                    Some(SsaVal::new("i32", dl))
                 } else {
-                    self.park_task_prim(&pptr, None);
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                }
+                    None
+                };
+                let pm = self.next_tmp();
+                self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
+                let fm_p = self.next_tmp();
+                let fm = self.next_tmp();
+                let has_free = self.next_tmp();
+                self.emit_line(format!(
+                    "{fm_p} = getelementptr inbounds %prim.pool_hdr, ptr {pptr}, i32 0, i32 0"
+                ));
+                self.emit_line(format!("{fm} = load i32, ptr {fm_p}, align 4"));
+                self.emit_line(format!("{has_free} = icmp ne i32 {fm}, 0"));
+                let retry_lbl = self.next_label("pool_retry");
+                let do_park_lbl = self.next_label("pool_do_park");
+                self.emit_term(format!(
+                    "br i1 {has_free}, label %{retry_lbl}, label %{do_park_lbl}"
+                ));
+
+                self.start_block(&retry_lbl);
+                self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                self.emit_term(format!("br label %bb_{}", poll_bb.0));
+
+                self.start_block(&do_park_lbl);
+                self.park_task_prim(&pptr, dl_ssa.as_ref());
+                self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                self.store_coro_pc(poll_bb.0 as i32);
+                self.emit_term("ret i32 1");
             }
             MirYieldKind::CallYielding {
                 callee,
@@ -6813,10 +6897,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let done_lbl = self.next_label("poll_child_done");
                 self.emit_term(format!("br label %{loop_lbl}"));
 
+                let call_kw = self.call_kw();
                 self.start_block(&loop_lbl);
                 let st = self.next_tmp();
                 self.emit_line(format!(
-                    "{st} = call i32 {}(ptr {cptr}, ptr %__task)",
+                    "{st} = {call_kw} i32 {}(ptr {cptr}, ptr %__task)",
                     child_sig.symbol
                 ));
                 let is_done = self.next_tmp();
@@ -6829,7 +6914,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let is_more = self.next_tmp();
                 self.emit_line(format!("{is_more} = icmp eq i32 {st}, 0"));
                 let share = self.next_tmp();
-                self.emit_line(format!("{share} = call i1 @__syn_should_share(ptr %__task)"));
+                self.emit_line(format!("{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"));
                 let not_share = self.next_tmp();
                 self.emit_line(format!("{not_share} = xor i1 {share}, true"));
                 let keep_going = self.next_tmp();
@@ -6896,9 +6981,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let (tmp_elem, al) = self.emit_temp_alloca(&ety);
         self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp_elem}, align {al}"));
 
+        let call_kw = self.call_kw();
         let ok = self.next_tmp();
         self.emit_line(format!(
-            "{ok} = call i8 @__syn_q_pop_{id}(ptr {qptr}, ptr {tmp_elem}, ptr %__task)"
+            "{ok} = {call_kw} i8 @__syn_q_pop_{id}(ptr {qptr}, ptr {tmp_elem}, ptr %__task)"
         ));
         let got = self.next_tmp();
         self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
@@ -6930,7 +7016,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let dl = self.next_tmp();
             self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
             let now = self.next_tmp();
-            self.emit_line(format!("{now} = call i32 @__syn_now_ms()"));
+            self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
             let diff = self.next_tmp();
             self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
             let exp = self.next_tmp();
@@ -6940,6 +7026,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
             self.start_block(&to_lbl);
+            self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
             if let Some(rvid) = dst_res {
                 let rp = self.var_ptr(rvid);
                 let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
@@ -7017,10 +7104,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let done_lbl = self.next_label("boot_done");
         self.emit_term(format!("br label %{loop_lbl}"));
 
+        let call_kw = self.call_kw();
         self.start_block(&loop_lbl);
         let st = self.next_tmp();
         self.emit_line(format!(
-            "{st} = call i32 {}(ptr {fsym}, ptr null)",
+            "{st} = {call_kw} i32 {}(ptr {fsym}, ptr null)",
             child_sig.symbol
         ));
         let done = self.next_tmp();
@@ -7035,7 +7123,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         ));
 
         self.start_block(&sleep_lbl);
-        self.emit_line("call void @__syn_idle_sleep()");
+        self.emit_line(format!("{call_kw} void @__syn_idle_sleep()"));
         self.emit_term(format!("br label %{loop_lbl}"));
 
         self.start_block(&done_lbl);
@@ -7068,7 +7156,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok(())
     }
 
-    fn emit_store_pool_hdr(&mut self, hdr_ptr: &str, cap: usize, dma_safe: bool) {
+    fn emit_store_pool_hdr(&mut self, hdr_ptr: &str, cap: usize, dma_flag: u8) {
         let c = cap.max(1);
         let mask: u32 = if c >= 32 {
             u32::MAX
@@ -7076,7 +7164,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             (1u32 << c) - 1
         };
         let mask_i32 = mask as i32;
-        let dma8 = i8::from(dma_safe);
+        let dma8 = dma_flag as i8;
         let cap8 = c as u8;
         let ptr_al = self.ctx.ptr_align();
         let f0 = self.next_tmp();
@@ -7106,7 +7194,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.emit_line(format!("store i8 {cap8}, ptr {f4}, align 1"));
     }
 
-    fn emit_subsys_pool_inits(&mut self, struct_name: &str, base_ptr: &str) {
+    fn emit_subsys_pool_inits(&mut self, struct_name: &str, base_ptr: &str, parent_dma_safe: bool) {
         let Some(si) = self.ctx.structs.get(struct_name).cloned() else {
             return;
         };
@@ -7114,6 +7202,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let Some(&(fidx, _)) = si.field_indices.get(&f.name) else {
                 continue;
             };
+            let eff_dma = parent_dma_safe || f.dma_safe;
             match &f.ty {
                 MirType::Primitive(MirPrimKind::Pool { cap, .. }) => {
                     let fp = self.next_tmp();
@@ -7121,7 +7210,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         "{fp} = getelementptr inbounds {}, ptr {base_ptr}, i32 0, i32 {fidx}",
                         si.llvm_name
                     ));
-                    self.emit_store_pool_hdr(&fp, *cap, f.dma_safe);
+                    let dma_flag = if eff_dma {
+                        1u8
+                    } else if self.ctx.dma_layout_structs.contains(struct_name) {
+                        2u8
+                    } else {
+                        0u8
+                    };
+                    self.emit_store_pool_hdr(&fp, *cap, dma_flag);
                 }
                 MirType::Struct(sub_name) => {
                     let fp = self.next_tmp();
@@ -7129,7 +7225,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         "{fp} = getelementptr inbounds {}, ptr {base_ptr}, i32 0, i32 {fidx}",
                         si.llvm_name
                     ));
-                    self.emit_subsys_pool_inits(sub_name, &fp);
+                    self.emit_subsys_pool_inits(sub_name, &fp, eff_dma);
                 }
                 _ => {}
             }
@@ -7153,17 +7249,23 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             .collect();
         for (name, cap, dma_safe) in prims {
             let gsym = format!("@__syn_prim_{}", sanitize_ident(&name));
-            self.emit_store_pool_hdr(&gsym, cap, dma_safe);
+            self.emit_store_pool_hdr(&gsym, cap, u8::from(dma_safe));
         }
-        let subs: Vec<(String, String)> = self
+        let subs: Vec<(String, String, bool)> = self
             .ctx
             .module
             .subsystems
             .iter()
-            .map(|s| (s.struct_name.clone(), format!("@__zev_subsys_{}", sanitize_ident(&s.name))))
+            .map(|s| {
+                (
+                    s.struct_name.clone(),
+                    format!("@__zev_subsys_{}", sanitize_ident(&s.name)),
+                    s.dma_safe,
+                )
+            })
             .collect();
-        for (sname, gsym) in subs {
-            self.emit_subsys_pool_inits(&sname, &gsym);
+        for (sname, gsym, dma_safe) in subs {
+            self.emit_subsys_pool_inits(&sname, &gsym, dma_safe);
         }
     }
 
@@ -7225,8 +7327,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let prio = sp.priority.as_u8();
         let core = sp.core_pin.map_or(-1i8, |c| c as i8);
         let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
+        let call_kw = self.call_kw();
         self.emit_line(format!(
-            "call void @__syn_activate_task(i32 {slot_id}, {fn_ptr_ty} {step_sym}, ptr {fsym}, i8 {prio}, i8 {core})"
+            "{call_kw} void @__syn_activate_task(i32 {slot_id}, {fn_ptr_ty} {step_sym}, ptr {fsym}, i8 {prio}, i8 {core})"
         ));
         Ok(())
     }
@@ -7352,7 +7455,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let lty = self.ctx.llvm_ty(&host_ty);
                 let dst_signed = !host_ty.is_unsigned();
                 let rhs = self.emit_expr(value)?;
-                let rhs_c = self.coerce(rhs, &lty, !value.ty.is_unsigned());
+                let rhs_signed = if matches!(op, MirAssignOp::ShlAssign | MirAssignOp::ShrAssign) {
+                    false
+                } else {
+                    !value.ty.is_unsigned()
+                };
+                let rhs_c = self.coerce(rhs, &lty, rhs_signed);
 
                 let final_host = if *op == MirAssignOp::Assign {
                     rhs_c
@@ -7394,18 +7502,21 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("store i8 {value}, ptr @{sym}, align 1"));
             }
             MirStmt::EnterCritical => {
+                let call_kw = self.call_kw();
                 let pm = self.next_tmp();
-                self.emit_line(format!("{pm} = call i32 @__syn_crit_enter()"));
+                self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
                 self.emit_line(format!("store i32 {pm}, ptr %__crit_pm, align 4"));
             }
             MirStmt::ExitCritical => {
+                let call_kw = self.call_kw();
                 let pm = self.next_tmp();
                 self.emit_line(format!("{pm} = load i32, ptr %__crit_pm, align 4"));
-                self.emit_line(format!("call void @__syn_crit_exit(i32 {pm})"));
+                self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
             }
             MirStmt::EndInboxTurn => {
                 if self.coroutine.is_some() {
-                    self.emit_line("call void @__syn_end_inbox_turn(ptr %__task)");
+                    let call_kw = self.call_kw();
+                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
                 }
             }
             MirStmt::If {
@@ -7521,12 +7632,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_boot_spawn_activate(*slot_id, args)?;
             }
             MirStmt::PrintFmt { chunks, newline } => {
-                self.emit_line("call void @__syn_fmt_init_uart(ptr %__fmt_sink)");
+                let call_kw = self.call_kw();
+                self.emit_line(format!("{call_kw} void @__syn_fmt_init_uart(ptr %__fmt_sink)"));
                 for ch in chunks {
                     self.emit_fmt_chunk("%__fmt_sink", ch)?;
                 }
                 if *newline {
-                    self.emit_line("call void @__syn_fmt_putc(ptr %__fmt_sink, i8 10)");
+                    self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr %__fmt_sink, i8 10)"));
                 }
             }
             MirStmt::FmtBuf {
@@ -7534,6 +7646,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 buf,
                 chunks,
             } => {
+                let call_kw = self.call_kw();
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let bv = self.emit_expr(buf)?;
@@ -7543,7 +7656,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{blen} = extractvalue {sl_ty} {}, 1", bv.repr));
                 let cap32 = self.coerce(SsaVal::new(&usize_ty, blen), "i32", false);
                 self.emit_line(format!(
-                    "call void @__syn_fmt_init_buf(ptr %__fmt_sink, ptr {bptr}, i32 {})",
+                    "{call_kw} void @__syn_fmt_init_buf(ptr %__fmt_sink, ptr {bptr}, i32 {})",
                     cap32.repr
                 ));
                 for ch in chunks {
@@ -7592,10 +7705,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 chunks,
                 boost,
             } => {
+                let call_kw = self.call_kw();
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(ring)?;
                 self.emit_line(format!(
-                    "call void @__syn_fmt_init_ring(ptr %__fmt_sink, ptr {hdr}, i32 {cap32})"
+                    "{call_kw} void @__syn_fmt_init_ring(ptr %__fmt_sink, ptr {hdr}, i32 {cap32})"
                 ));
                 for ch in chunks {
                     self.emit_fmt_chunk("%__fmt_sink", ch)?;
@@ -7620,7 +7734,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.start_block(&wake_lbl);
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 self.emit_line(format!(
-                    "call void @__syn_ring_hdr_wake(ptr {hdr}, i32 {b})"
+                    "{call_kw} void @__syn_ring_hdr_wake(ptr {hdr}, i32 {b})"
                 ));
                 self.emit_term(format!("br label %{done_lbl}"));
                 self.start_block(&done_lbl);
@@ -7645,6 +7759,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn emit_fmt_chunk(&mut self, sink: &str, ch: &MirFmtChunk) -> Result<(), CodegenError> {
+        let call_kw = self.call_kw();
         let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
         match ch {
             MirFmtChunk::Literal(s) => {
@@ -7654,12 +7769,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
                 if bytes.len() == 1 {
                     let b = bytes[0] as i8;
-                    self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 {b})"));
+                    self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 {b})"));
                 } else {
                     let idx = self.ctx.intern_string(s);
                     let slen = bytes.len() as i32;
                     self.emit_line(format!(
-                        "call void @__syn_fmt_bytes(ptr {sink}, ptr @.str.{idx}, i32 {slen})"
+                        "{call_kw} void @__syn_fmt_bytes(ptr {sink}, ptr @.str.{idx}, i32 {slen})"
                     ));
                 }
             }
@@ -7682,7 +7797,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                                 "@__syn_fmt_u64_dec"
                             };
                             self.emit_line(format!(
-                                "call void {fn_sym}(ptr {sink}, i64 {})",
+                                "{call_kw} void {fn_sym}(ptr {sink}, i64 {})",
                                 v64.repr
                             ));
                         } else {
@@ -7693,7 +7808,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                                 "@__syn_fmt_u32_dec"
                             };
                             self.emit_line(format!(
-                                "call void {fn_sym}(ptr {sink}, i32 {})",
+                                "{call_kw} void {fn_sym}(ptr {sink}, i32 {})",
                                 v32.repr
                             ));
                         }
@@ -7714,13 +7829,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let w = i32::from(*zero_pad_width);
                         if narrow_ty == "i64" {
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u64_hex(ptr {sink}, i64 {}, i8 {up}, i32 {w})",
+                                "{call_kw} void @__syn_fmt_u64_hex(ptr {sink}, i64 {}, i8 {up}, i32 {w})",
                                 nv.repr
                             ));
                         } else {
                             let u32v = self.coerce(nv, "i32", false);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u32_hex(ptr {sink}, i32 {}, i8 {up}, i32 {w})",
+                                "{call_kw} void @__syn_fmt_u32_hex(ptr {sink}, i32 {}, i8 {up}, i32 {w})",
                                 u32v.repr
                             ));
                         }
@@ -7737,13 +7852,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let w = i32::from(*zero_pad_width);
                         if narrow_ty == "i64" {
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u64_bin(ptr {sink}, i64 {}, i32 {w})",
+                                "{call_kw} void @__syn_fmt_u64_bin(ptr {sink}, i64 {}, i32 {w})",
                                 nv.repr
                             ));
                         } else {
                             let u32v = self.coerce(nv, "i32", false);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u32_bin(ptr {sink}, i32 {}, i32 {w})",
+                                "{call_kw} void @__syn_fmt_u32_bin(ptr {sink}, i32 {}, i32 {w})",
                                 u32v.repr
                             ));
                         }
@@ -7758,13 +7873,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         if *is_f64 {
                             let dv = self.coerce(vv, "double", true);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_f64_fixed(ptr {sink}, double {}, i32 {p})",
+                                "{call_kw} void @__syn_fmt_f64_fixed(ptr {sink}, double {}, i32 {p})",
                                 dv.repr
                             ));
                         } else {
                             let fv = self.coerce(vv, "float", true);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_f32_fixed(ptr {sink}, float {}, i32 {p})",
+                                "{call_kw} void @__syn_fmt_f32_fixed(ptr {sink}, float {}, i32 {p})",
                                 fv.repr
                             ));
                         }
@@ -7774,13 +7889,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         if *is_f64 {
                             let dv = self.coerce(vv, "double", true);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_f64_sci(ptr {sink}, double {}, i32 {p})",
+                                "{call_kw} void @__syn_fmt_f64_sci(ptr {sink}, double {}, i32 {p})",
                                 dv.repr
                             ));
                         } else {
                             let fv = self.coerce(vv, "float", true);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_f32_sci(ptr {sink}, float {}, i32 {p})",
+                                "{call_kw} void @__syn_fmt_f32_sci(ptr {sink}, float {}, i32 {p})",
                                 fv.repr
                             ));
                         }
@@ -7792,13 +7907,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b1 = self.to_i1(vv);
                 let b8 = self.next_tmp();
                 self.emit_line(format!("{b8} = zext i1 {b1} to i8"));
-                self.emit_line(format!("call void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
+                self.emit_line(format!("{call_kw} void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
             }
             MirFmtChunk::Str(value) => {
                 let vv = self.emit_expr(value)?;
                 let p = self.coerce_str_ptr(vv);
                 self.emit_line(format!(
-                    "call void @__syn_fmt_cstr(ptr {sink}, ptr {})",
+                    "{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {})",
                     p.repr
                 ));
             }
@@ -7811,7 +7926,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{dl} = extractvalue {sl_ty} {}, 1", sv.repr));
                 let dl32 = self.coerce(SsaVal::new(&usize_ty, dl), "i32", false);
                 self.emit_line(format!(
-                    "call void @__syn_fmt_bytes(ptr {sink}, ptr {dp}, i32 {})",
+                    "{call_kw} void @__syn_fmt_bytes(ptr {sink}, ptr {dp}, i32 {})",
                     dl32.repr
                 ));
             }
@@ -7821,10 +7936,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let eid = sanitize_ident(enum_name);
                 let np = self.next_tmp();
                 self.emit_line(format!(
-                    "{np} = call ptr @__syn_enum_name_{eid}(i32 {})",
+                    "{np} = {call_kw} ptr @__syn_enum_name_{eid}(i32 {})",
                     v32.repr
                 ));
-                self.emit_line(format!("call void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
+                self.emit_line(format!("{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
             }
             MirFmtChunk::DebugSlice { elem_ty, slice } => {
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
@@ -7838,7 +7953,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let dl = self.next_tmp();
                 self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", sv.repr));
                 self.emit_line(format!("{dl} = extractvalue {sl_ty} {}, 1", sv.repr));
-                self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 91)"));
+                self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 91)"));
 
                 let (idx_slot, idx_al) = self.emit_temp_alloca(&usize_ty);
                 self.emit_line(format!("store {usize_ty} 0, ptr {idx_slot}, align {idx_al}"));
@@ -7865,7 +7980,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
                 self.start_block(&sep_lbl);
                 self.emit_line(format!(
-                    "call void @__syn_fmt_bytes(ptr {sink}, ptr @.str.{sep_idx}, i32 2)"
+                    "{call_kw} void @__syn_fmt_bytes(ptr {sink}, ptr @.str.{sep_idx}, i32 2)"
                 ));
                 self.emit_term(format!("br label %{val_lbl}"));
 
@@ -7880,19 +7995,19 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let b1 = self.to_i1(ev);
                         let b8 = self.next_tmp();
                         self.emit_line(format!("{b8} = zext i1 {b1} to i8"));
-                        self.emit_line(format!("call void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
+                        self.emit_line(format!("{call_kw} void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
                     }
                     MirType::F32 => {
                         let fv = self.coerce(ev, "float", true);
                         self.emit_line(format!(
-                            "call void @__syn_fmt_f32_fixed(ptr {sink}, float {}, i32 2)",
+                            "{call_kw} void @__syn_fmt_f32_fixed(ptr {sink}, float {}, i32 2)",
                             fv.repr
                         ));
                     }
                     MirType::F64 => {
                         let dv = self.coerce(ev, "double", true);
                         self.emit_line(format!(
-                            "call void @__syn_fmt_f64_fixed(ptr {sink}, double {}, i32 2)",
+                            "{call_kw} void @__syn_fmt_f64_fixed(ptr {sink}, double {}, i32 2)",
                             dv.repr
                         ));
                     }
@@ -7901,31 +8016,31 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let eid = sanitize_ident(ename);
                         let np = self.next_tmp();
                         self.emit_line(format!(
-                            "{np} = call ptr @__syn_enum_name_{eid}(i32 {})",
+                            "{np} = {call_kw} ptr @__syn_enum_name_{eid}(i32 {})",
                             v32.repr
                         ));
-                        self.emit_line(format!("call void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
+                        self.emit_line(format!("{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
                     }
                     MirType::Str => {
                         let p = self.coerce_str_ptr(ev);
                         self.emit_line(format!(
-                            "call void @__syn_fmt_cstr(ptr {sink}, ptr {})",
+                            "{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {})",
                             p.repr
                         ));
                     }
                     MirType::Ptr(_) => {
-                        self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 48)"));
-                        self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 120)"));
+                        self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 48)"));
+                        self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 120)"));
                         if self.ctx.opts.target.ptr_bits() == 64 {
                             let addr64 = self.coerce(ev, "i64", false);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u64_hex(ptr {sink}, i64 {}, i8 0, i32 1)",
+                                "{call_kw} void @__syn_fmt_u64_hex(ptr {sink}, i64 {}, i8 0, i32 1)",
                                 addr64.repr
                             ));
                         } else {
                             let addr32 = self.coerce(ev, "i32", false);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u32_hex(ptr {sink}, i32 {}, i8 0, i32 1)",
+                                "{call_kw} void @__syn_fmt_u32_hex(ptr {sink}, i32 {}, i8 0, i32 1)",
                                 addr32.repr
                             ));
                         }
@@ -7937,21 +8052,21 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         self.emit_line(format!("{sln} = extractvalue {sl_ty} {}, 1", ev.repr));
                         let sln32 = self.coerce(SsaVal::new(&usize_ty, sln), "i32", false);
                         self.emit_line(format!(
-                            "call void @__syn_fmt_bytes(ptr {sink}, ptr {sp}, i32 {})",
+                            "{call_kw} void @__syn_fmt_bytes(ptr {sink}, ptr {sp}, i32 {})",
                             sln32.repr
                         ));
                     }
                     MirType::I64 => {
                         let v64 = self.coerce(ev, "i64", true);
                         self.emit_line(format!(
-                            "call void @__syn_fmt_i64_dec(ptr {sink}, i64 {})",
+                            "{call_kw} void @__syn_fmt_i64_dec(ptr {sink}, i64 {})",
                             v64.repr
                         ));
                     }
                     MirType::U64 => {
                         let v64 = self.coerce(ev, "i64", false);
                         self.emit_line(format!(
-                            "call void @__syn_fmt_u64_dec(ptr {sink}, i64 {})",
+                            "{call_kw} void @__syn_fmt_u64_dec(ptr {sink}, i64 {})",
                             v64.repr
                         ));
                     }
@@ -7965,13 +8080,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         {
                             let v64 = self.coerce(ev, "i64", true);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_i64_dec(ptr {sink}, i64 {})",
+                                "{call_kw} void @__syn_fmt_i64_dec(ptr {sink}, i64 {})",
                                 v64.repr
                             ));
                         } else {
                             let v32 = self.coerce(ev, "i32", true);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_i32_dec(ptr {sink}, i32 {})",
+                                "{call_kw} void @__syn_fmt_i32_dec(ptr {sink}, i32 {})",
                                 v32.repr
                             ));
                         }
@@ -7982,13 +8097,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         {
                             let v64 = self.coerce(ev, "i64", false);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u64_dec(ptr {sink}, i64 {})",
+                                "{call_kw} void @__syn_fmt_u64_dec(ptr {sink}, i64 {})",
                                 v64.repr
                             ));
                         } else {
                             let v32 = self.coerce(ev, "i32", false);
                             self.emit_line(format!(
-                                "call void @__syn_fmt_u32_dec(ptr {sink}, i32 {})",
+                                "{call_kw} void @__syn_fmt_u32_dec(ptr {sink}, i32 {})",
                                 v32.repr
                             ));
                         }
@@ -8000,7 +8115,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_term(format!("br label %{cond_lbl}"));
 
                 self.start_block(&end_lbl);
-                self.emit_line(format!("call void @__syn_fmt_putc(ptr {sink}, i8 93)"));
+                self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 93)"));
             }
         }
         Ok(())
@@ -8013,7 +8128,6 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         rhs: &SsaVal,
         signed: bool,
     ) -> SsaVal {
-        let t = self.next_tmp();
         let ty = &lhs.ty;
         if ty == "float" || ty == "double" {
             let finst = match op {
@@ -8025,9 +8139,15 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 MirAssignOp::RemAssign => "frem",
                 _ => "fadd",
             };
+            let t = self.next_tmp();
             self.emit_line(format!("{t} = {finst} {ty} {}, {}", lhs.repr, rhs.repr));
             return SsaVal::new(ty, t);
         }
+        let rv = if matches!(op, MirAssignOp::ShlAssign | MirAssignOp::ShrAssign) {
+            self.coerce(rhs.clone(), ty, false)
+        } else {
+            rhs.clone()
+        };
         let inst = match op {
             MirAssignOp::Assign => unreachable!(),
             MirAssignOp::AddAssign => "add",
@@ -8059,7 +8179,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
             }
         };
-        self.emit_line(format!("{t} = {inst} {ty} {}, {}", lhs.repr, rhs.repr));
+        let t = self.next_tmp();
+        self.emit_line(format!("{t} = {inst} {ty} {}, {}", lhs.repr, rv.repr));
         SsaVal::new(ty, t)
     }
 
@@ -8104,6 +8225,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn emit_prim_nonblocking(&mut self, pop: &MirPrimNonBlockingOp) -> Result<(), CodegenError> {
+        let call_kw = self.call_kw();
         match pop {
             MirPrimNonBlockingOp::WatchPublish {
                 target,
@@ -8131,7 +8253,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let vv = self.emit_expr(value)?;
                 let vc = self.coerce(vv, &ety, !value.ty.is_unsigned());
                 self.emit_line(format!(
-                    "call void @__syn_watch_pub_{id}(ptr {wptr}, {ety} {})",
+                    "{call_kw} void @__syn_watch_pub_{id}(ptr {wptr}, {ety} {})",
                     vc.repr
                 ));
             }
@@ -8154,7 +8276,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let ign = self.next_tmp();
                 self.emit_line(format!(
-                    "{ign} = call i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {}, i32 {b})",
+                    "{ign} = {call_kw} i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {}, i32 {b})",
                     vc.repr
                 ));
             }
@@ -8162,7 +8284,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let id = sanitize_ident(&MirPrimKind::Signal.mangle_name());
                 let sptr = self.resolve_prim_ptr(target)?;
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
-                self.emit_line(format!("call void @__syn_sig_notify_{id}(ptr {sptr}, i32 {b})"));
+                self.emit_line(format!("{call_kw} void @__syn_sig_notify_{id}(ptr {sptr}, i32 {b})"));
             }
             MirPrimNonBlockingOp::SignalClear { target } => {
                 let sptr = self.resolve_prim_ptr(target)?;
@@ -8183,7 +8305,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let id = sanitize_ident(&pk.mangle_name());
                 let pptr = self.resolve_prim_ptr(target)?;
-                self.emit_line(format!("call void @__syn_pp_flip_{id}(ptr {pptr})"));
+                self.emit_line(format!("{call_kw} void @__syn_pp_flip_{id}(ptr {pptr})"));
             }
             MirPrimNonBlockingOp::PingPongSetActive {
                 target,
@@ -8199,7 +8321,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pptr = self.resolve_prim_ptr(target)?;
                 let act = i8::from(*active);
                 self.emit_line(format!(
-                    "call void @__syn_pp_set_active_{id}(ptr {pptr}, i8 {act})"
+                    "{call_kw} void @__syn_pp_set_active_{id}(ptr {pptr}, i8 {act})"
                 ));
             }
             MirPrimNonBlockingOp::LeaseRelease { value, boost, .. } => {
@@ -8210,7 +8332,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{idx} = extractvalue {{ ptr, ptr, i8 }} {}, 2", lv.repr));
                 let b = boost.map_or(-1i8, |p| p.as_u8() as i8);
                 self.emit_line(format!(
-                    "call void @__syn_pool_release(ptr {ph}, i8 {idx}, i8 {b})"
+                    "{call_kw} void @__syn_pool_release(ptr {ph}, i8 {idx}, i8 {b})"
                 ));
             }
             MirPrimNonBlockingOp::LeaseNullify { target, .. } => {
@@ -8229,7 +8351,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let lv = self.emit_expr(len)?;
                 let l32 = self.coerce(lv, "i32", false);
                 self.emit_line(format!(
-                    "call void @__syn_ring_consume_{id}(ptr {rptr}, i32 {})",
+                    "{call_kw} void @__syn_ring_consume_{id}(ptr {rptr}, i32 {})",
                     l32.repr
                 ));
             }
@@ -8246,7 +8368,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let l32 = self.coerce(lv, "i32", false);
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 self.emit_line(format!(
-                    "call void @__syn_ring_commit_write_{id}(ptr {rptr}, i32 {}, i32 {b})",
+                    "{call_kw} void @__syn_ring_commit_write_{id}(ptr {rptr}, i32 {}, i32 {b})",
                     l32.repr
                 ));
             }
@@ -8254,7 +8376,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pk = MirPrimKind::ByteRing { cap: *cap };
                 let id = sanitize_ident(&pk.mangle_name());
                 let rptr = self.resolve_prim_ptr(target)?;
-                self.emit_line(format!("call void @__syn_ring_clear_{id}(ptr {rptr})"));
+                self.emit_line(format!("{call_kw} void @__syn_ring_clear_{id}(ptr {rptr})"));
             }
             MirPrimNonBlockingOp::InboxViewPost {
                 view,
@@ -8270,7 +8392,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let ign = self.next_tmp();
                 self.emit_line(format!(
-                    "{ign} = call i8 @__syn_q_view_push_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {}, i32 {b})",
+                    "{ign} = {call_kw} i8 @__syn_q_view_push_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {}, i32 {b})",
                     vc.repr
                 ));
             }
@@ -8279,7 +8401,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let lv = self.emit_expr(len)?;
                 let l32 = self.coerce(lv, "i32", false);
                 self.emit_line(format!(
-                    "call void @__syn_ring_view_consume(ptr {hdr}, i32 {cap32}, i32 {})",
+                    "{call_kw} void @__syn_ring_view_consume(ptr {hdr}, i32 {cap32}, i32 {})",
                     l32.repr
                 ));
             }
@@ -8289,28 +8411,29 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let l32 = self.coerce(lv, "i32", false);
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 self.emit_line(format!(
-                    "call void @__syn_ring_view_commit_write(ptr {hdr}, i32 {cap32}, i32 {}, i32 {b})",
+                    "{call_kw} void @__syn_ring_view_commit_write(ptr {hdr}, i32 {cap32}, i32 {}, i32 {b})",
                     l32.repr
                 ));
             }
             MirPrimNonBlockingOp::ByteRingViewClear { view } => {
                 let (hdr, _) = self.emit_byte_ring_view_parts(view)?;
-                self.emit_line(format!("call void @__syn_ring_view_clear(ptr {hdr})"));
+                self.emit_line(format!("{call_kw} void @__syn_ring_view_clear(ptr {hdr})"));
             }
         }
         Ok(())
     }
 
     fn emit_intrinsic(&mut self, iop: &MirIntrinsicOp) -> Result<(), CodegenError> {
+        let call_kw = self.call_kw();
         match iop {
             MirIntrinsicOp::UseSystick { hz } => {
                 let hv = self.emit_expr(hz)?;
                 let h32 = self.coerce(hv, "i32", false);
-                self.emit_line(format!("call void @__syn_use_systick(i32 {})", h32.repr));
+                self.emit_line(format!("{call_kw} void @__syn_use_systick(i32 {})", h32.repr));
             }
             MirIntrinsicOp::SetPriority { prio } => {
                 let p = prio.as_u8() as i32;
-                self.emit_line(format!("call void @__syn_set_priority(i32 {p})"));
+                self.emit_line(format!("{call_kw} void @__syn_set_priority(i32 {p})"));
             }
             MirIntrinsicOp::SysOp { method, args } => {
                 let mut ev = Vec::new();
@@ -8324,14 +8447,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         } else {
                             "0".to_string()
                         };
-                        self.emit_line(format!("call void @__syn_platform_exit(i32 {code})"));
+                        self.emit_line(format!("{call_kw} void @__syn_platform_exit(i32 {code})"));
                         self.emit_term("unreachable");
                     }
                     "pend_irq" => {
                         if let Some((irq, _)) = ev.first() {
                             let i32v = self.coerce(irq.clone(), "i32", false);
                             self.emit_line(format!(
-                                "call void @__syn_nvic_pend_irq(i32 {})",
+                                "{call_kw} void @__syn_nvic_pend_irq(i32 {})",
                                 i32v.repr
                             ));
                         }
@@ -8339,28 +8462,28 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "use_systick" => {
                         if let Some((hz, _)) = ev.first() {
                             let h32 = self.coerce(hz.clone(), "i32", false);
-                            self.emit_line(format!("call void @__syn_use_systick(i32 {})", h32.repr));
+                            self.emit_line(format!("{call_kw} void @__syn_use_systick(i32 {})", h32.repr));
                         }
                     }
                     "now_ms" | "now_ticks" => {
                         let ign = self.next_tmp();
-                        self.emit_line(format!("{ign} = call i32 @__syn_now_ms()"));
+                        self.emit_line(format!("{ign} = {call_kw} i32 @__syn_now_ms()"));
                     }
                     "puts" | "print" => {
                         if let Some((s, _)) = ev.first() {
                             let p = self.coerce_str_ptr(s.clone());
-                            self.emit_line(format!("call void @__syn_uart_puts(ptr {})", p.repr));
+                            self.emit_line(format!("{call_kw} void @__syn_uart_puts(ptr {})", p.repr));
                         }
                     }
                     "println" | "log" => {
                         if let Some((s, _)) = ev.first() {
                             let p = self.coerce_str_ptr(s.clone());
                             self.emit_line(format!(
-                                "call void @__syn_uart_println(ptr {})",
+                                "{call_kw} void @__syn_uart_println(ptr {})",
                                 p.repr
                             ));
                         } else {
-                            self.emit_line("call void @__syn_uart_putc(i8 10)");
+                            self.emit_line(format!("{call_kw} void @__syn_uart_putc(i8 10)"));
                         }
                     }
                     "log_kv" => {
@@ -8368,7 +8491,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             let p = self.coerce_str_ptr(lbl.clone());
                             let v32 = self.coerce(val.clone(), "i32", !vty.is_unsigned());
                             self.emit_line(format!(
-                                "call void @__syn_uart_kv(ptr {}, i32 {})",
+                                "{call_kw} void @__syn_uart_kv(ptr {}, i32 {})",
                                 p.repr, v32.repr
                             ));
                         }
@@ -8378,16 +8501,16 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             let p = self.coerce_str_ptr(lbl.clone());
                             let v32 = self.coerce(val.clone(), "i32", false);
                             self.emit_line(format!(
-                                "call void @__syn_uart_log_hex(ptr {}, i32 {})",
+                                "{call_kw} void @__syn_uart_log_hex(ptr {}, i32 {})",
                                 p.repr, v32.repr
                             ));
                         }
                     }
                     "tick" | "tick_ms" => {
-                        self.emit_line("call void @__syn_sys_tick()");
+                        self.emit_line(format!("{call_kw} void @__syn_sys_tick()"));
                     }
                     "set_putc" => {
-                        let elide = self.ctx.opts.target == TargetArch::AvrAtmega4809
+                        let elide = self.ctx.opts.target.is_avr()
                             && matches!(
                                 self.ctx.avr_mega0_putc,
                                 AvrMega0PutcMode::DirectStatic {
@@ -8442,21 +8565,17 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let ptr_tmp = if let Some(idx_expr) = index {
             let iv = self.emit_expr(idx_expr)?;
             let idx_val = self.coerce(iv, idx_ty, !idx_expr.ty.is_unsigned()).repr;
-            let eff_idx = if is_host64 {
-                if let Some(alen) = array_len {
-                    if alen == 0 {
-                        "0".to_string()
-                    } else {
-                        let inb = self.next_tmp();
-                        let clamped = self.next_tmp();
-                        self.emit_line(format!("{inb} = icmp ult i64 {idx_val}, {alen}"));
-                        self.emit_line(format!(
-                            "{clamped} = select i1 {inb}, i64 {idx_val}, i64 0"
-                        ));
-                        clamped
-                    }
+            let eff_idx = if let Some(alen) = array_len {
+                if alen == 0 {
+                    "0".to_string()
                 } else {
-                    idx_val
+                    let inb = self.next_tmp();
+                    let clamped = self.next_tmp();
+                    self.emit_line(format!("{inb} = icmp ult {idx_ty} {idx_val}, {alen}"));
+                    self.emit_line(format!(
+                        "{clamped} = select i1 {inb}, {idx_ty} {idx_val}, {idx_ty} 0"
+                    ));
+                    clamped
                 }
             } else {
                 idx_val
@@ -9160,13 +9279,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(SsaVal::new(sl_ty, r1))
             }
             MirExprKind::FromBytes { struct_name, slice } => {
+                let call_kw = self.call_kw();
                 let sv = self.emit_expr(slice)?;
                 let sname = sanitize_ident(struct_name);
                 let sty = format!("%struct.{sname}");
                 let rty = format!("{{ {sty}, i32 }}");
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {rty} @__syn_from_bytes_{sname}({} {})",
+                    "{res} = {call_kw} {rty} @__syn_from_bytes_{sname}({} {})",
                     sv.ty, sv.repr
                 ));
                 Ok(SsaVal::new(rty, res))
@@ -9222,37 +9342,48 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(self.coerce(SsaVal::new(ok_lty, val), &dst_lty, ok_signed))
             }
             MirExprKind::NowTicks => {
+                let call_kw = self.call_kw();
                 let t = self.next_tmp();
-                self.emit_line(format!("{t} = call i32 @__syn_now_ms()"));
+                self.emit_line(format!("{t} = {call_kw} i32 @__syn_now_ms()"));
                 Ok(self.coerce(SsaVal::new("i32", t), &dst_lty, false))
             }
             MirExprKind::SysQuery(q) => {
-                let v = self.next_tmp();
-                match q {
+                let call_kw = self.call_kw();
+                let v = match q {
                     MirSysQuery::CurrentPrio => {
-                        self.emit_line(format!("{v} = call i32 @__syn_current_prio()"));
+                        let tmp = self.next_tmp();
+                        self.emit_line(format!("{tmp} = {call_kw} i32 @__syn_current_prio()"));
+                        tmp
                     }
                     MirSysQuery::SleepDepth => {
                         let m = self.next_tmp();
                         let dl = self.next_tmp();
                         let any = self.next_tmp();
                         let locked = self.next_tmp();
+                        let out_v = self.next_tmp();
+                        let pm = if self.ctx.opts.target.is_avr() {
+                            let pm = self.next_tmp();
+                            self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
+                            Some(pm)
+                        } else {
+                            None
+                        };
                         self.emit_line(format!(
                             "{m} = load volatile i32, ptr @__syn_sleep_lock_mask, align 4"
                         ));
                         self.emit_line(format!(
                             "{dl} = load volatile i32, ptr @__syn_dma_locks, align 4"
                         ));
+                        if let Some(pm) = pm {
+                            self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                        }
                         self.emit_line(format!("{any} = or i32 {m}, {dl}"));
                         self.emit_line(format!("{locked} = icmp ne i32 {any}, 0"));
-                        self.emit_line(format!("{v} = select i1 {locked}, i32 1, i32 2"));
+                        self.emit_line(format!("{out_v} = select i1 {locked}, i32 1, i32 2"));
+                        out_v
                     }
-                    MirSysQuery::WfiCount => {
-                        self.emit_line(format!(
-                            "{v} = load volatile i32, ptr @__syn_wfi_count, align 4"
-                        ));
-                    }
-                }
+                    MirSysQuery::WfiCount => self.emit_avr_safe_i32_load("@__syn_wfi_count", true),
+                };
                 Ok(self.coerce(SsaVal::new("i32", v), &dst_lty, false))
             }
             MirExprKind::LeaseGet { lease, .. } => {
@@ -9274,6 +9405,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn emit_prim_read(&mut self, prop: &MirPrimReadOp) -> Result<SsaVal, CodegenError> {
+        let call_kw = self.call_kw();
         match prop {
             MirPrimReadOp::WatchRead { target, elem_ty } => {
                 let pk = MirPrimKind::Watch {
@@ -9283,7 +9415,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let wptr = self.resolve_prim_ptr(target)?;
                 let ety = self.ctx.llvm_ty(elem_ty);
                 let v = self.next_tmp();
-                self.emit_line(format!("{v} = call {ety} @__syn_watch_read_{id}(ptr {wptr})"));
+                self.emit_line(format!("{v} = {call_kw} {ety} @__syn_watch_read_{id}(ptr {wptr})"));
                 Ok(SsaVal::new(ety, v))
             }
             MirPrimReadOp::InboxTryRecv {
@@ -9316,7 +9448,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {}, i32 {b})",
+                    "{ok} = {call_kw} i8 @__syn_q_push_{id}(ptr {qptr}, {ety} {}, i32 {b})",
                     vc.repr
                 ));
                 Ok(SsaVal::new("i8", ok))
@@ -9333,11 +9465,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
                 let qptr = self.resolve_prim_ptr(target)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_prim_family_contended(&pk);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
@@ -9353,13 +9485,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
                 let qptr = self.resolve_prim_ptr(target)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
-                let emp = self.next_tmp();
-                let b8 = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_prim_family_contended(&pk);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
+                let emp = self.next_tmp();
+                let b8 = self.next_tmp();
                 self.emit_line(format!("{emp} = icmp eq i32 {cnt}, 0"));
                 self.emit_line(format!("{b8} = zext i1 {emp} to i8"));
                 Ok(SsaVal::new("i8", b8))
@@ -9377,13 +9509,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let qptr = self.resolve_prim_ptr(target)?;
                 let c = (*cap).max(1) as i32;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
-                let fl = self.next_tmp();
-                let b8 = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_prim_family_contended(&pk);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
+                let fl = self.next_tmp();
+                let b8 = self.next_tmp();
                 self.emit_line(format!("{fl} = icmp sge i32 {cnt}, {c}"));
                 self.emit_line(format!("{b8} = zext i1 {fl} to i8"));
                 Ok(SsaVal::new("i8", b8))
@@ -9408,7 +9540,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr {task_arg})"
+                    "{ok} = {call_kw} i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr {task_arg})"
                 ));
                 Ok(SsaVal::new("i8", ok))
             }
@@ -9464,7 +9596,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let rty = "{ { ptr, ptr, i8 }, i32 }".to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {rty} @__syn_pool_try_alloc_{id}(ptr {pptr})"
+                    "{res} = {call_kw} {rty} @__syn_pool_try_alloc_{id}(ptr {pptr})"
                 ));
                 Ok(SsaVal::new(rty, res))
             }
@@ -9482,7 +9614,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {usize_ty} @__syn_pool_avail_{id}(ptr {pptr})"
+                    "{res} = {call_kw} {usize_ty} @__syn_pool_avail_{id}(ptr {pptr})"
                 ));
                 Ok(SsaVal::new(usize_ty, res))
             }
@@ -9500,7 +9632,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {usize_ty} @__syn_pool_in_use_{id}(ptr {pptr})"
+                    "{res} = {call_kw} {usize_ty} @__syn_pool_in_use_{id}(ptr {pptr})"
                 ));
                 Ok(SsaVal::new(usize_ty, res))
             }
@@ -9517,7 +9649,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pptr = self.resolve_prim_ptr(target)?;
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call i8 @__syn_pool_is_exhausted_{id}(ptr {pptr})"
+                    "{res} = {call_kw} i8 @__syn_pool_is_exhausted_{id}(ptr {pptr})"
                 ));
                 Ok(SsaVal::new("i8", res))
             }
@@ -9535,7 +9667,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {usize_ty} @__syn_pool_cap_{id}(ptr {pptr})"
+                    "{res} = {call_kw} {usize_ty} @__syn_pool_cap_{id}(ptr {pptr})"
                 ));
                 Ok(SsaVal::new(usize_ty, res))
             }
@@ -9552,7 +9684,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let lv = self.emit_expr(lease)?;
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {{ i32, i32 }} @__syn_slot_park_{id}(ptr {sptr}, {{ ptr, ptr, i8 }} {})",
+                    "{res} = {call_kw} {{ i32, i32 }} @__syn_slot_park_{id}(ptr {sptr}, {{ ptr, ptr, i8 }} {})",
                     lv.repr
                 ));
                 Ok(SsaVal::new("{ i32, i32 }", res))
@@ -9566,7 +9698,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let rty = "{ { ptr, ptr, i8 }, i32 }".to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {rty} @__syn_slot_take_{id}(ptr {sptr})"
+                    "{res} = {call_kw} {rty} @__syn_slot_take_{id}(ptr {sptr})"
                 ));
                 Ok(SsaVal::new(rty, res))
             }
@@ -9583,7 +9715,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i8, |p| p.as_u8() as i8);
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call i8 @__syn_slot_release_{id}(ptr {sptr}, i8 {b})"
+                    "{res} = {call_kw} i8 @__syn_slot_release_{id}(ptr {sptr}, i8 {b})"
                 ));
                 Ok(SsaVal::new("i8", res))
             }
@@ -9595,7 +9727,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let sptr = self.resolve_prim_ptr(target)?;
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call i8 @__syn_slot_is_busy_{id}(ptr {sptr})"
+                    "{res} = {call_kw} i8 @__syn_slot_is_busy_{id}(ptr {sptr})"
                 ));
                 Ok(SsaVal::new("i8", res))
             }
@@ -9607,7 +9739,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let sptr = self.resolve_prim_ptr(target)?;
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call i8 @__syn_slot_is_empty_{id}(ptr {sptr})"
+                    "{res} = {call_kw} i8 @__syn_slot_is_empty_{id}(ptr {sptr})"
                 ));
                 Ok(SsaVal::new("i8", res))
             }
@@ -9620,7 +9752,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
-                    "{res} = call {usize_ty} @__syn_slot_addr_{id}(ptr {sptr})"
+                    "{res} = {call_kw} {usize_ty} @__syn_slot_addr_{id}(ptr {sptr})"
                 ));
                 Ok(SsaVal::new(usize_ty, res))
             }
@@ -9645,7 +9777,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let w32 = self.next_tmp();
                 self.emit_line(format!(
-                    "{w32} = call i32 @__syn_ring_push_{id}(ptr {rptr}, ptr {sp}, i32 {}, i32 {b})",
+                    "{w32} = {call_kw} i32 @__syn_ring_push_{id}(ptr {rptr}, ptr {sp}, i32 {}, i32 {b})",
                     sl32.repr
                 ));
                 Ok(self.coerce(SsaVal::new("i32", w32), &usize_ty, false))
@@ -9664,7 +9796,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_ring_push_byte_{id}(ptr {rptr}, i8 {}, i32 {b})",
+                    "{ok} = {call_kw} i8 @__syn_ring_push_byte_{id}(ptr {rptr}, i8 {}, i32 {b})",
                     b8.repr
                 ));
                 Ok(SsaVal::new("i8", ok))
@@ -9679,7 +9811,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let res_ty = format!("{{ {{ ptr, {usize_ty} }}, i32 }}");
                 let rv = self.next_tmp();
                 self.emit_line(format!(
-                    "{rv} = call {res_ty} @__syn_ring_grant_write_{id}(ptr {rptr}, i32 {})",
+                    "{rv} = {call_kw} {res_ty} @__syn_ring_grant_write_{id}(ptr {rptr}, i32 {})",
                     l32.repr
                 ));
                 Ok(SsaVal::new(res_ty, rv))
@@ -9692,7 +9824,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sl = self.next_tmp();
                 self.emit_line(format!(
-                    "{sl} = call {sl_ty} @__syn_ring_read_slice_{id}(ptr {rptr})"
+                    "{sl} = {call_kw} {sl_ty} @__syn_ring_read_slice_{id}(ptr {rptr})"
                 ));
                 Ok(SsaVal::new(sl_ty, sl))
             }
@@ -9716,7 +9848,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let n32 = self.next_tmp();
                 self.emit_line(format!(
-                    "{n32} = call i32 @__syn_ring_pop_{id}(ptr {rptr}, ptr {dp}, i32 {}, ptr {task_arg})",
+                    "{n32} = {call_kw} i32 @__syn_ring_pop_{id}(ptr {rptr}, ptr {dp}, i32 {}, ptr {task_arg})",
                     dl32.repr
                 ));
                 Ok(self.coerce(SsaVal::new("i32", n32), &usize_ty, false))
@@ -9732,7 +9864,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let rv = self.next_tmp();
                 self.emit_line(format!(
-                    "{rv} = call {{ i8, i32 }} @__syn_ring_try_pop_byte_{id}(ptr {rptr}, ptr {task_arg})"
+                    "{rv} = {call_kw} {{ i8, i32 }} @__syn_ring_try_pop_byte_{id}(ptr {rptr}, ptr {task_arg})"
                 ));
                 Ok(SsaVal::new("{ i8, i32 }", rv))
             }
@@ -9741,11 +9873,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
                 let rptr = self.resolve_prim_ptr(target)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds {pty}, ptr {rptr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_prim_family_contended(&pk);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
@@ -9755,7 +9887,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let rptr = self.resolve_prim_ptr(target)?;
                 let fs = self.next_tmp();
                 self.emit_line(format!(
-                    "{fs} = call i32 @__syn_ring_free_space_{id}(ptr {rptr})"
+                    "{fs} = {call_kw} i32 @__syn_ring_free_space_{id}(ptr {rptr})"
                 ));
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", fs), &usize_ty, false))
@@ -9765,13 +9897,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
                 let rptr = self.resolve_prim_ptr(target)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
-                let emp = self.next_tmp();
-                let b8 = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds {pty}, ptr {rptr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_prim_family_contended(&pk);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
+                let emp = self.next_tmp();
+                let b8 = self.next_tmp();
                 self.emit_line(format!("{emp} = icmp eq i32 {cnt}, 0"));
                 self.emit_line(format!("{b8} = zext i1 {emp} to i8"));
                 Ok(SsaVal::new("i8", b8))
@@ -9784,7 +9916,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let full = self.next_tmp();
                 let b8 = self.next_tmp();
                 self.emit_line(format!(
-                    "{fs} = call i32 @__syn_ring_free_space_{id}(ptr {rptr})"
+                    "{fs} = {call_kw} i32 @__syn_ring_free_space_{id}(ptr {rptr})"
                 ));
                 self.emit_line(format!("{full} = icmp eq i32 {fs}, 0"));
                 self.emit_line(format!("{b8} = zext i1 {full} to i8"));
@@ -9804,7 +9936,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_q_view_pop_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, ptr {tmp}, ptr {task_arg})"
+                    "{ok} = {call_kw} i8 @__syn_q_view_pop_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, ptr {tmp}, ptr {task_arg})"
                 ));
                 let val = self.next_tmp();
                 let got = self.next_tmp();
@@ -9832,19 +9964,19 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_q_view_push_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {}, i32 {b})",
+                    "{ok} = {call_kw} i8 @__syn_q_view_push_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {}, i32 {b})",
                     vc.repr
                 ));
                 Ok(SsaVal::new("i8", ok))
             }
-            MirPrimReadOp::InboxViewLen { view, .. } => {
+            MirPrimReadOp::InboxViewLen { view, elem_ty } => {
                 let (hdr, _, _) = self.emit_inbox_view_parts(view)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds %prim.inbox_hdr, ptr {hdr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_inbox_view_contended(elem_ty);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
@@ -9856,30 +9988,30 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{cap_u} = extractvalue {vty} {}, 2", vv.repr));
                 Ok(SsaVal::new(usize_ty, cap_u))
             }
-            MirPrimReadOp::InboxViewIsEmpty { view, .. } => {
+            MirPrimReadOp::InboxViewIsEmpty { view, elem_ty } => {
                 let (hdr, _, _) = self.emit_inbox_view_parts(view)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
-                let emp = self.next_tmp();
-                let b8 = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds %prim.inbox_hdr, ptr {hdr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_inbox_view_contended(elem_ty);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
+                let emp = self.next_tmp();
+                let b8 = self.next_tmp();
                 self.emit_line(format!("{emp} = icmp eq i32 {cnt}, 0"));
                 self.emit_line(format!("{b8} = zext i1 {emp} to i8"));
                 Ok(SsaVal::new("i8", b8))
             }
-            MirPrimReadOp::InboxViewIsFull { view, .. } => {
+            MirPrimReadOp::InboxViewIsFull { view, elem_ty } => {
                 let (hdr, _, cap32) = self.emit_inbox_view_parts(view)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
-                let fl = self.next_tmp();
-                let b8 = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds %prim.inbox_hdr, ptr {hdr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_inbox_view_contended(elem_ty);
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
+                let fl = self.next_tmp();
+                let b8 = self.next_tmp();
                 self.emit_line(format!("{fl} = icmp sge i32 {cnt}, {cap32}"));
                 self.emit_line(format!("{b8} = zext i1 {fl} to i8"));
                 Ok(SsaVal::new("i8", b8))
@@ -9898,7 +10030,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let w32 = self.next_tmp();
                 self.emit_line(format!(
-                    "{w32} = call i32 @__syn_ring_view_push(ptr {hdr}, i32 {cap32}, ptr {sp}, i32 {}, i32 {b})",
+                    "{w32} = {call_kw} i32 @__syn_ring_view_push(ptr {hdr}, i32 {cap32}, ptr {sp}, i32 {}, i32 {b})",
                     sl32.repr
                 ));
                 Ok(self.coerce(SsaVal::new("i32", w32), &usize_ty, false))
@@ -9910,7 +10042,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 let ok = self.next_tmp();
                 self.emit_line(format!(
-                    "{ok} = call i8 @__syn_ring_view_push_byte(ptr {hdr}, i32 {cap32}, i8 {}, i32 {b})",
+                    "{ok} = {call_kw} i8 @__syn_ring_view_push_byte(ptr {hdr}, i32 {cap32}, i8 {}, i32 {b})",
                     b8.repr
                 ));
                 Ok(SsaVal::new("i8", ok))
@@ -9923,7 +10055,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let l32 = self.coerce(lv, "i32", false);
                 let rv = self.next_tmp();
                 self.emit_line(format!(
-                    "{rv} = call {res_slice_ty} @__syn_ring_view_grant_write(ptr {hdr}, i32 {cap32}, i32 {})",
+                    "{rv} = {call_kw} {res_slice_ty} @__syn_ring_view_grant_write(ptr {hdr}, i32 {cap32}, i32 {})",
                     l32.repr
                 ));
                 Ok(SsaVal::new(res_slice_ty, rv))
@@ -9934,7 +10066,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sv = self.next_tmp();
                 self.emit_line(format!(
-                    "{sv} = call {sl_ty} @__syn_ring_view_read_slice(ptr {hdr}, i32 {cap32})"
+                    "{sv} = {call_kw} {sl_ty} @__syn_ring_view_read_slice(ptr {hdr}, i32 {cap32})"
                 ));
                 Ok(SsaVal::new(sl_ty, sv))
             }
@@ -9956,7 +10088,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let n32 = self.next_tmp();
                 self.emit_line(format!(
-                    "{n32} = call i32 @__syn_ring_view_pop(ptr {hdr}, i32 {cap32}, ptr {dp}, i32 {}, ptr {task_arg})",
+                    "{n32} = {call_kw} i32 @__syn_ring_view_pop(ptr {hdr}, i32 {cap32}, ptr {dp}, i32 {}, ptr {task_arg})",
                     dl32.repr
                 ));
                 Ok(self.coerce(SsaVal::new("i32", n32), &usize_ty, false))
@@ -9970,18 +10102,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let rv = self.next_tmp();
                 self.emit_line(format!(
-                    "{rv} = call {{ i8, i32 }} @__syn_ring_view_try_pop_byte(ptr {hdr}, i32 {cap32}, ptr {task_arg})"
+                    "{rv} = {call_kw} {{ i8, i32 }} @__syn_ring_view_try_pop_byte(ptr {hdr}, i32 {cap32}, ptr {task_arg})"
                 ));
                 Ok(SsaVal::new("{ i8, i32 }", rv))
             }
             MirPrimReadOp::ByteRingViewLen { view } => {
                 let (hdr, _) = self.emit_byte_ring_view_parts(view)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds %prim.byte_ring_hdr, ptr {hdr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_byte_ring_view_contended();
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
@@ -9997,7 +10129,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
                 let fs = self.next_tmp();
                 self.emit_line(format!(
-                    "{fs} = call i32 @__syn_ring_view_free_space(ptr {hdr}, i32 {cap32})"
+                    "{fs} = {call_kw} i32 @__syn_ring_view_free_space(ptr {hdr}, i32 {cap32})"
                 ));
                 let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", fs), &usize_ty, false))
@@ -10005,13 +10137,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirPrimReadOp::ByteRingViewIsEmpty { view } => {
                 let (hdr, _) = self.emit_byte_ring_view_parts(view)?;
                 let cnt_p = self.next_tmp();
-                let cnt = self.next_tmp();
-                let emp = self.next_tmp();
-                let b8 = self.next_tmp();
                 self.emit_line(format!(
                     "{cnt_p} = getelementptr inbounds %prim.byte_ring_hdr, ptr {hdr}, i32 0, i32 2"
                 ));
-                self.emit_line(format!("{cnt} = load volatile i32, ptr {cnt_p}, align 4"));
+                let contended = self.ctx.vis.is_byte_ring_view_contended();
+                let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
+                let emp = self.next_tmp();
+                let b8 = self.next_tmp();
                 self.emit_line(format!("{emp} = icmp eq i32 {cnt}, 0"));
                 self.emit_line(format!("{b8} = zext i1 {emp} to i8"));
                 Ok(SsaVal::new("i8", b8))
@@ -10022,7 +10154,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let full = self.next_tmp();
                 let b8 = self.next_tmp();
                 self.emit_line(format!(
-                    "{fs} = call i32 @__syn_ring_view_free_space(ptr {hdr}, i32 {cap32})"
+                    "{fs} = {call_kw} i32 @__syn_ring_view_free_space(ptr {hdr}, i32 {cap32})"
                 ));
                 self.emit_line(format!("{full} = icmp eq i32 {fs}, 0"));
                 self.emit_line(format!("{b8} = zext i1 {full} to i8"));
@@ -10048,9 +10180,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         } else {
             "null"
         };
+        let call_kw = self.call_kw();
         let ok = self.next_tmp();
         self.emit_line(format!(
-            "{ok} = call i8 @__syn_q_pop_{id}(ptr {qptr}, ptr {tmp}, ptr {task_arg})"
+            "{ok} = {call_kw} i8 @__syn_q_pop_{id}(ptr {qptr}, ptr {tmp}, ptr {task_arg})"
         ));
         let val = self.next_tmp();
         let got = self.next_tmp();
@@ -10076,14 +10209,15 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn emit_runtime_assert(&mut self, cond_val: SsaVal) {
+        let call_kw = self.call_kw();
         let c1 = self.to_i1(cond_val);
         let ok_lbl = self.next_label("assert_ok");
         let fail_lbl = self.next_label("assert_fail");
         self.emit_term(format!("br i1 {c1}, label %{ok_lbl}, label %{fail_lbl}"));
         self.start_block(&fail_lbl);
         let idx = self.ctx.intern_string("ASSERTION FAILED\n");
-        self.emit_line(format!("call void @__syn_uart_puts(ptr @.str.{idx})"));
-        self.emit_line("call void @__syn_platform_exit(i32 1)");
+        self.emit_line(format!("{call_kw} void @__syn_uart_puts(ptr @.str.{idx})"));
+        self.emit_line(format!("{call_kw} void @__syn_platform_exit(i32 1)"));
         self.emit_term("unreachable");
         self.start_block(&ok_lbl);
     }
@@ -10095,6 +10229,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         args: &[MirExpr],
         ret_mir_ty: &MirType,
     ) -> Result<SsaVal, CodegenError> {
+        let call_kw = self.call_kw();
         // Indirect call through a local/parameter/temp `MirVar` of `MirType::FnPtr`
         if callee != "assert" {
             if let Some((vid, params, ret)) =
@@ -10127,11 +10262,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
                 let joined = call_args.join(", ");
                 if ret.is_void() || ret_lty == "void" {
-                    self.emit_line(format!("call void {}({joined})", fp_ptr.repr));
+                    self.emit_line(format!("{call_kw} void {}({joined})", fp_ptr.repr));
                     return Ok(SsaVal::new("void", "0"));
                 } else {
                     let r = self.next_tmp();
-                    self.emit_line(format!("{r} = call {ret_lty} {}({joined})", fp_ptr.repr));
+                    self.emit_line(format!("{r} = {call_kw} {ret_lty} {}({joined})", fp_ptr.repr));
                     return Ok(SsaVal::new(ret_lty, r));
                 }
             }
@@ -10152,12 +10287,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
                 let joined = call_args.join(", ");
                 if sig.ret_llvm_ty == "void" {
-                    self.emit_line(format!("call void {}({joined})", sig.symbol));
+                    self.emit_line(format!("{call_kw} void {}({joined})", sig.symbol));
                     return Ok(SsaVal::new("void", "0"));
                 } else {
                     let r = self.next_tmp();
                     self.emit_line(format!(
-                        "{r} = call {} {}({joined})",
+                        "{r} = {call_kw} {} {}({joined})",
                         sig.ret_llvm_ty, sig.symbol
                     ));
                     return Ok(SsaVal::new(sig.ret_llvm_ty, r));
@@ -10191,11 +10326,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             };
             let joined = call_args.join(", ");
             if ret_lty == "void" {
-                self.emit_line(format!("call {sig_prefix} {sym}({joined})"));
+                self.emit_line(format!("{call_kw} {sig_prefix} {sym}({joined})"));
                 return Ok(SsaVal::new("void", "0"));
             } else {
                 let r = self.next_tmp();
-                self.emit_line(format!("{r} = call {sig_prefix} {sym}({joined})"));
+                self.emit_line(format!("{r} = {call_kw} {sig_prefix} {sym}({joined})"));
                 return Ok(SsaVal::new(ret_lty, r));
             }
         }
@@ -10206,7 +10341,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 if let Some(a0) = args.first() {
                     let sv = self.emit_expr(a0)?;
                     let p = self.coerce_str_ptr(sv);
-                    self.emit_line(format!("call void @__syn_uart_puts(ptr {})", p.repr));
+                    self.emit_line(format!("{call_kw} void @__syn_uart_puts(ptr {})", p.repr));
                 }
                 return Ok(SsaVal::new("void", "0"));
             }
@@ -10214,9 +10349,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 if let Some(a0) = args.first() {
                     let sv = self.emit_expr(a0)?;
                     let p = self.coerce_str_ptr(sv);
-                    self.emit_line(format!("call void @__syn_uart_println(ptr {})", p.repr));
+                    self.emit_line(format!("{call_kw} void @__syn_uart_println(ptr {})", p.repr));
                 } else {
-                    self.emit_line("call void @__syn_uart_putc(i8 10)");
+                    self.emit_line(format!("{call_kw} void @__syn_uart_putc(i8 10)"));
                 }
                 return Ok(SsaVal::new("void", "0"));
             }
@@ -10229,7 +10364,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             "now_ms" | "now_ticks" => {
                 let t = self.next_tmp();
-                self.emit_line(format!("{t} = call i32 @__syn_now_ms()"));
+                self.emit_line(format!("{t} = {call_kw} i32 @__syn_now_ms()"));
                 let rlty = self.ctx.llvm_ty(ret_mir_ty);
                 return Ok(self.coerce(SsaVal::new("i32", t), &rlty, false));
             }
@@ -10371,6 +10506,28 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             return Ok(self.coerce(SsaVal::new(common_fty, t), &res_lty, true));
         }
 
+        if matches!(op, MirBinOp::Shl | MirBinOp::Shr) {
+            let lhs_host = lhs.ty.host_value_type();
+            let shift_ty = self.ctx.llvm_ty(&lhs_host);
+            let lc = self.coerce(lv, &shift_ty, !lhs.ty.is_unsigned());
+            let rc = self.coerce(rv, &shift_ty, false);
+            let inst = match op {
+                MirBinOp::Shl => "shl",
+                MirBinOp::Shr => {
+                    if !lhs.ty.is_unsigned() {
+                        "ashr"
+                    } else {
+                        "lshr"
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let t = self.next_tmp();
+            self.emit_line(format!("{t} = {inst} {shift_ty} {}, {}", lc.repr, rc.repr));
+            let dst_lty = self.ctx.llvm_ty(&res_ty.host_value_type());
+            return Ok(self.coerce(SsaVal::new(shift_ty, t), &dst_lty, !res_ty.is_unsigned()));
+        }
+
         let signed = !lhs.ty.is_unsigned() || !rhs.ty.is_unsigned();
 
         // Pick common operand type
@@ -10457,13 +10614,16 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 }
 
-fn elide_llvm_crit(ir: &mut String) {
-    if ir.contains("%pm = call i32 @__syn_crit_enter()") {
-        *ir = ir
-            .replace(
-                "  %pm = call i32 @__syn_crit_enter()\n",
-                "  ; irq-mask elided (task-to-task)\n",
-            )
-            .replace("  call void @__syn_crit_exit(i32 %pm)\n", "");
+fn crit_pair(contended: bool, call_kw: &str) -> (String, String) {
+    if contended {
+        (
+            format!("  %pm = {call_kw} i32 @__syn_crit_enter()\n"),
+            format!("  {call_kw} void @__syn_crit_exit(i32 %pm)\n"),
+        )
+    } else {
+        (
+            "  ; irq-mask elided (task-to-task)\n".to_string(),
+            String::new(),
+        )
     }
 }

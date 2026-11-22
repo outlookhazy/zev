@@ -37,6 +37,7 @@ struct ExportedSymbol {
 struct ModuleExports {
     types: BTreeMap<String, ExportedSymbol>,
     values: BTreeMap<String, ExportedSymbol>,
+    variants: BTreeMap<String, Vec<String>>,
 }
 
 /// Resolution of a single `import` statement inside a file.
@@ -66,6 +67,8 @@ struct LoadedModule {
 pub struct LinkedModulesOutput {
     /// Linked `(Program, Option<file_path>)` sequence (imported modules first, then root programs).
     pub programs: Vec<(Program, Option<String>)>,
+    /// Number of leading non-root module programs in `programs`.
+    pub non_root_program_count: usize,
     /// Module dot-paths (`"chip.stm32g4"`, `"drivers.uart"`) that resolved to real `.zev` modules.
     pub loaded_module_paths: BTreeSet<String>,
     /// Human-readable display names for canonicalized module symbols (`mod__Foo` -> `mod.Foo`).
@@ -172,7 +175,7 @@ fn search_dirs_for_file(
     dirs
 }
 
-fn lex_import_paths(source: &str) -> Vec<Vec<String>> {
+fn lex_import_bindings(source: &str) -> Vec<(Vec<String>, String)> {
     let Ok(tokens) = zev_parser::lex(source) else {
         return Vec::new();
     };
@@ -197,7 +200,10 @@ fn lex_import_paths(source: &str) -> Vec<Vec<String>> {
                         segs.push(s.clone());
                         i += 1;
                         while i + 1 < tokens.len()
-                            && tokens[i].kind == zev_parser::TokenKind::Dot
+                            && matches!(
+                                tokens[i].kind,
+                                zev_parser::TokenKind::Dot | zev_parser::TokenKind::ColonColon
+                            )
                         {
                             if let zev_parser::TokenKind::Ident(next_seg) = &tokens[i + 1].kind {
                                 segs.push(next_seg.clone());
@@ -209,7 +215,19 @@ fn lex_import_paths(source: &str) -> Vec<Vec<String>> {
                     }
                 }
                 if !segs.is_empty() {
-                    imports.push(segs);
+                    let alias = if i + 1 < tokens.len()
+                        && tokens[i].kind == zev_parser::TokenKind::KwAs
+                    {
+                        if let zev_parser::TokenKind::Ident(al) = &tokens[i + 1].kind {
+                            i += 2;
+                            al.clone()
+                        } else {
+                            segs.last().cloned().unwrap_or_default()
+                        }
+                    } else {
+                        segs.last().cloned().unwrap_or_default()
+                    };
+                    imports.push((segs, alias));
                 }
             }
             _ => i += 1,
@@ -218,8 +236,8 @@ fn lex_import_paths(source: &str) -> Vec<Vec<String>> {
     imports
 }
 
-/// Collect declared generic `struct` and `fn` names across root `.zev` sources and all
-/// transitively imported `.zev` / embedded modules (`import a.b.c;`).
+/// Collect declared generic `struct` and `fn` names across root `.zev` sources and module-qualified
+/// `pub` generics for directly imported modules (`import a.b as alias;` -> `alias.fn_name`).
 pub fn collect_import_aware_generic_names(
     roots: &[(&str, Option<&Path>)],
     include_dirs: &[PathBuf],
@@ -250,39 +268,25 @@ fn collect_import_aware_generic_names_with_entries(
     }
 
     let mut out = BTreeSet::new();
-    let mut visited: BTreeSet<ModuleKey> = BTreeSet::new();
-    let mut worklist: Vec<(String, Option<PathBuf>)> = Vec::with_capacity(roots.len());
+    out.insert("#import_scoped".to_string());
 
     for (src, path_opt) in roots {
         out.extend(zev_parser::collect_declared_generic_names(src));
         let abs = path_opt.map(normalize_abs);
-        if let Some(ref p) = abs {
-            let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-            visited.insert(ModuleKey::File(canon));
-        }
-        worklist.push(((*src).to_owned(), abs));
-    }
-
-    while let Some((src, importer_file)) = worklist.pop() {
-        let dirs = search_dirs_for_file(importer_file.as_deref(), &entry_dirs, include_dirs);
-        for segs in lex_import_paths(&src) {
+        let dirs = search_dirs_for_file(abs.as_deref(), &entry_dirs, include_dirs);
+        for (segs, alias) in lex_import_bindings(src) {
             let dot_path = segs.join(".");
             match resolve_module_loc_in_dirs(&segs, &dot_path, &dirs) {
                 ModuleLoc::File(cand) => {
-                    let canon = std::fs::canonicalize(&cand).unwrap_or_else(|_| cand.clone());
-                    let key = ModuleKey::File(canon);
-                    if visited.insert(key) {
-                        if let Ok(mod_src) = std::fs::read_to_string(&cand) {
-                            out.extend(zev_parser::collect_declared_generic_names(&mod_src));
-                            worklist.push((mod_src, Some(cand)));
+                    if let Ok(mod_src) = std::fs::read_to_string(&cand) {
+                        for g in zev_parser::collect_pub_declared_generic_names(&mod_src) {
+                            out.insert(format!("{alias}.{g}"));
                         }
                     }
                 }
                 ModuleLoc::Embedded(mod_src) => {
-                    let key = ModuleKey::Embedded(dot_path);
-                    if visited.insert(key) {
-                        out.extend(zev_parser::collect_declared_generic_names(mod_src));
-                        worklist.push((mod_src.to_owned(), None));
+                    for g in zev_parser::collect_pub_declared_generic_names(mod_src) {
+                        out.insert(format!("{alias}.{g}"));
                     }
                 }
                 ModuleLoc::Ambiguous(..) | ModuleLoc::NotFound => {}
@@ -441,9 +445,9 @@ impl ModuleLinker {
             }
         }
 
-        // Track `extern "C"` prototypes across all modules to deduplicate identical declarations
-        // and reject conflicting signatures with `E0030`.
-        let mut seen_extern_c: BTreeMap<String, (FnDecl, Option<String>)> = BTreeMap::new();
+        // Track `extern "C"` prototypes across all files to deduplicate identical declarations
+        // across distinct files and reject conflicting signatures with `E0030`.
+        let mut seen_extern_c: BTreeMap<String, (FnDecl, usize)> = BTreeMap::new();
 
         for (prog_idx, key) in order.iter().enumerate() {
             let m = self.loaded.get(key).expect("loaded module in order").clone();
@@ -459,7 +463,6 @@ impl ModuleLinker {
                 &mut self.display_names,
                 prog_idx,
                 m.file_display.as_str(),
-                true,
                 &mut seen_extern_c,
                 &mut rewritten_pub_extern_sites,
                 &mut diags,
@@ -497,7 +500,6 @@ impl ModuleLinker {
                 &mut self.display_names,
                 prog_idx,
                 file_label,
-                false,
                 &mut seen_extern_c,
                 &mut rewritten_pub_extern_sites,
                 &mut diags,
@@ -514,6 +516,7 @@ impl ModuleLinker {
 
         LinkedModulesOutput {
             programs: out_programs,
+            non_root_program_count: order.len(),
             loaded_module_paths: self.loaded_module_paths.clone(),
             display_names: self.display_names.clone(),
             program_extern_c_scopes,
@@ -912,11 +915,15 @@ fn collect_module_exports(prog: &Program, prefix: &str) -> ModuleExports {
                 );
             }
             ItemKind::Enum(en) => {
-                insert_type(
-                    &en.name.name,
-                    format!("{prefix}__{}", en.name.name),
-                    item.is_pub,
-                );
+                let canon = format!("{prefix}__{}", en.name.name);
+                insert_type(&en.name.name, canon.clone(), item.is_pub);
+                for v in &en.variants {
+                    exports
+                        .variants
+                        .entry(v.name.name.clone())
+                        .or_default()
+                        .push(canon.clone());
+                }
             }
             ItemKind::Mmio(mm) => match &mm.kind {
                 MmioDeclKind::Layout { .. } => {
@@ -1632,6 +1639,21 @@ impl<'a> AstRewriter<'a> {
                         ExprKind::Ident(Ident::new(can.to_owned(), id.span))
                     } else if let Some(can) = self.self_type_canonical(&id.name) {
                         ExprKind::Ident(Ident::new(can.to_owned(), id.span))
+                    } else if self.prefix.is_some()
+                        && self
+                            .self_exports
+                            .variants
+                            .get(&id.name)
+                            .is_some_and(|enums| enums.len() == 1)
+                    {
+                        let enum_canon = self.self_exports.variants[&id.name][0].clone();
+                        ExprKind::Field {
+                            target: Box::new(Expr::new(
+                                ExprKind::Ident(Ident::new(enum_canon, id.span)),
+                                id.span,
+                            )),
+                            field: id.clone(),
+                        }
                     } else {
                         ExprKind::Ident(id.clone())
                     }
@@ -1872,6 +1894,100 @@ impl<'a> AstRewriter<'a> {
     }
 }
 
+fn check_pub_surface_type(
+    ty: &TypeExpr,
+    generic_type_params: &BTreeSet<String>,
+    local_type_is_pub: &BTreeMap<String, (&'static str, bool)>,
+    item_desc: &str,
+    rw: &mut AstRewriter<'_>,
+) {
+    match &ty.kind {
+        TypeKind::Prim(_) | TypeKind::Path(_) => {}
+        TypeKind::Named(id) => {
+            if !generic_type_params.contains(&id.name) {
+                if let Some(&(kind_str, false)) = local_type_is_pub.get(&id.name) {
+                    rw.emit(
+                        id.span,
+                        format!(
+                            "private {kind_str} `{}` cannot be exposed in `pub` {item_desc}; mark `{}` as `pub`",
+                            id.name, id.name
+                        ),
+                    );
+                }
+            }
+        }
+        TypeKind::Generic { base, args } => {
+            if !generic_type_params.contains(&base.name) {
+                if let Some(&(kind_str, false)) = local_type_is_pub.get(&base.name) {
+                    rw.emit(
+                        base.span,
+                        format!(
+                            "private {kind_str} `{}` cannot be exposed in `pub` {item_desc}; mark `{}` as `pub`",
+                            base.name, base.name
+                        ),
+                    );
+                }
+            }
+            for a in args {
+                if let GenericArg::Type(t) = a {
+                    check_pub_surface_type(t, generic_type_params, local_type_is_pub, item_desc, rw);
+                }
+            }
+        }
+        TypeKind::GenericPath { args, .. } => {
+            for a in args {
+                if let GenericArg::Type(t) = a {
+                    check_pub_surface_type(t, generic_type_params, local_type_is_pub, item_desc, rw);
+                }
+            }
+        }
+        TypeKind::Slice(inner) | TypeKind::Ptr(inner) | TypeKind::Lease(inner) => {
+            check_pub_surface_type(inner, generic_type_params, local_type_is_pub, item_desc, rw);
+        }
+        TypeKind::Array { elem, .. } => {
+            check_pub_surface_type(elem, generic_type_params, local_type_is_pub, item_desc, rw);
+        }
+        TypeKind::OsPrimitive(op) => {
+            check_pub_surface_os_primitive(
+                op,
+                generic_type_params,
+                local_type_is_pub,
+                item_desc,
+                rw,
+            );
+        }
+        TypeKind::FnPtr { params, ret } => {
+            for p in params {
+                check_pub_surface_type(p, generic_type_params, local_type_is_pub, item_desc, rw);
+            }
+            check_pub_surface_type(ret, generic_type_params, local_type_is_pub, item_desc, rw);
+        }
+    }
+}
+
+fn check_pub_surface_os_primitive(
+    op: &OsPrimitiveType,
+    generic_type_params: &BTreeSet<String>,
+    local_type_is_pub: &BTreeMap<String, (&'static str, bool)>,
+    item_desc: &str,
+    rw: &mut AstRewriter<'_>,
+) {
+    let elem = match op {
+        OsPrimitiveType::Watch { elem }
+        | OsPrimitiveType::Inbox { elem, .. }
+        | OsPrimitiveType::InboxUnsized { elem }
+        | OsPrimitiveType::PingPong { elem, .. }
+        | OsPrimitiveType::Pool { elem, .. }
+        | OsPrimitiveType::DmaSlot { elem } => Some(elem.as_ref()),
+        OsPrimitiveType::Signal
+        | OsPrimitiveType::ByteRing { .. }
+        | OsPrimitiveType::ByteRingUnsized => None,
+    };
+    if let Some(inner) = elem {
+        check_pub_surface_type(inner, generic_type_params, local_type_is_pub, item_desc, rw);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn rewrite_program(
     prog: &Program,
@@ -1884,11 +2000,35 @@ fn rewrite_program(
     display_names: &mut BTreeMap<String, String>,
     prog_idx: usize,
     file_label: &str,
-    is_non_root: bool,
-    seen_extern_c: &mut BTreeMap<String, (FnDecl, Option<String>)>,
+    seen_extern_c: &mut BTreeMap<String, (FnDecl, usize)>,
     rewritten_pub_extern_sites: &mut BTreeSet<(usize, u32, u32)>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Program {
+    let mut local_type_is_pub: BTreeMap<String, (&'static str, bool)> = BTreeMap::new();
+    for item in &prog.items {
+        match &item.kind {
+            ItemKind::Struct(st) => {
+                local_type_is_pub.insert(st.name.name.clone(), ("struct", item.is_pub));
+            }
+            ItemKind::Enum(en) => {
+                local_type_is_pub.insert(en.name.name.clone(), ("enum", item.is_pub));
+            }
+            ItemKind::Mmio(mm) => match &mm.kind {
+                MmioDeclKind::Layout { .. } => {
+                    local_type_is_pub.insert(mm.name.name.clone(), ("mmio layout", item.is_pub));
+                }
+                MmioDeclKind::Inline { .. } => {
+                    local_type_is_pub.insert(
+                        format!("{}__Layout", mm.name.name),
+                        ("mmio layout", item.is_pub),
+                    );
+                }
+                MmioDeclKind::Instance { .. } => {}
+            },
+            _ => {}
+        }
+    }
+
     let mut rw = AstRewriter {
         prefix,
         module_dot_path,
@@ -1916,6 +2056,13 @@ fn rewrite_program(
                     .filter(|g| g.kind == GenericParamKind::Type)
                     .map(|g| g.name.name.clone())
                     .collect();
+                if item.is_pub {
+                    let desc = format!("struct `{}`", st.name.name);
+                    let gp = rw.generic_type_params.clone();
+                    for f in &st.fields {
+                        check_pub_surface_type(&f.ty, &gp, &local_type_is_pub, &desc, &mut rw);
+                    }
+                }
                 rw.push_scope();
                 for g in &st.generic_params {
                     if g.kind != GenericParamKind::Type {
@@ -1961,6 +2108,19 @@ fn rewrite_program(
                 )
             }
             ItemKind::Mmio(mm) => {
+                if item.is_pub {
+                    if let MmioDeclKind::Instance { layout, .. } = &mm.kind {
+                        let desc = format!("mmio `{}`", mm.name.name);
+                        let empty_gp = BTreeSet::new();
+                        check_pub_surface_type(
+                            layout,
+                            &empty_gp,
+                            &local_type_is_pub,
+                            &desc,
+                            &mut rw,
+                        );
+                    }
+                }
                 let new_kind = match &mm.kind {
                     MmioDeclKind::Layout { regs } => {
                         let new_regs = regs
@@ -2019,6 +2179,11 @@ fn rewrite_program(
                 )
             }
             ItemKind::Const(c) => {
+                if item.is_pub {
+                    let desc = format!("const `{}`", c.name.name);
+                    let empty_gp = BTreeSet::new();
+                    check_pub_surface_type(&c.ty, &empty_gp, &local_type_is_pub, &desc, &mut rw);
+                }
                 let new_name = rw.canonicalize_top_name(&c.name.name);
                 Item::with_pub(
                     item.attrs.clone(),
@@ -2033,6 +2198,11 @@ fn rewrite_program(
                 )
             }
             ItemKind::GlobalVar(g) => {
+                if item.is_pub {
+                    let desc = format!("global `{}`", g.name.name);
+                    let empty_gp = BTreeSet::new();
+                    check_pub_surface_type(&g.ty, &empty_gp, &local_type_is_pub, &desc, &mut rw);
+                }
                 let new_name = rw.canonicalize_top_name(&g.name.name);
                 Item::with_pub(
                     item.attrs.clone(),
@@ -2047,6 +2217,17 @@ fn rewrite_program(
                 )
             }
             ItemKind::OsPrimitive(p) => {
+                if item.is_pub {
+                    let desc = format!("primitive `{}`", p.name.name);
+                    let empty_gp = BTreeSet::new();
+                    check_pub_surface_os_primitive(
+                        &p.ty,
+                        &empty_gp,
+                        &local_type_is_pub,
+                        &desc,
+                        &mut rw,
+                    );
+                }
                 let new_name = rw.canonicalize_top_name(&p.name.name);
                 let new_ty = rw.rewrite_os_primitive(&p.ty);
                 Item::with_pub(
@@ -2069,6 +2250,17 @@ fn rewrite_program(
                     .filter(|g| g.kind == GenericParamKind::Type)
                     .map(|g| g.name.name.clone())
                     .collect();
+                if item.is_pub {
+                    let desc = format!("fn `{}`", f.name.name);
+                    let gp = rw.generic_type_params.clone();
+                    for p in &f.params {
+                        check_pub_surface_type(&p.ty, &gp, &local_type_is_pub, &desc, &mut rw);
+                    }
+                    check_pub_surface_type(&f.ret_type, &gp, &local_type_is_pub, &desc, &mut rw);
+                    if let Some(zev_ast::ErrorSpec::Typed(err_ty)) = &f.error_spec {
+                        check_pub_surface_type(err_ty, &gp, &local_type_is_pub, &desc, &mut rw);
+                    }
+                }
                 let new_params = rw.rewrite_params(&f.params);
                 let new_ret = rw.rewrite_type(&f.ret_type);
                 let new_err = f.error_spec.as_ref().map(|es| match es {
@@ -2108,34 +2300,37 @@ fn rewrite_program(
                     span: f.span,
                 };
 
-                if new_decl.is_extern_c && (is_non_root || !seen_extern_c.is_empty()) {
-                    if let Some((prev_decl, _)) = seen_extern_c.get(&new_name) {
-                        if !extern_signatures_match(prev_decl, &new_decl) {
-                            rw.emit(
-                                new_decl.name.span,
-                                format!(
-                                    "conflicting `extern \"C\"` signature for `{new_name}` across modules"
-                                ),
-                            );
-                        } else if new_decl.body.is_none() && prev_decl.body.is_none() {
-                            // Deduplicate identical `extern "C"` declarations across linked files.
-                            continue;
+                if new_decl.is_extern_c {
+                    if let Some((prev_decl, prev_prog_idx)) = seen_extern_c.get(&new_name) {
+                        if *prev_prog_idx != prog_idx {
+                            if !extern_signatures_match(prev_decl, &new_decl) {
+                                rw.emit(
+                                    new_decl.name.span,
+                                    format!(
+                                        "conflicting `extern \"C\"` signature for `{new_name}` across modules"
+                                    ),
+                                );
+                            } else if new_decl.body.is_none() && prev_decl.body.is_none() {
+                                // Deduplicate identical `extern "C"` declarations across linked files.
+                                continue;
+                            }
                         }
-                    } else if is_non_root {
-                        seen_extern_c.insert(
-                            new_name,
-                            (new_decl.clone(), Some(rw.file_label.to_owned())),
-                        );
+                        // Same `prog_idx`: fall through so `Analyzer` still emits `E0021` on duplicate extern in the same file.
+                    } else {
+                        seen_extern_c.insert(new_name, (new_decl.clone(), prog_idx));
                     }
-                } else if new_decl.is_extern_c {
-                    // Only register cross-module `extern "C"` tracking when non-root modules exist;
-                    // root-only files rely on normal `Analyzer` duplicate checks if repeated in root.
-                    let _ = is_non_root;
                 }
 
                 Item::with_pub(item.attrs.clone(), item.is_pub, ItemKind::Fn(new_decl), item.span)
             }
             ItemKind::Task(t) => {
+                if item.is_pub {
+                    let desc = format!("task `{}`", t.name.name);
+                    let empty_gp = BTreeSet::new();
+                    for p in &t.params {
+                        check_pub_surface_type(&p.ty, &empty_gp, &local_type_is_pub, &desc, &mut rw);
+                    }
+                }
                 let new_params = rw.rewrite_params(&t.params);
                 rw.push_scope();
                 for p in &new_params {
@@ -2158,6 +2353,13 @@ fn rewrite_program(
                 )
             }
             ItemKind::Isr(i) => {
+                if item.is_pub {
+                    let desc = format!("isr `{}`", i.vector.name);
+                    let empty_gp = BTreeSet::new();
+                    for p in &i.params {
+                        check_pub_surface_type(&p.ty, &empty_gp, &local_type_is_pub, &desc, &mut rw);
+                    }
+                }
                 let new_params = rw.rewrite_params(&i.params);
                 rw.push_scope();
                 for p in &new_params {

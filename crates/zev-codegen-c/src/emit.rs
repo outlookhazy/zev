@@ -60,6 +60,7 @@ struct C99Emitter<'a> {
     inbox_views: BTreeMap<String, MirType>,
     leases: BTreeMap<String, MirType>,
     uses_byte_ring_view: bool,
+    dma_layout_structs: BTreeSet<String>,
 }
 
 impl<'a> C99Emitter<'a> {
@@ -134,6 +135,7 @@ impl<'a> C99Emitter<'a> {
             inbox_views: BTreeMap::new(),
             leases: BTreeMap::new(),
             uses_byte_ring_view: false,
+            dma_layout_structs: zev_mir::collect_dma_layout_structs(m),
         }
     }
 
@@ -1575,7 +1577,7 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             }
             .mangle_name();
             let mut sec = format!(
-                "static SYN_UNUSED inline bool syn_view_inbox_{em}_try_push_keep(syn_view_inbox_{em}_t v, {ec} item, uint8_t boost_prio) {{\n    syn_enter_critical();\n    if (v.cap == 0U || (size_t)v.hdr->count >= v.cap) {{\n        syn_exit_critical();\n        return false;\n    }}\n    v.buf[v.hdr->tail] = item;\n    v.boost_buf[v.hdr->tail] = boost_prio;\n    v.hdr->tail = (uint16_t)(((size_t)v.hdr->tail + 1U) % v.cap);\n    v.hdr->count++;\n    syn_task_t *rw = v.hdr->rx_waiter;\n    v.hdr->rx_waiter = NULL;\n    if (rw != NULL) {{\n        syn_task_wake_from_isr_or_task(rw, boost_prio);\n    }}\n    syn_exit_critical();\n    return true;\n}}\nstatic SYN_UNUSED inline bool syn_view_inbox_{em}_try_pop(syn_view_inbox_{em}_t v, syn_task_t *task, {ec} *out_item) {{\n    syn_enter_critical();\n    if (v.cap == 0U || v.hdr->count == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    *out_item = v.buf[v.hdr->head];\n    uint8_t bp = v.boost_buf[v.hdr->head];\n    v.hdr->head = (uint16_t)(((size_t)v.hdr->head + 1U) % v.cap);\n    v.hdr->count--;\n    if (v.hdr->rx_waiter == task) {{ v.hdr->rx_waiter = NULL; }}\n    syn_task_t *tw = v.hdr->tx_waiter;\n    v.hdr->tx_waiter = NULL;\n    if (tw != NULL) {{\n        syn_task_wake_from_isr_or_task(tw, SYN_NO_BOOST);\n    }}\n    syn_exit_critical();\n    if (task != NULL && bp < SYN_PRIO_LEVELS) {{\n        syn_task_apply_boost(task, bp);\n    }}\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_view_inbox_{em}_try_recv(syn_view_inbox_{em}_t v) {{\n    {ec} _item;\n    if (syn_view_inbox_{em}_try_pop(v, g_syn_sched.running, &_item)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _item }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_arm_rx(syn_view_inbox_{em}_t v, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (v.hdr->count > 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    v.hdr->rx_waiter = task;\n    task->wait_check = syn_inbox_hdr_rx_ready;\n    task->wait_obj = v.hdr;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_cancel_rx(syn_view_inbox_{em}_t v, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (v.hdr->rx_waiter == task) {{ v.hdr->rx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_arm_tx(syn_view_inbox_{em}_t v, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (v.hdr->tx_cap == 0U) {{ v.hdr->tx_cap = (uint16_t)v.cap; }}\n    if ((size_t)v.hdr->count < v.cap) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    v.hdr->tx_waiter = task;\n    task->wait_check = syn_inbox_hdr_tx_ready;\n    task->wait_obj = v.hdr;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_cancel_tx(syn_view_inbox_{em}_t v, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (v.hdr->tx_waiter == task) {{ v.hdr->tx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline bool syn_view_inbox_{em}_is_full(syn_view_inbox_{em}_t v) {{\n    return v.cap == 0U || (size_t)v.hdr->count >= v.cap;\n}}\n"
+                "static SYN_UNUSED inline bool syn_view_inbox_{em}_try_push_keep(syn_view_inbox_{em}_t v, {ec} item, uint8_t boost_prio) {{\n    syn_enter_critical();\n    if (v.cap == 0U || (size_t)v.hdr->count >= v.cap) {{\n        syn_exit_critical();\n        return false;\n    }}\n    v.buf[v.hdr->tail] = item;\n    v.boost_buf[v.hdr->tail] = boost_prio;\n    v.hdr->tail = (uint16_t)(((size_t)v.hdr->tail + 1U) % v.cap);\n    v.hdr->count++;\n    syn_task_t *rw = v.hdr->rx_waiter;\n    v.hdr->rx_waiter = NULL;\n    if (rw != NULL) {{\n        syn_task_wake_from_isr_or_task(rw, boost_prio);\n    }}\n    syn_exit_critical();\n    return true;\n}}\nstatic SYN_UNUSED inline bool syn_view_inbox_{em}_try_pop(syn_view_inbox_{em}_t v, syn_task_t *task, {ec} *out_item) {{\n    syn_enter_critical();\n    if (v.cap == 0U || v.hdr->count == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    *out_item = v.buf[v.hdr->head];\n    uint8_t bp = v.boost_buf[v.hdr->head];\n    v.hdr->head = (uint16_t)(((size_t)v.hdr->head + 1U) % v.cap);\n    v.hdr->count--;\n    if (v.hdr->rx_waiter == task) {{ v.hdr->rx_waiter = NULL; }}\n    syn_task_t *tw = v.hdr->tx_waiter;\n    v.hdr->tx_waiter = NULL;\n    if (tw != NULL) {{\n        syn_task_wake_from_isr_or_task(tw, SYN_NO_BOOST);\n    }}\n    syn_exit_critical();\n    if (task != NULL && bp < SYN_PRIO_LEVELS) {{\n        syn_task_apply_boost(task, bp);\n    }}\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_view_inbox_{em}_try_recv(syn_view_inbox_{em}_t v) {{\n    {ec} _item;\n    if (syn_view_inbox_{em}_try_pop(v, g_syn_sched.running, &_item)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _item }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_arm_rx(syn_view_inbox_{em}_t v, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (v.hdr->count > 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    syn_task_end_inbox_turn(task);\n    v.hdr->rx_waiter = task;\n    task->wait_check = syn_inbox_hdr_rx_ready;\n    task->wait_obj = v.hdr;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_cancel_rx(syn_view_inbox_{em}_t v, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (v.hdr->rx_waiter == task) {{ v.hdr->rx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_arm_tx(syn_view_inbox_{em}_t v, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_enter_critical();\n    if (v.hdr->tx_cap == 0U) {{ v.hdr->tx_cap = (uint16_t)v.cap; }}\n    if ((size_t)v.hdr->count < v.cap) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    v.hdr->tx_waiter = task;\n    task->wait_check = syn_inbox_hdr_tx_ready;\n    task->wait_obj = v.hdr;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_view_inbox_{em}_cancel_tx(syn_view_inbox_{em}_t v, const syn_task_t *task) {{\n    syn_enter_critical();\n    if (v.hdr->tx_waiter == task) {{ v.hdr->tx_waiter = NULL; }}\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline bool syn_view_inbox_{em}_is_full(syn_view_inbox_{em}_t v) {{\n    return v.cap == 0U || (size_t)v.hdr->count >= v.cap;\n}}\n"
             );
             if !vis.is_inbox_view_contended(elem) {
                 elide_c_crit(&mut sec);
@@ -1782,13 +1784,16 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
             );
         }
         let packed_attr = if st.packed { " SYN_PACKED" } else { "" };
+        let struct_dma = self.dma_layout_structs.contains(&st.name);
         let _ = writeln!(self.out, "struct{packed_attr} syn_struct_{} {{", st.name);
         if st.fields.is_empty() {
             self.out.push_str("    uint8_t _empty;\n");
         } else {
             for f in &st.fields {
                 let fc = match &f.ty {
-                    MirType::Primitive(pk @ MirPrimKind::Pool { .. }) if f.dma_safe => {
+                    MirType::Primitive(pk @ MirPrimKind::Pool { .. })
+                        if f.dma_safe || struct_dma =>
+                    {
                         format!("syn_{}_dma_t", pk.mangle_name())
                     }
                     other => self.c_type(other),
@@ -1865,6 +1870,7 @@ static SYN_UNUSED inline void syn_signal_arm_wait(syn_signal_t *s, syn_task_t *t
         syn_exit_critical();
         return;
     }
+    syn_task_end_inbox_turn(task);
     s->waiter = task;
     task->wait_check = syn_signal_is_ready;
     task->wait_obj = s;
@@ -1909,7 +1915,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     let n = (*cap).max(1);
                     let _ = writeln!(
                         sec,
-                        "struct syn_{mangle}_t {{\n    syn_pp_hdr_t hdr;\n    SYN_DMA_ALIGN {ec} buf[2][{n}];\n}};\n\nstatic SYN_UNUSED inline {slice_c} syn_{mangle}_dma_buf(syn_{mangle}_t *pp) {{\n    return ({slice_c}){{ .ptr = &pp->buf[pp->hdr.write_idx & 1U][0], .len = (size_t){n}U }};\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *pp, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!pp->hdr.chunk_ready) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t ridx = pp->hdr.ready_idx;\n    uint16_t rlen = pp->hdr.ready_len;\n    pp->hdr.chunk_ready = false;\n    syn_exit_critical();\n    out_slice->ptr = &pp->buf[ridx][0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *pp, syn_task_t *task) {{\n    syn_enter_critical();\n    if (pp->hdr.chunk_ready) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    pp->hdr.waiter = task;\n    task->wait_check = syn_pp_hdr_is_ready;\n    task->wait_obj = &pp->hdr;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    syn_pp_hdr_t hdr;\n    SYN_DMA_ALIGN {ec} buf[2][{n}];\n}};\n\nstatic SYN_UNUSED inline {slice_c} syn_{mangle}_dma_buf(syn_{mangle}_t *pp) {{\n    return ({slice_c}){{ .ptr = &pp->buf[pp->hdr.write_idx & 1U][0], .len = (size_t){n}U }};\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_take(syn_{mangle}_t *pp, {slice_c} *out_slice) {{\n    syn_enter_critical();\n    if (!pp->hdr.chunk_ready) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t ridx = pp->hdr.ready_idx;\n    uint16_t rlen = pp->hdr.ready_len;\n    pp->hdr.chunk_ready = false;\n    syn_exit_critical();\n    out_slice->ptr = &pp->buf[ridx][0];\n    out_slice->len = (size_t)rlen;\n    return true;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(syn_{mangle}_t *pp, syn_task_t *task) {{\n    syn_enter_critical();\n    if (pp->hdr.chunk_ready) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    syn_task_end_inbox_turn(task);\n    pp->hdr.waiter = task;\n    task->wait_check = syn_pp_hdr_is_ready;\n    task->wait_obj = &pp->hdr;\n    task->has_deadline = false;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\n"
                     );
                 }
                 MirPrimKind::Pool { elem, cap } => {
@@ -1924,7 +1930,7 @@ static SYN_UNUSED inline void syn_signal_cancel_wait(syn_signal_t *s, const syn_
                     let n = (*cap).max(1);
                     let _ = writeln!(
                         sec,
-                        "struct syn_{mangle}_t {{\n    syn_pool_hdr_t hdr;\n    {ec} slots[{n}];\n}};\n\ntypedef struct {{\n    SYN_DMA32_ALIGN {ec} val;\n}} syn_{mangle}_dma_slot_t;\n\nstruct syn_{mangle}_dma_t {{\n    SYN_DMA32_ALIGN syn_pool_hdr_t hdr;\n    syn_{mangle}_dma_slot_t slots[{n}];\n}};\n\nstatic SYN_UNUSED inline {ec} *syn_{mangle}_slot_ptr(void *pool_raw, uint8_t idx) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    if (h->dma_safe != 0U) {{\n        return &((syn_{mangle}_dma_t *)pool_raw)->slots[idx].val;\n    }}\n    return &((syn_{mangle}_t *)pool_raw)->slots[idx];\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_alloc_raw(void *pool_raw, {lc} *out_lease) {{\n    syn_pool_hdr_t *h = (syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    uint32_t m = h->free_mask;\n    if (m == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t idx = syn_pool_ctz32(m);\n    h->free_mask = m & ~(1U << idx);\n    if (h->dma_safe != 0U) {{\n        g_syn_sleep.dma_active_locks++;\n    }}\n    syn_exit_critical();\n    out_lease->data = syn_{mangle}_slot_ptr(pool_raw, idx);\n    out_lease->pool_hdr = h;\n    out_lease->slot_idx = idx;\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_{mangle}_try_alloc(void *pool_raw) {{\n    {lc} _l;\n    if (syn_{mangle}_try_alloc_raw(pool_raw, &_l)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _l }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline size_t syn_{mangle}_avail(void *pool_raw) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    uint32_t m = h->free_mask;\n    syn_exit_critical();\n    return syn_pool_popcount32(m);\n}}\nstatic SYN_UNUSED inline size_t syn_{mangle}_in_use(void *pool_raw) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    size_t c = (size_t)h->cap;\n    uint32_t m = h->free_mask;\n    syn_exit_critical();\n    return c - syn_pool_popcount32(m);\n}}\nstatic SYN_UNUSED inline size_t syn_{mangle}_cap(void *pool_raw) {{\n    return (size_t)((const syn_pool_hdr_t *)pool_raw)->cap;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_is_exhausted(void *pool_raw) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    bool e = (h->free_mask == 0U);\n    syn_exit_critical();\n    return e;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(void *pool_raw, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_pool_hdr_t *h = (syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    if (h->free_mask != 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    h->waiters = task;\n    task->wait_check = syn_pool_hdr_has_free;\n    task->wait_obj = h;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_wait(void *pool_raw, const syn_task_t *task) {{\n    syn_pool_hdr_t *h = (syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    if (h->waiters == task) {{ h->waiters = NULL; }}\n    syn_exit_critical();\n}}\n"
+                        "struct syn_{mangle}_t {{\n    syn_pool_hdr_t hdr;\n    {ec} slots[{n}];\n}};\n\ntypedef struct {{\n    SYN_DMA32_ALIGN {ec} val;\n}} syn_{mangle}_dma_slot_t;\n\nstruct syn_{mangle}_dma_t {{\n    SYN_DMA32_ALIGN syn_pool_hdr_t hdr;\n    syn_{mangle}_dma_slot_t slots[{n}];\n}};\n\nstatic SYN_UNUSED inline {ec} *syn_{mangle}_slot_ptr(void *pool_raw, uint8_t idx) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    if (h->dma_safe != 0U) {{\n        return &((syn_{mangle}_dma_t *)pool_raw)->slots[idx].val;\n    }}\n    return &((syn_{mangle}_t *)pool_raw)->slots[idx];\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_try_alloc_raw(void *pool_raw, {lc} *out_lease) {{\n    syn_pool_hdr_t *h = (syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    uint32_t m = h->free_mask;\n    if (m == 0U) {{\n        syn_exit_critical();\n        return false;\n    }}\n    uint8_t idx = syn_pool_ctz32(m);\n    h->free_mask = m & ~(1U << idx);\n    if ((h->dma_safe & 1U) != 0U) {{\n        g_syn_sleep.dma_active_locks++;\n    }}\n    syn_exit_critical();\n    out_lease->data = syn_{mangle}_slot_ptr(pool_raw, idx);\n    out_lease->pool_hdr = h;\n    out_lease->slot_idx = idx;\n    return true;\n}}\nstatic SYN_UNUSED inline syn_{res_mangle}_t syn_{mangle}_try_alloc(void *pool_raw) {{\n    {lc} _l;\n    if (syn_{mangle}_try_alloc_raw(pool_raw, &_l)) {{\n        return (syn_{res_mangle}_t){{ .is_err = false, .val = _l }};\n    }}\n    return (syn_{res_mangle}_t){{ .is_err = true }};\n}}\nstatic SYN_UNUSED inline size_t syn_{mangle}_avail(void *pool_raw) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    uint32_t m = h->free_mask;\n    syn_exit_critical();\n    return syn_pool_popcount32(m);\n}}\nstatic SYN_UNUSED inline size_t syn_{mangle}_in_use(void *pool_raw) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    size_t c = (size_t)h->cap;\n    uint32_t m = h->free_mask;\n    syn_exit_critical();\n    return c - syn_pool_popcount32(m);\n}}\nstatic SYN_UNUSED inline size_t syn_{mangle}_cap(void *pool_raw) {{\n    return (size_t)((const syn_pool_hdr_t *)pool_raw)->cap;\n}}\nstatic SYN_UNUSED inline bool syn_{mangle}_is_exhausted(void *pool_raw) {{\n    const syn_pool_hdr_t *h = (const syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    bool e = (h->free_mask == 0U);\n    syn_exit_critical();\n    return e;\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_arm_wait(void *pool_raw, syn_task_t *task, bool has_to, uint32_t dl) {{\n    syn_pool_hdr_t *h = (syn_pool_hdr_t *)pool_raw;\n    syn_enter_critical();\n    if (h->free_mask != 0U) {{\n        task->state = SYN_TASK_READY;\n        task->sched_flags |= SYN_FLAG_MORE;\n        syn_exit_critical();\n        return;\n    }}\n    syn_task_end_inbox_turn(task);\n    task->wait_check = syn_pool_hdr_has_free;\n    task->wait_obj = h;\n    task->has_deadline = has_to;\n    task->delay_until = dl;\n    task->state = SYN_TASK_BLOCKED;\n    syn_exit_critical();\n}}\nstatic SYN_UNUSED inline void syn_{mangle}_cancel_wait(void *pool_raw, const syn_task_t *task) {{\n    (void)pool_raw;\n    (void)task;\n}}\n"
                     );
                 }
                 MirPrimKind::DmaSlot { elem } => {
@@ -2073,7 +2079,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 let _ = writeln!(self.out, "#else");
                 let _ = writeln!(
                     self.out,
-                    "static SYN_UNUSED volatile uint8_t __zev_mmio_buf_{sym}[{buf_bytes}] __attribute__((aligned(4)));"
+                    "static SYN_UNUSED SYN_DMA_ALIGN volatile uint8_t __zev_mmio_buf_{sym}[{buf_bytes}];"
                 );
                 let _ = writeln!(self.out, "#define {macro_name} (&__zev_mmio_buf_{sym}[0])");
                 let _ = writeln!(self.out, "#endif\n");
@@ -2166,19 +2172,29 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
 
         if !self.m.subsystems.is_empty() {
             self.out.push_str("/* ── Static Subsystem Driver Instances ────────────────────────────────── */\n\n");
+            let mut next_pp_bit: u8 = self
+                .m
+                .primitives
+                .iter()
+                .filter_map(|p| p.sleep_lock_bit)
+                .map(|b| b.saturating_add(1))
+                .max()
+                .unwrap_or(0)
+                .min(31);
             for sub in &self.m.subsystems {
                 let sym = format!("__zev_subsys_{}", sanitize_ident(&sub.name));
+                let dma_attr = if sub.dma_safe { "SYN_DMA_ALIGN " } else { "" };
                 if self.struct_needs_static_c_init(&sub.struct_name) {
-                    let init_s = self.fmt_subsystem_init(&sub.struct_name, &sym);
+                    let init_s = self.fmt_subsystem_init(&sub.struct_name, &sym, &mut next_pp_bit);
                     let _ = writeln!(
                         self.out,
-                        "static SYN_UNUSED syn_struct_{} {sym} = {init_s};",
+                        "static SYN_UNUSED {dma_attr}syn_struct_{} {sym} = {init_s};",
                         sub.struct_name
                     );
                 } else {
                     let _ = writeln!(
                         self.out,
-                        "static SYN_UNUSED syn_struct_{} {sym};",
+                        "static SYN_UNUSED {dma_attr}syn_struct_{} {sym};",
                         sub.struct_name
                     );
                 }
@@ -2445,15 +2461,22 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
         )
     }
 
-    fn fmt_subsystem_prim_init(&self, pk: &MirPrimKind, c_path: &str) -> String {
+    fn fmt_subsystem_prim_init(
+        &self,
+        pk: &MirPrimKind,
+        c_path: &str,
+        next_pp_bit: &mut u8,
+    ) -> String {
         match pk {
             MirPrimKind::Watch { elem } => {
                 format!("{{ .value = {}, .seq = 0U }}", self.zero_init_expr(elem))
             }
             MirPrimKind::PingPong { elem, cap } => {
+                let bit = (*next_pp_bit).min(31);
+                *next_pp_bit = next_pp_bit.saturating_add(1).min(31);
                 let ec = self.c_type(elem);
                 format!(
-                    "{{ .hdr = {{ .buf0 = {c_path}.buf[0], .buf1 = {c_path}.buf[1], .waiter = NULL, .sleep_lock_bit = (1U << 0U), .cap = {cap}U, .elem_size = (uint16_t)sizeof({ec}), .pending_write_len = 0U, .ready_len = 0U, .write_idx = 0U, .ready_idx = 0U, .chunk_ready = false, .dma_active = false }} }}"
+                    "{{ .hdr = {{ .buf0 = {c_path}.buf[0], .buf1 = {c_path}.buf[1], .waiter = NULL, .sleep_lock_bit = (1U << {bit}U), .cap = {cap}U, .elem_size = (uint16_t)sizeof({ec}), .pending_write_len = 0U, .ready_len = 0U, .write_idx = 0U, .ready_idx = 0U, .chunk_ready = false, .dma_active = false }} }}"
                 )
             }
             MirPrimKind::Pool { .. } => {
@@ -2481,35 +2504,55 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
             return false;
         };
         st.fields.iter().any(|f| match &f.ty {
-            MirType::Primitive(MirPrimKind::PingPong { .. } | MirPrimKind::Inbox { .. }) => true,
+            MirType::Primitive(
+                MirPrimKind::PingPong { .. } | MirPrimKind::Inbox { .. } | MirPrimKind::Signal,
+            ) => true,
             MirType::Struct(sub) => self.struct_needs_static_c_init(sub),
             _ => false,
         })
     }
 
-    fn emit_subsystem_pool_boot_inits(&mut self, struct_name: &str, c_path: &str) {
+    fn emit_subsystem_pool_boot_inits(
+        &mut self,
+        struct_name: &str,
+        c_path: &str,
+        parent_dma_safe: bool,
+    ) {
         let Some(st) = self.m.structs.iter().find(|s| s.name == struct_name).cloned() else {
             return;
         };
+        let struct_has_dma_layout = self.dma_layout_structs.contains(struct_name);
         for f in &st.fields {
             let fpath = format!("{c_path}.{}", c_ident(&f.name));
+            let eff_dma = parent_dma_safe || f.dma_safe;
             match &f.ty {
                 MirType::Primitive(MirPrimKind::Pool { cap, .. }) => {
-                    let dma_flag = if f.dma_safe { 1u8 } else { 0u8 };
+                    let dma_flag = if eff_dma {
+                        1u8
+                    } else if struct_has_dma_layout {
+                        2u8
+                    } else {
+                        0u8
+                    };
                     let _ = writeln!(
                         self.out,
                         "    {fpath}.hdr.free_mask = syn_pool_full_mask({cap}U);\n    {fpath}.hdr.full_mask = syn_pool_full_mask({cap}U);\n    {fpath}.hdr.waiters = NULL;\n    {fpath}.hdr.dma_safe = {dma_flag}U;\n    {fpath}.hdr.cap = {cap}U;"
                     );
                 }
                 MirType::Struct(sub_name) => {
-                    self.emit_subsystem_pool_boot_inits(sub_name, &fpath);
+                    self.emit_subsystem_pool_boot_inits(sub_name, &fpath, eff_dma);
                 }
                 _ => {}
             }
         }
     }
 
-    fn fmt_subsystem_init(&self, struct_name: &str, c_path: &str) -> String {
+    fn fmt_subsystem_init(
+        &self,
+        struct_name: &str,
+        c_path: &str,
+        next_pp_bit: &mut u8,
+    ) -> String {
         let Some(st) = self.m.structs.iter().find(|s| s.name == struct_name) else {
             return "{ 0 }".to_string();
         };
@@ -2522,8 +2565,12 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
             .map(|f| {
                 let fpath = format!("{c_path}.{}", c_ident(&f.name));
                 let val = match &f.ty {
-                    MirType::Primitive(pk) => self.fmt_subsystem_prim_init(pk, &fpath),
-                    MirType::Struct(sub_name) => self.fmt_subsystem_init(sub_name, &fpath),
+                    MirType::Primitive(pk) => {
+                        self.fmt_subsystem_prim_init(pk, &fpath, next_pp_bit)
+                    }
+                    MirType::Struct(sub_name) => {
+                        self.fmt_subsystem_init(sub_name, &fpath, next_pp_bit)
+                    }
                     other => self.zero_init_expr(other),
                 };
                 format!(".{} = {val}", c_ident(&f.name))
@@ -3088,7 +3135,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     let dl = self.var_ref(*tv, vars);
                     let _ = writeln!(
                         self.out,
-                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_{mangle}_cancel_rx({ptr}, _task);\n            syn_task_clear_wait(_task);"
+                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_{mangle}_cancel_rx({ptr}, _task);\n            syn_task_clear_wait(_task);\n            syn_task_end_inbox_turn(_task);"
                     );
                     if let Some(dr) = dst_res {
                         let rc = self.c_type(&vars[dr.0].ty);
@@ -3151,7 +3198,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     let dl = self.var_ref(*tv, vars);
                     let _ = writeln!(
                         self.out,
-                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_{mangle}_cancel_rx({ptr}, _task);\n            syn_task_clear_wait(_task);"
+                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_{mangle}_cancel_rx({ptr}, _task);\n            syn_task_clear_wait(_task);\n            syn_task_end_inbox_turn(_task);"
                     );
                     if let Some(dr) = dst_res {
                         let rc = self.c_type(&vars[dr.0].ty);
@@ -3279,7 +3326,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     let dl = self.var_ref(*tv, vars);
                     let _ = writeln!(
                         self.out,
-                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_view_inbox_{em}_cancel_rx({vw}, _task);\n            syn_task_clear_wait(_task);"
+                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_view_inbox_{em}_cancel_rx({vw}, _task);\n            syn_task_clear_wait(_task);\n            syn_task_end_inbox_turn(_task);"
                     );
                     if let Some(dr) = dst_res {
                         let rc = self.c_type(&vars[dr.0].ty);
@@ -3340,7 +3387,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     let dl = self.var_ref(*tv, vars);
                     let _ = writeln!(
                         self.out,
-                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_ring_view_cancel_rx({vw}, _task);\n            syn_task_clear_wait(_task);"
+                        "        if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n            syn_ring_view_cancel_rx({vw}, _task);\n            syn_task_clear_wait(_task);\n            syn_task_end_inbox_turn(_task);"
                     );
                     if let Some(dr) = dst_res {
                         let rc = self.c_type(&vars[dr.0].ty);
@@ -3451,7 +3498,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     let dl = self.var_ref(*tv, vars);
                     let _ = writeln!(
                         self.out,
-                        "    if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n        syn_signal_cancel_wait({ptr}, _task);\n        syn_task_clear_wait(_task);"
+                        "    if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n        syn_signal_cancel_wait({ptr}, _task);\n        syn_task_clear_wait(_task);\n        syn_task_end_inbox_turn(_task);"
                     );
                     if let Some(dr) = dst_res {
                         let rc = self.c_type(&vars[dr.0].ty);
@@ -3538,7 +3585,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     let dl = self.var_ref(*tv, vars);
                     let _ = writeln!(
                         self.out,
-                        "    if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n        syn_{mangle}_cancel_wait({ptr}, _task);\n        syn_task_clear_wait(_task);"
+                        "    if ((int32_t)(syn_now_ms() - {dl}) >= 0) {{\n        syn_{mangle}_cancel_wait({ptr}, _task);\n        syn_task_clear_wait(_task);\n        syn_task_end_inbox_turn(_task);"
                     );
                     if let Some(dr) = dst_res {
                         let rc = self.c_type(&vars[dr.0].ty);
@@ -3569,13 +3616,15 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 let mut init_fields = vec!["._pc = 0U".to_string()];
                 if let Some(callee_fn) = self.m.functions.iter().find(|f| f.name == *callee) {
                     for (idx, &pvid) in callee_fn.params.iter().enumerate() {
-                        if let Some(arg_expr) = args.get(idx) {
-                            let pvar = &callee_fn.vars[pvid.0];
-                            init_fields.push(format!(
-                                ".{} = {}",
-                                frame_var_name(pvar),
-                                self.fmt_expr(arg_expr, vars)
-                            ));
+                        let pvar = &callee_fn.vars[pvid.0];
+                        if pvar.hoisted && !pvar.ty.is_void() {
+                            if let Some(arg_expr) = args.get(idx) {
+                                init_fields.push(format!(
+                                    ".{} = {}",
+                                    frame_var_name(pvar),
+                                    self.fmt_expr(arg_expr, vars)
+                                ));
+                            }
                         }
                     }
                 }
@@ -5230,8 +5279,16 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                                 &expr.ty,
                             ))),
                             MirBinOp::Shr => {
-                                let s = if uns {
-                                    ((a as u128).wrapping_shr(b as u32)) as i128
+                                let s = if lhs.ty.is_unsigned() {
+                                    let mask: u128 = match lhs.ty.host_value_type() {
+                                        MirType::Bool => 1,
+                                        MirType::U8 => 0xFF,
+                                        MirType::U16 => 0xFFFF,
+                                        MirType::U32 => 0xFFFF_FFFF,
+                                        MirType::U64 | MirType::Usize => u64::MAX as u128,
+                                        _ => u128::MAX,
+                                    };
+                                    (((a as u128) & mask).wrapping_shr(b as u32)) as i128
                                 } else {
                                     a.wrapping_shr(b as u32)
                                 };
@@ -5318,14 +5375,20 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 }
             }
         }
-        let subsys_snapshot: Vec<(String, String)> = self
+        let subsys_snapshot: Vec<(String, String, bool)> = self
             .m
             .subsystems
             .iter()
-            .map(|s| (s.struct_name.clone(), format!("__zev_subsys_{}", sanitize_ident(&s.name))))
+            .map(|s| {
+                (
+                    s.struct_name.clone(),
+                    format!("__zev_subsys_{}", sanitize_ident(&s.name)),
+                    s.dma_safe,
+                )
+            })
             .collect();
-        for (st_name, sym) in &subsys_snapshot {
-            self.emit_subsystem_pool_boot_inits(st_name, sym);
+        for (st_name, sym, dma_safe) in &subsys_snapshot {
+            self.emit_subsystem_pool_boot_inits(st_name, sym, *dma_safe);
         }
 
         // Dummy boot task descriptor for driving sequential boot-time yielding self-tests
@@ -5351,18 +5414,21 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     let mut init_fields = vec!["._pc = 0U".to_string()];
                     if let Some(cf) = self.m.functions.iter().find(|f| f.name == *callee) {
                         for (idx, &pvid) in cf.params.iter().enumerate() {
-                            if let Some(ae) = args.get(idx) {
-                                init_fields.push(format!(
-                                    ".{} = {}",
-                                    frame_var_name(&cf.vars[pvid.0]),
-                                    self.fmt_expr(ae, &self.m.boot.vars)
-                                ));
+                            let pvar = &cf.vars[pvid.0];
+                            if pvar.hoisted && !pvar.ty.is_void() {
+                                if let Some(ae) = args.get(idx) {
+                                    init_fields.push(format!(
+                                        ".{} = {}",
+                                        frame_var_name(pvar),
+                                        self.fmt_expr(ae, &self.m.boot.vars)
+                                    ));
+                                }
                             }
                         }
                     }
                     let _ = writeln!(
                         self.out,
-                        "    g_syn_boot_frame_{callee} = (syn_frame_fn_{callee}_t){{ {} }};\n    while (!g_syn_sim_stopped && syn_coro_{callee}(&_boot_task, &g_syn_boot_frame_{callee}) != SYN_STEP_DONE) {{\n        if (_boot_task.has_deadline && (int32_t)(syn_now_ms() - _boot_task.delay_until) < 0) {{\n            g_syn_tick_ms = _boot_task.delay_until;\n            _boot_task.has_deadline = false;\n        }}\n    }}\n    if (g_syn_sim_stopped) {{ return; }}",
+                        "    g_syn_boot_frame_{callee} = (syn_frame_fn_{callee}_t){{ {} }};\n    while (!g_syn_sim_stopped && syn_coro_{callee}(&_boot_task, &g_syn_boot_frame_{callee}) != SYN_STEP_DONE) {{\n        if (_boot_task.has_deadline && (int32_t)(syn_now_ms() - _boot_task.delay_until) < 0) {{\n#if defined(SYN_FREESTANDING)\n#if defined(__ARM_ARCH)\n            __asm__ volatile (\"wfi\" ::: \"memory\");\n#endif\n#else\n            g_syn_tick_ms = _boot_task.delay_until;\n            _boot_task.has_deadline = false;\n#endif\n        }}\n    }}\n    if (g_syn_sim_stopped) {{ return; }}",
                         init_fields.join(", ")
                     );
                     if let Some(d) = dst {

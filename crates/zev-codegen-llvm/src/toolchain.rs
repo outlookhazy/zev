@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub enum TargetArch {
     /// Bare-metal ARM Cortex-M3 (`thumbv7m-none-eabi`, Stellaris `lm3s6965evb` / STM32 compatible).
     Thumbv7mNoneEabi,
+    /// Bare-metal Raspberry Pi Pico / Pico W RP2040 (`thumbv6m-none-eabi`, Cortex-M0+ SRAM UF2).
+    Thumbv6mRp2040,
     /// Bare-metal Espressif ESP32-C6 RISC-V (`riscv32-unknown-none-elf`, `rv32imac` Direct-Boot).
     Riscv32Esp32C6,
     /// Bare-metal Microchip ATmega328P AVR (`avr`, Arduino Uno R3 Optiboot 16 MHz).
@@ -29,17 +31,25 @@ impl TargetArch {
         matches!(self, Self::AvrAtmega328p | Self::AvrAtmega4809)
     }
 
+    pub const fn is_arm_eabi(self) -> bool {
+        matches!(self, Self::Thumbv7mNoneEabi | Self::Thumbv6mRp2040)
+    }
+
     pub const fn avr_mcpu(self) -> &'static str {
         match self {
             Self::AvrAtmega328p => "atmega328p",
             Self::AvrAtmega4809 => "atmega4809",
-            Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 | Self::HostX86_64Linux => "",
+            Self::Thumbv7mNoneEabi
+            | Self::Thumbv6mRp2040
+            | Self::Riscv32Esp32C6
+            | Self::HostX86_64Linux => "",
         }
     }
 
     pub const fn triple(self) -> &'static str {
         match self {
             Self::Thumbv7mNoneEabi => "thumbv7m-none-eabi",
+            Self::Thumbv6mRp2040 => "thumbv6m-none-eabi",
             Self::Riscv32Esp32C6 => "riscv32-unknown-none-elf",
             Self::AvrAtmega328p | Self::AvrAtmega4809 => "avr",
             Self::HostX86_64Linux => "x86_64-unknown-linux-gnu",
@@ -48,7 +58,9 @@ impl TargetArch {
 
     pub const fn datalayout(self) -> &'static str {
         match self {
-            Self::Thumbv7mNoneEabi => "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64",
+            Self::Thumbv7mNoneEabi | Self::Thumbv6mRp2040 => {
+                "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"
+            }
             Self::Riscv32Esp32C6 => "e-m:e-p:32:32-i64:64-n32-S128",
             Self::AvrAtmega328p | Self::AvrAtmega4809 => {
                 "e-P1-p:16:8-i8:8-i16:8-i32:8-i64:8-f32:8-f64:8-n8:16-a:8"
@@ -61,7 +73,7 @@ impl TargetArch {
 
     pub const fn ptr_bits(self) -> u32 {
         match self {
-            Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 => 32,
+            Self::Thumbv7mNoneEabi | Self::Thumbv6mRp2040 | Self::Riscv32Esp32C6 => 32,
             Self::AvrAtmega328p | Self::AvrAtmega4809 => 16,
             Self::HostX86_64Linux => 64,
         }
@@ -69,7 +81,7 @@ impl TargetArch {
 
     pub const fn usize_llvm_ty(self) -> &'static str {
         match self {
-            Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 => "i32",
+            Self::Thumbv7mNoneEabi | Self::Thumbv6mRp2040 | Self::Riscv32Esp32C6 => "i32",
             Self::AvrAtmega328p | Self::AvrAtmega4809 => "i16",
             Self::HostX86_64Linux => "i64",
         }
@@ -78,7 +90,26 @@ impl TargetArch {
     pub const fn fn_ptr_llvm_ty(self) -> &'static str {
         match self {
             Self::AvrAtmega328p | Self::AvrAtmega4809 => "ptr addrspace(1)",
-            Self::Thumbv7mNoneEabi | Self::Riscv32Esp32C6 | Self::HostX86_64Linux => "ptr",
+            Self::Thumbv7mNoneEabi
+            | Self::Thumbv6mRp2040
+            | Self::Riscv32Esp32C6
+            | Self::HostX86_64Linux => "ptr",
+        }
+    }
+
+    pub const fn fn_addrspace_attr(self) -> &'static str {
+        if self.is_avr() {
+            " addrspace(1)"
+        } else {
+            ""
+        }
+    }
+
+    pub const fn call_kw(self) -> &'static str {
+        if self.is_avr() {
+            "call addrspace(1)"
+        } else {
+            "call"
         }
     }
 }
@@ -157,6 +188,20 @@ impl CodegenOptions {
             ram_origin: 0x0000_2800,
             ram_len: 6_144,
             opt_level: "-Os".to_string(),
+            max_ticks: 0,
+        }
+    }
+
+    /// Default options for bare-metal Raspberry Pi Pico / Pico W (`RP2040`, `thumbv6m-none-eabi`):
+    /// - `SRAM`: `0x2000_0000..0x2004_2000` (`270,336 B` = 264 KB unified `NO_FLASH` execution)
+    pub fn rp2040() -> Self {
+        Self {
+            target: TargetArch::Thumbv6mRp2040,
+            flash_origin: 0x2000_0000,
+            flash_len: 264 * 1024,
+            ram_origin: 0x2000_0000,
+            ram_len: 264 * 1024,
+            opt_level: "-O2".to_string(),
             max_ticks: 0,
         }
     }
@@ -285,6 +330,17 @@ pub struct AvrImageResult {
     pub sram_static_bytes: u64,
 }
 
+/// Artifacts produced by `build_rp2040_image`.
+#[derive(Debug, Clone)]
+pub struct Rp2040ImageResult {
+    pub elf: ElfBuildResult,
+    pub bin_path: PathBuf,
+    pub uf2_path: PathBuf,
+    pub bin_size: u64,
+    pub uf2_size: u64,
+    pub uf2_blocks: u32,
+}
+
 /// Options for executing a Cortex-M3 `.elf` inside `qemu-system-arm`.
 #[derive(Debug, Clone)]
 pub struct QemuRunOptions {
@@ -397,6 +453,67 @@ SECTIONS
             ram_vma = ram_vma,
             ram_len = opts.ram_len,
             mcpu = opts.target.avr_mcpu(),
+        );
+    }
+
+    if opts.target == TargetArch::Thumbv6mRp2040 {
+        return format!(
+            r#"/* Auto-synthesized by zev-codegen-llvm for Raspberry Pi RP2040 (NO_FLASH SRAM UF2) */
+MEMORY
+{{
+  SRAM (rwx) : ORIGIN = 0x{ram_orig:08X}, LENGTH = {ram_len}
+}}
+
+ENTRY(_start)
+
+SECTIONS
+{{
+  .entry ORIGIN(SRAM) :
+  {{
+    KEEP(*(.entry))
+  }} > SRAM
+
+  .isr_vector ALIGN(256) :
+  {{
+    KEEP(*(.isr_vector))
+  }} > SRAM
+
+  .text : ALIGN(4)
+  {{
+    *(.text .text.*)
+    *(.rodata .rodata.*)
+    . = ALIGN(4);
+  }} > SRAM
+
+  .data : ALIGN(4)
+  {{
+    __sidata = .;
+    __sdata = .;
+    *(.data .data.*)
+    . = ALIGN(4);
+    __edata = .;
+  }} > SRAM
+
+  .bss (NOLOAD) : ALIGN(4)
+  {{
+    __sbss = .;
+    *(.bss .bss.* COMMON)
+    . = ALIGN(4);
+    __ebss = .;
+  }} > SRAM
+
+  /DISCARD/ :
+  {{
+    *(.ARM.exidx*)
+    *(.ARM.attributes*)
+    *(.comment)
+    *(.note*)
+    *(.eh_frame*)
+  }}
+}}
+"#,
+            ram_orig = opts.ram_origin,
+            ram_len = opts.ram_len,
         );
     }
 
@@ -544,6 +661,9 @@ pub fn optimize_ll_with_opt(
         TargetArch::Thumbv7mNoneEabi => {
             cmd.arg("-mcpu=cortex-m3");
         }
+        TargetArch::Thumbv6mRp2040 => {
+            cmd.arg("-mcpu=cortex-m0plus");
+        }
         TargetArch::Riscv32Esp32C6 => {
             cmd.arg("-mcpu=generic-rv32").arg("-mattr=+m,+a,+c");
         }
@@ -593,6 +713,11 @@ pub fn compile_ll_to_obj(
     match opts.target {
         TargetArch::Thumbv7mNoneEabi => {
             cmd.arg("-mcpu=cortex-m3")
+                .arg("-function-sections")
+                .arg("-data-sections");
+        }
+        TargetArch::Thumbv6mRp2040 => {
+            cmd.arg("-mcpu=cortex-m0plus")
                 .arg("-function-sections")
                 .arg("-data-sections");
         }
@@ -803,13 +928,14 @@ pub fn compile_ll_to_elf(
     if !matches!(
         opts.target,
         TargetArch::Thumbv7mNoneEabi
+            | TargetArch::Thumbv6mRp2040
             | TargetArch::Riscv32Esp32C6
             | TargetArch::AvrAtmega328p
             | TargetArch::AvrAtmega4809
     ) {
         return Err(CodegenError::new(
             "build-elf",
-            "bare-metal .elf linking requires Thumbv7mNoneEabi, Riscv32Esp32C6, AvrAtmega328p, or AvrAtmega4809",
+            "bare-metal .elf linking requires Thumbv7mNoneEabi, Thumbv6mRp2040, Riscv32Esp32C6, AvrAtmega328p, or AvrAtmega4809",
         ));
     }
     if let Some(parent) = out_elf.parent() {
@@ -875,10 +1001,12 @@ pub fn run_elf_in_qemu(
         .arg("none")
         .arg("-monitor")
         .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=con0,mux=on")
         .arg("-serial")
-        .arg("stdio")
+        .arg("chardev:con0")
         .arg("-semihosting-config")
-        .arg("enable=on,target=native")
+        .arg("enable=on,target=native,chardev=con0")
         .arg("-kernel")
         .arg(elf_path)
         .stdin(Stdio::null())
@@ -1263,6 +1391,235 @@ try:
 finally:
     ser.close()
 "#;
+
+/// Pack a contiguous RP2040 SRAM payload into standard 512-byte UF2 blocks (`RP2040_FAMILY_ID = 0xE48BFF56`).
+pub fn pack_rp2040_uf2(bin: &[u8], base_addr: u32) -> Vec<u8> {
+    const UF2_MAGIC_START0: u32 = 0x0A32_4655;
+    const UF2_MAGIC_START1: u32 = 0x9E5D_5157;
+    const UF2_MAGIC_END: u32 = 0x0AB1_6F30;
+    const UF2_FLAG_FAMILY_ID_PRESENT: u32 = 0x0000_2000;
+    const RP2040_FAMILY_ID: u32 = 0xE48B_FF56;
+
+    let chunks: Vec<&[u8]> = if bin.is_empty() {
+        vec![&[][..]]
+    } else {
+        bin.chunks(256).collect()
+    };
+    let num_blocks = chunks.len() as u32;
+    let mut out = Vec::with_capacity(chunks.len() * 512);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let mut blk = [0u8; 512];
+        blk[0..4].copy_from_slice(&UF2_MAGIC_START0.to_le_bytes());
+        blk[4..8].copy_from_slice(&UF2_MAGIC_START1.to_le_bytes());
+        blk[8..12].copy_from_slice(&UF2_FLAG_FAMILY_ID_PRESENT.to_le_bytes());
+        blk[12..16].copy_from_slice(&(base_addr + (idx as u32) * 256).to_le_bytes());
+        blk[16..20].copy_from_slice(&256u32.to_le_bytes());
+        blk[20..24].copy_from_slice(&(idx as u32).to_le_bytes());
+        blk[24..28].copy_from_slice(&num_blocks.to_le_bytes());
+        blk[28..32].copy_from_slice(&RP2040_FAMILY_ID.to_le_bytes());
+        blk[32..32 + chunk.len()].copy_from_slice(chunk);
+        blk[508..512].copy_from_slice(&UF2_MAGIC_END.to_le_bytes());
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+/// Convert a linked RP2040 `NO_FLASH` `.elf` into a raw `.bin` + 512B-blocked `.uf2` at `0x2000_0000`.
+pub fn objcopy_elf_to_rp2040_uf2(
+    elf_path: &Path,
+    out_uf2: &Path,
+) -> Result<(PathBuf, u64, u64, u32), CodegenError> {
+    if let Some(parent) = out_uf2.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| {
+                CodegenError::new("io", format!("failed to create {}: {e}", parent.display()))
+            })?;
+        }
+    }
+    let out_bin = out_uf2.with_extension("bin");
+    let objcopy = find_tool("/bin/llvm-objcopy", "llvm-objcopy");
+    let out = Command::new(objcopy)
+        .arg("-O")
+        .arg("binary")
+        .arg(elf_path)
+        .arg(&out_bin)
+        .output()
+        .map_err(|e| {
+            CodegenError::new("llvm-objcopy", format!("failed to invoke `{objcopy}`: {e}"))
+        })?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(CodegenError::new(
+            "llvm-objcopy",
+            format!("llvm-objcopy exited with {}: {}", out.status, stderr.trim()),
+        ));
+    }
+
+    let bytes = fs::read(&out_bin).map_err(|e| {
+        CodegenError::new("io", format!("failed to read {}: {e}", out_bin.display()))
+    })?;
+    let sizes = inspect_elf_sizes(elf_path)?;
+    let padded_bin_len = (bytes.len() as u64).next_multiple_of(256);
+    if bytes.is_empty() || padded_bin_len + sizes.bss > 262_144 {
+        return Err(CodegenError::new(
+            "rp2040-image",
+            format!(
+                "RP2040 SRAM UF2 footprint (bin={}B + bss={}B) leaves fewer than 8 KB stack in 264 KB SRAM",
+                padded_bin_len, sizes.bss
+            ),
+        ));
+    }
+
+    let uf2 = pack_rp2040_uf2(&bytes, 0x2000_0000);
+    let blocks = (uf2.len() / 512) as u32;
+    fs::write(out_uf2, &uf2).map_err(|e| {
+        CodegenError::new("io", format!("failed to write {}: {e}", out_uf2.display()))
+    })?;
+    Ok((out_bin, bytes.len() as u64, uf2.len() as u64, blocks))
+}
+
+const RP2040_TOUCH_1200_SCRIPT: &str = r#"
+import sys, time
+try:
+    import serial
+except Exception as e:
+    raise SystemExit(f"pyserial unavailable for 1200-baud touch: {e}")
+
+port = sys.argv[1]
+try:
+    ser = serial.Serial(port, 1200, timeout=0.1)
+    ser.dtr = False
+    time.sleep(0.05)
+    ser.close()
+except Exception:
+    pass
+"#;
+
+/// Flash an RP2040 `.uf2` image via automatic 1200-baud BOOTSEL touch (if not already in `RPI-RP2`
+/// mass-storage mode), `udisksctl mount --no-user-interaction`, and direct UF2 copy.
+pub fn flash_rp2040_uf2(uf2_path: &Path, port: &str) -> Result<String, CodegenError> {
+    let by_label = Path::new("/dev/disk/by-label/RPI-RP2");
+    if !by_label.exists() {
+        if !Path::new(port).exists() {
+            return Err(CodegenError::new(
+                "rp2040-flash",
+                format!(
+                    "neither /dev/disk/by-label/RPI-RP2 nor serial port `{port}` exists; plug in the Pico or hold BOOTSEL"
+                ),
+            ));
+        }
+        let _ = Command::new("python3")
+            .arg("-c")
+            .arg(RP2040_TOUCH_1200_SCRIPT)
+            .arg(port)
+            .output();
+
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while !by_label.exists() {
+            if Instant::now() >= deadline {
+                return Err(CodegenError::new(
+                    "rp2040-flash",
+                    format!(
+                        "RP2040 did not enter BOOTSEL (/dev/disk/by-label/RPI-RP2) after 1200-baud touch on `{port}`; hold BOOTSEL while plugging USB to flash the initial Zev SRAM UF2"
+                    ),
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    let query_mount = || -> Option<String> {
+        let out = Command::new("lsblk")
+            .args(["-nr", "-o", "MOUNTPOINT", "/dev/disk/by-label/RPI-RP2"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let mp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if mp.is_empty() { None } else { Some(mp) }
+    };
+
+    let mut mount_point = query_mount();
+    if mount_point.is_none() {
+        let mut last_err = String::new();
+        for _ in 0..8 {
+            let out = Command::new("udisksctl")
+                .args([
+                    "mount",
+                    "--no-user-interaction",
+                    "-b",
+                    "/dev/disk/by-label/RPI-RP2",
+                ])
+                .output()
+                .map_err(|e| {
+                    CodegenError::new("rp2040-flash", format!("failed to invoke udisksctl: {e}"))
+                })?;
+            if out.status.success() {
+                thread::sleep(Duration::from_millis(150));
+                mount_point = query_mount();
+                if mount_point.is_some() {
+                    break;
+                }
+            } else {
+                last_err = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+                .trim()
+                .to_string();
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        if mount_point.is_none() {
+            return Err(CodegenError::new(
+                "rp2040-flash",
+                format!("failed to mount /dev/disk/by-label/RPI-RP2: {last_err}"),
+            ));
+        }
+    }
+
+    let mount_dir = mount_point.unwrap();
+    let dest = Path::new(&mount_dir).join("firmware.uf2");
+    let uf2_bytes = fs::read(uf2_path).map_err(|e| {
+        CodegenError::new(
+            "io",
+            format!("failed to read {}: {e}", uf2_path.display()),
+        )
+    })?;
+    {
+        use std::io::Write;
+        let mut f = fs::File::create(&dest).map_err(|e| {
+            CodegenError::new(
+                "rp2040-flash",
+                format!("failed to write {}: {e}", dest.display()),
+            )
+        })?;
+        f.write_all(&uf2_bytes).map_err(|e| {
+            CodegenError::new("rp2040-flash", format!("UF2 write failed: {e}"))
+        })?;
+        let _ = f.sync_all();
+    }
+
+    let reboot_deadline = Instant::now() + Duration::from_secs(6);
+    while by_label.exists() && Instant::now() < reboot_deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    let cdc_deadline = Instant::now() + Duration::from_secs(5);
+    while !Path::new(port).exists() && Instant::now() < cdc_deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Ok(format!(
+        "Flashed RP2040 SRAM UF2 ({} bytes, {} block(s)) via `{mount_dir}`; USB CDC port `{port}` present={}\n",
+        uf2_bytes.len(),
+        uf2_bytes.len() / 512,
+        Path::new(port).exists()
+    ))
+}
 
 /// Flash a raw AVR Flash `.bin` image onto an Arduino Uno R3 (`ATmega328P` / Optiboot) at `0x0000`
 /// using STK500v1 over `pyserial` (`115200` baud) with full page readback verification.

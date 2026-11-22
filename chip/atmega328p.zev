@@ -81,22 +81,42 @@ pub mmio TwiRegs {
     @rw u8 twamr @ 0x05;
 }
 
-pub mmio PORTB      : PortRegs   @ 0x23;
-pub mmio PORTC      : PortRegs   @ 0x26;
-pub mmio PORTD      : PortRegs   @ 0x29;
-pub mmio TIFR       : TifrRegs   @ 0x35;
-pub mmio PCIFR      : PcifrRegs  @ 0x3B;
-pub mmio EIFR       : EifrRegs   @ 0x3C;
-pub mmio SPI_REGS   : SpiRegs    @ 0x4C;
-pub mmio PCICR_REGS : PcicrRegs  @ 0x68;
-pub mmio PCMSK_REGS : PcmskRegs  @ 0x6B;
-pub mmio TIMSK_REGS : TimskRegs  @ 0x6E;
-pub mmio ADC_REGS   : AdcRegs    @ 0x78;
-pub mmio TIMER1     : Timer1Regs @ 0x80;
-pub mmio TWI_REGS   : TwiRegs    @ 0xB8;
-pub mmio USART0     : Usart0Regs @ 0xC0;
+pub mmio Timer0Regs {
+    @rw u8 tccr0a @ 0x00;
+    @rw u8 tccr0b @ 0x01;
+    @rw u8 tcnt0  @ 0x02;
+    @rw u8 ocr0a  @ 0x03;
+    @rw u8 ocr0b  @ 0x04;
+}
 
-// Interrupt vector indices (ATmega328P Datasheet Table 11-1; slot 0=RESET, 14=TIMER0_COMPA runtime tick)
+pub mmio McuCtrlRegs {
+    @rw u8 smcr  @ 0x00;
+    @rw u8 mcusr @ 0x01;
+}
+
+pub mmio WdtRegs {
+    @rw u8 wdtcsr @ 0x00;
+}
+
+pub mmio PORTB      : PortRegs    @ 0x23;
+pub mmio PORTC      : PortRegs    @ 0x26;
+pub mmio PORTD      : PortRegs    @ 0x29;
+pub mmio TIFR       : TifrRegs    @ 0x35;
+pub mmio PCIFR      : PcifrRegs   @ 0x3B;
+pub mmio EIFR       : EifrRegs    @ 0x3C;
+pub mmio TIMER0     : Timer0Regs  @ 0x44;
+pub mmio SPI_REGS   : SpiRegs     @ 0x4C;
+pub mmio MCU_CTRL   : McuCtrlRegs @ 0x53;
+pub mmio WDT_REGS   : WdtRegs     @ 0x60;
+pub mmio PCICR_REGS : PcicrRegs   @ 0x68;
+pub mmio PCMSK_REGS : PcmskRegs   @ 0x6B;
+pub mmio TIMSK_REGS : TimskRegs   @ 0x6E;
+pub mmio ADC_REGS   : AdcRegs     @ 0x78;
+pub mmio TIMER1     : Timer1Regs  @ 0x80;
+pub mmio TWI_REGS   : TwiRegs     @ 0xB8;
+pub mmio USART0     : Usart0Regs  @ 0xC0;
+
+// Interrupt vector indices (ATmega328P Datasheet Table 11-1; slot 0=RESET)
 pub irq IRQ_INT0         = 1;
 pub irq IRQ_INT1         = 2;
 pub irq IRQ_PCINT0       = 3;
@@ -106,6 +126,7 @@ pub irq IRQ_WDT          = 6;
 pub irq IRQ_TIMER2_COMPA = 7;
 pub irq IRQ_TIMER1_COMPA = 11;
 pub irq IRQ_TIMER1_OVF   = 13;
+pub irq IRQ_TIMER0_COMPA = 14;
 pub irq IRQ_SPI_STC      = 17;
 pub irq IRQ_USART_RX     = 18;
 pub irq IRQ_USART_UDRE   = 19;

@@ -14,6 +14,7 @@ pub mod avr_mega0;
 pub mod esp32c6;
 pub mod mir_codegen;
 pub mod nvic;
+pub mod rp2040;
 pub mod runtime_ir;
 pub mod stack_sizes;
 pub mod toolchain;
@@ -24,13 +25,15 @@ pub use avr_mega0::{flash_avr_nano_every_bin, objcopy_elf_to_avr_nano_every_bin}
 pub use esp32c6::ESP32C6_DIRECT_BOOT_MAGIC;
 pub use mir_codegen::emit_llvm_ir_with_options;
 pub use nvic::NvicMap;
+pub use rp2040::RP2040_UF2_FAMILY_ID;
 pub use stack_sizes::{HardwareStackProof, analyze_hardware_stack_high_water};
 pub use toolchain::{
     AvrImageResult, CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
-    Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, TargetArch,
-    compile_ll_to_elf, compile_ll_to_obj, flash_avr_uno_bin, flash_esp32c6_bin,
-    inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf, objcopy_elf_to_avr_bin,
-    objcopy_elf_to_esp32c6_bin, optimize_ll_with_opt, run_elf_in_qemu, synthesize_linker_script,
+    Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, Rp2040ImageResult,
+    TargetArch, compile_ll_to_elf, compile_ll_to_obj, flash_avr_uno_bin, flash_esp32c6_bin,
+    flash_rp2040_uf2, inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf,
+    objcopy_elf_to_avr_bin, objcopy_elf_to_esp32c6_bin, objcopy_elf_to_rp2040_uf2,
+    optimize_ll_with_opt, pack_rp2040_uf2, run_elf_in_qemu, synthesize_linker_script,
     verify_ll_with_opt,
 };
 
@@ -142,6 +145,35 @@ pub fn build_avr_nano_every_image_with_options(
         bin_path: out_bin.to_path_buf(),
         bin_size,
         sram_static_bytes,
+    })
+}
+
+/// Build a freestanding Raspberry Pi Pico / Pico W (`RP2040`, `thumbv6m-none-eabi` SRAM UF2).
+pub fn build_rp2040_image(
+    module: &zev_mir::MirModule,
+    out_elf: &Path,
+    out_uf2: &Path,
+) -> Result<Rp2040ImageResult, CodegenError> {
+    build_rp2040_image_with_options(module, out_elf, out_uf2, &CodegenOptions::rp2040())
+}
+
+/// Build a freestanding Raspberry Pi RP2040 `.elf`, `.bin`, and `.uf2` with custom [`CodegenOptions`].
+pub fn build_rp2040_image_with_options(
+    module: &zev_mir::MirModule,
+    out_elf: &Path,
+    out_uf2: &Path,
+    opts: &CodegenOptions,
+) -> Result<Rp2040ImageResult, CodegenError> {
+    let elf = build_elf(module, out_elf, opts)?;
+    let (bin_path, bin_size, uf2_size, uf2_blocks) =
+        objcopy_elf_to_rp2040_uf2(&elf.elf_path, out_uf2)?;
+    Ok(Rp2040ImageResult {
+        elf,
+        bin_path,
+        uf2_path: out_uf2.to_path_buf(),
+        bin_size,
+        uf2_size,
+        uf2_blocks,
     })
 }
 
@@ -268,10 +300,16 @@ mod tests {
             disasm.contains("csrci\tmstatus, 0x8") || disasm.contains("csrci mstatus, 8"),
             "expected mstatus interrupt mask at @_start:\n{disasm}"
         );
+        let ll_src = std::fs::read_to_string(&img.elf.ll_path).expect("read esp32c6_demo.ll");
         assert!(
-            disasm.contains("<__syn_esp32c6_disarm_watchdogs>:")
-                || disasm.contains("__syn_esp32c6_reset"),
-            "expected watchdog disarm routine in .text:\n{disasm}"
+            disasm.contains("<__syn_esp32c6_reset>:"),
+            "expected __syn_esp32c6_reset startup routine in .text:\n{disasm}"
+        );
+        assert!(
+            ll_src.contains("bsp_esp32c6_pico__init_soc")
+                && ll_src.contains("call i32 @__syn_fn_bsp_esp32c6_pico__sys_now_ms()")
+                && ll_src.contains("call void @__syn_fn_bsp_esp32c6_pico__console_putc(i8 %c)"),
+            "expected pure-.zev ESP32-C6 init_soc, sys_now_ms, and console_putc wiring in esp32c6_demo.ll"
         );
         assert!(
             disasm.contains("40800000 <__syn_rv_vector_table>:")
@@ -3611,9 +3649,9 @@ fn main() {
         assert!(img.elf.audit.is_zero_heap_freestanding());
         for req_sym in [
             "__syn_avr_reset",
-            "__syn_avr_systick_isr",
             "__syn_avr_vec_3",
             "__syn_avr_vec_11",
+            "__syn_avr_vec_14",
             "__syn_avr_vec_17",
             "__syn_avr_vec_18",
             "__syn_avr_vec_19",
@@ -3676,17 +3714,127 @@ fn main() {
             }],
         };
 
-        let attached = avr::validate_avr_irq_vectors(&[make_vec(11, "IRQ_TIMER1_COMPA")])
-            .expect("slot 11 is valid on ATmega328P");
-        assert!(attached.contains(&11));
+        let attached = avr::validate_avr_irq_vectors(&[
+            make_vec(11, "IRQ_TIMER1_COMPA"),
+            make_vec(14, "IRQ_TIMER0_COMPA"),
+        ])
+        .expect("slots 11 and 14 are valid user vectors on ATmega328P");
+        assert!(attached.contains(&11) && attached.contains(&14));
 
-        for (bad_num, name) in [(0, "RESET"), (14, "TIMER0_COMPA"), (26, "OOB")] {
+        for (bad_num, name) in [(0, "RESET"), (26, "OOB")] {
             let err = avr::validate_avr_irq_vectors(&[make_vec(bad_num, name)])
                 .expect_err("reserved/out-of-range vector must be rejected");
             assert!(
                 !err.message.is_empty(),
                 "expected descriptive validation error for vector {bad_num}"
             );
+        }
+    }
+
+    #[test]
+    fn pico_w_demo_builds_rp2040_uf2_and_passes_audit() {
+        let demo_path = repo_root().join("examples/pico_w_demo.zev");
+        let mir = compile_example_mir(&[demo_path]);
+
+        assert_eq!(mir.ram_report.mcu32.heap_bytes, 0);
+
+        let dir = test_out_dir();
+        let out_elf = dir.join("pico_w_demo.elf");
+        let out_uf2 = dir.join("pico_w_demo.uf2");
+
+        let img = build_rp2040_image(&mir, &out_elf, &out_uf2)
+            .unwrap_or_else(|e| panic!("RP2040 SRAM UF2 build failed: {e}"));
+
+        verify_ll_with_opt(&img.elf.ll_path)
+            .expect("LLVM 23 opt -passes=verify on pico_w_demo.ll");
+
+        assert!(img.elf.audit.is_zero_heap_freestanding());
+        for req_sym in [
+            "_start",
+            "Reset_Handler",
+            "SysTick_Handler",
+            "__syn_vec_irq_0",
+            "__syn_vec_irq_5",
+            "__syn_vec_irq_11",
+            "__zev_isr_state_1_usb",
+            "__syn_fn_bsp_rpi_pico_w__init_clocks",
+            "__syn_fn_bsp_rpi_pico_w__usb_cdc_irq_step",
+        ] {
+            assert!(
+                img.elf.audit.defined_symbols.iter().any(|s| s == req_sym),
+                "missing RP2040 symbol {req_sym} in {:?}",
+                img.elf.audit.defined_symbols
+            );
+        }
+        let ll_src = std::fs::read_to_string(&img.elf.ll_path).expect("read pico_w_demo.ll");
+        assert!(ll_src.contains("call void @__syn_isr_usb_cdc_isr("));
+        assert!(ll_src.contains("call void @__syn_fn_console_putc(i8 %c)"));
+
+        let uf2 = std::fs::read(&img.uf2_path).expect("read generated UF2");
+        assert!(!uf2.is_empty() && uf2.len() % 512 == 0, "UF2 len={}", uf2.len());
+        assert_eq!(uf2.len(), (img.uf2_blocks as usize) * 512);
+        for (idx, blk) in uf2.chunks_exact(512).enumerate() {
+            let m0 = u32::from_le_bytes(blk[0..4].try_into().unwrap());
+            let m1 = u32::from_le_bytes(blk[4..8].try_into().unwrap());
+            let flags = u32::from_le_bytes(blk[8..12].try_into().unwrap());
+            let target_addr = u32::from_le_bytes(blk[12..16].try_into().unwrap());
+            let payload_sz = u32::from_le_bytes(blk[16..20].try_into().unwrap());
+            let block_no = u32::from_le_bytes(blk[20..24].try_into().unwrap());
+            let num_blocks = u32::from_le_bytes(blk[24..28].try_into().unwrap());
+            let family_id = u32::from_le_bytes(blk[28..32].try_into().unwrap());
+            let mend = u32::from_le_bytes(blk[508..512].try_into().unwrap());
+            assert_eq!(m0, 0x0A32_4655);
+            assert_eq!(m1, 0x9E5D_5157);
+            assert_eq!(flags, 0x0000_2000);
+            assert_eq!(target_addr, 0x2000_0000 + (idx as u32) * 256);
+            assert_eq!(payload_sz, 256);
+            assert_eq!(block_no, idx as u32);
+            assert_eq!(num_blocks, img.uf2_blocks);
+            assert_eq!(family_id, RP2040_UF2_FAMILY_ID);
+            assert_eq!(mend, 0x0AB1_6F30);
+        }
+
+        let objdump = Command::new("/bin/llvm-objdump")
+            .args(["-d", "--start-address=0x20000000", "--stop-address=0x20000020"])
+            .arg(&img.elf.elf_path)
+            .output()
+            .expect("invoke llvm-objdump on RP2040 ELF");
+        assert!(objdump.status.success());
+        let disasm = String::from_utf8_lossy(&objdump.stdout);
+        assert!(disasm.contains("20000000 <_start>:"), "disasm:\n{disasm}");
+    }
+
+    #[test]
+    fn compiler_backends_contain_zero_board_peripheral_mmio_addresses() {
+        let forbidden = [
+            "1073790976",
+            "0x4000C000",
+            "inttoptr (i16 192",
+            "inttoptr (i16 198",
+            "inttoptr (i16 83",
+            "sts 0x0060",
+            "1610645",
+            "1610674176",
+            "0x6000F",
+            "0x5010",
+            "0x5011",
+            "134322",
+            "0x0860",
+            "0x0AB",
+        ];
+        for (name, src) in [
+            ("runtime_ir.rs", include_str!("runtime_ir.rs")),
+            ("avr.rs", include_str!("avr.rs")),
+            ("avr_mega0.rs", include_str!("avr_mega0.rs")),
+            ("esp32c6.rs", include_str!("esp32c6.rs")),
+            ("rp2040.rs", include_str!("rp2040.rs")),
+        ] {
+            for pat in forbidden {
+                assert!(
+                    !src.contains(pat),
+                    "compiler backend `{name}` leaked forbidden board peripheral MMIO pattern `{pat}`"
+                );
+            }
         }
     }
 
@@ -4184,13 +4332,18 @@ print("OK")
     fn byte_ring_isr_push_bipbuffer_and_wait_read_in_qemu() {
         let src = r#"
 byte_ring<16> uart_rx;
+byte_ring<16> bip_rx;
 signal done_sig;
 irq IRQ_EXTI4 = 4;
 
 isr uart_isr(*byte_ring<16> rx) {
-    state u8 byte_seq = 65;
-    rx.push_byte(byte_seq, boost: @critical);
-    byte_seq += 1;
+    state u8 pass = 0;
+    if (pass == 0) {
+        rx.push_byte(65, boost: @critical);
+    } else if (pass == 1) {
+        rx.push("HELLO_RING", boost: @low);
+    }
+    pass += 1;
 }
 
 task parser_task(*byte_ring<16> rx, *signal done) {
@@ -4215,36 +4368,36 @@ fn main() {
     sys.use_systick(12_000_000);
     IRQ_EXTI4.attach(uart_isr(&uart_rx));
 
-    // 1. Wrap-around + BipBuffer early wrap in pure LLVM IR
-    assert(uart_rx.push("0123456789AB") == 12);
+    // 1. Wrap-around + BipBuffer early wrap in pure LLVM IR on private ring
+    assert(bip_rx.push("0123456789AB") == 12);
     u8 pre[8];
-    assert(uart_rx.pop(pre) == 8);
+    assert(bip_rx.pop(pre) == 8);
     assert(pre[0] == '0' && pre[7] == '7');
 
     // Back free=4 (12..16), front free=8 (0..8) -> grant_write(6) wraps to index 0!
-    []u8 wr = uart_rx.grant_write(6) catch {
+    []u8 wr = bip_rx.grant_write(6) catch {
         sys.exit(1);
     };
     wr[0] = 'X';
     wr[1] = 'Y';
     wr[2] = 'Z';
-    uart_rx.commit_write(3);
+    bip_rx.commit_write(3);
 
     u8 tail_a[4];
-    assert(uart_rx.pop(tail_a) == 4);
+    assert(bip_rx.pop(tail_a) == 4);
     assert(tail_a[0] == '8' && tail_a[3] == 'B');
 
-    assert((uart_rx.try_pop_byte() or 0) == 'X');
-    assert((uart_rx.try_pop_byte() or 0) == 'Y');
-    assert((uart_rx.try_pop_byte() or 0) == 'Z');
-    assert(uart_rx.is_empty());
+    assert((bip_rx.try_pop_byte() or 0) == 'X');
+    assert((bip_rx.try_pop_byte() or 0) == 'Y');
+    assert((bip_rx.try_pop_byte() or 0) == 'Z');
+    assert(bip_rx.is_empty());
 
-    // 2. Spawn parser_task and drive it from NVIC ISR + slice push
+    // 2. Spawn parser_task and drive it strictly single-producer from NVIC ISR
     spawn parser_task(&uart_rx, &done_sig) @low;
     set_priority(@low);
     sys.pend_irq(4);
     delay(2ms);
-    assert(uart_rx.push("HELLO_RING") == 10);
+    sys.pend_irq(4);
     done_sig.wait();
     println("[PASS] BYTE_RING QEMU OK");
     sys.exit(0);
@@ -4568,6 +4721,7 @@ fn main() {
     fn fmt_ring_wrap_single_wake_boost_and_truncation_in_qemu() {
         let src = r#"
 byte_ring<16> tx;
+byte_ring<16> tx2;
 signal sync;
 
 usize write_fmt_view(*byte_ring r, u16 v) error FmtErr {
@@ -4590,25 +4744,25 @@ task reader() {
     tx.consume(cw_len);
     println(f"QEMU_FMT_WAKE len={cw_len} b0={first_b} prio={prio}");
 
-    assert(tx.push("0123456789A") == 11);
+    assert(tx2.push("0123456789A") == 11);
     u8 trash[10];
-    assert(tx.pop(trash) == 10);
-    usize w = write_fmt_view(&tx, 0x1A2B) catch { 0 };
+    assert(tx2.pop(trash) == 10);
+    usize w = write_fmt_view(&tx2, 0x1A2B) catch { 0 };
     assert(w == 6);
 
-    []u8 c1 = tx.read_slice();
+    []u8 c1 = tx2.read_slice();
     usize c1_len = c1.len;
     assert(c1_len == 6);
-    tx.consume(c1_len);
-    []u8 c2 = tx.read_slice();
+    tx2.consume(c1_len);
+    []u8 c2 = tx2.read_slice();
     assert(c2.len == 1);
     u8 last_b = c2[0];
-    tx.consume(c2.len);
+    tx2.consume(c2.len);
     println(f"QEMU_FMT_WRAP c1len={c1_len} last={last_b}");
 
-    assert(tx.push("123456789012") == 12);
-    usize partial_w = fmt_ring(&tx, f"ABCD1234") catch (FmtErr e, usize pw) {
-        println(f"QEMU_FMT_TRUNC partial={pw} total_len={tx.len()}");
+    assert(tx2.push("123456789012") == 12);
+    usize partial_w = fmt_ring(&tx2, f"ABCD1234") catch (FmtErr e, usize pw) {
+        println(f"QEMU_FMT_TRUNC partial={pw} total_len={tx2.len()}");
         sys.exit(0);
     };
     println(f"UNEXPECTED_OK={partial_w}");
@@ -4713,7 +4867,27 @@ fn main() {
         assert!(!uno_proof.has_cycle);
         assert!(uno_proof.format_table().contains("PASS"));
 
-        // 4. Host target rejects hardware stack proof cleanly, and AVR >2048 B high-water fails `within_budget`
+        // 4. Raspberry Pi Pico W RP2040 (`examples/pico_w_demo.zev`, 270,336 B SRAM, 32 B NVIC frame)
+        let pico_mir = compile_example_mir(&[repo_root().join("examples/pico_w_demo.zev")]);
+        let pico_proof = analyze_hardware_stack_high_water(&pico_mir, &CodegenOptions::rp2040())
+            .expect("RP2040 stack high-water proof");
+        println!("{}", pico_proof.format_table());
+        assert_eq!(pico_proof.sram_budget_bytes, 270_336);
+        assert_eq!(pico_proof.isr_hw_overhead_bytes, 32);
+        assert!(pico_proof.text_bytes > 0);
+        assert!(pico_proof.static_sram_bytes > 0);
+        assert!(pico_proof.boot_stack_bytes > 0);
+        assert!(pico_proof.sched_task_stack_bytes > 0);
+        assert!(pico_proof.worst_isr_stack_bytes >= 32);
+        assert_eq!(
+            pico_proof.total_high_water_bytes,
+            pico_proof.static_sram_bytes + pico_proof.peak_stack_bytes
+        );
+        assert!(pico_proof.within_budget);
+        assert!(!pico_proof.has_cycle);
+        assert!(pico_proof.format_table().contains("PASS"));
+
+        // 5. Host target rejects hardware stack proof cleanly, and AVR >2048 B high-water fails `within_budget`
         let mut host_opts = CodegenOptions::default();
         host_opts.target = TargetArch::HostX86_64Linux;
         assert!(analyze_hardware_stack_high_water(&cm3_mir, &host_opts).is_err());
@@ -5254,5 +5428,697 @@ fn main() {
         let motor_ll = emit_llvm_ir_with_options(&motor_mir, &CodegenOptions::default())
             .expect("emit LLVM IR for motor_controller");
         assert!(motor_ll.contains("motor_control"));
+    }
+
+    fn compile_src_mir(src: &str) -> zev_mir::MirModule {
+        let prog = zev_parser::parse_str(src).expect("parse regression test");
+        zev_sema::analyze_program(&prog).expect("sema regression test");
+        zev_mir::lower_program(&prog).expect("mir regression test")
+    }
+
+    #[test]
+    fn l_h1_mixed_width_shifts_and_const_shr_mask_in_qemu() {
+        let src = r#"
+const u8 C_U8_SHR = 0xF0u8 >> 1;
+const u16 C_U16_SHR = 0x8001u16 >> 1;
+
+fn main() {
+    sys.use_systick(12_000_000);
+    u8 uval = 0x80u8;
+    u32 ush = 1u32;
+    u8 u_shr = uval >> ush;
+    assert(u_shr == 0x40u8);
+
+    i8 sval = -128i8;
+    i8 s_shr = sval >> ush;
+    assert(s_shr == -64i8);
+
+    u8 lv = 1u8;
+    u32 lsh = 4u32;
+    u8 l_res = lv << lsh;
+    assert(l_res == 16u8);
+    u8 l_wrap = 0x80u8 << ush;
+    assert(l_wrap == 0u8);
+
+    u8 cu = 0x80u8;
+    u16 csh = 2u16;
+    cu >>= csh;
+    assert(cu == 0x20u8);
+
+    i8 cs = -16i8;
+    cs >>= csh;
+    assert(cs == -4i8);
+
+    u8 cl = 3u8;
+    cl <<= csh;
+    assert(cl == 12u8);
+
+    assert(C_U8_SHR == 0x78u8);
+    assert(C_U16_SHR == 0x4000u16);
+    println("L_H1_SHIFT_OK");
+    sys.exit(0);
+}
+"#;
+        let (mir, ll, res) = run_zev_cortex_m_qemu("l_h1_mixed_shifts", src);
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify L-H1 Cortex-M3");
+        assert!(ll.contains("ashr i8") && ll.contains("lshr i8"), "expected i8 shifts in IR");
+        assert!(
+            res.exec.stdout.contains("L_H1_SHIFT_OK"),
+            "stdout={}",
+            res.exec.stdout
+        );
+
+        let avr_opts = CodegenOptions {
+            target: TargetArch::AvrAtmega328p,
+            ..Default::default()
+        };
+        let avr_ll = emit_llvm_ir_with_options(&mir, &avr_opts).expect("AVR L-H1 IR");
+        let avr_ll_path = test_out_dir().join("l_h1_avr.ll");
+        std::fs::write(&avr_ll_path, &avr_ll).unwrap();
+        verify_ll_with_opt(&avr_ll_path).expect("opt verify AVR L-H1");
+    }
+
+    #[test]
+    fn l_h2_avr_volatile_crit_wrapping_and_should_share_lock() {
+        let src = r#"
+inbox<u8, 4> isr_in;
+inbox<u16, 4> task_in;
+byte_ring<16> isr_ring;
+byte_ring<8> task_ring;
+watch<u32> out_diag = 0;
+irq IRQ_T = 2;
+
+isr on_timer_irq(*inbox<u8, 4> q, *byte_ring<16> r) {
+    q.post(1u8, boost: @critical);
+    r.push_byte(2u8, boost: @critical);
+}
+
+usize inspect_q_view(*inbox<u8> q) {
+    usize n = q.len();
+    if (q.is_empty() || q.is_full()) {
+        return n + 1;
+    }
+    return n;
+}
+
+usize inspect_r_view(*byte_ring r) {
+    usize n = r.len();
+    if (r.is_empty()) {
+        return n + 1;
+    }
+    return n;
+}
+
+task worker() {
+    task_in.post(5u16);
+    task_ring.push_byte(6u8);
+    loop {
+        usize a = isr_in.len() + (isr_in.is_empty() as usize) + (isr_in.is_full() as usize);
+        usize b = task_in.len() + (task_in.is_empty() as usize) + (task_in.is_full() as usize);
+        usize c = isr_ring.len() + (isr_ring.is_empty() as usize);
+        usize d = task_ring.len() + (task_ring.is_empty() as usize);
+        usize e = inspect_q_view(&isr_in) + inspect_r_view(&isr_ring);
+        u32 sd = sys.sleep_depth();
+        u32 wc = sys.wfi_count();
+        out_diag.publish(((a + b + c + d + e) as u32) + sd + wc);
+        u8 _d1 = isr_in.try_recv() or 0u8;
+        u16 _d2 = task_in.try_recv() or 0u16;
+        isr_ring.consume(0);
+        task_ring.consume(0);
+        sys.delay(5ms);
+    }
+}
+
+fn main() {
+    IRQ_T.attach(on_timer_irq(&isr_in, &isr_ring));
+    spawn worker() @normal;
+}
+"#;
+        let mir = compile_src_mir(src);
+        let avr_opts = CodegenOptions {
+            target: TargetArch::AvrAtmega328p,
+            ..Default::default()
+        };
+        let ll = emit_llvm_ir_with_options(&mir, &avr_opts).expect("emit AVR L-H2 IR");
+        let ll_path = test_out_dir().join("l_h2_avr.ll");
+        std::fs::create_dir_all(ll_path.parent().unwrap()).unwrap();
+        std::fs::write(&ll_path, &ll).unwrap();
+        verify_ll_with_opt(&ll_path).expect("opt verify AVR L-H2 IR");
+
+        // 1. `@__syn_should_share` wraps timer wakeup + task scan in AVR crit enter/exit.
+        let ss_start = ll.find("define i1 @__syn_should_share(").expect("@__syn_should_share present");
+        let ss_end = ll[ss_start..].find("\n}\n").unwrap() + ss_start;
+        let ss_body = &ll[ss_start..ss_end];
+        assert!(ss_body.contains("@__syn_crit_enter()"), "{ss_body}");
+        assert!(ss_body.contains("@__syn_crit_exit("), "{ss_body}");
+
+        // 2. Worker mixes contended ISR primitives + sleep_depth + wfi_count (crit-wrapped)
+        //    and uncontended task-only primitives (unwrapped `load volatile` + `; irq-mask elided`).
+        let w_start = ll.find("define i32 @__syn_task_step_worker(").expect("worker step present");
+        let w_end = ll[w_start..].find("\n}\n").unwrap() + w_start;
+        let w_body = &ll[w_start..w_end];
+        assert!(w_body.contains("@__syn_crit_enter()"), "{w_body}");
+        assert!(ll.contains("; irq-mask elided"), "expected elided helper in AVR IR");
+        let task_in_gep = w_body
+            .find("getelementptr inbounds %prim.inbox_u16_4, ptr @__syn_prim_task_in")
+            .expect("task_in gep present");
+        let task_in_slice = &w_body[task_in_gep..(task_in_gep + 200).min(w_body.len())];
+        assert!(
+            !task_in_slice.contains("@__syn_crit_enter()"),
+            "task-only inbox_u16_4 load should not mask IRQs:\n{task_in_slice}"
+        );
+
+        // 3. View helpers keep critical guards on AVR for contended views.
+        let qv_start = ll.find("define i16 @__syn_fn_inspect_q_view(").expect("q view present");
+        let qv_end = ll[qv_start..].find("\n}\n").unwrap() + qv_start;
+        assert!(ll[qv_start..qv_end].contains("@__syn_crit_enter()"));
+        let rv_start = ll.find("define i16 @__syn_fn_inspect_r_view(").expect("r view present");
+        let rv_end = ll[rv_start..].find("\n}\n").unwrap() + rv_start;
+        assert!(ll[rv_start..rv_end].contains("@__syn_crit_enter()"));
+    }
+
+    #[test]
+    fn l_h3_watch_struct_f32_slice_and_const_ref_in_qemu() {
+        let src = r#"
+struct SensorCfg {
+    u16 id;
+    i16 bias;
+}
+
+const u16 DEFAULT_ID = 42u16;
+const SensorCfg INIT_CFG = SensorCfg { id: DEFAULT_ID, bias: -5i16 };
+const [3]u8 INIT_TAG = [10u8, 20u8, 30u8];
+
+watch<SensorCfg> w_cfg = INIT_CFG;
+watch<f32> w_temp = 23.5f32;
+watch<[]u8> w_slice = INIT_TAG;
+watch<[3]u8> w_arr = INIT_TAG;
+
+fn main() {
+    sys.use_systick(12_000_000);
+    SensorCfg c0 = w_cfg.read();
+    f32 t0 = w_temp.read();
+    []u8 s0 = w_slice.read();
+    [3]u8 a0 = w_arr.read();
+    assert(c0.id == 42u16 && c0.bias == -5i16);
+    assert(t0 > 23.4f32 && t0 < 23.6f32);
+    assert(s0.len == 3 && s0[0] == 10u8 && s0[1] == 20u8 && s0[2] == 30u8);
+    assert(a0[0] == 10u8 && a0[1] == 20u8 && a0[2] == 30u8);
+
+    w_cfg.publish(SensorCfg { id: 99u16, bias: 7i16 });
+    w_temp.publish(-1.25f32);
+    SensorCfg c1 = w_cfg.read();
+    assert(c1.id == 99u16 && c1.bias == 7i16);
+    assert(w_temp.read() < -1.2f32);
+    println("L_H3_WATCH_OK");
+    sys.exit(0);
+}
+"#;
+        let (mir, _ll, res) = run_zev_cortex_m_qemu("l_h3_watch_init", src);
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify L-H3 Cortex-M3");
+        assert!(res.exec.stdout.contains("L_H3_WATCH_OK"), "stdout={}", res.exec.stdout);
+
+        let avr_opts = CodegenOptions {
+            target: TargetArch::AvrAtmega328p,
+            ..Default::default()
+        };
+        let avr_ll = emit_llvm_ir_with_options(&mir, &avr_opts).expect("AVR L-H3 IR");
+        let avr_ll_path = test_out_dir().join("l_h3_avr.ll");
+        std::fs::write(&avr_ll_path, &avr_ll).unwrap();
+        verify_ll_with_opt(&avr_ll_path).expect("opt verify AVR L-H3 IR");
+    }
+
+    #[test]
+    fn l_m2_cortex_m_boot_primask_boot_delay_and_crit_pend_irq_in_qemu() {
+        let src = r#"
+irq IRQ_TEST = 5;
+watch<u32> isr_count = 0;
+signal done;
+
+isr on_test_irq(*watch<u32> c) {
+    state u32 n = 0;
+    n += 1;
+    c.publish(n);
+}
+
+fn boot_delay_helper() {
+    sys.delay(2ms);
+}
+
+task worker() {
+    // 1. Inside `critical`, pending IRQ 5 MUST defer until leaving `critical`.
+    u32 in_crit = 0;
+    critical {
+        sys.pend_irq(5);
+        in_crit = isr_count.read();
+    }
+    u32 after_crit = isr_count.read();
+    println(f"L_M2_IRQ boot={in_crit} after={after_crit}");
+    assert(in_crit == 1u32);
+    assert(after_crit == 2u32);
+    done.notify();
+    sys.exit(0);
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    IRQ_TEST.attach(on_test_irq(&isr_count));
+    // During boot (`@__syn_cm_in_boot == 1`), `pend_irq` dispatches synchronously and
+    // `RunYieldingFn` delay wakes cleanly despite PRIMASK=1 boot guard.
+    sys.pend_irq(5);
+    assert(isr_count.read() == 1u32);
+    boot_delay_helper();
+    assert(sys.now_ms() >= 2u32);
+    spawn worker() @normal;
+}
+"#;
+        let (_mir, ll, res) = run_zev_cortex_m_qemu("l_m2_boot_primask", src);
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify L-M2 Cortex-M3");
+        assert!(res.exec.stdout.contains("L_M2_IRQ boot=1 after=2"), "stdout={}", res.exec.stdout);
+
+        assert!(ll.contains("@__syn_cm_in_boot = internal global i8 1"));
+        let rh_start = ll.find("define void @Reset_Handler(").expect("Reset_Handler present");
+        let rh_end = ll[rh_start..].find("\n}\n").unwrap() + rh_start;
+        let rh_body = &ll[rh_start..rh_end];
+        let cpsid_pos = rh_body.find("cpsid i").expect("cpsid i in Reset_Handler");
+        let boot_pos = rh_body.find("@__syn_boot()").expect("@__syn_boot in Reset_Handler");
+        assert!(cpsid_pos < boot_pos, "Reset_Handler must set PRIMASK=1 before __syn_boot");
+
+        let idle_start = ll.find("define void @__syn_idle_sleep(").expect("idle sleep present");
+        let idle_end = ll[idle_start..].find("\n}\n").unwrap() + idle_start;
+        assert!(ll[idle_start..idle_end].contains("dsb\\0Awfi\\0Acpsie i\\0Aisb\\0Acpsid i"));
+
+        let sl_start = ll.find("define void @__syn_sched_loop(").expect("sched_loop present");
+        let sl_end = ll[sl_start..].find("\n}\n").unwrap() + sl_start;
+        assert!(ll[sl_start..sl_end].contains("store volatile i8 0, ptr @__syn_cm_in_boot"));
+        assert!(ll[sl_start..sl_end].contains("cpsie i"));
+
+        let pend_start = ll.find("define void @__syn_nvic_pend_irq(").expect("pend_irq present");
+        let pend_end = ll[pend_start..].find("\n}\n").unwrap() + pend_start;
+        assert!(ll[pend_start..pend_end].contains("@__syn_cm_dispatch_irq("));
+    }
+
+    #[test]
+    fn l_m1_indirect_fnptr_conservative_stack_bound_end_to_end() {
+        let src = r#"
+u32 heavy_leaf(u32 x) {
+    u8 buf[64];
+    u32 i = 0;
+    while (i < 64u32) {
+        buf[i] = ((x + i) & 0xff) as u8;
+        i += 1u32;
+    }
+    return (buf[x & 63u32] as u32) + (buf[(x + 17u32) & 63u32] as u32);
+}
+
+u32 alt_leaf(u32 x) {
+    return x + 1u32;
+}
+
+watch<fn(u32) -> u32> cb_w = heavy_leaf;
+watch<u32> out_v = 0;
+
+task runner() {
+    if (sys.wfi_count() > 10000u32) {
+        cb_w.publish(alt_leaf);
+    }
+    fn(u32) -> u32 f = cb_w.read();
+    u32 r = f(sys.now_ms());
+    out_v.publish(r);
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    spawn runner() @normal;
+}
+"#;
+        let mir = compile_src_mir(src);
+        let proof = stack_sizes::analyze_hardware_stack_high_water(&mir, &CodegenOptions::default())
+            .expect("Cortex-M3 L-M1 indirect stack proof");
+        assert!(!proof.has_cycle, "unexpected cycle: {proof:?}");
+        assert!(
+            proof.sched_task_stack_bytes >= 64,
+            "expected indirect fnptr call to include >= 64 B heavy_leaf frame, got {:?}",
+            proof
+        );
+    }
+
+    #[test]
+    fn l_l2_avr_uno_and_nano_every_direct_addrspace1_ir_valid() {
+        let src = r#"
+@dma_safe pool<[8]u8, 2> dma_p;
+byte_ring<16> rx;
+watch<f32> filt = 1.0f32;
+irq IRQ_TICK = 1;
+
+isr on_tick(*byte_ring<16> r) {
+    r.push_byte(0x41u8, boost: @critical);
+}
+
+task consumer() {
+    loop {
+        Lease<[8]u8> l = dma_p.try_alloc() catch {
+            sys.delay(1ms);
+            []u8 s0 = rx.wait_read(timeout: 1ms) catch { continue; };
+            rx.consume(s0.len);
+            continue;
+        };
+        defer l.release();
+        filt.publish(filt.read() * 0.5f32 + 1.0f32);
+        []u8 s = rx.wait_read();
+        rx.consume(s.len);
+    }
+}
+
+fn main() {
+    IRQ_TICK.attach(on_tick(&rx));
+    spawn consumer() @normal;
+}
+"#;
+        let mir = compile_src_mir(src);
+        let dir = test_out_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (tag, target) in [
+            ("uno", TargetArch::AvrAtmega328p),
+            ("nano_every", TargetArch::AvrAtmega4809),
+        ] {
+            let opts = CodegenOptions {
+                target,
+                ..Default::default()
+            };
+            let ll = emit_llvm_ir_with_options(&mir, &opts).expect("emit AVR L-L2 IR");
+            let ll_path = dir.join(format!("l_l2_{tag}.ll"));
+            std::fs::write(&ll_path, &ll).unwrap();
+            verify_ll_with_opt(&ll_path).unwrap_or_else(|e| panic!("opt verify {tag}: {e}"));
+
+            // Every user/runtime `define`/`declare` uses `addrspace(1)` directly, and no
+            // non-asm / non-`@llvm.` call omits `addrspace(1)`.
+            assert!(ll.contains("define void @__syn_boot() addrspace(1)"));
+            assert!(ll.contains("call addrspace(1) void @__syn_boot()"));
+            for line in ll.lines() {
+                let t = line.trim();
+                if t.contains("call ")
+                    && !t.starts_with(';')
+                    && !t.contains(" asm ")
+                    && !t.contains("@llvm.")
+                    && (t.contains("@__syn_") || t.contains("@main("))
+                {
+                    assert!(
+                        t.contains("call addrspace(1) "),
+                        "{tag} AVR call missing addrspace(1): {t}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn b_h2_b_l2_nested_dma_struct_pp_bits_and_mmio_clamp_parity() {
+        let src = r#"
+struct Inner {
+    @dma_safe pool<[8]u8, 2> sub_p;
+    pool<u32, 2> raw_p;
+    ping_pong<u16, 4> pp_in;
+}
+
+struct Outer {
+    Inner inner;
+    @dma_safe ping_pong<u16, 4> pp_out;
+    signal sig;
+}
+
+Outer mixed_outer;
+@dma_safe Outer full_dma_outer;
+watch<u32> ping_sum = 0;
+
+task fold_worker(*watch<u32> out) {
+    // 1. Non-@dma_safe field inside non-dma Outer keeps sleep_depth == 2,
+    //    while `@dma_safe` field `sub_p` clamps sleep_depth 2 -> 1.
+    assert(sys.sleep_depth() == 2);
+    Lease<u32> r0 = mixed_outer.inner.raw_p.try_alloc() catch { sys.exit(1); };
+    assert(sys.sleep_depth() == 2);
+    r0.release();
+    Lease<[8]u8> a = mixed_outer.inner.sub_p.try_alloc() catch { sys.exit(1); };
+    assert(sys.sleep_depth() == 1);
+    a.release();
+    assert(sys.sleep_depth() == 2);
+
+    // 2. Top-level `@dma_safe Outer` propagates `parent_dma_safe` into `inner.raw_p`!
+    Lease<u32> r1 = full_dma_outer.inner.raw_p.try_alloc() catch { sys.exit(1); };
+    assert(sys.sleep_depth() == 1);
+    r1.release();
+    assert(sys.sleep_depth() == 2);
+
+    mixed_outer.inner.pp_in.start();
+    full_dma_outer.pp_out.start();
+    assert(sys.sleep_depth() == 1);
+    full_dma_outer.pp_out.stop();
+    mixed_outer.inner.pp_in.stop();
+    out.publish(42u32);
+    println("B_H2_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    spawn fold_worker(&ping_sum) @normal;
+}
+"#;
+        let (mir, ll, res) = run_zev_cortex_m_qemu("b_h2_nested_dma", src);
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify B-H2/B-L2 Cortex-M3");
+        assert!(res.exec.stdout.contains("B_H2_OK"), "stdout={}", res.exec.stdout);
+        // B-H2: `@full_dma_outer` has >= 16 byte align + `_dma` pool layout type
+        assert!(ll.contains("%prim.pool_arr_8_u8_2_dma ="), "missing _dma pool type in IR");
+        let dma_global_line = ll
+            .lines()
+            .find(|l| l.starts_with("@__zev_subsys_full_dma_outer =") || l.starts_with("@full_dma_outer ="))
+            .expect("@full_dma_outer global present");
+        assert!(dma_global_line.contains("align 16") || dma_global_line.contains("align 32"), "{dma_global_line}");
+        // B-H2: non-zero-init struct globals (signal / ping_pong) get constant struct init + distinct pp bits
+        assert!(ll.contains("global %struct.Outer {"));
+        assert!(dma_global_line.contains("i8 2, [4 x i16]") && dma_global_line.contains("i8 3, [4 x i16]"), "{dma_global_line}");
+        // B-L2: folded singleton param `out` of `fold_worker` should NOT allocate dead `%p.out` alloca
+        let fw_start = ll.find("define i32 @__syn_task_step_fold_worker(").expect("fold_worker present");
+        let fw_end = ll[fw_start..].find("\n}\n").unwrap() + fw_start;
+        assert!(mir.visibility.folded_task_vars.contains_key("fold_worker"));
+        assert!(!ll[fw_start..fw_end].contains("%p.out = alloca"), "dead folded Param alloca emitted");
+
+        // B-M4: unconditional MMIO array bounds clamping to 0 across bare-metal targets
+        let mmio_src = r#"
+mmio ArrRegs {
+    @rw [4]u32 arr @ 0x0;
+}
+mmio DEV : ArrRegs @ 0x0100;
+
+fn main() {
+    u32 idx = 9u32;
+    DEV.arr[idx as usize] = 42u32;
+}
+"#;
+        let mmio_mir = compile_src_mir(mmio_src);
+        for target in [
+            TargetArch::Thumbv7mNoneEabi,
+            TargetArch::AvrAtmega328p,
+            TargetArch::Riscv32Esp32C6,
+            TargetArch::HostX86_64Linux,
+        ] {
+            let mmio_ll = emit_llvm_ir_with_options(
+                &mmio_mir,
+                &CodegenOptions {
+                    target,
+                    ..Default::default()
+                },
+            )
+            .expect("emit B-M4 MMIO IR");
+            assert!(
+                mmio_ll.contains("icmp ult ") && mmio_ll.contains("select i1 "),
+                "expected unconditional MMIO bounds clamp for {target:?}:\n{mmio_ll}"
+            );
+        }
+    }
+
+    #[test]
+    fn b_h4_b_m1_b_m2_timeout_prio_wake_and_trunc_parity_in_qemu() {
+        let src = r#"
+pool<u32, 1> single_pool;
+byte_ring<8> trunc_ring;
+signal boost_sig;
+signal timeout_sig;
+signal start_low;
+signal start_high;
+signal low_started;
+signal high_started;
+signal low_done;
+signal high_done;
+
+task low_waiter() {
+    set_priority(@low);
+    start_low.wait();
+    low_started.notify();
+    // B-M1: queues FIRST on exhausted `single_pool`
+    Lease<u32> l = single_pool.alloc(timeout: 200ms) catch { sys.exit(1); };
+    println("WAKE_LOW");
+    l.release();
+    low_done.notify();
+    loop { sys.delay(10ms); }
+}
+
+task high_waiter() {
+    set_priority(@high);
+    start_high.wait();
+    high_started.notify();
+    // B-M1: queues SECOND, yet wakes BEFORE `low_waiter` because @high > @low
+    Lease<u32> l = single_pool.alloc(timeout: 200ms) catch { sys.exit(1); };
+    println("WAKE_HIGH");
+    l.release();
+    high_done.notify();
+    loop { sys.delay(10ms); }
+}
+
+task boost_timeout_task() {
+    set_priority(@low);
+    boost_sig.wait();
+    assert(sys.current_prio() == 0);
+    // B-H4: timing out on `timeout_sig` clears boosted turn and restores base prio (@low = 3)
+    bool timed_out = false;
+    timeout_sig.wait(timeout: 2ms) catch {
+        timed_out = true;
+    };
+    assert(timed_out);
+    assert(sys.current_prio() == 3);
+    println("B_H4_TIMEOUT_RESTORED");
+    loop { sys.delay(10ms); }
+}
+
+task driver() {
+    // 1. B-H4 timeout prio restore check
+    sys.delay(1ms);
+    boost_sig.notify(boost: @critical);
+    sys.delay(6ms);
+
+    // 2. B-M1 pool priority wakeup order check
+    Lease<u32> held = single_pool.try_alloc() catch { sys.exit(1); };
+    start_low.notify();
+    low_started.wait();
+    sys.delay(1ms);
+    start_high.notify();
+    high_started.wait();
+    sys.delay(1ms);
+    held.release();
+    high_done.wait();
+    low_done.wait();
+
+    // 3. B-M2 sticky fmt_ring truncation check
+    assert(trunc_ring.push("12345") == 5);
+    usize pw = fmt_ring(&trunc_ring, f"ABCDEF") catch (FmtErr e, usize partial) {
+        partial;
+    };
+    assert(pw == 3 && trunc_ring.len() == 8);
+    println(f"B_M2_PARTIAL={pw}");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    spawn boost_timeout_task() @low;
+    spawn low_waiter() @low;
+    spawn high_waiter() @high;
+    spawn driver() @normal;
+}
+"#;
+        let (_mir, ll, res) = run_zev_cortex_m_qemu("b_h4_m1_m2_parity", src);
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify B-H4/B-M1/B-M2");
+
+        let out = &res.exec.stdout;
+        assert!(out.contains("B_H4_TIMEOUT_RESTORED"), "out={out}");
+        assert!(out.contains("B_M2_PARTIAL=3"), "out={out}");
+        let hi_pos = out.find("WAKE_HIGH").expect("WAKE_HIGH missing");
+        let lo_pos = out.find("WAKE_LOW").expect("WAKE_LOW missing");
+        assert!(hi_pos < lo_pos, "expected high-priority waiter before low-priority waiter: {out}");
+
+        // IR checks for @__syn_wake_one_waiter, sticky trunc check, and end_inbox_turn on timeout
+        assert!(ll.contains("define void @__syn_wake_one_waiter("));
+        assert!(ll.contains("@__syn_rr_idx"));
+        let putc_start = ll.find("define weak void @__syn_fmt_putc(").expect("@__syn_fmt_putc");
+        let putc_end = ll[putc_start..].find("\n}\n").unwrap() + putc_start;
+        assert!(ll[putc_start..putc_end].contains("getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3"));
+    }
+
+    #[test]
+    fn string_lit_to_u8_slice_coercion_and_rp2040_usb_descriptors_in_qemu() {
+        let src = r#"
+struct PacketSlice {
+    []u8 bytes;
+}
+
+[]u8 ret_lit_slice() {
+    return "RET\x00!";
+}
+
+u8 read_slice_byte([]u8 s, usize expected_len, usize idx) {
+    assert(s.len == expected_len);
+    return s[idx];
+}
+
+fn main() {
+    []u8 dev_desc = "\x12\x01\x00\x02\x8A\x2E";
+    assert(dev_desc.len == 6usize);
+    assert(dev_desc[0] == 0x12u8 && dev_desc[2] == 0x00u8 && dev_desc[5] == 0x2Eu8);
+
+    dev_desc = "\x04\x03\x09\x04";
+    assert(dev_desc.len == 4usize && dev_desc[3] == 0x04u8);
+
+    []u8 r = ret_lit_slice();
+    assert(r.len == 5usize && r[3] == 0x00u8 && r[4] == '!');
+
+    PacketSlice p = PacketSlice { bytes: "AB\x00CD" };
+    assert(p.bytes.len == 5usize && p.bytes[2] == 0x00u8 && p.bytes[4] == 'D');
+
+    u8 tail = read_slice_byte("ZEV2040", 7usize, 6usize);
+    assert(tail == '0');
+    println(f"LLVM_SLICE_LIT_OK tail={tail}");
+    sys.exit(0);
+}
+"#;
+        let (_mir, ll, res) = run_zev_cortex_m_qemu("slice_lit_coercion_qemu", src);
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify slice_lit_coercion");
+        assert!(
+            res.exec.stdout.contains("LLVM_SLICE_LIT_OK tail=48"),
+            "stdout:\n{}",
+            res.exec.stdout
+        );
+        assert!(
+            !ll.contains("call i8 @__syn_fn_read_slice_byte({ ptr, i32 } zeroinitializer"),
+            "string literal arg must not degrade to zeroinitializer slice:\n{ll}"
+        );
+
+        // Regression check for `examples/pico_w_demo.zev` / `bsp/rpi_pico_w.zev` `ep0_desc_byte`:
+        // USB descriptors bound to `[]u8` locals or passed to `utf16_str_desc_byte([]u8, usize)`
+        // MUST emit valid `@.str.*` slice pairs rather than `{ ptr, i32 } zeroinitializer`.
+        let pico_mir = compile_example_mir(&[repo_root().join("examples/pico_w_demo.zev")]);
+        let pico_ll = emit_llvm_ir_with_options(&pico_mir, &CodegenOptions::rp2040())
+            .expect("emit RP2040 pico_w_demo IR");
+        let ep0_start = pico_ll
+            .find("define i8 @__syn_fn_bsp_rpi_pico_w__ep0_desc_byte(")
+            .expect("ep0_desc_byte present in pico_w_demo IR");
+        let ep0_end = pico_ll[ep0_start..].find("\n}\n").unwrap() + ep0_start;
+        let ep0_body = &pico_ll[ep0_start..ep0_end];
+        let after_allocas = ep0_body
+            .find("store i32 %arg1, ptr %v_1")
+            .map(|p| &ep0_body[p..])
+            .unwrap_or(ep0_body);
+        assert!(
+            !after_allocas.contains("{ ptr, i32 } zeroinitializer"),
+            "RP2040 USB descriptors degraded to zeroinitializer:\n{ep0_body}"
+        );
+        assert!(
+            ep0_body.contains("insertvalue { ptr, i32 } poison, ptr @.str.")
+                && ep0_body.contains("i32 18, 1")
+                && ep0_body.contains("i32 67, 1")
+                && ep0_body.contains("utf16_str_desc_byte({ ptr, i32 } %"),
+            "expected pooled @.str.* slice pairs in ep0_desc_byte:\n{ep0_body}"
+        );
     }
 }

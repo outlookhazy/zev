@@ -152,57 +152,27 @@ static SYN_UNUSED inline void syn_mmio_write_u32(volatile uint8_t *base, uint32_
     *(volatile uint32_t *)(volatile void *)(base + offset) = val;
 }}
 static SYN_UNUSED inline uint8_t syn_mmio_read_arr_u8(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len) {{
-    size_t safe_idx = idx;
-#if !defined(SYN_FREESTANDING)
-    safe_idx = (idx < arr_len) ? idx : 0U;
-#else
-    (void)arr_len;
-#endif
+    size_t safe_idx = (idx < arr_len) ? idx : 0U;
     return *(volatile uint8_t *)(volatile void *)(base + offset + safe_idx);
 }}
 static SYN_UNUSED inline uint16_t syn_mmio_read_arr_u16(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len) {{
-    size_t safe_idx = idx;
-#if !defined(SYN_FREESTANDING)
-    safe_idx = (idx < arr_len) ? idx : 0U;
-#else
-    (void)arr_len;
-#endif
+    size_t safe_idx = (idx < arr_len) ? idx : 0U;
     return *(volatile uint16_t *)(volatile void *)(base + offset + (safe_idx * 2U));
 }}
 static SYN_UNUSED inline uint32_t syn_mmio_read_arr_u32(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len) {{
-    size_t safe_idx = idx;
-#if !defined(SYN_FREESTANDING)
-    safe_idx = (idx < arr_len) ? idx : 0U;
-#else
-    (void)arr_len;
-#endif
+    size_t safe_idx = (idx < arr_len) ? idx : 0U;
     return *(volatile uint32_t *)(volatile void *)(base + offset + (safe_idx * 4U));
 }}
 static SYN_UNUSED inline void syn_mmio_write_arr_u8(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len, uint8_t val) {{
-    size_t safe_idx = idx;
-#if !defined(SYN_FREESTANDING)
-    safe_idx = (idx < arr_len) ? idx : 0U;
-#else
-    (void)arr_len;
-#endif
+    size_t safe_idx = (idx < arr_len) ? idx : 0U;
     *(volatile uint8_t *)(volatile void *)(base + offset + safe_idx) = val;
 }}
 static SYN_UNUSED inline void syn_mmio_write_arr_u16(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len, uint16_t val) {{
-    size_t safe_idx = idx;
-#if !defined(SYN_FREESTANDING)
-    safe_idx = (idx < arr_len) ? idx : 0U;
-#else
-    (void)arr_len;
-#endif
+    size_t safe_idx = (idx < arr_len) ? idx : 0U;
     *(volatile uint16_t *)(volatile void *)(base + offset + (safe_idx * 2U)) = val;
 }}
 static SYN_UNUSED inline void syn_mmio_write_arr_u32(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len, uint32_t val) {{
-    size_t safe_idx = idx;
-#if !defined(SYN_FREESTANDING)
-    safe_idx = (idx < arr_len) ? idx : 0U;
-#else
-    (void)arr_len;
-#endif
+    size_t safe_idx = (idx < arr_len) ? idx : 0U;
     *(volatile uint32_t *)(volatile void *)(base + offset + (safe_idx * 4U)) = val;
 }}
 
@@ -1089,6 +1059,31 @@ static SYN_UNUSED inline size_t syn_pool_popcount32(uint32_t m) {{
     return c;
 }}
 
+static SYN_UNUSED inline void syn_pool_wake_highest_waiter_nolock(syn_pool_hdr_t *h, uint8_t boost_prio) {{
+    size_t n = g_syn_sched.task_count;
+    syn_task_t *best = NULL;
+    uint8_t best_prio = 255U;
+    size_t best_dist = n;
+    for (size_t i = 0U; i < n; i++) {{
+        syn_task_t *t = &g_syn_sched.tasks[i];
+        if (t->state != SYN_TASK_BLOCKED || t->wait_obj != (void *)h) {{
+            continue;
+        }}
+        uint8_t p = (t->priority < SYN_PRIO_LEVELS) ? t->priority : (SYN_PRIO_LEVELS - 1U);
+        size_t rr = g_syn_sched.rr_per_prio[p];
+        if (rr >= n) {{ rr = 0U; }}
+        size_t dist = (i >= rr) ? (i - rr) : (n - rr + i);
+        if (best == NULL || p < best_prio || (p == best_prio && dist < best_dist)) {{
+            best = t;
+            best_prio = p;
+            best_dist = dist;
+        }}
+    }}
+    if (best != NULL) {{
+        syn_task_wake_from_isr_or_task(best, boost_prio);
+    }}
+}}
+
 static SYN_UNUSED inline void __syn_pool_release(void *pool_hdr_raw, uint8_t slot_idx, int8_t boost_prio) {{
     if (pool_hdr_raw == NULL) {{ return; }}
     syn_pool_hdr_t *h = (syn_pool_hdr_t *)pool_hdr_raw;
@@ -1099,15 +1094,11 @@ static SYN_UNUSED inline void __syn_pool_release(void *pool_hdr_raw, uint8_t slo
         uint32_t bit = (1U << slot_idx);
         if ((h->free_mask & bit) == 0U) {{
             h->free_mask |= bit;
-            if (h->dma_safe != 0U && g_syn_sleep.dma_active_locks > 0U) {{
+            if ((h->dma_safe & 1U) != 0U && g_syn_sleep.dma_active_locks > 0U) {{
                 g_syn_sleep.dma_active_locks--;
             }}
-            syn_task_t *w = h->waiters;
-            h->waiters = NULL;
-            if (w != NULL) {{
-                uint8_t bp = (boost_prio >= 0) ? (uint8_t)boost_prio : SYN_NO_BOOST;
-                syn_task_wake_from_isr_or_task(w, bp);
-            }}
+            uint8_t bp = (boost_prio >= 0) ? (uint8_t)boost_prio : SYN_NO_BOOST;
+            syn_pool_wake_highest_waiter_nolock(h, bp);
         }}
     }}
 #if !defined(SYN_POOL_IRQ_ELIDED)
@@ -1409,6 +1400,7 @@ static SYN_UNUSED inline void syn_ring_view_arm_rx(syn_view_byte_ring_t v, syn_t
         syn_exit_critical();
         return;
     }}
+    syn_task_end_inbox_turn(task);
     r->rx_waiter = task;
     task->wait_check = syn_ring_hdr_rx_ready;
     task->wait_obj = r;
@@ -1435,6 +1427,7 @@ typedef struct {{
 
 static SYN_UNUSED inline void syn_fmt_write(syn_fmt_sink_t *s, const void *data, size_t len) {{
     if (len == 0U) {{ return; }}
+    if (s->mode != 0U && s->truncated) {{ return; }}
     if (s->mode == 1U) {{
         size_t avail = (s->dst != NULL && s->pos < s->cap) ? (s->cap - s->pos) : 0U;
         size_t n = (len <= avail) ? len : avail;

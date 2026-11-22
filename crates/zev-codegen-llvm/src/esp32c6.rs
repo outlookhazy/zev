@@ -1,17 +1,11 @@
-//! Bare-Metal ESP32-C6 (`riscv32imac`) Direct-Boot Startup, Watchdog Disarm,
-//! 16 MHz `SYSTIMER`, `USB_DEVICE` (`/dev/ttyACM0`) Serial Console, and HP-SRAM
-//! Hardware-Calibrated `GPIO8` WS2812B RGB LED + `GPIO9` `BOOT` Button HAL in Pure LLVM 23 IR.
+//! Bare-Metal ESP32-C6 (`riscv32imac`) Direct-Boot Startup, Interrupt Routing (`INTMTX` / `PLIC_MX`),
+//! and Architectural `mstatus` Critical Sections in Pure LLVM 23 IR.
 //!
-//! Hardware register addresses & bitmasks verified against Espressif ESP32-C6 TRM / SVD:
+//! Hardware Direct-Boot & interrupt-controller map (zero peripheral drivers live here — watchdogs,
+//! APM, `PCR`, `SYSTIMER`, and `USB_DEVICE` console I/O live 100% in `.zev`):
 //! - Direct-Boot Flash MMU Cache: `0x4200_0000` (magic `0xAEDB041D` x2 at `0x0`, `@_start` at `0x4200_0008`)
 //! - HP-SRAM: `0x4080_0000 .. 0x4088_0000` (initial `sp = 0x4087_0000`, `.iram1` + `.data` + `.bss`)
-//! - `TIMG0` (`0x6000_8000`) & `TIMG1` (`0x6000_9000`): `WDTCONFIG0` `+0x48`, `WDTWPROTECT` `+0x64` (`0x50D8_3AA1`)
-//! - `LP_WDT` (`0x600B_1C00`): `CONFIG0` `+0x00`, `WPROTECT` `+0x18`, `SWD_CONFIG` `+0x1C` (`BIT(31)|BIT(30)`), `SWD_WPROTECT` `+0x20`
-//! - `PCR` (`0x6009_6000`): `PCR_SYSTIMER_CONF_REG` `+0x54`
-//! - `SYSTIMER` (`0x6000_A000`, 16 MHz = `16_000` ticks/ms): `CONF` `+0x00`, `UNIT0_OP` `+0x04` (`UPDATE` bit 30, `VALID` bit 29), `VALUE_HI` `+0x40`, `VALUE_LO` `+0x44`
-//! - `USB_DEVICE` (`0x6000_F000`): `EP1` `+0x00`, `EP1_CONF` `+0x04` (`WR_DONE` bit 0, `SERIAL_IN_EP_DATA_FREE` bit 1)
-//! - `IO_MUX` (`0x6009_0000`): `GPIO8` `+0x24`, `GPIO9` `+0x28` (`MCU_SEL=1` at `[14:12]`, `FUN_IE` bit 9, `FUN_WPU` bit 8)
-//! - `GPIO` (`0x6009_1000`): `OUT_W1TS` `+0x08`, `OUT_W1TC` `+0x0C`, `ENABLE_W1TS` `+0x24`, `ENABLE_W1TC` `+0x28`, `IN` `+0x3C`, `FUNC8_OUT_SEL_CFG` `+0x574` (`SIG_GPIO_OUT_IDX = 256`)
+//! - Interrupt Routing: `INTMTX` (`0x6001_0000`), `PLIC_MX` (`0x2000_1000`), vectored `mtvec` (`@__syn_rv_vector_table`)
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -75,9 +69,8 @@ pub fn assign_esp32c6_irq_routes(
         .collect())
 }
 
-/// Emit ESP32-C6 `.entry` (`@_start` at `0x4200_0008`), `@__syn_esp32c6_reset`, watchdog disarm,
-/// `.data`/`.iram1` copy + `fence.i`, `.bss` zeroing, `SYSTIMER` init, and `GPIO8`/`GPIO9` +
-/// APB `store_ns` / `.iram1` cycle calibration (plus `INTMTX`/`PLIC_MX`/`mie`/vectored `mtvec` when `routes` is non-empty).
+/// Emit ESP32-C6 `.entry` (`@_start` at `0x4200_0008`), `@__syn_esp32c6_reset`,
+/// `.data`/`.iram1` copy + `fence.i`, `.bss` zeroing, and `INTMTX`/`PLIC_MX`/`mie`/vectored `mtvec`.
 pub fn emit_esp32c6_startup_ir(
     out: &mut String,
     initial_sp: u32,
@@ -111,62 +104,9 @@ module asm "  .option pop"
 @__ebss = external global i8
 @llvm.used = appending global [1 x ptr] [ptr @__syn_esp32c6_reset], section "llvm.metadata"
 
-define void @__syn_esp32c6_disarm_watchdogs() nounwind{sz} {{
-entry:
-  ; 1. TIMG0 MWDT0 (base 0x60008000 = 1610645504): WDTWPROTECT (+0x64 = 1610645604), WDTCONFIG0 (+0x48 = 1610645576)
-  ;    Unlock key 0x50D83AA1 = 1356348065
-  store volatile i32 1356348065, ptr inttoptr (i32 1610645604 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1610645576 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1610645604 to ptr), align 4
-
-  ; 2. TIMG1 MWDT1 (base 0x60009000 = 1610649600): WDTWPROTECT (+0x64 = 1610649700), WDTCONFIG0 (+0x48 = 1610649672)
-  store volatile i32 1356348065, ptr inttoptr (i32 1610649700 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1610649672 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1610649700 to ptr), align 4
-
-  ; 3. LP_WDT RWDT (base 0x600B1C00 = 1611340800): WPROTECT (+0x18 = 1611340824), CONFIG0 (+0x00 = 1611340800)
-  store volatile i32 1356348065, ptr inttoptr (i32 1611340824 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1611340800 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1611340824 to ptr), align 4
-
-  ; 4. LP_WDT Super Watchdog SWD: SWD_WPROTECT (+0x20 = 1611340832), SWD_CONFIG (+0x1C = 1611340828)
-  ;    Set BIT(31) SWD_AUTO_FEED_EN | BIT(30) SWD_DISABLE = 0xC0000000 (-1073741824)
-  store volatile i32 1356348065, ptr inttoptr (i32 1611340832 to ptr), align 4
-  %swd_old = load volatile i32, ptr inttoptr (i32 1611340828 to ptr), align 4
-  %swd_new = or i32 %swd_old, -1073741824
-  store volatile i32 %swd_new, ptr inttoptr (i32 1611340828 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1611340832 to ptr), align 4
-  ret void
-}}
-
-define void @__syn_esp32c6_hw_init() nounwind{sz} {{
-entry:
-  ; 1. Disable HP_APM, LP_APM0, and LP_APM access-path PMS filters so non-CPU bus masters (e.g. GDMA)
-  ;    can read/write HP-SRAM in Direct-Boot mode without TEE blocks (matches esp-hal pre_init).
-  store volatile i32 0, ptr inttoptr (i32 1611239620 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1611241668 to ptr), align 4
-  store volatile i32 0, ptr inttoptr (i32 1611348164 to ptr), align 4
-
-  ; 2. Enable SYSTIMER clock gate in PCR_SYSTIMER_CONF_REG (0x60096054 = 1611227220): set bit 0, clear rst bit 1
-  %pcr = load volatile i32, ptr inttoptr (i32 1611227220 to ptr), align 4
-  %pcr1 = or i32 %pcr, 1
-  %pcr2 = and i32 %pcr1, -3
-  store volatile i32 %pcr2, ptr inttoptr (i32 1611227220 to ptr), align 4
-
-  ; 3. Enable SYSTIMER_CLK_EN (bit 31) | SYSTIMER_TIMER_UNIT0_WORK_EN (bit 30) = 0xC0000000 at 0x6000A000 (1610653696)
-  %st_old = load volatile i32, ptr inttoptr (i32 1610653696 to ptr), align 4
-  %st_new = or i32 %st_old, -1073741824
-  store volatile i32 %st_new, ptr inttoptr (i32 1610653696 to ptr), align 4
-  store i8 1, ptr @__syn_systick_enabled, align 1
-  ret void
-}}
-
 define void @__syn_esp32c6_reset() #98 {{
 entry:
-  ; 1. Immediately disarm TIMG0, TIMG1, LP_WDT, and SWD watchdogs
-  call void @__syn_esp32c6_disarm_watchdogs()
-
-  ; 2. Copy .iram1 + .data from Flash LMA (__sidata) to HP-SRAM VMA [__sdata .. __edata)
+  ; 1. Copy .iram1 + .data from Flash LMA (__sidata) to HP-SRAM VMA [__sdata .. __edata)
   ;    in integer address domain (avoids provenance UB & memcpy idiom before RAM code exists!)
   %sdata_a = ptrtoint ptr @__sdata to i32
   %edata_a = ptrtoint ptr @__edata to i32
@@ -203,7 +143,6 @@ bss_body:
   br label %bss_loop
 
 boot:
-  call void @__syn_esp32c6_hw_init()
 {irq_init_call}  call void @__syn_boot()
   call void @__syn_sched_loop()
   unreachable
@@ -385,13 +324,19 @@ entry:
     );
 }
 
-/// Emit ESP32-C6 (`rv32imac`) hardware runtime primitives (`mstatus` critical sections,
-/// 16 MHz `SYSTIMER` `now_ms`, `USB_DEVICE` `/dev/ttyACM0` serial console, single-block `.iram1`
-/// WS2812B assembly shifter on `GPIO8`, and `GPIO` input/output helpers).
-pub fn emit_esp32c6_hal_ir(out: &mut String, sz: &str) {
+/// Emit ESP32-C6 (`rv32imac`) architectural runtime primitives (`mstatus` critical sections,
+/// `sys.set_putc` / `.zev` `console_putc(u8)` delegation, and `@__syn_idle_sleep` calling `@__syn_now_ms()`).
+pub fn emit_esp32c6_hal_ir(
+    out: &mut String,
+    sz: &str,
+    uses_set_putc: bool,
+    console_putc_sym: Option<&str>,
+) {
+    let putc_body =
+        crate::runtime_ir::format_uart_putc_body(uses_set_putc, 4, console_putc_sym, "  ret void");
     let _ = writeln!(
         out,
-        r#"; ── ESP32-C6 (rv32imac) Hardware Primitives: SYSTIMER, USB_DEVICE, GPIO, WS2812B ──
+        r#"; ── ESP32-C6 (rv32imac) Architectural CPU Primitives: mstatus & Idle Poll ──
 define i32 @__syn_crit_enter() nounwind alwaysinline {{
 entry:
   %pm = call i32 asm sideeffect "csrrci $0, mstatus, 8", "=r,~{{memory}}"()
@@ -405,96 +350,9 @@ entry:
   ret void
 }}
 
-define {{ i32, i32 }} @__syn_esp32c6_systimer_snapshot() nounwind{sz} {{
-entry:
-  ; Latch SYSTIMER UNIT0: write BIT(30) = 0x40000000 (1073741824) to UNIT0_OP (0x6000A004 = 1610653700)
-  ; Allow 4 cycles for clock-domain crossing so stale VALUE_VALID is cleared before polling!
-  store volatile i32 1073741824, ptr inttoptr (i32 1610653700 to ptr), align 4
-  call void asm sideeffect "nop\0Anop\0Anop\0Anop", "~{{memory}}"()
-  br label %poll
-poll:
-  %tries = phi i32 [ 0, %entry ], [ %t1, %poll_next ]
-  %op = load volatile i32, ptr inttoptr (i32 1610653700 to ptr), align 4
-  ; Poll BIT(29) VALUE_VALID = 0x20000000 (536870912)
-  %valid_bits = and i32 %op, 536870912
-  %is_valid = icmp ne i32 %valid_bits, 0
-  %timed_out = icmp sge i32 %tries, 256
-  %done = or i1 %is_valid, %timed_out
-  br i1 %done, label %read_val, label %poll_next
-poll_next:
-  %t1 = add i32 %tries, 1
-  br label %poll
-read_val:
-  ; UNIT0_VALUE_HI (0x6000A040 = 1610653760), UNIT0_VALUE_LO (0x6000A044 = 1610653764)
-  %hi_raw = load volatile i32, ptr inttoptr (i32 1610653760 to ptr), align 4
-  %lo = load volatile i32, ptr inttoptr (i32 1610653764 to ptr), align 4
-  %hi = and i32 %hi_raw, 1048575
-  %r0 = insertvalue {{ i32, i32 }} poison, i32 %hi, 0
-  %r1 = insertvalue {{ i32, i32 }} %r0, i32 %lo, 1
-  ret {{ i32, i32 }} %r1
-}}
-
-define i32 @__syn_esp32c6_systimer_lo() nounwind{sz} {{
-entry:
-  %snap = call {{ i32, i32 }} @__syn_esp32c6_systimer_snapshot()
-  %lo = extractvalue {{ i32, i32 }} %snap, 1
-  ret i32 %lo
-}}
-
-define i32 @__syn_esp32c6_read_ms() nounwind noinline{sz} {{
-entry:
-  ; Exact 52-bit SYSTIMER (16 MHz -> 16,000 ticks/ms = 128 * 125) division using pure 32-bit RV32M `divu`/`remu`!
-  %snap = call {{ i32, i32 }} @__syn_esp32c6_systimer_snapshot()
-  %hi = extractvalue {{ i32, i32 }} %snap, 0
-  %lo = extractvalue {{ i32, i32 }} %snap, 1
-  %h_sh = lshr i32 %hi, 7
-  %lo_sh = lshr i32 %lo, 7
-  %hi_low7 = shl i32 %hi, 25
-  %l_comb = or i32 %lo_sh, %hi_low7
-  %l_hi = lshr i32 %l_comb, 16
-  %l_lo = and i32 %l_comb, 65535
-  %h_top = shl i32 %h_sh, 16
-  %n0 = or i32 %h_top, %l_hi
-  %q_hi = udiv i32 %n0, 125
-  %r0 = urem i32 %n0, 125
-  %r0_sh = shl i32 %r0, 16
-  %n1 = or i32 %r0_sh, %l_lo
-  %q_lo = udiv i32 %n1, 125
-  %q_hi_sh = shl i32 %q_hi, 16
-  %ms = add i32 %q_hi_sh, %q_lo
-  store volatile i32 %ms, ptr @__syn_tick_ms, align 4
-  ret i32 %ms
-}}
-
 define void @__syn_uart_putc(i8 %c) nounwind noinline{sz} {{
 entry:
-  ; Built-in USB_DEVICE Serial/JTAG (0x6000F000 = 1610674176, EP1_CONF 0x6000F004 = 1610674180)
-  ; Wait up to ~4000 polls for SERIAL_IN_EP_DATA_FREE (bit 1 = 2); drop byte if host monitor disconnected!
-  br label %wait_fifo
-wait_fifo:
-  %tries = phi i32 [ 0, %entry ], [ %t1, %wait_next ]
-  %conf = load volatile i32, ptr inttoptr (i32 1610674180 to ptr), align 4
-  %free_bit = and i32 %conf, 2
-  %is_free = icmp ne i32 %free_bit, 0
-  br i1 %is_free, label %write_byte, label %chk_timeout
-chk_timeout:
-  %expired = icmp sge i32 %tries, 4000
-  br i1 %expired, label %done, label %wait_next
-wait_next:
-  %t1 = add i32 %tries, 1
-  br label %wait_fifo
-
-write_byte:
-  %z = zext i8 %c to i32
-  store volatile i32 %z, ptr inttoptr (i32 1610674176 to ptr), align 4
-  %is_nl = icmp eq i8 %c, 10
-  br i1 %is_nl, label %flush_pkt, label %done
-flush_pkt:
-  ; Write WR_DONE (bit 0 = 1) to EP1_CONF so USB host receives every line immediately!
-  store volatile i32 1, ptr inttoptr (i32 1610674180 to ptr), align 4
-  br label %done
-done:
-  ret void
+{putc_body}
 }}
 
 define void @__syn_platform_exit(i32 %code) noreturn nounwind{sz} {{
@@ -528,7 +386,7 @@ entry:
   %wc = load volatile i32, ptr @__syn_wfi_count, align 4
   %wc1 = add i32 %wc, 1
   store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
-  %ign = call i32 @__syn_esp32c6_read_ms()
+  %ign = call i32 @__syn_now_ms()
   call void asm sideeffect "nop\0Anop\0Anop\0Anop", "~{{memory}}"()
   ret void
 }}

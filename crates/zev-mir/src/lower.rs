@@ -98,6 +98,7 @@ struct ModuleSymbols {
     soft_yielding_in_coro: BTreeSet<String>,
     soft_yielding_in_noyield: BTreeSet<String>,
     dual_specialized_fns: BTreeSet<String>,
+    boost_capable_fns: BTreeSet<String>,
 }
 
 impl ModuleSymbols {
@@ -457,6 +458,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         soft_yielding_in_coro: BTreeSet::new(),
         soft_yielding_in_noyield: BTreeSet::new(),
         dual_specialized_fns: BTreeSet::new(),
+        boost_capable_fns: BTreeSet::new(),
     };
 
     let mut mir_imports = Vec::new();
@@ -1081,26 +1083,9 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
     let vis = crate::opt::analyze_visibility(&module);
     for p in &mut module.primitives {
         p.dead_stripped = vis.can_strip_bss(&p.name);
-        let view_contended = if vis.addr_taken_prims.contains(&p.name) {
-            match &p.kind {
-                MirPrimKind::ByteRing { .. } => {
-                    vis.isr_contended_prim_mangles.contains("view_byte_ring")
-                }
-                MirPrimKind::Inbox { elem, .. } => vis.isr_contended_prim_mangles.contains(
-                    &MirPrimViewKind::Inbox {
-                        elem: elem.clone(),
-                    }
-                    .mangle_name(),
-                ),
-                _ => false,
-            }
-        } else {
-            false
-        };
         p.irq_mask_elided = !p.dead_stripped
-            && !view_contended
             && !vis.isr_contended_globals.contains(&p.name)
-            && !vis.isr_contended_prim_mangles.contains(&p.kind.mangle_name());
+            && !vis.is_prim_family_contended(&p.kind);
     }
     module.visibility = vis;
 
@@ -1251,6 +1236,7 @@ fn infer_effects_and_specializations(
 ) {
     let mut direct_eff: BTreeMap<String, MirFnEffect> = BTreeMap::new();
     let mut direct_spawns: BTreeSet<String> = BTreeSet::new();
+    let mut boost_capable: BTreeSet<String> = BTreeSet::new();
     let mut edges: Vec<RawCallEdge> = Vec::new();
     let mut fn_names: BTreeSet<String> = BTreeSet::new();
 
@@ -1261,6 +1247,9 @@ fn infer_effects_and_specializations(
         let mut eff = MirFnEffect::NonYielding;
         let mut spawns = false;
         if let Some(body) = &fd.body {
+            if ast_stmts_have_boost_acquire(&body.stmts) {
+                boost_capable.insert(fname.clone());
+            }
             scan_stmts_effect(
                 &fname,
                 &body.stmts,
@@ -1340,6 +1329,9 @@ fn infer_effects_and_specializations(
                 changed = true;
             }
             if spawns_in_boot.contains(&edge.callee) && spawns_in_boot.insert(edge.caller.clone()) {
+                changed = true;
+            }
+            if boost_capable.contains(&edge.callee) && boost_capable.insert(edge.caller.clone()) {
                 changed = true;
             }
         }
@@ -1462,6 +1454,7 @@ fn infer_effects_and_specializations(
         .collect();
     syms.soft_yielding_in_coro = soft_in_coro;
     syms.soft_yielding_in_noyield = soft_in_noyield;
+    syms.boost_capable_fns = boost_capable;
 }
 
 fn ast_block_has_break(block: &Block) -> bool {
@@ -1798,7 +1791,14 @@ fn scan_expr_effect(
             }
             if matches!(
                 m,
-                "wait_chunk" | "recv" | "wait" | "send" | "delay" | "wait_change" | "alloc"
+                "wait_chunk"
+                    | "wait_read"
+                    | "recv"
+                    | "wait"
+                    | "send"
+                    | "delay"
+                    | "wait_change"
+                    | "alloc"
             ) && !in_noyield
                 && !in_restricted
             {
@@ -4990,6 +4990,7 @@ struct CoroutineLowerCtx<'a> {
     manual_yield: bool,
     in_noyield: bool,
     has_restart: bool,
+    may_hold_boost: bool,
     vars: Vec<MirVar>,
     scopes: VarScopes,
     defer_stack: Vec<Vec<Stmt>>,
@@ -5016,6 +5017,7 @@ impl<'a> CoroutineLowerCtx<'a> {
             manual_yield,
             in_noyield: false,
             has_restart: false,
+            may_hold_boost: false,
             vars: Vec::new(),
             scopes: VarScopes::new(),
             defer_stack: vec![Vec::new()],
@@ -5027,6 +5029,11 @@ impl<'a> CoroutineLowerCtx<'a> {
             child_slots: Vec::new(),
             loop_stack: Vec::new(),
         }
+    }
+
+    fn emit_end_inbox_turn(&mut self) {
+        self.cur_stmts.push(MirStmt::EndInboxTurn);
+        self.may_hold_boost = false;
     }
 
     fn alloc_bb(&mut self) -> BlockId {
@@ -5301,7 +5308,7 @@ impl<'a> CoroutineLowerCtx<'a> {
             StmtKind::Restart => {
                 self.has_restart = true;
                 self.emit_defers_down_to(0)?;
-                self.cur_stmts.push(MirStmt::EndInboxTurn);
+                self.emit_end_inbox_turn();
                 let dead_bb = self.alloc_bb();
                 self.seal_bb(
                     MirTerminator::Yield(MirYieldKind::ShareCheckpoint {
@@ -5317,6 +5324,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 else_block,
             } => {
                 let c = self.lower_expr(cond, Some(&MirType::Bool))?;
+                let entry_boost = self.may_hold_boost;
                 let then_bb = self.alloc_bb();
                 let else_bb = self.alloc_bb();
                 let join_bb = self.alloc_bb();
@@ -5330,10 +5338,16 @@ impl<'a> CoroutineLowerCtx<'a> {
                     false,
                 );
                 self.lower_scoped_block(then_block)?;
+                let then_boost = self.may_hold_boost;
                 self.seal_bb(MirTerminator::Goto(join_bb), else_bb, false);
-                if let Some(eb) = else_block {
+                self.may_hold_boost = entry_boost;
+                let else_boost = if let Some(eb) = else_block {
                     self.lower_scoped_block(eb)?;
-                }
+                    self.may_hold_boost
+                } else {
+                    entry_boost
+                };
+                self.may_hold_boost = then_boost || else_boost;
                 self.seal_bb(MirTerminator::Goto(join_bb), join_bb, false);
             }
             StmtKind::While { cond, body } => {
@@ -5343,6 +5357,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let exit_bb = self.alloc_bb();
                 let is_while_true = matches!(cond.kind, ExprKind::Literal(Literal::Bool(true)));
                 let auto_share = is_while_true && !stmt_manual && !self.in_noyield;
+                let has_inbox = ast_expr_has_inbox_recv(cond, &self.syms.boost_capable_fns)
+                    || ast_stmts_have_inbox_recv(&body.stmts, &self.syms.boost_capable_fns);
+                if self.loop_stack.is_empty() && !has_inbox && self.may_hold_boost {
+                    self.emit_end_inbox_turn();
+                }
+                let entry_boost = self.may_hold_boost;
 
                 self.seal_bb(MirTerminator::Goto(cond_bb), cond_bb, auto_share);
                 let c = self.lower_expr(cond, Some(&MirType::Bool))?;
@@ -5356,7 +5376,6 @@ impl<'a> CoroutineLowerCtx<'a> {
                     false,
                 );
 
-                let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
                 let defer_depth = self.defer_stack.len();
                 self.loop_stack.push(LoopContext {
                     continue_bb: latch_bb,
@@ -5369,7 +5388,8 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 self.seal_bb(MirTerminator::Goto(latch_bb), latch_bb, false);
                 if has_inbox {
-                    self.cur_stmts.push(MirStmt::EndInboxTurn);
+                    self.emit_end_inbox_turn();
+                    self.may_hold_boost = entry_boost && !is_while_true;
                 }
                 if auto_share {
                     self.seal_bb(
@@ -5386,7 +5406,11 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let latch_bb = self.alloc_bb();
                 let exit_bb = self.alloc_bb();
                 let auto_share = !stmt_manual && !self.in_noyield;
-                let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
+                let has_inbox =
+                    ast_stmts_have_inbox_recv(&body.stmts, &self.syms.boost_capable_fns);
+                if self.loop_stack.is_empty() && !has_inbox && self.may_hold_boost {
+                    self.emit_end_inbox_turn();
+                }
 
                 self.seal_bb(MirTerminator::Goto(top_bb), top_bb, auto_share);
                 let defer_depth = self.defer_stack.len();
@@ -5401,7 +5425,7 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 self.seal_bb(MirTerminator::Goto(latch_bb), latch_bb, false);
                 if has_inbox {
-                    self.cur_stmts.push(MirStmt::EndInboxTurn);
+                    self.emit_end_inbox_turn();
                 }
                 if auto_share {
                     self.seal_bb(
@@ -5472,9 +5496,13 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let body_bb = self.alloc_bb();
                 let latch_bb = self.alloc_bb();
                 let exit_bb = self.alloc_bb();
+                let has_inbox = ast_expr_has_inbox_recv(period, &self.syms.boost_capable_fns)
+                    || ast_stmts_have_inbox_recv(&body.stmts, &self.syms.boost_capable_fns);
+                if self.loop_stack.is_empty() && !has_inbox && self.may_hold_boost {
+                    self.emit_end_inbox_turn();
+                }
 
                 self.seal_bb(MirTerminator::Goto(body_bb), body_bb, true);
-                let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
                 let defer_depth = self.defer_stack.len();
                 self.loop_stack.push(LoopContext {
                     continue_bb: latch_bb,
@@ -5486,9 +5514,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 self.loop_stack.pop();
 
                 self.seal_bb(MirTerminator::Goto(latch_bb), latch_bb, false);
-                if has_inbox {
-                    self.cur_stmts.push(MirStmt::EndInboxTurn);
-                }
+                self.emit_end_inbox_turn();
                 self.seal_bb(
                     MirTerminator::Yield(MirYieldKind::EveryLatch {
                         next_deadline_var: deadline_var,
@@ -5584,7 +5610,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                     false,
                 );
 
-                let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
+                let has_inbox =
+                    ast_stmts_have_inbox_recv(&body.stmts, &self.syms.boost_capable_fns);
+                let entry_boost = self.may_hold_boost;
                 let defer_depth = self.defer_stack.len();
                 self.loop_stack.push(LoopContext {
                     continue_bb: step_bb,
@@ -5598,7 +5626,8 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 self.seal_bb(MirTerminator::Goto(step_bb), step_bb, false);
                 if has_inbox {
-                    self.cur_stmts.push(MirStmt::EndInboxTurn);
+                    self.emit_end_inbox_turn();
+                    self.may_hold_boost = entry_boost;
                 }
                 if let Some(dt) = done_tmp_opt {
                     // Inclusive `..=`: check `ivar >= e_tmp` BEFORE incrementing so `e_tmp == T::MAX` is overflow-free!
@@ -5699,7 +5728,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                     value: coerce_or_cast_int(raw_elem_expr, &ety),
                 });
 
-                let has_inbox = ast_stmts_have_inbox_recv(&body.stmts);
+                let has_inbox =
+                    ast_stmts_have_inbox_recv(&body.stmts, &self.syms.boost_capable_fns);
+                let entry_boost = self.may_hold_boost;
                 let defer_depth = self.defer_stack.len();
                 self.loop_stack.push(LoopContext {
                     continue_bb: step_bb,
@@ -5713,7 +5744,8 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 self.seal_bb(MirTerminator::Goto(step_bb), step_bb, false);
                 if has_inbox {
-                    self.cur_stmts.push(MirStmt::EndInboxTurn);
+                    self.emit_end_inbox_turn();
+                    self.may_hold_boost = entry_boost;
                 }
                 self.cur_stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(idx_tmp),
@@ -5768,18 +5800,27 @@ impl<'a> CoroutineLowerCtx<'a> {
                     false,
                 );
 
+                let entry_boost = self.may_hold_boost;
+                let mut exit_boost = if default_bb_opt.is_none() {
+                    entry_boost
+                } else {
+                    false
+                };
                 for (idx, (_, abb, abody)) in arm_bbs.iter().enumerate() {
                     if self.cur_bb != *abb {
                         self.cur_bb = *abb;
                         self.cur_is_resume = false;
                     }
+                    self.may_hold_boost = entry_boost;
                     self.lower_scoped_block(abody)?;
+                    exit_boost |= self.may_hold_boost;
                     let next_after = arm_bbs
                         .get(idx + 1)
                         .map(|(_, b, _)| *b)
                         .unwrap_or(join_bb);
                     self.seal_bb(MirTerminator::Goto(join_bb), next_after, false);
                 }
+                self.may_hold_boost = exit_boost;
 
                 if self.cur_bb != join_bb {
                     self.cur_bb = join_bb;
@@ -5797,7 +5838,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 if let Some(&lc) = self.loop_stack.last() {
                     self.emit_defers_down_to(lc.defer_depth)?;
                     if lc.has_inbox_recv {
-                        self.cur_stmts.push(MirStmt::EndInboxTurn);
+                        self.emit_end_inbox_turn();
                     }
                     let dead_bb = self.alloc_bb();
                     self.seal_bb(MirTerminator::Goto(lc.break_bb), dead_bb, false);
@@ -5878,7 +5919,7 @@ impl<'a> CoroutineLowerCtx<'a> {
             MirExpr::new(MirExprKind::IntLit(0), MirType::I32)
         };
         self.emit_defers_down_to(0)?;
-        self.cur_stmts.push(MirStmt::EndInboxTurn);
+        self.emit_end_inbox_turn();
         self.cur_stmts.push(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
             method: "exit".to_string(),
             args: vec![code_expr],
@@ -6057,7 +6098,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                         LoweredPrimReceiver::ByteRingView(view)
                             if m == "wait_read" && find_named_arg(args, "timeout").is_none() =>
                         {
-                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
@@ -6073,12 +6114,13 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 resume_bb,
                                 false,
                             );
+                            self.may_hold_boost = true;
                             return Ok(true);
                         }
                         LoweredPrimReceiver::InboxView(view, elem)
                             if m == "recv" && find_named_arg(args, "timeout").is_none() =>
                         {
-                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
@@ -6095,11 +6137,13 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 resume_bb,
                                 false,
                             );
+                            self.may_hold_boost = true;
                             return Ok(true);
                         }
                         LoweredPrimReceiver::Sized(target, pkind) => {
                             match (m, pkind) {
                         ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
+                            self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
@@ -6120,6 +6164,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                         ("alloc", MirPrimKind::Pool { elem, cap })
                             if find_named_arg(args, "timeout").is_none() =>
                         {
+                            self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
@@ -6137,12 +6182,13 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 resume_bb,
                                 false,
                             );
+                            self.may_hold_boost = true;
                             return Ok(true);
                         }
                         ("recv", MirPrimKind::Inbox { elem, cap })
                             if find_named_arg(args, "timeout").is_none() =>
                         {
-                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
@@ -6160,12 +6206,13 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 resume_bb,
                                 false,
                             );
+                            self.may_hold_boost = true;
                             return Ok(true);
                         }
                         ("wait_read", MirPrimKind::ByteRing { cap })
                             if find_named_arg(args, "timeout").is_none() =>
                         {
-                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
@@ -6182,6 +6229,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 resume_bb,
                                 false,
                             );
+                            self.may_hold_boost = true;
                             return Ok(true);
                         }
                         _ => {}
@@ -6359,6 +6407,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                         ("wait", MirPrimKind::Signal)
                             if find_named_arg(args, "timeout").is_none() =>
                         {
+                            self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
                             self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
@@ -6373,6 +6422,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 resume_bb,
                                 false,
                             );
+                            self.may_hold_boost = true;
                             return Ok(true);
                         }
                         _ => {}
@@ -6467,6 +6517,9 @@ impl<'a> CoroutineLowerCtx<'a> {
             resume_bb,
             false,
         );
+        if self.syms.boost_capable_fns.contains(callee) {
+            self.may_hold_boost = true;
+        }
         Ok(())
     }
 
@@ -6813,7 +6866,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 }
                             }
                             "recv" => {
-                                self.cur_stmts.push(MirStmt::EndInboxTurn);
+                                self.emit_end_inbox_turn();
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
                                     let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
                                     let dl_var = self.alloc_temp("inbox_deadline", MirType::U32);
@@ -6853,6 +6906,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                         resume_bb,
                                         false,
                                     );
+                                    self.may_hold_boost = true;
                                     return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                                 } else {
                                     let dst_val = self.alloc_temp("inbox_val", elem.clone());
@@ -6872,13 +6926,14 @@ impl<'a> CoroutineLowerCtx<'a> {
                                         resume_bb,
                                         false,
                                     );
+                                    self.may_hold_boost = true;
                                     return Ok(MirExpr::new(MirExprKind::Var(dst_val), elem));
                                 }
                             }
                             _ => {}
                         },
                         LoweredPrimReceiver::ByteRingView(view) if m == "wait_read" => {
-                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            self.emit_end_inbox_turn();
                             let slice_ty = MirType::Slice(Box::new(MirType::U8));
                             if let Some(texpr) = find_named_arg(args, "timeout") {
                                 let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
@@ -6918,6 +6973,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                             } else {
                                 let dst_val = self.alloc_temp("ring_chunk", slice_ty.clone());
@@ -6936,6 +6992,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
                             }
                         }
@@ -6943,6 +7000,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                         LoweredPrimReceiver::Sized(target, pkind) => {
                             match (m, pkind) {
                         ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
+                            self.emit_end_inbox_turn();
                             let sty = MirType::Slice(elem.clone());
                             let dst_vid = self.alloc_temp("pp_chunk", sty.clone());
                             let poll_bb = self.alloc_bb();
@@ -6963,6 +7021,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             return Ok(MirExpr::new(MirExprKind::Var(dst_vid), sty));
                         }
                         ("alloc", MirPrimKind::Pool { elem, cap }) => {
+                            self.emit_end_inbox_turn();
                             if let Some(texpr) = find_named_arg(args, "timeout") {
                                 let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
                                 let dl_var = self.alloc_temp("pool_deadline", MirType::U32);
@@ -7004,6 +7063,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                             } else {
                                 let lease_ty = MirType::Lease(elem.clone());
@@ -7025,6 +7085,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_val), lease_ty));
                             }
                         }
@@ -7105,7 +7166,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             }
                         }
                         ("recv", MirPrimKind::Inbox { elem, cap }) => {
-                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            self.emit_end_inbox_turn();
                             if let Some(texpr) = find_named_arg(args, "timeout") {
                                 let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
                                 let dl_var = self.alloc_temp("inbox_deadline", MirType::U32);
@@ -7146,6 +7207,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                             } else {
                                 let dst_val = self.alloc_temp("inbox_val", *elem.clone());
@@ -7166,11 +7228,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_val), *elem));
                             }
                         }
                         ("wait_read", MirPrimKind::ByteRing { cap }) => {
-                            self.cur_stmts.push(MirStmt::EndInboxTurn);
+                            self.emit_end_inbox_turn();
                             let slice_ty = MirType::Slice(Box::new(MirType::U8));
                             if let Some(texpr) = find_named_arg(args, "timeout") {
                                 let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
@@ -7211,6 +7274,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                             } else {
                                 let dst_val = self.alloc_temp("ring_chunk", slice_ty.clone());
@@ -7230,10 +7294,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                     false,
                                 );
+                                self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
                             }
                         }
                         ("wait", MirPrimKind::Signal) => {
+                            self.emit_end_inbox_turn();
                             let timeout_var = if let Some(texpr) = find_named_arg(args, "timeout") {
                                 let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
                                 let dl_var = self.alloc_temp("sig_deadline", MirType::U32);
@@ -7275,6 +7341,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 resume_bb,
                                 false,
                             );
+                            self.may_hold_boost = true;
                             return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                         }
                         _ => {}
@@ -7352,6 +7419,7 @@ trait LowerBackend {
     fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId;
     fn emit_stmt_be(&mut self, stmt: MirStmt);
     fn invalidate_boot_const(&mut self, _vid: VarId) {}
+    fn mark_may_hold_boost_be(&mut self) {}
     fn lower_sub(
         &mut self,
         expr: &Expr,
@@ -7419,6 +7487,9 @@ impl<'a> LowerBackend for CoroutineLowerCtx<'a> {
     }
     fn emit_stmt_be(&mut self, stmt: MirStmt) {
         self.cur_stmts.push(stmt);
+    }
+    fn mark_may_hold_boost_be(&mut self) {
+        self.may_hold_boost = true;
     }
     fn lower_sub(
         &mut self,
@@ -7773,13 +7844,47 @@ fn try_lower_mmio_assign_be<B: LowerBackend>(
     Ok(true)
 }
 
-fn ast_stmts_have_inbox_recv(stmts: &[Stmt]) -> bool {
+fn ast_stmts_have_boost_acquire(stmts: &[Stmt]) -> bool {
+    ast_stmts_check_boost_ops(stmts, None, false)
+}
+
+fn ast_stmts_have_inbox_recv(stmts: &[Stmt], boost_fns: &BTreeSet<String>) -> bool {
+    ast_stmts_check_boost_ops(stmts, Some(boost_fns), true)
+}
+
+fn ast_expr_has_inbox_recv(expr: &Expr, boost_fns: &BTreeSet<String>) -> bool {
+    ast_expr_checks_boost_ops(expr, Some(boost_fns), true)
+}
+
+fn ast_stmts_check_boost_ops(
+    stmts: &[Stmt],
+    boost_fns: Option<&BTreeSet<String>>,
+    include_wait_chunk: bool,
+) -> bool {
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::VarDecl { init: Some(e), .. }
-            | StmtKind::Assign { value: e, .. }
+            | StmtKind::Return(Some(e))
             | StmtKind::Expr(e) => {
-                if ast_expr_has_inbox_recv(e) {
+                if ast_expr_checks_boost_ops(e, boost_fns, include_wait_chunk) {
+                    return true;
+                }
+            }
+            StmtKind::Assign { target, value, .. } => {
+                if ast_expr_checks_boost_ops(target, boost_fns, include_wait_chunk)
+                    || ast_expr_checks_boost_ops(value, boost_fns, include_wait_chunk)
+                {
+                    return true;
+                }
+            }
+            StmtKind::Error { reason, partial } => {
+                if reason
+                    .as_ref()
+                    .is_some_and(|r| ast_expr_checks_boost_ops(r, boost_fns, include_wait_chunk))
+                    || partial.as_ref().is_some_and(|p| {
+                        ast_expr_checks_boost_ops(p, boost_fns, include_wait_chunk)
+                    })
+                {
                     return true;
                 }
             }
@@ -7788,34 +7893,172 @@ fn ast_stmts_have_inbox_recv(stmts: &[Stmt]) -> bool {
                 then_block,
                 else_block,
             } => {
-                if ast_expr_has_inbox_recv(cond)
-                    || ast_stmts_have_inbox_recv(&then_block.stmts)
-                    || else_block
-                        .as_ref()
-                        .map_or(false, |eb| ast_stmts_have_inbox_recv(&eb.stmts))
+                if ast_expr_checks_boost_ops(cond, boost_fns, include_wait_chunk)
+                    || ast_stmts_check_boost_ops(&then_block.stmts, boost_fns, include_wait_chunk)
+                    || else_block.as_ref().is_some_and(|eb| {
+                        ast_stmts_check_boost_ops(&eb.stmts, boost_fns, include_wait_chunk)
+                    })
                 {
                     return true;
                 }
             }
-            StmtKind::Block(b) => {
-                if ast_stmts_have_inbox_recv(&b.stmts) {
+            StmtKind::Switch { scrutinee, arms } => {
+                if ast_expr_checks_boost_ops(scrutinee, boost_fns, include_wait_chunk)
+                    || arms.iter().any(|arm| {
+                        ast_stmts_check_boost_ops(&arm.body.stmts, boost_fns, include_wait_chunk)
+                    })
+                {
                     return true;
                 }
             }
-            _ => {}
+            StmtKind::While { cond, body } => {
+                if ast_expr_checks_boost_ops(cond, boost_fns, include_wait_chunk)
+                    || ast_stmts_check_boost_ops(&body.stmts, boost_fns, include_wait_chunk)
+                {
+                    return true;
+                }
+            }
+            StmtKind::Loop { body }
+            | StmtKind::NoYield { body }
+            | StmtKind::Critical { body }
+            | StmtKind::Block(body) => {
+                if ast_stmts_check_boost_ops(&body.stmts, boost_fns, include_wait_chunk) {
+                    return true;
+                }
+            }
+            StmtKind::LoopEvery { period, body } => {
+                if ast_expr_checks_boost_ops(period, boost_fns, include_wait_chunk)
+                    || ast_stmts_check_boost_ops(&body.stmts, boost_fns, include_wait_chunk)
+                {
+                    return true;
+                }
+            }
+            StmtKind::ForRange {
+                start, end, body, ..
+            } => {
+                if ast_expr_checks_boost_ops(start, boost_fns, include_wait_chunk)
+                    || ast_expr_checks_boost_ops(end, boost_fns, include_wait_chunk)
+                    || ast_stmts_check_boost_ops(&body.stmts, boost_fns, include_wait_chunk)
+                {
+                    return true;
+                }
+            }
+            StmtKind::ForEach { iter, body, .. } => {
+                if ast_expr_checks_boost_ops(iter, boost_fns, include_wait_chunk)
+                    || ast_stmts_check_boost_ops(&body.stmts, boost_fns, include_wait_chunk)
+                {
+                    return true;
+                }
+            }
+            StmtKind::Defer(inner) => {
+                if ast_stmts_check_boost_ops(
+                    std::slice::from_ref(inner.as_ref()),
+                    boost_fns,
+                    include_wait_chunk,
+                ) {
+                    return true;
+                }
+            }
+            StmtKind::Spawn(sp) => {
+                if sp
+                    .args
+                    .iter()
+                    .any(|a| ast_expr_checks_boost_ops(&a.value, boost_fns, include_wait_chunk))
+                {
+                    return true;
+                }
+            }
+            StmtKind::VarDecl { init: None, .. }
+            | StmtKind::StateVar { .. }
+            | StmtKind::Return(None)
+            | StmtKind::Restart
+            | StmtKind::Continue
+            | StmtKind::Break
+            | StmtKind::Checkpoint => {}
         }
     }
     false
 }
 
-fn ast_expr_has_inbox_recv(expr: &Expr) -> bool {
+fn ast_expr_checks_boost_ops(
+    expr: &Expr,
+    boost_fns: Option<&BTreeSet<String>>,
+    include_wait_chunk: bool,
+) -> bool {
     match &expr.kind {
-        ExprKind::MethodCall { method, .. } if method.name == "recv" => true,
-        ExprKind::Or { expr: l, fallback: r } => {
-            ast_expr_has_inbox_recv(l) || ast_expr_has_inbox_recv(r)
+        ExprKind::MethodCall {
+            receiver,
+            method,
+            args,
+        } => {
+            let m = method.name.as_str();
+            if matches!(
+                m,
+                "recv" | "wait" | "alloc" | "wait_read" | "try_recv" | "try_wait" | "pop"
+                    | "try_pop_byte"
+            ) || (include_wait_chunk && m == "wait_chunk")
+            {
+                return true;
+            }
+            ast_expr_checks_boost_ops(receiver, boost_fns, include_wait_chunk)
+                || args.iter().any(|a| {
+                    ast_expr_checks_boost_ops(&a.value, boost_fns, include_wait_chunk)
+                })
         }
-        ExprKind::Catch { expr: inner, .. } => ast_expr_has_inbox_recv(inner),
-        _ => false,
+        ExprKind::Call { callee, args, .. } => {
+            if let (Some(fns), ExprKind::Ident(id)) = (boost_fns, &callee.kind) {
+                if fns.contains(&id.name) {
+                    return true;
+                }
+            }
+            ast_expr_checks_boost_ops(callee, boost_fns, include_wait_chunk)
+                || args.iter().any(|a| {
+                    ast_expr_checks_boost_ops(&a.value, boost_fns, include_wait_chunk)
+                })
+        }
+        ExprKind::Or {
+            expr: l,
+            fallback: r,
+        }
+        | ExprKind::Binary { lhs: l, rhs: r, .. }
+        | ExprKind::Index {
+            target: l,
+            index: r,
+        } => {
+            ast_expr_checks_boost_ops(l, boost_fns, include_wait_chunk)
+                || ast_expr_checks_boost_ops(r, boost_fns, include_wait_chunk)
+        }
+        ExprKind::Catch { expr: inner, clause } => {
+            ast_expr_checks_boost_ops(inner, boost_fns, include_wait_chunk)
+                || ast_stmts_check_boost_ops(&clause.body.stmts, boost_fns, include_wait_chunk)
+        }
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Field { target: inner, .. } => {
+            ast_expr_checks_boost_ops(inner, boost_fns, include_wait_chunk)
+        }
+        ExprKind::Slice { target, start, end } => {
+            ast_expr_checks_boost_ops(target, boost_fns, include_wait_chunk)
+                || start.as_ref().is_some_and(|s| {
+                    ast_expr_checks_boost_ops(s, boost_fns, include_wait_chunk)
+                })
+                || end.as_ref().is_some_and(|e| {
+                    ast_expr_checks_boost_ops(e, boost_fns, include_wait_chunk)
+                })
+        }
+        ExprKind::StructLit { fields, .. } => fields
+            .iter()
+            .any(|f| ast_expr_checks_boost_ops(&f.value, boost_fns, include_wait_chunk)),
+        ExprKind::ArrayLit(elems) => elems
+            .iter()
+            .any(|e| ast_expr_checks_boost_ops(e, boost_fns, include_wait_chunk)),
+        ExprKind::FormatString(parts) => parts.iter().any(|part| match part {
+            FormatPart::Hole { expr: he, .. } => {
+                ast_expr_checks_boost_ops(he, boost_fns, include_wait_chunk)
+            }
+            FormatPart::Literal(_) => false,
+        }),
+        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Priority(_) => false,
     }
 }
 
@@ -7997,6 +8240,15 @@ fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
             MirType::F64 => MirExpr::new(MirExprKind::FloatLit(bits), MirType::F64),
             _ => MirExpr::new(MirExprKind::FloatLit(bits), expr.ty),
         },
+        MirExprKind::StringLit(s)
+            if expr.ty == MirType::Str
+                && matches!(&host_target, MirType::Slice(elem) if **elem == MirType::U8) =>
+        {
+            MirExpr::new(
+                MirExprKind::StringLit(s),
+                MirType::Slice(Box::new(MirType::U8)),
+            )
+        }
         other_kind => MirExpr::new(other_kind, expr.ty),
     }
 }
@@ -8052,7 +8304,15 @@ fn lower_leaf_expr(
                 Ok(MirExpr::new(MirExprKind::TicksLit(ticks), MirType::U32))
             }
             Literal::Bool(b) => Ok(MirExpr::new(MirExprKind::BoolLit(*b), MirType::Bool)),
-            Literal::String(s) => Ok(MirExpr::new(MirExprKind::StringLit(s.clone()), MirType::Str)),
+            Literal::String(s) => {
+                let ty = match expected.map(|t| t.host_value_type()) {
+                    Some(MirType::Slice(elem)) if *elem == MirType::U8 => {
+                        MirType::Slice(Box::new(MirType::U8))
+                    }
+                    _ => MirType::Str,
+                };
+                Ok(MirExpr::new(MirExprKind::StringLit(s.clone()), ty))
+            }
         },
         ExprKind::Priority(p) => Ok(MirExpr::new(
             MirExprKind::IntLit(convert_priority(*p).as_u8() as i128),
@@ -8186,14 +8446,20 @@ fn lower_common_expr<B: LowerBackend>(
                     | BinaryOp::And
                     | BinaryOp::Or
             );
+            let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
             let op_expected = if is_cmp_or_logic { None } else { expected };
-            let (l, r) = if ast_is_untyped_int_lit(lhs) && !ast_is_untyped_int_lit(rhs) {
+            let (l, r) = if !is_shift && ast_is_untyped_int_lit(lhs) && !ast_is_untyped_int_lit(rhs) {
                 let r = be.lower_sub(rhs, op_expected)?;
                 let l = be.lower_sub(lhs, Some(&r.ty.host_value_type()))?;
                 (l, r)
             } else {
                 let l = be.lower_sub(lhs, op_expected)?;
-                let r = be.lower_sub(rhs, Some(&l.ty.host_value_type()))?;
+                let rhs_exp = if is_shift {
+                    None
+                } else {
+                    Some(l.ty.host_value_type())
+                };
+                let r = be.lower_sub(rhs, rhs_exp.as_ref())?;
                 (l, r)
             };
             Ok(finish_binary(*op, l, r))
@@ -8201,6 +8467,11 @@ fn lower_common_expr<B: LowerBackend>(
         ExprKind::Cast { expr: inner, ty } => {
             let target_ty = be.syms().resolve_type(ty);
             let sub = be.lower_sub(inner, None)?;
+            if matches!(&target_ty, MirType::Slice(elem) if **elem == MirType::U8)
+                && matches!(&sub.kind, MirExprKind::StringLit(_))
+            {
+                return Ok(MirExpr::new(sub.kind, target_ty));
+            }
             Ok(MirExpr::new(
                 MirExprKind::Cast {
                     expr: Box::new(sub),
@@ -8474,6 +8745,9 @@ fn lower_common_expr<B: LowerBackend>(
                         } else {
                             id.name.clone()
                         };
+                    if be.syms().boost_capable_fns.contains(&id.name) {
+                        be.mark_may_hold_boost_be();
+                    }
                     return Ok(MirExpr::new(
                         MirExprKind::CallDirect {
                             callee: target_callee,
@@ -8835,15 +9109,21 @@ fn coerce_or_cast_int(expr: MirExpr, target_ty: &MirType) -> MirExpr {
 }
 
 fn finish_binary(op: BinaryOp, mut lhs: MirExpr, mut rhs: MirExpr) -> MirExpr {
+    let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
     // Unify float literal precision if one side is `f32` and the other is a `FloatLit`
     if lhs.ty == MirType::F32 && matches!(rhs.kind, MirExprKind::FloatLit(_)) {
         rhs = coerce_expr_if_needed(rhs, &MirType::F32);
     } else if rhs.ty == MirType::F32 && matches!(lhs.kind, MirExprKind::FloatLit(_)) {
         lhs = coerce_expr_if_needed(lhs, &MirType::F32);
-    } else if is_signed_int_mir_type(&rhs.ty) && lhs.ty.is_unsigned() && is_scalar_int_mir_type(&lhs.ty) {
+    } else if !is_shift
+        && is_signed_int_mir_type(&rhs.ty)
+        && lhs.ty.is_unsigned()
+        && is_scalar_int_mir_type(&lhs.ty)
+    {
         let target = rhs.ty.host_value_type();
         lhs = coerce_or_cast_int(lhs, &target);
-    } else if is_signed_int_mir_type(&lhs.ty)
+    } else if !is_shift
+        && is_signed_int_mir_type(&lhs.ty)
         && rhs.ty.is_unsigned()
         && is_scalar_int_mir_type(&rhs.ty)
     {
@@ -9175,17 +9455,20 @@ fn finish_prim_read_method<B: LowerBackend>(
             })),
             *elem,
         )),
-        ("try_recv", MirPrimKind::Inbox { elem, cap }) => Ok(MirExpr::new(
-            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxTryRecv {
-                target,
-                elem_ty: *elem.clone(),
-                cap,
-            })),
-            MirType::Result {
-                ok: elem,
-                err: None,
-            },
-        )),
+        ("try_recv", MirPrimKind::Inbox { elem, cap }) => {
+            be.mark_may_hold_boost_be();
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxTryRecv {
+                    target,
+                    elem_ty: *elem.clone(),
+                    cap,
+                })),
+                MirType::Result {
+                    ok: elem,
+                    err: None,
+                },
+            ))
+        }
         ("try_send", MirPrimKind::Inbox { elem, cap }) => {
             let v = if let Some(first) = first_positional_arg(args) {
                 let raw = be.lower_sub(first, Some(&elem))?;
@@ -9237,10 +9520,13 @@ fn finish_prim_read_method<B: LowerBackend>(
             MirExprKind::PrimRead(Box::new(MirPrimReadOp::SignalIsSet { target })),
             MirType::Bool,
         )),
-        ("try_wait", MirPrimKind::Signal) => Ok(MirExpr::new(
-            MirExprKind::PrimRead(Box::new(MirPrimReadOp::SignalTryWait { target })),
-            MirType::Bool,
-        )),
+        ("try_wait", MirPrimKind::Signal) => {
+            be.mark_may_hold_boost_be();
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::SignalTryWait { target })),
+                MirType::Bool,
+            ))
+        }
         ("half_len" | "cap", MirPrimKind::PingPong { cap, .. }) => {
             Ok(MirExpr::new(MirExprKind::IntLit(cap as i128), MirType::Usize))
         }
@@ -9322,6 +9608,7 @@ fn finish_prim_read_method<B: LowerBackend>(
             MirType::Slice(Box::new(MirType::U8)),
         )),
         ("pop", MirPrimKind::ByteRing { cap }) => {
+            be.mark_may_hold_boost_be();
             let dst = if let Some(first) = first_positional_arg(args) {
                 lower_fmt_buf_dst_be(first, be)?
             } else {
@@ -9339,13 +9626,16 @@ fn finish_prim_read_method<B: LowerBackend>(
                 MirType::Usize,
             ))
         }
-        ("try_pop_byte", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
-            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingTryPopByte { target, cap })),
-            MirType::Result {
-                ok: Box::new(MirType::U8),
-                err: None,
-            },
-        )),
+        ("try_pop_byte", MirPrimKind::ByteRing { cap }) => {
+            be.mark_may_hold_boost_be();
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingTryPopByte { target, cap })),
+                MirType::Result {
+                    ok: Box::new(MirType::U8),
+                    err: None,
+                },
+            ))
+        }
         ("len", MirPrimKind::ByteRing { cap }) => Ok(MirExpr::new(
             MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingLen { target, cap })),
             MirType::Usize,
@@ -9487,16 +9777,19 @@ fn finish_inbox_view_read_method<B: LowerBackend>(
     be: &mut B,
 ) -> Result<MirExpr, MirLowerError> {
     match method {
-        "try_recv" => Ok(MirExpr::new(
-            MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewTryRecv {
-                view,
-                elem_ty: elem_ty.clone(),
-            })),
-            MirType::Result {
-                ok: Box::new(elem_ty),
-                err: None,
-            },
-        )),
+        "try_recv" => {
+            be.mark_may_hold_boost_be();
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::InboxViewTryRecv {
+                    view,
+                    elem_ty: elem_ty.clone(),
+                })),
+                MirType::Result {
+                    ok: Box::new(elem_ty),
+                    err: None,
+                },
+            ))
+        }
         "try_send" => {
             let v = if let Some(first) = first_positional_arg(args) {
                 let raw = be.lower_sub(first, Some(&elem_ty))?;
@@ -9611,6 +9904,7 @@ fn finish_byte_ring_view_read_method<B: LowerBackend>(
             MirType::Slice(Box::new(MirType::U8)),
         )),
         "pop" => {
+            be.mark_may_hold_boost_be();
             let dst = if let Some(first) = first_positional_arg(args) {
                 lower_fmt_buf_dst_be(first, be)?
             } else {
@@ -9627,13 +9921,16 @@ fn finish_byte_ring_view_read_method<B: LowerBackend>(
                 MirType::Usize,
             ))
         }
-        "try_pop_byte" => Ok(MirExpr::new(
-            MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewTryPopByte { view })),
-            MirType::Result {
-                ok: Box::new(MirType::U8),
-                err: None,
-            },
-        )),
+        "try_pop_byte" => {
+            be.mark_may_hold_boost_be();
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewTryPopByte { view })),
+                MirType::Result {
+                    ok: Box::new(MirType::U8),
+                    err: None,
+                },
+            ))
+        }
         "len" => Ok(MirExpr::new(
             MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewLen { view })),
             MirType::Usize,

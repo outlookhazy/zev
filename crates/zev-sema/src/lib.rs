@@ -118,7 +118,10 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
         .map(|(p, f)| (p, f.as_deref()))
         .collect();
 
-    let mono_out = monomorphize::monomorphize_named_programs(&linked_pairs);
+    let mono_out = monomorphize::monomorphize_named_programs_with_non_root_count(
+        &linked_pairs,
+        linked.non_root_program_count,
+    );
     if !mono_out.diagnostics.is_empty() {
         let mut diagnostics = mono_out.diagnostics;
         if programs.len() == 1 {

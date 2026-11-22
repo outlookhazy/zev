@@ -346,6 +346,7 @@ task usb_cmd_worker(
 
 // ── Sequential Boot + Low-Priority Telemetry Supervisor ─────────────────────
 fn main() {
+    bsp.init_soc();
     bsp.init_board_gpio();
     bsp.init_temp_sensor();
     bsp.init_gdma_ch0();

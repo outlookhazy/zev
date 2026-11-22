@@ -31,6 +31,13 @@ pub fn collect_declared_generic_names(src: &str) -> BTreeSet<String> {
     parser::Parser::collect_declared_generics(src, tokens)
 }
 
+/// Pre-scan `.zev` source text at brace-depth `0` and return all `pub` top-level generic `struct`
+/// and `fn` names declared in `src`.
+pub fn collect_pub_declared_generic_names(src: &str) -> BTreeSet<String> {
+    let tokens = lexer::lex_prefix_best_effort(src);
+    parser::Parser::collect_pub_declared_generics(src, tokens)
+}
+
 /// Parse an in-memory `.zev` source string into a [`Program`].
 pub fn parse_str(source: &str) -> Result<Program, ParseError> {
     parse_str_named(source, "<input>")
@@ -2259,6 +2266,194 @@ fn main() {
             ));
         } else {
             panic!("expected Fn main");
+        }
+    }
+
+    #[test]
+    fn regression_s_m6_scoped_generics_and_non_usize_top_level_values() {
+        let mod_src = r#"
+pub struct Box<T, usize N> {
+    [N]T data;
+}
+
+pub T clamp<T>(T x, T lo, T hi) {
+    return x;
+}
+
+T private_gen<T>(T x) {
+    return x;
+}
+"#;
+        let pub_gens = collect_pub_declared_generic_names(mod_src);
+        assert!(pub_gens.contains("Box"));
+        assert!(pub_gens.contains("clamp"));
+        assert!(!pub_gens.contains("private_gen"));
+
+        let app_src = r#"
+import math.mod as m;
+
+const u32 HI = 10;
+const usize CAP = 4;
+mmio Regs {
+    @rw u32 cr @ 0x00;
+}
+mmio REGS : Regs @ 0x4000_0000;
+irq IRQ0 = 5;
+watch<u32> FLAG = 0;
+
+struct FixedVec<T, usize N> {
+    [N]T items;
+}
+
+struct Holder {
+    u32 clamp;
+}
+
+FixedVec<u32, N + 1> grow_n<usize N>(FixedVec<u32, N> v) {
+    return FixedVec<u32, N + 1> { items: [0] };
+}
+
+fn check_pair(bool a, bool b) {
+    assert(a && b);
+}
+
+fn use_n<usize N>(u32 cmp, FixedVec<u32, N> v) {
+    // Generic type/fn instantiations with usize CAP and N + 1 must parse as generic args:
+    FixedVec<u32, CAP> fixed = FixedVec<u32, CAP> { items: [1, 2, 3, 4] };
+    FixedVec<u32, N + 1> grown = grow_n<N>(v);
+    u32 c = m.clamp<u32>(cmp, 0, HI);
+
+    // Module-scoped `m.clamp` must NOT hijack `b.clamp < 2, HI > (0)`:
+    Holder b = Holder { clamp: 1 };
+    check_pair(b.clamp < 2, HI > (0));
+
+    // Non-usize top-level `const` / `mmio` / `irq` / `OsPrimitive` must NOT trigger generic speculation
+    // even when LHS `unk` is undeclared:
+    check_pair(unk < HI, c > (0));
+    check_pair(unk < REGS, c > (0));
+    check_pair(unk < IRQ0, c > (0));
+    check_pair(unk < FLAG, c > (0));
+    println(f"{fixed.items[0]} {grown.items[0]}");
+}
+"#;
+        // Also verify standalone parse WITHOUT known_generics protects non-usize top-level values:
+        assert!(parse_str(app_src).is_ok());
+
+        let mut known = collect_declared_generic_names(app_src);
+        known.insert("#import_scoped".to_string());
+        known.insert("m.clamp".to_string());
+        known.insert("m.Box".to_string());
+
+        let prog = parse_str_named_with_generics(app_src, "app.zev", Some(&known))
+            .expect("parse app with scoped generics and non-usize guards");
+        let use_n_fn = prog
+            .items
+            .iter()
+            .find_map(|it| match &it.kind {
+                ItemKind::Fn(f) if f.name.name == "use_n" => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        let stmts = &use_n_fn.body.as_ref().unwrap().stmts;
+
+        // stmt 0: FixedVec<u32, CAP> local type + struct lit
+        assert!(matches!(
+            &stmts[0].kind,
+            StmtKind::VarDecl { ty, .. } if matches!(&ty.kind, TypeKind::Generic { args, .. } if args.len() == 2)
+        ));
+        // stmt 1: grow_n<N>(v) generic call
+        assert!(matches!(
+            &stmts[1].kind,
+            StmtKind::VarDecl {
+                init: Some(Expr { kind: ExprKind::Call { generic_args, args, .. }, .. }),
+                ..
+            } if generic_args.len() == 1 && args.len() == 1
+        ));
+        // stmt 2: m.clamp<u32>(cmp, 0, HI) generic call
+        assert!(matches!(
+            &stmts[2].kind,
+            StmtKind::VarDecl {
+                init: Some(Expr { kind: ExprKind::Call { generic_args, args, .. }, .. }),
+                ..
+            } if generic_args.len() == 1 && args.len() == 3
+        ));
+        // stmts 4..=8: all 5 `check_pair(...)` calls stay 2-arg relational comparisons!
+        for idx in [4usize, 5, 6, 7, 8] {
+            match &stmts[idx].kind {
+                StmtKind::Expr(Expr {
+                    kind: ExprKind::Call { args, generic_args, .. },
+                    ..
+                }) => {
+                    assert!(generic_args.is_empty(), "stmt {idx} hijacked generic args!");
+                    assert_eq!(args.len(), 2, "stmt {idx} expected 2 comparison args");
+                }
+                other => panic!("expected 2-arg Call at stmt {idx}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn regression_s_l1_c_style_struct_generic_path_ptr_casts() {
+        let src = r#"
+import lib.mod_m as mod_m;
+
+struct MyStruct {
+    u32 x;
+}
+
+struct Box<T, usize N> {
+    [N]T arr;
+}
+
+fn test(*void vp, *i32 a) {
+    *MyStruct p1 = (*MyStruct)vp;
+    *MyStruct p2 = (MyStruct*)vp;
+    *mod_m.MyStruct p3 = (*mod_m.MyStruct)vp;
+    *mod_m.MyStruct p4 = (mod_m.MyStruct*)vp;
+    *Box<u32, 4> p5 = (*Box<u32, 4>)vp;
+    *Box<u32, 4> p6 = (Box<u32, 4>*)vp;
+
+    i32 s1 = (*a) - 1;
+    i32 s2 = (*a) * 2;
+    i32 s3 = (*a) + 3;
+}
+"#;
+        let prog = parse_str(src).expect("C-style struct/generic/path ptr casts must parse");
+        let f = match &prog.items[3].kind {
+            ItemKind::Fn(f) => f,
+            other => panic!("expected Fn, got {other:?}"),
+        };
+        let stmts = &f.body.as_ref().unwrap().stmts;
+        for idx in 0..6 {
+            assert!(
+                matches!(
+                    &stmts[idx].kind,
+                    StmtKind::VarDecl {
+                        init: Some(Expr { kind: ExprKind::Cast { .. }, .. }),
+                        ..
+                    }
+                ),
+                "stmt {idx} must parse as Cast"
+            );
+        }
+        for (idx, expected_op) in [(6usize, BinaryOp::Sub), (7, BinaryOp::Mul), (8, BinaryOp::Add)] {
+            assert!(
+                matches!(
+                    &stmts[idx].kind,
+                    StmtKind::VarDecl {
+                        init: Some(Expr {
+                            kind: ExprKind::Binary {
+                                op,
+                                lhs,
+                                ..
+                            },
+                            ..
+                        }),
+                        ..
+                    } if *op == expected_op && matches!(lhs.kind, ExprKind::Unary { op: UnaryOp::Deref, .. })
+                ),
+                "stmt {idx} must remain binary deref expression"
+            );
         }
     }
 }

@@ -1,8 +1,56 @@
-// Waveshare ESP32-C6-Pico Board Support Package
+// Waveshare ESP32-C6-Pico Board Support Package (100% Pure .zev)
 import chip.esp32c6 as hw;
 
 pub const u32 PIN_WS2812_RGB = 8;
 pub const u32 PIN_BOOT_BTN   = 9;
+
+const u32 ESP32C6_WDT_UNLOCK = 0x50D8_3AA1;
+
+pub fn init_soc() {
+    critical {
+        // 1. Disarm TIMG0 MWDT0, TIMG1 MWDT1, LP_WDT RWDT, and Super Watchdog (SWD).
+        hw.TIMG0.wdtwprotect = ESP32C6_WDT_UNLOCK;
+        hw.TIMG0.wdtconfig0 = 0;
+        hw.TIMG0.wdtwprotect = 0;
+
+        hw.TIMG1.wdtwprotect = ESP32C6_WDT_UNLOCK;
+        hw.TIMG1.wdtconfig0 = 0;
+        hw.TIMG1.wdtwprotect = 0;
+
+        hw.LP_WDT.wprotect = ESP32C6_WDT_UNLOCK;
+        hw.LP_WDT.config0 = 0;
+        hw.LP_WDT.wprotect = 0;
+
+        hw.LP_WDT.swd_wprotect = ESP32C6_WDT_UNLOCK;
+        hw.LP_WDT.swd_config = hw.LP_WDT.swd_config | 0xC000_0000;
+        hw.LP_WDT.swd_wprotect = 0;
+
+        // 2. Disable APM access-path filters so GDMA can access HP-SRAM in Direct-Boot mode.
+        hw.HP_APM.func_ctrl = 0;
+        hw.LP_APM0.func_ctrl = 0;
+        hw.LP_APM.func_ctrl = 0;
+
+        // 3. Ungate SYSTIMER clock and enable 16 MHz UNIT0.
+        hw.PCR.systimer_conf = (hw.PCR.systimer_conf | 1) & (~2u32);
+        hw.SYSTIMER.conf = hw.SYSTIMER.conf | 0xC000_0000;
+    }
+}
+
+pub u32 sys_now_ms() {
+    hw.SYSTIMER.unit0_op = 1 << 30;
+    u32 _sync0 = hw.SYSTIMER.conf;
+    u32 _sync1 = hw.SYSTIMER.conf;
+    u32 _sync_acc = _sync0 ^ _sync1;
+    for (u32 i in 0..256) {
+        if ((hw.SYSTIMER.unit0_op & (1 << 29)) != 0 || _sync_acc == 0xFFFF_FFFF) {
+            break;
+        }
+    }
+    u32 hi = hw.SYSTIMER.unit0_value_hi & 0xF_FFFF;
+    u32 lo = hw.SYSTIMER.unit0_value_lo;
+    u64 ticks = ((hi as u64) << 32) | (lo as u64);
+    return (ticks / 16000u64) as u32;
+}
 
 // RMT TX0 base config: mem_size=1 block (bit 16), div_cnt=4 -> 10 MHz (100 ns tick, bits 15:8), idle_out_en=1 (bit 6), idle_lv=0
 const u32 RMT_CH0_BASE_CFG = 0x0001_0440;
@@ -194,6 +242,13 @@ pub fn usb_tx_write_byte(u8 b) {
 
 pub fn usb_tx_flush() {
     hw.USB_DEVICE.ep1_conf = 1;
+}
+
+pub fn console_putc(u8 b) {
+    usb_tx_write_byte(b);
+    if (b == '\n') {
+        usb_tx_flush();
+    }
 }
 
 pub fn init_gdma_ch0() {

@@ -14,7 +14,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use crate::toolchain::{CodegenError, find_tool, inspect_elf_sizes, read_elf32_sym_addr};
+use crate::toolchain::{CodegenError, TargetArch, find_tool, inspect_elf_sizes, read_elf32_sym_addr};
 
 /// Total ATmega4809 interrupt vectors (`0..=39`).
 pub const AVR_ATMEGA4809_VECTOR_COUNT: u32 = 40;
@@ -56,6 +56,8 @@ pub fn emit_avr_mega0_startup_ir(
     sz: &str,
     attached_irqs: &BTreeSet<u32>,
 ) {
+    let fn_as = TargetArch::AvrAtmega4809.fn_addrspace_attr();
+    let call_kw = TargetArch::AvrAtmega4809.call_kw();
     let sp_lo = initial_sp & 0xFF;
     let sp_hi = (initial_sp >> 8) & 0xFF;
 
@@ -127,14 +129,14 @@ module asm "5: rjmp 5b"
 @__sbss = external global i8
 @__ebss = external global i8
 
-define void @__syn_avr_mega0_entry() noreturn nounwind{sz} {{
+define void @__syn_avr_mega0_entry(){fn_as} noreturn nounwind{sz} {{
 entry:
-  call void @__syn_boot()
-  call void @__syn_sched_loop()
+  {call_kw} void @__syn_boot()
+  {call_kw} void @__syn_sched_loop()
   unreachable
 }}
 
-define avr_signalcc void @__syn_avr_unhandled_irq() nounwind {{
+define avr_signalcc void @__syn_avr_unhandled_irq(){fn_as} nounwind {{
 entry:
   ret void
 }}
@@ -144,9 +146,9 @@ entry:
     for &irq in attached_irqs {
         let _ = writeln!(
             out,
-            r#"define avr_signalcc void @__syn_avr_vec_{irq}() nounwind {{
+            r#"define avr_signalcc void @__syn_avr_vec_{irq}(){fn_as} nounwind {{
 entry:
-  call void @__syn_vec_irq_{irq}()
+  {call_kw} void @__syn_vec_irq_{irq}()
   ret void
 }}
 "#
@@ -158,17 +160,19 @@ entry:
 /// `@__syn_avr_read_ms`, `sei; sleep; cli` idle hook, and shared per-section weak
 /// `avr-libgcc` integer mul/divmod shims).
 pub fn emit_avr_mega0_hal_ir(out: &mut String, sz: &str) {
+    let fn_as = TargetArch::AvrAtmega4809.fn_addrspace_attr();
+    let call_kw = TargetArch::AvrAtmega4809.call_kw();
     let _ = writeln!(
         out,
         r#"; ── AVR avrxmega3 Pure-ISA CPU Primitives: SREG, Tear-Free Tick Read, Sleep ──
-define i32 @__syn_crit_enter() nounwind alwaysinline {{
+define i32 @__syn_crit_enter(){fn_as} nounwind alwaysinline {{
 entry:
   %sr = call i8 asm sideeffect "in $0, 0x3f\0Acli", "=r,~{{memory}}"()
   %z = zext i8 %sr to i32
   ret i32 %z
 }}
 
-define void @__syn_crit_exit(i32 %pm) nounwind alwaysinline {{
+define void @__syn_crit_exit(i32 %pm){fn_as} nounwind alwaysinline {{
 entry:
   %ib = and i32 %pm, 128
   %en = icmp ne i32 %ib, 0
@@ -180,15 +184,15 @@ done:
   ret void
 }}
 
-define i32 @__syn_avr_read_ms() nounwind noinline{sz} {{
+define i32 @__syn_avr_read_ms(){fn_as} nounwind noinline{sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
+  %pm = {call_kw} i32 @__syn_crit_enter()
   %t = load volatile i32, ptr @__syn_tick_ms, align 4
-  call void @__syn_crit_exit(i32 %pm)
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   ret i32 %t
 }}
 
-define void @__syn_platform_exit(i32 %code) noreturn nounwind{sz} {{
+define void @__syn_platform_exit(i32 %code){fn_as} noreturn nounwind{sz} {{
 entry:
   br label %halt
 halt:
@@ -196,26 +200,26 @@ halt:
   br label %halt
 }}
 
-define void @__syn_use_systick(i32 %hz) nounwind{sz} {{
+define void @__syn_use_systick(i32 %hz){fn_as} nounwind{sz} {{
 entry:
   store i8 1, ptr @__syn_systick_enabled, align 1
   ret void
 }}
 
-define void @__syn_nvic_pend_irq(i32 %irq) nounwind{sz} {{
+define void @__syn_nvic_pend_irq(i32 %irq){fn_as} nounwind{sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
-  call void @__syn_avr_dispatch_irq(i32 %irq)
-  call void @__syn_crit_exit(i32 %pm)
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  {call_kw} void @__syn_avr_dispatch_irq(i32 %irq)
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   ret void
 }}
 
-define void @__syn_idle_sleep() nounwind{sz} {{
+define void @__syn_idle_sleep(){fn_as} nounwind{sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
+  %pm = {call_kw} i32 @__syn_crit_enter()
   %now = load volatile i32, ptr @__syn_tick_ms, align 4
-  call void @__syn_wake_timers(i32 %now)
-  %any_ready = call i1 @__syn_any_ready_task()
+  {call_kw} void @__syn_wake_timers(i32 %now)
+  %any_ready = {call_kw} i1 @__syn_any_ready_task()
   br i1 %any_ready, label %restore, label %do_sleep
 do_sleep:
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
@@ -230,7 +234,7 @@ do_sleep:
   call void asm sideeffect "sei\0Asleep\0Acli", "~{{memory}}"()
   br label %restore
 restore:
-  call void @__syn_crit_exit(i32 %pm)
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   ret void
 }}
 "#

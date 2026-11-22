@@ -1,9 +1,9 @@
-//! Pure LLVM 23 IR Cooperative Language-OS Kernel & Bare-Metal Cortex-M3 Hardware Runtime.
+//! Pure LLVM 23 IR Cooperative Language-OS Kernel & Architectural CPU Runtime.
 //!
 //! Synthesizes the entire cooperative scheduler (`Overdue -> Work -> Poll -> Sleep`),
 //! priority starvation windows, `should_share()`, ISR `boost: @critical` elevation & restore,
-//! wake-lock sleep-depth clamping (`LIGHT` vs `DEEP`), Cortex-M3 `PRIMASK` critical sections,
-//! `SysTick` (`0xE000E010`), NVIC `ISPR0` (`0xE000E200`), Stellaris `UART0` (`0x4000C000`),
+//! wake-lock sleep-depth clamping (`LIGHT` vs `DEEP`), Cortex-M `PRIMASK` critical sections,
+//! `SysTick` (`0xE000E010`), NVIC `ISPR0` (`0xE000E200`), ARM semihosting / `.zev` `console_putc`,
 //! `wfi` idle sleep, and ARM semihosting exit (`bkpt #0xab`) directly in opaque-pointer SSA IR.
 
 use std::fmt::Write;
@@ -11,7 +11,7 @@ use std::fmt::Write;
 use crate::toolchain::{CodegenOptions, TargetArch};
 
 /// Feature flags controlling on-demand emission of soft-float and formatting IR helpers.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RuntimeIrFeatures {
     pub uses_i64: bool,
     pub uses_floats: bool,
@@ -20,6 +20,8 @@ pub struct RuntimeIrFeatures {
     pub uses_rv_irqs: bool,
     pub uses_sys_tick: bool,
     pub uses_set_putc: bool,
+    pub console_putc_sym: Option<String>,
+    pub now_ms_sym: Option<String>,
 }
 
 impl RuntimeIrFeatures {
@@ -32,8 +34,43 @@ impl RuntimeIrFeatures {
             uses_rv_irqs: false,
             uses_sys_tick: true,
             uses_set_putc: false,
+            console_putc_sym: None,
+            now_ms_sym: None,
         }
     }
+}
+
+/// Format the body of `@__syn_uart_putc(i8 %c)` uniformly for pointer-uniform targets
+/// (`Thumbv7mNoneEabi`, `Thumbv6mRp2040`, `Riscv32Esp32C6`, `HostX86_64Linux`), routing optional
+/// runtime `sys.set_putc` callbacks through `@__syn_user_putc_fn` before falling back to a `.zev`
+/// `console_putc` symbol or `default_fallback`.
+pub(crate) fn format_uart_putc_body(
+    uses_set_putc: bool,
+    ptr_align: u32,
+    console_putc_sym: Option<&str>,
+    default_fallback: &str,
+) -> String {
+    let fallback_body = match console_putc_sym {
+        Some(sym) => format!("  call void {sym}(i8 %c)\n  ret void"),
+        None => default_fallback.to_string(),
+    };
+    if !uses_set_putc {
+        return fallback_body;
+    }
+    let indented_fb = fallback_body
+        .lines()
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "  %ufp = load ptr, ptr @__syn_user_putc_fn, align {ptr_align}\n  \
+         %uhas = icmp ne ptr %ufp, null\n  \
+         br i1 %uhas, label %u_call, label %fallback\n\
+         u_call:\n  \
+         call void %ufp(i8 %c)\n  \
+         ret void\n\
+         fallback:\n\
+         {indented_fb}"
+    )
 }
 
 /// Emit target header, LLVM intrinsics, `%SynTask` layout, kernel globals, bare-metal HAL,
@@ -44,7 +81,7 @@ pub fn emit_kernel_runtime_ir(
     task_slots: usize,
     opts: &CodegenOptions,
 ) {
-    emit_kernel_runtime_ir_with_features(out, task_slots, opts, RuntimeIrFeatures::all());
+    emit_kernel_runtime_ir_with_features(out, task_slots, opts, &RuntimeIrFeatures::all());
 }
 
 /// Emit target header, LLVM intrinsics, `%SynTask` layout, kernel globals, bare-metal HAL,
@@ -53,7 +90,7 @@ pub fn emit_kernel_runtime_ir_with_features(
     out: &mut String,
     task_slots: usize,
     opts: &CodegenOptions,
-    features: RuntimeIrFeatures,
+    features: &RuntimeIrFeatures,
 ) {
     let slots_alloc = task_slots.max(1);
     let max_ticks = opts.max_ticks as i32;
@@ -112,16 +149,19 @@ pub fn emit_kernel_runtime_ir_with_features(
     let _ = writeln!(out);
 
     let fn_ptr_ty = opts.target.fn_ptr_llvm_ty();
+    let fn_as = opts.target.fn_addrspace_attr();
+    let call_kw = opts.target.call_kw();
     let systick_init = if features.uses_sys_tick { 1 } else { 0 };
-    let user_putc_global = if features.uses_set_putc && opts.target != TargetArch::AvrAtmega4809 {
-        let ptr_al = if opts.target.is_avr() {
-            1
-        } else {
-            opts.target.ptr_bits() / 8
-        };
+    let user_putc_global = if features.uses_set_putc && !opts.target.is_avr() {
+        let ptr_al = opts.target.ptr_bits() / 8;
         format!("\n@__syn_user_putc_fn = global {fn_ptr_ty} null, align {ptr_al}")
     } else {
         String::new()
+    };
+    let cm_boot_global = if opts.target.is_arm_eabi() {
+        "\n@__syn_cm_in_boot = internal global i8 1, align 1"
+    } else {
+        ""
     };
 
     // %SynTask control block, %SynFmtSink, & scheduler globals
@@ -170,31 +210,52 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_last_sleep_depth = global i32 2, align 4
 @__syn_wfi_count = global i32 0, align 4
 @__syn_irq_woke_urgent = global i8 0, align 1
-@__syn_current_task = global ptr null, align 4{user_putc_global}
+@__syn_current_task = global ptr null, align 4{user_putc_global}{cm_boot_global}
 "#
     );
 
     let sz = opts.fn_size_attrs();
 
     match opts.target {
-        TargetArch::Thumbv7mNoneEabi => emit_cortex_m_hal_ir(out, sz, features.uses_set_putc),
-        TargetArch::Riscv32Esp32C6 => crate::esp32c6::emit_esp32c6_hal_ir(out, sz),
+        TargetArch::Thumbv7mNoneEabi => emit_cortex_m_hal_ir(
+            out,
+            sz,
+            features.uses_set_putc,
+            features.console_putc_sym.as_deref(),
+        ),
+        TargetArch::Thumbv6mRp2040 => crate::rp2040::emit_rp2040_hal_ir(
+            out,
+            sz,
+            features.uses_set_putc,
+            features.console_putc_sym.as_deref(),
+        ),
+        TargetArch::Riscv32Esp32C6 => crate::esp32c6::emit_esp32c6_hal_ir(
+            out,
+            sz,
+            features.uses_set_putc,
+            features.console_putc_sym.as_deref(),
+        ),
         TargetArch::AvrAtmega328p => crate::avr::emit_avr_hal_ir(out, sz),
         TargetArch::AvrAtmega4809 => crate::avr_mega0::emit_avr_mega0_hal_ir(out, sz),
-        TargetArch::HostX86_64Linux => emit_host_linux_hal_ir(out, sz, features.uses_set_putc),
+        TargetArch::HostX86_64Linux => emit_host_linux_hal_ir(
+            out,
+            sz,
+            features.uses_set_putc,
+            features.console_putc_sym.as_deref(),
+        ),
     }
 
     if features.uses_sys_tick {
         let _ = writeln!(
             out,
-            r#"define void @__syn_sys_tick() nounwind{sz} {{
+            r#"define void @__syn_sys_tick(){fn_as} nounwind{sz} {{
 entry:
-  %pm = call i32 @__syn_crit_enter()
+  %pm = {call_kw} i32 @__syn_crit_enter()
   store i8 1, ptr @__syn_systick_enabled, align 1
   %t = load volatile i32, ptr @__syn_tick_ms, align 4
   %t1 = add i32 %t, 1
   store volatile i32 %t1, ptr @__syn_tick_ms, align 4
-  call void @__syn_crit_exit(i32 %pm)
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   ret void
 }}
 "#
@@ -202,21 +263,31 @@ entry:
     }
 
     emit_freestanding_mem_builtins_ir(out, opts.target);
+    if opts.target == TargetArch::Thumbv6mRp2040 {
+        emit_freestanding_thumbv6m_builtins_ir(out);
+    }
     if features.uses_i64 || features.uses_floats || features.uses_fmt {
         emit_freestanding_int64_divmod_ir(out, opts.target);
     }
     if features.uses_floats || features.uses_fmt_float_sci {
         emit_freestanding_soft_float_ir(out, opts.target);
     }
-    emit_portable_uart_format_ir(out, sz);
+    emit_portable_uart_format_ir(out, opts.target, sz);
     if features.uses_fmt {
         emit_zero_heap_fmt_ir(
             out,
+            opts.target,
             features.uses_floats || features.uses_fmt_float_sci,
             features.uses_fmt_float_sci,
         );
     }
-    emit_scheduler_core_ir(out, opts.target, sz, features.uses_rv_irqs);
+    emit_scheduler_core_ir(
+        out,
+        opts.target,
+        sz,
+        features.uses_rv_irqs,
+        features.now_ms_sym.as_deref(),
+    );
 
     let _ = writeln!(out, "attributes #98 = {{ noreturn nounwind \"no-builtins\" }}");
     let _ = writeln!(out, "attributes #99 = {{ nounwind \"no-builtins\" }}");
@@ -225,6 +296,7 @@ entry:
 
 fn emit_freestanding_mem_builtins_ir(out: &mut String, target: TargetArch) {
     let uty = target.usize_llvm_ty();
+    let fn_as = target.fn_addrspace_attr();
     let c_int_ty = if target.is_avr() {
         "i16"
     } else {
@@ -233,7 +305,7 @@ fn emit_freestanding_mem_builtins_ir(out: &mut String, target: TargetArch) {
     let _ = writeln!(
         out,
         r#"; ── Freestanding Zero-Libc @memcpy / @memset / @memmove (#99 = "no-builtins") ──
-define weak ptr @memcpy(ptr %dst, ptr %src, {uty} %n) #99 {{
+define weak ptr @memcpy(ptr %dst, ptr %src, {uty} %n){fn_as} #99 {{
 entry:
   br label %loop
 loop:
@@ -251,7 +323,7 @@ exit:
   ret ptr %dst
 }}
 
-define weak ptr @memset(ptr %dst, {c_int_ty} %c, {uty} %n) #99 {{
+define weak ptr @memset(ptr %dst, {c_int_ty} %c, {uty} %n){fn_as} #99 {{
 entry:
   %b = trunc {c_int_ty} %c to i8
   br label %loop
@@ -268,7 +340,7 @@ exit:
   ret ptr %dst
 }}
 
-define weak ptr @memmove(ptr %dst, ptr %src, {uty} %n) #99 {{
+define weak ptr @memmove(ptr %dst, ptr %src, {uty} %n){fn_as} #99 {{
 entry:
   %empty = icmp eq {uty} %n, 0
   %same = icmp eq ptr %dst, %src
@@ -309,7 +381,7 @@ exit:
 "#
     );
 
-    if target == TargetArch::Thumbv7mNoneEabi {
+    if target.is_arm_eabi() {
         let _ = writeln!(
             out,
             r#"; ── ARM RTABI (__aeabi_mem*) Shims for -Os / -Oz Lowering ──
@@ -378,22 +450,289 @@ entry:
     }
 }
 
-fn emit_cortex_m_hal_ir(out: &mut String, sz: &str, uses_set_putc: bool) {
-    let user_putc_hook = if uses_set_putc {
-        r#"  %ufp = load ptr, ptr @__syn_user_putc_fn, align 4
-  %uhas = icmp ne ptr %ufp, null
-  br i1 %uhas, label %u_call, label %hw_uart
-u_call:
-  call void %ufp(i8 %c)
-  ret void
-hw_uart:
-"#
-    } else {
-        ""
-    };
+fn emit_freestanding_thumbv6m_builtins_ir(out: &mut String) {
+    out.push_str(
+        r#"; ── ARMv6-M (Cortex-M0+) Pure-SSA 32-bit Div/Mod, Clz, & 64-bit Shift/Mul Shims ──
+define weak i32 @__clzsi2(i32 %x) #99 {
+entry:
+  %z = icmp eq i32 %x, 0
+  br i1 %z, label %ret32, label %calc
+ret32:
+  ret i32 32
+calc:
+  %top16 = lshr i32 %x, 16
+  %h16 = icmp eq i32 %top16, 0
+  %n1 = select i1 %h16, i32 16, i32 0
+  %v1 = select i1 %h16, i32 %x, i32 %top16
+  %top8 = lshr i32 %v1, 8
+  %h8 = icmp eq i32 %top8, 0
+  %a8 = add i32 %n1, 8
+  %n2 = select i1 %h8, i32 %a8, i32 %n1
+  %v2 = select i1 %h8, i32 %v1, i32 %top8
+  %top4 = lshr i32 %v2, 4
+  %h4 = icmp eq i32 %top4, 0
+  %a4 = add i32 %n2, 4
+  %n3 = select i1 %h4, i32 %a4, i32 %n2
+  %v3 = select i1 %h4, i32 %v2, i32 %top4
+  %top2 = lshr i32 %v3, 2
+  %h2 = icmp eq i32 %top2, 0
+  %a2 = add i32 %n3, 2
+  %n4 = select i1 %h2, i32 %a2, i32 %n3
+  %v4 = select i1 %h2, i32 %v3, i32 %top2
+  %top1 = lshr i32 %v4, 1
+  %h1 = icmp eq i32 %top1, 0
+  %a1 = add i32 %n4, 1
+  %n5 = select i1 %h1, i32 %a1, i32 %n4
+  ret i32 %n5
+}
+
+define weak { i32, i32 } @__syn_udivrem32(i32 %n, i32 %d) #99 {
+entry:
+  %dz = icmp eq i32 %d, 0
+  br i1 %dz, label %ret_zero, label %loop
+ret_zero:
+  ret { i32, i32 } zeroinitializer
+loop:
+  %step = phi i32 [ 0, %entry ], [ %step_next, %body ]
+  %q = phi i32 [ 0, %entry ], [ %q_next, %body ]
+  %r = phi i32 [ 0, %entry ], [ %r_next, %body ]
+  %done = icmp eq i32 %step, 32
+  br i1 %done, label %finish, label %body
+body:
+  %bit = sub i32 31, %step
+  %nsh = lshr i32 %n, %bit
+  %nbit = and i32 %nsh, 1
+  %rsh = shl i32 %r, 1
+  %rcur = or i32 %rsh, %nbit
+  %ge = icmp uge i32 %rcur, %d
+  %rsub = sub i32 %rcur, %d
+  %r_next = select i1 %ge, i32 %rsub, i32 %rcur
+  %qbit = shl i32 1, %bit
+  %qor = or i32 %q, %qbit
+  %q_next = select i1 %ge, i32 %qor, i32 %q
+  %step_next = add i32 %step, 1
+  br label %loop
+finish:
+  %p0 = insertvalue { i32, i32 } poison, i32 %q, 0
+  %p1 = insertvalue { i32, i32 } %p0, i32 %r, 1
+  ret { i32, i32 } %p1
+}
+
+define weak { i32, i32 } @__aeabi_uidivmod(i32 %n, i32 %d) #99 {
+entry:
+  %res = call { i32, i32 } @__syn_udivrem32(i32 %n, i32 %d)
+  ret { i32, i32 } %res
+}
+
+define weak i32 @__aeabi_uidiv(i32 %n, i32 %d) #99 {
+entry:
+  %res = call { i32, i32 } @__syn_udivrem32(i32 %n, i32 %d)
+  %q = extractvalue { i32, i32 } %res, 0
+  ret i32 %q
+}
+
+define weak { i32, i32 } @__aeabi_idivmod(i32 %a, i32 %b) #99 {
+entry:
+  %sa = icmp slt i32 %a, 0
+  %sb = icmp slt i32 %b, 0
+  %na = sub i32 0, %a
+  %nb = sub i32 0, %b
+  %ua = select i1 %sa, i32 %na, i32 %a
+  %ub = select i1 %sb, i32 %nb, i32 %b
+  %ur_pair = call { i32, i32 } @__syn_udivrem32(i32 %ua, i32 %ub)
+  %uq = extractvalue { i32, i32 } %ur_pair, 0
+  %ur = extractvalue { i32, i32 } %ur_pair, 1
+  %neg_q = xor i1 %sa, %sb
+  %nq = sub i32 0, %uq
+  %q = select i1 %neg_q, i32 %nq, i32 %uq
+  %nr = sub i32 0, %ur
+  %r = select i1 %sa, i32 %nr, i32 %ur
+  %p0 = insertvalue { i32, i32 } poison, i32 %q, 0
+  %p1 = insertvalue { i32, i32 } %p0, i32 %r, 1
+  ret { i32, i32 } %p1
+}
+
+define weak i32 @__aeabi_idiv(i32 %a, i32 %b) #99 {
+entry:
+  %res = call { i32, i32 } @__aeabi_idivmod(i32 %a, i32 %b)
+  %q = extractvalue { i32, i32 } %res, 0
+  ret i32 %q
+}
+
+define weak i64 @__aeabi_llsl(i64 %a, i32 %n) #99 {
+entry:
+  %lo = trunc i64 %a to i32
+  %hi64 = lshr i64 %a, 32
+  %hi = trunc i64 %hi64 to i32
+  %is0 = icmp eq i32 %n, 0
+  br i1 %is0, label %ret_same, label %chk32
+ret_same:
+  ret i64 %a
+chk32:
+  %lt32 = icmp ult i32 %n, 32
+  br i1 %lt32, label %small, label %chk64
+small:
+  %nlo = shl i32 %lo, %n
+  %inv = sub i32 32, %n
+  %carry = lshr i32 %lo, %inv
+  %shi = shl i32 %hi, %n
+  %nhi = or i32 %shi, %carry
+  br label %pack
+chk64:
+  %lt64 = icmp ult i32 %n, 64
+  br i1 %lt64, label %mid, label %ret_zero
+mid:
+  %sub32 = sub i32 %n, 32
+  %mhi = shl i32 %lo, %sub32
+  br label %pack
+ret_zero:
+  ret i64 0
+pack:
+  %rlo = phi i32 [ %nlo, %small ], [ 0, %mid ]
+  %rhi = phi i32 [ %nhi, %small ], [ %mhi, %mid ]
+  %rlo64 = zext i32 %rlo to i64
+  %rhi64 = zext i32 %rhi to i64
+  %rhi_sh = shl i64 %rhi64, 32
+  %res = or i64 %rhi_sh, %rlo64
+  ret i64 %res
+}
+
+define weak i64 @__aeabi_llsr(i64 %a, i32 %n) #99 {
+entry:
+  %lo = trunc i64 %a to i32
+  %hi64 = lshr i64 %a, 32
+  %hi = trunc i64 %hi64 to i32
+  %is0 = icmp eq i32 %n, 0
+  br i1 %is0, label %ret_same, label %chk32
+ret_same:
+  ret i64 %a
+chk32:
+  %lt32 = icmp ult i32 %n, 32
+  br i1 %lt32, label %small, label %chk64
+small:
+  %nhi = lshr i32 %hi, %n
+  %inv = sub i32 32, %n
+  %carry = shl i32 %hi, %inv
+  %slo = lshr i32 %lo, %n
+  %nlo = or i32 %slo, %carry
+  br label %pack
+chk64:
+  %lt64 = icmp ult i32 %n, 64
+  br i1 %lt64, label %mid, label %ret_zero
+mid:
+  %sub32 = sub i32 %n, 32
+  %mlo = lshr i32 %hi, %sub32
+  br label %pack
+ret_zero:
+  ret i64 0
+pack:
+  %rlo = phi i32 [ %nlo, %small ], [ %mlo, %mid ]
+  %rhi = phi i32 [ %nhi, %small ], [ 0, %mid ]
+  %rlo64 = zext i32 %rlo to i64
+  %rhi64 = zext i32 %rhi to i64
+  %rhi_sh = shl i64 %rhi64, 32
+  %res = or i64 %rhi_sh, %rlo64
+  ret i64 %res
+}
+
+define weak i64 @__aeabi_lasr(i64 %a, i32 %n) #99 {
+entry:
+  %lo = trunc i64 %a to i32
+  %hi64 = lshr i64 %a, 32
+  %hi = trunc i64 %hi64 to i32
+  %is0 = icmp eq i32 %n, 0
+  br i1 %is0, label %ret_same, label %chk32
+ret_same:
+  ret i64 %a
+chk32:
+  %lt32 = icmp ult i32 %n, 32
+  br i1 %lt32, label %small, label %chk64
+small:
+  %nhi = ashr i32 %hi, %n
+  %inv = sub i32 32, %n
+  %carry = shl i32 %hi, %inv
+  %slo = lshr i32 %lo, %n
+  %nlo = or i32 %slo, %carry
+  br label %pack
+chk64:
+  %lt64 = icmp ult i32 %n, 64
+  %sign = ashr i32 %hi, 31
+  br i1 %lt64, label %mid, label %saturate
+mid:
+  %sub32 = sub i32 %n, 32
+  %mlo = ashr i32 %hi, %sub32
+  br label %pack
+saturate:
+  br label %pack
+pack:
+  %rlo = phi i32 [ %nlo, %small ], [ %mlo, %mid ], [ %sign, %saturate ]
+  %rhi = phi i32 [ %nhi, %small ], [ %sign, %mid ], [ %sign, %saturate ]
+  %rlo64 = zext i32 %rlo to i64
+  %rhi64 = zext i32 %rhi to i64
+  %rhi_sh = shl i64 %rhi64, 32
+  %res = or i64 %rhi_sh, %rlo64
+  ret i64 %res
+}
+
+define weak i64 @__aeabi_lmul(i64 %a, i64 %b) #99 {
+entry:
+  %al = trunc i64 %a to i32
+  %ah64 = lshr i64 %a, 32
+  %ah = trunc i64 %ah64 to i32
+  %bl = trunc i64 %b to i32
+  %bh64 = lshr i64 %b, 32
+  %bh = trunc i64 %bh64 to i32
+  %al0 = and i32 %al, 65535
+  %al1 = lshr i32 %al, 16
+  %bl0 = and i32 %bl, 65535
+  %bl1 = lshr i32 %bl, 16
+  %p00 = mul i32 %al0, %bl0
+  %p01 = mul i32 %al0, %bl1
+  %p10 = mul i32 %al1, %bl0
+  %p11 = mul i32 %al1, %bl1
+  %p00_hi = lshr i32 %p00, 16
+  %mid1 = add i32 %p00_hi, %p01
+  %c1 = icmp ult i32 %mid1, %p01
+  %c1_hi = select i1 %c1, i32 65536, i32 0
+  %mid2 = add i32 %mid1, %p10
+  %c2 = icmp ult i32 %mid2, %p10
+  %c2_hi = select i1 %c2, i32 65536, i32 0
+  %rlo_lo = and i32 %p00, 65535
+  %rlo_hi = shl i32 %mid2, 16
+  %rlo = or i32 %rlo_lo, %rlo_hi
+  %mid_hi = lshr i32 %mid2, 16
+  %hi0 = add i32 %p11, %mid_hi
+  %hi1 = add i32 %hi0, %c1_hi
+  %hi2 = add i32 %hi1, %c2_hi
+  %cross1 = mul i32 %al, %bh
+  %cross2 = mul i32 %ah, %bl
+  %hi3 = add i32 %hi2, %cross1
+  %rhi = add i32 %hi3, %cross2
+  %rlo64 = zext i32 %rlo to i64
+  %rhi64 = zext i32 %rhi to i64
+  %rhi_sh = shl i64 %rhi64, 32
+  %res = or i64 %rhi_sh, %rlo64
+  ret i64 %res
+}
+"#,
+    );
+}
+
+fn emit_cortex_m_hal_ir(
+    out: &mut String,
+    sz: &str,
+    uses_set_putc: bool,
+    console_putc_sym: Option<&str>,
+) {
+    let default_semihosting = "  ; Architectural ARMv7-M semihosting SYS_WRITEC (0x03) when no .zev console_putc is defined\n  \
+                               %ch = alloca i8, align 1\n  \
+                               store i8 %c, ptr %ch, align 1\n  \
+                               call void asm sideeffect \"mov r0, #0x03\\0Abkpt #0xab\", \"{r1},~{r0},~{memory}\"(ptr %ch)\n  \
+                               ret void";
+    let putc_body = format_uart_putc_body(uses_set_putc, 4, console_putc_sym, default_semihosting);
     let _ = writeln!(
         out,
-        r#"; ── ARM Cortex-M3 Inline Thumb-2 Hardware Primitives (lm3s6965evb) ──
+        r#"; ── ARM Cortex-M3 Architectural Thumb-2 CPU Primitives ──
 define i32 @__syn_crit_enter() nounwind alwaysinline {{
 entry:
   %pm = call i32 asm sideeffect "mrs $0, primask\0Acpsid i", "=r,~{{memory}}"()
@@ -408,10 +747,7 @@ entry:
 
 define void @__syn_uart_putc(i8 %c) nounwind{sz} {{
 entry:
-{user_putc_hook}  ; Stellaris LM3S6965 UART0 Data Register at 0x4000C000 (1073790976)
-  %z = zext i8 %c to i32
-  store volatile i32 %z, ptr inttoptr (i32 1073790976 to ptr), align 4
-  ret void
+{putc_body}
 }}"#,
     );
     let _ = writeln!(
@@ -449,6 +785,13 @@ entry:
 
 define void @__syn_nvic_pend_irq(i32 %irq) nounwind{sz} {{
 entry:
+  %in_boot = load volatile i8, ptr @__syn_cm_in_boot, align 1
+  %is_boot = icmp ne i8 %in_boot, 0
+  br i1 %is_boot, label %boot_sw, label %hw_ispr
+boot_sw:
+  call void @__syn_cm_dispatch_irq(i32 %irq)
+  ret void
+hw_ispr:
   %word = lshr i32 %irq, 5
   %wcl = and i32 %word, 7
   %off = shl i32 %wcl, 2
@@ -499,7 +842,7 @@ do_wfi:
   %wc1 = add i32 %wc, 1
   store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
 
-  call void asm sideeffect "wfi", "~{{memory}}"()
+  call void asm sideeffect "dsb\0Awfi\0Acpsie i\0Aisb\0Acpsid i", "~{{memory}}"()
   br label %restore
 
 restore:
@@ -511,19 +854,14 @@ restore:
     );
 }
 
-fn emit_host_linux_hal_ir(out: &mut String, sz: &str, uses_set_putc: bool) {
-    let user_putc_hook = if uses_set_putc {
-        r#"  %ufp = load ptr, ptr @__syn_user_putc_fn, align 8
-  %uhas = icmp ne ptr %ufp, null
-  br i1 %uhas, label %u_call, label %host_put
-u_call:
-  call void %ufp(i8 %c)
-  ret void
-host_put:
-"#
-    } else {
-        ""
-    };
+fn emit_host_linux_hal_ir(
+    out: &mut String,
+    sz: &str,
+    uses_set_putc: bool,
+    console_putc_sym: Option<&str>,
+) {
+    let default_putchar = "  %z = zext i8 %c to i32\n  %r = call i32 @putchar(i32 %z)\n  ret void";
+    let putc_body = format_uart_putc_body(uses_set_putc, 8, console_putc_sym, default_putchar);
     let _ = writeln!(
         out,
         r#"; ── Host Linux x86_64 Simulation Runtime Hooks ──
@@ -542,9 +880,7 @@ entry:
 
 define void @__syn_uart_putc(i8 %c) nounwind{sz} {{
 entry:
-{user_putc_hook}  %z = zext i8 %c to i32
-  %r = call i32 @putchar(i32 %z)
-  ret void
+{putc_body}
 }}"#,
     );
     let _ = writeln!(
@@ -589,11 +925,13 @@ entry:
     );
 }
 
-fn emit_portable_uart_format_ir(out: &mut String, sz: &str) {
+fn emit_portable_uart_format_ir(out: &mut String, target: TargetArch, sz: &str) {
+    let fn_as = target.fn_addrspace_attr();
+    let call_kw = target.call_kw();
     let _ = writeln!(
         out,
         r#"; ── Freestanding Zero-Heap UART0 Telemetry Helpers ──
-define void @__syn_uart_puts(ptr %s) nounwind noinline{sz} {{
+define void @__syn_uart_puts(ptr %s){fn_as} nounwind noinline{sz} {{
 entry:
   %isnull = icmp eq ptr %s, null
   br i1 %isnull, label %done, label %loop
@@ -604,20 +942,20 @@ loop:
   %end = icmp eq i8 %c, 0
   br i1 %end, label %done, label %body
 body:
-  call void @__syn_uart_putc(i8 %c)
+  {call_kw} void @__syn_uart_putc(i8 %c)
   %next = add i32 %i, 1
   br label %loop
 done:
   ret void
 }}
 
-define void @__syn_uart_u32(i32 %val) nounwind noinline{sz} {{
+define void @__syn_uart_u32(i32 %val){fn_as} nounwind noinline{sz} {{
 entry:
   %buf = alloca [12 x i8], align 1
   %is_zero = icmp eq i32 %val, 0
   br i1 %is_zero, label %print_zero, label %extract
 print_zero:
-  call void @__syn_uart_putc(i8 48)
+  {call_kw} void @__syn_uart_putc(i8 48)
   ret void
 
 extract:
@@ -647,45 +985,45 @@ pbody:
   %idx_prev = sub i32 %idx, 1
   %cp = getelementptr inbounds [12 x i8], ptr %buf, i32 0, i32 %idx_prev
   %ch = load i8, ptr %cp, align 1
-  call void @__syn_uart_putc(i8 %ch)
+  {call_kw} void @__syn_uart_putc(i8 %ch)
   br label %ploop
 ret_bb:
   ret void
 }}
 
-define void @__syn_uart_i32(i32 %val) nounwind noinline{sz} {{
+define void @__syn_uart_i32(i32 %val){fn_as} nounwind noinline{sz} {{
 entry:
   %neg = icmp slt i32 %val, 0
   br i1 %neg, label %do_neg, label %do_pos
 do_neg:
-  call void @__syn_uart_putc(i8 45)
+  {call_kw} void @__syn_uart_putc(i8 45)
   %abs = sub i32 0, %val
-  call void @__syn_uart_u32(i32 %abs)
+  {call_kw} void @__syn_uart_u32(i32 %abs)
   ret void
 do_pos:
-  call void @__syn_uart_u32(i32 %val)
+  {call_kw} void @__syn_uart_u32(i32 %val)
   ret void
 }}
 
-define void @__syn_uart_println(ptr %s) nounwind noinline{sz} {{
+define void @__syn_uart_println(ptr %s){fn_as} nounwind noinline{sz} {{
 entry:
-  call void @__syn_uart_puts(ptr %s)
-  call void @__syn_uart_putc(i8 10)
+  {call_kw} void @__syn_uart_puts(ptr %s)
+  {call_kw} void @__syn_uart_putc(i8 10)
   ret void
 }}
 
-define void @__syn_uart_kv(ptr %label, i32 %val) nounwind noinline{sz} {{
+define void @__syn_uart_kv(ptr %label, i32 %val){fn_as} nounwind noinline{sz} {{
 entry:
-  call void @__syn_uart_puts(ptr %label)
-  call void @__syn_uart_i32(i32 %val)
-  call void @__syn_uart_putc(i8 10)
+  {call_kw} void @__syn_uart_puts(ptr %label)
+  {call_kw} void @__syn_uart_i32(i32 %val)
+  {call_kw} void @__syn_uart_putc(i8 10)
   ret void
 }}
 
-define void @__syn_uart_hex_u32(i32 %val) nounwind noinline{sz} {{
+define void @__syn_uart_hex_u32(i32 %val){fn_as} nounwind noinline{sz} {{
 entry:
-  call void @__syn_uart_putc(i8 48) ; '0'
-  call void @__syn_uart_putc(i8 120) ; 'x'
+  {call_kw} void @__syn_uart_putc(i8 48) ; '0'
+  {call_kw} void @__syn_uart_putc(i8 120) ; 'x'
   br label %ehloop
 ehloop:
   %esh = phi i32 [ 28, %entry ], [ %enext, %ehbody ]
@@ -699,25 +1037,25 @@ ehbody:
   %eadd_a = add i32 %enib, 55 ; uppercase 'A' - 10 (matches C99 0x%08X)
   %ech32 = select i1 %eis_af, i32 %eadd_a, i32 %eadd_0
   %ech = trunc i32 %ech32 to i8
-  call void @__syn_uart_putc(i8 %ech)
+  {call_kw} void @__syn_uart_putc(i8 %ech)
   %enext = sub i32 %esh, 4
   br label %ehloop
 ehdone:
   ret void
 }}
 
-define void @__syn_uart_log_hex(ptr %label, i32 %val) nounwind noinline{sz} {{
+define void @__syn_uart_log_hex(ptr %label, i32 %val){fn_as} nounwind noinline{sz} {{
 entry:
-  call void @__syn_uart_puts(ptr %label)
-  call void @__syn_uart_hex_u32(i32 %val)
-  call void @__syn_uart_putc(i8 10)
+  {call_kw} void @__syn_uart_puts(ptr %label)
+  {call_kw} void @__syn_uart_hex_u32(i32 %val)
+  {call_kw} void @__syn_uart_putc(i8 10)
   ret void
 }}
 
-define void @__syn_uart_hex(i32 %val) nounwind noinline{sz} {{
+define void @__syn_uart_hex(i32 %val){fn_as} nounwind noinline{sz} {{
 entry:
-  call void @__syn_uart_putc(i8 48) ; '0'
-  call void @__syn_uart_putc(i8 120) ; 'x'
+  {call_kw} void @__syn_uart_putc(i8 48) ; '0'
+  {call_kw} void @__syn_uart_putc(i8 120) ; 'x'
   br label %hloop
 hloop:
   %shift = phi i32 [ 20, %entry ], [ %next_sh, %hbody ]
@@ -731,7 +1069,7 @@ hbody:
   %add_a = add i32 %nib, 55
   %ch32 = select i1 %is_af, i32 %add_a, i32 %add_0
   %ch = trunc i32 %ch32 to i8
-  call void @__syn_uart_putc(i8 %ch)
+  {call_kw} void @__syn_uart_putc(i8 %ch)
   %next_sh = sub i32 %shift, 4
   br label %hloop
 hex_done:
@@ -746,25 +1084,44 @@ fn emit_scheduler_core_ir(
     target: TargetArch,
     sz: &str,
     enable_rv_irqs: bool,
+    now_ms_sym: Option<&str>,
 ) {
     let fn_ptr_ty = target.fn_ptr_llvm_ty();
-    if target == TargetArch::Riscv32Esp32C6 {
-        let _ = writeln!(
-            out,
-            r#"; ── Cooperative Scheduler Core: Overdue -> Work -> Poll -> Sleep ──
-define i32 @__syn_now_ms() nounwind alwaysinline {{
+    let fn_as = target.fn_addrspace_attr();
+    let call_kw = target.call_kw();
+    if let Some(sym) = now_ms_sym {
+        if target.is_avr() {
+            let _ = writeln!(
+                out,
+                r#"; ── Cooperative Scheduler Core: Overdue -> Work -> Poll -> Sleep ──
+define i32 @__syn_now_ms(){fn_as} nounwind alwaysinline {{
 entry:
-  %t = call i32 @__syn_esp32c6_read_ms()
+  %t = {call_kw} i32 {sym}()
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  store volatile i32 %t, ptr @__syn_tick_ms, align 4
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   ret i32 %t
 }}"#
-        );
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                r#"; ── Cooperative Scheduler Core: Overdue -> Work -> Poll -> Sleep ──
+define i32 @__syn_now_ms(){fn_as} nounwind alwaysinline {{
+entry:
+  %t = {call_kw} i32 {sym}()
+  store volatile i32 %t, ptr @__syn_tick_ms, align 4
+  ret i32 %t
+}}"#
+            );
+        }
     } else if target.is_avr() {
         let _ = writeln!(
             out,
             r#"; ── Cooperative Scheduler Core: Overdue -> Work -> Poll -> Idle Sleep ──
-define i32 @__syn_now_ms() nounwind alwaysinline {{
+define i32 @__syn_now_ms(){fn_as} nounwind alwaysinline {{
 entry:
-  %t = call i32 @__syn_avr_read_ms()
+  %t = {call_kw} i32 @__syn_avr_read_ms()
   ret i32 %t
 }}"#
         );
@@ -772,7 +1129,7 @@ entry:
         let _ = writeln!(
             out,
             r#"; ── Cooperative Scheduler Core: Overdue -> Work -> Poll -> WFI Sleep ──
-define i32 @__syn_now_ms() nounwind alwaysinline {{
+define i32 @__syn_now_ms(){fn_as} nounwind alwaysinline {{
 entry:
   %t = load volatile i32, ptr @__syn_tick_ms, align 4
   ret i32 %t
@@ -782,7 +1139,7 @@ entry:
     let _ = writeln!(
         out,
         r#"
-define i32 @__syn_starvation_window(i8 %prio) nounwind alwaysinline {{
+define i32 @__syn_starvation_window(i8 %prio){fn_as} nounwind alwaysinline {{
 entry:
   %clamped_lo = icmp slt i8 %prio, 0
   %p0 = select i1 %clamped_lo, i8 0, i8 %prio
@@ -794,7 +1151,7 @@ entry:
   ret i32 %w
 }}
 
-define void @__syn_boost_task_ptr(ptr %task, i32 %boost_prio, i32 %now) nounwind{sz} {{
+define void @__syn_boost_task_ptr(ptr %task, i32 %boost_prio, i32 %now){fn_as} nounwind{sz} {{
 entry:
   %isnull = icmp eq ptr %task, null
   %no_boost = icmp slt i32 %boost_prio, 0
@@ -813,7 +1170,7 @@ apply:
   store i8 1, ptr %boost_flag_ptr, align 1
   %more_ptr = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 5
   store i8 1, ptr %more_ptr, align 1
-  %win = call i32 @__syn_starvation_window(i8 %bp8)
+  %win = {call_kw} i32 @__syn_starvation_window(i8 %bp8)
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
@@ -822,12 +1179,12 @@ done:
   ret void
 }}
 
-define void @__syn_end_inbox_turn(ptr %task) nounwind{sz} {{
+define void @__syn_end_inbox_turn(ptr %task){fn_as} nounwind{sz} {{
 entry:
   %isnull = icmp eq ptr %task, null
   br i1 %isnull, label %done, label %restore
 restore:
-  %pm = call i32 @__syn_crit_enter()
+  %pm = {call_kw} i32 @__syn_crit_enter()
   %bf_ptr = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 8
   %was_boosted = load i8, ptr %bf_ptr, align 1
   %is_b = icmp ne i8 %was_boosted, 0
@@ -838,26 +1195,26 @@ do_restore:
   %base = load i8, ptr %bp_ptr, align 1
   store i8 %base, ptr %ep_ptr, align 1
   store i8 0, ptr %bf_ptr, align 1
-  %now_r = call i32 @__syn_now_ms()
-  %win_r = call i32 @__syn_starvation_window(i8 %base)
+  %now_r = {call_kw} i32 @__syn_now_ms()
+  %win_r = {call_kw} i32 @__syn_starvation_window(i8 %base)
   %due_r = add i32 %now_r, %win_r
   %due_p = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 10
   store i32 %due_r, ptr %due_p, align 4
   br label %unlock
 unlock:
-  call void @__syn_crit_exit(i32 %pm)
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   br label %done
 done:
   ret void
 }}
 
-define void @__syn_set_priority(i32 %prio) nounwind{sz} {{
+define void @__syn_set_priority(i32 %prio){fn_as} nounwind{sz} {{
 entry:
   %cur = load ptr, ptr @__syn_current_task, align 4
   %isnull = icmp eq ptr %cur, null
   br i1 %isnull, label %done, label %update
 update:
-  %pm = call i32 @__syn_crit_enter()
+  %pm = {call_kw} i32 @__syn_crit_enter()
   %p8 = trunc i32 %prio to i8
   %bp_ptr = getelementptr inbounds %SynTask, ptr %cur, i32 0, i32 3
   %ep_ptr = getelementptr inbounds %SynTask, ptr %cur, i32 0, i32 4
@@ -876,13 +1233,13 @@ set_ep:
   store i8 %p8, ptr %ep_ptr, align 1
   br label %unlock
 unlock:
-  call void @__syn_crit_exit(i32 %pm)
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   br label %done
 done:
   ret void
 }}
 
-define i32 @__syn_current_prio() nounwind{sz} {{
+define i32 @__syn_current_prio(){fn_as} nounwind{sz} {{
 entry:
   %cur = load ptr, ptr @__syn_current_task, align 4
   %isnull = icmp eq ptr %cur, null
@@ -896,10 +1253,10 @@ ok:
   ret i32 %ep32
 }}
 
-define void @__syn_wake_waiters(ptr %prim, i32 %boost_prio) nounwind{sz} {{
+define void @__syn_wake_waiters(ptr %prim, i32 %boost_prio){fn_as} nounwind{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
-  %now = call i32 @__syn_now_ms()
+  %now = {call_kw} i32 @__syn_now_ms()
   br label %loop
 loop:
   %i = phi i32 [ 0, %entry ], [ %inext, %cont ]
@@ -927,11 +1284,11 @@ wake:
   store i8 0, ptr %pr_ptr, align 1
   %ep_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
   %ep = load i8, ptr %ep_ptr, align 1
-  %win = call i32 @__syn_starvation_window(i8 %ep)
+  %win = {call_kw} i32 @__syn_starvation_window(i8 %ep)
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
-  call void @__syn_boost_task_ptr(ptr %tp, i32 %boost_prio, i32 %now)
+  {call_kw} void @__syn_boost_task_ptr(ptr %tp, i32 %boost_prio, i32 %now)
   store volatile i8 1, ptr @__syn_irq_woke_urgent, align 1
   br label %cont
 cont:
@@ -941,7 +1298,74 @@ exit:
   ret void
 }}
 
-define void @__syn_wake_timers(i32 %now) nounwind{sz} {{
+define void @__syn_wake_one_waiter(ptr %prim, i32 %boost_prio){fn_as} nounwind{sz} {{
+entry:
+  %n = load i32, ptr @__syn_task_count, align 4
+  %empty = icmp sle i32 %n, 0
+  br i1 %empty, label %exit, label %prio_loop
+prio_loop:
+  %p = phi i32 [ 0, %entry ], [ %pnext, %prio_next ]
+  %pdone = icmp sge i32 %p, 4
+  br i1 %pdone, label %exit, label %prio_body
+prio_body:
+  %rr_ptr = getelementptr inbounds [4 x i32], ptr @__syn_rr_idx, i32 0, i32 %p
+  %rr_raw = load i32, ptr %rr_ptr, align 4
+  %rr_ok = icmp ult i32 %rr_raw, %n
+  %rr = select i1 %rr_ok, i32 %rr_raw, i32 0
+  %p8 = trunc i32 %p to i8
+  br label %slot_loop
+slot_loop:
+  %k = phi i32 [ 0, %prio_body ], [ %knext, %slot_next ]
+  %kdone = icmp sge i32 %k, %n
+  br i1 %kdone, label %prio_next, label %slot_body
+slot_body:
+  %sum = add i32 %rr, %k
+  %sum_ge = icmp uge i32 %sum, %n
+  %sum_sub = sub i32 %sum, %n
+  %idx = select i1 %sum_ge, i32 %sum_sub, i32 %sum
+  %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %idx
+  %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
+  %st = load i8, ptr %st_ptr, align 1
+  %is_blk = icmp eq i8 %st, 3
+  br i1 %is_blk, label %chk_obj, label %slot_next
+chk_obj:
+  %wo_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 12
+  %wo = load ptr, ptr %wo_ptr, align 4
+  %match = icmp eq ptr %wo, %prim
+  br i1 %match, label %chk_prio, label %slot_next
+chk_prio:
+  %ep_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
+  %ep = load i8, ptr %ep_ptr, align 1
+  %pmatch = icmp eq i8 %ep, %p8
+  br i1 %pmatch, label %wake, label %slot_next
+wake:
+  %now = {call_kw} i32 @__syn_now_ms()
+  store i8 1, ptr %st_ptr, align 1
+  store ptr null, ptr %wo_ptr, align 4
+  %ht_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 7
+  store i8 0, ptr %ht_ptr, align 1
+  %mp_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 5
+  store i8 1, ptr %mp_ptr, align 1
+  %pr_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 6
+  store i8 0, ptr %pr_ptr, align 1
+  %win = {call_kw} i32 @__syn_starvation_window(i8 %ep)
+  %due = add i32 %now, %win
+  %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
+  store i32 %due, ptr %due_ptr, align 4
+  {call_kw} void @__syn_boost_task_ptr(ptr %tp, i32 %boost_prio, i32 %now)
+  store volatile i8 1, ptr @__syn_irq_woke_urgent, align 1
+  ret void
+slot_next:
+  %knext = add i32 %k, 1
+  br label %slot_loop
+prio_next:
+  %pnext = add i32 %p, 1
+  br label %prio_loop
+exit:
+  ret void
+}}
+
+define void @__syn_wake_timers(i32 %now){fn_as} nounwind{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop
@@ -981,7 +1405,7 @@ do_wake:
   store i8 0, ptr %pr_ptr, align 1
   %ep_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
   %ep = load i8, ptr %ep_ptr, align 1
-  %win = call i32 @__syn_starvation_window(i8 %ep)
+  %win = {call_kw} i32 @__syn_starvation_window(i8 %ep)
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
@@ -993,7 +1417,7 @@ exit:
   ret void
 }}
 
-define i1 @__syn_any_ready_task() nounwind{sz} {{
+define i1 @__syn_any_ready_task(){fn_as} nounwind{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop
@@ -1016,7 +1440,7 @@ ret_false:
   ret i1 false
 }}
 
-define i1 @__syn_any_alive_task() nounwind{sz} {{
+define i1 @__syn_any_alive_task(){fn_as} nounwind{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop
@@ -1039,13 +1463,13 @@ ret_false:
   ret i1 false
 }}
 
-define i1 @__syn_should_share(ptr %task) nounwind{sz} {{
+define i1 @__syn_should_share(ptr %task){fn_as} nounwind{sz} {{
 entry:
   %cap = load i32, ptr @__syn_max_ticks, align 4
   %has_cap = icmp sgt i32 %cap, 0
   br i1 %has_cap, label %chk_cap, label %chk_null
 chk_cap:
-  %now_cap = call i32 @__syn_now_ms()
+  %now_cap = {call_kw} i32 @__syn_now_ms()
   %hit_cap = icmp sge i32 %now_cap, %cap
   br i1 %hit_cap, label %ret_true, label %chk_null
 chk_null:
@@ -1056,8 +1480,9 @@ chk_irq:
   %has_woke = icmp ne i8 %woke, 0
   br i1 %has_woke, label %ret_true, label %scan_init
 scan_init:
-  %now = call i32 @__syn_now_ms()
-  call void @__syn_wake_timers(i32 %now)
+  %now = {call_kw} i32 @__syn_now_ms()
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  {call_kw} void @__syn_wake_timers(i32 %now)
   %my_ep_ptr = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 4
   %my_ep = load i8, ptr %my_ep_ptr, align 1
   %n = load i32, ptr @__syn_task_count, align 4
@@ -1065,7 +1490,7 @@ scan_init:
 loop:
   %i = phi i32 [ 0, %scan_init ], [ %inext, %cont ]
   %done = icmp sge i32 %i, %n
-  br i1 %done, label %ret_false, label %body
+  br i1 %done, label %ret_false_unlock, label %body
 body:
   %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %i
   %same = icmp eq ptr %tp, %task
@@ -1080,24 +1505,30 @@ chk_peer:
   %ep = load i8, ptr %ep_ptr, align 1
   ; Higher priority peer ready?
   %hi = icmp slt i8 %ep, %my_ep
-  br i1 %hi, label %ret_true, label %chk_overdue
+  br i1 %hi, label %ret_true_unlock, label %chk_overdue
 chk_overdue:
   ; Any peer hit starvation bound?
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   %due = load i32, ptr %due_ptr, align 4
   %diff = sub i32 %now, %due
   %ov = icmp sge i32 %diff, 0
-  br i1 %ov, label %ret_true, label %chk_equal_more
+  br i1 %ov, label %ret_true_unlock, label %chk_equal_more
 chk_equal_more:
   %eq = icmp eq i8 %ep, %my_ep
   %mp_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 5
   %mp = load i8, ptr %mp_ptr, align 1
   %has_m = icmp ne i8 %mp, 0
   %eq_more = and i1 %eq, %has_m
-  br i1 %eq_more, label %ret_true, label %cont
+  br i1 %eq_more, label %ret_true_unlock, label %cont
 cont:
   %inext = add i32 %i, 1
   br label %loop
+ret_true_unlock:
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  br label %ret_true
+ret_false_unlock:
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  br label %ret_false
 ret_true:
   ret i1 true
 ret_false:
@@ -1105,7 +1536,7 @@ ret_false:
 }}
 
 ; Helper: scan one rank (`mode`: 0=Overdue, 1=Work, 2=Poll) ordered by priority 0..3 + round-robin
-define i32 @__syn_scan_rank(i32 %mode, i32 %now) nounwind noinline{sz} {{
+define i32 @__syn_scan_rank(i32 %mode, i32 %now){fn_as} nounwind noinline{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   %empty = icmp sle i32 %n, 0
@@ -1172,7 +1603,7 @@ not_found:
   ret i32 -1
 }}
 
-define void @__syn_reset_poll_round() nounwind{sz} {{
+define void @__syn_reset_poll_round(){fn_as} nounwind{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop
@@ -1190,39 +1621,39 @@ exit:
   ret void
 }}
 
-define i32 @__syn_select_next_task(i32 %now) nounwind{sz} {{
+define i32 @__syn_select_next_task(i32 %now){fn_as} nounwind{sz} {{
 entry:
-  %ov = call i32 @__syn_scan_rank(i32 0, i32 %now)
+  %ov = {call_kw} i32 @__syn_scan_rank(i32 0, i32 %now)
   %has_ov = icmp sge i32 %ov, 0
   br i1 %has_ov, label %ret_ov, label %try_work
 ret_ov:
   ret i32 %ov
 try_work:
-  %wk = call i32 @__syn_scan_rank(i32 1, i32 %now)
+  %wk = {call_kw} i32 @__syn_scan_rank(i32 1, i32 %now)
   %has_wk = icmp sge i32 %wk, 0
   br i1 %has_wk, label %ret_wk, label %try_poll
 ret_wk:
   ret i32 %wk
 try_poll:
-  %pl = call i32 @__syn_scan_rank(i32 2, i32 %now)
+  %pl = {call_kw} i32 @__syn_scan_rank(i32 2, i32 %now)
   %has_pl = icmp sge i32 %pl, 0
   br i1 %has_pl, label %ret_pl, label %try_reset
 ret_pl:
   ret i32 %pl
 try_reset:
-  %any_rdy = call i1 @__syn_any_ready_task()
+  %any_rdy = {call_kw} i1 @__syn_any_ready_task()
   br i1 %any_rdy, label %do_reset, label %none
 do_reset:
-  call void @__syn_reset_poll_round()
-  %pl2 = call i32 @__syn_scan_rank(i32 2, i32 %now)
+  {call_kw} void @__syn_reset_poll_round()
+  %pl2 = {call_kw} i32 @__syn_scan_rank(i32 2, i32 %now)
   ret i32 %pl2
 none:
   ret i32 -1
 }}
 
-define void @__syn_activate_task(i32 %slot, {fn_ptr_ty} %step_fn, ptr %frame, i8 %prio, i8 %core_pin) nounwind{sz} {{
+define void @__syn_activate_task(i32 %slot, {fn_ptr_ty} %step_fn, ptr %frame, i8 %prio, i8 %core_pin){fn_as} nounwind{sz} {{
 entry:
-  %now = call i32 @__syn_now_ms()
+  %now = {call_kw} i32 @__syn_now_ms()
   %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %slot
   %f0 = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 0
   %f1 = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 1
@@ -1247,7 +1678,7 @@ entry:
   store i8 0, ptr %f7, align 1
   store i8 0, ptr %f8, align 1
   store i8 %core_pin, ptr %f9, align 1
-  %win = call i32 @__syn_starvation_window(i8 %prio)
+  %win = {call_kw} i32 @__syn_starvation_window(i8 %prio)
   %due = add i32 %now, %win
   store i32 %due, ptr %f10, align 4
   store i32 0, ptr %f11, align 4
@@ -1260,24 +1691,26 @@ entry:
         "  call void asm sideeffect \"csrsi mstatus, 8\", \"~{memory}\"()\n"
     } else if target.is_avr() {
         "  call void asm sideeffect \"sei\", \"~{memory}\"()\n"
+    } else if target.is_arm_eabi() {
+        "  store volatile i8 0, ptr @__syn_cm_in_boot, align 1\n  call void asm sideeffect \"dsb\\0Aisb\\0Acpsie i\\0Aisb\", \"~{memory}\"()\n"
     } else {
         ""
     };
     let _ = writeln!(
         out,
-        r#"define void @__syn_sched_loop() noreturn nounwind{sz} {{
+        r#"define void @__syn_sched_loop(){fn_as} noreturn nounwind{sz} {{
 entry:
-{mie_enable_ir}  %alive_init = call i1 @__syn_any_alive_task()
+{mie_enable_ir}  %alive_init = {call_kw} i1 @__syn_any_alive_task()
   br i1 %alive_init, label %chk_init_st, label %clean_exit
 chk_init_st:
   %st_en = load i8, ptr @__syn_systick_enabled, align 1
   %need_st = icmp eq i8 %st_en, 0
   br i1 %need_st, label %auto_systick, label %tick_loop
 auto_systick:
-  call void @__syn_use_systick(i32 12000000)
+  {call_kw} void @__syn_use_systick(i32 12000000)
   br label %tick_loop
 tick_loop:
-  %now = call i32 @__syn_now_ms()
+  %now = {call_kw} i32 @__syn_now_ms()
   %cap = load i32, ptr @__syn_max_ticks, align 4
   %has_cap = icmp sgt i32 %cap, 0
   br i1 %has_cap, label %chk_cap, label %wake_phase
@@ -1286,10 +1719,10 @@ chk_cap:
   br i1 %reached, label %clean_exit, label %wake_phase
 
 wake_phase:
-  %pm = call i32 @__syn_crit_enter()
-  call void @__syn_wake_timers(i32 %now)
-  %sel = call i32 @__syn_select_next_task(i32 %now)
-  call void @__syn_crit_exit(i32 %pm)
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  {call_kw} void @__syn_wake_timers(i32 %now)
+  %sel = {call_kw} i32 @__syn_select_next_task(i32 %now)
+  {call_kw} void @__syn_crit_exit(i32 %pm)
 
   %has_sel = icmp sge i32 %sel, 0
   br i1 %has_sel, label %dispatch, label %idle_phase
@@ -1313,7 +1746,7 @@ dispatch:
 
   %pr_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 6
   store i8 1, ptr %pr_ptr, align 1
-  %win = call i32 @__syn_starvation_window(i8 %ep)
+  %win = {call_kw} i32 @__syn_starvation_window(i8 %ep)
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
@@ -1324,7 +1757,7 @@ dispatch:
   %frame = load ptr, ptr %fr_ptr_p, align 4
 
   ; Execute one cooperative step: 0=MORE, 1=WAIT, 2=DONE
-  %st = call i32 %step_fn(ptr %frame, ptr %tp)
+  %st = {call_kw} i32 %step_fn(ptr %frame, ptr %tp)
   store ptr null, ptr @__syn_current_task, align 4
 
   %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
@@ -1332,15 +1765,15 @@ dispatch:
   %is_more = icmp eq i32 %st, 0
   br i1 %is_more, label %on_more, label %chk_done
 on_more:
-  %pm_m = call i32 @__syn_crit_enter()
+  %pm_m = {call_kw} i32 @__syn_crit_enter()
   store i8 1, ptr %st_ptr, align 1
   store i8 1, ptr %mp_ptr, align 1
   %ep_m = load i8, ptr %ep_ptr, align 1
-  %win_m = call i32 @__syn_starvation_window(i8 %ep_m)
-  %now_m = call i32 @__syn_now_ms()
+  %win_m = {call_kw} i32 @__syn_starvation_window(i8 %ep_m)
+  %now_m = {call_kw} i32 @__syn_now_ms()
   %due_m = add i32 %now_m, %win_m
   store i32 %due_m, ptr %due_ptr, align 4
-  call void @__syn_crit_exit(i32 %pm_m)
+  {call_kw} void @__syn_crit_exit(i32 %pm_m)
   br label %tick_loop
 
 chk_done:
@@ -1349,10 +1782,10 @@ chk_done:
 on_done:
   store i8 0, ptr %st_ptr, align 1
   store i8 0, ptr %mp_ptr, align 1
-  call void @__syn_end_inbox_turn(ptr %tp)
+  {call_kw} void @__syn_end_inbox_turn(ptr %tp)
   br label %tick_loop
 on_wait:
-  %pm_w = call i32 @__syn_crit_enter()
+  %pm_w = {call_kw} i32 @__syn_crit_enter()
   %cur_st = load i8, ptr %st_ptr, align 1
   %still_w = icmp ne i8 %cur_st, 1
   br i1 %still_w, label %clr_mp, label %keep_mp
@@ -1360,18 +1793,18 @@ clr_mp:
   store i8 0, ptr %mp_ptr, align 1
   br label %keep_mp
 keep_mp:
-  call void @__syn_crit_exit(i32 %pm_w)
+  {call_kw} void @__syn_crit_exit(i32 %pm_w)
   br label %tick_loop
 
 idle_phase:
-  %alive = call i1 @__syn_any_alive_task()
+  %alive = {call_kw} i1 @__syn_any_alive_task()
   br i1 %alive, label %do_sleep, label %clean_exit
 do_sleep:
-  call void @__syn_idle_sleep()
+  {call_kw} void @__syn_idle_sleep()
   br label %tick_loop
 
 clean_exit:
-  call void @__syn_platform_exit(i32 0)
+  {call_kw} void @__syn_platform_exit(i32 0)
   unreachable
 }}
 "#
@@ -1383,9 +1816,12 @@ clean_exit:
 // ─────────────────────────────────────────────────────────────────────────────
 
 fn emit_freestanding_int64_divmod_ir(out: &mut String, target: TargetArch) {
-    out.push_str(
+    let fn_as = target.fn_addrspace_attr();
+    let call_kw = target.call_kw();
+    let _ = write!(
+        out,
         r#"; ── Freestanding 64-Bit Integer Division / Modulo Shims (#99 = "no-builtins") ──
-define weak i64 @__syn_udivrem64(i64 %n, i64 %d, ptr %rem_out) #99 {
+define weak i64 @__syn_udivrem64(i64 %n, i64 %d, ptr %rem_out){fn_as} #99 {{
 entry:
   %dz = icmp eq i64 %d, 0
   br i1 %dz, label %div_zero, label %loop_init
@@ -1427,24 +1863,24 @@ store_r:
   br label %ret_q
 ret_q:
   ret i64 %q
-}
+}}
 
-define weak i64 @__udivdi3(i64 %a, i64 %b) #99 {
+define weak i64 @__udivdi3(i64 %a, i64 %b){fn_as} #99 {{
 entry:
-  %q = call i64 @__syn_udivrem64(i64 %a, i64 %b, ptr null)
+  %q = {call_kw} i64 @__syn_udivrem64(i64 %a, i64 %b, ptr null)
   ret i64 %q
-}
+}}
 
-define weak i64 @__umoddi3(i64 %a, i64 %b) #99 {
+define weak i64 @__umoddi3(i64 %a, i64 %b){fn_as} #99 {{
 entry:
   %rem = alloca i64, align 8
   store i64 0, ptr %rem, align 8
-  %q = call i64 @__syn_udivrem64(i64 %a, i64 %b, ptr %rem)
+  %q = {call_kw} i64 @__syn_udivrem64(i64 %a, i64 %b, ptr %rem)
   %r = load i64, ptr %rem, align 8
   ret i64 %r
-}
+}}
 
-define weak i64 @__divdi3(i64 %a, i64 %b) #99 {
+define weak i64 @__divdi3(i64 %a, i64 %b){fn_as} #99 {{
 entry:
   %sa = icmp slt i64 %a, 0
   %sb = icmp slt i64 %b, 0
@@ -1452,14 +1888,14 @@ entry:
   %nb = sub i64 0, %b
   %ua = select i1 %sa, i64 %na, i64 %a
   %ub = select i1 %sb, i64 %nb, i64 %b
-  %uq = call i64 @__syn_udivrem64(i64 %ua, i64 %ub, ptr null)
+  %uq = {call_kw} i64 @__syn_udivrem64(i64 %ua, i64 %ub, ptr null)
   %neg = xor i1 %sa, %sb
   %nq = sub i64 0, %uq
   %res = select i1 %neg, i64 %nq, i64 %uq
   ret i64 %res
-}
+}}
 
-define weak i64 @__moddi3(i64 %a, i64 %b) #99 {
+define weak i64 @__moddi3(i64 %a, i64 %b){fn_as} #99 {{
 entry:
   %rem = alloca i64, align 8
   store i64 0, ptr %rem, align 8
@@ -1469,16 +1905,16 @@ entry:
   %nb = sub i64 0, %b
   %ua = select i1 %sa, i64 %na, i64 %a
   %ub = select i1 %sb, i64 %nb, i64 %b
-  %uq = call i64 @__syn_udivrem64(i64 %ua, i64 %ub, ptr %rem)
+  %uq = {call_kw} i64 @__syn_udivrem64(i64 %ua, i64 %ub, ptr %rem)
   %ur = load i64, ptr %rem, align 8
   %nr = sub i64 0, %ur
   %res = select i1 %sa, i64 %nr, i64 %ur
   ret i64 %res
-}
+}}
 "#,
     );
 
-    if target == TargetArch::Thumbv7mNoneEabi {
+    if target.is_arm_eabi() {
         out.push_str(
             r#"define weak { i64, i64 } @__aeabi_uldivmod(i64 %n, i64 %d) #99 {
 entry:
@@ -1519,9 +1955,12 @@ entry:
 }
 
 fn emit_freestanding_soft_float_ir(out: &mut String, target: TargetArch) {
-    out.push_str(
+    let fn_as = target.fn_addrspace_attr();
+    let call_kw = target.call_kw();
+    let _ = write!(
+        out,
         r#"; ── Freestanding IEEE-754 Soft-Float Core & GNU ABI Shims (#99 = "no-builtins") ──
-define weak { i64, i32 } @__syn_norm_sig64(i64 %sig, i32 %exp_at_target, i32 %target_bit) #99 {
+define weak {{ i64, i32 }} @__syn_norm_sig64(i64 %sig, i32 %exp_at_target, i32 %target_bit){fn_as} #99 {{
 entry:
   %lz64 = call i64 @llvm.ctlz.i64(i64 %sig, i1 true)
   %lz = trunc i64 %lz64 to i32
@@ -1539,9 +1978,9 @@ shr_bb:
   %shifted = lshr i64 %sig, %rsh64
   %sn_r = or i64 %shifted, %st
   %en_r = add i32 %exp_at_target, %rsh
-  %pr0 = insertvalue { i64, i32 } poison, i64 %sn_r, 0
-  %pr1 = insertvalue { i64, i32 } %pr0, i32 %en_r, 1
-  ret { i64, i32 } %pr1
+  %pr0 = insertvalue {{ i64, i32 }} poison, i64 %sn_r, 0
+  %pr1 = insertvalue {{ i64, i32 }} %pr0, i32 %en_r, 1
+  ret {{ i64, i32 }} %pr1
 chk_lt:
   %lt = icmp slt i32 %msb, %target_bit
   br i1 %lt, label %shl_bb, label %exact_bb
@@ -1550,16 +1989,16 @@ shl_bb:
   %lsh64 = zext i32 %lsh to i64
   %sn_l = shl i64 %sig, %lsh64
   %en_l = sub i32 %exp_at_target, %lsh
-  %pl0 = insertvalue { i64, i32 } poison, i64 %sn_l, 0
-  %pl1 = insertvalue { i64, i32 } %pl0, i32 %en_l, 1
-  ret { i64, i32 } %pl1
+  %pl0 = insertvalue {{ i64, i32 }} poison, i64 %sn_l, 0
+  %pl1 = insertvalue {{ i64, i32 }} %pl0, i32 %en_l, 1
+  ret {{ i64, i32 }} %pl1
 exact_bb:
-  %pe0 = insertvalue { i64, i32 } poison, i64 %sig, 0
-  %pe1 = insertvalue { i64, i32 } %pe0, i32 %exp_at_target, 1
-  ret { i64, i32 } %pe1
-}
+  %pe0 = insertvalue {{ i64, i32 }} poison, i64 %sig, 0
+  %pe1 = insertvalue {{ i64, i32 }} %pe0, i32 %exp_at_target, 1
+  ret {{ i64, i32 }} %pe1
+}}
 
-define weak { i32, i32, i64 } @__syn_unpack_f32(i32 %u) #99 {
+define weak {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %u){fn_as} #99 {{
 entry:
   %s = lshr i32 %u, 31
   %es = lshr i32 %u, 23
@@ -1573,20 +2012,20 @@ sub_bb:
   %s24_sub32 = shl i32 %f_raw, %sh
   %s24_sub = zext i32 %s24_sub32 to i64
   %eb_sub = sub i32 1, %sh
-  %r0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
-  %r1 = insertvalue { i32, i32, i64 } %r0, i32 %eb_sub, 1
-  %r2 = insertvalue { i32, i32, i64 } %r1, i64 %s24_sub, 2
-  ret { i32, i32, i64 } %r2
+  %r0 = insertvalue {{ i32, i32, i64 }} poison, i32 %s, 0
+  %r1 = insertvalue {{ i32, i32, i64 }} %r0, i32 %eb_sub, 1
+  %r2 = insertvalue {{ i32, i32, i64 }} %r1, i64 %s24_sub, 2
+  ret {{ i32, i32, i64 }} %r2
 norm_bb:
   %s24_n32 = or i32 %f_raw, 8388608
   %s24_n = zext i32 %s24_n32 to i64
-  %n0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
-  %n1 = insertvalue { i32, i32, i64 } %n0, i32 %e_raw, 1
-  %n2 = insertvalue { i32, i32, i64 } %n1, i64 %s24_n, 2
-  ret { i32, i32, i64 } %n2
-}
+  %n0 = insertvalue {{ i32, i32, i64 }} poison, i32 %s, 0
+  %n1 = insertvalue {{ i32, i32, i64 }} %n0, i32 %e_raw, 1
+  %n2 = insertvalue {{ i32, i32, i64 }} %n1, i64 %s24_n, 2
+  ret {{ i32, i32, i64 }} %n2
+}}
 
-define weak { i32, i32, i64 } @__syn_unpack_f64(i64 %u) #99 {
+define weak {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %u){fn_as} #99 {{
 entry:
   %s64 = lshr i64 %u, 63
   %s = trunc i64 %s64 to i32
@@ -1603,19 +2042,19 @@ sub_bb:
   %sh64 = zext i32 %sh to i64
   %s53_sub = shl i64 %f_raw, %sh64
   %eb_sub = sub i32 1, %sh
-  %r0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
-  %r1 = insertvalue { i32, i32, i64 } %r0, i32 %eb_sub, 1
-  %r2 = insertvalue { i32, i32, i64 } %r1, i64 %s53_sub, 2
-  ret { i32, i32, i64 } %r2
+  %r0 = insertvalue {{ i32, i32, i64 }} poison, i32 %s, 0
+  %r1 = insertvalue {{ i32, i32, i64 }} %r0, i32 %eb_sub, 1
+  %r2 = insertvalue {{ i32, i32, i64 }} %r1, i64 %s53_sub, 2
+  ret {{ i32, i32, i64 }} %r2
 norm_bb:
   %s53_n = or i64 %f_raw, 4503599627370496
-  %n0 = insertvalue { i32, i32, i64 } poison, i32 %s, 0
-  %n1 = insertvalue { i32, i32, i64 } %n0, i32 %e_raw, 1
-  %n2 = insertvalue { i32, i32, i64 } %n1, i64 %s53_n, 2
-  ret { i32, i32, i64 } %n2
-}
+  %n0 = insertvalue {{ i32, i32, i64 }} poison, i32 %s, 0
+  %n1 = insertvalue {{ i32, i32, i64 }} %n0, i32 %e_raw, 1
+  %n2 = insertvalue {{ i32, i32, i64 }} %n1, i64 %s53_n, 2
+  ret {{ i32, i32, i64 }} %n2
+}}
 
-define weak float @__syn_pack_f32(i32 %sign, i32 %exp, i64 %sig26) #99 {
+define weak float @__syn_pack_f32(i32 %sign, i32 %exp, i64 %sig26){fn_as} #99 {{
 entry:
   %sbit = shl i32 %sign, 31
   %is_z = icmp eq i64 %sig26, 0
@@ -1684,9 +2123,9 @@ ret_fin:
   %u1 = or i32 %u0, %frac
   %f_fin = bitcast i32 %u1 to float
   ret float %f_fin
-}
+}}
 
-define weak double @__syn_pack_f64(i32 %sign, i32 %exp, i64 %sig55) #99 {
+define weak double @__syn_pack_f64(i32 %sign, i32 %exp, i64 %sig55){fn_as} #99 {{
 entry:
   %sign64 = zext i32 %sign to i64
   %sbit = shl i64 %sign64, 63
@@ -1756,10 +2195,10 @@ ret_fin:
   %u1 = or i64 %u0, %frac
   %d_fin = bitcast i64 %u1 to double
   ret double %d_fin
-}
+}}
 
 ; ── f32 Arithmetic (__addsf3, __subsf3, __mulsf3, __divsf3, fmodf) ──
-define weak float @__addsf3(float %a, float %b) #99 {
+define weak float @__addsf3(float %a, float %b){fn_as} #99 {{
 entry:
   %ua = bitcast float %a to i32
   %ub = bitcast float %b to i32
@@ -1802,14 +2241,14 @@ both_zero:
 chk_zb:
   br i1 %zb, label %ret_a, label %finite_add
 finite_add:
-  %upa = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ua)
-  %upb = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ub)
-  %sa0 = extractvalue { i32, i32, i64 } %upa, 0
-  %ea0 = extractvalue { i32, i32, i64 } %upa, 1
-  %ma0 = extractvalue { i32, i32, i64 } %upa, 2
-  %sb0 = extractvalue { i32, i32, i64 } %upb, 0
-  %eb0 = extractvalue { i32, i32, i64 } %upb, 1
-  %mb0 = extractvalue { i32, i32, i64 } %upb, 2
+  %upa = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %ua)
+  %upb = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %ub)
+  %sa0 = extractvalue {{ i32, i32, i64 }} %upa, 0
+  %ea0 = extractvalue {{ i32, i32, i64 }} %upa, 1
+  %ma0 = extractvalue {{ i32, i32, i64 }} %upa, 2
+  %sb0 = extractvalue {{ i32, i32, i64 }} %upb, 0
+  %eb0 = extractvalue {{ i32, i32, i64 }} %upb, 1
+  %mb0 = extractvalue {{ i32, i32, i64 }} %upb, 2
   %ma26 = shl i64 %ma0, 3
   %mb26 = shl i64 %mb0, 3
   %elt = icmp slt i32 %ea0, %eb0
@@ -1847,10 +2286,10 @@ aligned_bb:
   br i1 %same_s, label %do_sum, label %do_diff
 do_sum:
   %sum = add i64 %ma, %mb_fin
-  %ns = call { i64, i32 } @__syn_norm_sig64(i64 %sum, i32 %ea, i32 26)
-  %sn_s = extractvalue { i64, i32 } %ns, 0
-  %en_s = extractvalue { i64, i32 } %ns, 1
-  %res_s = call float @__syn_pack_f32(i32 %sa, i32 %en_s, i64 %sn_s)
+  %ns = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %sum, i32 %ea, i32 26)
+  %sn_s = extractvalue {{ i64, i32 }} %ns, 0
+  %en_s = extractvalue {{ i64, i32 }} %ns, 1
+  %res_s = {call_kw} float @__syn_pack_f32(i32 %sa, i32 %en_s, i64 %sn_s)
   ret float %res_s
 do_diff:
   %diff = sub i64 %ma, %mb_fin
@@ -1859,23 +2298,23 @@ do_diff:
 ret_pos_zero:
   ret float 0.0
 norm_diff:
-  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %diff, i32 %ea, i32 26)
-  %sn_d = extractvalue { i64, i32 } %nd, 0
-  %en_d = extractvalue { i64, i32 } %nd, 1
-  %res_d = call float @__syn_pack_f32(i32 %sa, i32 %en_d, i64 %sn_d)
+  %nd = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %diff, i32 %ea, i32 26)
+  %sn_d = extractvalue {{ i64, i32 }} %nd, 0
+  %en_d = extractvalue {{ i64, i32 }} %nd, 1
+  %res_d = {call_kw} float @__syn_pack_f32(i32 %sa, i32 %en_d, i64 %sn_d)
   ret float %res_d
-}
+}}
 
-define weak float @__subsf3(float %a, float %b) #99 {
+define weak float @__subsf3(float %a, float %b){fn_as} #99 {{
 entry:
   %ub = bitcast float %b to i32
   %ub_neg = xor i32 %ub, -2147483648
   %nb = bitcast i32 %ub_neg to float
-  %r = call float @__addsf3(float %a, float %nb)
+  %r = {call_kw} float @__addsf3(float %a, float %nb)
   ret float %r
-}
+}}
 
-define weak float @__mulsf3(float %a, float %b) #99 {
+define weak float @__mulsf3(float %a, float %b){fn_as} #99 {{
 entry:
   %ua = bitcast float %a to i32
   %ub = bitcast float %b to i32
@@ -1915,23 +2354,23 @@ ret_zero:
   %fz = bitcast i32 %sbit to float
   ret float %fz
 finite_mul:
-  %upa = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ua)
-  %upb = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ub)
-  %ea = extractvalue { i32, i32, i64 } %upa, 1
-  %ma = extractvalue { i32, i32, i64 } %upa, 2
-  %eb = extractvalue { i32, i32, i64 } %upb, 1
-  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %upa = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %ua)
+  %upb = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %ub)
+  %ea = extractvalue {{ i32, i32, i64 }} %upa, 1
+  %ma = extractvalue {{ i32, i32, i64 }} %upa, 2
+  %eb = extractvalue {{ i32, i32, i64 }} %upb, 1
+  %mb = extractvalue {{ i32, i32, i64 }} %upb, 2
   %prod = mul i64 %ma, %mb
   %esum = add i32 %ea, %eb
   %ebase = sub i32 %esum, 147
-  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %prod, i32 %ebase, i32 26)
-  %sn = extractvalue { i64, i32 } %nm, 0
-  %en = extractvalue { i64, i32 } %nm, 1
-  %res = call float @__syn_pack_f32(i32 %sr, i32 %en, i64 %sn)
+  %nm = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %prod, i32 %ebase, i32 26)
+  %sn = extractvalue {{ i64, i32 }} %nm, 0
+  %en = extractvalue {{ i64, i32 }} %nm, 1
+  %res = {call_kw} float @__syn_pack_f32(i32 %sr, i32 %en, i64 %sn)
   ret float %res
-}
+}}
 
-define weak float @__divsf3(float %a, float %b) #99 {
+define weak float @__divsf3(float %a, float %b){fn_as} #99 {{
 entry:
   %rem = alloca i64, align 8
   %ua = bitcast float %a to i32
@@ -1973,29 +2412,29 @@ ret_zero:
   ret float %fz
 finite_div:
   store i64 0, ptr %rem, align 8
-  %upa = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ua)
-  %upb = call { i32, i32, i64 } @__syn_unpack_f32(i32 %ub)
-  %ea = extractvalue { i32, i32, i64 } %upa, 1
-  %ma = extractvalue { i32, i32, i64 } %upa, 2
-  %eb = extractvalue { i32, i32, i64 } %upb, 1
-  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %upa = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %ua)
+  %upb = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %ub)
+  %ea = extractvalue {{ i32, i32, i64 }} %upa, 1
+  %ma = extractvalue {{ i32, i32, i64 }} %upa, 2
+  %eb = extractvalue {{ i32, i32, i64 }} %upb, 1
+  %mb = extractvalue {{ i32, i32, i64 }} %upb, 2
   %num = shl i64 %ma, 27
-  %q = call i64 @__syn_udivrem64(i64 %num, i64 %mb, ptr %rem)
+  %q = {call_kw} i64 @__syn_udivrem64(i64 %num, i64 %mb, ptr %rem)
   %rv = load i64, ptr %rem, align 8
   %r_nz = icmp ne i64 %rv, 0
   %st = zext i1 %r_nz to i64
   %qs = or i64 %q, %st
   %ediff = sub i32 %ea, %eb
   %ebase = add i32 %ediff, 126
-  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %qs, i32 %ebase, i32 26)
-  %sn = extractvalue { i64, i32 } %nd, 0
-  %en = extractvalue { i64, i32 } %nd, 1
-  %res = call float @__syn_pack_f32(i32 %sr, i32 %en, i64 %sn)
+  %nd = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %qs, i32 %ebase, i32 26)
+  %sn = extractvalue {{ i64, i32 }} %nd, 0
+  %en = extractvalue {{ i64, i32 }} %nd, 1
+  %res = {call_kw} float @__syn_pack_f32(i32 %sr, i32 %en, i64 %sn)
   ret float %res
-}
+}}
 
 ; ── f32 <-> f64 Conversions (__extendsfdf2, __truncdfsf2) ──
-define weak double @__extendsfdf2(float %a) #99 {
+define weak double @__extendsfdf2(float %a){fn_as} #99 {{
 entry:
   %u = bitcast float %a to i32
   %aa = and i32 %u, 2147483647
@@ -2021,9 +2460,9 @@ ret_inf:
   %dinf = bitcast i64 %uinf to double
   ret double %dinf
 finite:
-  %up = call { i32, i32, i64 } @__syn_unpack_f32(i32 %u)
-  %eb = extractvalue { i32, i32, i64 } %up, 1
-  %s24 = extractvalue { i32, i32, i64 } %up, 2
+  %up = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f32(i32 %u)
+  %eb = extractvalue {{ i32, i32, i64 }} %up, 1
+  %s24 = extractvalue {{ i32, i32, i64 }} %up, 2
   %ed = add i32 %eb, 896
   %ed64 = zext i32 %ed to i64
   %ebits = shl i64 %ed64, 52
@@ -2033,9 +2472,9 @@ finite:
   %u1 = or i64 %u0, %fbits
   %dfin = bitcast i64 %u1 to double
   ret double %dfin
-}
+}}
 
-define weak float @__truncdfsf2(double %a) #99 {
+define weak float @__truncdfsf2(double %a){fn_as} #99 {{
 entry:
   %u = bitcast double %a to i64
   %aa = and i64 %u, 9223372036854775807
@@ -2061,21 +2500,21 @@ ret_inf:
   %finf = bitcast i32 %uinf to float
   ret float %finf
 finite:
-  %up = call { i32, i32, i64 } @__syn_unpack_f64(i64 %u)
-  %eb = extractvalue { i32, i32, i64 } %up, 1
-  %s53 = extractvalue { i32, i32, i64 } %up, 2
+  %up = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %u)
+  %eb = extractvalue {{ i32, i32, i64 }} %up, 1
+  %s53 = extractvalue {{ i32, i32, i64 }} %up, 2
   %rem = and i64 %s53, 67108863
   %has_st = icmp ne i64 %rem, 0
   %st = zext i1 %has_st to i64
   %shr = lshr i64 %s53, 26
   %sig26 = or i64 %shr, %st
   %ef = sub i32 %eb, 896
-  %res = call float @__syn_pack_f32(i32 %s, i32 %ef, i64 %sig26)
+  %res = {call_kw} float @__syn_pack_f32(i32 %s, i32 %ef, i64 %sig26)
   ret float %res
-}
+}}
 
 ; ── f64 Arithmetic (__adddf3, __subdf3, __muldf3, __divdf3, fmod, fmodf) ──
-define weak double @__adddf3(double %a, double %b) #99 {
+define weak double @__adddf3(double %a, double %b){fn_as} #99 {{
 entry:
   %ua = bitcast double %a to i64
   %ub = bitcast double %b to i64
@@ -2118,14 +2557,14 @@ both_zero:
 chk_zb:
   br i1 %zb, label %ret_a, label %finite_add
 finite_add:
-  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
-  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
-  %sa0 = extractvalue { i32, i32, i64 } %upa, 0
-  %ea0 = extractvalue { i32, i32, i64 } %upa, 1
-  %ma0 = extractvalue { i32, i32, i64 } %upa, 2
-  %sb0 = extractvalue { i32, i32, i64 } %upb, 0
-  %eb0 = extractvalue { i32, i32, i64 } %upb, 1
-  %mb0 = extractvalue { i32, i32, i64 } %upb, 2
+  %upa = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ua)
+  %upb = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ub)
+  %sa0 = extractvalue {{ i32, i32, i64 }} %upa, 0
+  %ea0 = extractvalue {{ i32, i32, i64 }} %upa, 1
+  %ma0 = extractvalue {{ i32, i32, i64 }} %upa, 2
+  %sb0 = extractvalue {{ i32, i32, i64 }} %upb, 0
+  %eb0 = extractvalue {{ i32, i32, i64 }} %upb, 1
+  %mb0 = extractvalue {{ i32, i32, i64 }} %upb, 2
   %ma55 = shl i64 %ma0, 3
   %mb55 = shl i64 %mb0, 3
   %elt = icmp slt i32 %ea0, %eb0
@@ -2163,10 +2602,10 @@ aligned_bb:
   br i1 %same_s, label %do_sum, label %do_diff
 do_sum:
   %sum = add i64 %ma, %mb_fin
-  %ns = call { i64, i32 } @__syn_norm_sig64(i64 %sum, i32 %ea, i32 55)
-  %sn_s = extractvalue { i64, i32 } %ns, 0
-  %en_s = extractvalue { i64, i32 } %ns, 1
-  %res_s = call double @__syn_pack_f64(i32 %sa, i32 %en_s, i64 %sn_s)
+  %ns = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %sum, i32 %ea, i32 55)
+  %sn_s = extractvalue {{ i64, i32 }} %ns, 0
+  %en_s = extractvalue {{ i64, i32 }} %ns, 1
+  %res_s = {call_kw} double @__syn_pack_f64(i32 %sa, i32 %en_s, i64 %sn_s)
   ret double %res_s
 do_diff:
   %diff = sub i64 %ma, %mb_fin
@@ -2175,23 +2614,23 @@ do_diff:
 ret_pos_zero:
   ret double 0.0
 norm_diff:
-  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %diff, i32 %ea, i32 55)
-  %sn_d = extractvalue { i64, i32 } %nd, 0
-  %en_d = extractvalue { i64, i32 } %nd, 1
-  %res_d = call double @__syn_pack_f64(i32 %sa, i32 %en_d, i64 %sn_d)
+  %nd = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %diff, i32 %ea, i32 55)
+  %sn_d = extractvalue {{ i64, i32 }} %nd, 0
+  %en_d = extractvalue {{ i64, i32 }} %nd, 1
+  %res_d = {call_kw} double @__syn_pack_f64(i32 %sa, i32 %en_d, i64 %sn_d)
   ret double %res_d
-}
+}}
 
-define weak double @__subdf3(double %a, double %b) #99 {
+define weak double @__subdf3(double %a, double %b){fn_as} #99 {{
 entry:
   %ub = bitcast double %b to i64
   %ub_neg = xor i64 %ub, -9223372036854775808
   %nb = bitcast i64 %ub_neg to double
-  %r = call double @__adddf3(double %a, double %nb)
+  %r = {call_kw} double @__adddf3(double %a, double %nb)
   ret double %r
-}
+}}
 
-define weak double @__muldf3(double %a, double %b) #99 {
+define weak double @__muldf3(double %a, double %b){fn_as} #99 {{
 entry:
   %ua = bitcast double %a to i64
   %ub = bitcast double %b to i64
@@ -2232,12 +2671,12 @@ ret_zero:
   %dz = bitcast i64 %sbit to double
   ret double %dz
 finite_mul:
-  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
-  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
-  %ea = extractvalue { i32, i32, i64 } %upa, 1
-  %ma = extractvalue { i32, i32, i64 } %upa, 2
-  %eb = extractvalue { i32, i32, i64 } %upb, 1
-  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %upa = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ua)
+  %upb = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ub)
+  %ea = extractvalue {{ i32, i32, i64 }} %upa, 1
+  %ma = extractvalue {{ i32, i32, i64 }} %upa, 2
+  %eb = extractvalue {{ i32, i32, i64 }} %upb, 1
+  %mb = extractvalue {{ i32, i32, i64 }} %upb, 2
   %ma128 = zext i64 %ma to i128
   %mb128 = zext i64 %mb to i128
   %prod = mul i128 %ma128, %mb128
@@ -2249,14 +2688,14 @@ finite_mul:
   %p64 = or i64 %p64_raw, %st
   %esum = add i32 %ea, %eb
   %ebase = sub i32 %esum, 1023
-  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %p64, i32 %ebase, i32 55)
-  %sn = extractvalue { i64, i32 } %nm, 0
-  %en = extractvalue { i64, i32 } %nm, 1
-  %res = call double @__syn_pack_f64(i32 %sr, i32 %en, i64 %sn)
+  %nm = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %p64, i32 %ebase, i32 55)
+  %sn = extractvalue {{ i64, i32 }} %nm, 0
+  %en = extractvalue {{ i64, i32 }} %nm, 1
+  %res = {call_kw} double @__syn_pack_f64(i32 %sr, i32 %en, i64 %sn)
   ret double %res
-}
+}}
 
-define weak double @__divdf3(double %a, double %b) #99 {
+define weak double @__divdf3(double %a, double %b){fn_as} #99 {{
 entry:
   %ua = bitcast double %a to i64
   %ub = bitcast double %b to i64
@@ -2297,12 +2736,12 @@ ret_zero:
   %dz = bitcast i64 %sbit to double
   ret double %dz
 finite_div:
-  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
-  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
-  %ea = extractvalue { i32, i32, i64 } %upa, 1
-  %ma = extractvalue { i32, i32, i64 } %upa, 2
-  %eb = extractvalue { i32, i32, i64 } %upb, 1
-  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %upa = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ua)
+  %upb = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ub)
+  %ea = extractvalue {{ i32, i32, i64 }} %upa, 1
+  %ma = extractvalue {{ i32, i32, i64 }} %upa, 2
+  %eb = extractvalue {{ i32, i32, i64 }} %upb, 1
+  %mb = extractvalue {{ i32, i32, i64 }} %upb, 2
   br label %dloop
 dloop:
   %k = phi i64 [ 56, %finite_div ], [ %k_next, %dbody ]
@@ -2328,14 +2767,14 @@ dfinish:
   %qs = or i64 %q, %st
   %ediff = sub i32 %ea, %eb
   %ebase = add i32 %ediff, 1022
-  %nd = call { i64, i32 } @__syn_norm_sig64(i64 %qs, i32 %ebase, i32 55)
-  %sn = extractvalue { i64, i32 } %nd, 0
-  %en = extractvalue { i64, i32 } %nd, 1
-  %res = call double @__syn_pack_f64(i32 %sr, i32 %en, i64 %sn)
+  %nd = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %qs, i32 %ebase, i32 55)
+  %sn = extractvalue {{ i64, i32 }} %nd, 0
+  %en = extractvalue {{ i64, i32 }} %nd, 1
+  %res = {call_kw} double @__syn_pack_f64(i32 %sr, i32 %en, i64 %sn)
   ret double %res
-}
+}}
 
-define weak double @__syn_fmod_f64(double %a, double %b) #99 {
+define weak double @__syn_fmod_f64(double %a, double %b){fn_as} #99 {{
 entry:
   %ua = bitcast double %a to i64
   %ub = bitcast double %b to i64
@@ -2363,13 +2802,13 @@ chk_trivial:
 ret_a:
   ret double %a
 do_rem:
-  %upa = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ua)
-  %upb = call { i32, i32, i64 } @__syn_unpack_f64(i64 %ub)
-  %sa = extractvalue { i32, i32, i64 } %upa, 0
-  %ea = extractvalue { i32, i32, i64 } %upa, 1
-  %ma = extractvalue { i32, i32, i64 } %upa, 2
-  %eb = extractvalue { i32, i32, i64 } %upb, 1
-  %mb = extractvalue { i32, i32, i64 } %upb, 2
+  %upa = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ua)
+  %upb = {call_kw} {{ i32, i32, i64 }} @__syn_unpack_f64(i64 %ub)
+  %sa = extractvalue {{ i32, i32, i64 }} %upa, 0
+  %ea = extractvalue {{ i32, i32, i64 }} %upa, 1
+  %ma = extractvalue {{ i32, i32, i64 }} %upa, 2
+  %eb = extractvalue {{ i32, i32, i64 }} %upb, 1
+  %mb = extractvalue {{ i32, i32, i64 }} %upb, 2
   %steps = sub i32 %ea, %eb
   br label %rloop
 rloop:
@@ -2394,126 +2833,126 @@ ret_szero:
   ret double %dz
 pack_rem:
   %r55 = shl i64 %r, 3
-  %nr = call { i64, i32 } @__syn_norm_sig64(i64 %r55, i32 %eb, i32 55)
-  %sn = extractvalue { i64, i32 } %nr, 0
-  %en = extractvalue { i64, i32 } %nr, 1
-  %res = call double @__syn_pack_f64(i32 %sa, i32 %en, i64 %sn)
+  %nr = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %r55, i32 %eb, i32 55)
+  %sn = extractvalue {{ i64, i32 }} %nr, 0
+  %en = extractvalue {{ i64, i32 }} %nr, 1
+  %res = {call_kw} double @__syn_pack_f64(i32 %sa, i32 %en, i64 %sn)
   ret double %res
-}
+}}
 
-define weak double @fmod(double %a, double %b) #99 {
+define weak double @fmod(double %a, double %b){fn_as} #99 {{
 entry:
-  %r = call double @__syn_fmod_f64(double %a, double %b)
+  %r = {call_kw} double @__syn_fmod_f64(double %a, double %b)
   ret double %r
-}
+}}
 
-define weak float @fmodf(float %a, float %b) #99 {
+define weak float @fmodf(float %a, float %b){fn_as} #99 {{
 entry:
-  %da = call double @__extendsfdf2(float %a)
-  %db = call double @__extendsfdf2(float %b)
-  %dr = call double @__syn_fmod_f64(double %da, double %db)
-  %fr = call float @__truncdfsf2(double %dr)
+  %da = {call_kw} double @__extendsfdf2(float %a)
+  %db = {call_kw} double @__extendsfdf2(float %b)
+  %dr = {call_kw} double @__syn_fmod_f64(double %da, double %db)
+  %fr = {call_kw} float @__truncdfsf2(double %dr)
   ret float %fr
-}
+}}
 
 ; ── Integer <-> Float Conversions (i32/u32/i64/u64 <-> f32/f64) ──
-define weak float @__syn_u64_to_f32(i32 %sign, i64 %mag) #99 {
+define weak float @__syn_u64_to_f32(i32 %sign, i64 %mag){fn_as} #99 {{
 entry:
   %iz = icmp eq i64 %mag, 0
   br i1 %iz, label %ret_z, label %conv
 ret_z:
   ret float 0.0
 conv:
-  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %mag, i32 153, i32 26)
-  %sn = extractvalue { i64, i32 } %nm, 0
-  %en = extractvalue { i64, i32 } %nm, 1
-  %res = call float @__syn_pack_f32(i32 %sign, i32 %en, i64 %sn)
+  %nm = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %mag, i32 153, i32 26)
+  %sn = extractvalue {{ i64, i32 }} %nm, 0
+  %en = extractvalue {{ i64, i32 }} %nm, 1
+  %res = {call_kw} float @__syn_pack_f32(i32 %sign, i32 %en, i64 %sn)
   ret float %res
-}
+}}
 
-define weak double @__syn_u64_to_f64(i32 %sign, i64 %mag) #99 {
+define weak double @__syn_u64_to_f64(i32 %sign, i64 %mag){fn_as} #99 {{
 entry:
   %iz = icmp eq i64 %mag, 0
   br i1 %iz, label %ret_z, label %conv
 ret_z:
   ret double 0.0
 conv:
-  %nm = call { i64, i32 } @__syn_norm_sig64(i64 %mag, i32 1078, i32 55)
-  %sn = extractvalue { i64, i32 } %nm, 0
-  %en = extractvalue { i64, i32 } %nm, 1
-  %res = call double @__syn_pack_f64(i32 %sign, i32 %en, i64 %sn)
+  %nm = {call_kw} {{ i64, i32 }} @__syn_norm_sig64(i64 %mag, i32 1078, i32 55)
+  %sn = extractvalue {{ i64, i32 }} %nm, 0
+  %en = extractvalue {{ i64, i32 }} %nm, 1
+  %res = {call_kw} double @__syn_pack_f64(i32 %sign, i32 %en, i64 %sn)
   ret double %res
-}
+}}
 
-define weak float @__floatsisf(i32 %a) #99 {
+define weak float @__floatsisf(i32 %a){fn_as} #99 {{
 entry:
   %neg = icmp slt i32 %a, 0
   %s = zext i1 %neg to i32
   %na = sub i32 0, %a
   %ua = select i1 %neg, i32 %na, i32 %a
   %u64 = zext i32 %ua to i64
-  %r = call float @__syn_u64_to_f32(i32 %s, i64 %u64)
+  %r = {call_kw} float @__syn_u64_to_f32(i32 %s, i64 %u64)
   ret float %r
-}
+}}
 
-define weak float @__floatunsisf(i32 %a) #99 {
+define weak float @__floatunsisf(i32 %a){fn_as} #99 {{
 entry:
   %u64 = zext i32 %a to i64
-  %r = call float @__syn_u64_to_f32(i32 0, i64 %u64)
+  %r = {call_kw} float @__syn_u64_to_f32(i32 0, i64 %u64)
   ret float %r
-}
+}}
 
-define weak float @__floatdisf(i64 %a) #99 {
+define weak float @__floatdisf(i64 %a){fn_as} #99 {{
 entry:
   %neg = icmp slt i64 %a, 0
   %s = zext i1 %neg to i32
   %na = sub i64 0, %a
   %ua = select i1 %neg, i64 %na, i64 %a
-  %r = call float @__syn_u64_to_f32(i32 %s, i64 %ua)
+  %r = {call_kw} float @__syn_u64_to_f32(i32 %s, i64 %ua)
   ret float %r
-}
+}}
 
-define weak float @__floatundisf(i64 %a) #99 {
+define weak float @__floatundisf(i64 %a){fn_as} #99 {{
 entry:
-  %r = call float @__syn_u64_to_f32(i32 0, i64 %a)
+  %r = {call_kw} float @__syn_u64_to_f32(i32 0, i64 %a)
   ret float %r
-}
+}}
 
-define weak double @__floatsidf(i32 %a) #99 {
+define weak double @__floatsidf(i32 %a){fn_as} #99 {{
 entry:
   %neg = icmp slt i32 %a, 0
   %s = zext i1 %neg to i32
   %na = sub i32 0, %a
   %ua = select i1 %neg, i32 %na, i32 %a
   %u64 = zext i32 %ua to i64
-  %r = call double @__syn_u64_to_f64(i32 %s, i64 %u64)
+  %r = {call_kw} double @__syn_u64_to_f64(i32 %s, i64 %u64)
   ret double %r
-}
+}}
 
-define weak double @__floatunsidf(i32 %a) #99 {
+define weak double @__floatunsidf(i32 %a){fn_as} #99 {{
 entry:
   %u64 = zext i32 %a to i64
-  %r = call double @__syn_u64_to_f64(i32 0, i64 %u64)
+  %r = {call_kw} double @__syn_u64_to_f64(i32 0, i64 %u64)
   ret double %r
-}
+}}
 
-define weak double @__floatdidf(i64 %a) #99 {
+define weak double @__floatdidf(i64 %a){fn_as} #99 {{
 entry:
   %neg = icmp slt i64 %a, 0
   %s = zext i1 %neg to i32
   %na = sub i64 0, %a
   %ua = select i1 %neg, i64 %na, i64 %a
-  %r = call double @__syn_u64_to_f64(i32 %s, i64 %ua)
+  %r = {call_kw} double @__syn_u64_to_f64(i32 %s, i64 %ua)
   ret double %r
-}
+}}
 
-define weak double @__floatundidf(i64 %a) #99 {
+define weak double @__floatundidf(i64 %a){fn_as} #99 {{
 entry:
-  %r = call double @__syn_u64_to_f64(i32 0, i64 %a)
+  %r = {call_kw} double @__syn_u64_to_f64(i32 0, i64 %a)
   ret double %r
-}
+}}
 
-define weak i64 @__syn_f64_to_u64_sat(double %x, ptr %neg_out, ptr %nan_out) #99 {
+define weak i64 @__syn_f64_to_u64_sat(double %x, ptr %neg_out, ptr %nan_out){fn_as} #99 {{
 entry:
   %u = bitcast double %x to i64
   %s64 = lshr i64 %u, 63
@@ -2554,26 +2993,26 @@ shr_bb:
   %rsh64 = zext i32 %rsh to i64
   %mr = lshr i64 %sig, %rsh64
   ret i64 %mr
-}
+}}
 
-define weak i64 @__fixunsdfdi(double %x) #99 {
+define weak i64 @__fixunsdfdi(double %x){fn_as} #99 {{
 entry:
   %neg = alloca i8, align 1
   %nan = alloca i8, align 1
-  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %m = {call_kw} i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
   %nv = load i8, ptr %neg, align 1
   %nn = load i8, ptr %nan, align 1
   %bad = or i8 %nv, %nn
   %is_bad = icmp ne i8 %bad, 0
   %res = select i1 %is_bad, i64 0, i64 %m
   ret i64 %res
-}
+}}
 
-define weak i64 @__fixdfdi(double %x) #99 {
+define weak i64 @__fixdfdi(double %x){fn_as} #99 {{
 entry:
   %neg = alloca i8, align 1
   %nan = alloca i8, align 1
-  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %m = {call_kw} i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
   %nn = load i8, ptr %nan, align 1
   %is_nan = icmp ne i8 %nn, 0
   br i1 %is_nan, label %ret_z, label %chk_sign
@@ -2592,13 +3031,13 @@ neg_bb:
   %nm = sub i64 0, %m
   %rn = select i1 %ov_n, i64 -9223372036854775808, i64 %nm
   ret i64 %rn
-}
+}}
 
-define weak i32 @__fixunsdfsi(double %x) #99 {
+define weak i32 @__fixunsdfsi(double %x){fn_as} #99 {{
 entry:
   %neg = alloca i8, align 1
   %nan = alloca i8, align 1
-  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %m = {call_kw} i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
   %nv = load i8, ptr %neg, align 1
   %nn = load i8, ptr %nan, align 1
   %bad = or i8 %nv, %nn
@@ -2611,13 +3050,13 @@ clamp_u32:
   %tr = trunc i64 %m to i32
   %res = select i1 %ov, i32 -1, i32 %tr
   ret i32 %res
-}
+}}
 
-define weak i32 @__fixdfsi(double %x) #99 {
+define weak i32 @__fixdfsi(double %x){fn_as} #99 {{
 entry:
   %neg = alloca i8, align 1
   %nan = alloca i8, align 1
-  %m = call i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
+  %m = {call_kw} i64 @__syn_f64_to_u64_sat(double %x, ptr %neg, ptr %nan)
   %nn = load i8, ptr %nan, align 1
   %is_nan = icmp ne i8 %nn, 0
   br i1 %is_nan, label %ret_z, label %chk_sign
@@ -2638,38 +3077,38 @@ neg_bb:
   %nm = sub i32 0, %tr_n
   %rn = select i1 %ov_n, i32 -2147483648, i32 %nm
   ret i32 %rn
-}
+}}
 
-define weak i32 @__fixsfsi(float %x) #99 {
+define weak i32 @__fixsfsi(float %x){fn_as} #99 {{
 entry:
-  %d = call double @__extendsfdf2(float %x)
-  %r = call i32 @__fixdfsi(double %d)
+  %d = {call_kw} double @__extendsfdf2(float %x)
+  %r = {call_kw} i32 @__fixdfsi(double %d)
   ret i32 %r
-}
+}}
 
-define weak i32 @__fixunssfsi(float %x) #99 {
+define weak i32 @__fixunssfsi(float %x){fn_as} #99 {{
 entry:
-  %d = call double @__extendsfdf2(float %x)
-  %r = call i32 @__fixunsdfsi(double %d)
+  %d = {call_kw} double @__extendsfdf2(float %x)
+  %r = {call_kw} i32 @__fixunsdfsi(double %d)
   ret i32 %r
-}
+}}
 
-define weak i64 @__fixsfdi(float %x) #99 {
+define weak i64 @__fixsfdi(float %x){fn_as} #99 {{
 entry:
-  %d = call double @__extendsfdf2(float %x)
-  %r = call i64 @__fixdfdi(double %d)
+  %d = {call_kw} double @__extendsfdf2(float %x)
+  %r = {call_kw} i64 @__fixdfdi(double %d)
   ret i64 %r
-}
+}}
 
-define weak i64 @__fixunssfdi(float %x) #99 {
+define weak i64 @__fixunssfdi(float %x){fn_as} #99 {{
 entry:
-  %d = call double @__extendsfdf2(float %x)
-  %r = call i64 @__fixunsdfdi(double %d)
+  %d = {call_kw} double @__extendsfdf2(float %x)
+  %r = {call_kw} i64 @__fixunsdfdi(double %d)
   ret i64 %r
-}
+}}
 
 ; ── IEEE-754 Soft-Float Comparisons (GNU __*sf2 / __*df2) ──
-define weak i32 @__syn_cmp_f32(float %a, float %b, i32 %nan_res) #99 {
+define weak i32 @__syn_cmp_f32(float %a, float %b, i32 %nan_res){fn_as} #99 {{
 entry:
   %ua = bitcast float %a to i32
   %ub = bitcast float %b to i32
@@ -2702,9 +3141,9 @@ same_s:
   %lt = xor i1 %mag_lt, %sa
   %rs = select i1 %lt, i32 -1, i32 1
   ret i32 %rs
-}
+}}
 
-define weak i32 @__syn_cmp_f64(double %a, double %b, i32 %nan_res) #99 {
+define weak i32 @__syn_cmp_f64(double %a, double %b, i32 %nan_res){fn_as} #99 {{
 entry:
   %ua = bitcast double %a to i64
   %ub = bitcast double %b to i64
@@ -2737,9 +3176,9 @@ same_s:
   %lt = xor i1 %mag_lt, %sa
   %rs = select i1 %lt, i32 -1, i32 1
   ret i32 %rs
-}
+}}
 
-define weak i32 @__unordsf2(float %a, float %b) #99 {
+define weak i32 @__unordsf2(float %a, float %b){fn_as} #99 {{
 entry:
   %ua = bitcast float %a to i32
   %ub = bitcast float %b to i32
@@ -2750,40 +3189,40 @@ entry:
   %u = or i1 %na, %nb
   %r = zext i1 %u to i32
   ret i32 %r
-}
+}}
 
-define weak i32 @__eqsf2(float %a, float %b) #99 {
+define weak i32 @__eqsf2(float %a, float %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f32(float %a, float %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__nesf2(float %a, float %b) #99 {
+}}
+define weak i32 @__nesf2(float %a, float %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f32(float %a, float %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__ltsf2(float %a, float %b) #99 {
+}}
+define weak i32 @__ltsf2(float %a, float %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f32(float %a, float %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__lesf2(float %a, float %b) #99 {
+}}
+define weak i32 @__lesf2(float %a, float %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f32(float %a, float %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__gtsf2(float %a, float %b) #99 {
+}}
+define weak i32 @__gtsf2(float %a, float %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
+  %r = {call_kw} i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
   ret i32 %r
-}
-define weak i32 @__gesf2(float %a, float %b) #99 {
+}}
+define weak i32 @__gesf2(float %a, float %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
+  %r = {call_kw} i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
   ret i32 %r
-}
+}}
 
-define weak i32 @__unorddf2(double %a, double %b) #99 {
+define weak i32 @__unorddf2(double %a, double %b){fn_as} #99 {{
 entry:
   %ua = bitcast double %a to i64
   %ub = bitcast double %b to i64
@@ -2794,42 +3233,42 @@ entry:
   %u = or i1 %na, %nb
   %r = zext i1 %u to i32
   ret i32 %r
-}
+}}
 
-define weak i32 @__eqdf2(double %a, double %b) #99 {
+define weak i32 @__eqdf2(double %a, double %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f64(double %a, double %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__nedf2(double %a, double %b) #99 {
+}}
+define weak i32 @__nedf2(double %a, double %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f64(double %a, double %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__ltdf2(double %a, double %b) #99 {
+}}
+define weak i32 @__ltdf2(double %a, double %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f64(double %a, double %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__ledf2(double %a, double %b) #99 {
+}}
+define weak i32 @__ledf2(double %a, double %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
+  %r = {call_kw} i32 @__syn_cmp_f64(double %a, double %b, i32 1)
   ret i32 %r
-}
-define weak i32 @__gtdf2(double %a, double %b) #99 {
+}}
+define weak i32 @__gtdf2(double %a, double %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
+  %r = {call_kw} i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
   ret i32 %r
-}
-define weak i32 @__gedf2(double %a, double %b) #99 {
+}}
+define weak i32 @__gedf2(double %a, double %b){fn_as} #99 {{
 entry:
-  %r = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
+  %r = {call_kw} i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
   ret i32 %r
-}
+}}
 "#,
     );
 
-    if target == TargetArch::Thumbv7mNoneEabi {
+    if target.is_arm_eabi() {
         out.push_str(
             r#"; ── ARM RTABI (__aeabi_f* / __aeabi_d*) Soft-Float Shims ──
 define weak float @__aeabi_fadd(float %a, float %b) #99 {
@@ -3063,8 +3502,11 @@ entry:
 // Freestanding Zero-Heap Stream & Bounded-Buffer (`fmt_buf`) Formatters
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn emit_zero_heap_fmt_ir(out: &mut String, emit_float_fixed: bool, emit_float_sci: bool) {
-    out.push_str(
+fn emit_zero_heap_fmt_ir(out: &mut String, target: TargetArch, emit_float_fixed: bool, emit_float_sci: bool) {
+    let fn_as = target.fn_addrspace_attr();
+    let call_kw = target.call_kw();
+    let _ = write!(
+        out,
         r#"; ── Freestanding Zero-Heap Format Sink & Tiered Formatters (ld.lld --gc-sections) ──
 @.syn_fmt_str_true = weak unnamed_addr constant [5 x i8] c"true\00", align 1
 @.syn_fmt_str_false = weak unnamed_addr constant [6 x i8] c"false\00", align 1
@@ -3084,13 +3526,13 @@ fn emit_zero_heap_fmt_ir(out: &mut String, emit_float_fixed: bool, emit_float_sc
   i64 1000000000
 ], align 8
 
-define weak void @__syn_fmt_init_uart(ptr %sink) #99 {
+define weak void @__syn_fmt_init_uart(ptr %sink){fn_as} #99 {{
 entry:
   store %SynFmtSink zeroinitializer, ptr %sink, align 4
   ret void
-}
+}}
 
-define weak void @__syn_fmt_init_buf(ptr %sink, ptr %dst, i32 %cap) #99 {
+define weak void @__syn_fmt_init_buf(ptr %sink, ptr %dst, i32 %cap){fn_as} #99 {{
 entry:
   %c_neg = icmp slt i32 %cap, 0
   %c_nonneg = select i1 %c_neg, i32 0, i32 %cap
@@ -3107,9 +3549,9 @@ entry:
   store i8 0, ptr %p3, align 1
   store i8 1, ptr %p4, align 1
   ret void
-}
+}}
 
-define weak void @__syn_fmt_init_ring(ptr %sink, ptr %hdr, i32 %cap) #99 {
+define weak void @__syn_fmt_init_ring(ptr %sink, ptr %hdr, i32 %cap){fn_as} #99 {{
 entry:
   %c_neg = icmp slt i32 %cap, 0
   %c_nonneg = select i1 %c_neg, i32 0, i32 %cap
@@ -3126,9 +3568,9 @@ entry:
   store i8 0, ptr %p3, align 1
   store i8 2, ptr %p4, align 1
   ret void
-}
+}}
 
-define weak void @__syn_fmt_putc(ptr %sink, i8 %ch) noinline #99 {
+define weak void @__syn_fmt_putc(ptr %sink, i8 %ch){fn_as} noinline #99 {{
 entry:
   %ib_ptr = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 4
   %ib = load i8, ptr %ib_ptr, align 1
@@ -3137,11 +3579,18 @@ entry:
   %is_uart = icmp eq i8 %ib, 0
   br i1 %is_uart, label %to_uart, label %chk_ring
 to_uart:
-  call void @__syn_uart_putc(i8 %ch)
+  {call_kw} void @__syn_uart_putc(i8 %ch)
   %wu = add i32 %w, 1
   store i32 %wu, ptr %wp, align 4
   ret void
 chk_ring:
+  %tr_chk_p = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3
+  %tr_cur = load i8, ptr %tr_chk_p, align 1
+  %already_tr = icmp ne i8 %tr_cur, 0
+  br i1 %already_tr, label %ret_trunc, label %chk_mode
+ret_trunc:
+  ret void
+chk_mode:
   %is_ring = icmp eq i8 %ib, 2
   br i1 %is_ring, label %to_ring, label %to_buf
 to_buf:
@@ -3162,7 +3611,7 @@ mark_trunc:
   store i8 1, ptr %tp, align 1
   ret void
 to_ring:
-  %r_pm = call i32 @__syn_crit_enter()
+  %r_pm = {call_kw} i32 @__syn_crit_enter()
   %r_dp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 0
   %r = load ptr, ptr %r_dp, align 4
   %r_cp_s = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 1
@@ -3198,16 +3647,16 @@ ring_wr:
   store i32 %r_c1, ptr %r_cntp, align 4
   %r_w1 = add i32 %w, 1
   store i32 %r_w1, ptr %wp, align 4
-  call void @__syn_crit_exit(i32 %r_pm)
+  {call_kw} void @__syn_crit_exit(i32 %r_pm)
   ret void
 ring_trunc:
   %r_trp = getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3
   store i8 1, ptr %r_trp, align 1
-  call void @__syn_crit_exit(i32 %r_pm)
+  {call_kw} void @__syn_crit_exit(i32 %r_pm)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_bytes(ptr %sink, ptr %data, i32 %len) noinline #99 {
+define weak void @__syn_fmt_bytes(ptr %sink, ptr %data, i32 %len){fn_as} noinline #99 {{
 entry:
   %isnull = icmp eq ptr %data, null
   %le0 = icmp sle i32 %len, 0
@@ -3220,14 +3669,14 @@ loop:
 body:
   %bp = getelementptr i8, ptr %data, i32 %i
   %b = load i8, ptr %bp, align 1
-  call void @__syn_fmt_putc(ptr %sink, i8 %b)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %b)
   %inext = add i32 %i, 1
   br label %loop
 done:
   ret void
-}
+}}
 
-define weak void @__syn_fmt_cstr(ptr %sink, ptr %cstr) noinline #99 {
+define weak void @__syn_fmt_cstr(ptr %sink, ptr %cstr){fn_as} noinline #99 {{
 entry:
   %isnull = icmp eq ptr %cstr, null
   br i1 %isnull, label %done, label %loop
@@ -3238,22 +3687,22 @@ loop:
   %is_nul = icmp eq i8 %b, 0
   br i1 %is_nul, label %done, label %body
 body:
-  call void @__syn_fmt_putc(ptr %sink, i8 %b)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %b)
   %inext = add i32 %i, 1
   br label %loop
 done:
   ret void
-}
+}}
 
-define weak void @__syn_fmt_bool(ptr %sink, i8 %val) noinline #99 {
+define weak void @__syn_fmt_bool(ptr %sink, i8 %val){fn_as} noinline #99 {{
 entry:
   %nz = icmp ne i8 %val, 0
   %s = select i1 %nz, ptr @.syn_fmt_str_true, ptr @.syn_fmt_str_false
-  call void @__syn_fmt_cstr(ptr %sink, ptr %s)
+  {call_kw} void @__syn_fmt_cstr(ptr %sink, ptr %s)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 %min_width) noinline #99 {
+define weak void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 %min_width){fn_as} noinline #99 {{
 entry:
   %buf = alloca [12 x i8], align 1
   %w_neg = icmp slt i32 %min_width, 1
@@ -3283,7 +3732,7 @@ pad_loop:
   %pdone = icmp sle i32 %p, 0
   br i1 %pdone, label %emit_init, label %pad_body
 pad_body:
-  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 48)
   %p_next = sub i32 %p, 1
   br label %pad_loop
 emit_init:
@@ -3296,33 +3745,33 @@ emit_body:
   %idx_prev = sub i32 %idx, 1
   %cp = getelementptr inbounds [12 x i8], ptr %buf, i32 0, i32 %idx_prev
   %ch = load i8, ptr %cp, align 1
-  call void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %ch)
   br label %emit_loop
 done:
   ret void
-}
+}}
 
-define weak void @__syn_fmt_u32_dec(ptr %sink, i32 %val) noinline #99 {
+define weak void @__syn_fmt_u32_dec(ptr %sink, i32 %val){fn_as} noinline #99 {{
 entry:
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 1)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 1)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_i32_dec(ptr %sink, i32 %val) noinline #99 {
+define weak void @__syn_fmt_i32_dec(ptr %sink, i32 %val){fn_as} noinline #99 {{
 entry:
   %neg = icmp slt i32 %val, 0
   br i1 %neg, label %do_neg, label %do_pos
 do_neg:
-  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
   %abs = sub i32 0, %val
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %abs, i32 1)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %abs, i32 1)
   ret void
 do_pos:
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 1)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %val, i32 1)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 %min_width) noinline #99 {
+define weak void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 %min_width){fn_as} noinline #99 {{
 entry:
   %buf = alloca [24 x i8], align 1
   %rem_slot = alloca i64, align 8
@@ -3334,7 +3783,7 @@ entry:
 eloop:
   %v = phi i64 [ %val, %entry ], [ %q, %eloop_cont ]
   %len = phi i32 [ 0, %entry ], [ %len1, %eloop_cont ]
-  %q = call i64 @__syn_udivrem64(i64 %v, i64 10, ptr %rem_slot)
+  %q = {call_kw} i64 @__syn_udivrem64(i64 %v, i64 10, ptr %rem_slot)
   %rem64 = load i64, ptr %rem_slot, align 8
   %d64 = add i64 %rem64, 48
   %d8 = trunc i64 %d64 to i8
@@ -3353,7 +3802,7 @@ pad_loop:
   %pdone = icmp sle i32 %p, 0
   br i1 %pdone, label %emit_init, label %pad_body
 pad_body:
-  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 48)
   %p_next = sub i32 %p, 1
   br label %pad_loop
 emit_init:
@@ -3366,33 +3815,33 @@ emit_body:
   %idx_prev = sub i32 %idx, 1
   %cp = getelementptr inbounds [24 x i8], ptr %buf, i32 0, i32 %idx_prev
   %ch = load i8, ptr %cp, align 1
-  call void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %ch)
   br label %emit_loop
 done:
   ret void
-}
+}}
 
-define weak void @__syn_fmt_u64_dec(ptr %sink, i64 %val) noinline #99 {
+define weak void @__syn_fmt_u64_dec(ptr %sink, i64 %val){fn_as} noinline #99 {{
 entry:
-  call void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 1)
+  {call_kw} void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 1)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_i64_dec(ptr %sink, i64 %val) noinline #99 {
+define weak void @__syn_fmt_i64_dec(ptr %sink, i64 %val){fn_as} noinline #99 {{
 entry:
   %neg = icmp slt i64 %val, 0
   br i1 %neg, label %do_neg, label %do_pos
 do_neg:
-  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
   %abs = sub i64 0, %val
-  call void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %abs, i32 1)
+  {call_kw} void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %abs, i32 1)
   ret void
 do_pos:
-  call void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 1)
+  {call_kw} void @__syn_fmt_u64_dec_pad(ptr %sink, i64 %val, i32 1)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 %shift_bits, i8 %upper, i32 %min_width) noinline #99 {
+define weak void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 %shift_bits, i8 %upper, i32 %min_width){fn_as} noinline #99 {{
 entry:
   %buf = alloca [64 x i8], align 1
   %w_neg = icmp slt i32 %min_width, 1
@@ -3430,7 +3879,7 @@ pad_loop:
   %pdone = icmp sle i32 %p, 0
   br i1 %pdone, label %emit_init, label %pad_body
 pad_body:
-  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 48)
   %p_next = sub i32 %p, 1
   br label %pad_loop
 emit_init:
@@ -3443,44 +3892,45 @@ emit_body:
   %idx_prev = sub i32 %idx, 1
   %cp = getelementptr inbounds [64 x i8], ptr %buf, i32 0, i32 %idx_prev
   %ch = load i8, ptr %cp, align 1
-  call void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %ch)
   br label %emit_loop
 done:
   ret void
-}
+}}
 
-define weak void @__syn_fmt_u64_hex(ptr %sink, i64 %val, i8 %upper, i32 %min_width) noinline #99 {
+define weak void @__syn_fmt_u64_hex(ptr %sink, i64 %val, i8 %upper, i32 %min_width){fn_as} noinline #99 {{
 entry:
-  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 4, i8 %upper, i32 %min_width)
+  {call_kw} void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 4, i8 %upper, i32 %min_width)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_u32_hex(ptr %sink, i32 %val, i8 %upper, i32 %min_width) noinline #99 {
-entry:
-  %v64 = zext i32 %val to i64
-  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %v64, i32 4, i8 %upper, i32 %min_width)
-  ret void
-}
-
-define weak void @__syn_fmt_u64_bin(ptr %sink, i64 %val, i32 %min_width) noinline #99 {
-entry:
-  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 1, i8 0, i32 %min_width)
-  ret void
-}
-
-define weak void @__syn_fmt_u32_bin(ptr %sink, i32 %val, i32 %min_width) noinline #99 {
+define weak void @__syn_fmt_u32_hex(ptr %sink, i32 %val, i8 %upper, i32 %min_width){fn_as} noinline #99 {{
 entry:
   %v64 = zext i32 %val to i64
-  call void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %v64, i32 1, i8 0, i32 %min_width)
+  {call_kw} void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %v64, i32 4, i8 %upper, i32 %min_width)
   ret void
-}
+}}
+
+define weak void @__syn_fmt_u64_bin(ptr %sink, i64 %val, i32 %min_width){fn_as} noinline #99 {{
+entry:
+  {call_kw} void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %val, i32 1, i8 0, i32 %min_width)
+  ret void
+}}
+
+define weak void @__syn_fmt_u32_bin(ptr %sink, i32 %val, i32 %min_width){fn_as} noinline #99 {{
+entry:
+  %v64 = zext i32 %val to i64
+  {call_kw} void @__syn_fmt_u64_pow2_base(ptr %sink, i64 %v64, i32 1, i8 0, i32 %min_width)
+  ret void
+}}
 "#,
     );
 
     if emit_float_fixed || emit_float_sci {
-        out.push_str(
-            r#"; ── Arduino-Style Fixed-Decimal Float Formatter (Pure Integer/Bit Math, Zero Soft-Float/Libm) ──
-define weak void @__syn_fmt_f64_fixed(ptr %sink, double %val, i32 %prec) noinline #99 {
+        let _ = write!(
+        out,
+        r#"; ── Arduino-Style Fixed-Decimal Float Formatter (Pure Integer/Bit Math, Zero Soft-Float/Libm) ──
+define weak void @__syn_fmt_f64_fixed(ptr %sink, double %val, i32 %prec){fn_as} noinline #99 {{
 entry:
   %rem_slot = alloca i64, align 8
   %bits = bitcast double %val to i64
@@ -3489,7 +3939,7 @@ entry:
   %is_nan = icmp ugt i64 %abs_bits, 9218868437227405312
   br i1 %is_nan, label %on_nan, label %chk_inf
 on_nan:
-  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_nan)
+  {call_kw} void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_nan)
   ret void
 chk_inf:
   %is_inf = icmp eq i64 %abs_bits, 9218868437227405312
@@ -3497,10 +3947,10 @@ chk_inf:
 on_inf:
   br i1 %neg_bit, label %inf_neg, label %inf_pos
 inf_neg:
-  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
   br label %inf_pos
 inf_pos:
-  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_inf)
+  {call_kw} void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_inf)
   ret void
 chk_ovf:
   ; Arduino overflow threshold: fabs(val) > 4294967040.0 (0x41EFFFFFE0000000 = 4751297606339002368)
@@ -3509,10 +3959,10 @@ chk_ovf:
 on_ovf:
   br i1 %neg_bit, label %ovf_neg, label %ovf_pos
 ovf_neg:
-  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
   br label %ovf_pos
 ovf_pos:
-  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_ovf)
+  {call_kw} void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_ovf)
   ret void
 clamp_prec:
   %p_def = icmp slt i32 %prec, 0
@@ -3548,7 +3998,7 @@ do_shift_round:
   %rsh128 = zext i32 %rsh to i128
   %tot128 = lshr i128 %rounded128, %rsh128
   %tot64 = trunc i128 %tot128 to i64
-  %ipart = call i64 @__syn_udivrem64(i64 %tot64, i64 %scale, ptr %rem_slot)
+  %ipart = {call_kw} i64 @__syn_udivrem64(i64 %tot64, i64 %scale, ptr %rem_slot)
   %fpart = load i64, ptr %rem_slot, align 8
   br label %emit_parts
 emit_parts:
@@ -3560,36 +4010,37 @@ emit_parts:
   %emit_minus = and i1 %neg_bit, %res_nz
   br i1 %emit_minus, label %put_minus, label %emit_int
 put_minus:
-  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
   br label %emit_int
 emit_int:
   %i32_part = trunc i64 %int_v to i32
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %i32_part, i32 1)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %i32_part, i32 1)
   %has_p = icmp sgt i32 %p, 0
   br i1 %has_p, label %emit_frac, label %done
 emit_frac:
-  call void @__syn_fmt_putc(ptr %sink, i8 46)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 46)
   %f32_part = trunc i64 %frac_v to i32
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %f32_part, i32 %p)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %f32_part, i32 %p)
   br label %done
 done:
   ret void
-}
+}}
 
-define weak void @__syn_fmt_f32_fixed(ptr %sink, float %val, i32 %prec) noinline #99 {
+define weak void @__syn_fmt_f32_fixed(ptr %sink, float %val, i32 %prec){fn_as} noinline #99 {{
 entry:
-  %d = call double @__extendsfdf2(float %val)
-  call void @__syn_fmt_f64_fixed(ptr %sink, double %d, i32 %prec)
+  %d = {call_kw} double @__extendsfdf2(float %val)
+  {call_kw} void @__syn_fmt_f64_fixed(ptr %sink, double %d, i32 %prec)
   ret void
-}
+}}
 "#,
-        );
+    );
     }
 
     if emit_float_sci {
-        out.push_str(
-            r#"; ── Standalone Scientific `:e` Float Formatters (Pure 64-Bit Mantissa Math, Dead-Stripped by --gc-sections) ──
-define weak void @__syn_sci_mul_u32(ptr %pm, ptr %pe2, i32 %k) noinline #99 {
+        let _ = write!(
+        out,
+        r#"; ── Standalone Scientific `:e` Float Formatters (Pure 64-Bit Mantissa Math, Dead-Stripped by --gc-sections) ──
+define weak void @__syn_sci_mul_u32(ptr %pm, ptr %pe2, i32 %k){fn_as} noinline #99 {{
 entry:
   %m = load i64, ptr %pm, align 8
   %e2 = load i32, ptr %pe2, align 4
@@ -3628,9 +4079,9 @@ entry:
   store i64 %norm, ptr %pm, align 8
   store i32 %e2_next, ptr %pe2, align 4
   ret void
-}
+}}
 
-define weak void @__syn_sci_div_u32(ptr %pm, ptr %pe2, i32 %k) noinline #99 {
+define weak void @__syn_sci_div_u32(ptr %pm, ptr %pe2, i32 %k){fn_as} noinline #99 {{
 entry:
   %r_slot = alloca i64, align 8
   %m = load i64, ptr %pm, align 8
@@ -3652,12 +4103,12 @@ entry:
   %top_sh = shl i64 %top, 32
   %rest_hi = lshr i64 %rest, 32
   %d1 = or i64 %top_sh, %rest_hi
-  %q_hi = call i64 @__syn_udivrem64(i64 %d1, i64 %k64, ptr %r_slot)
+  %q_hi = {call_kw} i64 @__syn_udivrem64(i64 %d1, i64 %k64, ptr %r_slot)
   %r1 = load i64, ptr %r_slot, align 8
   %r1_sh = shl i64 %r1, 32
   %rest_lo = and i64 %rest, 4294967295
   %d0 = or i64 %r1_sh, %rest_lo
-  %q_lo = call i64 @__syn_udivrem64(i64 %d0, i64 %k64, ptr %r_slot)
+  %q_lo = {call_kw} i64 @__syn_udivrem64(i64 %d0, i64 %k64, ptr %r_slot)
   %rem = load i64, ptr %r_slot, align 8
   %q_hi_sh = shl i64 %q_hi, 32
   %q0 = or i64 %q_hi_sh, %q_lo
@@ -3679,9 +4130,9 @@ entry:
   store i64 %q, ptr %pm, align 8
   store i32 %e2_next, ptr %pe2, align 4
   ret void
-}
+}}
 
-define weak void @__syn_fmt_f64_sci(ptr %sink, double %val, i32 %prec) noinline #99 {
+define weak void @__syn_fmt_f64_sci(ptr %sink, double %val, i32 %prec){fn_as} noinline #99 {{
 entry:
   %m_slot = alloca i64, align 8
   %e2_slot = alloca i32, align 4
@@ -3692,7 +4143,7 @@ entry:
   %is_nan = icmp ugt i64 %abs_bits, 9218868437227405312
   br i1 %is_nan, label %on_nan, label %chk_inf
 on_nan:
-  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_nan)
+  {call_kw} void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_nan)
   ret void
 chk_inf:
   %is_inf = icmp eq i64 %abs_bits, 9218868437227405312
@@ -3700,10 +4151,10 @@ chk_inf:
 on_inf:
   br i1 %neg_bit, label %inf_neg, label %inf_pos
 inf_neg:
-  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
   br label %inf_pos
 inf_pos:
-  call void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_inf)
+  {call_kw} void @__syn_fmt_cstr(ptr %sink, ptr @.syn_fmt_str_inf)
   ret void
 prep:
   %p_def = icmp slt i32 %prec, 0
@@ -3713,22 +4164,22 @@ prep:
   %nz = icmp ne i64 %abs_bits, 0
   br i1 %nz, label %chk_neg, label %on_zero
 on_zero:
-  call void @__syn_fmt_putc(ptr %sink, i8 48)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 48)
   %zp = icmp sgt i32 %p, 0
   br i1 %zp, label %z_dot, label %z_exp
 z_dot:
-  call void @__syn_fmt_putc(ptr %sink, i8 46)
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 0, i32 %p)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 46)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 0, i32 %p)
   br label %z_exp
 z_exp:
-  call void @__syn_fmt_putc(ptr %sink, i8 101)
-  call void @__syn_fmt_putc(ptr %sink, i8 43)
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 0, i32 2)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 101)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 43)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 0, i32 2)
   ret void
 chk_neg:
   br i1 %neg_bit, label %put_minus, label %unpack
 put_minus:
-  call void @__syn_fmt_putc(ptr %sink, i8 45)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
   br label %unpack
 unpack:
   %es = lshr i64 %abs_bits, 52
@@ -3757,7 +4208,7 @@ big9_loop:
   %ge_b9 = icmp sge i32 %e2_b9, -33
   br i1 %ge_b9, label %big9_body, label %sml9_loop
 big9_body:
-  call void @__syn_sci_div_u32(ptr %m_slot, ptr %e2_slot, i32 1000000000)
+  {call_kw} void @__syn_sci_div_u32(ptr %m_slot, ptr %e2_slot, i32 1000000000)
   %exp_b9_next = add i32 %exp_b9, 9
   br label %big9_loop
 sml9_loop:
@@ -3766,7 +4217,7 @@ sml9_loop:
   %le_s9 = icmp sle i32 %e2_s9, -94
   br i1 %le_s9, label %sml9_body, label %big1_loop
 sml9_body:
-  call void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 1000000000)
+  {call_kw} void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 1000000000)
   %exp_s9_next = sub i32 %exp_s9, 9
   br label %sml9_loop
 big1_loop:
@@ -3780,7 +4231,7 @@ big1_loop:
   %do_b1 = or i1 %gt_m60, %eq_ge
   br i1 %do_b1, label %big1_body, label %sml1_loop
 big1_body:
-  call void @__syn_sci_div_u32(ptr %m_slot, ptr %e2_slot, i32 10)
+  {call_kw} void @__syn_sci_div_u32(ptr %m_slot, ptr %e2_slot, i32 10)
   %exp_b1_next = add i32 %exp_b1, 1
   br label %big1_loop
 sml1_loop:
@@ -3789,7 +4240,7 @@ sml1_loop:
   %lt_m63 = icmp slt i32 %e2_s1, -63
   br i1 %lt_m63, label %sml1_body, label %scale_prec
 sml1_body:
-  call void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 10)
+  {call_kw} void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 10)
   %exp_s1_next = sub i32 %exp_s1, 1
   br label %sml1_loop
 scale_prec:
@@ -3799,7 +4250,7 @@ scale_prec:
   br i1 %has_p0, label %do_scale_p, label %round_sci
 do_scale_p:
   %scale32 = trunc i64 %scale to i32
-  call void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 %scale32)
+  {call_kw} void @__syn_sci_mul_u32(ptr %m_slot, ptr %e2_slot, i32 %scale32)
   br label %round_sci
 round_sci:
   %m_fin = load i64, ptr %m_slot, align 8
@@ -3820,36 +4271,36 @@ round_sci:
   %scaled = select i1 %carried, i64 %scale, i64 %scaled0
   %exp_inc = add i32 %exp_s1, 1
   %exp10 = select i1 %carried, i32 %exp_inc, i32 %exp_s1
-  %lead64 = call i64 @__syn_udivrem64(i64 %scaled, i64 %scale, ptr %rem_slot)
+  %lead64 = {call_kw} i64 @__syn_udivrem64(i64 %scaled, i64 %scale, ptr %rem_slot)
   %frac64 = load i64, ptr %rem_slot, align 8
   %lead_c = add i64 %lead64, 48
   %lead8 = trunc i64 %lead_c to i8
-  call void @__syn_fmt_putc(ptr %sink, i8 %lead8)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %lead8)
   %has_p = icmp sgt i32 %p, 0
   br i1 %has_p, label %sci_frac, label %sci_exp
 sci_frac:
-  call void @__syn_fmt_putc(ptr %sink, i8 46)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 46)
   %f32_part = trunc i64 %frac64 to i32
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %f32_part, i32 %p)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %f32_part, i32 %p)
   br label %sci_exp
 sci_exp:
-  call void @__syn_fmt_putc(ptr %sink, i8 101)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 101)
   %eneg = icmp slt i32 %exp10, 0
   %esign = select i1 %eneg, i8 45, i8 43
-  call void @__syn_fmt_putc(ptr %sink, i8 %esign)
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %esign)
   %ne = sub i32 0, %exp10
   %ae = select i1 %eneg, i32 %ne, i32 %exp10
-  call void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %ae, i32 2)
+  {call_kw} void @__syn_fmt_u32_dec_pad(ptr %sink, i32 %ae, i32 2)
   ret void
-}
+}}
 
-define weak void @__syn_fmt_f32_sci(ptr %sink, float %val, i32 %prec) noinline #99 {
+define weak void @__syn_fmt_f32_sci(ptr %sink, float %val, i32 %prec){fn_as} noinline #99 {{
 entry:
-  %d = call double @__extendsfdf2(float %val)
-  call void @__syn_fmt_f64_sci(ptr %sink, double %d, i32 %prec)
+  %d = {call_kw} double @__extendsfdf2(float %val)
+  {call_kw} void @__syn_fmt_f64_sci(ptr %sink, double %d, i32 %prec)
   ret void
-}
+}}
 "#,
-        );
+    );
     }
 }

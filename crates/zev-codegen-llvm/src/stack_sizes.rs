@@ -34,6 +34,7 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 pub const fn target_sram_budget_bytes(target: TargetArch) -> Option<u64> {
     match target {
         TargetArch::Thumbv7mNoneEabi => Some(65_536),
+        TargetArch::Thumbv6mRp2040 => Some(270_336),
         TargetArch::Riscv32Esp32C6 => Some(524_288),
         TargetArch::AvrAtmega328p => Some(2_048),
         TargetArch::AvrAtmega4809 => Some(6_144),
@@ -74,6 +75,10 @@ impl HardwareStackProof {
                 "ARM Cortex-M3 (thumbv7m-none-eabi)",
                 "LLVM .stack_sizes + ELF call graph + 32B NVIC frame",
             ),
+            TargetArch::Thumbv6mRp2040 => (
+                "Raspberry Pi RP2040 Pico W (thumbv6m-none-eabi, NO_FLASH SRAM)",
+                "LLVM .stack_sizes + ELF call graph + 32B NVIC frame",
+            ),
             TargetArch::Riscv32Esp32C6 => (
                 "Espressif ESP32-C6 (riscv32-unknown-none-elf, rv32imac)",
                 "LLVM .stack_sizes + ELF call graph + 64B trap context frame",
@@ -101,13 +106,23 @@ impl HardwareStackProof {
 
         out.push_str("1. Linked ELF Section Footprint (/bin/llvm-size)\n");
         out.push_str("--------------------------------------------------------------------------------\n");
-        let _ = writeln!(out, "  {:<36} {:>10} B", "Flash Code (.text)", self.text_bytes);
+        let text_label = if self.target == TargetArch::Thumbv6mRp2040 {
+            "SRAM Code (.text + .rodata)"
+        } else {
+            "Flash Code (.text)"
+        };
+        let static_label = if self.target == TargetArch::Thumbv6mRp2040 {
+            "Static SRAM (.text + .data + .bss)"
+        } else {
+            "Static SRAM (.data + .bss)"
+        };
+        let _ = writeln!(out, "  {:<36} {:>10} B", text_label, self.text_bytes);
         let _ = writeln!(out, "  {:<36} {:>10} B", "Initialized SRAM (.data)", self.data_bytes);
         let _ = writeln!(out, "  {:<36} {:>10} B", "Zero-Init SRAM (.bss)", self.bss_bytes);
         let _ = writeln!(
             out,
             "  {:<36} {:>10} B",
-            "Static SRAM (.data + .bss)", self.static_sram_bytes
+            static_label, self.static_sram_bytes
         );
         out.push('\n');
 
@@ -154,10 +169,15 @@ impl HardwareStackProof {
 
         out.push_str("3. Total SRAM High-Water Budget Verdict\n");
         out.push_str("--------------------------------------------------------------------------------\n");
+        let static_sram_lbl = if self.target == TargetArch::Thumbv6mRp2040 {
+            "Static SRAM (.text + .data + .bss)"
+        } else {
+            "Static SRAM (.data + .bss)"
+        };
         let _ = writeln!(
             out,
             "  {:<36} {:>10} B",
-            "Static SRAM (.data + .bss)", self.static_sram_bytes
+            static_sram_lbl, self.static_sram_bytes
         );
         let _ = writeln!(
             out,
@@ -236,6 +256,12 @@ fn compile_ll_to_obj_with_stack_sizes(
     match opts.target {
         TargetArch::Thumbv7mNoneEabi => {
             cmd.arg("-mcpu=cortex-m3")
+                .arg("-function-sections")
+                .arg("-data-sections")
+                .arg("--stack-size-section");
+        }
+        TargetArch::Thumbv6mRp2040 => {
+            cmd.arg("-mcpu=cortex-m0plus")
                 .arg("-function-sections")
                 .arg("-data-sections")
                 .arg("--stack-size-section");
@@ -474,20 +500,37 @@ fn extract_angle_symbol(operands: &str) -> Option<&str> {
     }
 }
 
+fn parse_ll_define_header(t: &str) -> Option<String> {
+    if t.starts_with("define ") && t.ends_with('{') {
+        if let Some(at) = t.find('@') {
+            let after = &t[at + 1..];
+            if let Some(paren) = after.find('(') {
+                return Some(after[..paren].trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_ll_call_line(t: &str) -> bool {
+    t.starts_with("call ")
+        || t.starts_with("tail call ")
+        || t.starts_with("musttail call ")
+        || t.starts_with("notail call ")
+        || t.contains(" = call ")
+        || t.contains(" = tail call ")
+        || t.contains(" = musttail call ")
+        || t.contains(" = notail call ")
+}
+
 fn parse_ll_call_edges(ll_text: &str) -> BTreeMap<String, BTreeSet<String>> {
     let mut edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut cur_fn: Option<String> = None;
 
     for line in ll_text.lines() {
         let t = line.trim();
-        if t.starts_with("define ") && t.ends_with('{') {
-            if let Some(at) = t.find('@') {
-                let after = &t[at + 1..];
-                if let Some(paren) = after.find('(') {
-                    let name = after[..paren].trim().trim_matches('"').to_string();
-                    cur_fn = Some(name);
-                }
-            }
+        if let Some(name) = parse_ll_define_header(t) {
+            cur_fn = Some(name);
             continue;
         }
         if t == "}" {
@@ -497,16 +540,7 @@ fn parse_ll_call_edges(ll_text: &str) -> BTreeMap<String, BTreeSet<String>> {
         let Some(ref caller) = cur_fn else {
             continue;
         };
-        if t.starts_with(';') || t.contains(" asm ") {
-            continue;
-        }
-        let has_call = t.starts_with("call ")
-            || t.starts_with("tail call ")
-            || t.starts_with("musttail call ")
-            || t.contains(" = call ")
-            || t.contains(" = tail call ")
-            || t.contains(" = musttail call ");
-        if !has_call {
+        if t.starts_with(';') || t.contains(" asm ") || !is_ll_call_line(t) {
             continue;
         }
         // Locate `@callee(` after `call `
@@ -533,6 +567,94 @@ fn parse_ll_call_edges(ll_text: &str) -> BTreeMap<String, BTreeSet<String>> {
         }
     }
     edges
+}
+
+fn has_indirect_ll_call(after_call: &str) -> bool {
+    let bytes = after_call.as_bytes();
+    let mut i = 0usize;
+    let mut paren_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut in_quotes = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'"' {
+            in_quotes = !in_quotes;
+            i += 1;
+            continue;
+        }
+        if in_quotes {
+            i += 1;
+            continue;
+        }
+        match b {
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'{' => brace_depth += 1,
+            b'}' => brace_depth = brace_depth.saturating_sub(1),
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'@' | b'%' if paren_depth == 0 && brace_depth == 0 && bracket_depth == 0 => {
+                let mut j = i + 1;
+                let mut q = false;
+                while j < bytes.len() {
+                    let c = bytes[j] as char;
+                    if c == '"' {
+                        q = !q;
+                        j += 1;
+                    } else if q || c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let mut k = j;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'(' && j > i + 1 {
+                    return b == b'%';
+                }
+                i = j;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
+fn parse_ll_indirect_callers(ll_text: &str) -> BTreeSet<String> {
+    let mut callers = BTreeSet::new();
+    let mut cur_fn: Option<String> = None;
+
+    for line in ll_text.lines() {
+        let t = line.trim();
+        if let Some(name) = parse_ll_define_header(t) {
+            cur_fn = Some(name);
+            continue;
+        }
+        if t == "}" {
+            cur_fn = None;
+            continue;
+        }
+        let Some(ref caller) = cur_fn else {
+            continue;
+        };
+        if caller == "__syn_sched_loop" || caller == "__syn_rp2040_usb_boot_reset" {
+            continue;
+        }
+        if t.starts_with(';') || t.contains(" asm ") || !is_ll_call_line(t) {
+            continue;
+        }
+        if let Some(call_pos) = t.find("call ") {
+            if has_indirect_ll_call(&t[call_pos + 5..]) {
+                callers.insert(caller.clone());
+            }
+        }
+    }
+    callers
 }
 
 fn parse_imm_u64(tok: &str) -> Option<u64> {
@@ -586,11 +708,27 @@ fn add_edge(graph: &mut EdgeGraph, caller: &str, callee: &str, cost: u64) {
     }
 }
 
+fn avr_two_ops(ops: &str) -> Option<(&str, &str)> {
+    let clean = ops.split(';').next().unwrap_or("").trim();
+    let (lhs, rhs) = clean.split_once(',')?;
+    Some((lhs.trim(), rhs.trim()))
+}
+
+fn is_riscv_ra_target(ops: &str) -> bool {
+    let clean = ops.split(';').next().unwrap_or("").trim();
+    clean == "ra"
+        || clean == "x1"
+        || clean.ends_with("(ra)")
+        || clean.ends_with("(x1)")
+}
+
 fn analyze_avr_disasm(
     disasm: &DisasmData,
-) -> (BTreeMap<String, u64>, EdgeGraph) {
+    ll_indirect_callers: &BTreeSet<String>,
+) -> (BTreeMap<String, u64>, EdgeGraph, BTreeMap<String, u64>) {
     let mut frame_sizes = BTreeMap::new();
     let mut graph = EdgeGraph::new();
+    let mut indirect_callers: BTreeMap<String, u64> = BTreeMap::new();
 
     for (fn_name, insns) in &disasm.fn_insns {
         let mut frame_bytes = 0u64;
@@ -598,6 +736,14 @@ fn analyze_avr_disasm(
         let mut pending_subi_lo: Option<u8> = None;
         let mut pending_sbci_hi: Option<u8> = None;
         let mut saw_sp_read = false;
+
+        let mut z_tracks_sp = false;
+        let mut z_pending_delta: i64 = 0;
+        let mut z_subi_lo: Option<u8> = None;
+        let mut z_sbci_hi: Option<u8> = None;
+        let mut active_call_arg_bytes = 0u64;
+        let mut max_call_arg_bytes = 0u64;
+        let mut max_recorded_call_arg_bytes = 0u64;
 
         for (addr, mnem, ops) in insns {
             // 1. Prologue stack frame sizing
@@ -651,16 +797,95 @@ fn analyze_avr_disasm(
                 }
             }
 
-            // 2. Call & tail-call edges (skip vector table `_start` jumps)
+            // 2. Z-register (`r30:r31`) outgoing stack arg SP adjust across the entire body
+            match mnem.as_str() {
+                "in" => {
+                    if let Some((dst, src)) = avr_two_ops(ops) {
+                        if dst == "r30" && parse_imm_u64(src) == Some(0x3d) {
+                            z_tracks_sp = true;
+                            z_pending_delta = 0;
+                            z_subi_lo = None;
+                            z_sbci_hi = None;
+                        }
+                    }
+                }
+                "sbiw" if z_tracks_sp => {
+                    if let Some((dst, imm)) = avr_two_ops(ops) {
+                        if matches!(dst, "r30" | "Z" | "r31:r30") {
+                            if let Some(k) = parse_imm_u64(imm) {
+                                z_pending_delta = z_pending_delta.saturating_add(k as i64);
+                            }
+                        }
+                    }
+                }
+                "adiw" if z_tracks_sp => {
+                    if let Some((dst, imm)) = avr_two_ops(ops) {
+                        if matches!(dst, "r30" | "Z" | "r31:r30") {
+                            if let Some(k) = parse_imm_u64(imm) {
+                                z_pending_delta = z_pending_delta.saturating_sub(k as i64);
+                            }
+                        }
+                    }
+                }
+                "subi" if z_tracks_sp => {
+                    if let Some((dst, imm)) = avr_two_ops(ops) {
+                        if dst == "r30" {
+                            if let Some(v) = parse_imm_u64(imm).and_then(|x| u8::try_from(x).ok()) {
+                                z_subi_lo = Some(v);
+                            }
+                        }
+                    }
+                }
+                "sbci" if z_tracks_sp => {
+                    if let Some((dst, imm)) = avr_two_ops(ops) {
+                        if dst == "r31" {
+                            if let Some(v) = parse_imm_u64(imm).and_then(|x| u8::try_from(x).ok()) {
+                                z_sbci_hi = Some(v);
+                            }
+                        }
+                    }
+                }
+                "out" if z_tracks_sp => {
+                    if let Some((dst, src)) = avr_two_ops(ops) {
+                        if parse_imm_u64(dst) == Some(0x3d) && src == "r30" {
+                            let mut net_delta = z_pending_delta;
+                            if let (Some(lo), Some(hi)) = (z_subi_lo.take(), z_sbci_hi.take()) {
+                                let raw = ((hi as u16) << 8) | (lo as u16);
+                                net_delta = net_delta.saturating_add((raw as i16) as i64);
+                            }
+                            if net_delta >= 0 {
+                                active_call_arg_bytes =
+                                    active_call_arg_bytes.saturating_add(net_delta as u64);
+                                max_call_arg_bytes = max_call_arg_bytes.max(active_call_arg_bytes);
+                            } else {
+                                active_call_arg_bytes =
+                                    active_call_arg_bytes.saturating_sub((-net_delta) as u64);
+                            }
+                            z_tracks_sp = false;
+                            z_pending_delta = 0;
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            // 3. Call & tail-call edges (skip vector table `_start` jumps)
             if fn_name == "_start" {
                 continue;
             }
             match mnem.as_str() {
                 "call" => {
-                    if let Some(target_addr) = parse_imm_u64(ops.split_whitespace().next().unwrap_or("")) {
-                        if let Some((_, sym)) = disasm.addr_to_symbol.range(..=target_addr).next_back() {
+                    if let Some(target_addr) =
+                        parse_imm_u64(ops.split_whitespace().next().unwrap_or(""))
+                    {
+                        if let Some((_, sym)) =
+                            disasm.addr_to_symbol.range(..=target_addr).next_back()
+                        {
                             if !sym.starts_with('.') {
-                                add_edge(&mut graph, fn_name, sym, 2);
+                                let cost = 2u64.saturating_add(active_call_arg_bytes);
+                                max_recorded_call_arg_bytes =
+                                    max_recorded_call_arg_bytes.max(active_call_arg_bytes);
+                                add_edge(&mut graph, fn_name, sym, cost);
                             }
                         }
                     }
@@ -669,16 +894,45 @@ fn analyze_avr_disasm(
                     if let Some(off) = parse_signed_rel_offset(ops) {
                         if off != 0 {
                             let target_addr = ((*addr as i64) + 2 + off) as u64;
-                            if let Some((_, sym)) = disasm.addr_to_symbol.range(..=target_addr).next_back() {
+                            if let Some((_, sym)) =
+                                disasm.addr_to_symbol.range(..=target_addr).next_back()
+                            {
                                 if !sym.starts_with('.') {
-                                    add_edge(&mut graph, fn_name, sym, 2);
+                                    let cost = 2u64.saturating_add(active_call_arg_bytes);
+                                    max_recorded_call_arg_bytes =
+                                        max_recorded_call_arg_bytes.max(active_call_arg_bytes);
+                                    add_edge(&mut graph, fn_name, sym, cost);
                                 }
                             }
                         }
                     }
                 }
+                "icall" | "eicall" => {
+                    let cost = 2u64.saturating_add(active_call_arg_bytes);
+                    max_recorded_call_arg_bytes =
+                        max_recorded_call_arg_bytes.max(active_call_arg_bytes);
+                    if fn_name != "__syn_sched_loop" {
+                        indirect_callers
+                            .entry(fn_name.clone())
+                            .and_modify(|c| *c = (*c).max(cost))
+                            .or_insert(cost);
+                    }
+                }
+                "ijmp" | "eijmp" => {
+                    if fn_name != "__syn_sched_loop" && ll_indirect_callers.contains(fn_name) {
+                        let cost = active_call_arg_bytes;
+                        max_recorded_call_arg_bytes =
+                            max_recorded_call_arg_bytes.max(active_call_arg_bytes);
+                        indirect_callers
+                            .entry(fn_name.clone())
+                            .and_modify(|c| *c = (*c).max(cost))
+                            .or_insert(cost);
+                    }
+                }
                 "jmp" => {
-                    if let Some(target_addr) = parse_imm_u64(ops.split_whitespace().next().unwrap_or("")) {
+                    if let Some(target_addr) =
+                        parse_imm_u64(ops.split_whitespace().next().unwrap_or(""))
+                    {
                         if let Some(sym) = disasm.addr_to_symbol.get(&target_addr) {
                             if sym != fn_name && !sym.starts_with('.') {
                                 add_edge(&mut graph, fn_name, sym, 0);
@@ -698,12 +952,27 @@ fn analyze_avr_disasm(
                 }
                 _ => {}
             }
+
+            if matches!(
+                mnem.as_str(),
+                "ret" | "reti" | "jmp" | "rjmp" | "ijmp" | "eijmp"
+            ) {
+                active_call_arg_bytes = 0;
+                z_tracks_sp = false;
+                z_pending_delta = 0;
+                z_subi_lo = None;
+                z_sbci_hi = None;
+            }
         }
 
+        if max_call_arg_bytes > max_recorded_call_arg_bytes {
+            frame_bytes = frame_bytes
+                .saturating_add(max_call_arg_bytes - max_recorded_call_arg_bytes);
+        }
         frame_sizes.insert(fn_name.clone(), frame_bytes);
     }
 
-    (frame_sizes, graph)
+    (frame_sizes, graph, indirect_callers)
 }
 
 fn build_arm_or_rv_call_graph(
@@ -711,34 +980,73 @@ fn build_arm_or_rv_call_graph(
     disasm: &DisasmData,
     ll_text: &str,
     frame_sizes: &BTreeMap<String, u64>,
-) -> EdgeGraph {
+    ll_indirect_callers: &BTreeSet<String>,
+) -> (EdgeGraph, BTreeSet<String>) {
     let mut graph = EdgeGraph::new();
+    let mut indirect_callers = BTreeSet::new();
 
     for (fn_name, insns) in &disasm.fn_insns {
         if fn_name == "__syn_rv_vector_table" {
             continue;
         }
+        let check_indirect =
+            fn_name != "__syn_sched_loop" && fn_name != "__syn_rp2040_usb_boot_reset";
         for (_, mnem, ops) in insns {
             let is_call = match target {
-                TargetArch::Thumbv7mNoneEabi => matches!(mnem.as_str(), "bl" | "bl.w" | "blx"),
+                TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
+                    matches!(mnem.as_str(), "bl" | "bl.w" | "blx")
+                }
                 TargetArch::Riscv32Esp32C6 => {
                     matches!(mnem.as_str(), "jal" | "jalr" | "c.jal" | "c.jalr" | "call")
                 }
                 _ => false,
             };
             let is_tail_branch = match target {
-                TargetArch::Thumbv7mNoneEabi => matches!(mnem.as_str(), "b" | "b.w" | "b.n"),
-                TargetArch::Riscv32Esp32C6 => matches!(mnem.as_str(), "j" | "c.j" | "tail"),
+                TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
+                    matches!(mnem.as_str(), "b" | "b.w" | "b.n" | "bx")
+                }
+                TargetArch::Riscv32Esp32C6 => {
+                    matches!(mnem.as_str(), "j" | "c.j" | "jr" | "c.jr" | "tail")
+                }
                 _ => false,
             };
             if is_call {
                 if let Some(sym) = extract_angle_symbol(ops) {
                     add_edge(&mut graph, fn_name, sym, 0);
+                } else if check_indirect {
+                    match target {
+                        TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040
+                            if mnem == "blx" =>
+                        {
+                            indirect_callers.insert(fn_name.clone());
+                        }
+                        TargetArch::Riscv32Esp32C6
+                            if matches!(mnem.as_str(), "jalr" | "c.jalr")
+                                && !is_riscv_ra_target(ops) =>
+                        {
+                            indirect_callers.insert(fn_name.clone());
+                        }
+                        _ => {}
+                    }
                 }
             } else if is_tail_branch {
                 if let Some(sym) = extract_angle_symbol(ops) {
                     if sym != fn_name && !sym.starts_with('.') && disasm.elf_symbols.contains(sym) {
                         add_edge(&mut graph, fn_name, sym, 0);
+                    }
+                } else if check_indirect && ll_indirect_callers.contains(fn_name) {
+                    let op_clean = ops.split(';').next().unwrap_or("").trim();
+                    let is_indirect_tail = match target {
+                        TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
+                            mnem == "bx" && op_clean != "lr"
+                        }
+                        TargetArch::Riscv32Esp32C6 => {
+                            matches!(mnem.as_str(), "jr" | "c.jr") && !is_riscv_ra_target(op_clean)
+                        }
+                        _ => false,
+                    };
+                    if is_indirect_tail {
+                        indirect_callers.insert(fn_name.clone());
                     }
                 }
             }
@@ -758,7 +1066,7 @@ fn build_arm_or_rv_call_graph(
         }
     }
 
-    graph
+    (graph, indirect_callers)
 }
 
 fn walk_worst_stack(
@@ -835,7 +1143,7 @@ fn walk_worst_stack(
     res
 }
 
-/// Compile `mir` for `opts.target` (`Thumbv7mNoneEabi`, `Riscv32Esp32C6`, `AvrAtmega328p`, or `AvrAtmega4809`)
+/// Compile `mir` for `opts.target` (`Thumbv7mNoneEabi`, `Thumbv6mRp2040`, `Riscv32Esp32C6`, `AvrAtmega328p`, or `AvrAtmega4809`)
 /// and prove worst-case hardware single-stack + `.data`/`.bss` SRAM high-water mark against target limits.
 pub fn analyze_hardware_stack_high_water(
     mir: &MirModule,
@@ -844,7 +1152,7 @@ pub fn analyze_hardware_stack_high_water(
     let sram_budget_bytes = target_sram_budget_bytes(opts.target).ok_or_else(|| {
         CodegenError::new(
             "stack-sizes",
-            "hardware stack high-water proof only supports bare-metal targets (`cortex-m3`, `esp32c6`, `avr`, `nano-every`)",
+            "hardware stack high-water proof only supports bare-metal targets (`cortex-m3`, `rp2040`, `esp32c6`, `avr`, `nano-every`)",
         )
     })?;
 
@@ -868,44 +1176,85 @@ pub fn analyze_hardware_stack_high_water(
     link_obj_to_elf(&obj_path, &ld_path, &elf_path)?;
 
     let (text_bytes, data_bytes, bss_bytes) = inspect_elf_text_data_bss(&elf_path)?;
-    let static_sram_bytes = data_bytes.saturating_add(bss_bytes);
+    let static_sram_bytes = if opts.target == TargetArch::Thumbv6mRp2040 {
+        text_bytes.saturating_add(data_bytes).saturating_add(bss_bytes)
+    } else {
+        data_bytes.saturating_add(bss_bytes)
+    };
 
     let disasm_text = run_objdump_disasm(&elf_path)?;
     let disasm = parse_objdump_disassembly(&disasm_text);
     let ll_text = fs::read_to_string(&used_ll_path).unwrap_or(raw_ll);
+    let ll_indirect_callers = parse_ll_indirect_callers(&ll_text);
 
-    let (mut frame_sizes, mut graph) = match opts.target {
-        TargetArch::Thumbv7mNoneEabi | TargetArch::Riscv32Esp32C6 => {
-            let readobj_raw = run_readobj_stack_sizes(&obj_path)?;
-            let mut frames = parse_llvm_readobj_stack_sizes(&readobj_raw);
-            if opts.target == TargetArch::Riscv32Esp32C6 {
-                for (sym, insns) in &disasm.fn_insns {
-                    if sym.starts_with("__syn_rv_irq_tramp_") || sym == "__syn_esp32c6_trap_entry" {
-                        let parsed_alloc = extract_esp32c6_tramp_sp_alloc(insns).unwrap_or(64);
-                        frames
-                            .entry(sym.clone())
-                            .and_modify(|v| {
-                                if *v == 0 {
-                                    *v = parsed_alloc;
-                                }
-                            })
-                            .or_insert(parsed_alloc);
-                    }
+    let (mut frame_sizes, mut graph, mut indirect_callers) = if opts.target.is_avr() {
+        analyze_avr_disasm(&disasm, &ll_indirect_callers)
+    } else {
+        let readobj_raw = run_readobj_stack_sizes(&obj_path)?;
+        let mut frames = parse_llvm_readobj_stack_sizes(&readobj_raw);
+        if opts.target == TargetArch::Riscv32Esp32C6 {
+            for (sym, insns) in &disasm.fn_insns {
+                if sym.starts_with("__syn_rv_irq_tramp_") || sym == "__syn_esp32c6_trap_entry" {
+                    let parsed_alloc = extract_esp32c6_tramp_sp_alloc(insns).unwrap_or(64);
+                    frames
+                        .entry(sym.clone())
+                        .and_modify(|v| {
+                            if *v == 0 {
+                                *v = parsed_alloc;
+                            }
+                        })
+                        .or_insert(parsed_alloc);
                 }
             }
-            let g = build_arm_or_rv_call_graph(opts.target, &disasm, &ll_text, &frames);
-            (frames, g)
         }
-        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => analyze_avr_disasm(&disasm),
-        TargetArch::HostX86_64Linux => unreachable!(),
+        let (g, disasm_ind) = build_arm_or_rv_call_graph(
+            opts.target,
+            &disasm,
+            &ll_text,
+            &frames,
+            &ll_indirect_callers,
+        );
+        let ind_map = disasm_ind.into_iter().map(|c| (c, 0u64)).collect();
+        (frames, g, ind_map)
     };
 
+    // Merge indirect callers observed in `.ll` + disassembly, and wire conservative edges
+    // to non-entry, non-coroutine user functions (`__syn_fn_*` excluding `__syn_fn_step_*`) + `extern "C"`.
+    let step_edge_cost = if opts.target.is_avr() { 2 } else { 0 };
+    for caller in &ll_indirect_callers {
+        if caller != "__syn_sched_loop"
+            && caller != "__syn_rp2040_usb_boot_reset"
+            && (disasm.elf_symbols.contains(caller) || frame_sizes.contains_key(caller))
+        {
+            indirect_callers
+                .entry(caller.clone())
+                .or_insert(step_edge_cost);
+        }
+    }
+    if !indirect_callers.is_empty() {
+        let mut indirect_targets = BTreeSet::new();
+        for sym in disasm.elf_symbols.iter().chain(frame_sizes.keys()) {
+            if sym.starts_with("__syn_fn_") && !sym.starts_with("__syn_fn_step_") {
+                indirect_targets.insert(sym.clone());
+            }
+        }
+        for ext in &mir.extern_fns {
+            let ext_sym = sanitize_ident(&ext.name);
+            if disasm.elf_symbols.contains(&ext_sym) || frame_sizes.contains_key(&ext_sym) {
+                indirect_targets.insert(ext_sym);
+            }
+        }
+        for (caller, cost) in &indirect_callers {
+            if caller == "__syn_sched_loop" || caller == "__syn_rp2040_usb_boot_reset" {
+                continue;
+            }
+            for target in &indirect_targets {
+                add_edge(&mut graph, caller, target, *cost);
+            }
+        }
+    }
+
     // Wire indirect task-step dispatch edges from `__syn_sched_loop` -> `__syn_task_step_<bp>`
-    let step_edge_cost = if opts.target.is_avr() {
-        2
-    } else {
-        0
-    };
     let mut seen_bps = BTreeSet::new();
     for sp in &mir.spawned_tasks {
         if seen_bps.insert(sp.blueprint_name.clone()) {
@@ -981,7 +1330,7 @@ pub fn analyze_hardware_stack_high_water(
     // 3. Worst-case preempting ISR stack (including hardware interrupt frame overhead)
     let (worst_isr_stack_bytes, worst_isr_name, worst_isr_path, isr_hw_overhead_bytes) =
         match opts.target {
-            TargetArch::Thumbv7mNoneEabi => {
+            TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
                 let hw_frame = 32u64;
                 let mut candidates = Vec::new();
                 for st_sym in ["SysTick_Handler", "__syn_systick_isr"] {
@@ -1070,11 +1419,6 @@ pub fn analyze_hardware_stack_high_water(
             TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
                 let hw_frame = 2u64;
                 let mut candidates = Vec::new();
-                if disasm.elf_symbols.contains("__syn_avr_systick_isr")
-                    || frame_sizes.contains_key("__syn_avr_systick_isr")
-                {
-                    candidates.push("__syn_avr_systick_isr".to_string());
-                }
                 for v in &mir.irq_vectors {
                     let avr_vec = format!("__syn_avr_vec_{}", v.irq_num);
                     let raw_vec = format!("__syn_vec_irq_{}", v.irq_num);
@@ -1242,7 +1586,8 @@ StackSizes [
      210: 08 95        	ret
 "#;
         let disasm = parse_objdump_disassembly(sample_disasm);
-        let (frames, graph) = analyze_avr_disasm(&disasm);
+        let (frames, graph, indirect) = analyze_avr_disasm(&disasm, &BTreeSet::new());
+        assert!(indirect.is_empty());
         // __syn_avr_vec_11: 3 pushes (3 B) + rcall .+0 (2 B) = 5 B
         assert_eq!(frames.get("__syn_avr_vec_11"), Some(&5));
         // __syn_fn_helper: 2 pushes (2 B) + sbiw 0x14 (20 B) = 22 B
@@ -1299,5 +1644,132 @@ StackSizes [
         assert!(has_cycle);
         assert_eq!(total, 40);
         assert!(path.last().unwrap().contains("[cycle]"));
+    }
+
+    #[test]
+    fn avr_z_register_outgoing_stack_args_and_icall_detection() {
+        let sample_disasm = r#"
+00000100 <__syn_fn_caller>:
+     100: cf 93        	push	r28
+     102: df 93        	push	r29
+     104: ed b7        	in	r30, 0x3d
+     106: fe b7        	in	r31, 0x3e
+     108: 38 97        	sbiw	r30, 0x08
+     10a: ef bf        	out	0x3d, r30
+     10c: 0e 94 00 01  	call	0x200 <__syn_fn_big>
+     110: ed b7        	in	r30, 0x3d
+     112: 38 96        	adiw	r30, 0x08
+     114: ef bf        	out	0x3d, r30
+     116: ed b7        	in	r30, 0x3d
+     118: e6 50        	subi	r30, 0x06
+     11a: f0 40        	sbci	r31, 0x00
+     11c: ef bf        	out	0x3d, r30
+     11e: 09 95        	icall
+     120: 08 95        	ret
+     122: 0b d0        	rcall	.+22
+
+0000013a <__syn_fn_leaf>:
+     13a: 08 95        	ret
+
+00000140 <__syn_fn_uncalled_sp>:
+     140: ed b7        	in	r30, 0x3d
+     142: 3c 97        	sbiw	r30, 0x0c
+     144: ef bf        	out	0x3d, r30
+     146: 08 95        	ret
+
+00000200 <__syn_fn_big>:
+     200: 08 95        	ret
+"#;
+        let disasm = parse_objdump_disassembly(sample_disasm);
+        let (frames, graph, indirect) = analyze_avr_disasm(&disasm, &BTreeSet::new());
+
+        assert_eq!(frames.get("__syn_fn_caller"), Some(&2));
+        assert_eq!(frames.get("__syn_fn_uncalled_sp"), Some(&12));
+        // `call 0x200` has 2B return addr + 8B outgoing stack args; `rcall` after `ret` resets back to 2B.
+        assert_eq!(
+            graph.get("__syn_fn_caller"),
+            Some(&vec![
+                ("__syn_fn_big".to_string(), 10),
+                ("__syn_fn_leaf".to_string(), 2),
+            ])
+        );
+        // `icall` after `subi 6`/`sbci 0` carries 2 + 6 = 8B cost.
+        assert_eq!(indirect.get("__syn_fn_caller"), Some(&8));
+    }
+
+    #[test]
+    fn indirect_call_detection_for_ll_thumb_and_riscv() {
+        let ll = r#"
+define void @__syn_fn_dispatch(ptr %cb) {
+entry:
+  call void %cb()
+  ret void
+}
+define void @__syn_fn_asm_only() {
+entry:
+  call void asm sideeffect "nop", ""()
+  ret void
+}
+define void @__syn_sched_loop(ptr %step) {
+entry:
+  call void %step(ptr null)
+  ret void
+}
+define void @__syn_rp2040_usb_boot_reset(ptr %rom_fn) {
+entry:
+  call void %rom_fn()
+  ret void
+}
+"#;
+        let ll_indirect = parse_ll_indirect_callers(ll);
+        assert!(ll_indirect.contains("__syn_fn_dispatch"));
+        assert!(!ll_indirect.contains("__syn_fn_asm_only"));
+        assert!(!ll_indirect.contains("__syn_sched_loop"));
+        assert!(!ll_indirect.contains("__syn_rp2040_usb_boot_reset"));
+
+        let thumb_disasm = r#"
+00000100 <__syn_fn_dispatch>:
+     100: 98 47        	blx	r3
+     102: 70 47        	bx	lr
+00000110 <__syn_fn_tail>:
+     110: 18 47        	bx	r3
+00000120 <__syn_sched_loop>:
+     120: 98 47        	blx	r3
+     122: 70 47        	bx	lr
+"#;
+        let mut ll_thumb = ll_indirect.clone();
+        ll_thumb.insert("__syn_fn_tail".to_string());
+        let thumb_parsed = parse_objdump_disassembly(thumb_disasm);
+        let (_, thumb_indirect) = build_arm_or_rv_call_graph(
+            TargetArch::Thumbv7mNoneEabi,
+            &thumb_parsed,
+            "",
+            &BTreeMap::new(),
+            &ll_thumb,
+        );
+        assert!(thumb_indirect.contains("__syn_fn_dispatch"));
+        assert!(thumb_indirect.contains("__syn_fn_tail"));
+        assert!(!thumb_indirect.contains("__syn_sched_loop"));
+
+        let rv_disasm = r#"
+42000100 <__syn_fn_dispatch>:
+42000100: 000500e7     	jalr	a0
+42000104: 00008067     	ret
+42000110 <__syn_fn_ret_only>:
+42000110: 00008067     	jalr	ra
+42000120 <__syn_fn_tail>:
+42000120: 00028067     	jr	t0
+"#;
+        let rv_parsed = parse_objdump_disassembly(rv_disasm);
+        let (_, rv_indirect) = build_arm_or_rv_call_graph(
+            TargetArch::Riscv32Esp32C6,
+            &rv_parsed,
+            "",
+            &BTreeMap::new(),
+            &ll_thumb,
+        );
+        assert!(rv_indirect.contains("__syn_fn_dispatch"));
+        assert!(rv_indirect.contains("__syn_fn_tail"));
+        assert!(!rv_indirect.contains("__syn_fn_ret_only"));
     }
 }

@@ -4172,7 +4172,7 @@ int main(void) {
             "missing freestanding macro:\n{c_code}"
         );
         assert!(
-            c_code.contains("static SYN_UNUSED volatile uint8_t __zev_mmio_buf_UART1[20] __attribute__((aligned(4)));"),
+            c_code.contains("static SYN_UNUSED SYN_DMA_ALIGN volatile uint8_t __zev_mmio_buf_UART1[20];"),
             "missing sim buffer:\n{c_code}"
         );
 
@@ -5418,6 +5418,7 @@ fn main() {
     fn fmt_ring_wrap_single_wake_boost_and_truncation_asan() {
         let src = r#"
 byte_ring<16> tx;
+byte_ring<16> tx2;
 signal sync;
 
 usize write_fmt_view(*byte_ring r, u16 v) error FmtErr {
@@ -5428,7 +5429,7 @@ usize write_fmt_view(*byte_ring r, u16 v) error FmtErr {
 
 task reader() {
     set_priority(@low);
-    // 1. Wait on empty ring while writer calls multi-chunk `fmt_ring(..., boost: @high)`:
+    // 1. Wait on empty `tx` while `writer` calls multi-chunk `fmt_ring(..., boost: @high)`:
     //    must wake ONCE at end with all 8 bytes ("X=2A Y=7") and boosted prio=1.
     sync.notify();
     []u8 cw = tx.wait_read(timeout: 20ms) catch {
@@ -5442,28 +5443,28 @@ task reader() {
     tx.consume(cw_len);
     println(f"FMT_WAKE len={cw_len} b0={first_b} prio={prio}");
 
-    // 2. Wrap-around test: push 11 bytes then pop 10 -> head=10, tail=11, count=1 ('A').
+    // 2. Wrap-around test on `tx2`: push 11 bytes then pop 10 -> head=10, tail=11, count=1 ('A').
     //    fmt_ring("V=1A2B", 6 bytes) wraps 5 bytes (11..16) + 1 byte (0..1)!
-    assert(tx.push("0123456789A") == 11);
+    assert(tx2.push("0123456789A") == 11);
     u8 trash[10];
-    assert(tx.pop(trash) == 10);
-    usize w = write_fmt_view(&tx, 0x1A2B) catch { 0 };
+    assert(tx2.pop(trash) == 10);
+    usize w = write_fmt_view(&tx2, 0x1A2B) catch { 0 };
     assert(w == 6);
 
-    []u8 c1 = tx.read_slice();
+    []u8 c1 = tx2.read_slice();
     usize c1_len = c1.len;
     assert(c1_len == 6);
-    tx.consume(c1_len);
-    []u8 c2 = tx.read_slice();
+    tx2.consume(c1_len);
+    []u8 c2 = tx2.read_slice();
     assert(c2.len == 1);
     u8 last_b = c2[0];
-    tx.consume(c2.len);
+    tx2.consume(c2.len);
     println(f"FMT_WRAP c1len={c1_len} last={last_b}");
 
-    // 3. Overflow test: prefill 12 bytes -> 4 free bytes left, then format 8 bytes -> Truncated with partial == 4
-    assert(tx.push("123456789012") == 12);
-    usize partial_w = fmt_ring(&tx, f"ABCD1234") catch (FmtErr e, usize pw) {
-        println(f"FMT_TRUNC partial={pw} total_len={tx.len()}");
+    // 3. Overflow test on `tx2`: prefill 12 bytes -> 4 free bytes left, then format 8 bytes -> Truncated with partial == 4
+    assert(tx2.push("123456789012") == 12);
+    usize partial_w = fmt_ring(&tx2, f"ABCD1234") catch (FmtErr e, usize pw) {
+        println(f"FMT_TRUNC partial={pw} total_len={tx2.len()}");
         sys.exit(0);
     };
     println(f"UNEXPECTED_OK={partial_w}");
@@ -5765,6 +5766,549 @@ fn main() {
         assert!(
             stdout.contains("BUNDLE_OK b0=90 st=77"),
             "stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn b_h2_subsystem_ping_pong_bits_signal_init_and_dma_safe_asan() {
+        let src = r#"
+struct InnerPool {
+    pool<u8, 2> np;
+}
+struct DmaSub {
+    InnerPool inner;
+    pool<u8, 2> op;
+    ping_pong<u8, 8> pp;
+}
+struct SigOnlySub {
+    signal s;
+}
+
+ping_pong<u8, 8> top_pp;
+@dma_safe DmaSub dsub;
+DmaSub psub;
+SigOnlySub sigsub;
+
+task driver() {
+    set_priority(@low);
+    assert(sys.sleep_depth() == 2);
+
+    // 1. Subsystem ping_pong bits must be distinct from top_pp and from each other!
+    top_pp.start();
+    dsub.pp.start();
+    psub.pp.start();
+    assert(sys.sleep_depth() == 1);
+    top_pp.stop();
+    assert(sys.sleep_depth() == 1);
+    dsub.pp.stop();
+    assert(sys.sleep_depth() == 1);
+    psub.pp.stop();
+    assert(sys.sleep_depth() == 2);
+
+    // 2. SigOnlySub.s must initialize boost_prio to SYN_NO_BOOST (0xFF), NOT 0!
+    sigsub.s.notify();
+    sigsub.s.wait();
+    assert(sys.current_prio() == 3);
+
+    // 3. @dma_safe DmaSub dsub vs non-dma DmaSub psub sharing syn_struct_DmaSub:
+    //    NO ASan global-buffer-overflow, dsub clamps sleep depth -> 1, psub keeps -> 2!
+    Lease<u8> p0 = psub.op.try_alloc() catch { assert(false); sys.exit(1); };
+    Lease<u8> p1 = psub.inner.np.try_alloc() catch { assert(false); sys.exit(1); };
+    assert(p0.addr() % 32 == 0);
+    assert(p1.addr() % 32 == 0);
+    assert(sys.sleep_depth() == 2);
+    p0.release();
+    p1.release();
+
+    Lease<u8> d0 = dsub.op.try_alloc() catch { assert(false); sys.exit(1); };
+    assert(sys.sleep_depth() == 1);
+    Lease<u8> d1 = dsub.inner.np.try_alloc() catch { assert(false); sys.exit(1); };
+    assert(d0.addr() % 32 == 0);
+    assert(d1.addr() % 32 == 0);
+    assert(sys.sleep_depth() == 1);
+    d0.release();
+    assert(sys.sleep_depth() == 1);
+    d1.release();
+    assert(sys.sleep_depth() == 2);
+
+    println("BH2_ALL_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    spawn driver() @low;
+}
+"#;
+        let (_mir, c_code, stdout) = run_zev_c_sim_and_freestanding("b_h2_subsys_dma_asan", src);
+        assert!(stdout.contains("BH2_ALL_OK"), "stdout:\n{stdout}");
+        assert!(c_code.contains("(1U << 0U)") && c_code.contains("(1U << 1U)") && c_code.contains("(1U << 2U)"));
+        assert!(c_code.contains("SYN_NO_BOOST"));
+        assert!(c_code.contains("static SYN_UNUSED SYN_DMA_ALIGN syn_struct_DmaSub __zev_subsys_dsub"));
+    }
+
+    #[test]
+    fn b_h3_wait_read_helper_fn_and_main_tail_asan() {
+        let src = r#"
+byte_ring<16> r1;
+byte_ring<16> r2;
+
+usize read_once(*byte_ring r) {
+    []u8 ch = r.wait_read();
+    usize n = ch.len;
+    assert(n > 0);
+    r.consume(n);
+    return n;
+}
+
+task sender() {
+    sys.delay(1ms);
+    assert(r1.push("ABCD") == 4);
+    sys.delay(1ms);
+    assert(r2.push("WXYZ!") == 5);
+    loop { sys.delay(20ms); }
+}
+
+task helper_caller() {
+    usize n = read_once(&r1);
+    assert(n == 4);
+    println(f"BH3_HELPER={n}");
+    loop { sys.delay(20ms); }
+}
+
+fn main() {
+    spawn sender() @normal;
+    spawn helper_caller() @normal;
+    []u8 mch = r2.wait_read();
+    usize mn = mch.len;
+    r2.consume(mn);
+    assert(mn == 5);
+    println(f"BH3_MAIN={mn}");
+    sys.exit(0);
+}
+"#;
+        let (_mir, _c, stdout) = run_zev_c_sim_and_freestanding("b_h3_wait_read_asan", src);
+        assert!(stdout.contains("BH3_HELPER=4"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BH3_MAIN=5"), "stdout:\n{stdout}");
+    }
+
+    #[test]
+    fn b_h4_boost_restored_across_signal_pool_loops_and_stolen_wakeups_asan() {
+        let src = r#"
+signal sig_a;
+signal sig_b;
+pool<u8, 1> p1;
+inbox<u32, 4> q_stolen;
+inbox<u32, 4> q_turn;
+signal step_sig;
+signal gate_sig;
+
+fn delay_preserving_helper() {
+    assert(sys.current_prio() == 0);
+    sys.delay(1ms);
+    assert(sys.current_prio() == 0);
+}
+
+task victim_sig_and_pool() {
+    set_priority(@low);
+    // 1. Back-to-back signal.wait(): first boosted @critical, second unboosted -> restored to @low (3)
+    sig_a.wait();
+    assert(sys.current_prio() == 0);
+    sig_a.wait();
+    assert(sys.current_prio() == 3);
+
+    // 2. Back-to-back pool.alloc(): first boosted @critical, second unboosted -> restored to @low (3)
+    Lease<u8> l1 = p1.alloc();
+    assert(sys.current_prio() == 0);
+    l1.release();
+    sig_a.wait();
+    Lease<u8> l2 = p1.alloc();
+    assert(sys.current_prio() == 3);
+    l2.release();
+
+    // 3. Signal wakeup with boost followed by top-level non-receiving loop -> MUST restore to @low (3)
+    sig_b.wait();
+    assert(sys.current_prio() == 0);
+    step_sig.notify();
+    loop {
+        assert(sys.current_prio() == 3);
+        println("BH4_PRELOOP_RESTORED");
+        break;
+    }
+
+    // 4. Signal wakeup followed by `loop every` -> MUST restore to @low (3)
+    sig_b.wait();
+    assert(sys.current_prio() == 0);
+    loop every 2ms {
+        assert(sys.current_prio() == 3);
+        println("BH4_EVERY_RESTORED");
+        break;
+    }
+    step_sig.notify();
+
+    // 5. Active event turn via q_turn.recv() preserves boost across helper + delay, then restores on next iter
+    for (u32 iter in 0..2) {
+        u32 v = q_turn.recv();
+        if (v == 1) {
+            assert(sys.current_prio() == 0);
+            delay_preserving_helper();
+            assert(sys.current_prio() == 0);
+        } else {
+            assert(sys.current_prio() == 3);
+        }
+    }
+    println("BH4_TURN_OK");
+    step_sig.notify();
+    loop { sys.delay(20ms); }
+}
+
+task victim_stolen_timeout() {
+    set_priority(@low);
+    gate_sig.wait();
+    // Block on q_stolen with timeout; `thief` will steal the item after waking us with boost!
+    // Timeout MUST restore prio back to @low (3).
+    u32 r = q_stolen.recv(timeout: 3ms) or 999;
+    assert(r == 999);
+    assert(sys.current_prio() == 3);
+    println("BH4_STOLEN_RESTORED");
+    step_sig.notify();
+    loop { sys.delay(20ms); }
+}
+
+task thief_and_driver() {
+    // Hold p1 before sleeping so victim blocks cleanly on p1.alloc() after step 1
+    Lease<u8> hold = p1.try_alloc() catch { assert(false); sys.exit(1); };
+    sys.delay(1ms);
+    // Drive step 1
+    sig_a.notify(boost: @critical);
+    sys.delay(1ms);
+    sig_a.notify();
+    sys.delay(1ms);
+
+    // Drive step 2
+    hold.release(boost: @critical);
+    sys.delay(1ms);
+    Lease<u8> hold2 = p1.try_alloc() catch { assert(false); sys.exit(1); };
+    sig_a.notify();
+    sys.delay(1ms);
+    hold2.release();
+    sys.delay(1ms);
+
+    // Drive step 3
+    sig_b.notify(boost: @critical);
+    step_sig.wait();
+
+    // Drive step 4
+    sig_b.notify(boost: @critical);
+    step_sig.wait();
+
+    // Drive stolen wakeup: let victim arm q_stolen.recv(timeout: 3ms), post with @critical boost, then steal!
+    gate_sig.notify();
+    sys.delay(1ms);
+    q_stolen.post(77, boost: @critical);
+    u32 stolen = q_stolen.try_recv() catch { 0 };
+    assert(stolen == 77);
+    step_sig.wait();
+
+    // Drive step 5
+    q_turn.post(1, boost: @critical);
+    sys.delay(2ms);
+    q_turn.post(2);
+    step_sig.wait();
+    println("BH4_ALL_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    spawn victim_sig_and_pool() @low;
+    spawn victim_stolen_timeout() @low;
+    spawn thief_and_driver() @normal;
+}
+"#;
+        let (_mir, _c, stdout) = run_zev_c_sim_and_freestanding("b_h4_boost_asan", src);
+        assert!(stdout.contains("BH4_PRELOOP_RESTORED"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BH4_EVERY_RESTORED"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BH4_STOLEN_RESTORED"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BH4_TURN_OK"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BH4_ALL_OK"), "stdout:\n{stdout}");
+    }
+
+    #[test]
+    fn b_m1_pool_multi_waiter_priority_and_timeout_safety_asan() {
+        let src = r#"
+pool<u32, 1> shared_pool;
+signal start_sig;
+watch<u32> wake_order = 0;
+
+task low_timeout_waiter() {
+    set_priority(@low);
+    // 1. Block on exhausted pool with short timeout while high_waiter is also blocked!
+    bool timed_out = false;
+    Lease<u32> l = shared_pool.alloc(timeout: 2ms) catch {
+        timed_out = true;
+        // Dummy unreachable path won't run if we return or exit, so handle directly:
+        println("BM1_LOW_TO");
+        loop { sys.delay(50ms); }
+    };
+    assert(!timed_out);
+    l.release();
+    loop { sys.delay(50ms); }
+}
+
+task low_perm_waiter() {
+    set_priority(@low);
+    start_sig.wait();
+    // Blocks BEFORE high_perm_waiter; must wake SECOND!
+    Lease<u32> l = shared_pool.alloc();
+    u32 ord = wake_order.read() + 1;
+    wake_order.publish(ord);
+    assert(ord == 2);
+    l.release();
+    println(f"BM1_LOW_PERM={ord}");
+    loop { sys.delay(50ms); }
+}
+
+task high_waiter() {
+    set_priority(@high);
+    // 1. Blocked alongside low_timeout_waiter; low_timeout_waiter times out at 2ms,
+    //    cancel_wait MUST NOT clobber waiting state for high_waiter!
+    Lease<u32> l1 = shared_pool.alloc();
+    assert(sys.current_prio() == 0);
+    println("BM1_HIGH_WOKE_1");
+    l1.release();
+
+    // 2. Delay past t=5 when pool_holder re-acquires h2 and wakes low_perm_waiter first
+    sys.delay(2ms);
+    Lease<u32> l2 = shared_pool.alloc();
+    u32 ord = wake_order.read() + 1;
+    wake_order.publish(ord);
+    assert(ord == 1);
+    println(f"BM1_HIGH_PERM={ord}");
+    l2.release();
+    sys.delay(2ms);
+    assert(wake_order.read() == 2);
+    println("BM1_ALL_OK");
+    sys.exit(0);
+}
+
+task pool_holder() {
+    Lease<u32> h1 = shared_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    // Let low_timeout_waiter time out at 2ms, then release at 4ms with @critical boost!
+    sys.delay(4ms);
+    h1.release(boost: @critical);
+
+    // Wait 1ms for high_waiter to consume & release l1, then grab h2 and wake low_perm_waiter first
+    sys.delay(1ms);
+    Lease<u32> h2 = shared_pool.try_alloc() catch { assert(false); sys.exit(1); };
+    start_sig.notify();
+    // Both low_perm_waiter (at t=5) and high_waiter (at t=6) block; release at t=9 -> high_waiter wakes first!
+    sys.delay(4ms);
+    h2.release();
+    loop { sys.delay(50ms); }
+}
+
+fn main() {
+    spawn pool_holder() @critical;
+    spawn low_timeout_waiter() @low;
+    spawn high_waiter() @high;
+    spawn low_perm_waiter() @low;
+}
+"#;
+        let (_mir, _c, stdout) = run_zev_c_sim_and_freestanding("b_m1_pool_multi_waiter_asan", src);
+        assert!(stdout.contains("BM1_LOW_TO"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BM1_HIGH_WOKE_1"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BM1_HIGH_PERM=1"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BM1_LOW_PERM=2"), "stdout:\n{stdout}");
+        assert!(stdout.contains("BM1_ALL_OK"), "stdout:\n{stdout}");
+    }
+
+    #[test]
+    fn b_m2_and_l_h1_sticky_truncation_and_mixed_sign_shr_asan() {
+        let src = r#"
+const u32 C_RSHIFT = (0x80000000 as u32) >> (4 as i32);
+const i32 C_ARITH = (-16 as i32) >> (2 as u32);
+
+byte_ring<16> ring;
+irq IRQ_DRAIN = 4;
+watch<u32> drain_stage = 0;
+watch<u32> verified_len = 99;
+watch<u8> verified_b8 = 0;
+watch<u8> verified_b11 = 0;
+
+u32 drain_mid_chunk() {
+    sys.pend_irq(IRQ_DRAIN);
+    return 1;
+}
+
+isr drain_isr(*byte_ring r) {
+    if (drain_stage.read() == 0) {
+        r.consume(4);
+        drain_stage.publish(1);
+    } else {
+        u32 cur_len = r.len() as u32;
+        verified_len.publish(cur_len);
+        u8 out_b[12];
+        assert(r.pop(out_b) == 12);
+        // Expected contents: "456789AA1234" (NOT "456789AA12341ZZZZ")
+        assert(out_b[6] == 65 && out_b[8] == 49 && out_b[11] == 52);
+        verified_b8.publish(out_b[8]);
+        verified_b11.publish(out_b[11]);
+    }
+}
+
+fn main() {
+    IRQ_DRAIN.attach(drain_isr(&ring));
+
+    // L-H1 / B-M2: mixed-sign shifts (const + runtime)
+    i32 rt_sh = 4;
+    u32 rt_u = 0x80000000 as u32;
+    u32 rt_res = rt_u >> rt_sh;
+    u8 sh8 = 8;
+    u32 shl_res = 1 << sh8;
+    assert(C_RSHIFT == 0x08000000);
+    assert(C_ARITH == -4);
+    assert(rt_res == 0x08000000);
+    assert(shl_res == 256);
+
+    // B-M2: Multi-chunk fmt_ring where chunk 1 ("AA") fits, chunk 2 ("123456") truncates (fills remaining 4B),
+    //       chunk 3 runs `drain_mid_chunk()` which drains 4B in an ISR, and chunk 4 ("ZZZZ") MUST NOT
+    //       be written after dropped bytes because `s->truncated` is sticky!
+    assert(ring.push("0123456789") == 10); // 6 bytes free
+    bool got_err = false;
+    usize pw_out = 0;
+    usize w = fmt_ring(&ring, f"AA{123456}{drain_mid_chunk()}ZZZZ") catch (FmtErr e, usize pw) {
+        got_err = true;
+        pw_out = pw;
+        0
+    };
+    assert(got_err);
+    assert(pw_out == 6);
+    assert(w == 0);
+    // Remaining in ring: 10 + 6 - 4(ISR drained) == 12 bytes ("456789AA1234", NOT "456789AA12341ZZZZ"!)
+    sys.pend_irq(IRQ_DRAIN);
+    assert(verified_len.read() == 12);
+    assert(verified_b8.read() == 49 && verified_b11.read() == 52);
+    println("BM2_LH1_ALL_OK");
+    sys.exit(0);
+}
+"#;
+        let (_mir, _c, stdout) = run_zev_c_sim_and_freestanding("b_m2_l_h1_asan", src);
+        assert!(stdout.contains("BM2_LH1_ALL_OK"), "stdout:\n{stdout}");
+    }
+
+    #[test]
+    fn b_m4_freestanding_mmio_clamp_boot_delay_wfi_and_dma_align() {
+        let src = r#"
+mmio Regs @ 0x40020000 {
+    @rw [4]u32 arr @ 0x00;
+}
+
+usize make_oob_idx(usize base) {
+    return base + 90;
+}
+
+fn boot_wait() {
+    sys.delay(2ms);
+}
+
+fn main() {
+    boot_wait();
+    usize idx = make_oob_idx(9);
+    Regs.arr[idx] = 0xCAFEBABE;
+    u32 v = Regs.arr[idx];
+    assert(v == 0xCAFEBABE);
+    assert(Regs.arr[0] == 0xCAFEBABE);
+    println("BM4_OK");
+    sys.exit(0);
+}
+"#;
+        let (_mir, c_code, stdout) = run_zev_c_sim_and_freestanding("b_m4_freestanding_asan", src);
+        assert!(stdout.contains("BM4_OK"), "stdout:\n{stdout}");
+        assert!(c_code.contains("static SYN_UNUSED SYN_DMA_ALIGN volatile uint8_t __zev_mmio_buf_Regs[16];"));
+        assert!(c_code.contains("#if defined(SYN_FREESTANDING)"));
+        assert!(c_code.contains("__asm__ volatile (\"wfi\" ::: \"memory\")"));
+        assert!(
+            !c_code.contains("syn_mmio_read_arr_u8(volatile uint8_t *base, uint32_t offset, size_t idx, size_t arr_len) {\n    size_t safe_idx = idx;\n#if !defined(SYN_FREESTANDING)"),
+            "MMIO array clamping must be unconditional in freestanding mode"
+        );
+    }
+
+    #[test]
+    fn b_l2_uniform_coro_fn_param_boot_and_task_asan() {
+        let src = r#"
+watch<u32> out_sum = 0;
+
+u32 step_add(u32 mode, u32 delta) {
+    sys.delay(1ms);
+    return mode * 10 + delta;
+}
+
+task worker() {
+    u32 b = step_add(7, 3);
+    out_sum.publish(out_sum.read() + b);
+    assert(out_sum.read() == 145);
+    println(f"BL2_SUM={out_sum.read()}");
+    sys.exit(0);
+}
+
+fn main() {
+    u32 a = step_add(7, 2);
+    out_sum.publish(a);
+    spawn worker() @normal;
+}
+"#;
+        let (mir, c_code, stdout) = run_zev_c_sim_and_freestanding("b_l2_uniform_coro_asan", src);
+        assert!(stdout.contains("BL2_SUM=145"), "stdout:\n{stdout}");
+        let sf = mir.functions.iter().find(|f| f.name == "step_add").unwrap();
+        assert!(!sf.vars[0].hoisted, "uniform param `mode` must not be hoisted");
+        assert!(sf.vars[1].hoisted, "non-uniform param `delta` must stay hoisted");
+        assert!(
+            !c_code.contains(".v0_mode ="),
+            "folded param `.v0_mode` must not appear in compound literal initializers:\n{c_code}"
+        );
+    }
+
+    #[test]
+    fn string_lit_coerces_to_u8_slice_in_locals_assigns_structs_returns_and_calls() {
+        let src = r#"
+struct Desc {
+    []u8 bytes;
+}
+
+[]u8 ret_lit_slice() {
+    return "RET\x00!";
+}
+
+u8 check_slice([]u8 s, usize expected_len, usize idx, u8 expected_byte) {
+    assert(s.len == expected_len);
+    return s[idx];
+}
+
+fn main() {
+    // Embedded NUL byte descriptor (like USB device descriptors in `bsp/rpi_pico_w.zev`)
+    []u8 dev_desc = "\x12\x01\x00\x02\x8A\x2E";
+    assert(dev_desc.len == 6usize);
+    assert(dev_desc[0] == 0x12u8 && dev_desc[2] == 0x00u8 && dev_desc[5] == 0x2Eu8);
+
+    dev_desc = "\x04\x03\x09\x04";
+    assert(dev_desc.len == 4usize && dev_desc[3] == 0x04u8);
+
+    []u8 r = ret_lit_slice();
+    assert(r.len == 5usize && r[3] == 0x00u8 && r[4] == '!');
+
+    Desc d = Desc { bytes: "AB\x00CD" };
+    assert(d.bytes.len == 5usize && d.bytes[2] == 0x00u8 && d.bytes[4] == 'D');
+
+    u8 tail = check_slice("ZEV2040", 7usize, 6usize, '0');
+    assert(tail == '0');
+    println(f"SLICE_LIT_OK tail={tail}");
+    sys.exit(0);
+}
+"#;
+        let (_mir, c_code, stdout) = run_zev_c_sim_and_freestanding("slice_lit_coercion_asan", src);
+        assert!(stdout.contains("SLICE_LIT_OK tail=48"), "stdout:\n{stdout}");
+        assert!(
+            c_code.contains("syn_slice_u8"),
+            "expected syn_slice_u8 compound literal in C99:\n{c_code}"
         );
     }
 }

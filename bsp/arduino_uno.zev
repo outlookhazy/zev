@@ -1,32 +1,73 @@
-// Arduino Uno R3 (ATmega328P 16 MHz) Board Support Package
+// Arduino Uno R3 (ATmega328P 16 MHz) Board Support Package (100% Pure .zev)
 import chip.atmega328p as hw;
 
-pub fn init_board_gpio() {
-    // Configure Digital Pin 13 (`PB5`, onboard yellow L LED) as output driven LOW,
-    // and Digital Pin 2 (`PD2`) as input with internal pull-up enabled (leaving PD0/PD1 UART intact).
-    u8 ddrb = hw.PORTB.ddr;
-    hw.PORTB.ddr = ddrb | hw.BIT_PB5_LED;
-    u8 pb = hw.PORTB.port;
-    hw.PORTB.port = pb & (~hw.BIT_PB5_LED);
+pub fn init_mcu_core() {
+    critical {
+        // 1. Disarm hardware watchdog so bootloader resets never re-trip WDT.
+        hw.MCU_CTRL.mcusr = 0;
+        hw.WDT_REGS.wdtcsr = 0x18;
+        hw.WDT_REGS.wdtcsr = 0;
 
-    u8 ddrd = hw.PORTD.ddr;
-    hw.PORTD.ddr = ddrd & (~hw.BIT_PD2_IN);
-    u8 pd = hw.PORTD.port;
-    hw.PORTD.port = pd | hw.BIT_PD2_IN;
+        // 2. Keep AVR Sleep Mode Control Register in Idle mode (Timer0 & USART0 stay clocked).
+        hw.MCU_CTRL.smcr = 1;
+
+        // 3. Configure USART0 for 115200 8N1 at 16 MHz (U2X0=1, UBRR0=16).
+        hw.USART0.ucsr0a = 0x02;
+        hw.USART0.ubrr0 = 16;
+        hw.USART0.ucsr0c = 0x06;
+        hw.USART0.ucsr0b = 0x18;
+
+        // 4. Configure Timer0 for 1.000 kHz CTC tick (16 MHz / 64 = 250 kHz, OCR0A=249).
+        hw.TIMER0.tccr0a = 0x02;
+        hw.TIMER0.tccr0b = 0x03;
+        hw.TIMER0.tcnt0 = 0;
+        hw.TIMER0.ocr0a = 249;
+        hw.TIFR.tifr0 = 0x02;
+        hw.TIMSK_REGS.timsk0 = 0x02;
+    }
+}
+
+pub fn console_putc(u8 b) {
+    for (u32 spin in 0..32768) {
+        if ((hw.USART0.ucsr0a & 0x20) != 0) {
+            hw.USART0.udr0 = b;
+            return;
+        }
+    }
+}
+
+pub fn init_board_gpio() {
+    critical {
+        // Configure Digital Pin 13 (`PB5`, onboard yellow L LED) as output driven LOW,
+        // and Digital Pin 2 (`PD2`) as input with internal pull-up enabled (leaving PD0/PD1 UART intact).
+        u8 ddrb = hw.PORTB.ddr;
+        hw.PORTB.ddr = ddrb | hw.BIT_PB5_LED;
+        u8 pb = hw.PORTB.port;
+        hw.PORTB.port = pb & (~hw.BIT_PB5_LED);
+
+        u8 ddrd = hw.PORTD.ddr;
+        hw.PORTD.ddr = ddrd & (~hw.BIT_PD2_IN);
+        u8 pd = hw.PORTD.port;
+        hw.PORTD.port = pd | hw.BIT_PD2_IN;
+    }
 }
 
 pub fn set_led(bool on) {
-    u8 cur = hw.PORTB.port;
-    if (on) {
-        hw.PORTB.port = cur | hw.BIT_PB5_LED;
-    } else {
-        hw.PORTB.port = cur & (~hw.BIT_PB5_LED);
+    critical {
+        u8 cur = hw.PORTB.port;
+        if (on) {
+            hw.PORTB.port = cur | hw.BIT_PB5_LED;
+        } else {
+            hw.PORTB.port = cur & (~hw.BIT_PB5_LED);
+        }
     }
 }
 
 pub fn toggle_led() {
-    u8 cur = hw.PORTB.port;
-    hw.PORTB.port = cur ^ hw.BIT_PB5_LED;
+    critical {
+        u8 cur = hw.PORTB.port;
+        hw.PORTB.port = cur ^ hw.BIT_PB5_LED;
+    }
 }
 
 pub u8 read_led() {
@@ -38,11 +79,13 @@ pub u8 read_d2_pin() {
 }
 
 pub fn enable_led_pcint() {
-    u8 m = hw.PCMSK_REGS.pcmsk0;
-    hw.PCMSK_REGS.pcmsk0 = m | hw.BIT_PB5_LED;
-    hw.PCIFR.pcifr = hw.BIT_PCIE0;
-    u8 c = hw.PCICR_REGS.pcicr;
-    hw.PCICR_REGS.pcicr = c | hw.BIT_PCIE0;
+    critical {
+        u8 m = hw.PCMSK_REGS.pcmsk0;
+        hw.PCMSK_REGS.pcmsk0 = m | hw.BIT_PB5_LED;
+        hw.PCIFR.pcifr = hw.BIT_PCIE0;
+        u8 c = hw.PCICR_REGS.pcicr;
+        hw.PCICR_REGS.pcicr = c | hw.BIT_PCIE0;
+    }
 }
 
 pub fn clear_pcint0_flag() {
@@ -50,28 +93,36 @@ pub fn clear_pcint0_flag() {
 }
 
 pub fn start_timer1_ctc(u16 compare_top) {
-    // Configure 16-bit Timer1 in CTC mode (`/256` prescaler = 62,500 Hz -> 250ms at 15624).
-    hw.TIMSK_REGS.timsk1 = 0;
-    hw.TIMER1.tccr1a = 0;
-    hw.TIMER1.tccr1b = 0;
-    hw.TIMER1.tcnt1 = 0;
-    hw.TIMER1.ocr1a = compare_top;
-    hw.TIFR.tifr1 = hw.BIT_OCF1A;
-    hw.TIMSK_REGS.timsk1 = hw.BIT_OCF1A;
-    hw.TIMER1.tccr1b = 0x0C;
+    critical {
+        // Configure 16-bit Timer1 in CTC mode (`/256` prescaler = 62,500 Hz -> 250ms at 15624).
+        hw.TIMSK_REGS.timsk1 = 0;
+        hw.TIMER1.tccr1a = 0;
+        hw.TIMER1.tccr1b = 0;
+        hw.TIMER1.tcnt1 = 0;
+        hw.TIMER1.ocr1a = compare_top;
+        hw.TIFR.tifr1 = hw.BIT_OCF1A;
+        hw.TIMSK_REGS.timsk1 = hw.BIT_OCF1A;
+        hw.TIMER1.tccr1b = 0x0C;
+    }
 }
 
 pub fn enable_uart_rx_irq() {
-    u8 cur = hw.USART0.ucsr0b;
-    hw.USART0.ucsr0b = cur | hw.BIT_RXCIE0;
+    critical {
+        u8 cur = hw.USART0.ucsr0b;
+        hw.USART0.ucsr0b = cur | hw.BIT_RXCIE0;
+    }
 }
 
 pub fn enable_uart_udre_irq() {
-    hw.USART0.ucsr0b = hw.USART0.ucsr0b | hw.BIT_UDRIE0;
+    critical {
+        hw.USART0.ucsr0b = hw.USART0.ucsr0b | hw.BIT_UDRIE0;
+    }
 }
 
 pub fn disable_uart_udre_irq() {
-    hw.USART0.ucsr0b = hw.USART0.ucsr0b & (~hw.BIT_UDRIE0);
+    critical {
+        hw.USART0.ucsr0b = hw.USART0.ucsr0b & (~hw.BIT_UDRIE0);
+    }
 }
 
 u16 adc_convert_once() {
@@ -116,19 +167,21 @@ pub u16 read_mcu_vcc_mv() {
 }
 
 pub fn spi_master_start_byte(u8 first_byte) {
-    // Mask PB5 PCINT so hardware SCK edges do not fire PCINT0 during SPI clocking.
-    hw.PCMSK_REGS.pcmsk0 = hw.PCMSK_REGS.pcmsk0 & (~hw.BIT_PB5_LED);
-    hw.PORTB.port = hw.PORTB.port | hw.BIT_PB2_SS;
-    hw.PORTB.ddr = hw.PORTB.ddr | hw.BIT_PB2_SS | hw.BIT_PB3_MOSI | hw.BIT_PB5_LED;
+    critical {
+        // Mask PB5 PCINT so hardware SCK edges do not fire PCINT0 during SPI clocking.
+        hw.PCMSK_REGS.pcmsk0 = hw.PCMSK_REGS.pcmsk0 & (~hw.BIT_PB5_LED);
+        hw.PORTB.port = hw.PORTB.port | hw.BIT_PB2_SS;
+        hw.PORTB.ddr = hw.PORTB.ddr | hw.BIT_PB2_SS | hw.BIT_PB3_MOSI | hw.BIT_PB5_LED;
 
-    // Clear any stale SPIF flag by reading SPSR followed by SPDR.
-    u8 st = hw.SPI_REGS.spsr;
-    u8 dr = hw.SPI_REGS.spdr;
-    u8 _clr = st ^ dr;
+        // Clear any stale SPIF flag by reading SPSR followed by SPDR.
+        u8 st = hw.SPI_REGS.spsr;
+        u8 dr = hw.SPI_REGS.spdr;
+        u8 _clr = st ^ dr;
 
-    // Enable SPI Master + SPIE at fosc/16 (SPR0 = 1).
-    hw.SPI_REGS.spcr = hw.BIT_SPIE | hw.BIT_SPE | hw.BIT_MSTR | 1;
-    hw.SPI_REGS.spdr = first_byte;
+        // Enable SPI Master + SPIE at fosc/16 (SPR0 = 1).
+        hw.SPI_REGS.spcr = hw.BIT_SPIE | hw.BIT_SPE | hw.BIT_MSTR | 1;
+        hw.SPI_REGS.spdr = first_byte;
+    }
 }
 
 pub u8 spi_transfer_read() {
@@ -145,7 +198,9 @@ pub fn spi_transfer_next(u8 b) {
 }
 
 pub fn spi_master_finish() {
-    hw.SPI_REGS.spcr = 0;
-    hw.PCIFR.pcifr = hw.BIT_PCIE0;
-    hw.PCMSK_REGS.pcmsk0 = hw.PCMSK_REGS.pcmsk0 | hw.BIT_PB5_LED;
+    critical {
+        hw.SPI_REGS.spcr = 0;
+        hw.PCIFR.pcifr = hw.BIT_PCIE0;
+        hw.PCMSK_REGS.pcmsk0 = hw.PCMSK_REGS.pcmsk0 | hw.BIT_PB5_LED;
+    }
 }

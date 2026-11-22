@@ -106,6 +106,18 @@ pub mmio ApmRegs {
     @rw u32 func_ctrl @ 0xC4;
 }
 
+pub mmio TimgWdtRegs {
+    @rw u32 wdtconfig0  @ 0x48;
+    @rw u32 wdtwprotect @ 0x64;
+}
+
+pub mmio LpWdtRegs {
+    @rw u32 config0      @ 0x00;
+    @rw u32 wprotect     @ 0x18;
+    @rw u32 swd_config   @ 0x1C;
+    @rw u32 swd_wprotect @ 0x20;
+}
+
 pub mmio RmtRegs {
     @rw  u32 ch0conf0    @ 0x10;
     @ro  u32 int_raw     @ 0x38;
@@ -162,6 +174,8 @@ pub mmio IO_MUX     : IoMuxRegs     @ 0x6009_0000;
 pub mmio PCR        : PcrRegs       @ 0x6009_6000;
 pub mmio RMT        : RmtRegs       @ 0x6000_6000;
 pub mmio RMTMEM     : RmtMemRegs    @ 0x6000_6400;
+pub mmio TIMG0      : TimgWdtRegs   @ 0x6000_8000;
+pub mmio TIMG1      : TimgWdtRegs   @ 0x6000_9000;
 pub mmio SYSTIMER   : SystimerRegs  @ 0x6000_A000;
 pub mmio APB_SARADC : ApbSaradcRegs @ 0x6000_E000;
 pub mmio USB_DEVICE : UsbDeviceRegs @ 0x6000_F000;
@@ -175,6 +189,7 @@ pub mmio MODEM_LPCON  : ModemLpconRegs  @ 0x600A_F000;
 pub mmio I2C_ANA_MST  : I2cAnaMstRegs   @ 0x600A_F800;
 pub mmio PMU          : PmuRegs         @ 0x600B_0000;
 pub mmio EFUSE        : EfuseRegs       @ 0x600B_0800;
+pub mmio LP_WDT       : LpWdtRegs       @ 0x600B_1C00;
 pub mmio HP_APM       : ApmRegs         @ 0x6009_9000;
 pub mmio LP_APM0      : ApmRegs         @ 0x6009_9800;
 pub mmio LP_APM       : ApmRegs         @ 0x600B_3800;
