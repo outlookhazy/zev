@@ -1,0 +1,123 @@
+// Portable HAL digital GPIO interface (ESP32-C6 GPIO0..GPIO30; USB-JTAG GPIO12/GPIO13 guarded)
+
+import chip.esp32c6 as hw;
+
+pub enum Mode {
+    Input  = 0,
+    Output = 1,
+    Analog = 2,
+}
+
+pub enum Pull {
+    None = 0,
+    Up   = 1,
+    Down = 2,
+}
+
+pub struct Pin {
+    u8   port;
+    u8   pin;
+    bool active_low;
+}
+
+pub Pin make_pin(u8 port, u8 pin, bool active_low) {
+    return Pin {
+        port: port,
+        pin: pin,
+        active_low: active_low,
+    };
+}
+
+bool pin_guarded(u8 port, u8 pin) {
+    if (port != 0u8 || pin >= 31u8) {
+        return true;
+    }
+    // Never disturb native USB Serial/JTAG D- / D+ pads (GPIO12 / GPIO13).
+    if (pin == 12u8 || pin == 13u8) {
+        return true;
+    }
+    return false;
+}
+
+u32 pull_cfg(Pull p) {
+    switch (p) {
+        Pull.None => { return 0u32; }
+        Pull.Up   => { return 1u32 << 8; } // FUN_WPU
+        Pull.Down => { return 1u32 << 7; } // FUN_WPD
+    }
+}
+
+impl Pin {
+    pub fn set_mode(self, Mode mode, Pull pull) {
+        if (pin_guarded(self.port, self.pin)) {
+            return;
+        }
+        usize idx = self.pin as usize;
+        u32 bit = 1u32 << (self.pin as u32);
+        u32 io_gpio_fn = 1u32 << 12; // MCU_SEL = Function 1 (GPIO)
+        u32 pu_pd = pull_cfg(pull);
+        switch (mode) {
+            Mode.Input => {
+                hw.GPIO.enable_w1tc = bit;
+                hw.IO_MUX.gpio[idx] = io_gpio_fn | (1u32 << 9) | pu_pd;
+            }
+            Mode.Output => {
+                hw.GPIO.func_out_sel_cfg[idx] = 128u32; // Simple GPIO out
+                hw.IO_MUX.gpio[idx] = io_gpio_fn | (2u32 << 10) | (1u32 << 9) | pu_pd;
+                hw.GPIO.enable_w1ts = bit;
+            }
+            Mode.Analog => {
+                hw.GPIO.enable_w1tc = bit;
+                hw.IO_MUX.gpio[idx] = io_gpio_fn;
+            }
+        }
+    }
+
+    pub bool read(self) {
+        if (self.port != 0u8 || self.pin >= 31u8) {
+            return false;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        bool raw = (hw.GPIO.in_reg & bit) != 0u32;
+        if (self.active_low) {
+            return !raw;
+        }
+        return raw;
+    }
+
+    pub fn write(self, bool high) {
+        if (pin_guarded(self.port, self.pin)) {
+            return;
+        }
+        bool hw_lvl = high;
+        if (self.active_low) {
+            hw_lvl = !high;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        if (hw_lvl) {
+            hw.GPIO.out_w1ts = bit;
+        } else {
+            hw.GPIO.out_w1tc = bit;
+        }
+    }
+
+    pub fn set_high(self) {
+        self.write(true);
+    }
+
+    pub fn set_low(self) {
+        self.write(false);
+    }
+
+    pub fn toggle(self) {
+        if (pin_guarded(self.port, self.pin)) {
+            return;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        if ((hw.GPIO.out & bit) != 0u32) {
+            hw.GPIO.out_w1tc = bit;
+        } else {
+            hw.GPIO.out_w1ts = bit;
+        }
+    }
+}

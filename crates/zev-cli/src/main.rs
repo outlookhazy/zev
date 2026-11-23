@@ -38,13 +38,14 @@ fn load_and_check_detailed_with_includes(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
 ) -> Result<CheckedBundle, CheckFailure> {
-    load_and_check_detailed_with_includes_and_hal(files, include_dirs, None)
+    load_and_check_detailed_with_includes_and_targets(files, include_dirs, None, None)
 }
 
-fn load_and_check_detailed_with_includes_and_hal(
+fn load_and_check_detailed_with_includes_and_targets(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
     hal_dir: Option<&str>,
+    board_module: Option<&str>,
 ) -> Result<CheckedBundle, CheckFailure> {
     let mut source_files: Vec<(String, PathBuf, SourceFile)> = Vec::with_capacity(files.len());
     let mut seen_canon: HashSet<PathBuf> = HashSet::with_capacity(files.len());
@@ -76,10 +77,11 @@ fn load_and_check_detailed_with_includes_and_hal(
         .iter()
         .map(|(_, path, sf)| (sf.src.as_str(), Some(path.as_path())))
         .collect();
-    let all_generics: BTreeSet<String> = zev_sema::collect_import_aware_generic_names_with_hal(
+    let all_generics: BTreeSet<String> = zev_sema::collect_import_aware_generic_names_with_targets(
         &generic_roots,
         include_dirs,
         hal_dir,
+        board_module,
     );
 
     let mut loaded: Vec<(String, SourceFile, Program)> = Vec::with_capacity(source_files.len());
@@ -132,6 +134,7 @@ fn load_and_check_detailed_with_includes_and_hal(
     let mut opts = AnalyzeOptions::default();
     opts.include_dirs = include_dirs.to_vec();
     opts.hal_dir = hal_dir.map(str::to_string);
+    opts.board_module = board_module.map(str::to_string);
     let out = analyze_and_monomorphize_named_programs(&named_refs, &opts);
     if !out.diagnostics.is_empty() {
         let mut rendered = String::new();
@@ -210,17 +213,22 @@ fn compile_to_mir_with_includes(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
 ) -> Result<(CheckedBundle, MirModule), String> {
-    compile_to_mir_with_includes_and_hal(files, include_dirs, None)
+    compile_to_mir_with_includes_and_targets(files, include_dirs, None, None)
 }
 
-fn compile_to_mir_with_includes_and_hal(
+fn compile_to_mir_with_includes_and_targets(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
     hal_dir: Option<&str>,
+    board_module: Option<&str>,
 ) -> Result<(CheckedBundle, MirModule), String> {
-    let bundle =
-        load_and_check_detailed_with_includes_and_hal(files, include_dirs, hal_dir)
-            .map_err(|f| f.human)?;
+    let bundle = load_and_check_detailed_with_includes_and_targets(
+        files,
+        include_dirs,
+        hal_dir,
+        board_module,
+    )
+    .map_err(|f| f.human)?;
     let mir = zev_mir::lower_programs(&bundle.programs)
         .map_err(|e| format!("error: {e}\n  = docs: run 'zevc doc tasks'"))?;
     Ok((bundle, mir))
@@ -634,7 +642,13 @@ fn run_ram_analysis(
         }
     }
     let hal_dir = llvm_opts.as_ref().and_then(|o| o.hal_dir.as_deref());
-    let (_, mir) = match compile_to_mir_with_includes_and_hal(files, &eff_includes, hal_dir) {
+    let board_module = llvm_opts.as_ref().and_then(|o| o.board_module.as_deref());
+    let (_, mir) = match compile_to_mir_with_includes_and_targets(
+        files,
+        &eff_includes,
+        hal_dir,
+        board_module,
+    ) {
         Ok(res) => res,
         Err(err) => return RamExecOutcome::CompileErr(err),
     };
@@ -736,40 +750,42 @@ fn main() -> ExitCode {
             json,
         } => {
             let mut eff_includes = include_dirs.clone();
-            let hal_dir: Option<String> = if board.is_some() || chip.is_some() {
-                let manifest = match discover_manifest_for_inputs(&files) {
-                    Ok(m) => m,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return ExitCode::from(2);
+            let (hal_dir, board_module): (Option<String>, Option<String>) =
+                if board.is_some() || chip.is_some() {
+                    let manifest = match discover_manifest_for_inputs(&files) {
+                        Ok(m) => m,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    let mdir = manifest.as_ref().map(|(d, _)| d.as_path());
+                    let spec = match resolve_target_spec_for_inputs(
+                        &files,
+                        mdir,
+                        chip.as_deref(),
+                        board.as_deref(),
+                    ) {
+                        Ok(s) => s,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::from(2);
+                        }
+                    };
+                    if let Some(ref root) = spec.root_dir {
+                        if !eff_includes.contains(root) {
+                            eff_includes.push(root.clone());
+                        }
                     }
+                    (spec.hal_dir, spec.board_module)
+                } else {
+                    (None, None)
                 };
-                let mdir = manifest.as_ref().map(|(d, _)| d.as_path());
-                let spec = match resolve_target_spec_for_inputs(
-                    &files,
-                    mdir,
-                    chip.as_deref(),
-                    board.as_deref(),
-                ) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return ExitCode::from(2);
-                    }
-                };
-                if let Some(ref root) = spec.root_dir {
-                    if !eff_includes.contains(root) {
-                        eff_includes.push(root.clone());
-                    }
-                }
-                spec.hal_dir
-            } else {
-                None
-            };
-            match load_and_check_detailed_with_includes_and_hal(
+            match load_and_check_detailed_with_includes_and_targets(
                 &files,
                 &eff_includes,
                 hal_dir.as_deref(),
+                board_module.as_deref(),
             ) {
             Ok(bundle) => {
                 let verified_files = bundle.programs.len();
@@ -922,10 +938,11 @@ fn main() -> ExitCode {
                     eff_includes.push((*root).clone());
                 }
             }
-            match compile_to_mir_with_includes_and_hal(
+            match compile_to_mir_with_includes_and_targets(
                 &files,
                 &eff_includes,
                 opts.hal_dir.as_deref(),
+                opts.board_module.as_deref(),
             ) {
                 Ok((_, mir)) => match zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &opts) {
                     Ok(raw_ll) => {
@@ -1000,10 +1017,11 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            match compile_to_mir_with_includes_and_hal(
+            match compile_to_mir_with_includes_and_targets(
                 &built.files,
                 &built.include_dirs,
                 built.spec.hal_dir.as_deref(),
+                built.spec.board_module.as_deref(),
             ) {
                 Ok((_, mir)) => {
                     let default_ext = match built.spec.image {
@@ -1066,10 +1084,11 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            match compile_to_mir_with_includes_and_hal(
+            match compile_to_mir_with_includes_and_targets(
                 &built.files,
                 &built.include_dirs,
                 built.spec.hal_dir.as_deref(),
+                built.spec.board_module.as_deref(),
             ) {
                 Ok((_, mir)) => {
                     let ext = match built.spec.image {
@@ -1179,7 +1198,17 @@ fn main() -> ExitCode {
             max_ticks,
             opt_level,
         } => {
-            match compile_to_mir_with_includes(&files, &include_dirs) {
+            let mut opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+            opts.opt_level = opt_level;
+            if let Some(ticks) = max_ticks {
+                opts.max_ticks = ticks.min(u32::MAX as u64) as u32;
+            }
+            match compile_to_mir_with_includes_and_targets(
+                &files,
+                &include_dirs,
+                opts.hal_dir.as_deref(),
+                opts.board_module.as_deref(),
+            ) {
             Ok((_, mir)) => {
                 let temp = match TempWorkDir::create("zevc-qemu") {
                     Ok(t) => t,
@@ -1189,11 +1218,6 @@ fn main() -> ExitCode {
                     }
                 };
                 let elf_path = temp.dir.join("firmware.elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::default();
-                opts.opt_level = opt_level;
-                if let Some(ticks) = max_ticks {
-                    opts.max_ticks = ticks.min(u32::MAX as u64) as u32;
-                }
                 let qemu_opts = zev_codegen_llvm::QemuRunOptions::default();
                 match zev_codegen_llvm::run_qemu_cortex_m(&mir, &elf_path, &opts, &qemu_opts) {
                     Ok(res) => {
@@ -1227,12 +1251,17 @@ fn main() -> ExitCode {
             opt_level,
             output,
         } => {
-            match compile_to_mir_with_includes(&files, &include_dirs) {
+            let mut opts = zev_codegen_llvm::CodegenOptions::esp32c6();
+            opts.opt_level = opt_level;
+            match compile_to_mir_with_includes_and_targets(
+                &files,
+                &include_dirs,
+                opts.hal_dir.as_deref(),
+                opts.board_module.as_deref(),
+            ) {
             Ok((_, mir)) => {
                 let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
                 let out_elf = out_bin.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::esp32c6();
-                opts.opt_level = opt_level;
                 match zev_codegen_llvm::build_esp32c6_image_with_options(
                     &mir, &out_elf, &out_bin, &opts,
                 ) {
@@ -1259,7 +1288,14 @@ fn main() -> ExitCode {
             opt_level,
             output,
         } => {
-            match compile_to_mir_with_includes(&files, &include_dirs) {
+            let mut opts = zev_codegen_llvm::CodegenOptions::esp32c6();
+            opts.opt_level = opt_level;
+            match compile_to_mir_with_includes_and_targets(
+                &files,
+                &include_dirs,
+                opts.hal_dir.as_deref(),
+                opts.board_module.as_deref(),
+            ) {
             Ok((_, mir)) => {
                 let mut temp_holder: Option<TempWorkDir> = None;
                 let out_bin = match output {
@@ -1278,8 +1314,6 @@ fn main() -> ExitCode {
                     }
                 };
                 let out_elf = out_bin.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::esp32c6();
-                opts.opt_level = opt_level;
                 let res = match zev_codegen_llvm::build_esp32c6_image_with_options(
                     &mir, &out_elf, &out_bin, &opts,
                 ) {

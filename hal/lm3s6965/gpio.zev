@@ -1,0 +1,104 @@
+// Portable HAL digital GPIO interface (TI LM3S6965 GPIOA)
+
+import chip.lm3s6965 as hw;
+
+pub enum Mode {
+    Input  = 0,
+    Output = 1,
+    Analog = 2,
+}
+
+pub enum Pull {
+    None = 0,
+    Up   = 1,
+    Down = 2,
+}
+
+pub struct Pin {
+    u8   port;
+    u8   pin;
+    bool active_low;
+}
+
+pub Pin make_pin(u8 port, u8 pin, bool active_low) {
+    return Pin {
+        port: port,
+        pin: pin,
+        active_low: active_low,
+    };
+}
+
+impl Pin {
+    pub fn set_mode(self, Mode mode, Pull pull) {
+        Pull _p = pull;
+        if (self.port != 0u8 || self.pin >= 8u8) {
+            return;
+        }
+        hw.SYSCTL.rcgc2 = hw.SYSCTL.rcgc2 | hw.SYSCTL_RCGC2_GPIOA;
+        u32 _stab = hw.SYSCTL.rcgc2;
+        u32 bit = 1u32 << (self.pin as u32);
+        switch (mode) {
+            Mode.Input => {
+                hw.GPIOA.dir = hw.GPIOA.dir & (~bit);
+                hw.GPIOA.den = hw.GPIOA.den | bit;
+            }
+            Mode.Output => {
+                hw.GPIOA.dir = hw.GPIOA.dir | bit;
+                hw.GPIOA.den = hw.GPIOA.den | bit;
+            }
+            Mode.Analog => {
+                hw.GPIOA.dir = hw.GPIOA.dir & (~bit);
+                hw.GPIOA.den = hw.GPIOA.den & (~bit);
+            }
+        }
+    }
+
+    pub bool read(self) {
+        if (self.port != 0u8 || self.pin >= 8u8) {
+            return false;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        bool raw = (hw.GPIOA.data & bit) != 0u32;
+        if (self.active_low) {
+            return !raw;
+        }
+        return raw;
+    }
+
+    pub fn write(self, bool high) {
+        if (self.port != 0u8 || self.pin >= 8u8) {
+            return;
+        }
+        bool hw_lvl = high;
+        if (self.active_low) {
+            hw_lvl = !high;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        if (hw_lvl) {
+            hw.GPIOA.data = hw.GPIOA.data | bit;
+        } else {
+            hw.GPIOA.data = hw.GPIOA.data & (~bit);
+        }
+    }
+
+    pub fn set_high(self) {
+        self.write(true);
+    }
+
+    pub fn set_low(self) {
+        self.write(false);
+    }
+
+    pub fn toggle(self) {
+        if (self.port != 0u8 || self.pin >= 8u8) {
+            return;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        bool cur = (hw.GPIOA.data & bit) != 0u32;
+        if (cur) {
+            hw.GPIOA.data = hw.GPIOA.data & (~bit);
+        } else {
+            hw.GPIOA.data = hw.GPIOA.data | bit;
+        }
+    }
+}

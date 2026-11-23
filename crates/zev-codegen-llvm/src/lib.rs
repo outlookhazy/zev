@@ -6870,4 +6870,101 @@ fn main() {
         assert!(art.elf.audit.is_zero_heap_freestanding());
         let _ = std::fs::remove_dir_all(&out_dir);
     }
+
+    #[test]
+    fn portable_controller_demo_runs_in_qemu_and_builds_stm32f3_and_esp32c6() {
+        let root = repo_root();
+        let demo_path = root.join("examples/portable_controller_demo.zev");
+        let demo_src =
+            std::fs::read_to_string(&demo_path).expect("read portable_controller_demo.zev");
+        let demo_label = demo_path.display().to_string();
+
+        let compile_for_board = |board: &str| {
+            let spec = TargetSpec::resolve(None, Some(board)).expect("resolve target spec");
+            let generics = zev_sema::collect_import_aware_generic_names_with_targets(
+                &[(demo_src.as_str(), Some(demo_path.as_path()))],
+                std::slice::from_ref(&root),
+                spec.hal_dir.as_deref(),
+                spec.board_module.as_deref(),
+            );
+            let prog = zev_parser::parse_str_named_with_generics(
+                &demo_src,
+                &demo_label,
+                Some(&generics),
+            )
+            .unwrap_or_else(|e| panic!("parse failed for {board}: {e:#?}"));
+            let aopts = zev_sema::AnalyzeOptions {
+                include_dirs: vec![root.clone()],
+                hal_dir: spec.hal_dir.clone(),
+                board_module: spec.board_module.clone(),
+                ..zev_sema::AnalyzeOptions::default()
+            };
+            let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+                &[(&prog, Some(demo_label.as_str()))],
+                &aopts,
+            );
+            assert!(
+                analyzed.diagnostics.is_empty(),
+                "sema diagnostics for {board}: {:?}",
+                analyzed.diagnostics
+            );
+            let mir = zev_mir::lower_programs(&analyzed.programs)
+                .unwrap_or_else(|e| panic!("lower failed for {board}: {e:?}"));
+            let opts = CodegenOptions::from_spec(spec.clone());
+            (spec, opts, mir)
+        };
+
+        let out_dir =
+            std::env::temp_dir().join(format!("zev_portable_demo_llvm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // 1. QEMU Cortex-M3 (`lm3s6965_evb`)
+        let (cm3_spec, cm3_opts, cm3_mir) = compile_for_board("lm3s6965_evb");
+        assert_eq!(cm3_spec.hal_dir.as_deref(), Some("hal/lm3s6965"));
+        assert_eq!(cm3_spec.board_module.as_deref(), Some("bsp/lm3s6965_evb"));
+        let cm3_elf = out_dir.join("portable_lm3s6965.elf");
+        let qres = run_qemu_cortex_m(&cm3_mir, &cm3_elf, &cm3_opts, &QemuRunOptions::default())
+            .expect("QEMU execution for portable_controller_demo");
+        assert_eq!(
+            qres.exec.exit_code, 0,
+            "QEMU exit_code={}, stderr={}",
+            qres.exec.exit_code, qres.exec.stderr
+        );
+        assert!(
+            qres.exec.stdout.contains("[PORTABLE board=lm3s6965_evb step=0]"),
+            "missing step=0 in QEMU stdout:\n{}",
+            qres.exec.stdout
+        );
+        assert!(
+            qres.exec
+                .stdout
+                .contains("[PORTABLE] done board=lm3s6965_evb steps=4 lut_sum=2150 mid_sum=1100"),
+            "missing done line in QEMU stdout:\n{}",
+            qres.exec.stdout
+        );
+
+        // 2. STM32F334R8 (`nucleo_f334r8`)
+        let (_f3_spec, f3_opts, f3_mir) = compile_for_board("nucleo_f334r8");
+        let f3_bin = out_dir.join("portable_nucleo_f334r8.bin");
+        let f3_art = build_target_image(&f3_mir, &f3_opts, &f3_bin).expect("build nucleo_f334r8");
+        assert!(f3_art.elf.audit.is_zero_heap_freestanding());
+        let f3_proof =
+            analyze_hardware_stack_high_water(&f3_mir, &f3_opts).expect("nucleo_f334r8 stack proof");
+        assert!(f3_proof.within_budget, "nucleo_f334r8 over SRAM budget");
+
+        // 3. ESP32-C6-Pico (`esp32c6_pico`)
+        let (esp_spec, esp_opts, esp_mir) = compile_for_board("esp32c6_pico");
+        assert_eq!(esp_spec.hal_dir.as_deref(), Some("hal/esp32c6"));
+        assert_eq!(esp_spec.board_module.as_deref(), Some("bsp/esp32c6_pico"));
+        let esp_bin = out_dir.join("portable_esp32c6_pico.bin");
+        let esp_art =
+            build_target_image(&esp_mir, &esp_opts, &esp_bin).expect("build esp32c6_pico");
+        assert!(esp_art.elf.audit.is_zero_heap_freestanding());
+        let esp_proof =
+            analyze_hardware_stack_high_water(&esp_mir, &esp_opts).expect("esp32c6_pico stack proof");
+        assert!(esp_proof.within_budget, "esp32c6_pico over SRAM budget");
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
 }

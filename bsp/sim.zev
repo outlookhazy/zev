@@ -1,0 +1,39 @@
+// Host Simulator Board Support Package (`board` target for `zevc run`)
+
+import hal.{adc, gpio, i2c, pwm, spi};
+
+pub const []u8 BOARD_NAME = "host_sim";
+pub const bool EXIT_ON_DONE = true;
+
+pub const gpio.Pin PIN_USER_OUT = gpio.Pin { port: 0u8, pin: 13u8, active_low: false };
+pub const gpio.Pin PIN_BUTTON   = gpio.Pin { port: 0u8, pin: 0u8,  active_low: false };
+
+pub fn init() {
+    PIN_USER_OUT.set_low();
+    PIN_USER_OUT.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    PIN_BUTTON.set_mode(gpio.Mode.Input, gpio.Pull.Up);
+}
+
+pub fn set_led(bool on) {
+    PIN_USER_OUT.write(on);
+}
+
+pub bool read_button() {
+    return PIN_BUTTON.read();
+}
+
+pub adc.Channel default_adc() {
+    return adc.make_channel(1u8, 0u8, 3300u16);
+}
+
+pub pwm.Channel default_pwm() {
+    return pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 0u16);
+}
+
+pub spi.Bus default_spi() {
+    return spi.make_bus(1u8, 50u32);
+}
+
+pub i2c.Bus default_i2c() {
+    return i2c.make_bus(1u8, 50u32);
+}

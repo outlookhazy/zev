@@ -3,6 +3,7 @@
 [board]
 name = "nucleo_f334r8"
 chip = "stm32f334r8"
+board_module = "bsp/nucleo_f334r8"
 
 [memory]
 # Reserve the final 2 KiB flash page (0x0800_F800..0x0801_0000) for Flash NVS.

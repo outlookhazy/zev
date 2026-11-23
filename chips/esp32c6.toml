@@ -10,6 +10,7 @@ datalayout = "e-m:e-p:32:32-i64:64-n32-S128"
 ptr_bits = 32
 opt_level = "-O2"
 iram_in_data = true
+hal_dir = "hal/esp32c6"
 
 [memory]
 flash_base = 0x4200_0000

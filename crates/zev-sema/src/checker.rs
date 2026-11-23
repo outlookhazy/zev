@@ -39,6 +39,8 @@ pub struct AnalyzeOptions {
     pub include_dirs: Vec<PathBuf>,
     /// Target-bound HAL directory override (e.g. `"hal/stm32f3"`), defaulting to `"hal/sim"`.
     pub hal_dir: Option<String>,
+    /// Target-bound board module override (e.g. `"bsp/nucleo_f334r8"`), defaulting to `"bsp/sim"`.
+    pub board_module: Option<String>,
 }
 
 impl Default for AnalyzeOptions {
@@ -47,6 +49,7 @@ impl Default for AnalyzeOptions {
             default_tick_period_us: DEFAULT_TICK_PERIOD_US,
             include_dirs: Vec::new(),
             hal_dir: None,
+            board_module: None,
         }
     }
 }

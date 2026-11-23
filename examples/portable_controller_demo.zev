@@ -1,15 +1,20 @@
-// Portable HAL-Only Controller Demo
+// Portable HAL + `board` Controller Demo
 //
-// Zero `chip.*` or `bsp.*` imports: compiles & executes identically under:
-//   - Host ASan/UBSan (`hal/sim`): `zevc run --sanitize examples/portable_controller_demo.zev`
-//   - STM32F334R8 (`hal/stm32f3`): `zevc build --board nucleo_f334r8 examples/portable_controller_demo.zev`
+// Zero `chip.*` or concrete `bsp.<target>` imports: compiles & executes identically under:
+//   - Host ASan/UBSan (`hal/sim` + `bsp/sim`):
+//       `zevc run --sanitize examples/portable_controller_demo.zev`
+//   - ARM Cortex-M3 QEMU (`hal/lm3s6965` + `bsp/lm3s6965_evb`):
+//       `zevc run-qemu examples/portable_controller_demo.zev`
+//   - STM32F334R8 Hardware (`hal/stm32f3` + `bsp/nucleo_f334r8`):
+//       `zevc flash --board nucleo_f334r8 examples/portable_controller_demo.zev`
+//   - ESP32-C6-Pico Hardware (`hal/esp32c6` + `bsp/esp32c6_pico`):
+//       `zevc flash --board esp32c6_pico examples/portable_controller_demo.zev --port /dev/ttyACM1`
 
-import hal.{time, gpio, pwm, adc, i2c, spi};
-import std.{math, bus};
+import board;
+import hal.{time, pwm, adc, i2c, spi};
+import std.math as math;
 
-// Immutable Flash/.rodata board descriptors and lookup table
-const gpio.Pin STATUS_LED = gpio.Pin { port: 0u8, pin: 5u8, active_low: false };
-const gpio.Pin FAULT_IN   = gpio.Pin { port: 2u8, pin: 13u8, active_low: false };
+// Immutable Flash/.rodata lookup table
 const [4]u16 LUT_DUTY_PERMIL = [150u16, 400u16, 700u16, 900u16];
 
 struct Controller {
@@ -20,17 +25,15 @@ struct Controller {
 }
 
 impl Controller {
-    Controller make(u16 target_mv) {
+    Controller make(pwm.Channel ch, u16 target_mv) {
         return Controller {
-            drive: pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 0u16),
+            drive: ch,
             target_mv: target_mv,
             last_duty: 0u16,
             steps: 0u32,
         };
     }
-}
 
-impl Controller {
     fn arm(*self) {
         self.drive.set_duty_permil(LUT_DUTY_PERMIL[0]);
         self.drive.enable(true);
@@ -63,9 +66,7 @@ u16 sum_slice([]u16 xs) {
 }
 
 fn main() {
-    STATUS_LED.set_mode(gpio.Mode.Output, gpio.Pull.None);
-    FAULT_IN.set_mode(gpio.Mode.Input, gpio.Pull.Up);
-    STATUS_LED.set_low();
+    board.init();
     time.spin_us(10u32);
 
     u16 lut_sum = sum_slice(LUT_DUTY_PERMIL);
@@ -73,28 +74,48 @@ fn main() {
     assert(lut_sum == 2150u16);
     assert(mid_sum == 1100u16);
 
-    adc.Channel sense_ch = adc.make_channel(1u8, 1u8, 3300u16);
-    i2c.Bus     i2c_bus  = i2c.make_bus(1u8, 10u32);
-    spi.Bus     spi_bus  = spi.make_bus(1u8, 10u32);
+    adc.Channel sense_ch = board.default_adc();
+    i2c.Bus     i2c_bus  = board.default_i2c();
+    spi.Bus     spi_bus  = board.default_spi();
 
-    Controller ctrl = Controller.make(1800u16);
+    Controller ctrl = Controller.make(board.default_pwm(), 1800u16);
     ctrl.arm();
     assert(ctrl.last_duty == 150u16);
 
+    bool led_on = false;
     for (u32 iter in 0..4) {
         u32 mv = sense_ch.read_mv() or 0u32;
         bool _i2c_ack = i2c_bus.probe_7bit(0x3Cu8) or false;
         u8 _spi_rx = spi_bus.transfer_byte(0x55u8) or 0xFFu8;
-        bool fault = FAULT_IN.read();
+        bool fault = board.read_button();
 
         ctrl.step(mv as u16, fault);
-        STATUS_LED.toggle();
-        println(f"[PORTABLE step={iter}] mv={mv} fault={fault} duty={ctrl.last_duty} led={STATUS_LED.read()}");
+        led_on = !led_on;
+        board.set_led(led_on);
+        println(f"[PORTABLE board={board.BOARD_NAME} step={iter}] mv={mv} fault={fault} duty={ctrl.last_duty} led={led_on}");
         delay(2ms);
     }
 
-    STATUS_LED.set_high();
-    assert(STATUS_LED.read());
-    println(f"[PORTABLE] done steps={ctrl.steps} lut_sum={lut_sum} mid_sum={mid_sum}");
-    sys.exit(0);
+    board.set_led(true);
+    assert(board.PIN_USER_OUT.read());
+    println(f"[PORTABLE] done board={board.BOARD_NAME} steps={ctrl.steps} lut_sum={lut_sum} mid_sum={mid_sum}");
+
+    if (board.EXIT_ON_DONE) {
+        sys.exit(0);
+    }
+
+    u32 beat = 0u32;
+    loop {
+        u32 mv = sense_ch.read_mv() or 0u32;
+        bool _i2c_ack = i2c_bus.probe_7bit(0x3Cu8) or false;
+        u8 _spi_rx = spi_bus.transfer_byte(0x55u8) or 0xFFu8;
+        bool fault = board.read_button();
+
+        ctrl.step(mv as u16, fault);
+        led_on = !led_on;
+        board.set_led(led_on);
+        println(f"[PORTABLE board={board.BOARD_NAME} beat={beat}] mv={mv} fault={fault} duty={ctrl.last_duty} led={led_on}");
+        beat += 1u32;
+        delay(250ms);
+    }
 }

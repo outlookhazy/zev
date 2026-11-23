@@ -144,6 +144,7 @@ pub struct TargetSpec {
     pub allow_sleep_deep: bool,
     pub semihosting: bool,
     pub hal_dir: Option<String>,
+    pub board_module: Option<String>,
     pub flash_base: u32,
     pub flash_size: u32,
     pub usable_flash_size: Option<u32>,
@@ -186,6 +187,7 @@ impl TargetSpec {
             allow_sleep_deep: true,
             semihosting: false,
             hal_dir: None,
+            board_module: None,
             flash_base: 0,
             flash_size: 4 * 1024 * 1024,
             usable_flash_size: None,
@@ -426,6 +428,7 @@ impl TargetSpec {
                 .map_err(|_| CodegenError::new("toml", "image.reset_first_word_value > u16"))?;
 
         let mut board_name = None;
+        let mut board_module = None;
         let mut qemu_machine = cdoc.opt_str("run", "qemu_machine")?;
         let mut flash_cmd = cdoc.opt_str_array("run", "flash_cmd")?.unwrap_or_default();
         let mut default_port = cdoc.opt_str("run", "default_port")?;
@@ -450,6 +453,11 @@ impl TargetSpec {
             }
             if let Some(hd) = bdoc.opt_str("board", "hal_dir")? {
                 hal_dir = Some(hd);
+            }
+            if let Some(bm) = bdoc.opt_str("board", "board_module")? {
+                board_module = Some(bm);
+            } else if let Some(ref bn) = board_name {
+                board_module = Some(format!("bsp/{bn}"));
             }
             if let Some(uf) = bdoc.opt_u32("memory", "usable_flash_size")? {
                 usable_flash_size = Some(uf);
@@ -490,6 +498,7 @@ impl TargetSpec {
             allow_sleep_deep,
             semihosting,
             hal_dir,
+            board_module,
             flash_base,
             flash_size,
             usable_flash_size,

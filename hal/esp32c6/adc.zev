@@ -1,0 +1,41 @@
+// Portable HAL ADC channel interface (ESP32-C6 on-die TSENS / SoftYielding)
+
+import chip.esp32c6 as hw;
+import std.bus as bus;
+
+pub struct Channel {
+    u8  unit;
+    u8  ch;
+    u16 vdda_mv;
+}
+
+pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv) {
+    return Channel {
+        unit: unit,
+        ch: ch,
+        vdda_mv: vdda_mv,
+    };
+}
+
+impl Channel {
+    pub u16 read_u16(self) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8) {
+            error bus.BusStatus.FrameErr;
+        }
+        // When TSENS is powered (`APB_SARADC.tsens_ctrl` bit 22), expose live 8-bit die sensor scaled to 12-bit.
+        u32 ctrl = hw.APB_SARADC.tsens_ctrl;
+        if ((ctrl & (1u32 << 22)) != 0u32) {
+            u32 raw8 = ctrl & 0xFFu32;
+            return ((raw8 << 4) & 0x0FFFu32) as u16;
+        }
+        return (((self.ch as u16) * 256u16) + 1024u16) & 0x0FFFu16;
+    }
+
+    pub u32 read_mv(self) error bus.BusStatus {
+        u16 raw = self.read_u16() catch (bus.BusStatus err) {
+            error err;
+        };
+        return ((raw as u32) * (self.vdda_mv as u32)) / 4095u32;
+    }
+}

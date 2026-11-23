@@ -1,5 +1,12 @@
 // TI Stellaris LM3S6965 EVB Board Support Package (QEMU `lm3s6965evb`)
 import chip.lm3s6965 as hw;
+import hal.{adc, gpio, i2c, pwm, spi};
+
+pub const []u8 BOARD_NAME = "lm3s6965_evb";
+pub const bool EXIT_ON_DONE = true;
+
+pub const gpio.Pin PIN_USER_OUT = gpio.Pin { port: 0u8, pin: 1u8, active_low: false };
+pub const gpio.Pin PIN_BUTTON   = gpio.Pin { port: 0u8, pin: 2u8, active_low: false };
 
 pub const u32 MOTOR_EN_PIN = 0;
 
@@ -51,4 +58,36 @@ pub fn pend_nvic_irq(u32 irq_num) {
 
 pub fn console_putc(u8 b) {
     hw.UART0.dr = b as u32;
+}
+
+pub fn init() {
+    init_board();
+    sys.use_systick(12_000_000);
+    PIN_USER_OUT.set_low();
+    PIN_USER_OUT.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    PIN_BUTTON.set_mode(gpio.Mode.Input, gpio.Pull.Up);
+}
+
+pub fn set_led(bool on) {
+    PIN_USER_OUT.write(on);
+}
+
+pub bool read_button() {
+    return PIN_BUTTON.read();
+}
+
+pub adc.Channel default_adc() {
+    return adc.make_channel(1u8, 1u8, 3300u16);
+}
+
+pub pwm.Channel default_pwm() {
+    return pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 0u16);
+}
+
+pub spi.Bus default_spi() {
+    return spi.make_bus(1u8, 10u32);
+}
+
+pub i2c.Bus default_i2c() {
+    return i2c.make_bus(1u8, 10u32);
 }

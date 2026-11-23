@@ -11,6 +11,7 @@ opt_level = "-O2"
 code_in_ram = false
 has_thumb2 = true
 has_vtor = false
+hal_dir = "hal/lm3s6965"
 
 [memory]
 flash_base = 0x0000_0000

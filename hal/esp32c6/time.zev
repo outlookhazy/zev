@@ -1,0 +1,50 @@
+// Portable HAL microsecond hardware settle spin (ESP32-C6 16 MHz SYSTIMER unit 0)
+
+import chip.esp32c6 as hw;
+
+u32 read_systimer_lo() {
+    hw.SYSTIMER.unit0_op = 1u32 << 30;
+    for (u32 _w in 0..256) {
+        if ((hw.SYSTIMER.unit0_op & (1u32 << 29)) != 0u32) {
+            break;
+        }
+    }
+    return hw.SYSTIMER.unit0_value_lo;
+}
+
+pub fn spin_us(u32 us) {
+    if (us == 0u32) {
+        return;
+    }
+    if ((hw.SYSTIMER.conf & (1u32 << 30)) == 0u32) {
+        u32 n = us;
+        if (n > 500u32) {
+            n = 500u32;
+        }
+        for (u32 _i in 0..(n * 8u32)) {
+            sys.nop();
+        }
+        return;
+    }
+    u32 rem_us = us;
+    for (u32 _chunk in 0..2000) {
+        if (rem_us == 0u32) {
+            break;
+        }
+        u32 slice_us = rem_us;
+        if (slice_us > 500u32) {
+            slice_us = 500u32;
+        }
+        rem_us -= slice_us;
+        // ESP32-C6 SYSTIMER runs at 16 MHz (16 ticks per microsecond).
+        u32 target = slice_us * 16u32;
+        u32 max_polls = (target * 4u32) + 256u32;
+        u32 t0 = read_systimer_lo();
+        for (u32 _p in 0..max_polls) {
+            if ((read_systimer_lo() - t0) >= target) {
+                break;
+            }
+            sys.nop();
+        }
+    }
+}

@@ -6597,4 +6597,50 @@ fn main() {
             "stdout:\n{stdout}"
         );
     }
+
+    #[test]
+    fn portable_controller_demo_runs_under_asan() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let demo_path = root.join("examples/portable_controller_demo.zev");
+        let demo_src = std::fs::read_to_string(&demo_path).expect("read portable_controller_demo.zev");
+        let demo_label = demo_path.display().to_string();
+
+        let generics = zev_sema::collect_import_aware_generic_names_with_targets(
+            &[(demo_src.as_str(), Some(demo_path.as_path()))],
+            std::slice::from_ref(&root),
+            None,
+            None,
+        );
+        let prog = zev_parser::parse_str_named_with_generics(&demo_src, &demo_label, Some(&generics))
+            .expect("parse portable_controller_demo");
+        let aopts = zev_sema::AnalyzeOptions {
+            include_dirs: vec![root],
+            ..zev_sema::AnalyzeOptions::default()
+        };
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, Some(demo_label.as_str()))],
+            &aopts,
+        );
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema portable_controller_demo: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = zev_mir::lower_programs(&analyzed.programs).expect("lower portable_controller_demo");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("portable_controller_demo", &c_code);
+        let stdout = compile_and_run_clang_sanitized("portable_controller_demo", &c_code, None);
+        assert!(
+            stdout.contains("[PORTABLE board=host_sim step=0]"),
+            "missing step=0 line:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("fault=false"),
+            "missing fault=false:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("[PORTABLE] done board=host_sim steps=4 lut_sum=2150 mid_sum=1100"),
+            "missing done line:\n{stdout}"
+        );
+    }
 }

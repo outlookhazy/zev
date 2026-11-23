@@ -863,7 +863,10 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             ItemKind::Const(cd) => {
                 let ty = syms.resolve_type(&cd.ty);
                 let mut dummy_ctx = DirectLowerCtx::new(&syms, MirType::Void, MirErrorSpec::None);
-                let init = dummy_ctx.lower_pure_expr(&cd.value, Some(&ty))?;
+                let init = coerce_expr_if_needed(
+                    dummy_ctx.lower_pure_expr(&cd.value, Some(&ty))?,
+                    &ty,
+                );
                 mir_consts.push(MirConst {
                     name: cd.name.name.clone(),
                     ty,

@@ -6472,6 +6472,117 @@ fn main() {
     expect_ok(good_ro);
 }
 
+#[test]
+fn board_module_and_hal_target_binding_across_four_targets() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let demo_path = root.join("examples/portable_controller_demo.zev");
+    let demo_src = std::fs::read_to_string(&demo_path).expect("read portable_controller_demo.zev");
+    let demo_label = demo_path.display().to_string();
+
+    let targets: [(&str, Option<&str>, Option<&str>); 4] = [
+        ("host_sim", None, None),
+        ("lm3s6965_evb", Some("hal/lm3s6965"), Some("bsp/lm3s6965_evb")),
+        ("nucleo_f334r8", Some("hal/stm32f3"), Some("bsp/nucleo_f334r8")),
+        ("esp32c6_pico", Some("hal/esp32c6"), Some("bsp/esp32c6_pico")),
+    ];
+
+    for (label, hal_dir, board_module) in targets {
+        let generics = zev_sema::collect_import_aware_generic_names_with_targets(
+            &[(demo_src.as_str(), Some(demo_path.as_path()))],
+            std::slice::from_ref(&root),
+            hal_dir,
+            board_module,
+        );
+        let prog = zev_parser::parse_str_named_with_generics(&demo_src, &demo_label, Some(&generics))
+            .unwrap_or_else(|e| panic!("parse failed for {label}: {e:#?}"));
+        let aopts = AnalyzeOptions {
+            include_dirs: vec![root.clone()],
+            hal_dir: hal_dir.map(str::to_string),
+            board_module: board_module.map(str::to_string),
+            ..AnalyzeOptions::default()
+        };
+        let out = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, Some(demo_label.as_str()))],
+            &aopts,
+        );
+        assert!(
+            out.diagnostics.is_empty(),
+            "sema failed for {label}: {:?}",
+            out.diagnostics
+        );
+    }
+
+    // Diamond-import deduplication: `import board;` and `import bsp.nucleo_f334r8 as bsp;`
+    let diamond_src = r#"
+import board;
+import bsp.nucleo_f334r8 as bsp;
+
+fn main() {
+    board.init();
+    bsp.set_led(true);
+    assert(board.BOARD_NAME.len == bsp.BOARD_NAME.len);
+}
+"#;
+    let diamond_generics = zev_sema::collect_import_aware_generic_names_with_targets(
+        &[(diamond_src, None)],
+        std::slice::from_ref(&root),
+        Some("hal/stm32f3"),
+        Some("bsp/nucleo_f334r8"),
+    );
+    let diamond_prog =
+        zev_parser::parse_str_named_with_generics(diamond_src, "diamond.zev", Some(&diamond_generics))
+            .expect("parse diamond import");
+    let diamond_opts = AnalyzeOptions {
+        include_dirs: vec![root],
+        hal_dir: Some("hal/stm32f3".to_string()),
+        board_module: Some("bsp/nucleo_f334r8".to_string()),
+        ..AnalyzeOptions::default()
+    };
+    let diamond_out =
+        zev_sema::analyze_and_monomorphize_named_programs(&[(&diamond_prog, None)], &diamond_opts);
+    assert!(
+        diamond_out.diagnostics.is_empty(),
+        "diamond deduplication failed: {:?}",
+        diamond_out.diagnostics
+    );
+
+    // Embedded fallback resolution with no workspace include_dirs
+    let emb_src = r#"
+import board;
+
+fn main() {
+    board.init();
+    board.set_led(true);
+    bool _b = board.read_button();
+}
+"#;
+    for (label, hal_dir, board_module) in [
+        ("emb_sim", None, None),
+        ("emb_esp32c6", Some("hal/esp32c6"), Some("bsp/esp32c6_pico")),
+    ] {
+        let g = zev_sema::collect_import_aware_generic_names_with_targets(
+            &[(emb_src, None)],
+            &[],
+            hal_dir,
+            board_module,
+        );
+        let p = zev_parser::parse_str_named_with_generics(emb_src, "embedded.zev", Some(&g))
+            .unwrap_or_else(|e| panic!("parse embedded {label}: {e:#?}"));
+        let o = AnalyzeOptions {
+            include_dirs: Vec::new(),
+            hal_dir: hal_dir.map(str::to_string),
+            board_module: board_module.map(str::to_string),
+            ..AnalyzeOptions::default()
+        };
+        let res = zev_sema::analyze_and_monomorphize_named_programs(&[(&p, None)], &o);
+        assert!(
+            res.diagnostics.is_empty(),
+            "embedded fallback {label} failed: {:?}",
+            res.diagnostics
+        );
+    }
+}
+
 
 
 

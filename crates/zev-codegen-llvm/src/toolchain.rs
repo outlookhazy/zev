@@ -118,6 +118,8 @@ pub struct CodegenOptions {
     pub spec: Option<TargetSpec>,
     /// Target-bound HAL directory override (e.g. `"hal/stm32f3"`), defaulting to `"hal/sim"`.
     pub hal_dir: Option<String>,
+    /// Target-bound board module override (e.g. `"bsp/nucleo_f334r8"`), defaulting to `"bsp/sim"`.
+    pub board_module: Option<String>,
     /// Flash base address override.
     pub flash_origin: u32,
     /// Flash size in bytes override.
@@ -138,6 +140,7 @@ impl Default for CodegenOptions {
             target: TargetArch::Thumbv7mNoneEabi,
             spec: None,
             hal_dir: None,
+            board_module: None,
             flash_origin: 0x0000_0000,
             flash_len: 256 * 1024,
             ram_origin: 0x2000_0000,
@@ -172,6 +175,7 @@ impl CodegenOptions {
         Self {
             target,
             hal_dir: spec.hal_dir.clone(),
+            board_module: spec.board_module.clone(),
             flash_origin: spec.flash_base,
             flash_len: spec.effective_flash_size(),
             ram_origin: spec.ram_base,
@@ -224,6 +228,7 @@ impl CodegenOptions {
                 target: TargetArch::Riscv32Esp32C6,
                 spec: None,
                 hal_dir: None,
+            board_module: None,
                 flash_origin: 0x4200_0000,
                 flash_len: 4 * 1024 * 1024,
                 ram_origin: 0x4080_0000,
@@ -234,6 +239,13 @@ impl CodegenOptions {
         }
     }
 
+    pub fn lm3s6965() -> Self {
+        match TargetSpec::resolve(None, Some("lm3s6965_evb")) {
+            Ok(spec) => Self::from_spec(spec),
+            Err(_) => Self::default(),
+        }
+    }
+
     pub fn avr_uno() -> Self {
         match TargetSpec::resolve(None, Some("arduino_uno")) {
             Ok(spec) => Self::from_spec(spec),
@@ -241,6 +253,7 @@ impl CodegenOptions {
                 target: TargetArch::AvrAtmega328p,
                 spec: None,
                 hal_dir: None,
+            board_module: None,
                 flash_origin: 0x0000_0000,
                 flash_len: 32_256,
                 ram_origin: 0x0000_0100,
@@ -262,6 +275,7 @@ impl CodegenOptions {
                 target: TargetArch::AvrAtmega4809,
                 spec: None,
                 hal_dir: None,
+            board_module: None,
                 flash_origin: 0x0000_0000,
                 flash_len: 49_152,
                 ram_origin: 0x0000_2800,
@@ -279,6 +293,7 @@ impl CodegenOptions {
                 target: TargetArch::Thumbv6mRp2040,
                 spec: None,
                 hal_dir: None,
+            board_module: None,
                 flash_origin: 0x2000_0000,
                 flash_len: 264 * 1024,
                 ram_origin: 0x2000_0000,

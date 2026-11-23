@@ -3,6 +3,7 @@
 [board]
 name = "lm3s6965_evb"
 chip = "lm3s6965"
+board_module = "bsp/lm3s6965_evb"
 
 [run]
 qemu_machine = "lm3s6965evb"

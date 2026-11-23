@@ -552,6 +552,7 @@ Targets are defined declaratively in `chips/<chip>.toml` + `boards/<board>.toml`
 - `zevc build --board <board> [-Oz] [--emit-ll] [files...] [-o out]`
 - `zevc flash --board <board> [--port <dev>] [-Oz] [files...]`
 - `zevc ram --board <board> [files...]` (also supports `--chip <chip>` or legacy `--target <name>`)
+- Target-bound portability: `[chip]`/`[board]` `hal_dir` binds `import hal.*;` (default `hal/sim`) and `[board]` `board_module` binds `import board;` (default `bsp/sim`), allowing one portable `.zev` app (`examples/portable_controller_demo.zev`) to run across host, QEMU, STM32F3, and ESP32-C6 unchanged.
 - Optional `zev.toml` project manifest sets defaults (`entry`, `board`, `chip`, `port`, `opt_level`) so `zevc build` / `zevc flash` work with zero extra CLI flags.
 
 ```bash

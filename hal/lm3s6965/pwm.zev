@@ -1,0 +1,58 @@
+// Portable HAL PWM channel interface (TI LM3S6965 TIMER0 CCP backend)
+
+import chip.lm3s6965 as hw;
+import std.math as math;
+
+pub struct Channel {
+    u8  kind;
+    u8  unit;
+    u8  ch;
+    u32 period;
+    u16 duty_permil;
+}
+
+pub Channel make_channel(u8 kind, u8 unit, u8 ch, u32 period, u16 duty_permil) {
+    u16 d = math.clamp<u16>(duty_permil, 0u16, 1000u16);
+    return Channel {
+        kind: kind,
+        unit: unit,
+        ch: ch,
+        period: period,
+        duty_permil: d,
+    };
+}
+
+impl Channel {
+    pub fn set_duty_permil(*self, u16 permil) {
+        u16 d = math.clamp<u16>(permil, 0u16, 1000u16);
+        self.duty_permil = d;
+        u32 per = self.period;
+        if (per == 0u32) {
+            per = hw.TIMER0.tailr;
+        }
+        if (per == 0u32) {
+            per = 1000u32;
+        }
+        u32 match_v = (((per as u64) * (d as u64)) / 1000u64) as u32;
+        if (self.unit == 0u8 || self.unit == 1u8) {
+            hw.TIMER0.tamatchr = match_v;
+        }
+    }
+
+    pub fn set_duty_u16(*self, u16 duty) {
+        u32 pm = (((duty as u32) * 1000u32) + 32767u32) / 65535u32;
+        self.set_duty_permil(math.clamp<u32>(pm, 0u32, 1000u32) as u16);
+    }
+
+    pub fn enable(*self, bool on) {
+        if (self.unit == 0u8 || self.unit == 1u8) {
+            if (on) {
+                hw.TIMER0.ctl = hw.TIMER0.ctl | 1u32;
+            } else {
+                hw.TIMER0.ctl = hw.TIMER0.ctl & (~1u32);
+                self.duty_permil = 0u16;
+                hw.TIMER0.tamatchr = 0u32;
+            }
+        }
+    }
+}

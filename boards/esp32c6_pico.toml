@@ -3,6 +3,7 @@
 [board]
 name = "esp32c6_pico"
 chip = "esp32c6"
+board_module = "bsp/esp32c6_pico"
 
 [run]
 flash_cmd = ["esptool", "--chip", "esp32c6", "--port", "{port}", "--after", "hard-reset", "write-flash", "0x0", "{image}"]

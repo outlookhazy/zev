@@ -6,11 +6,17 @@
 
 import chip.stm32f334 as hw;
 import chip.stm32f3 as f3;
-import hal.gpio as gpio;
+import hal.{gpio, adc, pwm, spi, i2c};
+import std.bus as bus;
+
+pub const []u8 BOARD_NAME = "nucleo_f334r8";
+pub const bool EXIT_ON_DONE = false;
 
 // Onboard LD2 (PA5, active-high) and User Button B1 (PC13, active-low) in Flash `.rodata`
 pub const gpio.Pin PIN_LD2 = gpio.Pin { port: f3.PORT_A, pin: 5u8,  active_low: false };
 pub const gpio.Pin PIN_B1  = gpio.Pin { port: f3.PORT_C, pin: 13u8, active_low: true  };
+pub const gpio.Pin PIN_USER_OUT = gpio.Pin { port: f3.PORT_A, pin: 5u8,  active_low: false };
+pub const gpio.Pin PIN_BUTTON   = gpio.Pin { port: f3.PORT_C, pin: 13u8, active_low: true  };
 
 // Arduino Uno R3 Expansion Header Pin Mapping (ST UM1724)
 pub const gpio.Pin ARD_A0  = gpio.Pin { port: f3.PORT_A, pin: 0u8,  active_low: false };
@@ -85,4 +91,25 @@ pub fn toggle_led() {
 
 pub bool read_button() {
     return PIN_B1.read();
+}
+
+pub fn init() {
+    u32 _clk = init_board();
+    f3.init_adc12();
+}
+
+pub adc.Channel default_adc() {
+    return adc.make_channel(1u8, 18u8, 3300u16);
+}
+
+pub pwm.Channel default_pwm() {
+    return f3.tim1_pwm_ch1_pa8_start(1000u32, 0u16);
+}
+
+pub spi.Bus default_spi() {
+    return f3.spi1_init(bus.SpiMode.Mode0, 3u8, f3.SPI1_PINS_PB3_5, 10u32);
+}
+
+pub i2c.Bus default_i2c() {
+    return f3.i2c1_init_pb6_pb7_100k(10u32);
 }

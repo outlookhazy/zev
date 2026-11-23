@@ -1,0 +1,51 @@
+// Portable HAL I2C master bus interface (ESP32-C6 target, SoftYielding)
+
+import std.bus as bus;
+
+pub struct Bus {
+    u8  unit;
+    u32 timeout_ms;
+}
+
+pub Bus make_bus(u8 unit, u32 timeout_ms) {
+    return Bus {
+        unit: unit,
+        timeout_ms: timeout_ms,
+    };
+}
+
+impl Bus {
+    pub bool probe_7bit(self, u8 addr7) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8 || addr7 > 127u8) {
+            error bus.BusStatus.FrameErr;
+        }
+        return false;
+    }
+
+    pub fn write(self, u8 addr7, []u8 data) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8 || addr7 > 127u8 || data.len > 255) {
+            error bus.BusStatus.FrameErr;
+        }
+        error bus.BusStatus.BusBusy;
+    }
+
+    pub fn read(self, u8 addr7, []u8 dst) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8 || addr7 > 127u8 || dst.len > 255) {
+            error bus.BusStatus.FrameErr;
+        }
+        error bus.BusStatus.BusBusy;
+    }
+
+    pub fn write_read(self, u8 addr7, []u8 tx, []u8 rx) error bus.BusStatus {
+        self.write(addr7, tx) catch (bus.BusStatus err) {
+            error err;
+        };
+        self.read(addr7, rx) catch (bus.BusStatus err) {
+            error err;
+        };
+        return;
+    }
+}

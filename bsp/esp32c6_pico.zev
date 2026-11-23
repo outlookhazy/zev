@@ -1,5 +1,12 @@
 // Waveshare ESP32-C6-Pico Board Support Package (100% Pure .zev)
 import chip.esp32c6 as hw;
+import hal.{adc, gpio, i2c, pwm, spi};
+
+pub const []u8 BOARD_NAME = "esp32c6_pico";
+pub const bool EXIT_ON_DONE = false;
+
+pub const gpio.Pin PIN_USER_OUT = gpio.Pin { port: 0u8, pin: 2u8, active_low: false };
+pub const gpio.Pin PIN_BUTTON   = gpio.Pin { port: 0u8, pin: 9u8, active_low: true  };
 
 pub const u32 PIN_WS2812_RGB = 8;
 pub const u32 PIN_BOOT_BTN   = 9;
@@ -295,4 +302,42 @@ pub fn start_gdma_m2m_ch0(usize tx_desc_addr, usize rx_desc_addr) {
 
 pub fn clear_gdma_rx_ch0_irq() {
     hw.GDMA.in_int_clr_ch0 = 0x7F;
+}
+
+pub fn init() {
+    init_soc();
+    init_board_gpio();
+    init_temp_sensor();
+    PIN_USER_OUT.set_low();
+    PIN_USER_OUT.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    ws2812_rgb(0u8, 0u8, 0u8);
+}
+
+pub fn set_led(bool on) {
+    PIN_USER_OUT.write(on);
+    if (on) {
+        ws2812_rgb(0u8, 16u8, 0u8);
+    } else {
+        ws2812_rgb(0u8, 0u8, 0u8);
+    }
+}
+
+pub bool read_button() {
+    return PIN_BUTTON.read();
+}
+
+pub adc.Channel default_adc() {
+    return adc.make_channel(1u8, 0u8, 3300u16);
+}
+
+pub pwm.Channel default_pwm() {
+    return pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 0u16);
+}
+
+pub spi.Bus default_spi() {
+    return spi.make_bus(2u8, 10u32);
+}
+
+pub i2c.Bus default_i2c() {
+    return i2c.make_bus(1u8, 10u32);
 }
