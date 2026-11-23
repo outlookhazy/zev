@@ -6769,4 +6769,105 @@ fn main() {
             "expected ping_pong base_addr GEP (field 4, index 0) in LLVM IR:\n{ll}"
         );
     }
+
+    #[test]
+    fn rodata_consts_and_impl_methods_llvm_ir_and_build() {
+        let src = r#"
+import bsp.nucleo_f334r8 as bsp;
+import hal.gpio as gpio;
+
+const [4]u16 LUT = [10u16, 20u16, 30u16, 40u16];
+
+struct Acc<T, usize N> {
+    [N]T  vals;
+    usize count;
+}
+
+impl<T, usize N> Acc<T, N> {
+    pub fn push(*self, T v) {
+        if (self.count < N) {
+            self.vals[self.count] = v;
+            self.count += 1;
+        }
+    }
+}
+
+impl<usize N> Acc<f32, N> {
+    pub f32 avg(*self) {
+        if (self.count == 0) {
+            return 0.0f32;
+        }
+        f32 s = 0.0f32;
+        for (usize i in 0..self.count) {
+            s += self.vals[i];
+        }
+        return s / (self.count as f32);
+    }
+}
+
+watch<u32> out_w = 0u32;
+
+u16 sum_slice([]u16 xs) {
+    u16 total = 0u16;
+    for (u16 x in xs) {
+        total += x;
+    }
+    return total;
+}
+
+fn main() {
+    bsp.init_board();
+    bsp.PIN_LD2.set_high();
+    u16 a = LUT[2];
+    u16 b = sum_slice(LUT[1..3]);
+    u16 c = sum_slice(LUT);
+
+    Acc<f32, 4> acc = Acc<f32, 4> { vals: [0.0f32, 0.0f32, 0.0f32, 0.0f32], count: 0 };
+    acc.push(1.5f32);
+    acc.push(2.5f32);
+    u32 mean_x10 = (acc.avg() * 10.0f32) as u32;
+    out_w.publish((a as u32) + (b as u32) + (c as u32) + mean_x10);
+    loop {
+        delay(20ms);
+    }
+}
+"#;
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let prog = zev_parser::parse_str(src).expect("parse rodata_consts_llvm");
+        let aopts = zev_sema::AnalyzeOptions {
+            include_dirs: vec![root],
+            hal_dir: Some("hal/stm32f3".to_string()),
+            ..zev_sema::AnalyzeOptions::default()
+        };
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(&[(&prog, None)], &aopts);
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema diagnostics: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = zev_mir::lower_programs(&analyzed.programs).expect("lower MIR");
+        let spec = TargetSpec::resolve(None, Some("nucleo_f334r8")).expect("resolve nucleo_f334r8");
+        let opts = CodegenOptions::from_spec(spec);
+        let ll = emit_llvm_ir_with_options(&mir, &opts).expect("emit LLVM IR");
+        assert!(
+            ll.contains("@__zev_const_LUT = private unnamed_addr constant [4 x i16]"),
+            "expected LUT in .rodata:\n{ll}"
+        );
+        assert!(
+            ll.contains("@__zev_const_bsp_nucleo_f334r8__PIN_LD2 = private unnamed_addr constant %struct.hal_gpio__Pin"),
+            "expected PIN_LD2 in .rodata:\n{ll}"
+        );
+        assert!(
+            ll.contains("getelementptr inbounds [4 x i16], ptr @__zev_const_LUT"),
+            "expected direct GEP on @__zev_const_LUT without stack copy:\n{ll}"
+        );
+
+        let out_dir = std::env::temp_dir().join(format!("zev_rodata_impl_llvm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let bin_path = out_dir.join("rodata_impl.bin");
+        let art = build_target_image(&mir, &opts, &bin_path).expect("build nucleo_f334r8 ELF");
+        assert!(art.elf.audit.is_zero_heap_freestanding());
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
 }

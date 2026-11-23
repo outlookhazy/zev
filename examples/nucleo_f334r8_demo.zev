@@ -3,37 +3,19 @@
 // Validates peripherals wired to NUCLEO-F334R8 in application code layered cleanly over:
 //   - `std.{str, fmt, bus}` portable standard library
 //   - `hal.{time, gpio, pwm, adc, i2c, spi}` portable hardware abstractions (bound to `hal/stm32f3`)
-//   - `chip.stm32f3.*` reusable silicon drivers over pure MMIO `chip.stm32f334`
-//   - `bsp.nucleo_f334r8` slim Nucleo-64 board topology, 72 MHz clock init, & ST-LINK VCP console
+//   - `chip.stm32f3` reusable silicon drivers over pure MMIO `chip.stm32f334`
+//   - `bsp.nucleo_f334r8` slim Nucleo-64 board topology, `.rodata` `const` pins, 72 MHz clock init, & VCP console
 //   - Circular `@dma_safe ping_pong<u8, 32>` + `DMA1_CH5` (`IRQ_DMA1_CH5`) for zero-overrun GPS RX
 //   - Zero-copy `@dma_safe pool<DmaBurst, 2>` + `Lease<DmaBurst>` + `dma_slot` + `DMA1_CH1` (`IRQ11`)
 
 import chip.stm32f334 as hw;
-import chip.stm32f3.rcc as rcc;
-import chip.stm32f3.gpio as cgpio;
-import chip.stm32f3.tim as tim;
-import chip.stm32f3.hrtim as hrtim;
-import chip.stm32f3.adc as cadc;
-import chip.stm32f3.dac_comp as dac_comp;
-import chip.stm32f3.uart as uart;
-import chip.stm32f3.spi as cspi;
-import chip.stm32f3.i2c as ci2c;
-import chip.stm32f3.bxcan as bxcan;
-import chip.stm32f3.dma as cdma;
-import chip.stm32f3.flash as flash;
+import chip.stm32f3 as f3;
 import bsp.nucleo_f334r8 as bsp;
-import hal.time as htime;
-import hal.gpio as gpio;
-import hal.pwm as pwm;
-import hal.adc as adc;
-import hal.i2c as i2c;
-import hal.spi as spi;
-import std.str as str;
-import std.fmt as fmt;
-import std.bus as bus;
+import hal.{time as htime, gpio, pwm, adc, i2c, spi};
+import std.{str, fmt, bus};
 
-// Shakedown rig wiring pin aliases (kept in app, not in board BSP)
-const u32 RIG_PIN_PB1_LEGACY_PPS = 1;
+// Shakedown rig wiring pin descriptor in Flash `.rodata` (kept in app, not in board BSP)
+const gpio.Pin RIG_PB1_PPS = gpio.Pin { port: f3.PORT_B, pin: 1u8, active_low: false };
 
 enum SupEvent {
     RunShakedown,
@@ -166,19 +148,13 @@ isr tim2_isr(*inbox<u32, 8> q, *watch<PinSnapshot> pw) {
     state u32  pb0_edges = 0u32;
     state u32  btn_edges = 0u32;
 
-    tim.tim2_clear_irq();
+    f3.tim2_clear_irq();
     ticks += 1u32;
 
-    gpio.Pin p_pc1 = gpio.make_pin(cgpio.PORT_C, bsp.ARD_A4_PC1 as u8, false, false);
-    gpio.Pin p_pb1 = gpio.make_pin(cgpio.PORT_B, RIG_PIN_PB1_LEGACY_PPS as u8, false, false);
-    gpio.Pin p_pb0 = gpio.make_pin(cgpio.PORT_B, bsp.ARD_A3_PB0 as u8, false, false);
-    gpio.Pin p_btn = bsp.button_pin();
-    gpio.Pin p_led = bsp.led_pin();
-
-    bool pc1 = gpio.read(&p_pc1);
-    bool pb1 = gpio.read(&p_pb1);
-    bool pb0 = gpio.read(&p_pb0);
-    bool btn = gpio.read(&p_btn);
+    bool pc1 = bsp.ARD_A4.read();
+    bool pb1 = RIG_PB1_PPS.read();
+    bool pb0 = bsp.ARD_A3.read();
+    bool btn = bsp.PIN_B1.read();
     bool edge = false;
 
     if (pc1 && !prev_pc1) {
@@ -205,7 +181,7 @@ isr tim2_isr(*inbox<u32, 8> q, *watch<PinSnapshot> pw) {
 
     bool quarter_sec = (ticks % 250u32) == 0u32;
     if (quarter_sec) {
-        gpio.toggle(&p_led);
+        bsp.PIN_LD2.toggle();
         q.post(ticks, boost: @critical);
     }
     if (quarter_sec || edge) {
@@ -239,7 +215,7 @@ isr usart2_rx_isr(*byte_ring rx, *hw.UsartRegs u) {
 isr usart1_dma_isr(*ping_pong<u8, 32> rx_pp) {
     state u32 gps_dma_irqs = 0u32;
     gps_dma_irqs += 1u32;
-    u8 flags = uart.usart1_dma_rx_ack();
+    u8 flags = f3.usart1_dma_rx_ack();
     if ((flags & 1u8) != 0u8) {
         rx_pp.complete_half(0u8);
     }
@@ -251,7 +227,7 @@ isr usart1_dma_isr(*ping_pong<u8, 32> rx_pp) {
 isr dma1_ch1_isr(*dma_slot<DmaBurst> inflight, *inbox<Lease<DmaBurst>, 2> done_q) {
     state u32 dma_irqs = 0u32;
     dma_irqs += 1u32;
-    cdma.dma1_ch1_clear_irq();
+    f3.dma1_ch1_clear_irq();
     Lease<DmaBurst> done = inflight.take() catch {
         return;
     };
@@ -493,7 +469,7 @@ task cli_worker(*byte_ring rx, *inbox<SupEvent, 8> sup) {
 }
 
 // ── Application-Level Hardware Validation Suites (HAL + Chip Drivers) ───────
-u32 sample_a0_window_pct(*gpio.Pin pin_a0, u32 window_ms) {
+u32 sample_a0_window_pct(gpio.Pin pin_a0, u32 window_ms) {
     u32 t0 = sys.now_ms();
     u32 highs = 0u32;
     u32 total = 0u32;
@@ -502,7 +478,7 @@ u32 sample_a0_window_pct(*gpio.Pin pin_a0, u32 window_ms) {
             break;
         }
         for (u32 inner in 0..64) {
-            if (gpio.read(pin_a0)) {
+            if (pin_a0.read()) {
                 highs += 1u32;
             }
             total += 1u32;
@@ -514,8 +490,8 @@ u32 sample_a0_window_pct(*gpio.Pin pin_a0, u32 window_ms) {
     return ((highs * 100u32) + (total / 2u32)) / total;
 }
 
-u32 sample_a0_pwm_pct(*pwm.Channel ch, *gpio.Pin pin_a0, u16 duty_permil) {
-    pwm.set_duty_permil(ch, duty_permil);
+u32 sample_a0_pwm_pct(*pwm.Channel ch, gpio.Pin pin_a0, u16 duty_permil) {
+    ch.set_duty_permil(duty_permil);
 
     // Yield >= 3 ms ticks so OC1PE preload register latches on a clean 1 kHz PWM period boundary.
     delay(3ms);
@@ -523,26 +499,26 @@ u32 sample_a0_pwm_pct(*pwm.Channel ch, *gpio.Pin pin_a0, u16 duty_permil) {
 }
 
 LoopbackReport run_d7_a0_loopback_test() {
-    tim.tim1_pwm_ch1_stop();
-    gpio.Pin pin_a0 = cgpio.pin_in(cgpio.PORT_A, bsp.ARD_A0_PA0, cgpio.PUPD_DOWN, false);
-    gpio.Pin pin_d7 = cgpio.pin_out(cgpio.PORT_A, bsp.ARD_D7_PA8, false, false);
+    f3.tim1_pwm_ch1_stop();
+    bsp.ARD_A0.set_mode(gpio.Mode.Input, gpio.Pull.Down);
+    bsp.ARD_D7.set_low();
+    bsp.ARD_D7.set_mode(gpio.Mode.Output, gpio.Pull.None);
 
-    gpio.write(&pin_d7, false);
     delay(1ms);
-    bool dig_low_ok = !gpio.read(&pin_a0);
+    bool dig_low_ok = !bsp.ARD_A0.read();
 
-    gpio.write(&pin_d7, true);
+    bsp.ARD_D7.set_high();
     delay(1ms);
-    bool dig_high_ok = gpio.read(&pin_a0);
+    bool dig_high_ok = bsp.ARD_A0.read();
 
-    pwm.Channel tim1_ch = tim.tim1_pwm_ch1_pa8_start(1000u32, 250u16);
-    u32 pwm25_pct = sample_a0_pwm_pct(&tim1_ch, &pin_a0, 250u16);
-    u32 pwm75_pct = sample_a0_pwm_pct(&tim1_ch, &pin_a0, 750u16);
+    pwm.Channel tim1_ch = f3.tim1_pwm_ch1_pa8_start(1000u32, 250u16);
+    u32 pwm25_pct = sample_a0_pwm_pct(&tim1_ch, bsp.ARD_A0, 250u16);
+    u32 pwm75_pct = sample_a0_pwm_pct(&tim1_ch, bsp.ARD_A0, 750u16);
 
-    pwm.enable(&tim1_ch, false);
-    tim.tim1_pwm_ch1_stop();
-    gpio.Pin pin_d7_restored = cgpio.pin_out(cgpio.PORT_A, bsp.ARD_D7_PA8, false, false);
-    gpio.write(&pin_d7_restored, false);
+    tim1_ch.enable(false);
+    f3.tim1_pwm_ch1_stop();
+    bsp.ARD_D7.set_low();
+    bsp.ARD_D7.set_mode(gpio.Mode.Output, gpio.Pull.None);
 
     bool p25_ok = (pwm25_pct >= 19u32) && (pwm25_pct <= 31u32);
     bool p75_ok = (pwm75_pct >= 69u32) && (pwm75_pct <= 81u32);
@@ -557,65 +533,67 @@ LoopbackReport run_d7_a0_loopback_test() {
 }
 
 u16 probe_a1_with_discharge() {
-    cgpio.config(cgpio.PORT_A, bsp.ARD_A1_PA1, cgpio.MODE_IN, cgpio.PUPD_DOWN);
+    bsp.ARD_A1.set_mode(gpio.Mode.Input, gpio.Pull.Down);
     htime.spin_us(40u32);
-    cgpio.config(cgpio.PORT_A, bsp.ARD_A1_PA1, cgpio.MODE_ANALOG, cgpio.PUPD_NONE);
+    bsp.ARD_A1.set_mode(gpio.Mode.Analog, gpio.Pull.None);
     delay(1ms);
-    adc.Channel ch_a1 = cadc.channel(1u8, 2u8, 3300u16);
-    return adc.read_u16(&ch_a1) or 0u16;
+    adc.Channel ch_a1 = f3.adc_channel(1u8, 2u8, 3300u16);
+    return ch_a1.read_u16() or 0u16;
 }
 
 AnalogReport run_analog_test() {
-    u16 vref_counts = cadc.read_vrefint_counts() or 0u16;
+    u16 vref_counts = f3.read_vrefint_counts() or 0u16;
 
     // Sample D7 (PA8) -> A0 (PA0) analog levels via ADC1_IN1, then restore A0 digital input.
-    tim.tim1_pwm_ch1_stop();
-    cgpio.config(cgpio.PORT_A, bsp.ARD_A0_PA0, cgpio.MODE_ANALOG, cgpio.PUPD_NONE);
-    gpio.Pin pin_d7 = cgpio.pin_out(cgpio.PORT_A, bsp.ARD_D7_PA8, false, false);
-    adc.Channel ch_a0 = cadc.channel(1u8, 1u8, 3300u16);
+    f3.tim1_pwm_ch1_stop();
+    bsp.ARD_A0.set_mode(gpio.Mode.Analog, gpio.Pull.None);
+    bsp.ARD_D7.set_low();
+    bsp.ARD_D7.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    adc.Channel ch_a0 = f3.adc_channel(1u8, 1u8, 3300u16);
 
-    gpio.write(&pin_d7, false);
+    bsp.ARD_D7.set_low();
     delay(1ms);
-    u16 a0_low_counts = adc.read_u16(&ch_a0) or 0u16;
+    u16 a0_low_counts = ch_a0.read_u16() or 0u16;
 
-    gpio.write(&pin_d7, true);
+    bsp.ARD_D7.set_high();
     delay(1ms);
-    u16 a0_high_counts = adc.read_u16(&ch_a0) or 0u16;
+    u16 a0_high_counts = ch_a0.read_u16() or 0u16;
 
-    gpio.write(&pin_d7, false);
-    cgpio.config(cgpio.PORT_A, bsp.ARD_A0_PA0, cgpio.MODE_IN, cgpio.PUPD_DOWN);
+    bsp.ARD_D7.set_low();
+    bsp.ARD_A0.set_mode(gpio.Mode.Input, gpio.Pull.Down);
 
     // DAC1_OUT1 (PA4/A2) verified via ADC2_IN1 (PA4) + A2->A1 (PA1/ADC1_IN2) jumper probe.
-    dac_comp.dac1_enable_pa4();
-    adc.Channel ch_dac = cadc.channel(2u8, 1u8, 3300u16);
-    dac_comp.dac1_write(1024u16);
+    f3.dac1_enable_pa4();
+    adc.Channel ch_dac = f3.adc_channel(2u8, 1u8, 3300u16);
+    f3.dac1_write(1024u16);
     delay(1ms);
-    u16 dac_low_adc2 = adc.read_u16(&ch_dac) or 0u16;
+    u16 dac_low_adc2 = ch_dac.read_u16() or 0u16;
     u16 a1_low_adc1 = probe_a1_with_discharge();
 
-    dac_comp.dac1_write(3072u16);
+    f3.dac1_write(3072u16);
     delay(1ms);
-    u16 dac_high_adc2 = adc.read_u16(&ch_dac) or 0u16;
+    u16 dac_high_adc2 = ch_dac.read_u16() or 0u16;
     u16 a1_high_adc1 = probe_a1_with_discharge();
 
-    dac_comp.dac1_disable_pa4();
-    cgpio.config(cgpio.PORT_A, bsp.ARD_A1_PA1, cgpio.MODE_IN, cgpio.PUPD_NONE);
+    f3.dac1_disable_pa4();
+    bsp.ARD_A1.set_mode(gpio.Mode.Input, gpio.Pull.None);
 
     // COMP2 (PA7 non-inverting) vs internal VREFINT (~1.23V) with settle yield.
-    gpio.Pin pin_d11 = cgpio.pin_out(cgpio.PORT_A, bsp.ARD_D11_PA7, false, false);
-    dac_comp.comp2_enable_pa7_vrefint();
+    bsp.ARD_D11.set_low();
+    bsp.ARD_D11.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    f3.comp2_enable_pa7_vrefint();
     delay(1ms);
-    u32 comp_csr_lo = dac_comp.comp2_raw_csr();
-    bool comp_low_out = dac_comp.comp2_read_out();
+    u32 comp_csr_lo = f3.comp2_raw_csr();
+    bool comp_low_out = f3.comp2_read_out();
 
-    gpio.write(&pin_d11, true);
+    bsp.ARD_D11.set_high();
     delay(1ms);
-    u32 comp_csr_hi = dac_comp.comp2_raw_csr();
-    bool comp_high_out = dac_comp.comp2_read_out();
+    u32 comp_csr_hi = f3.comp2_raw_csr();
+    bool comp_high_out = f3.comp2_read_out();
 
-    dac_comp.comp2_disable();
-    gpio.write(&pin_d11, false);
-    cgpio.config(cgpio.PORT_A, bsp.ARD_D11_PA7, cgpio.MODE_IN, cgpio.PUPD_NONE);
+    f3.comp2_disable();
+    bsp.ARD_D11.set_low();
+    bsp.ARD_D11.set_mode(gpio.Mode.Input, gpio.Pull.None);
 
     bool vref_ok = (vref_counts >= 1350u16) && (vref_counts <= 1700u16);
     bool a0_ok = (a0_low_counts < 150u16) && (a0_high_counts > 3900u16);
@@ -643,7 +621,7 @@ AnalogReport run_analog_test() {
 }
 
 CanReport run_bxcan_test() {
-    bxcan.can1_init(500_000u32, bxcan.CAN_MODE_SILENT_LOOPBACK);
+    f3.can1_init(500_000u32, f3.CAN_MODE_SILENT_LOOPBACK);
 
     bus.CanFrame tx1 = bus.CanFrame {
         id: 0x123u32,
@@ -660,9 +638,9 @@ CanReport run_bxcan_test() {
         data: [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8],
     };
     bool std_ok = false;
-    if (bxcan.can1_send(&tx1)) {
+    if (f3.can1_send(&tx1)) {
         for (u32 spin in 0..40_000) {
-            if (bxcan.can1_recv(&rx1)) {
+            if (f3.can1_recv(&rx1)) {
                 std_ok = (!rx1.extended)
                     && (!rx1.rtr)
                     && (rx1.id == 0x123u32)
@@ -691,9 +669,9 @@ CanReport run_bxcan_test() {
         data: [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8],
     };
     bool ext_ok = false;
-    if (bxcan.can1_send(&tx2)) {
+    if (f3.can1_send(&tx2)) {
         for (u32 spin in 0..40_000) {
-            if (bxcan.can1_recv(&rx2)) {
+            if (f3.can1_recv(&rx2)) {
                 ext_ok = rx2.extended
                     && (!rx2.rtr)
                     && (rx2.id == 0x18DAF110u32)
@@ -711,7 +689,7 @@ CanReport run_bxcan_test() {
         }
     }
 
-    bxcan.can1_sleep();
+    f3.can1_sleep();
     return CanReport {
         std_ok: std_ok,
         std_id: rx1.id,
@@ -759,16 +737,16 @@ u8 reset_reason_code(bus.ResetReason rr) {
 }
 
 bool print_system_report(bus.ResetReason boot_rr) {
-    u32 sysclk = rcc.sysclk_hz();
-    u32 hclk = rcc.hclk_hz();
-    u32 pclk1 = rcc.pclk1_hz();
-    u32 pclk2 = rcc.pclk2_hz();
+    u32 sysclk = f3.sysclk_hz();
+    u32 hclk = f3.hclk_hz();
+    u32 pclk1 = f3.pclk1_hz();
+    u32 pclk2 = f3.pclk2_hz();
     u32 sleep_depth = sys.sleep_depth();
-    u32 uid0 = rcc.read_uid_word(0);
-    u32 uid1 = rcc.read_uid_word(1);
-    u32 uid2 = rcc.read_uid_word(2);
-    u16 vref_cal = cadc.read_vrefint_cal();
-    u32 vdda_mv = cadc.read_vdda_mv() or 0u32;
+    u32 uid0 = f3.read_uid_word(0);
+    u32 uid1 = f3.read_uid_word(1);
+    u32 uid2 = f3.read_uid_word(2);
+    u16 vref_cal = f3.read_vrefint_cal();
+    u32 vdda_mv = f3.read_vdda_mv() or 0u32;
     u8 r_code = reset_reason_code(boot_rr);
 
     bool clk_ok = (sysclk == 72_000_000u32 || sysclk == 64_000_000u32)
@@ -786,10 +764,10 @@ bool print_system_report(bus.ResetReason boot_rr) {
 
 bool print_fpu_report() {
     u32 rt_one = 0u32;
-    if (rcc.sysclk_hz() >= 1_000_000u32) {
+    if (f3.sysclk_hz() >= 1_000_000u32) {
         rt_one = 1u32;
     }
-    f32 vdda_v = cadc.read_vdda_volts() or 0.0f32;
+    f32 vdda_v = f3.read_vdda_volts() or 0.0f32;
     bool vdda_ok = (vdda_v >= 2.90f32) && (vdda_v <= 3.60f32);
 
     f32 x0 = 2.5f32 * (rt_one as f32);
@@ -820,23 +798,23 @@ bool print_fpu_report() {
 }
 
 bool print_hrtim_report() {
-    tim.tim1_pwm_ch1_stop();
-    gpio.Pin pin_a0 = cgpio.pin_in(cgpio.PORT_A, bsp.ARD_A0_PA0, cgpio.PUPD_DOWN, false);
+    f3.tim1_pwm_ch1_stop();
+    bsp.ARD_A0.set_mode(gpio.Mode.Input, gpio.Pull.Down);
 
     bool pwm_ok = false;
-    pwm.Channel hr_ch = hrtim.cha1_pwm_pa8_start(100_000u32, 250u16, &pwm_ok);
+    pwm.Channel hr_ch = f3.hrtim_cha1_pwm_pa8_start(100_000u32, 250u16, &pwm_ok);
     bool dll_ok = (hw.HRTIM1_COMMON.isr & (1u32 << 16)) != 0u32;
     delay(1ms);
-    u32 p25 = sample_a0_window_pct(&pin_a0, 15u32);
+    u32 p25 = sample_a0_window_pct(bsp.ARD_A0, 15u32);
 
-    pwm.set_duty_permil(&hr_ch, 750u16);
+    hr_ch.set_duty_permil(750u16);
     delay(1ms);
-    u32 p75 = sample_a0_window_pct(&pin_a0, 15u32);
+    u32 p75 = sample_a0_window_pct(bsp.ARD_A0, 15u32);
 
-    pwm.enable(&hr_ch, false);
-    hrtim.cha1_stop();
-    gpio.Pin pin_d7 = cgpio.pin_out(cgpio.PORT_A, bsp.ARD_D7_PA8, false, false);
-    gpio.write(&pin_d7, false);
+    hr_ch.enable(false);
+    f3.hrtim_cha1_stop();
+    bsp.ARD_D7.set_low();
+    bsp.ARD_D7.set_mode(gpio.Mode.Output, gpio.Pull.None);
 
     bool p25_ok = (p25 >= 19u32) && (p25 <= 31u32);
     bool p75_ok = (p75 >= 69u32) && (p75 <= 81u32);
@@ -847,18 +825,18 @@ bool print_hrtim_report() {
 }
 
 bool print_flash_nvs_report() {
-    bool erase_ok = flash.flash_nvs_erase();
+    bool erase_ok = f3.flash_nvs_erase();
     checkpoint();
-    u32 blank = flash.flash_nvs_read_u32(0);
+    u32 blank = f3.flash_nvs_read_u32(0);
 
-    u32 pattern[4] = [0x5A45_5631u32, 0xF334_0072u32, rcc.read_uid_word(0), 0xA55A_CC33u32];
-    bool write_ok = flash.flash_nvs_write_words(0, pattern[0..4]);
+    u32 pattern[4] = [0x5A45_5631u32, 0xF334_0072u32, f3.read_uid_word(0), 0xA55A_CC33u32];
+    bool write_ok = f3.flash_nvs_write_words(0, pattern[0..4]);
     checkpoint();
 
-    u32 w0 = flash.flash_nvs_read_u32(0);
-    u32 w1 = flash.flash_nvs_read_u32(1);
-    u32 w2 = flash.flash_nvs_read_u32(2);
-    u32 w3 = flash.flash_nvs_read_u32(3);
+    u32 w0 = f3.flash_nvs_read_u32(0);
+    u32 w1 = f3.flash_nvs_read_u32(1);
+    u32 w2 = f3.flash_nvs_read_u32(2);
+    u32 w3 = f3.flash_nvs_read_u32(3);
 
     bool ok = erase_ok
         && (blank == 0xFFFF_FFFFu32)
@@ -873,27 +851,27 @@ bool print_flash_nvs_report() {
 }
 
 bool print_bus_probe_report() {
-    spi.Bus spi1 = cspi.spi1_init(bus.SpiMode.Mode0, 4u8, cspi.PINS_PB3_5, 25u32);
+    spi.Bus spi1 = f3.spi1_init(bus.SpiMode.Mode0, 4u8, f3.SPI1_PINS_PB3_5, 25u32);
     bool spi_ok = true;
-    u8 spi_echo = spi.transfer_byte(&spi1, 0xA5u8) catch {
+    u8 spi_echo = spi1.transfer_byte(0xA5u8) catch {
         spi_ok = false;
         0u8;
     };
-    cspi.spi1_deinit();
-    cgpio.config(cgpio.PORT_B, bsp.PIN_SPI1_SCK_PB3, cgpio.MODE_IN, cgpio.PUPD_NONE);
-    cgpio.config(cgpio.PORT_B, bsp.PIN_SPI1_MISO_PB4, cgpio.MODE_IN, cgpio.PUPD_NONE);
-    cgpio.config(cgpio.PORT_B, bsp.PIN_SPI1_MOSI_PB5, cgpio.MODE_IN, cgpio.PUPD_NONE);
+    f3.spi1_deinit();
+    bsp.PIN_SPI1_SCK.set_mode(gpio.Mode.Input, gpio.Pull.None);
+    bsp.PIN_SPI1_MISO.set_mode(gpio.Mode.Input, gpio.Pull.None);
+    bsp.PIN_SPI1_MOSI.set_mode(gpio.Mode.Input, gpio.Pull.None);
 
-    i2c.Bus i2c1 = ci2c.i2c1_init_pb6_pb7_100k(25u32);
+    i2c.Bus i2c1 = f3.i2c1_init_pb6_pb7_100k(25u32);
     bool i2c_probe_ok = true;
-    bool i2c_ack3c = i2c.probe_7bit(&i2c1, 0x3Cu8) catch {
+    bool i2c_ack3c = i2c1.probe_7bit(0x3Cu8) catch {
         i2c_probe_ok = false;
         false;
     };
-    bool i2c_idle = i2c_probe_ok && ci2c.i2c1_bus_idle();
-    ci2c.i2c1_deinit();
-    cgpio.config(cgpio.PORT_B, bsp.PIN_I2C1_SCL_PB6, cgpio.MODE_IN, cgpio.PUPD_NONE);
-    cgpio.config(cgpio.PORT_B, bsp.PIN_I2C1_SDA_PB7, cgpio.MODE_IN, cgpio.PUPD_NONE);
+    bool i2c_idle = i2c_probe_ok && f3.i2c1_bus_idle();
+    f3.i2c1_deinit();
+    bsp.PIN_I2C1_SCL.set_mode(gpio.Mode.Input, gpio.Pull.None);
+    bsp.PIN_I2C1_SDA.set_mode(gpio.Mode.Input, gpio.Pull.None);
 
     bool ok = spi_ok && i2c_idle;
     println(f"[BUS] ok={ok} spi_ok={spi_ok} spi_rx=0x{spi_echo:02x} i2c_idle={i2c_idle} i2c_0x3c_ack={i2c_ack3c}");
@@ -933,7 +911,7 @@ bool run_dma_test() {
         println("[DMA] ok=false err=slot_busy");
         return false;
     };
-    cdma.dma1_ch1_mem2mem_start(base, base + 32, 8);
+    f3.dma1_ch1_mem2mem_start(base, base + 32, 8);
     Lease<DmaBurst> done = dma_done_q.recv(timeout: 100ms) catch {
         bool dropped = dma_inflight.release();
         println(f"[DMA] ok=false err=timeout dropped={dropped}");
@@ -952,7 +930,7 @@ bool run_dma_test() {
 
 fn run_full_shakedown(bus.ResetReason boot_rr) {
     println("--- [NUCLEO-F334R8 Hardware Shakedown] ---");
-    uart.usart1_write("$PMTK605*31\r\n");
+    f3.usart1_write("$PMTK605*31\r\n");
     bool sys_ok = print_system_report(boot_rr);
     bool fpu_ok = print_fpu_report();
     bool lb_ok = print_loopback_report();
@@ -972,22 +950,22 @@ fn run_full_shakedown(bus.ResetReason boot_rr) {
 // ── Boot & Supervisor Loop ───────────────────────────────────────────────────
 fn main() {
     bsp.init_board();
-    bus.ResetReason boot_rr = rcc.read_reset_reason(true);
-    cadc.init_adc12();
+    bus.ResetReason boot_rr = f3.read_reset_reason(true);
+    f3.init_adc12();
 
     // Activate @dma_safe ping_pong sleep clamp (sleep_depth==1) and circular DMA1_CH5 GPS RX.
     gps_dma.start();
-    uart.usart1_init_gps_dma_circular(9600u32, gps_dma.base_addr(), 64u32);
+    f3.usart1_init_gps_dma_circular(9600u32, gps_dma.base_addr(), 64u32);
 
     // Configure external rig GPIOs explicitly in application startup:
-    cgpio.config(cgpio.PORT_B, bsp.ARD_A3_PB0, cgpio.MODE_IN, cgpio.PUPD_UP);          // GPS FIX (PB0/A3)
-    cgpio.config(cgpio.PORT_C, bsp.ARD_A4_PC1, cgpio.MODE_IN, cgpio.PUPD_DOWN);        // Arduino A4 PPS (PC1)
-    cgpio.config(cgpio.PORT_B, RIG_PIN_PB1_LEGACY_PPS, cgpio.MODE_IN, cgpio.PUPD_DOWN); // Legacy PB1 PPS probe
-    cgpio.config(cgpio.PORT_A, bsp.ARD_A0_PA0, cgpio.MODE_IN, cgpio.PUPD_DOWN);        // D7->A0 RX
-    gpio.Pin pin_d7_init = cgpio.pin_out(cgpio.PORT_A, bsp.ARD_D7_PA8, false, false);  // D7 TX
-    gpio.write(&pin_d7_init, false);
+    bsp.ARD_A3.set_mode(gpio.Mode.Input, gpio.Pull.Up);       // GPS FIX (PB0/A3)
+    bsp.ARD_A4.set_mode(gpio.Mode.Input, gpio.Pull.Down);     // Arduino A4 PPS (PC1)
+    RIG_PB1_PPS.set_mode(gpio.Mode.Input, gpio.Pull.Down);    // Legacy PB1 PPS probe
+    bsp.ARD_A0.set_mode(gpio.Mode.Input, gpio.Pull.Down);     // D7->A0 RX
+    bsp.ARD_D7.set_low();
+    bsp.ARD_D7.set_mode(gpio.Mode.Output, gpio.Pull.None);    // D7 TX
 
-    tim.tim2_start_periodic_us(1000u32); // 1.000 kHz pin sampler & LED beat
+    f3.tim2_start_periodic_us(1000u32); // 1.000 kHz pin sampler & LED beat
 
     hw.IRQ_DMA1_CH1.attach(dma1_ch1_isr(&dma_inflight, &dma_done_q));
     hw.IRQ_DMA1_CH5.attach(usart1_dma_isr(&gps_dma));
@@ -1002,7 +980,7 @@ fn main() {
     println("[BOOT] Zev Language-OS on STM32F334R8 NUCLEO-F334R8 (Cortex-M4F, zero C)");
 
     // Query Adafruit Ultimate GPS firmware version over USART1 TX (PA9) and allow >=1.5s NMEA/PPS capture.
-    uart.usart1_write("$PMTK605*31\r\n");
+    f3.usart1_write("$PMTK605*31\r\n");
     delay(1500ms);
 
     run_full_shakedown(boot_rr);

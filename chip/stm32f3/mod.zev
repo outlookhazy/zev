@@ -1,0 +1,6 @@
+// STM32F3xx silicon driver facade re-exporting all peripheral modules
+
+pub import chip.stm32f3.{
+    rcc, gpio, tim, hrtim, adc, dac_comp,
+    uart, spi, i2c, bxcan, dma, flash,
+};

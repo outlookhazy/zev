@@ -55,16 +55,18 @@ isr dma_rx_isr(*ping_pong<u8, 64> rx_dma, *hw.DmaRegs dma, u32 clear_mask) {
 
 // ── Monomorphized `<T, usize N>`, Pure & Yielding Helpers ──────────────────
 
-fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
-    if (v.len < N) {
-        v.data[v.len] = item;
-        v.len += 1;
-        return;
+impl<T, usize N> FixedVec<T, N> {
+    fn push_ring(*self, T item) {
+        if (self.len < N) {
+            self.data[self.len] = item;
+            self.len += 1;
+            return;
+        }
+        for (usize i in 1..N) {
+            self.data[i - 1] = self.data[i];
+        }
+        self.data[N - 1] = item;
     }
-    for (usize i in 1..N) {
-        v.data[i - 1] = v.data[i];
-    }
-    v.data[N - 1] = item;
 }
 
 fn setup_clocks() {
@@ -149,8 +151,8 @@ fn scrub_flash_crc() {
 }
 
 fn log_sim_duty_snapshot(*FixedVec<u16, 4> hist, u16 r1, u16 r2, u16 d1, u16 d2) {
-    vec_push_ring(hist, r1);
-    vec_push_ring(hist, r2);
+    hist.push_ring(r1);
+    hist.push_ring(r2);
     f32 d1_pct = (d1 as f32) * 0.1f32;
     f32 d2_pct = (d2 as f32) * 0.1f32;
     u8 summary_buf[64];

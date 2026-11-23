@@ -6153,9 +6153,10 @@ fn hal_dir_target_binding_sim_vs_stm32f3_sema() {
 import hal.gpio as gpio;
 
 fn main() {
-    gpio.Pin p = gpio.make_pin(0u8, 5u8, false, false);
-    gpio.write(&p, true);
-    bool _v = gpio.read(&p);
+    gpio.Pin p = gpio.make_pin(0u8, 5u8, false);
+    p.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    p.write(true);
+    bool _v = p.read();
 }
 "#;
     let prog = zev_parser::parse_str(src).expect("parse hal test");
@@ -6170,8 +6171,9 @@ fn main() {
         sim_out.diagnostics
     );
     assert!(sim_out.model.functions.contains_key("hal_gpio__make_pin"));
-    assert!(sim_out.model.functions.contains_key("hal_gpio__write"));
-    assert!(sim_out.model.functions.contains_key("hal_gpio__read"));
+    assert!(sim_out.model.functions.contains_key("hal_gpio__Pin__set_mode"));
+    assert!(sim_out.model.functions.contains_key("hal_gpio__Pin__write"));
+    assert!(sim_out.model.functions.contains_key("hal_gpio__Pin__read"));
     assert!(!sim_out.model.mmio_instances.contains_key("chip_stm32f334__GPIOA"));
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -6187,9 +6189,287 @@ fn main() {
         f3_out.diagnostics
     );
     assert!(f3_out.model.functions.contains_key("hal_gpio__make_pin"));
-    assert!(f3_out.model.functions.contains_key("hal_gpio__write"));
-    assert!(f3_out.model.functions.contains_key("hal_gpio__read"));
+    assert!(f3_out.model.functions.contains_key("hal_gpio__Pin__set_mode"));
+    assert!(f3_out.model.functions.contains_key("hal_gpio__Pin__write"));
+    assert!(f3_out.model.functions.contains_key("hal_gpio__Pin__read"));
     assert!(f3_out.model.mmio_instances.contains_key("chip_stm32f334__GPIOA"));
+}
+
+#[test]
+fn grouped_imports_pub_import_reexports_and_ambiguity() {
+    let base = std::env::temp_dir().join(format!("zev_pub_reexport_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("pkg")).unwrap();
+
+    std::fs::write(
+        base.join("pkg/a.zev"),
+        r#"
+pub struct ItemA { u8 v; }
+pub u8 helper_a() { return 1u8; }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("pkg/b.zev"),
+        r#"
+pub struct ItemB { u16 v; }
+pub u16 helper_b() { return 2u16; }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("pkg/dup.zev"),
+        r#"
+pub u8 helper_a() { return 9u8; }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("pkg/facade.zev"),
+        r#"
+pub import pkg.{a, b};
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("pkg/ambig.zev"),
+        r#"
+pub import pkg.{a, dup};
+"#,
+    )
+    .unwrap();
+
+    // Clean diamond + grouped + pub import re-export
+    let ok_src = r#"
+import pkg.facade as p;
+import pkg.a as a_direct;
+
+fn main() {
+    p.ItemA a1 = p.ItemA { v: p.helper_a() };
+    a_direct.ItemA a2 = a1;
+    p.ItemB b1 = p.ItemB { v: p.helper_b() };
+    u32 _sum = (a2.v as u32) + (b1.v as u32);
+}
+"#;
+    let ok_prog = zev_parser::parse_str(ok_src).expect("parse ok_prog");
+    let opts = AnalyzeOptions {
+        include_dirs: vec![base.clone()],
+        ..AnalyzeOptions::default()
+    };
+    let ok_out = zev_sema::analyze_with_options(&[ok_prog], &opts);
+    assert!(ok_out.diagnostics.is_empty(), "diags: {:?}", ok_out.diagnostics);
+
+    // Ambiguous pub import must report ModuleError
+    let ambig_src = r#"
+import pkg.ambig as bad;
+
+fn main() {
+    u8 _x = bad.helper_a();
+}
+"#;
+    let ambig_prog = zev_parser::parse_str(ambig_src).expect("parse ambig_prog");
+    let ambig_out = zev_sema::analyze_with_options(&[ambig_prog], &opts);
+    assert!(
+        ambig_out.diagnostics.iter().any(|d| d.kind == DiagnosticKind::ModuleError),
+        "expected ambiguous re-export ModuleError, got: {:?}",
+        ambig_out.diagnostics
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn same_module_impl_ownership_visibility_and_generic_specialization() {
+    let base = std::env::temp_dir().join(format!("zev_impl_rules_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(base.join("modlib")).unwrap();
+
+    std::fs::write(
+        base.join("modlib/inner.zev"),
+        r#"
+pub struct Widget { u8 id; }
+
+impl Widget {
+    pub Widget make(u8 id) {
+        return Widget { id: id };
+    }
+
+    pub u8 id(self) {
+        return self.id;
+    }
+
+    fn secret(self) { }
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.join("modlib/facade.zev"),
+        r#"
+pub import modlib.inner;
+"#,
+    )
+    .unwrap();
+    let opts = AnalyzeOptions {
+        include_dirs: vec![base.clone()],
+        ..AnalyzeOptions::default()
+    };
+
+    // 1a. Qualified foreign-type `impl m.Widget` is rejected at parse time
+    let qualified_foreign_impl_src = r#"
+import modlib.facade as m;
+
+impl m.Widget {
+    pub u8 ext(self) { return self.id; }
+}
+
+fn main() {}
+"#;
+    let pe = zev_parser::parse_str(qualified_foreign_impl_src)
+        .expect_err("qualified `impl m.Widget` must be rejected by parser");
+    assert!(
+        pe.message.contains("foreign module type"),
+        "unexpected parse error: {pe}"
+    );
+
+    // 1b. Unqualified `impl Widget` for a struct not defined in this module must fail ModuleError
+    let foreign_impl_src = r#"
+import modlib.facade as m;
+
+impl Widget {
+    pub u8 ext(self) { return 0u8; }
+}
+
+fn main() {}
+"#;
+    let p1 = zev_parser::parse_str(foreign_impl_src).unwrap();
+    let o1 = zev_sema::analyze_with_options(&[p1], &opts);
+    assert!(
+        o1.diagnostics.iter().any(|d| d.kind == DiagnosticKind::ModuleError),
+        "expected foreign-type impl rejection, got: {:?}",
+        o1.diagnostics
+    );
+
+    // 2. Private method cannot be called from another module
+    let priv_call_src = r#"
+import modlib.inner as m;
+
+fn main() {
+    m.Widget w = m.Widget.make(1u8);
+    w.secret();
+}
+"#;
+    let p2 = zev_parser::parse_str(priv_call_src).unwrap();
+    let o2 = zev_sema::analyze_with_options(&[p2], &opts);
+    assert!(
+        o2.diagnostics.iter().any(|d| d.kind == DiagnosticKind::ModuleError),
+        "expected private method ModuleError, got: {:?}",
+        o2.diagnostics
+    );
+
+    // 3. `self` allowed on const, `*self` rejected on const, generic + specialized impl allowed
+    let good_impl_src = r#"
+struct Pair<T, usize N> {
+    [N]T  vals;
+    usize len;
+}
+
+impl<T, usize N> Pair<T, N> {
+    pub fn push(*self, T v) {
+        if (self.len < N) {
+            self.vals[self.len] = v;
+            self.len += 1;
+        }
+    }
+}
+
+impl<usize N> Pair<f32, N> {
+    pub f32 sum(*self) {
+        f32 s = 0.0f32;
+        for (usize i in 0..self.len) {
+            s += self.vals[i];
+        }
+        return s;
+    }
+}
+
+struct Tag { u8 code; }
+impl Tag {
+    pub u8 get(self) { return self.code; }
+    pub fn bump(*self) { self.code += 1u8; }
+}
+
+const Tag C_TAG = Tag { code: 42u8 };
+
+fn main() {
+    u8 _c = C_TAG.get();
+    Pair<f32, 3> p = Pair<f32, 3> { vals: [0.0f32, 0.0f32, 0.0f32], len: 0 };
+    p.push(1.0f32);
+    p.push(2.0f32);
+    f32 _s = p.sum();
+}
+"#;
+    expect_ok(good_impl_src);
+
+    let mut_self_on_const = r#"
+struct Tag { u8 code; }
+impl Tag {
+    pub fn bump(*self) { self.code += 1u8; }
+}
+const Tag C_TAG = Tag { code: 42u8 };
+fn main() {
+    C_TAG.bump();
+}
+"#;
+    expect_err_kind(mut_self_on_const, DiagnosticKind::ImmutableAssignment);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn const_aggregate_validation_and_mutability_guards() {
+    // Non-constant struct/array initializers rejected
+    let non_const_arr = r#"
+u16 runtime_val() { return 7u16; }
+const [2]u16 BAD = [1u16, runtime_val()];
+fn main() {}
+"#;
+    let p_bad = zev_parser::parse_str(non_const_arr).unwrap();
+    let o_bad = zev_sema::analyze_program(&p_bad);
+    assert!(o_bad.is_err(), "expected non-const array init error");
+
+    // `&CONST_STRUCT.field` and `&CONST_ARR[0]` rejected as ImmutableAssignment
+    let addr_field = r#"
+struct Pin { u8 port; }
+const Pin P = Pin { port: 1u8 };
+fn main() {
+    *u8 _ptr = &P.port;
+}
+"#;
+    expect_err_kind(addr_field, DiagnosticKind::ImmutableAssignment);
+
+    let addr_elem = r#"
+const [2]u16 LUT = [10u16, 20u16];
+fn main() {
+    *u16 _ptr = &LUT[0];
+}
+"#;
+    expect_err_kind(addr_elem, DiagnosticKind::ImmutableAssignment);
+
+    // Read-only indexing, slicing, and passing const arrays allowed
+    let good_ro = r#"
+struct Pin { u8 port; }
+const Pin P = Pin { port: 1u8 };
+const [3]u16 LUT = [10u16, 20u16, 30u16];
+u16 take([]u16 s) { return s[0]; }
+fn main() {
+    u8 _p = P.port;
+    u16 _x = LUT[1];
+    []u16 _s = LUT[0..2];
+    u16 _y = take(LUT);
+}
+"#;
+    expect_ok(good_ro);
 }
 
 

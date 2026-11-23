@@ -6,7 +6,7 @@ import hal.time as htime;
 import hal.adc as hadc;
 import std.bus as bus;
 
-pub fn set_sample_time(u8 unit, u32 ch, u32 smp) {
+pub fn adc_set_sample_time(u8 unit, u32 ch, u32 smp) {
     u32 s = smp & 7u32;
     if (unit == 1u8) {
         if (ch <= 9u32) {
@@ -62,10 +62,10 @@ pub fn init_adc12() {
     calibrate_and_enable(hw.ADC2);
 
     // Long sample time (601.5 cycles = 7) for high-Z and VREFINT channels.
-    set_sample_time(1u8, 1u32, 7u32);
-    set_sample_time(1u8, 2u32, 7u32);
-    set_sample_time(1u8, 18u32, 7u32);
-    set_sample_time(2u8, 1u32, 7u32);
+    adc_set_sample_time(1u8, 1u32, 7u32);
+    adc_set_sample_time(1u8, 2u32, 7u32);
+    adc_set_sample_time(1u8, 18u32, 7u32);
+    adc_set_sample_time(2u8, 1u32, 7u32);
 }
 
 pub u16 read_vrefint_cal() {
@@ -73,8 +73,8 @@ pub u16 read_vrefint_cal() {
 }
 
 pub u16 read_vrefint_counts() error bus.BusStatus {
-    hadc.Channel ch18 = hadc.make_channel(1u8, 18u8, 3300u16, 1525u16);
-    u16 raw = hadc.read_u16(&ch18) catch (bus.BusStatus err) {
+    hadc.Channel ch18 = hadc.make_channel(1u8, 18u8, 3300u16);
+    u16 raw = ch18.read_u16() catch (bus.BusStatus err) {
         error err;
     };
     return raw;
@@ -102,6 +102,6 @@ pub f32 read_vdda_volts() error bus.BusStatus {
     return (3.30f32 * (cal as f32)) / (raw as f32);
 }
 
-pub hadc.Channel channel(u8 unit, u8 ch, u16 vdda_mv) {
-    return hadc.make_channel(unit, ch, vdda_mv, 0u16);
+pub hadc.Channel adc_channel(u8 unit, u8 ch, u16 vdda_mv) {
+    return hadc.make_channel(unit, ch, vdda_mv);
 }

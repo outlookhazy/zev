@@ -2114,7 +2114,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
             self.out.push_str("/* ── Immutable Global Constants ─────────────────────────────────────────── */\n\n");
             for c in &self.m.consts {
                 let ct = self.c_type(&c.ty);
-                let val = self.fmt_const_init_expr(&c.init);
+                let val = self.fmt_const_init_expr_inner(&c.init, &c.ty, true);
                 // `#undef` first if it collided with a default hardware bit macro like `MOTOR_EN`
                 if matches!(c.name.as_str(), "MOTOR_EN" | "HALF_TRANSFER" | "FULL_TRANSFER") {
                     let _ = writeln!(self.out, "#undef {}", c.name);
@@ -4677,16 +4677,30 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 start,
                 end,
                 elem_ty,
-                ..
+                base_is_array,
             } => {
-                let b = self.fmt_expr(base, vars);
+                let b_slice = if *base_is_array || matches!(base.ty, MirType::Array { .. }) {
+                    let arr_len = match &base.ty {
+                        MirType::Array { len, .. } => *len,
+                        _ => 0,
+                    };
+                    let sc = self.c_type(&MirType::Slice(Box::new(elem_ty.clone())));
+                    let ect = self.c_type(elem_ty);
+                    let arr_ref = match &base.kind {
+                        MirExprKind::ConstRef(cname) => c_ident(cname),
+                        _ => self.fmt_expr(base, vars),
+                    };
+                    format!("(({sc}){{ .ptr = ({ect} *)(&({arr_ref}).data[0]), .len = (size_t){arr_len}U }})")
+                } else {
+                    self.fmt_expr(base, vars)
+                };
                 let s = self.fmt_expr(start, vars);
                 let e = self.fmt_expr(end, vars);
                 if *elem_ty == MirType::U8 {
-                    format!("syn_subslice_u8({b}, (size_t)({s}), (size_t)({e}))")
+                    format!("syn_subslice_u8({b_slice}, (size_t)({s}), (size_t)({e}))")
                 } else {
                     let mangle = MirType::Slice(Box::new(elem_ty.clone())).mangle_name();
-                    format!("syn_sub_{mangle}({b}, (size_t)({s}), (size_t)({e}))")
+                    format!("syn_sub_{mangle}({b_slice}, (size_t)({s}), (size_t)({e}))")
                 }
             }
             MirExprKind::ArrayToSlice {
@@ -5123,7 +5137,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
         format!("(({ret_c} (*)({param_tys}))(uintptr_t)({addr_s}))({arg_vals})")
     }
 
-    fn fmt_const_endian_bytes(bits: u8, big_endian: bool, val: i128) -> String {
+    fn fmt_const_endian_bytes(bits: u8, big_endian: bool, val: i128, bare_agg: bool) -> String {
         let nbytes = (bits / 8) as usize;
         let u = val as u64;
         let bytes: Vec<String> = (0..nbytes)
@@ -5133,10 +5147,23 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
             })
             .collect();
         let end = if big_endian { "be" } else { "le" };
-        format!("((syn_u{bits}{end}_t){{ .b = {{ {} }} }})", bytes.join(", "))
+        if bare_agg {
+            format!("{{ .b = {{ {} }} }}", bytes.join(", "))
+        } else {
+            format!("((syn_u{bits}{end}_t){{ .b = {{ {} }} }})", bytes.join(", "))
+        }
     }
 
     fn fmt_const_init_expr(&self, expr: &MirExpr) -> String {
+        self.fmt_const_init_expr_inner(expr, &expr.ty, false)
+    }
+
+    fn fmt_const_init_expr_inner(
+        &self,
+        expr: &MirExpr,
+        expected_ty: &MirType,
+        bare_agg: bool,
+    ) -> String {
         if let Some(cv) = self.eval_const_val(expr, 0) {
             return match cv {
                 ConstInitVal::Bool(b) => {
@@ -5154,7 +5181,7 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                         bits, big_endian, ..
                     } = &expr.ty
                     {
-                        return Self::fmt_const_endian_bytes(*bits, *big_endian, v);
+                        return Self::fmt_const_endian_bytes(*bits, *big_endian, v, bare_agg);
                     }
                     let ct = self.c_type(&expr.ty.host_value_type());
                     if expr.ty.is_unsigned() {
@@ -5171,11 +5198,26 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
             };
         }
         match &expr.kind {
+            MirExprKind::Cast { expr: sub, .. } => {
+                self.fmt_const_init_expr_inner(sub, expected_ty, bare_agg)
+            }
             MirExprKind::ConstRef(name) => {
                 if let Some(c) = self.m.consts.iter().find(|c| c.name == *name) {
-                    self.fmt_const_init_expr(&c.init)
+                    self.fmt_const_init_expr_inner(&c.init, expected_ty, bare_agg)
                 } else {
                     c_ident(name)
+                }
+            }
+            MirExprKind::StringLit(s)
+                if matches!(expected_ty, MirType::Slice(_))
+                    || matches!(expr.ty, MirType::Slice(_)) =>
+            {
+                let lit = escape_c_string(s);
+                let slen = zev_mir::decoded_string_byte_len(s);
+                if bare_agg {
+                    format!("{{ .ptr = (uint8_t *)({lit}), .len = (size_t){slen}U }}")
+                } else {
+                    format!("((syn_slice_u8){{ .ptr = (uint8_t *)({lit}), .len = (size_t){slen}U }})")
                 }
             }
             MirExprKind::StructLit {
@@ -5184,7 +5226,11 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 ..
             } => {
                 if fields.is_empty() {
-                    return format!("((syn_struct_{struct_name}){{ ._empty = 0U }})");
+                    return if bare_agg {
+                        "{ ._empty = 0U }".to_string()
+                    } else {
+                        format!("((syn_struct_{struct_name}){{ ._empty = 0U }})")
+                    };
                 }
                 let fs: Vec<String> = fields
                     .iter()
@@ -5194,34 +5240,111 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                                 bits, big_endian, ..
                             } => {
                                 if let Some(ConstInitVal::Int(raw)) = self.eval_const_val(fval, 0) {
-                                    Self::fmt_const_endian_bytes(*bits, *big_endian, raw)
+                                    Self::fmt_const_endian_bytes(*bits, *big_endian, raw, bare_agg)
                                 } else {
-                                    let vstr = self.fmt_const_init_expr(fval);
+                                    let vstr =
+                                        self.fmt_const_init_expr_inner(fval, raw_fty, bare_agg);
                                     let end = if *big_endian { "be" } else { "le" };
                                     format!("syn_make_u{bits}{end}((uint{bits}_t)({vstr}))")
                                 }
                             }
-                            _ => self.fmt_const_init_expr(fval),
+                            _ => self.fmt_const_init_expr_inner(fval, raw_fty, bare_agg),
                         };
                         format!(".{} = {wrapped}", c_ident(fname))
                     })
                     .collect();
-                format!("((syn_struct_{struct_name}){{ {} }})", fs.join(", "))
-            }
-            MirExprKind::ArrayLit { elems, .. } => {
-                let ct = self.c_type(&expr.ty);
-                if elems.is_empty() {
-                    format!("(({ct}){{ .data = {{ 0 }} }})")
+                if bare_agg {
+                    format!("{{ {} }}", fs.join(", "))
                 } else {
+                    format!("((syn_struct_{struct_name}){{ {} }})", fs.join(", "))
+                }
+            }
+            MirExprKind::ArrayLit { elems, elem_ty } => {
+                if let MirType::Slice(elem) = expected_ty {
+                    let ect = self.c_type(elem);
+                    let sc = self.c_type(expected_ty);
+                    let n = elems.len();
+                    if n == 0 {
+                        return if bare_agg {
+                            "{ .ptr = NULL, .len = (size_t)0U }".to_string()
+                        } else {
+                            format!("(({sc}){{ .ptr = NULL, .len = (size_t)0U }})")
+                        };
+                    }
                     let es: Vec<String> = elems
                         .iter()
-                        .map(|e| self.fmt_const_init_expr(e))
+                        .map(|e| self.fmt_const_init_expr_inner(e, elem, true))
                         .collect();
-                    format!("(({ct}){{ .data = {{ {} }} }})", es.join(", "))
+                    let body = format!(
+                        "{{ .ptr = ({ect}[]){{ {} }}, .len = (size_t){n}U }}",
+                        es.join(", ")
+                    );
+                    if bare_agg {
+                        body
+                    } else {
+                        format!("(({sc}){body})")
+                    }
+                } else {
+                    let ct = self.c_type(&expr.ty);
+                    let body = if elems.is_empty() {
+                        "{ .data = { 0 } }".to_string()
+                    } else {
+                        let es: Vec<String> = elems
+                            .iter()
+                            .map(|e| self.fmt_const_init_expr_inner(e, elem_ty, bare_agg))
+                            .collect();
+                        format!("{{ .data = {{ {} }} }}", es.join(", "))
+                    };
+                    if bare_agg {
+                        body
+                    } else {
+                        format!("(({ct}){body})")
+                    }
+                }
+            }
+            MirExprKind::SubSlice {
+                base,
+                start,
+                end,
+                elem_ty,
+                base_is_array,
+            } => {
+                let s_val = self.eval_const_val(start, 0).map_or(0usize, |cv| match cv {
+                    ConstInitVal::Int(v) if v >= 0 => v as usize,
+                    _ => 0,
+                });
+                let e_val = self.eval_const_val(end, 0).map_or(0usize, |cv| match cv {
+                    ConstInitVal::Int(v) if v >= 0 => v as usize,
+                    _ => 0,
+                });
+                if *base_is_array || matches!(base.ty, MirType::Array { .. }) {
+                    let arr_len = match &base.ty {
+                        MirType::Array { len, .. } => *len,
+                        _ => 0,
+                    };
+                    let sc = self.c_type(&MirType::Slice(Box::new(elem_ty.clone())));
+                    let ect = self.c_type(elem_ty);
+                    let arr_ref = match &base.kind {
+                        MirExprKind::ConstRef(cname) => c_ident(cname),
+                        _ => self.fmt_const_init_expr_inner(base, &base.ty, false),
+                    };
+                    let st = s_val.min(arr_len);
+                    let en = e_val.min(arr_len).max(st);
+                    let body = format!(
+                        "{{ .ptr = ({ect} *)(&({arr_ref}).data[{st}]), .len = (size_t){}U }}",
+                        en - st
+                    );
+                    if bare_agg {
+                        body
+                    } else {
+                        format!("(({sc}){body})")
+                    }
+                } else {
+                    self.fmt_expr(expr, &[])
                 }
             }
             MirExprKind::MakePrimView { ptr, cap, kind } => {
-                let p = self.fmt_const_init_expr(ptr);
+                let p = self.fmt_const_init_expr_inner(ptr, &ptr.ty, false);
                 let n = (*cap).max(1);
                 match kind {
                     MirPrimViewKind::ByteRing => format!(

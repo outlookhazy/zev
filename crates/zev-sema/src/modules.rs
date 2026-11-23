@@ -38,6 +38,7 @@ struct ModuleExports {
     types: BTreeMap<String, ExportedSymbol>,
     values: BTreeMap<String, ExportedSymbol>,
     variants: BTreeMap<String, Vec<String>>,
+    struct_names: BTreeSet<String>,
 }
 
 /// Resolution of a single `import` statement inside a file.
@@ -197,7 +198,7 @@ fn search_dirs_for_file(
     dirs
 }
 
-fn lex_import_bindings(source: &str) -> Vec<(Vec<String>, String)> {
+fn lex_import_bindings(source: &str) -> Vec<(Vec<String>, String, bool)> {
     let Ok(tokens) = zev_parser::lex(source) else {
         return Vec::new();
     };
@@ -215,8 +216,10 @@ fn lex_import_bindings(source: &str) -> Vec<(Vec<String>, String)> {
                 i += 1;
             }
             zev_parser::TokenKind::KwImport if depth == 0 => {
+                let is_pub = i > 0 && tokens[i - 1].kind == zev_parser::TokenKind::KwPub;
                 i += 1;
                 let mut segs = Vec::new();
+                let mut grouped = false;
                 if let Some(tok) = tokens.get(i) {
                     if let zev_parser::TokenKind::Ident(s) = &tok.kind {
                         segs.push(s.clone());
@@ -230,13 +233,50 @@ fn lex_import_bindings(source: &str) -> Vec<(Vec<String>, String)> {
                             if let zev_parser::TokenKind::Ident(next_seg) = &tokens[i + 1].kind {
                                 segs.push(next_seg.clone());
                                 i += 2;
+                            } else if tokens[i + 1].kind == zev_parser::TokenKind::LBrace {
+                                grouped = true;
+                                i += 2;
+                                while i < tokens.len() {
+                                    if tokens[i].kind == zev_parser::TokenKind::RBrace {
+                                        i += 1;
+                                        break;
+                                    }
+                                    if let zev_parser::TokenKind::Ident(entry) = &tokens[i].kind {
+                                        let mut full_segs = segs.clone();
+                                        full_segs.push(entry.clone());
+                                        i += 1;
+                                        let alias = if i + 1 < tokens.len()
+                                            && tokens[i].kind == zev_parser::TokenKind::KwAs
+                                        {
+                                            if let zev_parser::TokenKind::Ident(al) =
+                                                &tokens[i + 1].kind
+                                            {
+                                                i += 2;
+                                                al.clone()
+                                            } else {
+                                                entry.clone()
+                                            }
+                                        } else {
+                                            entry.clone()
+                                        };
+                                        imports.push((full_segs, alias, is_pub));
+                                        if i < tokens.len()
+                                            && tokens[i].kind == zev_parser::TokenKind::Comma
+                                        {
+                                            i += 1;
+                                        }
+                                    } else {
+                                        i += 1;
+                                    }
+                                }
+                                break;
                             } else {
                                 break;
                             }
                         }
                     }
                 }
-                if !segs.is_empty() {
+                if !grouped && !segs.is_empty() {
                     let alias = if i + 1 < tokens.len()
                         && tokens[i].kind == zev_parser::TokenKind::KwAs
                     {
@@ -249,13 +289,61 @@ fn lex_import_bindings(source: &str) -> Vec<(Vec<String>, String)> {
                     } else {
                         segs.last().cloned().unwrap_or_default()
                     };
-                    imports.push((segs, alias));
+                    imports.push((segs, alias, is_pub));
                 }
             }
             _ => i += 1,
         }
     }
     imports
+}
+
+fn collect_exported_generic_names_from_src(
+    src: &str,
+    mod_path: Option<&Path>,
+    entry_dirs: &[PathBuf],
+    include_dirs: &[PathBuf],
+    hal_dir: Option<&str>,
+    visited: &mut BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut out = zev_parser::collect_pub_declared_generic_names(src);
+    let abs = mod_path.map(normalize_abs);
+    let dirs = search_dirs_for_file(abs.as_deref(), entry_dirs, include_dirs);
+    for (segs, _alias, is_pub) in lex_import_bindings(src) {
+        if !is_pub {
+            continue;
+        }
+        let dot_path = segs.join(".");
+        if !visited.insert(dot_path.clone()) {
+            continue;
+        }
+        match resolve_module_loc_in_dirs(&segs, &dot_path, &dirs, hal_dir) {
+            ModuleLoc::File(cand) => {
+                if let Ok(child_src) = std::fs::read_to_string(&cand) {
+                    out.extend(collect_exported_generic_names_from_src(
+                        &child_src,
+                        Some(&cand),
+                        entry_dirs,
+                        include_dirs,
+                        hal_dir,
+                        visited,
+                    ));
+                }
+            }
+            ModuleLoc::Embedded(child_src) => {
+                out.extend(collect_exported_generic_names_from_src(
+                    child_src,
+                    None,
+                    entry_dirs,
+                    include_dirs,
+                    hal_dir,
+                    visited,
+                ));
+            }
+            ModuleLoc::Ambiguous(..) | ModuleLoc::NotFound => {}
+        }
+    }
+    out
 }
 
 /// Collect declared generic `struct` and `fn` names across root `.zev` sources and module-qualified
@@ -306,18 +394,34 @@ fn collect_import_aware_generic_names_with_entries(
         out.extend(zev_parser::collect_declared_generic_names(src));
         let abs = path_opt.map(normalize_abs);
         let dirs = search_dirs_for_file(abs.as_deref(), &entry_dirs, include_dirs);
-        for (segs, alias) in lex_import_bindings(src) {
+        for (segs, alias, _is_pub) in lex_import_bindings(src) {
             let dot_path = segs.join(".");
+            let mut visited = BTreeSet::new();
+            visited.insert(dot_path.clone());
             match resolve_module_loc_in_dirs(&segs, &dot_path, &dirs, hal_dir) {
                 ModuleLoc::File(cand) => {
                     if let Ok(mod_src) = std::fs::read_to_string(&cand) {
-                        for g in zev_parser::collect_pub_declared_generic_names(&mod_src) {
+                        for g in collect_exported_generic_names_from_src(
+                            &mod_src,
+                            Some(&cand),
+                            &entry_dirs,
+                            include_dirs,
+                            hal_dir,
+                            &mut visited,
+                        ) {
                             out.insert(format!("{alias}.{g}"));
                         }
                     }
                 }
                 ModuleLoc::Embedded(mod_src) => {
-                    for g in zev_parser::collect_pub_declared_generic_names(mod_src) {
+                    for g in collect_exported_generic_names_from_src(
+                        mod_src,
+                        None,
+                        &entry_dirs,
+                        include_dirs,
+                        hal_dir,
+                        &mut visited,
+                    ) {
                         out.insert(format!("{alias}.{g}"));
                     }
                 }
@@ -534,6 +638,14 @@ impl ModuleLinker {
         }
 
         // 3. Desugar `Inline` mmio + rewrite imported module references in all root programs.
+        let mut root_exports = ModuleExports::default();
+        for (prog, _) in root_programs {
+            for item in &prog.items {
+                if let ItemKind::Struct(st) = &item.kind {
+                    root_exports.struct_names.insert(st.name.name.clone());
+                }
+            }
+        }
         for (offset, ((prog, fname), imports)) in root_programs
             .iter()
             .zip(root_imports.into_iter())
@@ -542,14 +654,13 @@ impl ModuleLinker {
             let prog_idx = order.len() + offset;
             let desugared = desugar_inline_mmios(prog);
             let root_externs = collect_declared_extern_c(&desugared);
-            let empty_exports = ModuleExports::default();
             let file_label = fname.unwrap_or("<input>");
             let mut diags = Vec::new();
             let rewritten = rewrite_program(
                 &desugared,
                 None,
                 None,
-                &empty_exports,
+                &root_exports,
                 &imports,
                 &exports_by_key,
                 &private_canonical_symbols,
@@ -769,13 +880,105 @@ impl ModuleLinker {
 
         let desugared = desugar_inline_mmios(&parsed);
         let prefix = self.alloc_prefix(segments);
-        let exports = collect_module_exports(&desugared, &prefix);
+        let mut exports = collect_module_exports(&desugared, &prefix);
         let declared_extern_c = collect_declared_extern_c(&desugared);
 
         self.visiting.push((key.clone(), dot_path.to_owned()));
         let imports =
             self.resolve_imports_in_program(&desugared, disk_path, Some(&file_display));
         self.visiting.pop();
+
+        // Merge public symbols re-exported via `pub import ...;` into `exports`.
+        let local_types: BTreeSet<String> = exports.types.keys().cloned().collect();
+        let local_values: BTreeSet<String> = exports.values.keys().cloned().collect();
+        let mut reexport_type_origins: BTreeMap<String, (String, String)> = BTreeMap::new();
+        let mut reexport_value_origins: BTreeMap<String, (String, String)> = BTreeMap::new();
+        for item in &desugared.items {
+            if !item.is_pub {
+                continue;
+            }
+            let ItemKind::Import(imp) = &item.kind else {
+                continue;
+            };
+            let alias = imp
+                .alias
+                .as_ref()
+                .map(|a| a.name.clone())
+                .or_else(|| imp.path.last().map(|l| l.name.clone()))
+                .unwrap_or_default();
+            let Some(ResolvedImport::Module {
+                key: child_key,
+                dot_path: child_dot,
+            }) = imports.get(&alias)
+            else {
+                continue;
+            };
+            let Some(child_loaded) = self.loaded.get(child_key) else {
+                continue;
+            };
+            let child_exports = child_loaded.exports.clone();
+            let mut reexported_enum_canons: BTreeSet<String> = BTreeSet::new();
+
+            for (tname, sym) in &child_exports.types {
+                if !sym.is_pub || local_types.contains(tname) {
+                    continue;
+                }
+                if let Some((prev_canon, prev_dot)) = reexport_type_origins.get(tname) {
+                    if *prev_canon != sym.canonical_name {
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::ModuleError,
+                                imp.span,
+                                format!(
+                                    "ambiguous re-export of type `{tname}` in module `{dot_path}` (from `{prev_dot}` and `{child_dot}`)"
+                                ),
+                            ),
+                            Some(&file_display),
+                        );
+                    }
+                    continue;
+                }
+                reexport_type_origins
+                    .insert(tname.clone(), (sym.canonical_name.clone(), child_dot.clone()));
+                exports.types.insert(tname.clone(), sym.clone());
+                reexported_enum_canons.insert(sym.canonical_name.clone());
+            }
+
+            for (vname, enum_canons) in &child_exports.variants {
+                for ec in enum_canons {
+                    if reexported_enum_canons.contains(ec) {
+                        let dst = exports.variants.entry(vname.clone()).or_default();
+                        if !dst.contains(ec) {
+                            dst.push(ec.clone());
+                        }
+                    }
+                }
+            }
+
+            for (vname, sym) in &child_exports.values {
+                if !sym.is_pub || local_values.contains(vname) {
+                    continue;
+                }
+                if let Some((prev_canon, prev_dot)) = reexport_value_origins.get(vname) {
+                    if *prev_canon != sym.canonical_name {
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::ModuleError,
+                                imp.span,
+                                format!(
+                                    "ambiguous re-export of symbol `{vname}` in module `{dot_path}` (from `{prev_dot}` and `{child_dot}`)"
+                                ),
+                            ),
+                            Some(&file_display),
+                        );
+                    }
+                    continue;
+                }
+                reexport_value_origins
+                    .insert(vname.clone(), (sym.canonical_name.clone(), child_dot.clone()));
+                exports.values.insert(vname.clone(), sym.clone());
+            }
+        }
 
         self.loaded.insert(
             key.clone(),
@@ -976,6 +1179,7 @@ fn collect_module_exports(prog: &Program, prefix: &str) -> ModuleExports {
     for item in &prog.items {
         match &item.kind {
             ItemKind::Struct(st) => {
+                exports.struct_names.insert(st.name.name.clone());
                 insert_type(
                     &st.name.name,
                     format!("{prefix}__{}", st.name.name),
@@ -1080,7 +1284,7 @@ fn collect_module_exports(prog: &Program, prefix: &str) -> ModuleExports {
                     false,
                 );
             }
-            ItemKind::Import(_) => {}
+            ItemKind::Import(_) | ItemKind::Impl(_) => {}
         }
     }
 
@@ -2158,6 +2362,104 @@ fn rewrite_program(
                         generic_params: st.generic_params.clone(),
                         fields,
                         span: st.span,
+                    }),
+                    item.span,
+                )
+            }
+            ItemKind::Impl(imp) => {
+                if !rw.self_exports.struct_names.contains(&imp.target_name.name) {
+                    rw.emit(
+                        imp.target_name.span,
+                        format!(
+                            "cannot implement methods for `{}` outside its defining module; inherent `impl` blocks must live in the module that defines the struct",
+                            imp.target_name.name
+                        ),
+                    );
+                }
+                rw.generic_type_params = imp
+                    .generic_params
+                    .iter()
+                    .filter(|g| g.kind == GenericParamKind::Type)
+                    .map(|g| g.name.name.clone())
+                    .collect();
+                rw.push_scope();
+                for g in &imp.generic_params {
+                    if g.kind != GenericParamKind::Type {
+                        rw.define_local(&g.name.name);
+                    }
+                }
+                let new_target_args = imp
+                    .target_generic_args
+                    .iter()
+                    .map(|g| rw.rewrite_generic_arg(g))
+                    .collect();
+                let new_target_name = rw.canonicalize_top_name(&imp.target_name.name);
+                let dot_opt = rw.module_dot_path.map(str::to_owned);
+                let gp = rw.generic_type_params.clone();
+
+                let mut new_methods = Vec::with_capacity(imp.methods.len());
+                for m in &imp.methods {
+                    if m.is_pub {
+                        let desc = format!("method `{}.{}`", imp.target_name.name, m.func.name.name);
+                        for p in &m.func.params {
+                            check_pub_surface_type(&p.ty, &gp, &local_type_is_pub, &desc, &mut rw);
+                        }
+                        check_pub_surface_type(&m.func.ret_type, &gp, &local_type_is_pub, &desc, &mut rw);
+                        if let Some(zev_ast::ErrorSpec::Typed(err_ty)) = &m.func.error_spec {
+                            check_pub_surface_type(err_ty, &gp, &local_type_is_pub, &desc, &mut rw);
+                        }
+                    }
+                    let new_params = rw.rewrite_params(&m.func.params);
+                    let new_ret = rw.rewrite_type(&m.func.ret_type);
+                    let new_err = m.func.error_spec.as_ref().map(|es| match es {
+                        zev_ast::ErrorSpec::Bare(sp) => zev_ast::ErrorSpec::Bare(*sp),
+                        zev_ast::ErrorSpec::Typed(t) => zev_ast::ErrorSpec::Typed(rw.rewrite_type(t)),
+                    });
+                    rw.push_scope();
+                    if m.receiver.is_some() {
+                        rw.define_local("self");
+                    }
+                    for p in &new_params {
+                        rw.define_local(&p.name.name);
+                    }
+                    let new_body = m.func.body.as_ref().map(|b| rw.rewrite_block(b));
+                    rw.pop_scope();
+
+                    if let Some(dot) = &dot_opt {
+                        rw.record_display_name(
+                            &format!("{new_target_name}__{}", m.func.name.name),
+                            format!("{dot}.{}.{}", imp.target_name.name, m.func.name.name),
+                        );
+                    }
+                    new_methods.push(zev_ast::MethodDecl {
+                        is_pub: m.is_pub,
+                        receiver: m.receiver,
+                        func: FnDecl {
+                            attrs: m.func.attrs.clone(),
+                            is_extern_c: false,
+                            name: m.func.name.clone(),
+                            generic_params: Vec::new(),
+                            params: new_params,
+                            is_variadic: false,
+                            ret_type: new_ret,
+                            error_spec: new_err,
+                            body: new_body,
+                            span: m.func.span,
+                        },
+                        span: m.span,
+                    });
+                }
+
+                rw.pop_scope();
+                rw.generic_type_params.clear();
+                Item::new(
+                    item.attrs.clone(),
+                    ItemKind::Impl(zev_ast::ImplDecl {
+                        generic_params: imp.generic_params.clone(),
+                        target_name: Ident::new(new_target_name, imp.target_name.span),
+                        target_generic_args: new_target_args,
+                        methods: new_methods,
+                        span: imp.span,
                     }),
                     item.span,
                 )

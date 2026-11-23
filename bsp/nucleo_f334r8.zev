@@ -5,39 +5,37 @@
 // Reusable STM32F3 silicon drivers live in `chip.stm32f3.*` and portable interfaces in `hal.*`.
 
 import chip.stm32f334 as hw;
-import chip.stm32f3.rcc as rcc;
-import chip.stm32f3.gpio as cgpio;
-import chip.stm32f3.uart as uart;
+import chip.stm32f3 as f3;
 import hal.gpio as gpio;
 
-// Onboard LD2 (PA5) and User Button B1 (PC13)
-pub const u32 PIN_LD2 = 5;
-pub const u32 PIN_B1  = 13;
+// Onboard LD2 (PA5, active-high) and User Button B1 (PC13, active-low) in Flash `.rodata`
+pub const gpio.Pin PIN_LD2 = gpio.Pin { port: f3.PORT_A, pin: 5u8,  active_low: false };
+pub const gpio.Pin PIN_B1  = gpio.Pin { port: f3.PORT_C, pin: 13u8, active_low: true  };
 
 // Arduino Uno R3 Expansion Header Pin Mapping (ST UM1724)
-pub const u32 ARD_A0_PA0  = 0;
-pub const u32 ARD_A1_PA1  = 1;
-pub const u32 ARD_A2_PA4  = 4;
-pub const u32 ARD_A3_PB0  = 0;
-pub const u32 ARD_A4_PC1  = 1;
-pub const u32 ARD_A5_PC0  = 0;
-pub const u32 ARD_D2_PA10 = 10;
-pub const u32 ARD_D7_PA8  = 8;
-pub const u32 ARD_D8_PA9  = 9;
-pub const u32 ARD_D11_PA7 = 7;
+pub const gpio.Pin ARD_A0  = gpio.Pin { port: f3.PORT_A, pin: 0u8,  active_low: false };
+pub const gpio.Pin ARD_A1  = gpio.Pin { port: f3.PORT_A, pin: 1u8,  active_low: false };
+pub const gpio.Pin ARD_A2  = gpio.Pin { port: f3.PORT_A, pin: 4u8,  active_low: false };
+pub const gpio.Pin ARD_A3  = gpio.Pin { port: f3.PORT_B, pin: 0u8,  active_low: false };
+pub const gpio.Pin ARD_A4  = gpio.Pin { port: f3.PORT_C, pin: 1u8,  active_low: false };
+pub const gpio.Pin ARD_A5  = gpio.Pin { port: f3.PORT_C, pin: 0u8,  active_low: false };
+pub const gpio.Pin ARD_D2  = gpio.Pin { port: f3.PORT_A, pin: 10u8, active_low: false };
+pub const gpio.Pin ARD_D7  = gpio.Pin { port: f3.PORT_A, pin: 8u8,  active_low: false };
+pub const gpio.Pin ARD_D8  = gpio.Pin { port: f3.PORT_A, pin: 9u8,  active_low: false };
+pub const gpio.Pin ARD_D11 = gpio.Pin { port: f3.PORT_A, pin: 7u8,  active_low: false };
 
 // Dedicated Board Peripheral Pin Locations
-pub const u32 PIN_I2C1_SCL_PB6  = 6;
-pub const u32 PIN_I2C1_SDA_PB7  = 7;
-pub const u32 PIN_SPI1_SCK_PB3  = 3;
-pub const u32 PIN_SPI1_MISO_PB4 = 4;
-pub const u32 PIN_SPI1_MOSI_PB5 = 5;
+pub const gpio.Pin PIN_I2C1_SCL  = gpio.Pin { port: f3.PORT_B, pin: 6u8, active_low: false };
+pub const gpio.Pin PIN_I2C1_SDA  = gpio.Pin { port: f3.PORT_B, pin: 7u8, active_low: false };
+pub const gpio.Pin PIN_SPI1_SCK  = gpio.Pin { port: f3.PORT_B, pin: 3u8, active_low: false };
+pub const gpio.Pin PIN_SPI1_MISO = gpio.Pin { port: f3.PORT_B, pin: 4u8, active_low: false };
+pub const gpio.Pin PIN_SPI1_MOSI = gpio.Pin { port: f3.PORT_B, pin: 5u8, active_low: false };
 
 pub fn console_putc(u8 b) {
     if (b == '\n') {
-        uart.usart2_tx_byte('\r');
+        f3.usart2_tx_byte('\r');
     }
-    uart.usart2_tx_byte(b);
+    f3.usart2_tx_byte(b);
 }
 
 pub fn on_fault() {
@@ -50,7 +48,7 @@ pub fn on_fault() {
 pub u32 init_board() {
     sys.set_fault_handler(on_fault);
 
-    u32 clk = rcc.configure_pll_hse_bypass_72mhz();
+    u32 clk = f3.configure_pll_hse_bypass_72mhz();
     sys.use_systick(clk);
 
     hw.RCC.ahbenr = hw.RCC.ahbenr
@@ -60,39 +58,31 @@ pub u32 init_board() {
     u32 _stab_ahb = hw.RCC.ahbenr;
 
     // Configure onboard LD2 (PA5, active-high) and User Button B1 (PC13, active-low).
-    hw.GPIOA.brr = 1u32 << PIN_LD2;
-    cgpio.config(cgpio.PORT_A, PIN_LD2, cgpio.MODE_OUT, cgpio.PUPD_NONE);
-    cgpio.config(cgpio.PORT_C, PIN_B1, cgpio.MODE_IN, cgpio.PUPD_UP);
+    PIN_LD2.set_low();
+    PIN_LD2.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    PIN_B1.set_mode(gpio.Mode.Input, gpio.Pull.Up);
 
-    uart.usart2_init_vcp(115200u32, true);
+    f3.usart2_init_vcp(115200u32, true);
     sys.set_putc(console_putc);
     return clk;
 }
 
 pub gpio.Pin led_pin() {
-    return gpio.make_pin(cgpio.PORT_A, PIN_LD2 as u8, false, false);
+    return PIN_LD2;
 }
 
 pub gpio.Pin button_pin() {
-    return gpio.make_pin(cgpio.PORT_C, PIN_B1 as u8, true, false);
+    return PIN_B1;
 }
 
 pub fn set_led(bool on) {
-    if (on) {
-        hw.GPIOA.bsrr = 1u32 << PIN_LD2;
-    } else {
-        hw.GPIOA.brr = 1u32 << PIN_LD2;
-    }
+    PIN_LD2.write(on);
 }
 
 pub fn toggle_led() {
-    if ((hw.GPIOA.odr & (1u32 << PIN_LD2)) != 0u32) {
-        hw.GPIOA.brr = 1u32 << PIN_LD2;
-    } else {
-        hw.GPIOA.bsrr = 1u32 << PIN_LD2;
-    }
+    PIN_LD2.toggle();
 }
 
 pub bool read_button() {
-    return (hw.GPIOC.idr & (1u32 << PIN_B1)) == 0u32;
+    return PIN_B1.read();
 }

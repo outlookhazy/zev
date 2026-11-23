@@ -72,9 +72,9 @@ pub const TOPIC_DOCS: &[TopicDoc] = &[
         aliases: &[
             "types", "struct", "structs", "enum", "enums", "packed", "endian", "fn", "functions",
             "switch", "loops", "for", "defer", "generics", "float", "floats", "modules", "pub",
-            "import",
+            "import", "impl", "methods", "const",
         ],
-        summary: "Types (`f32`/`f64`), `<T, usize N>` generics, `packed struct`, `import`/`pub`, `for`/`defer`",
+        summary: "Types (`f32`/`f64`), `<T, usize N>` generics, `impl` methods, `.rodata` `const`, `import`/`pub import`",
         body: "\
 # Zev Topic Guide: `syntax`
 
@@ -84,10 +84,10 @@ pub const TOPIC_DOCS: &[TopicDoc] = &[
 - Wire-Endian (valid in `packed struct`): `u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le`
 - Compound: fat slices `[]u8` (`.len`, `buf[i]`, clamped `buf[0..5]`), pointers `i32 *p` / `*u8`, arrays `[16]u8` / `u8 b[16]`
 
-## 2. Wire `packed struct`, In-Memory `struct`, `enum` & `const`
+## 2. Wire `packed struct`, In-Memory `struct`, `enum` & `.rodata` `const`
 ```zev
 const u8 CMD_SET_RPM = 1;
-const usize MAX_SAMPLES = 8;
+const [4]u16 LUT_DUTY = [150u16, 400u16, 700u16, 900u16]; // Lives in Flash .rodata
 
 packed struct CmdFrame {
     u8    op;
@@ -98,15 +98,31 @@ packed struct CmdFrame {
 enum Mode { Idle, ClosedLoop, Fault }
 ```
 Decode a `packed struct` directly from a `[]u8` slice with `CmdFrame.from_bytes(buf[0..5]) catch { ... };`.
+Aggregate `const` structs/arrays live in `.rodata` and support direct field reads, indexing, and
+read-only slicing (`LUT_DUTY[0..2]`); taking `&CONST.field` or calling a `*self` method on a `const`
+value is rejected at compile time.
 
-## 3. Signatures (`Ret name(...)` vs `fn name(...)`) & Monomorphized `<T, usize N>` Generics
-- Value-returning functions put the return type first; `fn` is `void`. User `struct`s and `fn`s support
-  compile-time monomorphized `<T>` and `<T, usize N>` parameters (concrete Flash instantiations are reported in
-  `zevc ram` and `zevc check --json`; C++ ad-hoc overloading and trait hierarchies are omitted; `E0029` on misuse):
+## 3. Same-Module `impl` Blocks, `Ret name(...)` Signatures & `<T, usize N>` Generics
+- Value-returning functions/methods put the return type first; `fn` is `void`. User `struct`s and `fn`s
+  support compile-time monomorphized `<T>` and `<T, usize N>` parameters (`zevc ram` and `zevc check --json`
+  report concrete Flash instantiations; `E0029` on misuse):
+- Same-module `impl` blocks attach methods (including partial specializations like `impl<usize N> FixedVec<f32, N>`)
+  to types declared in the same file (`pub` goes on individual methods, never `pub impl`):
+  - `self`: pass-by-value receiver (valid on both variables and `.rodata` `const` descriptors)
+  - `*self`: auto-borrowed mutable pointer receiver (`v.push(x)` borrows `&v`; rejected on `const`)
+  - No `self` parameter: associated constructor/helper called as `Type.make(...)`
 ```zev
 struct FixedVec<T, usize N> {
     [N]T  data;
     usize len;
+}
+
+impl<T, usize N> FixedVec<T, N> {
+    pub fn push(*self, T item) { ... }
+}
+
+impl<usize N> FixedVec<f32, N> {
+    pub f32 avg(*self) { ... }
 }
 
 T clamp<T>(T val, T lo, T hi) {
@@ -114,16 +130,16 @@ T clamp<T>(T val, T lo, T hi) {
     if (val > hi) { return hi; }
     return val;
 }
-// Call with inferred `clamp(x, 0.0f32, 1.0f32)` or explicit `clamp<f32>(...)` / `clamp::<f32>(...)`!
 ```
 
-## 4. `switch`, Bounded `for..in` Loops & Zero-Cost `defer`
+## 4. `switch`, Bounded `for..in`, `defer`, Grouped `import` & `pub import`
 - `switch` dispatches on `enum` variants AND integer/`bool`/`const` values (`_` / `default` wildcard, zero fallthrough).
 - Bounded `for..in` loops support `for (usize i in 0..n)`, `0..=max`, and `for (u8 b in slice)` (3-clause `for (;;)` -> `P0008`).
 - `defer <stmt>;` and `defer { ... }` execute in strict LIFO order across scope exit, `return`, `error`, `break`,
   `continue`, `restart`, and `sys.exit` (`defer` bodies are implicitly non-yielding; dead code after exits -> `E0025`).
-- File/directory modules are **private by default**: prefix top-level exports with `pub` and import via
-  `import chip.stm32g4 as hw;` or `import bsp.motor_drive as bsp;` (pass `-I <dir>` for custom roots).
+- File/directory modules are **private by default**: prefix exports with `pub`, group imports cleanly via
+  `import hal.{time, gpio, pwm};`, and re-export child modules/symbols via `pub import chip.stm32f3.{rcc, gpio};`
+  (pass `-I <dir>` for custom roots).
 ",
     },
     TopicDoc {

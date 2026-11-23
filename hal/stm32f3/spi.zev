@@ -6,14 +6,12 @@ import std.bus as bus;
 pub struct Bus {
     u8  unit; // 1 = SPI1
     u32 timeout_ms;
-    u8  sim_rx;
 }
 
-pub Bus make_bus(u8 unit, u32 timeout_ms, u8 sim_rx) {
+pub Bus make_bus(u8 unit, u32 timeout_ms) {
     return Bus {
         unit: unit,
         timeout_ms: timeout_ms,
-        sim_rx: sim_rx,
     };
 }
 
@@ -24,69 +22,71 @@ u32 eff_timeout(u32 to_ms) {
     return to_ms;
 }
 
-pub u8 transfer_byte(*Bus b, u8 tx) error bus.BusStatus {
-    if (b.unit != 1u8) {
-        error bus.BusStatus.FrameErr;
-    }
-    u32 t0 = sys.now_ms();
-    u32 limit = eff_timeout(b.timeout_ms);
-    bool tx_ok = false;
-    for (u32 iter in 0..100_000) {
-        if ((hw.SPI1.sr & (1u32 << 1)) != 0u32) { // TXE
-            tx_ok = true;
-            break;
+impl Bus {
+    pub u8 transfer_byte(self, u8 tx) error bus.BusStatus {
+        if (self.unit != 1u8) {
+            error bus.BusStatus.FrameErr;
         }
-        if ((iter & 0x3Fu32) == 0x3Fu32) {
-            if ((sys.now_ms() - t0) >= limit) {
-                error bus.BusStatus.Timeout;
+        u32 t0 = sys.now_ms();
+        u32 limit = eff_timeout(self.timeout_ms);
+        bool tx_ok = false;
+        for (u32 iter in 0..100_000) {
+            if ((hw.SPI1.sr & (1u32 << 1)) != 0u32) { // TXE
+                tx_ok = true;
+                break;
             }
-            checkpoint();
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
         }
-    }
-    if (!tx_ok) {
+        if (!tx_ok) {
+            error bus.BusStatus.Timeout;
+        }
+        hw.SPI1.dr = tx;
+        for (u32 iter in 0..100_000) {
+            if ((hw.SPI1.sr & 1u32) != 0u32) { // RXNE
+                return hw.SPI1.dr;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
         error bus.BusStatus.Timeout;
     }
-    hw.SPI1.dr = tx;
-    for (u32 iter in 0..100_000) {
-        if ((hw.SPI1.sr & 1u32) != 0u32) { // RXNE
-            return hw.SPI1.dr;
+
+    pub fn transfer(self, []u8 tx, []u8 rx) error bus.BusStatus {
+        if (tx.len != rx.len) {
+            error bus.BusStatus.FrameErr;
         }
-        if ((iter & 0x3Fu32) == 0x3Fu32) {
-            if ((sys.now_ms() - t0) >= limit) {
-                error bus.BusStatus.Timeout;
-            }
-            checkpoint();
+        for (usize i in 0..tx.len) {
+            rx[i] = self.transfer_byte(tx[i]) catch (bus.BusStatus err) {
+                error err;
+            };
         }
+        return;
     }
-    error bus.BusStatus.Timeout;
-}
 
-pub fn transfer(*Bus b, []u8 tx, []u8 rx) error bus.BusStatus {
-    if (tx.len != rx.len) {
-        error bus.BusStatus.FrameErr;
+    pub fn write(self, []u8 tx) error bus.BusStatus {
+        for (u8 t in tx) {
+            u8 _r = self.transfer_byte(t) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
     }
-    for (usize i in 0..tx.len) {
-        rx[i] = transfer_byte(b, tx[i]) catch (bus.BusStatus err) {
-            error err;
-        };
-    }
-    return;
-}
 
-pub fn write(*Bus b, []u8 tx) error bus.BusStatus {
-    for (u8 t in tx) {
-        u8 _r = transfer_byte(b, t) catch (bus.BusStatus err) {
-            error err;
-        };
+    pub fn read(self, []u8 rx, u8 fill) error bus.BusStatus {
+        for (usize i in 0..rx.len) {
+            rx[i] = self.transfer_byte(fill) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
     }
-    return;
-}
-
-pub fn read(*Bus b, []u8 rx, u8 fill) error bus.BusStatus {
-    for (usize i in 0..rx.len) {
-        rx[i] = transfer_byte(b, fill) catch (bus.BusStatus err) {
-            error err;
-        };
-    }
-    return;
 }

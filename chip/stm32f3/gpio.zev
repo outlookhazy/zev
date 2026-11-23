@@ -35,7 +35,7 @@ fn set_af_raw(*hw.GpioRegs g, u32 pin, u32 af) {
     }
 }
 
-pub fn config(u8 port, u32 pin, u32 mode, u32 pupd) {
+pub fn gpio_config(u8 port, u32 pin, u32 mode, u32 pupd) {
     if (pin >= 16u32) {
         return;
     }
@@ -51,7 +51,7 @@ pub fn config(u8 port, u32 pin, u32 mode, u32 pupd) {
     }
 }
 
-pub fn config_af(u8 port, u32 pin, u32 pupd, bool open_drain, u32 af) {
+pub fn gpio_config_af(u8 port, u32 pin, u32 pupd, bool open_drain, u32 af) {
     if (pin >= 16u32) {
         return;
     }
@@ -89,14 +89,18 @@ pub fn config_af(u8 port, u32 pin, u32 pupd, bool open_drain, u32 af) {
     }
 }
 
-pub gpio.Pin pin_in(u8 port, u32 pin, u32 pupd, bool active_low) {
-    config(port, pin, MODE_IN, pupd);
-    return gpio.make_pin(port, pin as u8, active_low, false);
+pub fn gpio_set_af(gpio.Pin pin, u8 af, u32 pupd, bool open_drain) {
+    gpio_config_af(pin.port, pin.pin as u32, pupd, open_drain, af as u32);
 }
 
-pub gpio.Pin pin_out(u8 port, u32 pin, bool initial_high, bool active_low) {
-    config(port, pin, MODE_OUT, PUPD_NONE);
-    gpio.Pin p = gpio.make_pin(port, pin as u8, active_low, initial_high);
-    gpio.write(&p, initial_high);
+pub gpio.Pin gpio_pin_in(u8 port, u32 pin, u32 pupd, bool active_low) {
+    gpio_config(port, pin, MODE_IN, pupd);
+    return gpio.make_pin(port, pin as u8, active_low);
+}
+
+pub gpio.Pin gpio_pin_out(u8 port, u32 pin, bool initial_high, bool active_low) {
+    gpio_config(port, pin, MODE_OUT, PUPD_NONE);
+    gpio.Pin p = gpio.make_pin(port, pin as u8, active_low);
+    p.write(initial_high);
     return p;
 }

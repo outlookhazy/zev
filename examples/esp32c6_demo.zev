@@ -98,28 +98,32 @@ fn flush_tx_ring(*byte_ring tx) {
     }
 }
 
-// ── Monomorphized `<T, usize N>` Helpers (Zero Vtables, Zero Heap) ──────────
-fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
-    if (v.len < N) {
-        v.data[v.len] = item;
-        v.len += 1;
-        return;
+// ── Monomorphized `<T, usize N>` & Specialized Methods (Zero Vtables, Zero Heap) ──
+impl<T, usize N> FixedVec<T, N> {
+    fn push_ring(*self, T item) {
+        if (self.len < N) {
+            self.data[self.len] = item;
+            self.len += 1;
+            return;
+        }
+        for (usize i in 1..N) {
+            self.data[i - 1] = self.data[i];
+        }
+        self.data[N - 1] = item;
     }
-    for (usize i in 1..N) {
-        v.data[i - 1] = v.data[i];
-    }
-    v.data[N - 1] = item;
 }
 
-f32 vec_avg_f32<usize N>(*FixedVec<f32, N> v) {
-    if (v.len == 0) {
-        return 0.0f32;
+impl<usize N> FixedVec<f32, N> {
+    f32 avg(*self) {
+        if (self.len == 0) {
+            return 0.0f32;
+        }
+        f32 sum = 0.0f32;
+        for (usize i in 0..self.len) {
+            sum += self.data[i];
+        }
+        return sum / (self.len as f32);
     }
-    f32 sum = 0.0f32;
-    for (usize i in 0..v.len) {
-        sum += v.data[i];
-    }
-    return sum / (v.len as f32);
 }
 
 // ── Pure Saturated Color Wheel: Red -> Green -> Blue -> Cyan -> Magenta (0% White!) ──
@@ -397,8 +401,8 @@ fn main() {
 
                 u32 cur_rgb = active_color.read();
                 LedSample sample = sample_led_power(next_off, cur_rgb);
-                vec_push_ring(&mw_window, sample.mwatts);
-                f32 avg_mw = vec_avg_f32(&mw_window);
+                mw_window.push_ring(sample.mwatts);
+                f32 avg_mw = mw_window.avg();
 
                 print("[EVENT] BOOT Button (GPIO9) -> instant color shift! ");
                 print_telemetry_line(sys.now_ms(), cur_rgb, presses, boosted_prio, avg_mw, ev, sample);
@@ -411,8 +415,8 @@ fn main() {
                 u32 cur_slot = active_slot.read();
                 u32 cur_rgb = active_color.read();
                 LedSample sample = sample_led_power(cur_slot, cur_rgb);
-                vec_push_ring(&mw_window, sample.mwatts);
-                f32 avg_mw = vec_avg_f32(&mw_window);
+                mw_window.push_ring(sample.mwatts);
+                f32 avg_mw = mw_window.avg();
 
                 print_telemetry_line(sys.now_ms(), cur_rgb, presses, sys.current_prio(), avg_mw, ev, sample);
             }

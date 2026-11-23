@@ -15,7 +15,7 @@ u32 f_hrtim_hz() {
     return rcc.pclk2_hz();
 }
 
-pub bool dll_calibrate() {
+pub bool hrtim_dll_calibrate() {
     u32 sws = (hw.RCC.cfgr >> 2) & 3u32;
     if (sws == 2u32) {
         hw.RCC.cfgr3 = hw.RCC.cfgr3 | hw.RCC_CFGR3_HRTIM1SW_PLL;
@@ -35,9 +35,9 @@ pub bool dll_calibrate() {
     return false;
 }
 
-pub pwm.Channel cha1_pwm_pa8_start(u32 freq_hz, u16 initial_permil, *bool ok_out) {
+pub pwm.Channel hrtim_cha1_pwm_pa8_start(u32 freq_hz, u16 initial_permil, *bool ok_out) {
     *ok_out = false;
-    if (freq_hz == 0u32 || !dll_calibrate()) {
+    if (freq_hz == 0u32 || !hrtim_dll_calibrate()) {
         return pwm.make_channel(1u8, 0u8, 0u8, 0u32, 0u16);
     }
 
@@ -89,7 +89,7 @@ pub pwm.Channel cha1_pwm_pa8_start(u32 freq_hz, u16 initial_permil, *bool ok_out
 
     // PA8 = AF13 (HRTIM1_CHA1). Set high slew & AF before MODER=AF.
     hw.GPIOA.ospeedr = hw.GPIOA.ospeedr | (3u32 << (8u32 * 2u32));
-    cgpio.config_af(cgpio.PORT_A, 8u32, cgpio.PUPD_NONE, false, 13u32);
+    cgpio.gpio_config_af(cgpio.PORT_A, 8u32, cgpio.PUPD_NONE, false, 13u32);
 
     hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr | (1u32 << 17); // TACEN
     hw.HRTIM1_COMMON.oenr = hw.HRTIM1_COMMON.oenr | 1u32;        // TA1OEN
@@ -97,13 +97,13 @@ pub pwm.Channel cha1_pwm_pa8_start(u32 freq_hz, u16 initial_permil, *bool ok_out
     return pwm.make_channel(1u8, 0u8, 0u8, chosen_per, d);
 }
 
-pub fn cha1_set_deadtime(u16 rise_ticks, u16 fall_ticks) {
+pub fn hrtim_cha1_set_deadtime(u16 rise_ticks, u16 fall_ticks) {
     u32 r = (rise_ticks as u32) & 0x1FFu32;
     u32 f = (fall_ticks as u32) & 0x1FFu32;
     hw.HRTIM1_TIMA.dtr = r | (f << 16);
 }
 
-pub fn cha1_stop() {
+pub fn hrtim_cha1_stop() {
     hw.HRTIM1_COMMON.odisr = 1u32;
     hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr & (~(1u32 << 17));
 }

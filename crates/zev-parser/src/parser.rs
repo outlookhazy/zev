@@ -124,11 +124,13 @@ impl<'a> Parser<'a> {
             match self.peek_kind() {
                 TokenKind::Eof => break,
                 TokenKind::KwImport => {
-                    if let Ok(imp) = self.parse_import() {
-                        if let Some(alias) = imp.alias {
-                            self.import_aliases.insert(alias.name);
-                        } else if let Some(last) = imp.path.last() {
-                            self.import_aliases.insert(last.name.clone());
+                    if let Ok(imps) = self.parse_imports() {
+                        for imp in imps {
+                            if let Some(alias) = imp.alias {
+                                self.import_aliases.insert(alias.name);
+                            } else if let Some(last) = imp.path.last() {
+                                self.import_aliases.insert(last.name.clone());
+                            }
                         }
                     } else {
                         self.prescan_skip_until_semi_depth0();
@@ -168,7 +170,7 @@ impl<'a> Parser<'a> {
                     }
                     self.prescan_skip_item();
                 }
-                TokenKind::KwEnum | TokenKind::KwTask | TokenKind::KwIsr => {
+                TokenKind::KwEnum | TokenKind::KwImpl | TokenKind::KwTask | TokenKind::KwIsr => {
                     self.prescan_skip_item();
                 }
                 TokenKind::KwConst => {
@@ -988,14 +990,6 @@ impl<'a> Parser<'a> {
 
             // ── Valid Zev top-level constructs ──
             TokenKind::KwImport => {
-                if let Some(ps) = pub_span {
-                    return Err(self
-                        .err_at(
-                            "`pub` visibility modifier is not allowed on `import` declarations",
-                            ps,
-                        )
-                        .with_doc_topic("syntax"));
-                }
                 if !attrs.is_empty() {
                     return Err(self
                         .err_at(
@@ -1004,9 +998,11 @@ impl<'a> Parser<'a> {
                         )
                         .with_doc_topic("syntax"));
                 }
-                let imp = self.parse_import()?;
-                let span = imp.span;
-                out.push(Item::new(attrs, ItemKind::Import(imp), span));
+                let imps = self.parse_imports()?;
+                for imp in imps {
+                    let span = first_span.merge(imp.span);
+                    out.push(Item::with_pub(attrs.clone(), is_pub, ItemKind::Import(imp), span));
+                }
             }
             TokenKind::KwPacked | TokenKind::KwStruct => {
                 let mut st = self.parse_struct()?;
@@ -1019,6 +1015,27 @@ impl<'a> Parser<'a> {
                 let span = first_span.merge(st.span);
                 st.span = span;
                 out.push(Item::with_pub(attrs, is_pub, ItemKind::Struct(st), span));
+            }
+            TokenKind::KwImpl => {
+                if let Some(ps) = pub_span {
+                    return Err(self
+                        .err_at(
+                            "`pub` visibility modifier is not allowed on `impl` blocks; mark individual methods `pub` instead",
+                            ps,
+                        )
+                        .with_doc_topic("syntax"));
+                }
+                if !attrs.is_empty() {
+                    return Err(self
+                        .err_at(
+                            "attributes are not allowed on `impl` blocks; place attributes on individual methods instead",
+                            attrs[0].span,
+                        )
+                        .with_doc_topic("syntax"));
+                }
+                let imp = self.parse_impl(first_span)?;
+                let span = first_span.merge(imp.span);
+                out.push(Item::new(attrs, ItemKind::Impl(imp), span));
             }
             TokenKind::KwEnum => {
                 let en = self.parse_enum()?;
@@ -1206,23 +1223,289 @@ impl<'a> Parser<'a> {
     // Imports, Structs, Enums, Constants, Externs, Functions, Tasks, ISRs
     // ─────────────────────────────────────────────────────────────────────────
 
-    fn parse_import(&mut self) -> Result<ImportDecl, ParseError> {
+    fn parse_imports(&mut self) -> Result<Vec<ImportDecl>, ParseError> {
         let start = self.expect(&TokenKind::KwImport)?.span;
         let mut path = vec![self.parse_ident()?];
+        let mut grouped = false;
         while self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon) {
+            if self.at(&TokenKind::LBrace) {
+                grouped = true;
+                break;
+            }
             path.push(self.parse_ident()?);
         }
+
+        if grouped {
+            self.expect(&TokenKind::LBrace)?;
+            let mut entries = Vec::new();
+            while !self.at(&TokenKind::RBrace) {
+                let item_id = self.parse_ident()?;
+                let item_end = item_id.span;
+                let alias = if self.eat(&TokenKind::KwAs) {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                let entry_end = alias.as_ref().map_or(item_end, |a| a.span);
+                let mut full_path = path.clone();
+                full_path.push(item_id);
+                entries.push((full_path, alias, start.merge(entry_end)));
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::RBrace)?;
+            let semi = self.expect(&TokenKind::Semi)?;
+            if entries.is_empty() {
+                return Err(self
+                    .err_at(
+                        "grouped `import` list cannot be empty",
+                        start.merge(semi.span),
+                    )
+                    .with_doc_topic("syntax"));
+            }
+            let out = entries
+                .into_iter()
+                .map(|(full_path, alias, entry_span)| ImportDecl {
+                    path: full_path,
+                    alias,
+                    span: entry_span.merge(semi.span),
+                })
+                .collect();
+            return Ok(out);
+        }
+
         let alias = if self.eat(&TokenKind::KwAs) {
             Some(self.parse_ident()?)
         } else {
             None
         };
         let semi = self.expect(&TokenKind::Semi)?;
-        Ok(ImportDecl {
+        Ok(vec![ImportDecl {
             path,
             alias,
             span: start.merge(semi.span),
+        }])
+    }
+
+    fn parse_impl(&mut self, first_span: Span) -> Result<ImplDecl, ParseError> {
+        self.expect(&TokenKind::KwImpl)?;
+        let generic_params = self.parse_optional_generic_params()?;
+        let target_name = self.parse_ident()?;
+        if self.at(&TokenKind::Dot) || self.at(&TokenKind::ColonColon) {
+            return Err(self
+                .err_at(
+                    format!(
+                        "cannot implement methods on foreign module type `{}`; inherent `impl` blocks must live in the module that defines the struct",
+                        target_name.name
+                    ),
+                    target_name.span.merge(self.peek_span()),
+                )
+                .with_doc_topic("syntax"));
+        }
+        let target_generic_args = if self.at(&TokenKind::Lt) {
+            self.parse_generic_args()?.0
+        } else {
+            Vec::new()
+        };
+        self.expect(&TokenKind::LBrace)?;
+
+        let prev_const_params = self.generic_const_params.clone();
+        for gp in &generic_params {
+            if gp.kind == GenericParamKind::ConstUsize {
+                self.generic_const_params.insert(gp.name.name.clone());
+            }
+        }
+
+        let mut methods = Vec::new();
+        while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+            let m_res = self.parse_impl_method(&generic_params);
+            match m_res {
+                Ok(m) => methods.push(m),
+                Err(e) => {
+                    self.generic_const_params = prev_const_params;
+                    return Err(e);
+                }
+            }
+        }
+
+        self.generic_const_params = prev_const_params;
+        let rb = self.expect(&TokenKind::RBrace)?;
+        let end_span = if self.eat(&TokenKind::Semi) {
+            self.prev_span()
+        } else {
+            rb.span
+        };
+
+        Ok(ImplDecl {
+            generic_params,
+            target_name,
+            target_generic_args,
+            methods,
+            span: first_span.merge(end_span),
         })
+    }
+
+    fn parse_impl_method(&mut self, impl_generics: &[GenericParam]) -> Result<MethodDecl, ParseError> {
+        let first_span = self.peek_span();
+        let mut attrs = self.parse_attrs()?;
+        let is_pub = self.eat(&TokenKind::KwPub);
+        attrs.extend(self.parse_attrs()?);
+        if self.at(&TokenKind::KwPub) {
+            return Err(self
+                .err_at("duplicate `pub` visibility modifier", self.peek_span())
+                .with_doc_topic("syntax"));
+        }
+        let cur_span = self.peek_span();
+        if self.at(&TokenKind::KwExtern) {
+            return Err(self
+                .err_at("`extern \"C\"` declarations are not allowed inside `impl` blocks", cur_span)
+                .with_doc_topic("syntax"));
+        }
+
+        let (ret_type, name, fn_span) = if self.at(&TokenKind::KwFn) {
+            let fn_tok = self.expect(&TokenKind::KwFn)?;
+            let is_standard_fn = matches!(self.peek_kind(), TokenKind::Ident(_))
+                && matches!(self.peek_n_kind(1), TokenKind::LParen | TokenKind::Lt);
+            if !is_standard_fn {
+                if self.at(&TokenKind::Bang) {
+                    return Err(self.trap_p0007(
+                        "Zig-style `!Type` error-union return type",
+                        self.peek_span(),
+                    ));
+                }
+                let (rt, nm) = self.parse_typed_declarator("method declaration")?;
+                (rt, nm, fn_tok.span)
+            } else {
+                let nm = self.parse_ident()?;
+                (TypeExpr::void(fn_tok.span), nm, fn_tok.span)
+            }
+        } else {
+            let (rt, nm) = self.parse_typed_declarator("method declaration")?;
+            (rt, nm, cur_span)
+        };
+
+        if self.at(&TokenKind::Lt) {
+            return Err(self
+                .err_at(
+                    format!(
+                        "method-level generic parameters on `{}` inside `impl` are not supported; declare generic parameters on `impl<...>`",
+                        name.name
+                    ),
+                    self.peek_span(),
+                )
+                .with_doc_topic("syntax"));
+        }
+
+        let (receiver, params) = self.parse_method_param_list()?;
+
+        if self.at(&TokenKind::Arrow) {
+            let arrow = self.bump();
+            let (ret_hint, end_span) = self.sniff_type_display_and_span(arrow.span);
+            return Err(self.trap_p0002_fn_arrow(
+                &name.name,
+                ret_hint.as_deref(),
+                arrow.span.merge(end_span),
+            ));
+        }
+
+        let error_spec = self.parse_optional_error_spec()?;
+        let prev_const_params = self.generic_const_params.clone();
+        self.push_value_scope();
+        for gp in impl_generics {
+            if gp.kind == GenericParamKind::ConstUsize {
+                self.generic_const_params.insert(gp.name.name.clone());
+                self.record_local_value(&gp.name.name);
+            }
+        }
+        if receiver.is_some() {
+            self.record_local_value("self");
+        }
+        for p in &params {
+            self.generic_const_params.remove(&p.name.name);
+            self.record_local_value(&p.name.name);
+        }
+        let body_res = self.parse_fn_body(false, &name);
+        self.pop_value_scope();
+        self.generic_const_params = prev_const_params;
+        let (body, end_span) = body_res?;
+
+        let func = FnDecl {
+            attrs,
+            is_extern_c: false,
+            name,
+            generic_params: Vec::new(),
+            params,
+            is_variadic: false,
+            ret_type,
+            error_spec,
+            body,
+            span: fn_span.merge(end_span),
+        };
+
+        Ok(MethodDecl {
+            is_pub,
+            receiver,
+            func,
+            span: first_span.merge(end_span),
+        })
+    }
+
+    fn parse_method_param_list(&mut self) -> Result<(Option<SelfReceiver>, Vec<Param>), ParseError> {
+        self.expect(&TokenKind::LParen)?;
+        let mut receiver = None;
+        let mut params = Vec::new();
+
+        if self.eat(&TokenKind::KwSelf) {
+            receiver = Some(SelfReceiver::Value);
+            if !self.at(&TokenKind::RParen) {
+                self.expect(&TokenKind::Comma)?;
+            }
+        } else if self.at(&TokenKind::Star) && self.peek_n_kind(1) == TokenKind::KwSelf {
+            self.bump();
+            self.bump();
+            receiver = Some(SelfReceiver::Ptr);
+            if !self.at(&TokenKind::RParen) {
+                self.expect(&TokenKind::Comma)?;
+            }
+        }
+
+        if receiver.is_none()
+            && matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "void")
+            && self.peek_n_kind(1) == TokenKind::RParen
+        {
+            self.bump();
+            self.expect(&TokenKind::RParen)?;
+            return Ok((None, params));
+        }
+
+        while !self.at(&TokenKind::RParen) && !self.at(&TokenKind::Eof) {
+            if self.at(&TokenKind::DotDotDot) {
+                return Err(self
+                    .err_at("methods inside `impl` cannot be variadic (`...`)", self.peek_span())
+                    .with_doc_topic("syntax"));
+            }
+            if self.at(&TokenKind::KwSelf)
+                || (self.at(&TokenKind::Star) && self.peek_n_kind(1) == TokenKind::KwSelf)
+            {
+                return Err(self
+                    .err_at(
+                        "`self` / `*self` must be the first parameter of a method",
+                        self.peek_span(),
+                    )
+                    .with_doc_topic("syntax"));
+            }
+            let p_start = self.peek_span();
+            let (ty, name) = self.parse_field_or_param("parameter")?;
+            let span = p_start.merge(name.span);
+            params.push(Param { ty, name, span });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+
+        self.expect(&TokenKind::RParen)?;
+        Ok((receiver, params))
     }
 
     fn parse_struct(&mut self) -> Result<StructDecl, ParseError> {
@@ -4400,6 +4683,13 @@ impl<'a> Parser<'a> {
             TokenKind::KwFalse => {
                 self.bump();
                 Ok(Expr::new(ExprKind::Literal(Literal::Bool(false)), tok.span))
+            }
+            TokenKind::KwSelf => {
+                self.bump();
+                Ok(Expr::new(
+                    ExprKind::Ident(Ident::new("self", tok.span)),
+                    tok.span,
+                ))
             }
             TokenKind::String(s) => {
                 self.bump();

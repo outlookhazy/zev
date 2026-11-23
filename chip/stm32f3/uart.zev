@@ -12,8 +12,8 @@ pub fn usart2_init_vcp(u32 baud, bool rx_irq) {
     hw.RCC.apb1enr = hw.RCC.apb1enr | hw.RCC_APB1_USART2;
     u32 _stab = hw.RCC.apb1enr;
 
-    cgpio.config_af(cgpio.PORT_A, 2u32, cgpio.PUPD_NONE, false, 7u32);
-    cgpio.config_af(cgpio.PORT_A, 3u32, cgpio.PUPD_UP, false, 7u32);
+    cgpio.gpio_config_af(cgpio.PORT_A, 2u32, cgpio.PUPD_NONE, false, 7u32);
+    cgpio.gpio_config_af(cgpio.PORT_A, 3u32, cgpio.PUPD_UP, false, 7u32);
 
     u32 clk = rcc.pclk1_hz();
     hw.USART2.cr1 = 0u32;
@@ -58,8 +58,8 @@ pub fn usart1_init_gps_dma_circular(u32 baud, usize buf_addr, u32 total_bytes) {
     hw.RCC.apb2enr = hw.RCC.apb2enr | hw.RCC_APB2_USART1;
     u32 _stab_apb2 = hw.RCC.apb2enr;
 
-    cgpio.config_af(cgpio.PORT_A, 9u32, cgpio.PUPD_NONE, false, 7u32);
-    cgpio.config_af(cgpio.PORT_A, 10u32, cgpio.PUPD_UP, false, 7u32);
+    cgpio.gpio_config_af(cgpio.PORT_A, 9u32, cgpio.PUPD_NONE, false, 7u32);
+    cgpio.gpio_config_af(cgpio.PORT_A, 10u32, cgpio.PUPD_UP, false, 7u32);
 
     hw.USART1.cr1 = 0u32;
     hw.USART1.cr3 = 0u32;

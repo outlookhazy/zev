@@ -516,6 +516,7 @@ impl Item {
 pub enum ItemKind {
     Import(ImportDecl),
     Struct(StructDecl),
+    Impl(ImplDecl),
     Enum(EnumDecl),
     Mmio(MmioDecl),
     Irq(IrqDecl),
@@ -615,6 +616,32 @@ pub struct StructField {
     pub attrs: Vec<Attr>,
     pub ty: TypeExpr,
     pub name: Ident,
+    pub span: Span,
+}
+
+/// Receiver mode for a method declared inside an `impl` block (`self` vs `*self`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SelfReceiver {
+    Value,
+    Ptr,
+}
+
+/// A method or associated function declared inside an [`ImplDecl`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodDecl {
+    pub is_pub: bool,
+    pub receiver: Option<SelfReceiver>,
+    pub func: FnDecl,
+    pub span: Span,
+}
+
+/// Same-module inherent implementation block (`impl[<T, usize N>] StructName[<...>] { ... }`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImplDecl {
+    pub generic_params: Vec<GenericParam>,
+    pub target_name: Ident,
+    pub target_generic_args: Vec<GenericArg>,
+    pub methods: Vec<MethodDecl>,
     pub span: Span,
 }
 

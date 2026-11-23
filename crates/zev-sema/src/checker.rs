@@ -517,6 +517,26 @@ impl Analyzer {
             }
         }
         self.evaluate_all_const_int_values();
+        for (item, file, prog_idx) in &all_items {
+            self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
+            if let ItemKind::Const(c) = &item.kind {
+                if !self.is_compile_time_const_expr_with_shadowed(
+                    &c.value,
+                    &BTreeSet::new(),
+                    *prog_idx,
+                ) {
+                    self.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        c.value.span,
+                        format!(
+                            "`const` '{}' initializer must be a compile-time constant expression",
+                            c.name.name
+                        ),
+                    ));
+                }
+            }
+        }
 
         // Collect `mmio`, `irq`, OS primitives, illegal mutable globals, and callable signatures.
         for (item, file, prog_idx) in &all_items {
@@ -7880,6 +7900,17 @@ impl<'a> BodyChecker<'a> {
                         return ExprVal::error(span);
                     }
                 }
+                if let Some(const_name) = self.root_const_of_place(inner) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        span,
+                        format!(
+                            "cannot take mutable pointer to immutable 'const' '{}'",
+                            const_name
+                        ),
+                    ));
+                    return ExprVal::error(span);
+                }
 
                 let (iv, prov, endpoint_name) = self.check_addr_of_place(inner, span);
                 if iv.ty.is_error() {
@@ -8213,6 +8244,26 @@ impl<'a> BodyChecker<'a> {
             self.finish_deref_expr(iv, expr.span, false)
         } else {
             self.check_expr_infallible(expr)
+        }
+    }
+
+    fn root_const_of_place(&self, place: &Expr) -> Option<String> {
+        let mut cur = place;
+        loop {
+            match &cur.kind {
+                ExprKind::Ident(id) => {
+                    if self.lookup_local(&id.name).is_none()
+                        && self.sema.consts.contains_key(&id.name)
+                    {
+                        return Some(id.name.clone());
+                    }
+                    return None;
+                }
+                ExprKind::Field { target, .. } | ExprKind::Index { target, .. } => {
+                    cur = target;
+                }
+                _ => return None,
+            }
         }
     }
 

@@ -2,55 +2,65 @@
 
 import std.bus as bus;
 
+mmio SimSpiRegs {
+    @rw u32 loopback @ 0x00;
+}
+
+mmio SIM_SPI : SimSpiRegs @ 0x5F00_0300;
+
 pub struct Bus {
     u8  unit;
     u32 timeout_ms;
-    u8  sim_rx;
 }
 
-pub Bus make_bus(u8 unit, u32 timeout_ms, u8 sim_rx) {
+pub Bus make_bus(u8 unit, u32 timeout_ms) {
     return Bus {
         unit: unit,
         timeout_ms: timeout_ms,
-        sim_rx: sim_rx,
     };
 }
 
-pub u8 transfer_byte(*Bus b, u8 tx) error bus.BusStatus {
-    checkpoint();
-    if (b.unit == 0u8) {
-        error bus.BusStatus.FrameErr;
+impl Bus {
+    pub u8 transfer_byte(self, u8 tx) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8) {
+            error bus.BusStatus.FrameErr;
+        }
+        u8 _t = tx;
+        u32 cfg = SIM_SPI.loopback;
+        if (cfg == 0u32) {
+            return 0xFFu8;
+        }
+        return (cfg & 0xFFu32) as u8;
     }
-    u8 _t = tx;
-    return b.sim_rx;
-}
 
-pub fn transfer(*Bus b, []u8 tx, []u8 rx) error bus.BusStatus {
-    if (tx.len != rx.len) {
-        error bus.BusStatus.FrameErr;
+    pub fn transfer(self, []u8 tx, []u8 rx) error bus.BusStatus {
+        if (tx.len != rx.len) {
+            error bus.BusStatus.FrameErr;
+        }
+        for (usize i in 0..tx.len) {
+            rx[i] = self.transfer_byte(tx[i]) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
     }
-    for (usize i in 0..tx.len) {
-        rx[i] = transfer_byte(b, tx[i]) catch (bus.BusStatus err) {
-            error err;
-        };
-    }
-    return;
-}
 
-pub fn write(*Bus b, []u8 tx) error bus.BusStatus {
-    for (u8 t in tx) {
-        u8 _r = transfer_byte(b, t) catch (bus.BusStatus err) {
-            error err;
-        };
+    pub fn write(self, []u8 tx) error bus.BusStatus {
+        for (u8 t in tx) {
+            u8 _r = self.transfer_byte(t) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
     }
-    return;
-}
 
-pub fn read(*Bus b, []u8 rx, u8 fill) error bus.BusStatus {
-    for (usize i in 0..rx.len) {
-        rx[i] = transfer_byte(b, fill) catch (bus.BusStatus err) {
-            error err;
-        };
+    pub fn read(self, []u8 rx, u8 fill) error bus.BusStatus {
+        for (usize i in 0..rx.len) {
+            rx[i] = self.transfer_byte(fill) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
     }
-    return;
 }

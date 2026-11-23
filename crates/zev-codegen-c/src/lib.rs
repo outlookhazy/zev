@@ -6388,12 +6388,15 @@ fn main() {
     assert(str.xor_checksum("PMTK605") == 0x31u8);
     htime.spin_us(5u32);
 
-    gpio.Pin pin = gpio.make_pin(0u8, 5u8, false, false);
-    gpio.write(&pin, true);
-    assert(gpio.read(&pin));
+    gpio.Pin pin = gpio.make_pin(0u8, 5u8, false);
+    pin.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    pin.write(true);
+    assert(pin.read());
+    pin.toggle();
+    assert(!pin.read());
 
     pwm.Channel p_ch = pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 250u16);
-    pwm.set_duty_permil(&p_ch, 750u16);
+    p_ch.set_duty_permil(750u16);
     assert(p_ch.duty_permil == 750u16);
 
     rx_pp.start();
@@ -6401,17 +6404,17 @@ fn main() {
     IRQ_DMA_RX.attach(dma_rx_isr(&rx_pp));
     spawn rx_worker(&rx_pp, &parsed_sum);
 
-    adc.Channel a_ch = adc.make_channel(1u8, 1u8, 3300u16, 2048u16);
-    u16 raw = adc.read_u16(&a_ch) or 0u16;
-    assert(raw == 2048u16);
+    adc.Channel a_ch = adc.make_channel(1u8, 1u8, 3300u16);
+    u16 raw = a_ch.read_u16() or 0u16;
+    assert(raw == 1280u16);
 
-    i2c.Bus ibus = i2c.make_bus(1u8, 25u32, true);
-    bool ack = i2c.probe_7bit(&ibus, 0x3Cu8) or false;
-    assert(ack);
+    i2c.Bus ibus = i2c.make_bus(1u8, 25u32);
+    bool ack = ibus.probe_7bit(0x3Cu8) or true;
+    assert(!ack);
 
-    spi.Bus sbus = spi.make_bus(1u8, 25u32, 0x5Au8);
-    u8 rx_b = spi.transfer_byte(&sbus, 0xA5u8) or 0u8;
-    assert(rx_b == 0x5Au8);
+    spi.Bus sbus = spi.make_bus(1u8, 25u32);
+    u8 rx_b = sbus.transfer_byte(0xA5u8) or 0u8;
+    assert(rx_b == 0xFFu8);
 
     loop {
         delay(50ms);
@@ -6472,6 +6475,125 @@ int main(void) {
         let stdout = compile_and_run_clang_sanitized("circular_pp_hal_sim", &c_code, Some(driver));
         assert!(
             stdout.contains("CIRCULAR_PP_HAL_SIM_OK sum=400"),
+            "stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn impl_methods_and_rodata_const_aggregates_asan() {
+        let src = r#"
+pub struct Point {
+    i32 x;
+    i32 y;
+}
+
+struct Segment {
+    Point a;
+    Point b;
+}
+
+impl Point {
+    pub Point make(i32 x, i32 y) {
+        return Point { x: x, y: y };
+    }
+
+    pub i32 sum(self) {
+        return self.x + self.y;
+    }
+
+    pub fn translate(*self, i32 dx, i32 dy) {
+        self.x += dx;
+        self.y += dy;
+    }
+}
+
+struct FixedVec<T, usize N> {
+    [N]T  data;
+    usize len;
+}
+
+impl<T, usize N> FixedVec<T, N> {
+    pub fn push(*self, T item) {
+        if (self.len < N) {
+            self.data[self.len] = item;
+            self.len += 1;
+        }
+    }
+}
+
+impl<usize N> FixedVec<f32, N> {
+    pub f32 avg(*self) {
+        if (self.len == 0) {
+            return 0.0f32;
+        }
+        f32 s = 0.0f32;
+        for (usize i in 0..self.len) {
+            s += self.data[i];
+        }
+        return s / (self.len as f32);
+    }
+}
+
+const Point ORIGIN = Point { x: 3, y: 4 };
+const Segment SEG  = Segment { a: ORIGIN, b: Point { x: 10, y: 20 } };
+const [4]u16 LUT   = [10u16, 20u16, 30u16, 40u16];
+const [2]Point PTS = [Point { x: 1, y: 2 }, Point { x: 5, y: 6 }];
+const []u8 HDR     = [0xAAu8, 0x55u8];
+
+u16 sum_u16([]u16 xs) {
+    u16 acc = 0u16;
+    for (u16 x in xs) {
+        acc += x;
+    }
+    return acc;
+}
+
+fn main() {
+    assert(ORIGIN.sum() == 7);
+    assert(SEG.a.x == 3 && SEG.b.sum() == 30);
+    assert(PTS[1].sum() == 11);
+    assert(HDR.len == 2 && HDR[0] == 0xAAu8 && HDR[1] == 0x55u8);
+
+    u16 full_sum = sum_u16(LUT);
+    u16 sub_sum  = sum_u16(LUT[1..3]);
+    assert(full_sum == 100u16);
+    assert(sub_sum == 50u16);
+
+    Point p = Point.make(1, 2);
+    p.translate(4, 6);
+    assert(p.x == 5 && p.y == 8);
+
+    FixedVec<u32, 4> vi = FixedVec<u32, 4> { data: [0, 0, 0, 0], len: 0 };
+    vi.push(7u32);
+    vi.push(9u32);
+    assert(vi.len == 2 && vi.data[0] == 7u32 && vi.data[1] == 9u32);
+
+    FixedVec<f32, 3> vf = FixedVec<f32, 3> { data: [0.0f32, 0.0f32, 0.0f32], len: 0 };
+    vf.push(2.0f32);
+    vf.push(4.0f32);
+    f32 mean = vf.avg();
+    assert(mean > 2.99f32 && mean < 3.01f32);
+
+    println(f"IMPL_RODATA_OK full={full_sum} sub={sub_sum} p=({p.x},{p.y}) mean={mean:.1}");
+    sys.exit(0);
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse impl_rodata");
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, None)],
+            &zev_sema::AnalyzeOptions::default(),
+        );
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema impl_rodata: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = zev_mir::lower_programs(&analyzed.programs).expect("lower impl_rodata");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("impl_rodata", &c_code);
+        let stdout = compile_and_run_clang_sanitized("impl_rodata", &c_code, None);
+        assert!(
+            stdout.contains("IMPL_RODATA_OK full=100 sub=50 p=(5,8) mean=3.0"),
             "stdout:\n{stdout}"
         );
     }

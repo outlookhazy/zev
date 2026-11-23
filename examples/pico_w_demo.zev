@@ -96,27 +96,31 @@ fn flush_tx_ring() {
     bsp.usb_kick_tx();
 }
 
-fn vec_push_ring<T, usize N>(*FixedVec<T, N> v, T item) {
-    if (v.len < N) {
-        v.data[v.len] = item;
-        v.len += 1;
-        return;
+impl<T, usize N> FixedVec<T, N> {
+    fn push_ring(*self, T item) {
+        if (self.len < N) {
+            self.data[self.len] = item;
+            self.len += 1;
+            return;
+        }
+        for (usize i in 1..N) {
+            self.data[i - 1] = self.data[i];
+        }
+        self.data[N - 1] = item;
     }
-    for (usize i in 1..N) {
-        v.data[i - 1] = v.data[i];
-    }
-    v.data[N - 1] = item;
 }
 
-f32 vec_avg_f32<usize N>(*FixedVec<f32, N> v) {
-    if (v.len == 0) {
-        return 0.0f32;
+impl<usize N> FixedVec<f32, N> {
+    f32 avg(*self) {
+        if (self.len == 0) {
+            return 0.0f32;
+        }
+        f32 sum = 0.0f32;
+        for (usize i in 0..self.len) {
+            sum += self.data[i];
+        }
+        return sum / (self.len as f32);
     }
-    f32 sum = 0.0f32;
-    for (usize i in 0..v.len) {
-        sum += v.data[i];
-    }
-    return sum / (v.len as f32);
 }
 
 fn print_telemetry_line(
@@ -265,8 +269,8 @@ fn main() {
     loop {
         SupEvent ev = sup_inbox.recv(timeout: 1s) or Heartbeat;
         f32 temp_c = bsp.read_die_temp_c();
-        vec_push_ring(&temp_win, temp_c);
-        f32 avg_temp = vec_avg_f32(&temp_win);
+        temp_win.push_ring(temp_c);
+        f32 avg_temp = temp_win.avg();
         u32 alarms = alarm_count.read();
 
         switch (ev) {

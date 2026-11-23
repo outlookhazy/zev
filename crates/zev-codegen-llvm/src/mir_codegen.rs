@@ -91,6 +91,7 @@ struct ModuleCtx<'a> {
     bare_variants: HashMap<String, i64>,
     consts: HashMap<String, i128>,
     float_consts: HashMap<String, u64>,
+    rodata_consts: HashMap<String, (String, MirType)>,
     fn_sigs: HashMap<String, FnLlvmSig>,
     extern_sigs: HashMap<String, ExternLlvmSig>,
     fn_frames: HashMap<String, CoroutineFrameLayout>,
@@ -323,6 +324,7 @@ pub fn emit_llvm_ir_with_options(
         bare_variants: HashMap::new(),
         consts: HashMap::new(),
         float_consts: HashMap::new(),
+        rodata_consts: HashMap::new(),
         fn_sigs: HashMap::new(),
         extern_sigs: HashMap::new(),
         fn_frames: HashMap::new(),
@@ -418,7 +420,8 @@ pub fn emit_llvm_ir_with_options(
     ctx.emit_sys_hooks_ir(&mut out);
     ctx.emit_rom_wrappers_ir(&mut out);
 
-    // 13. Pooled string literal constants (`@.str.<k>`)
+    // 13. Immutable aggregate / slice / str constants and pooled string literals (.rodata)
+    ctx.emit_rodata_consts_ir(&mut out);
     ctx.emit_string_constants_ir(&mut out);
 
     Ok(out)
@@ -1117,6 +1120,13 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
     feat
 }
 
+fn is_rodata_const_ty(ty: &MirType) -> bool {
+    matches!(
+        ty,
+        MirType::Struct(_) | MirType::Array { .. } | MirType::Slice(_) | MirType::Str
+    )
+}
+
 impl<'a> ModuleCtx<'a> {
     fn prepare(&mut self) -> Result<(), CodegenError> {
         // Enums
@@ -1128,8 +1138,11 @@ impl<'a> ModuleCtx<'a> {
             }
         }
 
-        // Consts
+        // Consts (scalars/floats inlined; aggregate/slice/str constants live in .rodata)
         for c in &self.module.consts {
+            if is_rodata_const_ty(&c.ty) {
+                continue;
+            }
             if c.init.ty.is_float() {
                 let bits = self.eval_const_float_bits(&c.init);
                 self.float_consts.insert(c.name.clone(), bits);
@@ -1149,6 +1162,15 @@ impl<'a> ModuleCtx<'a> {
             .collect();
         for s in &self.module.structs {
             self.visit_struct(s.name.as_str(), &by_name, &mut visited);
+        }
+
+        for c in &self.module.consts {
+            if is_rodata_const_ty(&c.ty) {
+                self.rodata_consts.insert(
+                    c.name.clone(),
+                    (format!("@__zev_const_{}", sanitize_ident(&c.name)), c.ty.clone()),
+                );
+            }
         }
 
         // MMIO layouts & peripheral instances
@@ -3385,9 +3407,69 @@ impl<'a> ModuleCtx<'a> {
                 }
             }
             MirType::Slice(elem) => {
-                let usize_ty = self.spec.isa.usize_llvm_ty();
+                let usize_ty = self.spec.isa.usize_llvm_ty().to_string();
                 match &expr.kind {
                     MirExprKind::Cast { expr: sub, .. } => self.const_expr_to_llvm(sub, target_ty),
+                    MirExprKind::SubSlice {
+                        base,
+                        start,
+                        end,
+                        elem_ty,
+                        base_is_array,
+                    } => {
+                        let st = self.eval_const_int(start).max(0) as usize;
+                        let en = self.eval_const_int(end).max(0) as usize;
+                        if let MirExprKind::ConstRef(cname) = &base.kind {
+                            if let Some((sym, MirType::Array { len, .. })) =
+                                self.rodata_consts.get(cname).cloned()
+                            {
+                                let cl_st = st.min(len);
+                                let cl_en = en.min(len).max(cl_st);
+                                let ety = self.llvm_ty(elem_ty);
+                                return format!(
+                                    "{{ ptr getelementptr inbounds ([{len} x {ety}], ptr {sym}, {usize_ty} 0, {usize_ty} {cl_st}), {usize_ty} {} }}",
+                                    cl_en - cl_st
+                                );
+                            }
+                        }
+                        if *base_is_array {
+                            let resolved_base = if let MirExprKind::ConstRef(cname) = &base.kind {
+                                self.module
+                                    .consts
+                                    .iter()
+                                    .find(|c| c.name == *cname)
+                                    .map(|c| c.init.clone())
+                                    .unwrap_or_else(|| base.as_ref().clone())
+                            } else {
+                                base.as_ref().clone()
+                            };
+                            if let MirExprKind::ArrayLit { elems, .. } = resolved_base.kind {
+                                let len = elems.len();
+                                let cl_st = st.min(len);
+                                let cl_en = en.min(len).max(cl_st);
+                                if cl_en == cl_st {
+                                    return format!("{{ ptr null, {usize_ty} 0 }}");
+                                }
+                                let ety = self.llvm_ty(elem);
+                                let (_, eal) = self.size_align(elem, (ptr_bits / 8) as usize);
+                                let mut parts = Vec::with_capacity(len);
+                                for el in &elems {
+                                    let cv = self.const_expr_to_llvm(el, elem);
+                                    parts.push(format!("{ety} {cv}"));
+                                }
+                                let decl_body = format!(
+                                    "private unnamed_addr constant [{len} x {ety}] [{}], align {eal}",
+                                    parts.join(", ")
+                                );
+                                let idx = self.intern_const_blob(&decl_body);
+                                return format!(
+                                    "{{ ptr getelementptr inbounds ([{len} x {ety}], ptr @.cblob.{idx}, {usize_ty} 0, {usize_ty} {cl_st}), {usize_ty} {} }}",
+                                    cl_en - cl_st
+                                );
+                            }
+                        }
+                        "zeroinitializer".to_string()
+                    }
                     MirExprKind::StringLit(s) => {
                         let idx = self.intern_string(s);
                         let slen = zev_ast::decoded_string_byte_len(s);
@@ -5989,6 +6071,31 @@ entry:
             "define void @__syn_boot(){fn_as} nounwind{fn_sz} {{\n{body}}}\n"
         );
         Ok(())
+    }
+
+    fn emit_rodata_consts_ir(&mut self, out: &mut String) {
+        if self.rodata_consts.is_empty() {
+            return;
+        }
+        let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
+        let _ = writeln!(out, "; ── Immutable Aggregate / Slice / String Constants (Flash .rodata) ──");
+        for i in 0..self.module.consts.len() {
+            let cname = self.module.consts[i].name.clone();
+            let Some((sym, _)) = self.rodata_consts.get(&cname).cloned() else {
+                continue;
+            };
+            let cty = self.module.consts[i].ty.clone();
+            let cinit = self.module.consts[i].init.clone();
+            let lty = self.llvm_ty(&cty);
+            let (_, al) = self.size_align(&cty, ptr_bytes);
+            let al = al.max(1);
+            let init = self.const_expr_to_llvm(&cinit, &cty);
+            let _ = writeln!(
+                out,
+                "{sym} = private unnamed_addr constant {lty} {init}, align {al}"
+            );
+        }
+        let _ = writeln!(out);
     }
 
     fn emit_string_constants_ir(&self, out: &mut String) {
@@ -9399,6 +9506,65 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
     }
 
+    fn try_emit_rodata_const_ptr(
+        &mut self,
+        expr: &MirExpr,
+    ) -> Result<Option<(String, MirType, bool)>, CodegenError> {
+        match &expr.kind {
+            MirExprKind::ConstRef(name) => {
+                if let Some((sym, ty)) = self.ctx.rodata_consts.get(name).cloned() {
+                    Ok(Some((sym, ty, false)))
+                } else {
+                    Ok(None)
+                }
+            }
+            MirExprKind::FieldAccess {
+                base,
+                struct_name,
+                packed,
+                is_ptr: false,
+                field,
+                raw_field_ty,
+            } => {
+                let Some((bp, _, _)) = self.try_emit_rodata_const_ptr(base)? else {
+                    return Ok(None);
+                };
+                let si = self.ctx.structs[struct_name].clone();
+                let (fidx, _) = si.field_indices[field];
+                let sty = si.llvm_name;
+                let gp = self.next_tmp();
+                self.emit_line(format!(
+                    "{gp} = getelementptr inbounds {sty}, ptr {bp}, i32 0, i32 {fidx}"
+                ));
+                Ok(Some((gp, raw_field_ty.clone(), *packed)))
+            }
+            MirExprKind::Index {
+                base,
+                index,
+                is_slice: false,
+            } => {
+                let Some((bp, bty, packed)) = self.try_emit_rodata_const_ptr(base)? else {
+                    return Ok(None);
+                };
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
+                let iv = self.emit_expr(index)?;
+                let ic = self.coerce(iv, &usize_ty, false);
+                let blty = self.ctx.llvm_ty(&bty);
+                let ep = self.next_tmp();
+                self.emit_line(format!(
+                    "{ep} = getelementptr inbounds {blty}, ptr {bp}, {usize_ty} 0, {usize_ty} {}",
+                    ic.repr
+                ));
+                let elem_mir = match &bty {
+                    MirType::Array { elem, .. } => elem.as_ref().clone(),
+                    _ => expr.ty.clone(),
+                };
+                Ok(Some((ep, elem_mir, packed)))
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn load_from_place_ptr(&mut self, ptr: &str, raw_ty: &MirType, _packed: bool) -> SsaVal {
         let lty = self.ctx.llvm_ty(raw_ty);
         // `align 1` keeps unaligned `packed struct` / wire-cast pointer loads fault-safe while
@@ -9550,7 +9716,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(SsaVal::new("i32", format!("{disc}")))
             }
             MirExprKind::ConstRef(name) => {
-                if expr.ty.is_float() || dst_lty == "float" || dst_lty == "double" {
+                if let Some((sym, mir_ty)) = self.ctx.rodata_consts.get(name).cloned() {
+                    Ok(self.load_from_place_ptr(&sym, &mir_ty, false))
+                } else if expr.ty.is_float() || dst_lty == "float" || dst_lty == "double" {
                     let raw = self
                         .ctx
                         .float_consts
@@ -9815,6 +9983,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         bp.repr
                     ));
                     Ok(self.load_from_place_ptr(&gp, raw_field_ty, *packed))
+                } else if let Some((bp, _, _)) = self.try_emit_rodata_const_ptr(base)? {
+                    let gp = self.next_tmp();
+                    self.emit_line(format!(
+                        "{gp} = getelementptr inbounds {sty}, ptr {bp}, i32 0, i32 {fidx}"
+                    ));
+                    Ok(self.load_from_place_ptr(&gp, raw_field_ty, *packed))
                 } else {
                     let bv = self.emit_expr(base)?;
                     let ext = self.next_tmp();
@@ -9868,6 +10042,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         ic.repr
                     ));
                     Ok(self.load_from_place_ptr(&ep, &expr.ty, false))
+                } else if let Some((bp, bty, packed)) = self.try_emit_rodata_const_ptr(base)? {
+                    let blty = self.ctx.llvm_ty(&bty);
+                    let ep = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ep} = getelementptr inbounds {blty}, ptr {bp}, {usize_ty} 0, {usize_ty} {}",
+                        ic.repr
+                    ));
+                    Ok(self.load_from_place_ptr(&ep, &expr.ty, packed))
                 } else {
                     let bv = self.emit_expr(base)?;
                     let (tmp, al) = self.emit_temp_alloca(&bv.ty);
@@ -9904,6 +10086,15 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let p = if let MirExprKind::Var(vid) = &base.kind {
                             let ap = self.var_ptr(*vid);
                             let aty = self.ctx.llvm_ty(&base.ty);
+                            let gp = self.next_tmp();
+                            self.emit_line(format!(
+                                "{gp} = getelementptr inbounds {aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
+                            ));
+                            gp
+                        } else if let Some((ap, aty_mir, _)) =
+                            self.try_emit_rodata_const_ptr(base)?
+                        {
+                            let aty = self.ctx.llvm_ty(&aty_mir);
                             let gp = self.next_tmp();
                             self.emit_line(format!(
                                 "{gp} = getelementptr inbounds {aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"

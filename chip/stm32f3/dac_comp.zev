@@ -6,7 +6,7 @@ import chip.stm32f3.gpio as cgpio;
 pub fn dac1_enable_pa4() {
     hw.RCC.apb1enr = hw.RCC.apb1enr | hw.RCC_APB1_DAC1;
     u32 _stab = hw.RCC.apb1enr;
-    cgpio.config(cgpio.PORT_A, 4u32, cgpio.MODE_ANALOG, cgpio.PUPD_NONE);
+    cgpio.gpio_config(cgpio.PORT_A, 4u32, cgpio.MODE_ANALOG, cgpio.PUPD_NONE);
     hw.DAC1.cr = 1u32;
 }
 
@@ -16,7 +16,7 @@ pub fn dac1_write(u16 val_12b) {
 
 pub fn dac1_disable_pa4() {
     hw.DAC1.cr = 0u32;
-    cgpio.config(cgpio.PORT_A, 4u32, cgpio.MODE_IN, cgpio.PUPD_NONE);
+    cgpio.gpio_config(cgpio.PORT_A, 4u32, cgpio.MODE_IN, cgpio.PUPD_NONE);
 }
 
 pub fn comp2_enable_pa7_vrefint() {

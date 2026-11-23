@@ -19,8 +19,8 @@ pub fn can1_init(u32 bitrate, u8 mode) {
     if (mode != CAN_MODE_SILENT_LOOPBACK) {
         hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOA;
         u32 _staba = hw.RCC.ahbenr;
-        cgpio.config_af(cgpio.PORT_A, 11u32, cgpio.PUPD_NONE, false, 9u32); // CAN_RX
-        cgpio.config_af(cgpio.PORT_A, 12u32, cgpio.PUPD_NONE, false, 9u32); // CAN_TX
+        cgpio.gpio_config_af(cgpio.PORT_A, 11u32, cgpio.PUPD_NONE, false, 9u32); // CAN_RX
+        cgpio.gpio_config_af(cgpio.PORT_A, 12u32, cgpio.PUPD_NONE, false, 9u32); // CAN_TX
     }
 
     hw.CAN1.mcr = hw.CAN1.mcr & (~2u32);

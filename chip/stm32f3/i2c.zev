@@ -14,8 +14,8 @@ pub hi2c.Bus i2c1_init_pb6_pb7_100k(u32 timeout_ms) {
     hw.RCC.apb1rstr = hw.RCC.apb1rstr & (~hw.RCC_APB1_I2C1);
 
     // PB6 = I2C1_SCL, PB7 = I2C1_SDA (AF4 open-drain pull-up); let weak internal PU charge before PE=1.
-    cgpio.config_af(cgpio.PORT_B, 6u32, cgpio.PUPD_UP, true, 4u32);
-    cgpio.config_af(cgpio.PORT_B, 7u32, cgpio.PUPD_UP, true, 4u32);
+    cgpio.gpio_config_af(cgpio.PORT_B, 6u32, cgpio.PUPD_UP, true, 4u32);
+    cgpio.gpio_config_af(cgpio.PORT_B, 7u32, cgpio.PUPD_UP, true, 4u32);
     htime.spin_us(30u32);
 
     hw.I2C1.cr1 = 0u32;
@@ -24,7 +24,7 @@ pub hi2c.Bus i2c1_init_pb6_pb7_100k(u32 timeout_ms) {
     hw.I2C1.icr = 0x3F38u32;
     hw.I2C1.cr1 = 1u32; // PE = 1
     htime.spin_us(10u32);
-    return hi2c.make_bus(1u8, timeout_ms, false);
+    return hi2c.make_bus(1u8, timeout_ms);
 }
 
 pub bool i2c1_bus_idle() {

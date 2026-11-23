@@ -1,40 +1,114 @@
 // Portable HAL digital GPIO interface (host/sim target)
 
+pub enum Mode {
+    Input  = 0,
+    Output = 1,
+    Analog = 2,
+}
+
+pub enum Pull {
+    None = 0,
+    Up   = 1,
+    Down = 2,
+}
+
+mmio SimGpioRegs {
+    @rw [4]u32 odr   @ 0x00;
+    @rw [4]u32 idr   @ 0x10;
+    @rw [4]u32 moder @ 0x20;
+    @rw [4]u32 pupdr @ 0x30;
+}
+
+mmio SIM_GPIO : SimGpioRegs @ 0x5F00_0000;
+
 pub struct Pin {
     u8   port;
     u8   pin;
     bool active_low;
-    bool sim_high;
 }
 
-pub Pin make_pin(u8 port, u8 pin, bool active_low, bool initial_high) {
+pub Pin make_pin(u8 port, u8 pin, bool active_low) {
     return Pin {
         port: port,
         pin: pin,
         active_low: active_low,
-        sim_high: initial_high,
     };
 }
 
-pub bool read(*Pin p) {
-    if (p.active_low) {
-        return !p.sim_high;
+u32 mode_bits(Mode m) {
+    switch (m) {
+        Mode.Input  => { return 0u32; }
+        Mode.Output => { return 1u32; }
+        Mode.Analog => { return 3u32; }
     }
-    return p.sim_high;
 }
 
-pub fn write(*Pin p, bool high) {
-    p.sim_high = high;
+u32 pull_bits(Pull p) {
+    switch (p) {
+        Pull.None => { return 0u32; }
+        Pull.Up   => { return 1u32; }
+        Pull.Down => { return 2u32; }
+    }
 }
 
-pub fn set_high(*Pin p) {
-    p.sim_high = true;
-}
+impl Pin {
+    pub fn set_mode(self, Mode mode, Pull pull) {
+        if (self.port >= 4u8 || self.pin >= 16u8) {
+            return;
+        }
+        usize p = self.port as usize;
+        u32 sh = (self.pin as u32) * 2u32;
+        u32 mask = 3u32 << sh;
+        SIM_GPIO.moder[p] = (SIM_GPIO.moder[p] & (~mask)) | (mode_bits(mode) << sh);
+        SIM_GPIO.pupdr[p] = (SIM_GPIO.pupdr[p] & (~mask)) | (pull_bits(pull) << sh);
+    }
 
-pub fn set_low(*Pin p) {
-    p.sim_high = false;
-}
+    pub bool read(self) {
+        if (self.port >= 4u8 || self.pin >= 16u8) {
+            return self.active_low;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        bool raw = (SIM_GPIO.idr[self.port as usize] & bit) != 0u32;
+        if (self.active_low) {
+            return !raw;
+        }
+        return raw;
+    }
 
-pub fn toggle(*Pin p) {
-    p.sim_high = !p.sim_high;
+    pub fn write(self, bool high) {
+        if (self.port >= 4u8 || self.pin >= 16u8) {
+            return;
+        }
+        bool hw_lvl = high;
+        if (self.active_low) {
+            hw_lvl = !high;
+        }
+        usize p = self.port as usize;
+        u32 bit = 1u32 << (self.pin as u32);
+        if (hw_lvl) {
+            SIM_GPIO.odr[p] = SIM_GPIO.odr[p] | bit;
+            SIM_GPIO.idr[p] = SIM_GPIO.idr[p] | bit;
+        } else {
+            SIM_GPIO.odr[p] = SIM_GPIO.odr[p] & (~bit);
+            SIM_GPIO.idr[p] = SIM_GPIO.idr[p] & (~bit);
+        }
+    }
+
+    pub fn set_high(self) {
+        self.write(true);
+    }
+
+    pub fn set_low(self) {
+        self.write(false);
+    }
+
+    pub fn toggle(self) {
+        if (self.port >= 4u8 || self.pin >= 16u8) {
+            return;
+        }
+        usize p = self.port as usize;
+        u32 bit = 1u32 << (self.pin as u32);
+        SIM_GPIO.odr[p] = SIM_GPIO.odr[p] ^ bit;
+        SIM_GPIO.idr[p] = SIM_GPIO.idr[p] ^ bit;
+    }
 }

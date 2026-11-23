@@ -831,6 +831,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                 });
             }
             ItemKind::Import(_)
+            | ItemKind::Impl(_)
             | ItemKind::Enum(_)
             | ItemKind::Struct(_)
             | ItemKind::Mmio(_)
@@ -4352,6 +4353,25 @@ impl<'a> DirectLowerCtx<'a> {
                     },
                     sig.params[idx].clone(),
                 ),
+                (MirType::Array { elem, len }, Some(MirType::Slice(_)), _)
+                    if is_rodata_const_mir_expr(&me) =>
+                {
+                    let e_ty = *elem.clone();
+                    let n = *len;
+                    MirExpr::new(
+                        MirExprKind::SubSlice {
+                            base: Box::new(me),
+                            start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                            end: Box::new(MirExpr::new(
+                                MirExprKind::IntLit(n as i128),
+                                MirType::Usize,
+                            )),
+                            elem_ty: e_ty,
+                            base_is_array: true,
+                        },
+                        sig.params[idx].clone(),
+                    )
+                }
                 (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
                 _ => me,
             };
@@ -7464,6 +7484,25 @@ impl<'a> CoroutineLowerCtx<'a> {
                 param_ty.clone(),
             );
         }
+        if let (MirType::Array { elem, len }, MirType::Slice(_)) = (&arg.ty, param_ty) {
+            if is_rodata_const_mir_expr(&arg) {
+                let e_ty = *elem.clone();
+                let n = *len;
+                return MirExpr::new(
+                    MirExprKind::SubSlice {
+                        base: Box::new(arg),
+                        start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                        end: Box::new(MirExpr::new(
+                            MirExprKind::IntLit(n as i128),
+                            MirType::Usize,
+                        )),
+                        elem_ty: e_ty,
+                        base_is_array: true,
+                    },
+                    param_ty.clone(),
+                );
+            }
+        }
         coerce_expr_if_needed(arg, param_ty)
     }
 
@@ -8229,6 +8268,23 @@ fn consume_moved_lease_be<B: LowerBackend>(expr: MirExpr, be: &mut B) -> MirExpr
     MirExpr::new(MirExprKind::Var(tmp), ty)
 }
 
+fn is_rodata_const_mir_expr(expr: &MirExpr) -> bool {
+    match &expr.kind {
+        MirExprKind::ConstRef(_) => true,
+        MirExprKind::FieldAccess {
+            base,
+            is_ptr: false,
+            ..
+        }
+        | MirExprKind::Index {
+            base,
+            is_slice: false,
+            ..
+        } => is_rodata_const_mir_expr(base),
+        _ => false,
+    }
+}
+
 fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
     if &expr.ty == target_ty || target_ty.is_void() {
         return expr;
@@ -8268,6 +8324,25 @@ fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
                     ptr: Box::new(expr),
                     cap,
                     kind: MirPrimViewKind::Inbox { elem: elem.clone() },
+                },
+                target_ty.clone(),
+            );
+        }
+        (MirType::Array { elem, len }, MirType::Slice(_))
+            if is_rodata_const_mir_expr(&expr) =>
+        {
+            let e_ty = *elem.clone();
+            let n = *len;
+            return MirExpr::new(
+                MirExprKind::SubSlice {
+                    base: Box::new(expr),
+                    start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                    end: Box::new(MirExpr::new(
+                        MirExprKind::IntLit(n as i128),
+                        MirType::Usize,
+                    )),
+                    elem_ty: e_ty,
+                    base_is_array: true,
                 },
                 target_ty.clone(),
             );
@@ -8664,13 +8739,16 @@ fn lower_common_expr<B: LowerBackend>(
                 ));
             }
             let base = unwrap_ok_result_expr(be.lower_sub(target, None)?);
-            let elem_ty = match &base.ty {
-                MirType::Slice(inner) => *inner.clone(),
-                MirType::Array { elem, .. } => *elem.clone(),
-                _ => MirType::U8,
+            let (elem_ty, array_len) = match &base.ty {
+                MirType::Slice(inner) => (*inner.clone(), None),
+                MirType::Array { elem, len } => (*elem.clone(), Some(*len)),
+                _ => (MirType::U8, None),
             };
+            let base_is_array = array_len.is_some();
             let e = if let Some(ee) = end {
                 be.lower_sub(ee, Some(&MirType::Usize))?
+            } else if let Some(len) = array_len {
+                MirExpr::new(MirExprKind::IntLit(len as i128), MirType::Usize)
             } else {
                 MirExpr::new(MirExprKind::SliceLen(Box::new(base.clone())), MirType::Usize)
             };
@@ -8680,7 +8758,7 @@ fn lower_common_expr<B: LowerBackend>(
                     start: Box::new(s),
                     end: Box::new(e),
                     elem_ty: elem_ty.clone(),
-                    base_is_array: false,
+                    base_is_array,
                 },
                 MirType::Slice(Box::new(elem_ty)),
             ))

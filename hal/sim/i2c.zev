@@ -2,59 +2,67 @@
 
 import std.bus as bus;
 
-pub struct Bus {
-    u8   unit;
-    u32  timeout_ms;
-    bool sim_ack;
+mmio SimI2cRegs {
+    @rw u32 ack_mask @ 0x00;
+    @rw u32 rx_seed  @ 0x04;
 }
 
-pub Bus make_bus(u8 unit, u32 timeout_ms, bool sim_ack) {
+mmio SIM_I2C : SimI2cRegs @ 0x5F00_0200;
+
+pub struct Bus {
+    u8  unit;
+    u32 timeout_ms;
+}
+
+pub Bus make_bus(u8 unit, u32 timeout_ms) {
     return Bus {
         unit: unit,
         timeout_ms: timeout_ms,
-        sim_ack: sim_ack,
     };
 }
 
-pub bool probe_7bit(*Bus b, u8 addr7) error bus.BusStatus {
-    checkpoint();
-    if (addr7 > 127u8 || b.unit == 0u8) {
-        error bus.BusStatus.FrameErr;
+impl Bus {
+    pub bool probe_7bit(self, u8 addr7) error bus.BusStatus {
+        checkpoint();
+        if (addr7 > 127u8 || self.unit == 0u8) {
+            error bus.BusStatus.FrameErr;
+        }
+        return (SIM_I2C.ack_mask & 1u32) != 0u32;
     }
-    return b.sim_ack;
-}
 
-pub fn write(*Bus b, u8 addr7, []u8 data) error bus.BusStatus {
-    checkpoint();
-    if (b.unit == 0u8 || addr7 > 127u8 || data.len > 255) {
-        error bus.BusStatus.FrameErr;
+    pub fn write(self, u8 addr7, []u8 data) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8 || addr7 > 127u8 || data.len > 255) {
+            error bus.BusStatus.FrameErr;
+        }
+        if ((SIM_I2C.ack_mask & 1u32) == 0u32) {
+            error bus.BusStatus.FrameErr;
+        }
+        return;
     }
-    if (!b.sim_ack) {
-        error bus.BusStatus.FrameErr;
-    }
-    return;
-}
 
-pub fn read(*Bus b, u8 addr7, []u8 dst) error bus.BusStatus {
-    checkpoint();
-    if (b.unit == 0u8 || addr7 > 127u8 || dst.len > 255) {
-        error bus.BusStatus.FrameErr;
+    pub fn read(self, u8 addr7, []u8 dst) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8 || addr7 > 127u8 || dst.len > 255) {
+            error bus.BusStatus.FrameErr;
+        }
+        if ((SIM_I2C.ack_mask & 1u32) == 0u32) {
+            error bus.BusStatus.FrameErr;
+        }
+        u8 fill = (SIM_I2C.rx_seed & 0xFFu32) as u8;
+        for (usize i in 0..dst.len) {
+            dst[i] = fill;
+        }
+        return;
     }
-    if (!b.sim_ack) {
-        error bus.BusStatus.FrameErr;
-    }
-    for (usize i in 0..dst.len) {
-        dst[i] = 0u8;
-    }
-    return;
-}
 
-pub fn write_read(*Bus b, u8 addr7, []u8 tx, []u8 rx) error bus.BusStatus {
-    write(b, addr7, tx) catch (bus.BusStatus err) {
-        error err;
-    };
-    read(b, addr7, rx) catch (bus.BusStatus err) {
-        error err;
-    };
-    return;
+    pub fn write_read(self, u8 addr7, []u8 tx, []u8 rx) error bus.BusStatus {
+        self.write(addr7, tx) catch (bus.BusStatus err) {
+            error err;
+        };
+        self.read(addr7, rx) catch (bus.BusStatus err) {
+            error err;
+        };
+        return;
+    }
 }

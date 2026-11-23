@@ -22,88 +22,90 @@ pub Channel make_channel(u8 kind, u8 unit, u8 ch, u32 period, u16 duty_permil) {
     };
 }
 
-pub fn set_duty_permil(*Channel c, u16 permil) {
-    u16 d = math.clamp<u16>(permil, 0u16, 1000u16);
-    c.duty_permil = d;
+impl Channel {
+    pub fn set_duty_permil(*self, u16 permil) {
+        u16 d = math.clamp<u16>(permil, 0u16, 1000u16);
+        self.duty_permil = d;
 
-    if (c.kind == 0u8) {
-        u32 per = c.period;
-        if (per == 0u32) {
-            if (c.unit == 1u8) {
-                per = hw.TIM1.arr + 1u32;
-            } else if (c.unit == 2u8) {
-                per = hw.TIM2.arr + 1u32;
+        if (self.kind == 0u8) {
+            u32 per = self.period;
+            if (per == 0u32) {
+                if (self.unit == 1u8) {
+                    per = hw.TIM1.arr + 1u32;
+                } else if (self.unit == 2u8) {
+                    per = hw.TIM2.arr + 1u32;
+                }
             }
-        }
-        u32 ccr = (((per as u64) * (d as u64)) / 1000u64) as u32;
-        if (c.unit == 1u8 && c.ch == 0u8) {
-            hw.TIM1.ccr1 = ccr;
-        } else if (c.unit == 2u8 && c.ch == 0u8) {
-            hw.TIM2.ccr1 = ccr;
-        }
-        return;
-    }
-
-    if (c.kind == 1u8 && c.unit == 0u8) {
-        u32 per = c.period;
-        if (per < 96u32) {
-            per = hw.HRTIM1_TIMA.per & 0xFFFFu32;
-        }
-        if (per < 96u32) {
+            u32 ccr = (((per as u64) * (d as u64)) / 1000u64) as u32;
+            if (self.unit == 1u8 && self.ch == 0u8) {
+                hw.TIM1.ccr1 = ccr;
+            } else if (self.unit == 2u8 && self.ch == 0u8) {
+                hw.TIM2.ccr1 = ccr;
+            }
             return;
         }
-        u32 cmp = (((per as u64) * (d as u64)) / 1000u64) as u32;
-        u32 min_cmp = 48u32;
-        if (per >= 192u32) {
-            min_cmp = 96u32;
-        }
-        if (cmp < min_cmp) {
-            cmp = min_cmp;
-        }
-        if (cmp > (per - min_cmp)) {
-            cmp = per - min_cmp;
-        }
-        hw.HRTIM1_TIMA.cmp1r = cmp;
-        hw.HRTIM1_COMMON.cr2 = 1u32 << 1; // TASWU: latch preloaded CMP1R
-    }
-}
 
-pub fn set_duty_u16(*Channel c, u16 duty) {
-    u32 pm = (((duty as u32) * 1000u32) + 32767u32) / 65535u32;
-    set_duty_permil(c, math.clamp<u32>(pm, 0u32, 1000u32) as u16);
-}
-
-pub fn enable(*Channel c, bool on) {
-    if (c.kind == 0u8) {
-        if (c.unit == 1u8) {
-            if (on) {
-                hw.TIM1.ccer = hw.TIM1.ccer | 1u32;
-                hw.TIM1.bdtr = hw.TIM1.bdtr | (1u32 << 15);
-                hw.TIM1.cr1 = hw.TIM1.cr1 | 1u32;
-            } else {
-                hw.TIM1.bdtr = hw.TIM1.bdtr & (~(1u32 << 15));
-                hw.TIM1.ccer = hw.TIM1.ccer & (~1u32);
-                hw.TIM1.cr1 = hw.TIM1.cr1 & (~1u32);
+        if (self.kind == 1u8 && self.unit == 0u8) {
+            u32 per = self.period;
+            if (per < 96u32) {
+                per = hw.HRTIM1_TIMA.per & 0xFFFFu32;
             }
-        } else if (c.unit == 2u8) {
-            if (on) {
-                hw.TIM2.ccer = hw.TIM2.ccer | 1u32;
-                hw.TIM2.cr1 = hw.TIM2.cr1 | 1u32;
-            } else {
-                hw.TIM2.ccer = hw.TIM2.ccer & (~1u32);
-                hw.TIM2.cr1 = hw.TIM2.cr1 & (~1u32);
+            if (per < 96u32) {
+                return;
             }
+            u32 cmp = (((per as u64) * (d as u64)) / 1000u64) as u32;
+            u32 min_cmp = 48u32;
+            if (per >= 192u32) {
+                min_cmp = 96u32;
+            }
+            if (cmp < min_cmp) {
+                cmp = min_cmp;
+            }
+            if (cmp > (per - min_cmp)) {
+                cmp = per - min_cmp;
+            }
+            hw.HRTIM1_TIMA.cmp1r = cmp;
+            hw.HRTIM1_COMMON.cr2 = 1u32 << 1; // TASWU: latch preloaded CMP1R
         }
-        return;
     }
 
-    if (c.kind == 1u8 && c.unit == 0u8) {
-        if (on) {
-            hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr | (1u32 << 17);
-            hw.HRTIM1_COMMON.oenr = hw.HRTIM1_COMMON.oenr | 1u32;
-        } else {
-            hw.HRTIM1_COMMON.odisr = 1u32;
-            hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr & (~(1u32 << 17));
+    pub fn set_duty_u16(*self, u16 duty) {
+        u32 pm = (((duty as u32) * 1000u32) + 32767u32) / 65535u32;
+        self.set_duty_permil(math.clamp<u32>(pm, 0u32, 1000u32) as u16);
+    }
+
+    pub fn enable(*self, bool on) {
+        if (self.kind == 0u8) {
+            if (self.unit == 1u8) {
+                if (on) {
+                    hw.TIM1.ccer = hw.TIM1.ccer | 1u32;
+                    hw.TIM1.bdtr = hw.TIM1.bdtr | (1u32 << 15);
+                    hw.TIM1.cr1 = hw.TIM1.cr1 | 1u32;
+                } else {
+                    hw.TIM1.bdtr = hw.TIM1.bdtr & (~(1u32 << 15));
+                    hw.TIM1.ccer = hw.TIM1.ccer & (~1u32);
+                    hw.TIM1.cr1 = hw.TIM1.cr1 & (~1u32);
+                }
+            } else if (self.unit == 2u8) {
+                if (on) {
+                    hw.TIM2.ccer = hw.TIM2.ccer | 1u32;
+                    hw.TIM2.cr1 = hw.TIM2.cr1 | 1u32;
+                } else {
+                    hw.TIM2.ccer = hw.TIM2.ccer & (~1u32);
+                    hw.TIM2.cr1 = hw.TIM2.cr1 & (~1u32);
+                }
+            }
+            return;
+        }
+
+        if (self.kind == 1u8 && self.unit == 0u8) {
+            if (on) {
+                hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr | (1u32 << 17);
+                hw.HRTIM1_COMMON.oenr = hw.HRTIM1_COMMON.oenr | 1u32;
+            } else {
+                hw.HRTIM1_COMMON.odisr = 1u32;
+                hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr & (~(1u32 << 17));
+            }
         }
     }
 }

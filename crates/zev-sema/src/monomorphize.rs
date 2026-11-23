@@ -16,10 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use zev_ast::{
     ArrayLen, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, CatchParam, ConstDecl,
     ErrorSpec, Expr, ExprKind, FieldInit, FnDecl, FormatPart, GenericArg, GenericParam,
-    GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal, MmioDecl,
-    MmioDeclKind, MmioRegDecl, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType, Program,
-    SpawnStmt, Span, Stmt, StmtKind, StructDecl, StructField, SwitchArm, SwitchPat, TaskDecl,
-    TypeExpr, TypeKind, UnaryOp,
+    GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal,
+    MethodDecl, MmioDecl, MmioDeclKind, MmioRegDecl, OsPrimitiveDecl, OsPrimitiveType, Param,
+    PrimType, Program, SelfReceiver, SpawnStmt, Span, Stmt, StmtKind, StructDecl, StructField,
+    SwitchArm, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
 };
 
 use crate::diag::{Diagnostic, DiagnosticKind};
@@ -130,6 +130,26 @@ struct PendingFnBody {
     child_env: SubstEnv,
 }
 
+#[derive(Clone, Debug)]
+struct ConcreteMethodInfo {
+    fn_name: String,
+    receiver: Option<SelfReceiver>,
+    ret_ty: TypeExpr,
+    is_pub: bool,
+    owner_scope: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct GenericImplMethodEntry {
+    impl_generic_params: Vec<GenericParam>,
+    target_generic_args: Vec<GenericArg>,
+    method: MethodDecl,
+    prog_idx: usize,
+    owner_scope: Option<usize>,
+    file: Option<String>,
+    pattern_key: String,
+}
+
 struct Monomorphizer<'a> {
     inputs: &'a [(&'a Program, Option<&'a str>)],
     raw_consts: BTreeMap<String, (Expr, Option<String>)>,
@@ -146,6 +166,8 @@ struct Monomorphizer<'a> {
     non_generic_fn_rets: BTreeMap<String, TypeExpr>,
     struct_templates: BTreeMap<String, TemplateEntry<StructDecl>>,
     fn_templates: BTreeMap<String, TemplateEntry<FnDecl>>,
+    concrete_methods: BTreeMap<(String, String), ConcreteMethodInfo>,
+    generic_impl_methods: BTreeMap<String, Vec<GenericImplMethodEntry>>,
     /// Mangled struct name -> human signature (`"FixedVec__u32__16" -> "FixedVec<u32, 16>"`).
     human_type_names: BTreeMap<String, String>,
     /// Mangled struct name -> `(template_name, resolved_args)` for call-site generic inference (`*FixedVec<T, N>`).
@@ -184,6 +206,8 @@ impl<'a> Monomorphizer<'a> {
             non_generic_fn_rets: BTreeMap::new(),
             struct_templates: BTreeMap::new(),
             fn_templates: BTreeMap::new(),
+            concrete_methods: BTreeMap::new(),
+            generic_impl_methods: BTreeMap::new(),
             human_type_names: BTreeMap::new(),
             instantiated_struct_args: BTreeMap::new(),
             instantiated_structs: BTreeSet::new(),
@@ -431,6 +455,215 @@ impl<'a> Monomorphizer<'a> {
             }
         }
 
+        // Pass 1.6: Collect concrete and generic `impl` method signatures before Pass 2 body rewriting.
+        let mut concrete_impl_fns_by_prog: Vec<Vec<(Span, FnDecl, TypeExpr)>> =
+            vec![Vec::new(); self.inputs.len()];
+        for (prog_idx, (prog, file_opt)) in self.inputs.iter().enumerate() {
+            let file = file_opt.map(str::to_string);
+            let owner_scope = if prog_idx < self.non_root_prog_count {
+                Some(prog_idx)
+            } else {
+                None
+            };
+            let env = SubstEnv {
+                types: BTreeMap::new(),
+                consts: BTreeMap::new(),
+                depth: 0,
+                prog_idx,
+                file: file.clone(),
+            };
+            for item in &prog.items {
+                let ItemKind::Impl(imp) = &item.kind else {
+                    continue;
+                };
+                if imp.generic_params.is_empty() && imp.target_generic_args.is_empty() {
+                    if !self.known_structs.contains_key(&imp.target_name.name) {
+                        let diag = if self.struct_templates.contains_key(&imp.target_name.name) {
+                            Diagnostic::new(
+                                DiagnosticKind::GenericInstantiationError,
+                                imp.target_name.span,
+                                format!(
+                                    "missing generic arguments `<...>` for `impl` on generic struct '{}'",
+                                    imp.target_name.name
+                                ),
+                            )
+                        } else {
+                            Diagnostic::new(
+                                DiagnosticKind::UndefinedSymbol,
+                                imp.target_name.span,
+                                format!(
+                                    "cannot find struct '{}' for `impl` block",
+                                    imp.target_name.name
+                                ),
+                            )
+                        };
+                        self.emit(&file, diag);
+                        continue;
+                    }
+                    for m in &imp.methods {
+                        let key = (imp.target_name.name.clone(), m.func.name.name.clone());
+                        if self.concrete_methods.contains_key(&key) {
+                            self.emit(
+                                &file,
+                                Diagnostic::new(
+                                    DiagnosticKind::DuplicateDefinition,
+                                    m.func.name.span,
+                                    format!(
+                                        "duplicate method '{}' in `impl {}`",
+                                        m.func.name.name, imp.target_name.name
+                                    ),
+                                ),
+                            );
+                            continue;
+                        }
+                        let fn_name = format!("{}__{}", imp.target_name.name, m.func.name.name);
+                        if self.non_generic_fn_rets.contains_key(&fn_name)
+                            || self.fn_templates.contains_key(&fn_name)
+                        {
+                            self.emit(
+                                &file,
+                                Diagnostic::new(
+                                    DiagnosticKind::DuplicateDefinition,
+                                    m.func.name.span,
+                                    format!(
+                                        "method '{}' in `impl {}` collides with top-level function '{}'",
+                                        m.func.name.name, imp.target_name.name, fn_name
+                                    ),
+                                ),
+                            );
+                            continue;
+                        }
+                        let ret_ty = self.rewrite_type_expr(&m.func.ret_type, &env);
+                        let mut params = Vec::with_capacity(
+                            m.func.params.len() + usize::from(m.receiver.is_some()),
+                        );
+                        if let Some(recv) = m.receiver {
+                            let target_ty = TypeExpr::new(
+                                TypeKind::Named(imp.target_name.clone()),
+                                imp.target_name.span,
+                            );
+                            let self_ty = match recv {
+                                SelfReceiver::Value => target_ty,
+                                SelfReceiver::Ptr => {
+                                    TypeExpr::new(TypeKind::Ptr(Box::new(target_ty)), m.span)
+                                }
+                            };
+                            params.push(Param {
+                                ty: self_ty,
+                                name: Ident::new("self".to_string(), m.span),
+                                span: m.span,
+                            });
+                        }
+                        params.extend(m.func.params.iter().cloned());
+                        let synth_fn = FnDecl {
+                            attrs: m.func.attrs.clone(),
+                            is_extern_c: false,
+                            name: Ident::new(fn_name.clone(), m.func.name.span),
+                            generic_params: Vec::new(),
+                            params,
+                            is_variadic: false,
+                            ret_type: m.func.ret_type.clone(),
+                            error_spec: m.func.error_spec.clone(),
+                            body: m.func.body.clone(),
+                            span: m.func.span,
+                        };
+                        self.concrete_methods.insert(
+                            key,
+                            ConcreteMethodInfo {
+                                fn_name: fn_name.clone(),
+                                receiver: m.receiver,
+                                ret_ty: ret_ty.clone(),
+                                is_pub: m.is_pub,
+                                owner_scope,
+                            },
+                        );
+                        self.non_generic_fn_rets.insert(fn_name, ret_ty.clone());
+                        concrete_impl_fns_by_prog[prog_idx].push((m.span, synth_fn, ret_ty));
+                    }
+                } else {
+                    self.validate_generic_params(&imp.target_name.name, &imp.generic_params, &file);
+                    let Some(tmpl) = self.struct_templates.get(&imp.target_name.name).cloned() else {
+                        let msg = if self.known_structs.contains_key(&imp.target_name.name) {
+                            format!(
+                                "struct '{}' is not generic (expected 0 target generic arguments)",
+                                imp.target_name.name
+                            )
+                        } else {
+                            format!("unknown generic struct '{}' in `impl`", imp.target_name.name)
+                        };
+                        self.emit(
+                            &file,
+                            Diagnostic::new(
+                                DiagnosticKind::GenericInstantiationError,
+                                imp.target_name.span,
+                                msg,
+                            ),
+                        );
+                        continue;
+                    };
+                    if imp.target_generic_args.len() != tmpl.decl.generic_params.len() {
+                        self.emit(
+                            &file,
+                            Diagnostic::new(
+                                DiagnosticKind::GenericInstantiationError,
+                                imp.target_name.span,
+                                format!(
+                                    "`impl {}` expects {} target generic argument(s), found {}",
+                                    imp.target_name.name,
+                                    tmpl.decl.generic_params.len(),
+                                    imp.target_generic_args.len()
+                                ),
+                            ),
+                        );
+                        continue;
+                    }
+                    let pattern_key = self.compute_impl_pattern_key(
+                        &imp.generic_params,
+                        &imp.target_generic_args,
+                        &tmpl.decl.generic_params,
+                        &env,
+                    );
+                    for m in &imp.methods {
+                        let dup = self
+                            .generic_impl_methods
+                            .get(&imp.target_name.name)
+                            .is_some_and(|entries| {
+                                entries.iter().any(|e| {
+                                    e.method.func.name.name == m.func.name.name
+                                        && e.pattern_key == pattern_key
+                                })
+                            });
+                        if dup {
+                            self.emit(
+                                &file,
+                                Diagnostic::new(
+                                    DiagnosticKind::DuplicateDefinition,
+                                    m.func.name.span,
+                                    format!(
+                                        "duplicate method '{}' for identical specialization in `impl {}`",
+                                        m.func.name.name, imp.target_name.name
+                                    ),
+                                ),
+                            );
+                            continue;
+                        }
+                        self.generic_impl_methods
+                            .entry(imp.target_name.name.clone())
+                            .or_default()
+                            .push(GenericImplMethodEntry {
+                                impl_generic_params: imp.generic_params.clone(),
+                                target_generic_args: imp.target_generic_args.clone(),
+                                method: m.clone(),
+                                prog_idx,
+                                owner_scope,
+                                file: file.clone(),
+                                pattern_key: pattern_key.clone(),
+                            });
+                    }
+                }
+            }
+        }
+
         // Pass 2: Rewrite all concrete items in each input `Program` (stripping generic templates).
         let mut rewritten_items_by_prog: Vec<Vec<Item>> = Vec::with_capacity(self.inputs.len());
         for (prog_idx, (prog, file_opt)) in self.inputs.iter().enumerate() {
@@ -446,6 +679,10 @@ impl<'a> Monomorphizer<'a> {
                 match &item.kind {
                     ItemKind::Import(_) | ItemKind::Enum(_) => {
                         out_items.push(item.clone());
+                    }
+                    ItemKind::Impl(_) => {
+                        // Desugared into concrete `FnDecl` items below or instantiated lazily on demand.
+                        continue;
                     }
                     ItemKind::Mmio(mm) => {
                         let mut scopes = vec![BTreeMap::new()];
@@ -658,6 +895,15 @@ impl<'a> Monomorphizer<'a> {
                         });
                     }
                 }
+            }
+            for (m_span, m_fn, m_ret) in std::mem::take(&mut concrete_impl_fns_by_prog[prog_idx]) {
+                let rewritten_fn = self.rewrite_fn_decl(&m_fn, Some(m_ret), &env);
+                out_items.push(Item {
+                    attrs: rewritten_fn.attrs.clone(),
+                    is_pub: false,
+                    kind: ItemKind::Fn(rewritten_fn),
+                    span: m_span,
+                });
             }
             rewritten_items_by_prog.push(out_items);
         }
@@ -1652,6 +1898,588 @@ impl<'a> Monomorphizer<'a> {
         Some((mangled, ret_type))
     }
 
+    fn compute_impl_pattern_key(
+        &self,
+        impl_generics: &[GenericParam],
+        target_args: &[GenericArg],
+        struct_generics: &[GenericParam],
+        env: &SubstEnv,
+    ) -> String {
+        let mut t_idx = BTreeMap::new();
+        let mut c_idx = BTreeMap::new();
+        for (idx, gp) in impl_generics.iter().enumerate() {
+            match gp.kind {
+                GenericParamKind::Type => {
+                    t_idx.insert(gp.name.name.as_str(), idx);
+                }
+                GenericParamKind::ConstUsize => {
+                    c_idx.insert(gp.name.name.as_str(), idx);
+                }
+            }
+        }
+        let mut parts = Vec::with_capacity(target_args.len());
+        for (i, arg) in target_args.iter().enumerate() {
+            let is_const_slot = struct_generics
+                .get(i)
+                .is_some_and(|gp| gp.kind == GenericParamKind::ConstUsize);
+            if is_const_slot {
+                let bound_name = match arg {
+                    GenericArg::Type(TypeExpr {
+                        kind: TypeKind::Named(id),
+                        ..
+                    })
+                    | GenericArg::Const(Expr {
+                        kind: ExprKind::Ident(id),
+                        ..
+                    }) => c_idx.get(id.name.as_str()).copied(),
+                    _ => None,
+                };
+                if let Some(ci) = bound_name {
+                    parts.push(format!("#C{ci}"));
+                } else {
+                    let expr = match arg {
+                        GenericArg::Const(e) => Some(e.clone()),
+                        GenericArg::Type(TypeExpr {
+                            kind: TypeKind::Named(id),
+                            span,
+                        }) => Some(Expr::new(ExprKind::Ident(id.clone()), *span)),
+                        _ => None,
+                    };
+                    if let Some(n) = expr.and_then(|e| self.eval_usize_in_env(&e, env)) {
+                        parts.push(format!("K{n}"));
+                    } else {
+                        parts.push(format!("{arg:?}"));
+                    }
+                }
+            } else {
+                parts.push(Self::pattern_type_key(arg, &t_idx, &c_idx));
+            }
+        }
+        parts.join(",")
+    }
+
+    fn pattern_type_key(
+        arg: &GenericArg,
+        t_idx: &BTreeMap<&str, usize>,
+        c_idx: &BTreeMap<&str, usize>,
+    ) -> String {
+        fn norm_ty(
+            te: &TypeExpr,
+            t_idx: &BTreeMap<&str, usize>,
+            c_idx: &BTreeMap<&str, usize>,
+        ) -> String {
+            match &te.kind {
+                TypeKind::Prim(p) => p.as_str().to_string(),
+                TypeKind::Named(id) => {
+                    if let Some(ti) = t_idx.get(id.name.as_str()) {
+                        format!("#T{ti}")
+                    } else {
+                        id.name.clone()
+                    }
+                }
+                TypeKind::Path(segs) => segs
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+                TypeKind::Ptr(inner) => format!("*{}", norm_ty(inner, t_idx, c_idx)),
+                TypeKind::Slice(inner) => format!("[]{}", norm_ty(inner, t_idx, c_idx)),
+                TypeKind::Lease(inner) => format!("Lease<{}>", norm_ty(inner, t_idx, c_idx)),
+                TypeKind::Array { elem, len } => {
+                    let lstr = match len {
+                        ArrayLen::Fixed(n) => n.to_string(),
+                        ArrayLen::Expr(e) => {
+                            if let ExprKind::Ident(id) = &e.kind {
+                                if let Some(ci) = c_idx.get(id.name.as_str()) {
+                                    format!("#C{ci}")
+                                } else {
+                                    format!("{e:?}")
+                                }
+                            } else {
+                                format!("{e:?}")
+                            }
+                        }
+                    };
+                    format!("[{lstr}]{}", norm_ty(elem, t_idx, c_idx))
+                }
+                TypeKind::Generic { base, args } => {
+                    let gs: Vec<String> = args
+                        .iter()
+                        .map(|a| match a {
+                            GenericArg::Type(t) => norm_ty(t, t_idx, c_idx),
+                            GenericArg::Const(e) => format!("{e:?}"),
+                        })
+                        .collect();
+                    format!("{}<{}>", base.name, gs.join(","))
+                }
+                other => format!("{other:?}"),
+            }
+        }
+        match arg {
+            GenericArg::Type(te) => norm_ty(te, t_idx, c_idx),
+            GenericArg::Const(e) => format!("{e:?}"),
+        }
+    }
+
+    fn unify_const_arg_pattern(
+        &self,
+        pat_arg: &GenericArg,
+        conc_n: usize,
+        impl_consts: &BTreeSet<String>,
+        bound_consts: &mut BTreeMap<String, usize>,
+        score: &mut usize,
+        tmpl_env: &SubstEnv,
+    ) -> bool {
+        let ident_name = match pat_arg {
+            GenericArg::Type(TypeExpr {
+                kind: TypeKind::Named(id),
+                ..
+            })
+            | GenericArg::Const(Expr {
+                kind: ExprKind::Ident(id),
+                ..
+            }) => Some(id.clone()),
+            _ => None,
+        };
+        if let Some(id) = &ident_name {
+            if impl_consts.contains(&id.name) {
+                if let Some(&prev) = bound_consts.get(&id.name) {
+                    return prev == conc_n;
+                }
+                bound_consts.insert(id.name.clone(), conc_n);
+                return true;
+            }
+        }
+        *score += 10;
+        let eval_expr = match pat_arg {
+            GenericArg::Const(e) => Some(e.clone()),
+            GenericArg::Type(TypeExpr {
+                kind: TypeKind::Named(id),
+                span,
+            }) => Some(Expr::new(ExprKind::Ident(id.clone()), *span)),
+            _ => None,
+        };
+        eval_expr
+            .and_then(|e| self.eval_usize_in_env(&e, tmpl_env))
+            .is_some_and(|v| v == conc_n)
+    }
+
+    fn unify_type_pattern(
+        &self,
+        pat: &TypeExpr,
+        conc: &TypeExpr,
+        impl_types: &BTreeSet<String>,
+        impl_consts: &BTreeSet<String>,
+        bound_types: &mut BTreeMap<String, TypeExpr>,
+        bound_consts: &mut BTreeMap<String, usize>,
+        score: &mut usize,
+        tmpl_env: &SubstEnv,
+    ) -> bool {
+        if let TypeKind::Named(id) = &pat.kind {
+            if impl_types.contains(&id.name) {
+                if let Some(prev) = bound_types.get(&id.name) {
+                    return self.types_structurally_equal_mono(prev, conc);
+                }
+                bound_types.insert(id.name.clone(), conc.clone());
+                return true;
+            }
+        }
+        *score += 10;
+        match (&pat.kind, &conc.kind) {
+            (TypeKind::Prim(a), TypeKind::Prim(b)) => a == b,
+            (TypeKind::Named(a), TypeKind::Named(b)) => a.name == b.name,
+            (TypeKind::Ptr(a), TypeKind::Ptr(b))
+            | (TypeKind::Slice(a), TypeKind::Slice(b))
+            | (TypeKind::Lease(a), TypeKind::Lease(b)) => self.unify_type_pattern(
+                a,
+                b,
+                impl_types,
+                impl_consts,
+                bound_types,
+                bound_consts,
+                score,
+                tmpl_env,
+            ),
+            (
+                TypeKind::Array { elem: ea, len: la },
+                TypeKind::Array { elem: eb, len: lb },
+            ) => {
+                if !self.unify_type_pattern(
+                    ea,
+                    eb,
+                    impl_types,
+                    impl_consts,
+                    bound_types,
+                    bound_consts,
+                    score,
+                    tmpl_env,
+                ) {
+                    return false;
+                }
+                let Some(conc_n) = lb.as_fixed() else {
+                    return false;
+                };
+                match la {
+                    ArrayLen::Fixed(n) => {
+                        *score += 10;
+                        *n == conc_n
+                    }
+                    ArrayLen::Expr(e) => self.unify_const_arg_pattern(
+                        &GenericArg::Const((**e).clone()),
+                        conc_n,
+                        impl_consts,
+                        bound_consts,
+                        score,
+                        tmpl_env,
+                    ),
+                }
+            }
+            (TypeKind::Generic { base, args }, TypeKind::Named(conc_id)) => {
+                let Some((conc_base, conc_args)) = self.instantiated_struct_args.get(&conc_id.name)
+                else {
+                    return false;
+                };
+                if base.name != *conc_base || args.len() != conc_args.len() {
+                    return false;
+                }
+                let Some(st_tmpl) = self.struct_templates.get(conc_base) else {
+                    return false;
+                };
+                for (i, (pa, ca)) in args.iter().zip(conc_args.iter()).enumerate() {
+                    let is_c = st_tmpl
+                        .decl
+                        .generic_params
+                        .get(i)
+                        .is_some_and(|gp| gp.kind == GenericParamKind::ConstUsize);
+                    match (is_c, pa, ca) {
+                        (true, _, ResolvedGenArg::Const(cn)) => {
+                            if !self.unify_const_arg_pattern(
+                                pa,
+                                *cn,
+                                impl_consts,
+                                bound_consts,
+                                score,
+                                tmpl_env,
+                            ) {
+                                return false;
+                            }
+                        }
+                        (false, GenericArg::Type(pt), ResolvedGenArg::Type(ct)) => {
+                            if !self.unify_type_pattern(
+                                pt,
+                                ct,
+                                impl_types,
+                                impl_consts,
+                                bound_types,
+                                bound_consts,
+                                score,
+                                tmpl_env,
+                            ) {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn types_structurally_equal_mono(&self, a: &TypeExpr, b: &TypeExpr) -> bool {
+        match (&a.kind, &b.kind) {
+            (TypeKind::Prim(x), TypeKind::Prim(y)) => x == y,
+            (TypeKind::Named(x), TypeKind::Named(y)) => x.name == y.name,
+            (TypeKind::Path(x), TypeKind::Path(y)) => {
+                x.len() == y.len() && x.iter().zip(y.iter()).all(|(l, r)| l.name == r.name)
+            }
+            (TypeKind::Ptr(x), TypeKind::Ptr(y))
+            | (TypeKind::Slice(x), TypeKind::Slice(y))
+            | (TypeKind::Lease(x), TypeKind::Lease(y)) => {
+                self.types_structurally_equal_mono(x, y)
+            }
+            (
+                TypeKind::Array { elem: ex, len: lx },
+                TypeKind::Array { elem: ey, len: ly },
+            ) => lx == ly && self.types_structurally_equal_mono(ex, ey),
+            _ => false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_generic_method_call(
+        &mut self,
+        base_struct: &str,
+        concrete_struct_name: &str,
+        concrete_args: &[ResolvedGenArg],
+        method_name: &str,
+        call_span: Span,
+        caller_scope: Option<usize>,
+        caller_env: &SubstEnv,
+    ) -> Option<(String, Option<SelfReceiver>, TypeExpr, bool, Option<usize>)> {
+        let candidates = self.generic_impl_methods.get(base_struct)?.clone();
+        let st_tmpl = self.struct_templates.get(base_struct)?.clone();
+
+        let mut matches: Vec<(
+            usize,
+            GenericImplMethodEntry,
+            BTreeMap<String, TypeExpr>,
+            BTreeMap<String, usize>,
+        )> = Vec::new();
+
+        for entry in candidates {
+            if entry.method.func.name.name != method_name {
+                continue;
+            }
+            if entry.target_generic_args.len() != concrete_args.len() {
+                continue;
+            }
+            let impl_types: BTreeSet<String> = entry
+                .impl_generic_params
+                .iter()
+                .filter(|g| g.kind == GenericParamKind::Type)
+                .map(|g| g.name.name.clone())
+                .collect();
+            let impl_consts: BTreeSet<String> = entry
+                .impl_generic_params
+                .iter()
+                .filter(|g| g.kind == GenericParamKind::ConstUsize)
+                .map(|g| g.name.name.clone())
+                .collect();
+
+            let mut bound_types = BTreeMap::new();
+            let mut bound_consts = BTreeMap::new();
+            let mut score = 0usize;
+            let mut ok = true;
+            let tmpl_env = SubstEnv {
+                types: BTreeMap::new(),
+                consts: BTreeMap::new(),
+                depth: 0,
+                prog_idx: entry.prog_idx,
+                file: entry.file.clone(),
+            };
+
+            for (i, (pat_arg, conc_arg)) in entry
+                .target_generic_args
+                .iter()
+                .zip(concrete_args.iter())
+                .enumerate()
+            {
+                let is_const = st_tmpl
+                    .decl
+                    .generic_params
+                    .get(i)
+                    .is_some_and(|gp| gp.kind == GenericParamKind::ConstUsize);
+                match (is_const, pat_arg, conc_arg) {
+                    (true, _, ResolvedGenArg::Const(cn)) => {
+                        if !self.unify_const_arg_pattern(
+                            pat_arg,
+                            *cn,
+                            &impl_consts,
+                            &mut bound_consts,
+                            &mut score,
+                            &tmpl_env,
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    (false, GenericArg::Type(pat_ty), ResolvedGenArg::Type(conc_ty)) => {
+                        if !self.unify_type_pattern(
+                            pat_ty,
+                            conc_ty,
+                            &impl_types,
+                            &impl_consts,
+                            &mut bound_types,
+                            &mut bound_consts,
+                            &mut score,
+                            &tmpl_env,
+                        ) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok
+                && bound_types.len() == impl_types.len()
+                && bound_consts.len() == impl_consts.len()
+            {
+                matches.push((score, entry, bound_types, bound_consts));
+            }
+        }
+
+        if matches.is_empty() {
+            return None;
+        }
+        matches.sort_by(|a, b| b.0.cmp(&a.0));
+        let top_score = matches[0].0;
+        let tied = matches.iter().take_while(|m| m.0 == top_score).count();
+        let (_, entry, bound_types, bound_consts) = matches.into_iter().next().unwrap();
+
+        if tied > 1 {
+            let human_st = self
+                .human_type_names
+                .get(concrete_struct_name)
+                .cloned()
+                .unwrap_or_else(|| concrete_struct_name.to_string());
+            self.emit(
+                &caller_env.file,
+                Diagnostic::new(
+                    DiagnosticKind::GenericInstantiationError,
+                    call_span,
+                    format!(
+                        "ambiguous `impl` specialization for method '{method_name}' on '{human_st}'"
+                    ),
+                ),
+            );
+            return None;
+        }
+
+        if !entry.method.is_pub && entry.owner_scope != caller_scope {
+            let human_st = self
+                .human_type_names
+                .get(concrete_struct_name)
+                .cloned()
+                .unwrap_or_else(|| concrete_struct_name.to_string());
+            self.emit(
+                &caller_env.file,
+                Diagnostic::new(
+                    DiagnosticKind::ModuleError,
+                    call_span,
+                    format!("method `{method_name}` on `{human_st}` is private; mark it `pub` to export it"),
+                ),
+            );
+        }
+
+        let mangled = format!("{concrete_struct_name}__{method_name}");
+        let human_st = self
+            .human_type_names
+            .get(concrete_struct_name)
+            .cloned()
+            .unwrap_or_else(|| concrete_struct_name.to_string());
+        let human_sig = format!("{human_st}::{method_name}");
+
+        if caller_env.depth > MAX_GENERIC_DEPTH {
+            self.emit(
+                &caller_env.file,
+                Diagnostic::new(
+                    DiagnosticKind::GenericInstantiationError,
+                    call_span,
+                    format!(
+                        "recursive generic instantiation exceeded maximum depth of {} while instantiating '{human_sig}'",
+                        MAX_GENERIC_DEPTH
+                    ),
+                ),
+            );
+            return None;
+        }
+
+        if let Some(ret_ty) = self.instantiated_fns.get(&mangled).cloned() {
+            return Some((
+                mangled,
+                entry.method.receiver,
+                ret_ty,
+                entry.method.is_pub,
+                entry.owner_scope,
+            ));
+        }
+
+        let child_env = SubstEnv {
+            types: bound_types,
+            consts: bound_consts,
+            depth: caller_env.depth + 1,
+            prog_idx: entry.prog_idx,
+            file: entry.file.clone(),
+        };
+        let ret_type = self.rewrite_type_expr(&entry.method.func.ret_type, &child_env);
+
+        if !self.check_total_instance_cap(&human_sig, call_span, &caller_env.file) {
+            return None;
+        }
+
+        let instantiated_origin = Self::format_origin(&human_sig, &caller_env.file, call_span);
+        self.instances.insert(
+            (MonomorphizedKind::Fn, mangled.clone()),
+            MonomorphizedInstance {
+                kind: MonomorphizedKind::Fn,
+                signature: human_sig.clone(),
+                mangled_name: mangled.clone(),
+            },
+        );
+
+        let mut params = Vec::with_capacity(
+            entry.method.func.params.len() + usize::from(entry.method.receiver.is_some()),
+        );
+        if let Some(recv) = entry.method.receiver {
+            let target_ty = TypeExpr::new(
+                TypeKind::Named(Ident::new(
+                    concrete_struct_name.to_string(),
+                    entry.method.span,
+                )),
+                entry.method.span,
+            );
+            let self_ty = match recv {
+                SelfReceiver::Value => target_ty,
+                SelfReceiver::Ptr => {
+                    TypeExpr::new(TypeKind::Ptr(Box::new(target_ty)), entry.method.span)
+                }
+            };
+            params.push(Param {
+                ty: self_ty,
+                name: Ident::new("self".to_string(), entry.method.span),
+                span: entry.method.span,
+            });
+        }
+        for p in &entry.method.func.params {
+            params.push(Param {
+                ty: self.rewrite_type_expr(&p.ty, &child_env),
+                name: p.name.clone(),
+                span: p.span,
+            });
+        }
+        let error_spec = entry.method.func.error_spec.as_ref().map(|es| match es {
+            ErrorSpec::Bare(sp) => ErrorSpec::Bare(*sp),
+            ErrorSpec::Typed(te) => ErrorSpec::Typed(self.rewrite_type_expr(te, &child_env)),
+        });
+
+        self.instantiated_fns
+            .insert(mangled.clone(), ret_type.clone());
+        self.non_generic_fn_rets
+            .insert(mangled.clone(), ret_type.clone());
+
+        self.pending_fn_bodies.push_back(PendingFnBody {
+            prog_idx: entry.prog_idx,
+            item_attrs: Vec::new(),
+            fn_attrs: entry.method.func.attrs.clone(),
+            is_extern_c: false,
+            mangled: mangled.clone(),
+            name_span: entry.method.func.name.span,
+            human_sig,
+            instantiated_origin,
+            params,
+            is_variadic: false,
+            ret_type: ret_type.clone(),
+            error_spec,
+            raw_body: entry.method.func.body.clone(),
+            fn_span: entry.method.func.span,
+            child_env,
+        });
+
+        Some((
+            mangled,
+            entry.method.receiver,
+            ret_type,
+            entry.method.is_pub,
+            entry.owner_scope,
+        ))
+    }
+
     fn rewrite_fn_decl(
         &mut self,
         f: &FnDecl,
@@ -2436,6 +3264,176 @@ impl<'a> Monomorphizer<'a> {
                         value: self.rewrite_expr(&a.value, env, scopes, None).0,
                         span: a.span,
                     });
+                }
+
+                let caller_scope = if env.prog_idx < self.non_root_prog_count {
+                    Some(env.prog_idx)
+                } else {
+                    None
+                };
+
+                // 1. Associated struct method (`Type.method(...)` or `<mod>.Type.method(...)`).
+                if let ExprKind::Ident(id) = &rr.kind {
+                    if !scopes_contain(scopes, &id.name) {
+                        if let Some(info) = self
+                            .concrete_methods
+                            .get(&(id.name.clone(), method.name.clone()))
+                            .cloned()
+                        {
+                            if info.receiver.is_some() {
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::InvalidOperation,
+                                        expr.span,
+                                        format!(
+                                            "cannot call instance method `{}.{}` without a receiver value",
+                                            id.name, method.name
+                                        ),
+                                    ),
+                                );
+                            } else {
+                                if !info.is_pub && info.owner_scope != caller_scope {
+                                    self.emit(
+                                        &env.file,
+                                        Diagnostic::new(
+                                            DiagnosticKind::ModuleError,
+                                            expr.span,
+                                            format!(
+                                                "method `{}.{}` is private; mark it `pub` to export it",
+                                                id.name, method.name
+                                            ),
+                                        ),
+                                    );
+                                }
+                                let c_span = receiver.span.merge(method.span);
+                                return (
+                                    Expr::new(
+                                        ExprKind::Call {
+                                            callee: Box::new(Expr::new(
+                                                ExprKind::Ident(Ident::new(info.fn_name, c_span)),
+                                                c_span,
+                                            )),
+                                            generic_args: Vec::new(),
+                                            args: r_args,
+                                        },
+                                        expr.span,
+                                    ),
+                                    InferTy::Concrete(info.ret_ty),
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // 2. Instance method on concrete or monomorphized generic struct (`val.method(...)` / `ptr.method(...)`).
+                if let InferTy::Concrete(ct) = &r_ty {
+                    let (recv_is_ptr, struct_name_opt) = match &ct.kind {
+                        TypeKind::Ptr(inner) => match &inner.kind {
+                            TypeKind::Named(s) => (true, Some(s.name.clone())),
+                            _ => (true, None),
+                        },
+                        TypeKind::Named(s) => (false, Some(s.name.clone())),
+                        _ => (false, None),
+                    };
+                    if let Some(struct_name) = struct_name_opt {
+                        let resolved = if let Some(info) = self
+                            .concrete_methods
+                            .get(&(struct_name.clone(), method.name.clone()))
+                            .cloned()
+                        {
+                            if !info.is_pub && info.owner_scope != caller_scope {
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::ModuleError,
+                                        expr.span,
+                                        format!(
+                                            "method `{}` on `{}` is private; mark it `pub` to export it",
+                                            method.name, struct_name
+                                        ),
+                                    ),
+                                );
+                            }
+                            Some((info.fn_name, info.receiver, info.ret_ty))
+                        } else if let Some((base_struct, conc_args)) =
+                            self.instantiated_struct_args.get(&struct_name).cloned()
+                        {
+                            self.resolve_generic_method_call(
+                                &base_struct,
+                                &struct_name,
+                                &conc_args,
+                                &method.name,
+                                expr.span,
+                                caller_scope,
+                                env,
+                            )
+                            .map(|(fn_name, rcv, rty, _, _)| (fn_name, rcv, rty))
+                        } else {
+                            None
+                        };
+
+                        if let Some((fn_name, recv_kind_opt, ret_ty)) = resolved {
+                            match recv_kind_opt {
+                                None => {
+                                    self.emit(
+                                        &env.file,
+                                        Diagnostic::new(
+                                            DiagnosticKind::InvalidOperation,
+                                            expr.span,
+                                            format!(
+                                                "cannot call associated function `{}.{}` on an instance value",
+                                                struct_name, method.name
+                                            ),
+                                        ),
+                                    );
+                                }
+                                Some(recv_kind) => {
+                                    let recv_arg = match (recv_kind, recv_is_ptr) {
+                                        (SelfReceiver::Value, false) | (SelfReceiver::Ptr, true) => {
+                                            rr.clone()
+                                        }
+                                        (SelfReceiver::Value, true) => Expr::new(
+                                            ExprKind::Unary {
+                                                op: UnaryOp::Deref,
+                                                expr: Box::new(rr.clone()),
+                                            },
+                                            receiver.span,
+                                        ),
+                                        (SelfReceiver::Ptr, false) => Expr::new(
+                                            ExprKind::Unary {
+                                                op: UnaryOp::AddrOf,
+                                                expr: Box::new(rr.clone()),
+                                            },
+                                            receiver.span,
+                                        ),
+                                    };
+                                    let mut full_args = Vec::with_capacity(r_args.len() + 1);
+                                    full_args.push(CallArg {
+                                        name: None,
+                                        value: recv_arg,
+                                        span: receiver.span,
+                                    });
+                                    full_args.extend(r_args);
+                                    let c_span = receiver.span.merge(method.span);
+                                    return (
+                                        Expr::new(
+                                            ExprKind::Call {
+                                                callee: Box::new(Expr::new(
+                                                    ExprKind::Ident(Ident::new(fn_name, c_span)),
+                                                    c_span,
+                                                )),
+                                                generic_args: Vec::new(),
+                                                args: full_args,
+                                            },
+                                            expr.span,
+                                        ),
+                                        InferTy::Concrete(ret_ty),
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
 
                 let mut out_ty = InferTy::Unknown;

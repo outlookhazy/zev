@@ -1356,6 +1356,8 @@ const ZEV_KEYWORDS: &[&str] = &[
     "try",
     "static",
     "pub",
+    "impl",
+    "self",
     "mmio",
     "irq",
     "state",

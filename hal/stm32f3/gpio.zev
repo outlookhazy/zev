@@ -2,20 +2,54 @@
 
 import chip.stm32f334 as hw;
 
+pub enum Mode {
+    Input  = 0,
+    Output = 1,
+    Analog = 2,
+}
+
+pub enum Pull {
+    None = 0,
+    Up   = 1,
+    Down = 2,
+}
+
 pub struct Pin {
     u8   port;
     u8   pin;
     bool active_low;
-    bool sim_high;
 }
 
-pub Pin make_pin(u8 port, u8 pin, bool active_low, bool initial_high) {
+pub Pin make_pin(u8 port, u8 pin, bool active_low) {
     return Pin {
         port: port,
         pin: pin,
         active_low: active_low,
-        sim_high: initial_high,
     };
+}
+
+u32 mode_bits(Mode m) {
+    switch (m) {
+        Mode.Input  => { return 0u32; }
+        Mode.Output => { return 1u32; }
+        Mode.Analog => { return 3u32; }
+    }
+}
+
+u32 pull_bits(Pull p) {
+    switch (p) {
+        Pull.None => { return 0u32; }
+        Pull.Up   => { return 1u32; }
+        Pull.Down => { return 2u32; }
+    }
+}
+
+fn set_mode_raw(*hw.GpioRegs g, u32 pin, u32 mode, u32 pupd) {
+    u32 sh = pin * 2u32;
+    u32 mask = 3u32 << sh;
+    g.otyper = g.otyper & (~(1u32 << pin));
+    g.moder = (g.moder & (~mask)) | ((mode & 3u32) << sh);
+    g.pupdr = (g.pupdr & (~mask)) | ((pupd & 3u32) << sh);
 }
 
 bool read_raw_port(u8 port, u8 pin) {
@@ -65,47 +99,73 @@ fn write_raw_port(u8 port, u8 pin, bool high) {
     }
 }
 
-pub bool read(*Pin p) {
-    bool raw = read_raw_port(p.port, p.pin);
-    if (p.active_low) {
-        return !raw;
+impl Pin {
+    pub fn set_mode(self, Mode mode, Pull pull) {
+        if (self.pin >= 16u8) {
+            return;
+        }
+        // Never disturb SWD pins PA13 / PA14.
+        if (self.port == 0u8 && (self.pin == 13u8 || self.pin == 14u8)) {
+            return;
+        }
+        u32 mb = mode_bits(mode);
+        u32 pb = pull_bits(pull);
+        u32 pin_u = self.pin as u32;
+        if (self.port == 0u8) {
+            hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOA;
+            u32 _stab = hw.RCC.ahbenr;
+            set_mode_raw(hw.GPIOA, pin_u, mb, pb);
+        } else if (self.port == 1u8) {
+            hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOB;
+            u32 _stab = hw.RCC.ahbenr;
+            set_mode_raw(hw.GPIOB, pin_u, mb, pb);
+        } else if (self.port == 2u8) {
+            hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOC;
+            u32 _stab = hw.RCC.ahbenr;
+            set_mode_raw(hw.GPIOC, pin_u, mb, pb);
+        }
     }
-    return raw;
-}
 
-pub fn write(*Pin p, bool high) {
-    p.sim_high = high;
-    bool hw_lvl = high;
-    if (p.active_low) {
-        hw_lvl = !high;
+    pub bool read(self) {
+        bool raw = read_raw_port(self.port, self.pin);
+        if (self.active_low) {
+            return !raw;
+        }
+        return raw;
     }
-    write_raw_port(p.port, p.pin, hw_lvl);
-}
 
-pub fn set_high(*Pin p) {
-    write(p, true);
-}
+    pub fn write(self, bool high) {
+        bool hw_lvl = high;
+        if (self.active_low) {
+            hw_lvl = !high;
+        }
+        write_raw_port(self.port, self.pin, hw_lvl);
+    }
 
-pub fn set_low(*Pin p) {
-    write(p, false);
-}
+    pub fn set_high(self) {
+        self.write(true);
+    }
 
-pub fn toggle(*Pin p) {
-    if (p.port == 0u8 && (p.pin == 13u8 || p.pin == 14u8)) {
-        return;
+    pub fn set_low(self) {
+        self.write(false);
     }
-    if (p.pin >= 16u8) {
-        return;
+
+    pub fn toggle(self) {
+        if (self.port == 0u8 && (self.pin == 13u8 || self.pin == 14u8)) {
+            return;
+        }
+        if (self.pin >= 16u8) {
+            return;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        bool cur = false;
+        if (self.port == 0u8) {
+            cur = (hw.GPIOA.odr & bit) != 0u32;
+        } else if (self.port == 1u8) {
+            cur = (hw.GPIOB.odr & bit) != 0u32;
+        } else if (self.port == 2u8) {
+            cur = (hw.GPIOC.odr & bit) != 0u32;
+        }
+        write_raw_port(self.port, self.pin, !cur);
     }
-    u32 bit = 1u32 << (p.pin as u32);
-    bool cur = false;
-    if (p.port == 0u8) {
-        cur = (hw.GPIOA.odr & bit) != 0u32;
-    } else if (p.port == 1u8) {
-        cur = (hw.GPIOB.odr & bit) != 0u32;
-    } else if (p.port == 2u8) {
-        cur = (hw.GPIOC.odr & bit) != 0u32;
-    }
-    write_raw_port(p.port, p.pin, !cur);
-    p.sim_high = !p.sim_high;
 }

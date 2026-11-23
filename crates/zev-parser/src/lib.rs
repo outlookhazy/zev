@@ -1152,8 +1152,21 @@ Lease<[16]u8> process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> 
         let pub_prog = parse_str("pub fn main() {}").expect("top-level pub fn should parse");
         assert!(pub_prog.items[0].is_pub);
 
+        let grouped_prog = parse_str(
+            r#"
+import std.{str, fmt as f, bus,};
+pub import chip.stm32g4 as hw;
+pub import chip.stm32f3.{rcc, tim};
+"#,
+        )
+        .expect("grouped and pub import declarations should parse");
+        assert_eq!(grouped_prog.items.len(), 6);
+        assert!(!grouped_prog.items[0].is_pub);
+        assert!(grouped_prog.items[3].is_pub);
+        assert!(grouped_prog.items[4].is_pub);
+        assert!(grouped_prog.items[5].is_pub);
+
         for bad_pub in [
-            "pub import chip.stm32g4 as hw;",
             "fn main() { pub u32 x = 1; }",
             "struct Frame { pub u8 op; }",
             "pub pub fn foo() {}",
@@ -2484,6 +2497,74 @@ fn test(*void vp, *i32 a) {
                 ),
                 "stmt {idx} must remain binary deref expression"
             );
+        }
+    }
+
+    #[test]
+    fn parses_impl_blocks_methods_and_rejects_invalid_impl_modifiers() {
+        let src = r#"
+struct Pin { u8 port; u8 pin; }
+struct FixedVec<T, usize N> { [N]T data; usize len; }
+
+impl Pin {
+    pub Pin make(u8 port, u8 pin) {
+        return Pin { port: port, pin: pin };
+    }
+
+    pub u8 port_id(self) {
+        return self.port;
+    }
+
+    fn bump(*self, u8 delta) {
+        self.pin += delta;
+    }
+}
+
+impl<T, usize N> FixedVec<T, N> {
+    pub fn push(*self, T item) {
+        self.data[0] = item;
+    }
+}
+
+impl<usize N> FixedVec<f32, N> {
+    pub f32 avg(*self) {
+        return self.data[0];
+    }
+}
+"#;
+        let prog = parse_str(src).expect("valid concrete, generic, and specialized impl blocks should parse");
+        assert_eq!(prog.items.len(), 5);
+        let imp_pin = match &prog.items[2].kind {
+            ItemKind::Impl(d) => d,
+            other => panic!("expected Impl, got {other:?}"),
+        };
+        assert_eq!(imp_pin.methods.len(), 3);
+        assert_eq!(imp_pin.methods[0].receiver, None);
+        assert!(imp_pin.methods[0].is_pub);
+        assert_eq!(imp_pin.methods[1].receiver, Some(SelfReceiver::Value));
+        assert_eq!(imp_pin.methods[2].receiver, Some(SelfReceiver::Ptr));
+        assert!(!imp_pin.methods[2].is_pub);
+
+        let imp_vec = match &prog.items[3].kind {
+            ItemKind::Impl(d) => d,
+            other => panic!("expected generic Impl, got {other:?}"),
+        };
+        assert_eq!(imp_vec.generic_params.len(), 2);
+        assert_eq!(imp_vec.target_generic_args.len(), 2);
+
+        let imp_spec = match &prog.items[4].kind {
+            ItemKind::Impl(d) => d,
+            other => panic!("expected specialized Impl, got {other:?}"),
+        };
+        assert_eq!(imp_spec.generic_params.len(), 1);
+        assert_eq!(imp_spec.target_generic_args.len(), 2);
+
+        for bad in [
+            "struct S { u8 x; }\npub impl S { pub fn f(self) {} }",
+            "struct S { u8 x; }\nimpl S { fn f<T>(self, T a) {} }",
+            "struct S { u8 x; }\nimpl S { extern \"C\" fn c_hook(); }",
+        ] {
+            parse_str(bad).expect_err(&format!("expected parse failure for:\n{bad}"));
         }
     }
 }

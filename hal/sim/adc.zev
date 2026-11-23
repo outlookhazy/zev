@@ -2,33 +2,43 @@
 
 import std.bus as bus;
 
+mmio SimAdcRegs {
+    @rw u32 sample @ 0x00;
+}
+
+mmio SIM_ADC : SimAdcRegs @ 0x5F00_0100;
+
 pub struct Channel {
     u8  unit;
     u8  ch;
     u16 vdda_mv;
-    u16 sim_counts;
 }
 
-pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv, u16 sim_counts) {
+pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv) {
     return Channel {
         unit: unit,
         ch: ch,
         vdda_mv: vdda_mv,
-        sim_counts: sim_counts,
     };
 }
 
-pub u16 read_u16(*Channel c) error bus.BusStatus {
-    checkpoint();
-    if (c.unit == 0u8) {
-        error bus.BusStatus.FrameErr;
+impl Channel {
+    pub u16 read_u16(self) error bus.BusStatus {
+        checkpoint();
+        if (self.unit == 0u8) {
+            error bus.BusStatus.FrameErr;
+        }
+        u32 raw = SIM_ADC.sample;
+        if (raw == 0u32) {
+            return (((self.ch as u16) * 256u16) + 1024u16) & 0x0FFFu16;
+        }
+        return (raw as u16) & 0x0FFFu16;
     }
-    return c.sim_counts & 0x0FFFu16;
-}
 
-pub u32 read_mv(*Channel c) error bus.BusStatus {
-    u16 raw = read_u16(c) catch (bus.BusStatus err) {
-        error err;
-    };
-    return ((raw as u32) * (c.vdda_mv as u32)) / 4095u32;
+    pub u32 read_mv(self) error bus.BusStatus {
+        u16 raw = self.read_u16() catch (bus.BusStatus err) {
+            error err;
+        };
+        return ((raw as u32) * (self.vdda_mv as u32)) / 4095u32;
+    }
 }
