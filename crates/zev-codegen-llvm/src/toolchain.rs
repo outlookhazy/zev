@@ -883,6 +883,7 @@ fn find_tool_in_dirs(
     env_prefix: Option<&Path>,
     path_dirs: &[PathBuf],
     extra_sys_dirs: &[PathBuf],
+    versioned_dirs: fn(u32) -> Vec<PathBuf>,
 ) -> String {
     if let Some(p) = env_prefix {
         for dir in [p.join("bin"), p.to_path_buf()] {
@@ -955,11 +956,7 @@ fn find_tool_in_dirs(
                 }
             }
         }
-        for prefix_dir in [
-            PathBuf::from(format!("/usr/lib/llvm-{ver}/bin")),
-            PathBuf::from(format!("/usr/lib/llvm{ver}/bin")),
-            PathBuf::from(format!("/opt/homebrew/opt/llvm@{ver}/bin")),
-        ] {
+        for prefix_dir in versioned_dirs(ver) {
             for cand_name in [name, vname.as_str()] {
                 if let Some(found) = exe_candidate(&prefix_dir, cand_name) {
                     if let Some(ok) = consider(found) {
@@ -989,13 +986,23 @@ fn find_tool_in_dirs(
                 return found.to_string_lossy().into_owned();
             }
         }
-        let llvm_dir = PathBuf::from(format!("/usr/lib/llvm-{ver}/bin"));
-        if let Some(found) = exe_candidate(&llvm_dir, name) {
-            return found.to_string_lossy().into_owned();
+        for llvm_dir in versioned_dirs(ver) {
+            if let Some(found) = exe_candidate(&llvm_dir, name) {
+                return found.to_string_lossy().into_owned();
+            }
         }
     }
 
     name.to_string()
+}
+
+/// Per-version LLVM install prefixes probed on the host (Debian/Ubuntu, Arch-style, Homebrew).
+fn system_versioned_llvm_dirs(ver: u32) -> Vec<PathBuf> {
+    vec![
+        PathBuf::from(format!("/usr/lib/llvm-{ver}/bin")),
+        PathBuf::from(format!("/usr/lib/llvm{ver}/bin")),
+        PathBuf::from(format!("/opt/homebrew/opt/llvm@{ver}/bin")),
+    ]
 }
 
 /// Locate an external LLVM/QEMU executable portably, preferring LLVM >= [`MIN_LLVM_MAJOR`] (`23`):
@@ -1016,6 +1023,7 @@ pub fn find_tool(preferred_abs: &str, name: &str) -> String {
         prefix.as_deref(),
         &path_dirs,
         &sys_dirs,
+        system_versioned_llvm_dirs,
     )
 }
 
@@ -2018,12 +2026,21 @@ mod tests {
             .expect("LLVM 23 llc-23 must be accepted");
 
         // When PATH has LLVM 18 `llc` before `llc-23`, discovery skips 18 and selects `llc-23`.
-        let chosen = find_tool_in_dirs("", "llc", None, &[dir_old.clone(), dir_new.clone()], &[]);
+        // Hermetic: no real system LLVM prefixes, so a host-installed LLVM 23 can't win.
+        let no_sys = |_: u32| Vec::new();
+        let chosen = find_tool_in_dirs(
+            "",
+            "llc",
+            None,
+            &[dir_old.clone(), dir_new.clone()],
+            &[],
+            no_sys,
+        );
         assert_eq!(chosen, new_llc_ver.to_string_lossy());
 
         // When only LLVM 18 exists, discovery returns the old path so `require_llvm_tool`
         // reports a clear version mismatch rather than "file not found".
-        let fallback = find_tool_in_dirs("", "llc", None, &[dir_old], &[]);
+        let fallback = find_tool_in_dirs("", "llc", None, &[dir_old], &[], no_sys);
         assert_eq!(fallback, old_llc.to_string_lossy());
 
         let _ = std::fs::remove_dir_all(&base);
