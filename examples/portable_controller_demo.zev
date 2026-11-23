@@ -9,6 +9,8 @@
 //       `zevc flash --board nucleo_f334r8 examples/portable_controller_demo.zev`
 //   - ESP32-C6-Pico Hardware (`hal/esp32c6` + `bsp/esp32c6_pico`):
 //       `zevc flash --board esp32c6_pico examples/portable_controller_demo.zev --port /dev/ttyACM1`
+//   - RP2040 Pico W Hardware (`hal/rp2040` + `bsp/rpi_pico_w_board`):
+//       `zevc flash --board rpi_pico_w examples/portable_controller_demo.zev --port /dev/ttyACM2`
 
 import board;
 import hal.{time, pwm, adc, i2c, spi};

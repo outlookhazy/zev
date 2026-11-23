@@ -6965,6 +6965,18 @@ fn main() {
             analyze_hardware_stack_high_water(&esp_mir, &esp_opts).expect("esp32c6_pico stack proof");
         assert!(esp_proof.within_budget, "esp32c6_pico over SRAM budget");
 
+        // 4. Raspberry Pi Pico W (`rpi_pico_w`)
+        let (rp_spec, rp_opts, rp_mir) = compile_for_board("rpi_pico_w");
+        assert_eq!(rp_spec.hal_dir.as_deref(), Some("hal/rp2040"));
+        assert_eq!(rp_spec.board_module.as_deref(), Some("bsp/rpi_pico_w_board"));
+        let rp_uf2 = out_dir.join("portable_rpi_pico_w.uf2");
+        let rp_art =
+            build_target_image(&rp_mir, &rp_opts, &rp_uf2).expect("build rpi_pico_w");
+        assert!(rp_art.elf.audit.is_zero_heap_freestanding());
+        let rp_proof =
+            analyze_hardware_stack_high_water(&rp_mir, &rp_opts).expect("rpi_pico_w stack proof");
+        assert!(rp_proof.within_budget, "rpi_pico_w over SRAM budget");
+
         let _ = std::fs::remove_dir_all(&out_dir);
     }
 }

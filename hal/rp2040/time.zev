@@ -1,0 +1,33 @@
+// Portable HAL microsecond hardware settle spin (RP2040 1 MHz TIMER / SysTick fallback)
+
+import chip.rp2040 as hw;
+import arch.cortex_m as cm;
+
+pub fn spin_us(u32 us) {
+    if (us == 0u32) {
+        return;
+    }
+    if ((hw.CLOCKS.clk_ref_selected & 4u32) == 0u32) {
+        cm.spin_us(us);
+        return;
+    }
+    u32 rem = us;
+    for (u32 _chunk in 0..2000) {
+        if (rem == 0u32) {
+            break;
+        }
+        u32 slice_us = rem;
+        if (slice_us > 500u32) {
+            slice_us = 500u32;
+        }
+        rem -= slice_us;
+        u32 max_polls = (slice_us * 32u32) + 256u32;
+        u32 t0 = hw.TIMER.timerawl;
+        for (u32 _p in 0..max_polls) {
+            if ((hw.TIMER.timerawl - t0) >= slice_us) {
+                break;
+            }
+            sys.nop();
+        }
+    }
+}

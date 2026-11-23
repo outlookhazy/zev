@@ -134,6 +134,48 @@ pub mmio SioRegs {
     @wo  u32 gpio_out_set @ 0x14;
     @wo  u32 gpio_out_clr @ 0x18;
     @wo  u32 gpio_out_xor @ 0x1C;
+    @rw  u32 gpio_oe      @ 0x20;
+    @wo  u32 gpio_oe_set  @ 0x24;
+    @wo  u32 gpio_oe_clr  @ 0x28;
+}
+
+pub mmio IoBank0Regs {
+    @rw [60]u32 gpio @ 0x00;
+}
+
+pub mmio PadsBank0Regs {
+    @rw u32     voltage_select @ 0x00;
+    @rw [30]u32 gpio           @ 0x04;
+}
+
+pub mmio PwmRegs {
+    @rw [40]u32 ch @ 0x00;
+    @rw u32     en @ 0xA0;
+}
+
+pub mmio SpiRegs {
+    @rw u32 cr0  @ 0x00;
+    @rw u32 cr1  @ 0x04;
+    @rw u32 dr   @ 0x08;
+    @ro u32 sr   @ 0x0C;
+    @rw u32 cpsr @ 0x10;
+}
+
+pub mmio I2cRegs {
+    @rw u32 con           @ 0x00;
+    @rw u32 tar           @ 0x04;
+    @rw u32 data_cmd      @ 0x10;
+    @rw u32 ss_scl_hcnt   @ 0x14;
+    @rw u32 ss_scl_lcnt   @ 0x18;
+    @ro u32 raw_intr_stat @ 0x34;
+    @ro u32 clr_intr      @ 0x40;
+    @ro u32 clr_tx_abrt   @ 0x54;
+    @rw u32 enable        @ 0x6C;
+    @ro u32 status        @ 0x70;
+    @ro u32 txflr         @ 0x74;
+    @ro u32 rxflr         @ 0x78;
+    @ro u32 tx_abrt_source @ 0x80;
+    @ro u32 enable_status @ 0x9C;
 }
 
 pub mmio PpbRegs {
@@ -158,6 +200,11 @@ pub mmio PLL_SYS_CLR : PllRegs      @ 0x4002_B000;
 pub mmio PLL_USB     : PllRegs      @ 0x4002_C000;
 pub mmio PLL_USB_CLR : PllRegs      @ 0x4002_F000;
 pub mmio ADC         : AdcRegs      @ 0x4004_C000;
+pub mmio IO_BANK0    : IoBank0Regs  @ 0x4001_4000;
+pub mmio PADS_BANK0  : PadsBank0Regs @ 0x4001_C000;
+pub mmio SPI0        : SpiRegs      @ 0x4003_C000;
+pub mmio I2C0        : I2cRegs      @ 0x4004_4000;
+pub mmio PWM         : PwmRegs      @ 0x4005_0000;
 pub mmio TIMER       : TimerRegs    @ 0x4005_4000;
 pub mmio WATCHDOG    : WatchdogRegs @ 0x4005_8000;
 pub mmio DMA         : DmaRegs      @ 0x5000_0000;
@@ -196,3 +243,6 @@ pub const u32 PIO0_TXF0_ADDR = 0x5020_0010;
 pub const u32 PIO0_RXF0_ADDR = 0x5020_0020;
 pub const u32 DREQ_PIO0_TX0  = 0;
 pub const u32 DREQ_PIO0_RX0  = 4;
+pub const u32 RESETS_I2C0    = 1 << 3;
+pub const u32 RESETS_PWM     = 1 << 14;
+pub const u32 RESETS_SPI0    = 1 << 16;

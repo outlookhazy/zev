@@ -3,6 +3,7 @@
 [board]
 name = "rpi_pico_w"
 chip = "rp2040"
+board_module = "bsp/rpi_pico_w_board"
 
 [run]
 flash_cmd = ["python3", "tools/flash_rp2040_uf2.py", "{image}", "{port}"]

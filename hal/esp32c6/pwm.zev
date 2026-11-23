@@ -1,5 +1,6 @@
-// Portable HAL PWM channel interface (ESP32-C6 safe duty-state backend)
+// Portable HAL PWM channel interface (ESP32-C6 LEDC Timer0 / Channel 0 backend)
 
+import chip.esp32c6 as hw;
 import std.math as math;
 
 pub struct Channel {
@@ -23,17 +24,40 @@ pub Channel make_channel(u8 kind, u8 unit, u8 ch, u32 period, u16 duty_permil) {
 
 impl Channel {
     pub fn set_duty_permil(*self, u16 permil) {
-        self.duty_permil = math.clamp<u16>(permil, 0u16, 1000u16);
+        u16 d = math.clamp<u16>(permil, 0u16, 1000u16);
+        self.duty_permil = d;
+        if ((hw.PCR.ledc_conf & 1u32) == 0u32) {
+            return;
+        }
+        // Map 0..1000 permil onto 10-bit LEDC Timer0 (`0..1023` << 4 per `ledc_ll_set_duty_int_part`).
+        u32 duty10 = (((d as u32) * 1023u32) + 500u32) / 1000u32;
+        if (duty10 > 1023u32) {
+            duty10 = 1023u32;
+        }
+        hw.LEDC.ch0_hpoint = 0u32;
+        hw.LEDC.ch0_duty = duty10 << 4;
+        hw.LEDC.ch0_conf1 = 1u32 << 31; // DUTY_START_CH0
+        hw.LEDC.ch0_conf0 = hw.LEDC.ch0_conf0 | (1u32 << 4); // PARA_UP_CH0
     }
 
     pub fn set_duty_u16(*self, u16 duty) {
         u32 pm = (((duty as u32) * 1000u32) + 32767u32) / 65535u32;
-        self.duty_permil = math.clamp<u32>(pm, 0u32, 1000u32) as u16;
+        self.set_duty_permil(math.clamp<u32>(pm, 0u32, 1000u32) as u16);
     }
 
     pub fn enable(*self, bool on) {
         if (!on) {
             self.duty_permil = 0u16;
+        }
+        if ((hw.PCR.ledc_conf & 1u32) == 0u32) {
+            return;
+        }
+        if (on) {
+            hw.LEDC.ch0_conf0 = (hw.LEDC.ch0_conf0 | (1u32 << 2) | (1u32 << 4)); // SIG_OUT_EN | PARA_UP
+        } else {
+            hw.LEDC.ch0_duty = 0u32;
+            hw.LEDC.ch0_conf1 = 1u32 << 31;
+            hw.LEDC.ch0_conf0 = (hw.LEDC.ch0_conf0 & (~(1u32 << 2))) | (1u32 << 4);
         }
     }
 }

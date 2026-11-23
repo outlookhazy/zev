@@ -1,9 +1,10 @@
-// Portable HAL I2C master bus interface (ESP32-C6 target, SoftYielding)
+// Portable HAL I2C master bus interface (ESP32-C6 I2C0 hardware controller, SoftYielding)
 
+import chip.esp32c6 as hw;
 import std.bus as bus;
 
 pub struct Bus {
-    u8  unit;
+    u8  unit; // 1 = I2C0
     u32 timeout_ms;
 }
 
@@ -14,29 +15,137 @@ pub Bus make_bus(u8 unit, u32 timeout_ms) {
     };
 }
 
+const u32 CMD_RSTART = 6u32 << 11;
+const u32 CMD_WRITE  = 1u32 << 11;
+const u32 CMD_READ   = 3u32 << 11;
+const u32 CMD_STOP   = 2u32 << 11;
+const u32 CMD_ACK_EN = 1u32 << 8;
+const u32 CMD_ACK_VAL_NACK = 1u32 << 10;
+
+u32 eff_timeout(u32 to_ms) {
+    if (to_ms == 0u32) {
+        return 25u32;
+    }
+    return to_ms;
+}
+
+fn reset_i2c0_fifos() {
+    u32 base_fifo = hw.I2C0.fifo_conf & (~((1u32 << 12) | (1u32 << 13)));
+    hw.I2C0.fifo_conf = base_fifo | (1u32 << 12) | (1u32 << 13);
+    hw.I2C0.fifo_conf = base_fifo;
+    hw.I2C0.int_clr = 0x3FFFFu32;
+}
+
+fn start_i2c0_xfer() {
+    hw.I2C0.ctr = hw.I2C0.ctr | (1u32 << 11); // I2C_CONF_UPGATE
+    hw.I2C0.ctr = hw.I2C0.ctr | (1u32 << 5);  // I2C_TRANS_START
+}
+
+bool wait_i2c0_done(u32 timeout_ms) error bus.BusStatus {
+    u32 t0 = sys.now_ms();
+    u32 limit = eff_timeout(timeout_ms);
+    for (u32 iter in 0..100_000) {
+        u32 raw = hw.I2C0.int_raw;
+        if ((raw & (1u32 << 10)) != 0u32) { // I2C_NACK_INT_RAW
+            hw.I2C0.int_clr = 0x3FFFFu32;
+            return false;
+        }
+        if ((raw & ((1u32 << 5) | (1u32 << 8))) != 0u32) { // ARB_LOST | TIMEOUT
+            hw.I2C0.int_clr = 0x3FFFFu32;
+            error bus.BusStatus.BusBusy;
+        }
+        if ((raw & (1u32 << 7)) != 0u32) { // I2C_TRANS_COMPLETE_INT_RAW
+            hw.I2C0.int_clr = 0x3FFFFu32;
+            return true;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                hw.I2C0.int_clr = 0x3FFFFu32;
+                error bus.BusStatus.Timeout;
+            }
+            checkpoint();
+        }
+    }
+    error bus.BusStatus.Timeout;
+}
+
 impl Bus {
     pub bool probe_7bit(self, u8 addr7) error bus.BusStatus {
         checkpoint();
-        if (self.unit == 0u8 || addr7 > 127u8) {
+        if (self.unit != 1u8 || addr7 > 127u8) {
             error bus.BusStatus.FrameErr;
         }
-        return false;
+        if ((hw.PCR.i2c_conf & 1u32) == 0u32) {
+            error bus.BusStatus.BusBusy;
+        }
+        reset_i2c0_fifos();
+        hw.I2C0.data = ((addr7 & 0x7Fu8) as u32) << 1;
+        hw.I2C0.comd[0] = CMD_RSTART;
+        hw.I2C0.comd[1] = CMD_WRITE | CMD_ACK_EN | 1u32;
+        hw.I2C0.comd[2] = CMD_STOP;
+        start_i2c0_xfer();
+        bool ack = wait_i2c0_done(self.timeout_ms) catch (bus.BusStatus err) {
+            error err;
+        };
+        return ack;
     }
 
     pub fn write(self, u8 addr7, []u8 data) error bus.BusStatus {
         checkpoint();
-        if (self.unit == 0u8 || addr7 > 127u8 || data.len > 255) {
+        if (self.unit != 1u8 || addr7 > 127u8 || data.len > 30) {
             error bus.BusStatus.FrameErr;
         }
-        error bus.BusStatus.BusBusy;
+        if ((hw.PCR.i2c_conf & 1u32) == 0u32) {
+            error bus.BusStatus.BusBusy;
+        }
+        reset_i2c0_fifos();
+        hw.I2C0.data = ((addr7 & 0x7Fu8) as u32) << 1;
+        for (u8 b in data) {
+            hw.I2C0.data = b as u32;
+        }
+        hw.I2C0.comd[0] = CMD_RSTART;
+        hw.I2C0.comd[1] = CMD_WRITE | CMD_ACK_EN | (1u32 + (data.len as u32));
+        hw.I2C0.comd[2] = CMD_STOP;
+        start_i2c0_xfer();
+        bool ack = wait_i2c0_done(self.timeout_ms) catch (bus.BusStatus err) {
+            error err;
+        };
+        if (!ack) {
+            error bus.BusStatus.BusBusy;
+        }
+        return;
     }
 
     pub fn read(self, u8 addr7, []u8 dst) error bus.BusStatus {
         checkpoint();
-        if (self.unit == 0u8 || addr7 > 127u8 || dst.len > 255) {
+        if (self.unit != 1u8 || addr7 > 127u8 || dst.len == 0 || dst.len > 30) {
             error bus.BusStatus.FrameErr;
         }
-        error bus.BusStatus.BusBusy;
+        if ((hw.PCR.i2c_conf & 1u32) == 0u32) {
+            error bus.BusStatus.BusBusy;
+        }
+        reset_i2c0_fifos();
+        hw.I2C0.data = (((addr7 & 0x7Fu8) as u32) << 1) | 1u32;
+        hw.I2C0.comd[0] = CMD_RSTART;
+        hw.I2C0.comd[1] = CMD_WRITE | CMD_ACK_EN | 1u32;
+        usize cmd_idx = 2usize;
+        if (dst.len > 1usize) {
+            hw.I2C0.comd[cmd_idx] = CMD_READ | ((dst.len - 1usize) as u32);
+            cmd_idx += 1usize;
+        }
+        hw.I2C0.comd[cmd_idx] = CMD_READ | CMD_ACK_VAL_NACK | 1u32;
+        hw.I2C0.comd[cmd_idx + 1usize] = CMD_STOP;
+        start_i2c0_xfer();
+        bool ack = wait_i2c0_done(self.timeout_ms) catch (bus.BusStatus err) {
+            error err;
+        };
+        if (!ack) {
+            error bus.BusStatus.BusBusy;
+        }
+        for (usize i in 0..dst.len) {
+            dst[i] = (hw.I2C0.data & 0xFFu32) as u8;
+        }
+        return;
     }
 
     pub fn write_read(self, u8 addr7, []u8 tx, []u8 rx) error bus.BusStatus {

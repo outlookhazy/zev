@@ -331,13 +331,73 @@ pub adc.Channel default_adc() {
 }
 
 pub pwm.Channel default_pwm() {
-    return pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 0u16);
+    hw.PCR.ledc_conf = 3u32;
+    hw.PCR.ledc_conf = 1u32;
+    hw.PCR.ledc_sclk_conf = (1u32 << 22) | (3u32 << 20); // 40 MHz XTAL clock
+    hw.LEDC.conf = 1u32 << 31; // LEDC_CLK_EN
+    hw.LEDC.timer0_conf = 10u32 | (10000u32 << 5) | (1u32 << 26); // 10-bit ~1 kHz, RST=0, PARA_UP=1
+    hw.IO_MUX.gpio[3] = (1u32 << 12) | (2u32 << 10);
+    hw.GPIO.func_out_sel_cfg[3] = hw.LEDC_LS_SIG_OUT0_IDX;
+    hw.GPIO.enable_w1ts = 1u32 << 3;
+    return pwm.make_channel(0u8, 1u8, 0u8, 1024u32, 0u16);
 }
 
 pub spi.Bus default_spi() {
+    hw.PCR.spi2_conf = 3u32;
+    hw.PCR.spi2_conf = 1u32;
+    hw.PCR.spi2_clkm_conf = 1u32 << 22; // 40 MHz XTAL clock
+    // Route SPI2 signals onto free pads: GPIO4=SCK, GPIO5=MOSI, GPIO6=MISO (with PU).
+    hw.IO_MUX.gpio[4] = (1u32 << 12) | (2u32 << 10);
+    hw.IO_MUX.gpio[5] = (1u32 << 12) | (2u32 << 10);
+    hw.IO_MUX.gpio[6] = (1u32 << 12) | (1u32 << 9) | (1u32 << 8);
+    hw.GPIO.func_out_sel_cfg[4] = hw.FSPICLK_IDX;
+    hw.GPIO.func_out_sel_cfg[5] = hw.FSPID_IDX;
+    hw.GPIO.enable_w1ts = (1u32 << 4) | (1u32 << 5);
+    hw.GPIO.enable_w1tc = 1u32 << 6;
+    hw.GPIO.func_in_sel_cfg[hw.FSPIQ_IDX as usize] = 6u32 | (1u32 << 7);
+
+    hw.SPI2.misc = 0u32;
+    // 1 MHz Mode 0 from 40 MHz XTAL: pre = 19 (+1=20), cnt_n = 1 (+1=2), cnt_h = 0, cnt_l = 1.
+    hw.SPI2.clock = (19u32 << 18) | (1u32 << 12) | 1u32;
+    hw.SPI2.user = (1u32 << 28) | (1u32 << 27) | 1u32; // USR_MISO | USR_MOSI | DOUTDIN
+    hw.SPI2.ms_dlen = 7u32;
+    hw.SPI2.cmd = 1u32 << 23; // SPI_UPDATE
+    for (u32 _w in 0..256) {
+        if ((hw.SPI2.cmd & (1u32 << 23)) == 0u32) {
+            break;
+        }
+    }
     return spi.make_bus(2u8, 10u32);
 }
 
 pub i2c.Bus default_i2c() {
+    hw.PCR.i2c_conf = 3u32;
+    hw.PCR.i2c_conf = 1u32;
+    hw.PCR.i2c_sclk_conf = 1u32 << 22; // 40 MHz XTAL
+    // Configure GPIO10=SCL, GPIO11=SDA as open-drain inputs+outputs with weak pull-up, idling HIGH.
+    hw.GPIO.pin[10] = 1u32 << 2; // PAD_DRIVER = open-drain
+    hw.GPIO.pin[11] = 1u32 << 2;
+    hw.GPIO.out_w1ts = (1u32 << 10) | (1u32 << 11);
+    hw.IO_MUX.gpio[10] = (1u32 << 12) | (1u32 << 9) | (1u32 << 8);
+    hw.IO_MUX.gpio[11] = (1u32 << 12) | (1u32 << 9) | (1u32 << 8);
+    hw.GPIO.func_out_sel_cfg[10] = hw.I2CEXT0_SCL_IDX;
+    hw.GPIO.func_out_sel_cfg[11] = hw.I2CEXT0_SDA_IDX;
+    hw.GPIO.enable_w1ts = (1u32 << 10) | (1u32 << 11);
+    hw.GPIO.func_in_sel_cfg[hw.I2CEXT0_SCL_IDX as usize] = 10u32 | (1u32 << 7);
+    hw.GPIO.func_in_sel_cfg[hw.I2CEXT0_SDA_IDX as usize] = 11u32 | (1u32 << 7);
+
+    hw.I2C0.ctr = 0u32;
+    hw.I2C0.clk_conf = (1u32 << 21) | 3u32; // SCLK_ACTIVE=1, div=(3+1)=4 -> 10 MHz I2C core
+    hw.I2C0.scl_low_period = 50u32;
+    hw.I2C0.scl_high_period = 50u32;
+    hw.I2C0.sda_hold = 12u32;
+    hw.I2C0.sda_sample = 25u32;
+    hw.I2C0.scl_start_hold = 25u32;
+    hw.I2C0.scl_rstart_setup = 25u32;
+    hw.I2C0.scl_stop_hold = 25u32;
+    hw.I2C0.scl_stop_setup = 25u32;
+    hw.I2C0.filter_cfg = (1u32 << 3) | (1u32 << 7) | 3u32 | (3u32 << 4);
+    hw.I2C0.fifo_conf = 0u32;
+    hw.I2C0.ctr = (1u32 << 4) | (1u32 << 2) | (1u32 << 1) | 1u32 | (1u32 << 11);
     return i2c.make_bus(1u8, 10u32);
 }

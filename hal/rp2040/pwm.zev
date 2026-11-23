@@ -1,0 +1,75 @@
+// Portable HAL PWM channel interface (RP2040 hardware PWM slices 0..7)
+
+import chip.rp2040 as hw;
+import std.math as math;
+
+pub struct Channel {
+    u8  kind;
+    u8  unit; // PWM slice 0..7
+    u8  ch;   // 0 = Channel A, 1 = Channel B
+    u32 period;
+    u16 duty_permil;
+}
+
+pub Channel make_channel(u8 kind, u8 unit, u8 ch, u32 period, u16 duty_permil) {
+    u16 d = math.clamp<u16>(duty_permil, 0u16, 1000u16);
+    return Channel {
+        kind: kind,
+        unit: unit,
+        ch: ch,
+        period: period,
+        duty_permil: d,
+    };
+}
+
+impl Channel {
+    pub fn set_duty_permil(*self, u16 permil) {
+        u16 d = math.clamp<u16>(permil, 0u16, 1000u16);
+        self.duty_permil = d;
+        if (self.unit >= 8u8 || (hw.RESETS.reset_done & hw.RESETS_PWM) == 0u32) {
+            return;
+        }
+        usize base = (self.unit as usize) * 5usize;
+        u32 per = self.period;
+        if (per == 0u32) {
+            per = (hw.PWM.ch[base + 4usize] & 0xFFFFu32) + 1u32;
+        }
+        if (per == 0u32) {
+            per = 1000u32;
+        }
+        if (per > 65536u32) {
+            per = 65536u32;
+        }
+        hw.PWM.ch[base + 4usize] = per - 1u32; // TOP
+        u32 lvl = (((per as u64) * (d as u64)) / 1000u64) as u32;
+        if (lvl > 65535u32) {
+            lvl = 65535u32;
+        }
+        u32 cur_cc = hw.PWM.ch[base + 3usize];
+        if (self.ch == 0u8) {
+            hw.PWM.ch[base + 3usize] = (cur_cc & 0xFFFF_0000u32) | (lvl & 0xFFFFu32);
+        } else {
+            hw.PWM.ch[base + 3usize] = (cur_cc & 0x0000_FFFFu32) | ((lvl & 0xFFFFu32) << 16);
+        }
+    }
+
+    pub fn set_duty_u16(*self, u16 duty) {
+        u32 pm = (((duty as u32) * 1000u32) + 32767u32) / 65535u32;
+        self.set_duty_permil(math.clamp<u32>(pm, 0u32, 1000u32) as u16);
+    }
+
+    pub fn enable(*self, bool on) {
+        if (!on) {
+            self.duty_permil = 0u16;
+        }
+        if (self.unit >= 8u8 || (hw.RESETS.reset_done & hw.RESETS_PWM) == 0u32) {
+            return;
+        }
+        usize base = (self.unit as usize) * 5usize;
+        if (on) {
+            hw.PWM.ch[base] = hw.PWM.ch[base] | 1u32; // CSR.EN
+        } else {
+            hw.PWM.ch[base] = hw.PWM.ch[base] & (~1u32);
+        }
+    }
+}

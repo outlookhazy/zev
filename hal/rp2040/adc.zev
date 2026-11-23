@@ -1,0 +1,56 @@
+// Portable HAL ADC channel interface (RP2040 12-bit SAR ADC + Ch4 Temp Sensor, SoftYielding)
+
+import chip.rp2040 as hw;
+import std.bus as bus;
+
+pub struct Channel {
+    u8  unit; // 1 = ADC
+    u8  ch;   // 0..3 = ADC0..ADC3, 4 = On-die Temperature Sensor
+    u16 vdda_mv;
+}
+
+pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv) {
+    return Channel {
+        unit: unit,
+        ch: ch,
+        vdda_mv: vdda_mv,
+    };
+}
+
+impl Channel {
+    pub u16 read_u16(self) error bus.BusStatus {
+        checkpoint();
+        if (self.unit != 1u8 || self.ch >= 5u8) {
+            error bus.BusStatus.FrameErr;
+        }
+        if ((hw.RESETS.reset_done & 1u32) == 0u32) {
+            error bus.BusStatus.BusBusy;
+        }
+        u32 ts_en = 0u32;
+        if (self.ch == 4u8) {
+            ts_en = 2u32; // ADC_CS_TS_EN
+        }
+        u32 ainsel = ((self.ch as u32) & 7u32) << 12;
+        hw.ADC.cs = ainsel | ts_en | 5u32; // AINSEL | TS_EN | START_ONCE | EN
+        u32 t0 = sys.now_ms();
+        for (u32 iter in 0..100_000) {
+            if ((hw.ADC.cs & (1u32 << 8)) != 0u32) { // READY
+                return (hw.ADC.result & 0x0FFFu32) as u16;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= 20u32) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        error bus.BusStatus.Timeout;
+    }
+
+    pub u32 read_mv(self) error bus.BusStatus {
+        u16 raw = self.read_u16() catch (bus.BusStatus err) {
+            error err;
+        };
+        return ((raw as u32) * (self.vdda_mv as u32)) / 4095u32;
+    }
+}

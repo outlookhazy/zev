@@ -4861,6 +4861,156 @@ pub fn fold_singletons(module: &mut MirModule) {
     module.visibility.singleton_bytes_saved_64 = singleton_bytes_saved_64;
 }
 
+/// Prune `MirFunction`s, `dual_specialized_fns`, and monomorphized `Fn` entries not reachable from
+/// boot, tasks, ISRs, IRQ vectors, consts, or primitives (no-op on fragment-only test modules).
+pub fn prune_unreachable_functions(module: &mut MirModule) {
+    if module.boot.steps.is_empty()
+        && module.boot.boot_yielding_callees.is_empty()
+        && module.spawned_tasks.is_empty()
+        && module.task_blueprints.is_empty()
+        && module.isrs.is_empty()
+        && module.irq_vectors.is_empty()
+    {
+        return;
+    }
+
+    let mut addr_taken_fns = BTreeSet::new();
+    let mut call_sites: BTreeMap<String, Vec<Vec<MirExpr>>> = BTreeMap::new();
+    let mut reachable = BTreeSet::new();
+    let mut worklist = VecDeque::new();
+
+    let mut seed = |name: String| {
+        if reachable.insert(name.clone()) {
+            worklist.push_back(name);
+        }
+    };
+
+    for c in &module.consts {
+        collect_fn_addrs_and_calls_expr(&c.init, &mut addr_taken_fns, &mut call_sites);
+    }
+    for p in &module.primitives {
+        if let Some(init) = &p.init {
+            collect_fn_addrs_and_calls_expr(init, &mut addr_taken_fns, &mut call_sites);
+        }
+    }
+    for callee in &module.boot.boot_yielding_callees {
+        seed(callee.clone());
+    }
+    for step in &module.boot.steps {
+        match step {
+            MirBootStep::Stmt(s) => {
+                collect_fn_addrs_and_calls_stmt(s, &mut addr_taken_fns, &mut call_sites);
+            }
+            MirBootStep::RunYieldingFn { callee, args, .. } => {
+                seed(callee.clone());
+                for a in args {
+                    collect_fn_addrs_and_calls_expr(a, &mut addr_taken_fns, &mut call_sites);
+                }
+            }
+            MirBootStep::SpawnActivate { args, .. } => {
+                for a in args {
+                    collect_fn_addrs_and_calls_expr(a, &mut addr_taken_fns, &mut call_sites);
+                }
+            }
+        }
+    }
+    for bp in &module.task_blueprints {
+        for slot in &bp.child_slots {
+            seed(slot.callee.clone());
+        }
+        for blk in &bp.blocks {
+            for s in &blk.stmts {
+                collect_fn_addrs_and_calls_stmt(s, &mut addr_taken_fns, &mut call_sites);
+            }
+            collect_fn_addrs_and_calls_term(&blk.terminator, &mut addr_taken_fns, &mut call_sites);
+        }
+    }
+    for sp in &module.spawned_tasks {
+        for a in &sp.init_args {
+            collect_fn_addrs_and_calls_expr(a, &mut addr_taken_fns, &mut call_sites);
+        }
+    }
+    for isr in &module.isrs {
+        for sv in &isr.state_vars {
+            collect_fn_addrs_and_calls_expr(&sv.init, &mut addr_taken_fns, &mut call_sites);
+        }
+        for s in &isr.body {
+            collect_fn_addrs_and_calls_stmt(s, &mut addr_taken_fns, &mut call_sites);
+        }
+    }
+    for vec in &module.irq_vectors {
+        for b in &vec.bindings {
+            for barg in &b.baked_args {
+                if let MirBakedArg::Const(e) = barg {
+                    collect_fn_addrs_and_calls_expr(e, &mut addr_taken_fns, &mut call_sites);
+                }
+            }
+            for sv in &b.state_vars {
+                collect_fn_addrs_and_calls_expr(&sv.init, &mut addr_taken_fns, &mut call_sites);
+            }
+        }
+    }
+
+    for name in addr_taken_fns.into_iter().chain(call_sites.into_keys()) {
+        seed(name);
+    }
+
+    let fn_index: BTreeMap<String, usize> = module
+        .functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.name.clone(), i))
+        .collect();
+
+    while let Some(name) = worklist.pop_front() {
+        let Some(&idx) = fn_index.get(&name) else {
+            continue;
+        };
+        let mut sub_addrs = BTreeSet::new();
+        let mut sub_calls: BTreeMap<String, Vec<Vec<MirExpr>>> = BTreeMap::new();
+        let mut direct_callees = Vec::new();
+        match &module.functions[idx].body {
+            MirFnBody::Direct(stmts) => {
+                for s in stmts {
+                    collect_fn_addrs_and_calls_stmt(s, &mut sub_addrs, &mut sub_calls);
+                }
+            }
+            MirFnBody::Coroutine {
+                blocks,
+                child_slots,
+            } => {
+                for slot in child_slots {
+                    direct_callees.push(slot.callee.clone());
+                }
+                for blk in blocks {
+                    for s in &blk.stmts {
+                        collect_fn_addrs_and_calls_stmt(s, &mut sub_addrs, &mut sub_calls);
+                    }
+                    collect_fn_addrs_and_calls_term(&blk.terminator, &mut sub_addrs, &mut sub_calls);
+                }
+            }
+        }
+        for next in direct_callees
+            .into_iter()
+            .chain(sub_addrs)
+            .chain(sub_calls.into_keys())
+        {
+            if reachable.insert(next.clone()) {
+                worklist.push_back(next);
+            }
+        }
+    }
+
+    module.functions.retain(|f| reachable.contains(&f.name));
+    module
+        .dual_specialized_fns
+        .retain(|name| reachable.contains(name) || reachable.contains(&format!("{name}__noyield")));
+    module.monomorphized_instances.retain(|item| {
+        item.kind == crate::ir::MonomorphizedItemKind::Struct
+            || reachable.contains(&item.mangled_name)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7492,5 +7642,115 @@ mod tests {
             !mir.functions[0].vars[0].hoisted,
             "uniform folded coroutine fn param must clear hoisted"
         );
+    }
+
+    #[test]
+    fn prune_unreachable_functions_drops_dead_helpers_and_keeps_transitive_and_fnaddr() {
+        let mut mir = empty_module();
+        let ret_u32 = |v: i128| MirStmt::Return(Some(MirExpr::new(MirExprKind::IntLit(v), MirType::U32)));
+
+        mir.functions.push(MirFunction {
+            name: "used_direct".to_string(),
+            params: vec![],
+            ret_ty: MirType::U32,
+            error_spec: MirErrorSpec::None,
+            manual_yield: false,
+            is_yielding: false,
+            vars: vec![],
+            body: MirFnBody::Direct(vec![MirStmt::Return(Some(MirExpr::new(
+                MirExprKind::CallDirect {
+                    callee: "used_leaf".to_string(),
+                    is_extern_c: false,
+                    args: vec![],
+                },
+                MirType::U32,
+            )))]),
+        });
+        mir.functions.push(MirFunction {
+            name: "used_leaf".to_string(),
+            params: vec![],
+            ret_ty: MirType::U32,
+            error_spec: MirErrorSpec::None,
+            manual_yield: false,
+            is_yielding: false,
+            vars: vec![],
+            body: MirFnBody::Direct(vec![ret_u32(1)]),
+        });
+        mir.functions.push(MirFunction {
+            name: "putc_hook".to_string(),
+            params: vec![],
+            ret_ty: MirType::Void,
+            error_spec: MirErrorSpec::None,
+            manual_yield: false,
+            is_yielding: false,
+            vars: vec![],
+            body: MirFnBody::Direct(vec![MirStmt::Return(None)]),
+        });
+        mir.functions.push(MirFunction {
+            name: "dead_pure".to_string(),
+            params: vec![],
+            ret_ty: MirType::U32,
+            error_spec: MirErrorSpec::None,
+            manual_yield: false,
+            is_yielding: false,
+            vars: vec![],
+            body: MirFnBody::Direct(vec![ret_u32(99)]),
+        });
+        mir.functions.push(MirFunction {
+            name: "dead_yielding".to_string(),
+            params: vec![],
+            ret_ty: MirType::Void,
+            error_spec: MirErrorSpec::None,
+            manual_yield: false,
+            is_yielding: true,
+            vars: vec![],
+            body: MirFnBody::Coroutine {
+                blocks: vec![MirBlock {
+                    id: BlockId(0),
+                    is_resume_entry: true,
+                    stmts: vec![],
+                    terminator: MirTerminator::Return(None),
+                }],
+                child_slots: vec![],
+            },
+        });
+        mir.dual_specialized_fns.push("dead_yielding".to_string());
+        mir.monomorphized_instances.push(crate::ir::MonomorphizedMirItem {
+            kind: crate::ir::MonomorphizedItemKind::Fn,
+            signature: "dead_pure".to_string(),
+            mangled_name: "dead_pure".to_string(),
+            size_32: 0,
+            size_64: 0,
+        });
+        mir.boot.steps.push(MirBootStep::Stmt(MirStmt::Intrinsic(
+            MirIntrinsicOp::SysOp {
+                method: "set_putc".to_string(),
+                args: vec![MirExpr::new(
+                    MirExprKind::FnAddr("putc_hook".to_string()),
+                    MirType::Usize,
+                )],
+            },
+        )));
+        mir.boot.steps.push(MirBootStep::Stmt(MirStmt::Expr(MirExpr::new(
+            MirExprKind::CallDirect {
+                callee: "used_direct".to_string(),
+                is_extern_c: false,
+                args: vec![],
+            },
+            MirType::U32,
+        ))));
+
+        prune_unreachable_functions(&mut mir);
+        crate::ram::populate_module_ram_report(&mut mir);
+
+        let kept: BTreeSet<&str> = mir.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(kept.contains("used_direct"));
+        assert!(kept.contains("used_leaf"));
+        assert!(kept.contains("putc_hook"));
+        assert!(!kept.contains("dead_pure"));
+        assert!(!kept.contains("dead_yielding"));
+        assert!(mir.ram_report.fn_frames.is_empty(), "fn_frames={:?}", mir.ram_report.fn_frames);
+        assert!(mir.dual_specialized_fns.is_empty());
+        assert!(mir.monomorphized_instances.is_empty());
     }
 }

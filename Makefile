@@ -29,6 +29,7 @@ check:
 	$(ZEVC) check --board lm3s6965_evb examples/portable_controller_demo.zev
 	$(ZEVC) check --board nucleo_f334r8 examples/portable_controller_demo.zev
 	$(ZEVC) check --board esp32c6_pico examples/portable_controller_demo.zev
+	$(ZEVC) check --board rpi_pico_w examples/portable_controller_demo.zev
 	$(ZEVC) check --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
 
 ram:

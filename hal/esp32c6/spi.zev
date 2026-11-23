@@ -1,9 +1,10 @@
-// Portable HAL SPI master bus interface (ESP32-C6 target, SoftYielding)
+// Portable HAL SPI master bus interface (ESP32-C6 SPI2 / GP-SPI, SoftYielding)
 
+import chip.esp32c6 as hw;
 import std.bus as bus;
 
 pub struct Bus {
-    u8  unit;
+    u8  unit; // 1 or 2 -> SPI2
     u32 timeout_ms;
 }
 
@@ -14,14 +15,39 @@ pub Bus make_bus(u8 unit, u32 timeout_ms) {
     };
 }
 
+u32 eff_timeout(u32 to_ms) {
+    if (to_ms == 0u32) {
+        return 25u32;
+    }
+    return to_ms;
+}
+
 impl Bus {
     pub u8 transfer_byte(self, u8 tx) error bus.BusStatus {
         checkpoint();
-        u8 _t = tx;
-        if (self.unit == 0u8) {
+        if (self.unit == 0u8 || self.unit > 2u8) {
             error bus.BusStatus.FrameErr;
         }
-        error bus.BusStatus.BusBusy;
+        if ((hw.PCR.spi2_conf & 1u32) == 0u32) {
+            error bus.BusStatus.BusBusy;
+        }
+        u32 t0 = sys.now_ms();
+        u32 limit = eff_timeout(self.timeout_ms);
+        hw.SPI2.ms_dlen = 7u32; // 8-bit full-duplex transfer
+        hw.SPI2.data_buf[0] = tx as u32;
+        hw.SPI2.cmd = 1u32 << 24; // SPI_USR
+        for (u32 iter in 0..100_000) {
+            if ((hw.SPI2.cmd & (1u32 << 24)) == 0u32) {
+                return (hw.SPI2.data_buf[0] & 0xFFu32) as u8;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        error bus.BusStatus.Timeout;
     }
 
     pub fn transfer(self, []u8 tx, []u8 rx) error bus.BusStatus {

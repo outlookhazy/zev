@@ -1,0 +1,96 @@
+// Portable HAL SPI master bus interface (RP2040 PL022 SPI0, SoftYielding)
+
+import chip.rp2040 as hw;
+import std.bus as bus;
+
+pub struct Bus {
+    u8  unit; // 1 = SPI0
+    u32 timeout_ms;
+}
+
+pub Bus make_bus(u8 unit, u32 timeout_ms) {
+    return Bus {
+        unit: unit,
+        timeout_ms: timeout_ms,
+    };
+}
+
+u32 eff_timeout(u32 to_ms) {
+    if (to_ms == 0u32) {
+        return 25u32;
+    }
+    return to_ms;
+}
+
+impl Bus {
+    pub u8 transfer_byte(self, u8 tx) error bus.BusStatus {
+        checkpoint();
+        if (self.unit != 1u8) {
+            error bus.BusStatus.FrameErr;
+        }
+        if ((hw.RESETS.reset_done & hw.RESETS_SPI0) == 0u32 || (hw.SPI0.cr1 & 2u32) == 0u32) {
+            error bus.BusStatus.BusBusy;
+        }
+        u32 t0 = sys.now_ms();
+        u32 limit = eff_timeout(self.timeout_ms);
+        bool tx_ok = false;
+        for (u32 iter in 0..100_000) {
+            if ((hw.SPI0.sr & 2u32) != 0u32) { // TNF
+                tx_ok = true;
+                break;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        if (!tx_ok) {
+            error bus.BusStatus.Timeout;
+        }
+        hw.SPI0.dr = tx as u32;
+        for (u32 iter in 0..100_000) {
+            if ((hw.SPI0.sr & 4u32) != 0u32) { // RNE
+                return (hw.SPI0.dr & 0xFFu32) as u8;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        error bus.BusStatus.Timeout;
+    }
+
+    pub fn transfer(self, []u8 tx, []u8 rx) error bus.BusStatus {
+        if (tx.len != rx.len) {
+            error bus.BusStatus.FrameErr;
+        }
+        for (usize i in 0..tx.len) {
+            rx[i] = self.transfer_byte(tx[i]) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
+    }
+
+    pub fn write(self, []u8 tx) error bus.BusStatus {
+        for (u8 t in tx) {
+            u8 _r = self.transfer_byte(t) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
+    }
+
+    pub fn read(self, []u8 rx, u8 fill) error bus.BusStatus {
+        for (usize i in 0..rx.len) {
+            rx[i] = self.transfer_byte(fill) catch (bus.BusStatus err) {
+                error err;
+            };
+        }
+        return;
+    }
+}

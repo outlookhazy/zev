@@ -1083,6 +1083,13 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         ram_report: RamReport::default(),
     };
 
+    crate::opt::prune_unreachable_functions(&mut module);
+    module.formatted_enums = collect_formatted_enums(
+        &module.isrs,
+        &module.functions,
+        &module.task_blueprints,
+        &module.boot,
+    );
     crate::opt::fold_singletons(&mut module);
     let vis = crate::opt::analyze_visibility(&module);
     for p in &mut module.primitives {

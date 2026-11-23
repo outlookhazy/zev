@@ -6479,11 +6479,12 @@ fn board_module_and_hal_target_binding_across_four_targets() {
     let demo_src = std::fs::read_to_string(&demo_path).expect("read portable_controller_demo.zev");
     let demo_label = demo_path.display().to_string();
 
-    let targets: [(&str, Option<&str>, Option<&str>); 4] = [
+    let targets: [(&str, Option<&str>, Option<&str>); 5] = [
         ("host_sim", None, None),
         ("lm3s6965_evb", Some("hal/lm3s6965"), Some("bsp/lm3s6965_evb")),
         ("nucleo_f334r8", Some("hal/stm32f3"), Some("bsp/nucleo_f334r8")),
         ("esp32c6_pico", Some("hal/esp32c6"), Some("bsp/esp32c6_pico")),
+        ("rpi_pico_w", Some("hal/rp2040"), Some("bsp/rpi_pico_w_board")),
     ];
 
     for (label, hal_dir, board_module) in targets {
@@ -6559,6 +6560,7 @@ fn main() {
     for (label, hal_dir, board_module) in [
         ("emb_sim", None, None),
         ("emb_esp32c6", Some("hal/esp32c6"), Some("bsp/esp32c6_pico")),
+        ("emb_rp2040", Some("hal/rp2040"), Some("bsp/rpi_pico_w_board")),
     ] {
         let g = zev_sema::collect_import_aware_generic_names_with_targets(
             &[(emb_src, None)],

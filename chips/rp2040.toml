@@ -12,6 +12,7 @@ code_in_ram = true
 has_thumb2 = false
 has_vtor = true
 allow_sleep_deep = false
+hal_dir = "hal/rp2040"
 
 [memory]
 flash_base = 0x2000_0000

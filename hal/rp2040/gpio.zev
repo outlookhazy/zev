@@ -1,0 +1,125 @@
+// Portable HAL digital GPIO interface (RP2040 GPIO0..GPIO29; Pico W CYW43439 pins 23/24/25/29 guarded)
+
+import chip.rp2040 as hw;
+
+pub enum Mode {
+    Input  = 0,
+    Output = 1,
+    Analog = 2,
+}
+
+pub enum Pull {
+    None = 0,
+    Up   = 1,
+    Down = 2,
+}
+
+pub struct Pin {
+    u8   port;
+    u8   pin;
+    bool active_low;
+}
+
+pub Pin make_pin(u8 port, u8 pin, bool active_low) {
+    return Pin {
+        port: port,
+        pin: pin,
+        active_low: active_low,
+    };
+}
+
+bool pin_guarded(u8 port, u8 pin) {
+    if (port != 0u8 || pin >= 30u8) {
+        return true;
+    }
+    // Never disturb Pico W CYW43439 wireless / SMPS / VSYS pins (GPIO23, GPIO24, GPIO25, GPIO29).
+    if (pin == 23u8 || pin == 24u8 || pin == 25u8 || pin == 29u8) {
+        return true;
+    }
+    return false;
+}
+
+u32 pad_pull_bits(Pull p) {
+    switch (p) {
+        Pull.None => { return 0u32; }
+        Pull.Up   => { return 0x08u32; } // PUE
+        Pull.Down => { return 0x04u32; } // PDE
+    }
+}
+
+impl Pin {
+    pub fn set_mode(self, Mode mode, Pull pull) {
+        if (pin_guarded(self.port, self.pin)) {
+            return;
+        }
+        usize p = self.pin as usize;
+        u32 bit = 1u32 << (self.pin as u32);
+        u32 pull_b = pad_pull_bits(pull);
+        switch (mode) {
+            Mode.Input => {
+                hw.SIO.gpio_oe_clr = bit;
+                hw.PADS_BANK0.gpio[p] = 0x52u32 | pull_b; // IE | DRIVE_4MA | SCHMITT
+                hw.IO_BANK0.gpio[p * 2usize + 1usize] = 5u32; // SIO
+            }
+            Mode.Output => {
+                hw.SIO.gpio_oe_set = bit;
+                hw.PADS_BANK0.gpio[p] = 0x52u32 | pull_b; // Keep IE enabled so `read()` observes pad
+                hw.IO_BANK0.gpio[p * 2usize + 1usize] = 5u32; // SIO
+            }
+            Mode.Analog => {
+                hw.SIO.gpio_oe_clr = bit;
+                hw.PADS_BANK0.gpio[p] = 0x80u32; // Output disable, input disable
+                hw.IO_BANK0.gpio[p * 2usize + 1usize] = 0x1Fu32; // NULL
+            }
+        }
+    }
+
+    pub bool read(self) {
+        if (self.port != 0u8 || self.pin >= 30u8) {
+            return false;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        bool raw = false;
+        if ((hw.SIO.gpio_oe & bit) != 0u32) {
+            // Single-cycle output latch avoids RP2040's 2-FF SIO.gpio_in input synchronizer lag.
+            raw = (hw.SIO.gpio_out & bit) != 0u32;
+        } else {
+            raw = (hw.SIO.gpio_in & bit) != 0u32;
+        }
+        if (self.active_low) {
+            return !raw;
+        }
+        return raw;
+    }
+
+    pub fn write(self, bool high) {
+        if (pin_guarded(self.port, self.pin)) {
+            return;
+        }
+        bool hw_lvl = high;
+        if (self.active_low) {
+            hw_lvl = !high;
+        }
+        u32 bit = 1u32 << (self.pin as u32);
+        if (hw_lvl) {
+            hw.SIO.gpio_out_set = bit;
+        } else {
+            hw.SIO.gpio_out_clr = bit;
+        }
+    }
+
+    pub fn set_high(self) {
+        self.write(true);
+    }
+
+    pub fn set_low(self) {
+        self.write(false);
+    }
+
+    pub fn toggle(self) {
+        if (pin_guarded(self.port, self.pin)) {
+            return;
+        }
+        hw.SIO.gpio_out_xor = 1u32 << (self.pin as u32);
+    }
+}

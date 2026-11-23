@@ -9,6 +9,7 @@ pub mmio GpioRegs {
     @ro  u32     in_reg           @ 0x3C;
     @w1c u32     status_w1tc      @ 0x4C;
     @rw  [31]u32 pin              @ 0x74;
+    @rw  [128]u32 func_in_sel_cfg @ 0x154;
     @rw  [31]u32 func_out_sel_cfg @ 0x554;
 }
 
@@ -56,12 +57,51 @@ pub mmio PlicMxRegs {
 }
 
 pub mmio PcrRegs {
+    @rw u32 i2c_conf       @ 0x20;
+    @rw u32 i2c_sclk_conf  @ 0x24;
     @rw u32 rmt_conf       @ 0x2C;
     @rw u32 rmt_sclk_conf  @ 0x30;
+    @rw u32 ledc_conf      @ 0x34;
+    @rw u32 ledc_sclk_conf @ 0x38;
     @rw u32 systimer_conf  @ 0x54;
     @rw u32 saradc_conf    @ 0x80;
     @rw u32 tsens_clk_conf @ 0x88;
     @rw u32 gdma_conf      @ 0xBC;
+    @rw u32 spi2_conf      @ 0xC0;
+    @rw u32 spi2_clkm_conf @ 0xC4;
+}
+
+pub mmio LedcRegs {
+    @rw u32 ch0_conf0    @ 0x00;
+    @rw u32 ch0_hpoint   @ 0x04;
+    @rw u32 ch0_duty     @ 0x08;
+    @rw u32 ch0_conf1    @ 0x0C;
+    @ro u32 ch0_duty_r   @ 0x10;
+    @rw u32 timer0_conf  @ 0xA0;
+    @ro u32 timer0_value @ 0xA4;
+    @rw u32 conf         @ 0x1F0;
+}
+
+pub mmio I2cRegs {
+    @rw  u32    scl_low_period   @ 0x00;
+    @rw  u32    ctr              @ 0x04;
+    @ro  u32    sr               @ 0x08;
+    @rw  u32    to               @ 0x0C;
+    @ro  u32    fifo_st          @ 0x14;
+    @rw  u32    fifo_conf        @ 0x18;
+    @rw  u32    data             @ 0x1C;
+    @ro  u32    int_raw          @ 0x20;
+    @w1c u32    int_clr          @ 0x24;
+    @rw  u32    sda_hold         @ 0x30;
+    @rw  u32    sda_sample       @ 0x34;
+    @rw  u32    scl_high_period  @ 0x38;
+    @rw  u32    scl_start_hold   @ 0x40;
+    @rw  u32    scl_rstart_setup @ 0x44;
+    @rw  u32    scl_stop_hold    @ 0x48;
+    @rw  u32    scl_stop_setup   @ 0x4C;
+    @rw  u32    filter_cfg       @ 0x50;
+    @rw  u32    clk_conf         @ 0x54;
+    @rw  [8]u32 comd             @ 0x58;
 }
 
 pub mmio ApbSaradcRegs {
@@ -177,6 +217,8 @@ pub mmio RMTMEM     : RmtMemRegs    @ 0x6000_6400;
 pub mmio TIMG0      : TimgWdtRegs   @ 0x6000_8000;
 pub mmio TIMG1      : TimgWdtRegs   @ 0x6000_9000;
 pub mmio SYSTIMER   : SystimerRegs  @ 0x6000_A000;
+pub mmio I2C0       : I2cRegs       @ 0x6000_4000;
+pub mmio LEDC       : LedcRegs      @ 0x6000_7000;
 pub mmio APB_SARADC : ApbSaradcRegs @ 0x6000_E000;
 pub mmio USB_DEVICE : UsbDeviceRegs @ 0x6000_F000;
 pub mmio INTMTX     : IntmtxRegs    @ 0x6001_0000;
@@ -206,9 +248,15 @@ pub irq IRQ_GDMA_IN_CH0      = 66;
 pub irq IRQ_GDMA_OUT_CH0     = 69;
 pub irq IRQ_GSPI2            = 72;
 
-pub const u32 PIN_RGB_LED      = 8;
-pub const u32 PIN_BOOT_BTN     = 9;
-pub const u32 RMT_SIG_OUT0_IDX = 71;
+pub const u32 PIN_RGB_LED         = 8;
+pub const u32 PIN_BOOT_BTN        = 9;
+pub const u32 LEDC_LS_SIG_OUT0_IDX = 0;
+pub const u32 I2CEXT0_SCL_IDX     = 45;
+pub const u32 I2CEXT0_SDA_IDX     = 46;
+pub const u32 FSPICLK_IDX         = 63;
+pub const u32 FSPIQ_IDX           = 64;
+pub const u32 FSPID_IDX           = 65;
+pub const u32 RMT_SIG_OUT0_IDX    = 71;
 
 pub fn route_irq(u32 src_id, u32 cpu_slot) {
     INTMTX.map[src_id as usize] = cpu_slot;

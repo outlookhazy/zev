@@ -1,0 +1,137 @@
+// Raspberry Pi Pico W Portable `board` Module (`bsp.rpi_pico_w_board`)
+//
+// Implements the uniform `import board;` contract while delegating core RP2040 clock/USB-CDC/ADC
+// primitives to `bsp.rpi_pico_w` (keeping `examples/pico_w_demo.zev` unchanged).
+
+import chip.rp2040 as hw;
+import bsp.rpi_pico_w as bsp;
+import hal.{adc, gpio, i2c, pwm, spi};
+
+pub const []u8 BOARD_NAME = "rpi_pico_w";
+pub const bool EXIT_ON_DONE = false;
+
+pub const gpio.Pin PIN_USER_OUT = gpio.Pin { port: 0u8, pin: 2u8, active_low: false };
+pub const gpio.Pin PIN_BUTTON   = gpio.Pin { port: 0u8, pin: 3u8, active_low: true  };
+
+byte_ring<64>  usb_rx;
+byte_ring<512> usb_tx;
+
+fn console_putc(u8 b) {
+    bool _ok = usb_tx.push_byte(b);
+    if (b == '\n') {
+        bsp.usb_kick_tx();
+    }
+}
+
+isr board_usb_cdc_isr(*byte_ring rx, *byte_ring tx) {
+    state bsp.UsbCdcState usb = bsp.UsbCdcState {
+        ep0_pid: 8192u32,
+        ep1_pid: 0u32,
+        ep2_pid: 0u32,
+        ep0_off: 0u32,
+        ep0_rem: 0u32,
+        baud: 115200u32,
+        ep0_desc_id: 0u8,
+        ep2_busy: false,
+        should_addr: false,
+        pending_addr: 0u8,
+        expect_lc: false,
+        boot_rst: false,
+        was_data_in: false,
+        need_zlp: false,
+        configured: false,
+        dtr: false,
+        line_coding: [0x00u8, 0xC2u8, 0x01u8, 0x00u8, 0u8, 0u8, 8u8]
+    };
+    if (bsp.usb_cdc_irq_step(&usb, rx, tx)) {
+        hw.reset_usb_boot(0, 0);
+    }
+}
+
+pub fn init() {
+    sys.set_putc(console_putc);
+    bsp.init_clocks();
+    sys.use_systick(125_000_000);
+    bsp.init_usb_cdc();
+    bsp.init_temp_sensor();
+    hw.IRQ_USBCTRL.attach(board_usb_cdc_isr(&usb_rx, &usb_tx));
+    PIN_USER_OUT.set_low();
+    PIN_USER_OUT.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    PIN_BUTTON.set_mode(gpio.Mode.Input, gpio.Pull.Up);
+}
+
+pub fn set_led(bool on) {
+    PIN_USER_OUT.write(on);
+}
+
+pub bool read_button() {
+    return PIN_BUTTON.read();
+}
+
+pub adc.Channel default_adc() {
+    return adc.make_channel(1u8, 4u8, 3300u16);
+}
+
+pub pwm.Channel default_pwm() {
+    hw.RESETS_CLR.reset = hw.RESETS_PWM;
+    for (u32 _w in 0..1024) {
+        if ((hw.RESETS.reset_done & hw.RESETS_PWM) != 0u32) {
+            break;
+        }
+    }
+    // GPIO4 = PWM2 Channel A (`FUNCSEL = 4`)
+    hw.PADS_BANK0.gpio[4] = 0x52u32;
+    hw.IO_BANK0.gpio[4usize * 2usize + 1usize] = 4u32;
+    usize base = 2usize * 5usize; // Slice 2
+    hw.PWM.ch[base] = 0u32;
+    hw.PWM.ch[base + 1usize] = 125u32 << 4; // 125 MHz / 125 = 1 MHz tick
+    hw.PWM.ch[base + 4usize] = 999u32;       // 1 kHz PWM period
+    hw.PWM.ch[base + 3usize] = 0u32;
+    return pwm.make_channel(0u8, 2u8, 0u8, 1000u32, 0u16);
+}
+
+pub spi.Bus default_spi() {
+    hw.RESETS_CLR.reset = hw.RESETS_SPI0;
+    for (u32 _w in 0..1024) {
+        if ((hw.RESETS.reset_done & hw.RESETS_SPI0) != 0u32) {
+            break;
+        }
+    }
+    // GPIO16 = SPI0 RX (PUE|IE), GPIO18 = SPI0 SCK, GPIO19 = SPI0 TX (`FUNCSEL = 1`)
+    hw.PADS_BANK0.gpio[16] = 0x5Au32;
+    hw.PADS_BANK0.gpio[18] = 0x52u32;
+    hw.PADS_BANK0.gpio[19] = 0x52u32;
+    hw.IO_BANK0.gpio[16usize * 2usize + 1usize] = 1u32;
+    hw.IO_BANK0.gpio[18usize * 2usize + 1usize] = 1u32;
+    hw.IO_BANK0.gpio[19usize * 2usize + 1usize] = 1u32;
+    hw.SPI0.cr1 = 0u32;
+    hw.SPI0.cpsr = 124u32; // ~1 MHz from 125 MHz clk_peri
+    hw.SPI0.cr0 = 7u32;    // 8-bit Mode 0
+    hw.SPI0.cr1 = 2u32;    // SSE enable
+    return spi.make_bus(1u8, 10u32);
+}
+
+pub i2c.Bus default_i2c() {
+    hw.RESETS_CLR.reset = hw.RESETS_I2C0;
+    for (u32 _w in 0..1024) {
+        if ((hw.RESETS.reset_done & hw.RESETS_I2C0) != 0u32) {
+            break;
+        }
+    }
+    // GPIO8 = I2C0 SDA, GPIO9 = I2C0 SCL (`FUNCSEL = 3`, IE|PUE|SCHMITT)
+    hw.PADS_BANK0.gpio[8] = 0x5Au32;
+    hw.PADS_BANK0.gpio[9] = 0x5Au32;
+    hw.IO_BANK0.gpio[8usize * 2usize + 1usize] = 3u32;
+    hw.IO_BANK0.gpio[9usize * 2usize + 1usize] = 3u32;
+    hw.I2C0.enable = 0u32;
+    for (u32 _w in 0..1024) {
+        if ((hw.I2C0.enable_status & 1u32) == 0u32) {
+            break;
+        }
+    }
+    hw.I2C0.con = 0x63u32; // IC_SLAVE_DISABLE | IC_RESTART_EN | SPEED=1 (100k) | MASTER_MODE
+    hw.I2C0.ss_scl_hcnt = 560u32;
+    hw.I2C0.ss_scl_lcnt = 690u32;
+    hw.I2C0.enable = 1u32;
+    return i2c.make_bus(1u8, 10u32);
+}

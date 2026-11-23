@@ -1518,12 +1518,18 @@ fn main() -> ExitCode {
             include_dirs,
             opt_level,
             output,
-        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+        } => {
+            let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
+            opts.opt_level = opt_level;
+            match compile_to_mir_with_includes_and_targets(
+                &files,
+                &include_dirs,
+                opts.hal_dir.as_deref(),
+                opts.board_module.as_deref(),
+            ) {
             Ok((_, mir)) => {
                 let out_uf2 = output.unwrap_or_else(|| default_output_with_ext(&files, "uf2"));
                 let out_elf = out_uf2.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
-                opts.opt_level = opt_level;
                 match zev_codegen_llvm::build_rp2040_image_with_options(
                     &mir, &out_elf, &out_uf2, &opts,
                 ) {
@@ -1541,6 +1547,7 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
+            }
         },
         Command::FlashRp2040 {
             files,
@@ -1548,7 +1555,15 @@ fn main() -> ExitCode {
             port,
             opt_level,
             output,
-        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+        } => {
+            let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
+            opts.opt_level = opt_level;
+            match compile_to_mir_with_includes_and_targets(
+                &files,
+                &include_dirs,
+                opts.hal_dir.as_deref(),
+                opts.board_module.as_deref(),
+            ) {
             Ok((_, mir)) => {
                 let mut temp_holder: Option<TempWorkDir> = None;
                 let out_uf2 = match output {
@@ -1567,8 +1582,6 @@ fn main() -> ExitCode {
                     }
                 };
                 let out_elf = out_uf2.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
-                opts.opt_level = opt_level;
                 let res = match zev_codegen_llvm::build_rp2040_image_with_options(
                     &mir, &out_elf, &out_uf2, &opts,
                 ) {
@@ -1596,7 +1609,8 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-        },
+            }
+        }
     }
 }
 
