@@ -950,6 +950,128 @@ mod tests {
         );
     }
 
+    #[test]
+    fn avr_scheduler_select_next_task_compact_loop_and_all_opt_levels_link() {
+        let src = r#"
+            watch<u16> latest = 0;
+            signal wake_sig;
+            inbox<u8, 4> cmd_q;
+
+            task crit_worker() {
+                loop {
+                    wake_sig.wait();
+                    latest.publish(latest.read() + 1u16);
+                }
+            }
+
+            task high_worker() {
+                loop every 2ms {
+                    wake_sig.notify();
+                    cmd_q.post(7u8);
+                }
+            }
+
+            task norm_worker() {
+                loop {
+                    u8 v = cmd_q.recv();
+                    latest.publish((u16)v);
+                }
+            }
+
+            task poll_worker() {
+                loop {
+                    checkpoint();
+                    delay(5ms);
+                }
+            }
+
+            fn main() {
+                spawn crit_worker() @critical;
+                spawn high_worker() @high;
+                spawn norm_worker() @normal;
+                spawn poll_worker() @low;
+            }
+        "#;
+        let prog = zev_parser::parse_str(src).expect("parse avr sched test");
+        zev_sema::analyze_program(&prog).expect("sema avr sched test");
+        let mir = zev_mir::lower_program(&prog).expect("mir avr sched test");
+        let dir = test_out_dir();
+        let objdump_bin = crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump");
+        let nm_bin = crate::toolchain::find_tool("/bin/llvm-nm", "llvm-nm");
+
+        for level in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz"] {
+            let tag = level.trim_start_matches('-');
+
+            let mut uno_opts = CodegenOptions::avr_uno();
+            uno_opts.opt_level = level.to_string();
+            let uno_elf = dir.join(format!("avr_sched_uno_{tag}.elf"));
+            let uno_bin = dir.join(format!("avr_sched_uno_{tag}.bin"));
+            let uno_img = build_avr_uno_image_with_options(&mir, &uno_elf, &uno_bin, &uno_opts)
+                .unwrap_or_else(|e| panic!("ATmega328P AVR build/link failed under {level}: {e}"));
+            verify_ll_with_opt(&uno_img.elf.ll_path)
+                .unwrap_or_else(|e| panic!("LLVM opt verify failed under {level}: {e}"));
+            assert!(uno_img.elf.audit.is_zero_heap_freestanding());
+
+            let nm_out = Command::new(&nm_bin)
+                .args(["-S", "--radix=x"])
+                .arg(&uno_elf)
+                .output()
+                .expect("run llvm-nm -S on AVR ELF");
+            assert!(nm_out.status.success(), "llvm-nm failed on AVR ELF");
+            let nm_txt = String::from_utf8_lossy(&nm_out.stdout);
+            let sym_line = nm_txt
+                .lines()
+                .find(|l| l.split_whitespace().last() == Some("__syn_select_next_task"))
+                .unwrap_or_else(|| panic!("missing __syn_select_next_task symbol under {level}:\n{nm_txt}"));
+            let parts: Vec<&str> = sym_line.split_whitespace().collect();
+            let sym_size = u64::from_str_radix(parts[1], 16)
+                .unwrap_or_else(|_| panic!("expected hex size in llvm-nm line: {sym_line}"));
+            let max_size = if level == "-O0" { 320 } else { 112 };
+            assert!(
+                sym_size > 0 && sym_size <= max_size,
+                "expected __syn_select_next_task size <= {max_size} B under {level}, got {sym_size} B"
+            );
+
+            let scan_line = nm_txt
+                .lines()
+                .find(|l| l.split_whitespace().last() == Some("__syn_scan_rank"))
+                .unwrap_or_else(|| panic!("missing __syn_scan_rank symbol under {level}:\n{nm_txt}"));
+            let scan_addr = u64::from_str_radix(
+                scan_line.split_whitespace().next().unwrap_or("0"),
+                16,
+            )
+            .unwrap_or(0);
+            let scan_target = format!("0x{scan_addr:x}");
+
+            let dis_out = Command::new(&objdump_bin)
+                .args(["-d", "--disassemble-symbols=__syn_select_next_task"])
+                .arg(&uno_elf)
+                .output()
+                .expect("run llvm-objdump on __syn_select_next_task");
+            assert!(dis_out.status.success(), "llvm-objdump failed under {level}");
+            let dis_txt = String::from_utf8_lossy(&dis_out.stdout);
+            let scan_calls = dis_txt
+                .lines()
+                .filter(|l| (l.contains("\tcall\t") || l.contains("\trcall\t")) && l.contains(&scan_target))
+                .count();
+            assert_eq!(
+                scan_calls, 2,
+                "expected compact non-unrolled rank loop (1 loop call + 1 poll-reset call = 2 __syn_scan_rank calls) under {level}, got {scan_calls} (target {scan_target}):\n{dis_txt}"
+            );
+
+            let mut nano_opts = CodegenOptions::avr_nano_every();
+            nano_opts.opt_level = level.to_string();
+            let nano_elf = dir.join(format!("avr_sched_nano_{tag}.elf"));
+            let nano_bin = dir.join(format!("avr_sched_nano_{tag}.bin"));
+            let nano_img =
+                build_avr_nano_every_image_with_options(&mir, &nano_elf, &nano_bin, &nano_opts)
+                    .unwrap_or_else(|e| {
+                        panic!("ATmega4809 AVR build/link failed under {level}: {e}")
+                    });
+            assert!(nano_img.elf.audit.is_zero_heap_freestanding());
+        }
+    }
+
     // ─────────────────────────────────────────────────────────────────────────
     // Section 6.2 Wave 1 — Bare-Metal ARM Cortex-M3 QEMU Execution Suite
     // ─────────────────────────────────────────────────────────────────────────

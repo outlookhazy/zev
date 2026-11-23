@@ -1112,7 +1112,7 @@ exit:
   ret void
 }}
 
-define void @__syn_wake_timers(i32 %now){fn_as} nounwind{sz} {{
+define void @__syn_wake_timers(i32 %now){fn_as} nounwind noinline{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop
@@ -1283,7 +1283,7 @@ ret_false:
 }}
 
 ; Helper: scan one rank (`mode`: 0=Overdue, 1=Work, 2=Poll) ordered by priority 0..3 + round-robin
-define i32 @__syn_scan_rank(i32 %mode, i32 %now){fn_as} nounwind noinline{sz} {{
+define i32 @__syn_scan_rank(i8 %mode, i32 %now){fn_as} nounwind noinline{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   %empty = icmp sle i32 %n, 0
@@ -1317,7 +1317,7 @@ chk_prio:
   %pmatch = icmp eq i8 %ep, %p8
   br i1 %pmatch, label %chk_mode, label %slot_next
 chk_mode:
-  %m0 = icmp eq i32 %mode, 0
+  %m0 = icmp eq i8 %mode, 0
   br i1 %m0, label %mode_overdue, label %chk_m1
 mode_overdue:
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
@@ -1326,7 +1326,7 @@ mode_overdue:
   %is_ov = icmp sge i32 %diff, 0
   br i1 %is_ov, label %found, label %slot_next
 chk_m1:
-  %m1 = icmp eq i32 %mode, 1
+  %m1 = icmp eq i8 %mode, 1
   br i1 %m1, label %mode_work, label %mode_poll
 mode_work:
   %mp_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 5
@@ -1342,10 +1342,10 @@ found:
   ret i32 %idx
 slot_next:
   %knext = add i32 %k, 1
-  br label %slot_loop
+  br label %slot_loop, !llvm.loop !3
 prio_next:
   %pnext = add i32 %p, 1
-  br label %prio_loop
+  br label %prio_loop, !llvm.loop !2
 not_found:
   ret i32 -1
 }}
@@ -1368,35 +1368,35 @@ exit:
   ret void
 }}
 
-define i32 @__syn_select_next_task(i32 %now){fn_as} nounwind{sz} {{
+define i32 @__syn_select_next_task(i32 %now){fn_as} nounwind noinline{sz} {{
 entry:
-  %ov = {call_kw} i32 @__syn_scan_rank(i32 0, i32 %now)
-  %has_ov = icmp sge i32 %ov, 0
-  br i1 %has_ov, label %ret_ov, label %try_work
-ret_ov:
-  ret i32 %ov
-try_work:
-  %wk = {call_kw} i32 @__syn_scan_rank(i32 1, i32 %now)
-  %has_wk = icmp sge i32 %wk, 0
-  br i1 %has_wk, label %ret_wk, label %try_poll
-ret_wk:
-  ret i32 %wk
-try_poll:
-  %pl = {call_kw} i32 @__syn_scan_rank(i32 2, i32 %now)
-  %has_pl = icmp sge i32 %pl, 0
-  br i1 %has_pl, label %ret_pl, label %try_reset
-ret_pl:
-  ret i32 %pl
+  br label %rank_loop
+rank_loop:
+  %rank = phi i8 [ 0, %entry ], [ %rank_next, %rank_cont ]
+  %cand = {call_kw} i32 @__syn_scan_rank(i8 %rank, i32 %now)
+  %found = icmp sge i32 %cand, 0
+  br i1 %found, label %ret_cand, label %rank_cont
+ret_cand:
+  ret i32 %cand
+rank_cont:
+  %rank_next = add i8 %rank, 1
+  %more_ranks = icmp ult i8 %rank_next, 3
+  br i1 %more_ranks, label %rank_loop, label %try_reset, !llvm.loop !0
 try_reset:
   %any_rdy = {call_kw} i1 @__syn_any_ready_task()
   br i1 %any_rdy, label %do_reset, label %none
 do_reset:
   {call_kw} void @__syn_reset_poll_round()
-  %pl2 = {call_kw} i32 @__syn_scan_rank(i32 2, i32 %now)
+  %pl2 = {call_kw} i32 @__syn_scan_rank(i8 2, i32 %now)
   ret i32 %pl2
 none:
   ret i32 -1
 }}
+
+!0 = distinct !{{!0, !1}}
+!1 = !{{!"llvm.loop.unroll.disable"}}
+!2 = distinct !{{!2, !1}}
+!3 = distinct !{{!3, !1}}
 
 define void @__syn_activate_task(i32 %slot, {fn_ptr_ty} %step_fn, ptr %frame, i8 %prio, i8 %core_pin){fn_as} nounwind{sz} {{
 entry:

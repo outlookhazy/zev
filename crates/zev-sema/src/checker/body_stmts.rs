@@ -2622,6 +2622,17 @@ impl<'a> BodyChecker<'a> {
                 target: base,
                 field,
             } => {
+                if let Some(const_name) = self.root_const_of_place(target) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        target.span,
+                        format!(
+                            "cannot assign to field of immutable const '{}'",
+                            const_name
+                        ),
+                    ));
+                    return;
+                }
                 // Check field or MMIO register write (`r.buf = half;`, `USART1.icr = 1;`, `regs.cr1 |= 1;`).
                 let base_val = self.check_projection_base(base);
                 let (struct_name, via_ptr) = match &base_val.ty {
@@ -2919,6 +2930,17 @@ impl<'a> BodyChecker<'a> {
                 target: seq_expr,
                 index,
             } => {
+                if let Some(const_name) = self.root_const_of_place(target) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        target.span,
+                        format!(
+                            "cannot assign to element of immutable const '{}'",
+                            const_name
+                        ),
+                    ));
+                    return;
+                }
                 // Handle indexed MMIO array register writes (`regs.brr[i] = val;`, `regs.brr[i] |= mask;`)
                 // directly so `@wo` array registers are never misread before checking write qualifiers.
                 if let ExprKind::Field {
