@@ -1,0 +1,12 @@
+# Arduino Uno R3 (ATmega328P + Optiboot 512B Bootloader)
+
+[board]
+name = "arduino_uno"
+chip = "atmega328p"
+
+[memory]
+usable_flash_size = 32256
+
+[run]
+flash_cmd = ["python3", "tools/flash_avr_stk500v1.py", "{image}", "{port}"]
+default_port = "/dev/ttyACM0"

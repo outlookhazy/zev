@@ -34,6 +34,9 @@ pub fn init_soc() {
         hw.PCR.systimer_conf = (hw.PCR.systimer_conf | 1) & (~2u32);
         hw.SYSTIMER.conf = hw.SYSTIMER.conf | 0xC000_0000;
     }
+    sys.set_putc(console_putc);
+    sys.set_clock_ms(sys_now_ms);
+    sys.set_irq_router(hw.route_irq, hw.ack_irq);
 }
 
 pub u32 sys_now_ms() {

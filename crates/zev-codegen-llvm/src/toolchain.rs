@@ -9,20 +9,16 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Target architecture for LLVM 23 code generation.
+use crate::target_spec::{CpuIsa, ImageFormat, IrqModel, TargetSpec, discover_spec_roots};
+
+/// Compatibility target alias mapping legacy hardcoded enum variants onto declarative `chips/` + `boards/` TOMLs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetArch {
-    /// Bare-metal ARM Cortex-M3 (`thumbv7m-none-eabi`, Stellaris `lm3s6965evb` / STM32 compatible).
     Thumbv7mNoneEabi,
-    /// Bare-metal Raspberry Pi Pico / Pico W RP2040 (`thumbv6m-none-eabi`, Cortex-M0+ SRAM UF2).
     Thumbv6mRp2040,
-    /// Bare-metal Espressif ESP32-C6 RISC-V (`riscv32-unknown-none-elf`, `rv32imac` Direct-Boot).
     Riscv32Esp32C6,
-    /// Bare-metal Microchip ATmega328P AVR (`avr`, Arduino Uno R3 Optiboot 16 MHz).
     AvrAtmega328p,
-    /// Bare-metal Microchip ATmega4809 AVR (`avr` / `avrxmega3`, Arduino Nano Every 16/20 MHz).
     AvrAtmega4809,
-    /// Host 64-bit Linux (`x86_64-unknown-linux-gnu`) for host `.ll` inspection/testing.
     HostX86_64Linux,
 }
 
@@ -114,19 +110,21 @@ impl TargetArch {
     }
 }
 
-/// Configuration for LLVM 23 IR generation and bare-metal Cortex-M3 `.elf` linking.
+/// Configuration for LLVM 23 IR generation and bare-metal linking.
 #[derive(Debug, Clone)]
 pub struct CodegenOptions {
     pub target: TargetArch,
-    /// Flash base address (`0x0000_0000` on `lm3s6965evb`).
+    /// Optional declarative [`TargetSpec`] loaded from `chips/*.toml` + `boards/*.toml`.
+    pub spec: Option<TargetSpec>,
+    /// Flash base address override.
     pub flash_origin: u32,
-    /// Flash size in bytes (`256 * 1024` on `lm3s6965evb`).
+    /// Flash size in bytes override.
     pub flash_len: u32,
-    /// SRAM base address (`0x2000_0000` on Cortex-M).
+    /// SRAM base address override.
     pub ram_origin: u32,
-    /// SRAM size in bytes (`64 * 1024` on `lm3s6965evb` -> initial SP = `0x2001_0000`).
+    /// SRAM size in bytes override.
     pub ram_len: u32,
-    /// Optimization flag passed to `llc` (`"-O2"` by default).
+    /// Optimization flag passed to `opt`/`llc` (`"-O2"` by default; `"-Os"` on AVR).
     pub opt_level: String,
     /// Optional deterministic tick cap (`0` = unlimited, `> 0` = auto-exit at tick cap if reached).
     pub max_ticks: u32,
@@ -136,6 +134,7 @@ impl Default for CodegenOptions {
     fn default() -> Self {
         Self {
             target: TargetArch::Thumbv7mNoneEabi,
+            spec: None,
             flash_origin: 0x0000_0000,
             flash_len: 256 * 1024,
             ram_origin: 0x2000_0000,
@@ -147,62 +146,138 @@ impl Default for CodegenOptions {
 }
 
 impl CodegenOptions {
-    /// Default options for bare-metal Espressif ESP32-C6 (`rv32imac` Direct-Boot):
-    /// - `FLASH`: `0x4200_0000` (4 MB unified MMU cache mapped from flash offset `0x0`)
-    /// - `RAM`:   `0x4080_0000` (448 KB HP-SRAM -> initial `sp = 0x4087_0000`, below ROM top SRAM)
+    /// Construct codegen options directly from any declarative [`TargetSpec`].
+    pub fn from_spec(spec: TargetSpec) -> Self {
+        let target = match spec.isa {
+            CpuIsa::ArmCortexM => {
+                if spec.code_in_ram {
+                    TargetArch::Thumbv6mRp2040
+                } else {
+                    TargetArch::Thumbv7mNoneEabi
+                }
+            }
+            CpuIsa::Avr => {
+                if !spec.rodata_in_ram {
+                    TargetArch::AvrAtmega4809
+                } else {
+                    TargetArch::AvrAtmega328p
+                }
+            }
+            CpuIsa::Riscv32 => TargetArch::Riscv32Esp32C6,
+            CpuIsa::HostX86_64Linux => TargetArch::HostX86_64Linux,
+        };
+        Self {
+            target,
+            flash_origin: spec.flash_base,
+            flash_len: spec.effective_flash_size(),
+            ram_origin: spec.ram_base,
+            ram_len: spec.ram_size,
+            opt_level: spec.opt_level.clone(),
+            max_ticks: 0,
+            spec: Some(spec),
+        }
+    }
+
+    /// Resolve the active [`TargetSpec`], falling back to the built-in TOML mapped by `self.target`.
+    pub fn effective_spec(&self) -> Result<TargetSpec, CodegenError> {
+        let mut s = if let Some(spec) = &self.spec {
+            spec.clone()
+        } else {
+            let mut resolved = match self.target {
+                TargetArch::HostX86_64Linux => TargetSpec::host_linux(),
+                TargetArch::Thumbv7mNoneEabi => TargetSpec::resolve(None, Some("lm3s6965_evb"))?,
+                TargetArch::Thumbv6mRp2040 => TargetSpec::resolve(None, Some("rpi_pico_w"))?,
+                TargetArch::Riscv32Esp32C6 => TargetSpec::resolve(None, Some("esp32c6_pico"))?,
+                TargetArch::AvrAtmega328p => TargetSpec::resolve(None, Some("arduino_uno"))?,
+                TargetArch::AvrAtmega4809 => {
+                    TargetSpec::resolve(None, Some("arduino_nano_every"))?
+                }
+            };
+            let def = Self::default();
+            if self.target == TargetArch::Thumbv7mNoneEabi
+                && (self.flash_origin != def.flash_origin
+                    || self.flash_len != def.flash_len
+                    || self.ram_origin != def.ram_origin
+                    || self.ram_len != def.ram_len)
+            {
+                resolved.flash_base = self.flash_origin;
+                resolved.flash_size = self.flash_len;
+                resolved.usable_flash_size = None;
+                resolved.ram_base = self.ram_origin;
+                resolved.ram_size = self.ram_len;
+                resolved.sram_budget_bytes = self.ram_len;
+            }
+            resolved
+        };
+        s.opt_level = self.opt_level.clone();
+        Ok(s)
+    }
+
     pub fn esp32c6() -> Self {
-        Self {
-            target: TargetArch::Riscv32Esp32C6,
-            flash_origin: 0x4200_0000,
-            flash_len: 4 * 1024 * 1024,
-            ram_origin: 0x4080_0000,
-            ram_len: 448 * 1024,
-            opt_level: "-O2".to_string(),
-            max_ticks: 0,
+        match TargetSpec::resolve(None, Some("esp32c6_pico")) {
+            Ok(spec) => Self::from_spec(spec),
+            Err(_) => Self {
+                target: TargetArch::Riscv32Esp32C6,
+                spec: None,
+                flash_origin: 0x4200_0000,
+                flash_len: 4 * 1024 * 1024,
+                ram_origin: 0x4080_0000,
+                ram_len: 448 * 1024,
+                opt_level: "-O2".to_string(),
+                max_ticks: 0,
+            },
         }
     }
 
-    /// Default options for bare-metal Microchip ATmega328P (`avr`, Arduino Uno R3 Optiboot):
-    /// - `FLASH`: `0x0000_0000` (`32,256 B` usable below 512 B Optiboot)
-    /// - `RAM`:   `0x0000_0100` (`2,048 B` SRAM `0x0100..=0x08FF`, initial `SP = 0x08FF`)
     pub fn avr_uno() -> Self {
-        Self {
-            target: TargetArch::AvrAtmega328p,
-            flash_origin: 0x0000_0000,
-            flash_len: 32_256,
-            ram_origin: 0x0000_0100,
-            ram_len: 2_048,
-            opt_level: "-Os".to_string(),
-            max_ticks: 0,
+        match TargetSpec::resolve(None, Some("arduino_uno")) {
+            Ok(spec) => Self::from_spec(spec),
+            Err(_) => Self {
+                target: TargetArch::AvrAtmega328p,
+                spec: None,
+                flash_origin: 0x0000_0000,
+                flash_len: 32_256,
+                ram_origin: 0x0000_0100,
+                ram_len: 2_048,
+                opt_level: "-Os".to_string(),
+                max_ticks: 0,
+            },
         }
     }
 
-    /// Default options for bare-metal Microchip ATmega4809 (`avrxmega3`, Arduino Nano Every UPDI):
-    /// - `FLASH`: `0x0000_0000` (`49,152 B` = 48 KB full Flash via SAMD11 `MuxTO` UPDI)
-    /// - `RAM`:   `0x0000_2800` (`6,144 B` = 6 KB SRAM `0x2800..=0x3FFF`, initial `SP = 0x3FFF`)
     pub fn avr_nano_every() -> Self {
-        Self {
-            target: TargetArch::AvrAtmega4809,
-            flash_origin: 0x0000_0000,
-            flash_len: 49_152,
-            ram_origin: 0x0000_2800,
-            ram_len: 6_144,
-            opt_level: "-Os".to_string(),
-            max_ticks: 0,
+        match TargetSpec::resolve(None, Some("arduino_nano_every")) {
+            Ok(spec) => {
+                let mut opts = Self::from_spec(spec);
+                opts.target = TargetArch::AvrAtmega4809;
+                opts
+            }
+            Err(_) => Self {
+                target: TargetArch::AvrAtmega4809,
+                spec: None,
+                flash_origin: 0x0000_0000,
+                flash_len: 49_152,
+                ram_origin: 0x0000_2800,
+                ram_len: 6_144,
+                opt_level: "-Os".to_string(),
+                max_ticks: 0,
+            },
         }
     }
 
-    /// Default options for bare-metal Raspberry Pi Pico / Pico W (`RP2040`, `thumbv6m-none-eabi`):
-    /// - `SRAM`: `0x2000_0000..0x2004_2000` (`270,336 B` = 264 KB unified `NO_FLASH` execution)
     pub fn rp2040() -> Self {
-        Self {
-            target: TargetArch::Thumbv6mRp2040,
-            flash_origin: 0x2000_0000,
-            flash_len: 264 * 1024,
-            ram_origin: 0x2000_0000,
-            ram_len: 264 * 1024,
-            opt_level: "-O2".to_string(),
-            max_ticks: 0,
+        match TargetSpec::resolve(None, Some("rpi_pico_w")) {
+            Ok(spec) => Self::from_spec(spec),
+            Err(_) => Self {
+                target: TargetArch::Thumbv6mRp2040,
+                spec: None,
+                flash_origin: 0x2000_0000,
+                flash_len: 264 * 1024,
+                ram_origin: 0x2000_0000,
+                ram_len: 264 * 1024,
+                opt_level: "-O2".to_string(),
+                max_ticks: 0,
+            },
         }
     }
 
@@ -312,7 +387,20 @@ pub struct ElfBuildResult {
     pub audit: ElfSymbolAudit,
 }
 
-/// Artifacts produced by `build_esp32c6_image`.
+/// Build output returned by [`build_target_image`].
+#[derive(Debug, Clone)]
+pub struct TargetBuildArtifact {
+    pub elf: ElfBuildResult,
+    pub image_path: PathBuf,
+    pub bin_path: Option<PathBuf>,
+    pub uf2_path: Option<PathBuf>,
+    pub bin_size: u64,
+    pub image_size: u64,
+    pub uf2_blocks: u32,
+    pub sram_static_bytes: u64,
+}
+
+/// Artifacts produced by `build_esp32c6_image` (legacy wrapper).
 #[derive(Debug, Clone)]
 pub struct Esp32C6ImageResult {
     pub elf: ElfBuildResult,
@@ -321,7 +409,7 @@ pub struct Esp32C6ImageResult {
     pub magic_header: [u8; 8],
 }
 
-/// Artifacts produced by `build_avr_uno_image`.
+/// Artifacts produced by `build_avr_uno_image` / `build_avr_nano_every_image` (legacy wrapper).
 #[derive(Debug, Clone)]
 pub struct AvrImageResult {
     pub elf: ElfBuildResult,
@@ -330,7 +418,7 @@ pub struct AvrImageResult {
     pub sram_static_bytes: u64,
 }
 
-/// Artifacts produced by `build_rp2040_image`.
+/// Artifacts produced by `build_rp2040_image` (legacy wrapper).
 #[derive(Debug, Clone)]
 pub struct Rp2040ImageResult {
     pub elf: ElfBuildResult,
@@ -341,7 +429,7 @@ pub struct Rp2040ImageResult {
     pub uf2_blocks: u32,
 }
 
-/// Options for executing a Cortex-M3 `.elf` inside `qemu-system-arm`.
+/// Options for executing a Cortex-M `.elf` inside `qemu-system-arm`.
 #[derive(Debug, Clone)]
 pub struct QemuRunOptions {
     pub machine: String,
@@ -356,6 +444,25 @@ impl Default for QemuRunOptions {
             cpu: "cortex-m3".to_string(),
             timeout: Duration::from_millis(5_000),
         }
+    }
+}
+
+impl QemuRunOptions {
+    pub fn from_spec(spec: &TargetSpec) -> Result<Self, CodegenError> {
+        let machine = spec.qemu_machine.clone().ok_or_else(|| {
+            CodegenError::new(
+                "qemu",
+                format!(
+                    "target '{}' does not declare `[run].qemu_machine`",
+                    spec.board_name.as_deref().unwrap_or(&spec.chip_name)
+                ),
+            )
+        })?;
+        Ok(Self {
+            machine,
+            cpu: spec.cpu.clone(),
+            timeout: Duration::from_millis(5_000),
+        })
     }
 }
 
@@ -399,12 +506,31 @@ impl fmt::Display for CodegenError {
 
 impl std::error::Error for CodegenError {}
 
-/// Auto-generate the freestanding linker script (`FLASH` + `RAM`, zero libc) for Cortex-M3, ESP32-C6, or AVR.
-pub fn synthesize_linker_script(opts: &CodegenOptions) -> String {
-    if opts.target.is_avr() {
-        let ram_vma = 0x0080_0000u32.wrapping_add(opts.ram_origin);
+/// Synthesize a declarative LLD linker script purely from [`TargetSpec`].
+pub fn synthesize_target_linker_script(spec: &TargetSpec) -> String {
+    if spec.isa.is_avr() {
+        let data_ram_offset = match spec.irq {
+            IrqModel::AvrVectored {
+                data_ram_offset, ..
+            } => data_ram_offset,
+            _ => 0x0080_0000,
+        };
+        let ram_vma = data_ram_offset.wrapping_add(spec.ram_base);
+        let flash_orig = spec.flash_base;
+        let flash_len = spec.effective_flash_size();
+        let ram_len = spec.ram_size;
+        let rodata_in_text = if spec.rodata_in_ram {
+            ""
+        } else {
+            "\n    *(.rodata .rodata.*)"
+        };
+        let rodata_in_data = if spec.rodata_in_ram {
+            "    *(.rodata .rodata.*)\n"
+        } else {
+            ""
+        };
         return format!(
-            r#"/* Auto-synthesized by zev-codegen-llvm for AVR ({mcpu}) */
+            r#"/* Auto-synthesized by zev-codegen-llvm for AVR ({cpu}) */
 MEMORY
 {{
   FLASH (rx)  : ORIGIN = 0x{flash_orig:08X}, LENGTH = {flash_len}
@@ -419,7 +545,7 @@ SECTIONS
   {{
     KEEP(*(.vectors))
     KEEP(*(.text.startup))
-    *(.text .text.*)
+    *(.text .text.*){rodata_in_text}
     . = ALIGN(2);
     __sidata = .;
   }} > FLASH
@@ -427,8 +553,7 @@ SECTIONS
   .data 0x{ram_vma:08X} : AT(__sidata)
   {{
     __sdata = .;
-    *(.rodata .rodata.*)
-    *(.data .data.*)
+{rodata_in_data}    *(.data .data.*)
     . = ALIGN(2);
     __edata = .;
   }} > RAM
@@ -448,17 +573,20 @@ SECTIONS
   }}
 }}
 "#,
-            flash_orig = opts.flash_origin,
-            flash_len = opts.flash_len,
-            ram_vma = ram_vma,
-            ram_len = opts.ram_len,
-            mcpu = opts.target.avr_mcpu(),
+            cpu = spec.cpu
         );
     }
 
-    if opts.target == TargetArch::Thumbv6mRp2040 {
+    if spec.code_in_ram {
+        let ram_orig = spec.ram_base;
+        let ram_len = spec.ram_size;
+        let iram_keep = if spec.iram_in_data {
+            "    KEEP(*(.iram1 .iram1.*))\n"
+        } else {
+            ""
+        };
         return format!(
-            r#"/* Auto-synthesized by zev-codegen-llvm for Raspberry Pi RP2040 (NO_FLASH SRAM UF2) */
+            r#"/* Auto-synthesized by zev-codegen-llvm for RAM-resident {cpu} */
 MEMORY
 {{
   SRAM (rwx) : ORIGIN = 0x{ram_orig:08X}, LENGTH = {ram_len}
@@ -481,7 +609,7 @@ SECTIONS
   .text : ALIGN(4)
   {{
     *(.text .text.*)
-    *(.rodata .rodata.*)
+    *(.rodata .rodata.* .srodata .srodata.*)
     . = ALIGN(4);
   }} > SRAM
 
@@ -489,7 +617,7 @@ SECTIONS
   {{
     __sidata = .;
     __sdata = .;
-    *(.data .data.*)
+{iram_keep}    *(.data .data.* .sdata .sdata.*)
     . = ALIGN(4);
     __edata = .;
   }} > SRAM
@@ -497,7 +625,7 @@ SECTIONS
   .bss (NOLOAD) : ALIGN(4)
   {{
     __sbss = .;
-    *(.bss .bss.* COMMON)
+    *(.bss .bss.* .sbss .sbss.* COMMON)
     . = ALIGN(4);
     __ebss = .;
   }} > SRAM
@@ -505,37 +633,54 @@ SECTIONS
   /DISCARD/ :
   {{
     *(.ARM.exidx*)
+    *(.ARM.extab*)
     *(.ARM.attributes*)
+    *(.note.GNU-stack)
+    *(.eh_frame*)
+    *(.riscv.attributes)
     *(.comment)
     *(.note*)
-    *(.eh_frame*)
   }}
 }}
 "#,
-            ram_orig = opts.ram_origin,
-            ram_len = opts.ram_len,
+            cpu = spec.cpu
         );
     }
 
-    if opts.target == TargetArch::Riscv32Esp32C6 {
-        return format!(
-            r#"/* Auto-synthesized by zev-codegen-llvm for ESP32-C6 (rv32imac Direct-Boot) */
+    let flash_orig = spec.flash_base;
+    let flash_len = spec.effective_flash_size();
+    let ram_orig = spec.ram_base;
+    let ram_len = spec.ram_size;
+    let entry_sym = if spec.isa == CpuIsa::ArmCortexM && spec.header_magic_words.is_empty() {
+        "Reset_Handler"
+    } else {
+        "_start"
+    };
+    let mut magic_ir = String::new();
+    for w in &spec.header_magic_words {
+        magic_ir.push_str(&format!("    LONG(0x{w:08X});\n"));
+    }
+    let iram_keep = if spec.iram_in_data {
+        "    KEEP(*(.iram1 .iram1.*))\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"/* Auto-synthesized by zev-codegen-llvm for {cpu} */
 MEMORY
 {{
   FLASH (rx)  : ORIGIN = 0x{flash_orig:08X}, LENGTH = {flash_len}
   RAM   (rwx) : ORIGIN = 0x{ram_orig:08X}, LENGTH = {ram_len}
 }}
 
-ENTRY(_start)
+ENTRY({entry_sym})
 
 SECTIONS
 {{
   .text ORIGIN(FLASH) :
   {{
-    /* ESP32-C6 ROM Direct-Boot magic header (8 bytes at flash 0x0 -> jumps to 0x42000008) */
-    LONG(0xAEDB041D);
-    LONG(0xAEDB041D);
-    KEEP(*(.entry))
+{magic_ir}    KEEP(*(.entry))
+    KEEP(*(.isr_vector))
     *(.text .text.*)
     *(.rodata .rodata.* .srodata .srodata.*)
     . = ALIGN(4);
@@ -546,8 +691,7 @@ SECTIONS
   {{
     . = ALIGN(4);
     __sdata = .;
-    KEEP(*(.iram1 .iram1.*))
-    *(.data .data.* .sdata .sdata.*)
+{iram_keep}    *(.data .data.* .sdata .sdata.*)
     . = ALIGN(4);
     __edata = .;
   }} > RAM
@@ -563,6 +707,10 @@ SECTIONS
 
   /DISCARD/ :
   {{
+    *(.ARM.exidx*)
+    *(.ARM.extab*)
+    *(.ARM.attributes*)
+    *(.note.GNU-stack)
     *(.eh_frame*)
     *(.riscv.attributes)
     *(.comment)
@@ -570,65 +718,16 @@ SECTIONS
   }}
 }}
 "#,
-            flash_orig = opts.flash_origin,
-            flash_len = opts.flash_len,
-            ram_orig = opts.ram_origin,
-            ram_len = opts.ram_len,
-        );
-    }
-
-    format!(
-        r#"/* Auto-synthesized by zev-codegen-llvm — zero user .ld / zero CRT glue */
-MEMORY
-{{
-  FLASH (rx)  : ORIGIN = 0x{flash_orig:08X}, LENGTH = {flash_len}
-  RAM   (rwx) : ORIGIN = 0x{ram_orig:08X}, LENGTH = {ram_len}
-}}
-
-ENTRY(Reset_Handler)
-
-SECTIONS
-{{
-  .text :
-  {{
-    KEEP(*(.isr_vector))
-    *(.text .text.*)
-    *(.rodata .rodata.*)
-    . = ALIGN(4);
-    __sidata = .;
-  }} > FLASH
-
-  .data : AT(__sidata)
-  {{
-    . = ALIGN(4);
-    __sdata = .;
-    *(.data .data.*)
-    . = ALIGN(4);
-    __edata = .;
-  }} > RAM
-
-  .bss (NOLOAD) :
-  {{
-    . = ALIGN(4);
-    __sbss = .;
-    *(.bss .bss.* COMMON)
-    . = ALIGN(4);
-    __ebss = .;
-  }} > RAM
-
-  /DISCARD/ :
-  {{
-    *(.ARM.exidx*)
-    *(.ARM.extab*)
-    *(.note.GNU-stack)
-  }}
-}}
-"#,
-        flash_orig = opts.flash_origin,
-        flash_len = opts.flash_len,
-        ram_orig = opts.ram_origin,
-        ram_len = opts.ram_len,
+        cpu = spec.cpu
     )
+}
+
+/// Legacy compatibility linker script helper delegating to [`synthesize_target_linker_script`].
+pub fn synthesize_linker_script(opts: &CodegenOptions) -> String {
+    match opts.effective_spec() {
+        Ok(spec) => synthesize_target_linker_script(&spec),
+        Err(_) => synthesize_target_linker_script(&TargetSpec::host_linux()),
+    }
 }
 
 pub(crate) fn find_tool(preferred_abs: &'static str, fallback_name: &'static str) -> &'static str {
@@ -645,6 +744,7 @@ pub fn optimize_ll_with_opt(
     out_ll: &Path,
     opts: &CodegenOptions,
 ) -> Result<(), CodegenError> {
+    let spec = opts.effective_spec()?;
     let pipeline = opts.opt_passes_pipeline()?;
     if let Some(parent) = out_ll.parent() {
         if !parent.as_os_str().is_empty() {
@@ -656,21 +756,12 @@ pub fn optimize_ll_with_opt(
 
     let opt = find_tool("/bin/opt", "opt");
     let mut cmd = Command::new(opt);
-    cmd.arg(format!("-mtriple={}", opts.target.triple()));
-    match opts.target {
-        TargetArch::Thumbv7mNoneEabi => {
-            cmd.arg("-mcpu=cortex-m3");
-        }
-        TargetArch::Thumbv6mRp2040 => {
-            cmd.arg("-mcpu=cortex-m0plus");
-        }
-        TargetArch::Riscv32Esp32C6 => {
-            cmd.arg("-mcpu=generic-rv32").arg("-mattr=+m,+a,+c");
-        }
-        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
-            cmd.arg(format!("-mcpu={}", opts.target.avr_mcpu()));
-        }
-        TargetArch::HostX86_64Linux => {}
+    cmd.arg(format!("-mtriple={}", spec.triple));
+    if spec.isa != CpuIsa::HostX86_64Linux && !spec.cpu.is_empty() {
+        cmd.arg(format!("-mcpu={}", spec.cpu));
+    }
+    if !spec.features.is_empty() {
+        cmd.arg(format!("-mattr={}", spec.features));
     }
     cmd.arg(format!("-passes={pipeline}"))
         .arg("-S")
@@ -698,6 +789,7 @@ pub fn compile_ll_to_obj(
     obj_path: &Path,
     opts: &CodegenOptions,
 ) -> Result<(), CodegenError> {
+    let spec = opts.effective_spec()?;
     let llc_flag = opts.llc_opt_flag()?;
     let opt_ll_path = obj_path.with_extension("opt.ll");
     let llc_input: &Path = if opts.is_opt_o0() {
@@ -709,31 +801,18 @@ pub fn compile_ll_to_obj(
 
     let llc = find_tool("/bin/llc", "llc");
     let mut cmd = Command::new(llc);
-    cmd.arg(format!("-mtriple={}", opts.target.triple()));
-    match opts.target {
-        TargetArch::Thumbv7mNoneEabi => {
-            cmd.arg("-mcpu=cortex-m3")
-                .arg("-function-sections")
-                .arg("-data-sections");
+    cmd.arg(format!("-mtriple={}", spec.triple));
+    if spec.isa != CpuIsa::HostX86_64Linux {
+        if !spec.cpu.is_empty() {
+            cmd.arg(format!("-mcpu={}", spec.cpu));
         }
-        TargetArch::Thumbv6mRp2040 => {
-            cmd.arg("-mcpu=cortex-m0plus")
-                .arg("-function-sections")
-                .arg("-data-sections");
+        if !spec.features.is_empty() {
+            cmd.arg(format!("-mattr={}", spec.features));
         }
-        TargetArch::Riscv32Esp32C6 => {
-            cmd.arg("-mcpu=generic-rv32")
-                .arg("-mattr=+m,+a,+c")
-                .arg("-relocation-model=static")
-                .arg("-function-sections")
-                .arg("-data-sections");
+        if spec.isa == CpuIsa::Riscv32 {
+            cmd.arg("-relocation-model=static");
         }
-        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
-            cmd.arg(format!("-mcpu={}", opts.target.avr_mcpu()))
-                .arg("-function-sections")
-                .arg("-data-sections");
-        }
-        TargetArch::HostX86_64Linux => {}
+        cmd.arg("-function-sections").arg("-data-sections");
     }
     cmd.arg(llc_flag)
         .arg("-filetype=obj")
@@ -925,17 +1004,11 @@ pub fn compile_ll_to_elf(
     out_elf: &Path,
     opts: &CodegenOptions,
 ) -> Result<ElfBuildResult, CodegenError> {
-    if !matches!(
-        opts.target,
-        TargetArch::Thumbv7mNoneEabi
-            | TargetArch::Thumbv6mRp2040
-            | TargetArch::Riscv32Esp32C6
-            | TargetArch::AvrAtmega328p
-            | TargetArch::AvrAtmega4809
-    ) {
+    let spec = opts.effective_spec()?;
+    if spec.isa == CpuIsa::HostX86_64Linux {
         return Err(CodegenError::new(
             "build-elf",
-            "bare-metal .elf linking requires Thumbv7mNoneEabi, Thumbv6mRp2040, Riscv32Esp32C6, AvrAtmega328p, or AvrAtmega4809",
+            "bare-metal .elf linking requires a freestanding chip/board target (not host x86_64)",
         ));
     }
     if let Some(parent) = out_elf.parent() {
@@ -953,7 +1026,7 @@ pub fn compile_ll_to_elf(
     fs::write(&ll_path, ll_ir).map_err(|e| {
         CodegenError::new("io", format!("failed to write {}: {e}", ll_path.display()))
     })?;
-    let ld_script = synthesize_linker_script(opts);
+    let ld_script = synthesize_target_linker_script(&spec);
     fs::write(&ld_path, &ld_script).map_err(|e| {
         CodegenError::new("io", format!("failed to write {}: {e}", ld_path.display()))
     })?;
@@ -1087,12 +1160,39 @@ pub fn verify_ll_with_opt(ll_path: &Path) -> Result<(), CodegenError> {
     Ok(())
 }
 
-/// Convert a linked ESP32-C6 `.elf` into a raw Direct-Boot `.bin` image via `/bin/llvm-objcopy -O binary`,
-/// verifying the 8-byte `0xAEDB041D` x2 Direct-Boot magic header at offset `0x0`.
-pub fn objcopy_elf_to_esp32c6_bin(
-    elf_path: &Path,
-    out_bin: &Path,
-) -> Result<(u64, [u8; 8]), CodegenError> {
+/// Pack a contiguous binary payload into standard 512-byte UF2 blocks.
+pub fn pack_uf2(bin: &[u8], base_addr: u32, family_id: u32) -> Vec<u8> {
+    const UF2_MAGIC_START0: u32 = 0x0A32_4655;
+    const UF2_MAGIC_START1: u32 = 0x9E5D_5157;
+    const UF2_MAGIC_END: u32 = 0x0AB1_6F30;
+    const UF2_FLAG_FAMILY_ID_PRESENT: u32 = 0x0000_2000;
+
+    let chunks: Vec<&[u8]> = if bin.is_empty() {
+        vec![&[][..]]
+    } else {
+        bin.chunks(256).collect()
+    };
+    let num_blocks = chunks.len() as u32;
+    let mut out = Vec::with_capacity(chunks.len() * 512);
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let mut blk = [0u8; 512];
+        blk[0..4].copy_from_slice(&UF2_MAGIC_START0.to_le_bytes());
+        blk[4..8].copy_from_slice(&UF2_MAGIC_START1.to_le_bytes());
+        blk[8..12].copy_from_slice(&UF2_FLAG_FAMILY_ID_PRESENT.to_le_bytes());
+        blk[12..16].copy_from_slice(&(base_addr + (idx as u32) * 256).to_le_bytes());
+        blk[16..20].copy_from_slice(&256u32.to_le_bytes());
+        blk[20..24].copy_from_slice(&(idx as u32).to_le_bytes());
+        blk[24..28].copy_from_slice(&num_blocks.to_le_bytes());
+        blk[28..32].copy_from_slice(&family_id.to_le_bytes());
+        blk[32..32 + chunk.len()].copy_from_slice(chunk);
+        blk[508..512].copy_from_slice(&UF2_MAGIC_END.to_le_bytes());
+        out.extend_from_slice(&blk);
+    }
+    out
+}
+
+/// Convert a linked `.elf` into a raw binary via `/bin/llvm-objcopy -O binary`.
+pub fn objcopy_elf_to_bin(elf_path: &Path, out_bin: &Path) -> Result<Vec<u8>, CodegenError> {
     if let Some(parent) = out_bin.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| {
@@ -1117,47 +1217,237 @@ pub fn objcopy_elf_to_esp32c6_bin(
             format!("llvm-objcopy exited with {}: {}", out.status, stderr.trim()),
         ));
     }
-
-    let bytes = fs::read(out_bin).map_err(|e| {
+    fs::read(out_bin).map_err(|e| {
         CodegenError::new("io", format!("failed to read {}: {e}", out_bin.display()))
-    })?;
-    if bytes.len() < 8 {
+    })
+}
+
+fn measure_static_sram(elf_path: &Path, spec: &TargetSpec, bin_len: usize) -> Result<u64, CodegenError> {
+    if spec.code_in_ram {
+        let sizes = inspect_elf_sizes(elf_path)?;
+        let padded_bin_len = (bin_len as u64).next_multiple_of(256);
+        return Ok(padded_bin_len.saturating_add(sizes.bss));
+    }
+    match (
+        read_elf32_sym_addr(elf_path, "__sdata"),
+        read_elf32_sym_addr(elf_path, "__ebss"),
+    ) {
+        (Some(sdata), Some(ebss)) if ebss >= sdata => Ok(u64::from(ebss - sdata)),
+        _ => {
+            let sizes = inspect_elf_sizes(elf_path)?;
+            Ok(sizes.data.saturating_add(sizes.bss))
+        }
+    }
+}
+
+fn validate_bin_against_spec(
+    spec: &TargetSpec,
+    elf_path: &Path,
+    bytes: &[u8],
+) -> Result<u64, CodegenError> {
+    let target_label = spec.board_name.as_deref().unwrap_or(&spec.chip_name);
+    if bytes.is_empty() {
         return Err(CodegenError::new(
-            "esp32c6-image",
-            format!("generated .bin is too short ({} bytes)", bytes.len()),
+            "target-image",
+            format!("generated binary for `{target_label}` is empty"),
         ));
     }
-    let mut magic = [0u8; 8];
-    magic.copy_from_slice(&bytes[0..8]);
-    if magic != crate::esp32c6::ESP32C6_DIRECT_BOOT_MAGIC {
+    if !spec.code_in_ram && (bytes.len() as u64) > u64::from(spec.effective_flash_size()) {
         return Err(CodegenError::new(
-            "esp32c6-image",
+            "target-image",
             format!(
-                "invalid Direct-Boot header at offset 0: got {:02x?}, expected {:02x?}",
-                magic,
-                crate::esp32c6::ESP32C6_DIRECT_BOOT_MAGIC
+                "`{target_label}` image size {} B exceeds usable flash {} B",
+                bytes.len(),
+                spec.effective_flash_size()
             ),
         ));
     }
-    Ok((bytes.len() as u64, magic))
+    let magic = spec.header_magic_bytes();
+    if !magic.is_empty() {
+        if bytes.len() < magic.len() || bytes[..magic.len()] != magic[..] {
+            let got_len = bytes.len().min(magic.len());
+            return Err(CodegenError::new(
+                "target-image",
+                format!(
+                    "`{target_label}` image header mismatch at offset 0: got {:02x?}, expected {:02x?}",
+                    &bytes[..got_len],
+                    magic
+                ),
+            ));
+        }
+    }
+    if spec.reset_first_word_mask != 0 {
+        if bytes.len() < 2 {
+            return Err(CodegenError::new(
+                "target-image",
+                format!("`{target_label}` image shorter than 2 bytes for reset vector check"),
+            ));
+        }
+        let word0 = u16::from_le_bytes([bytes[0], bytes[1]]);
+        if (word0 & spec.reset_first_word_mask) != spec.reset_first_word_value {
+            return Err(CodegenError::new(
+                "target-image",
+                format!(
+                    "`{target_label}` reset word0 0x{word0:04X} failed mask 0x{:04X} == 0x{:04X}",
+                    spec.reset_first_word_mask, spec.reset_first_word_value
+                ),
+            ));
+        }
+    }
+    let static_sram = measure_static_sram(elf_path, spec, bytes.len())?;
+    let max_static = u64::from(spec.sram_budget_bytes.saturating_sub(spec.stack_reserve_bytes));
+    if spec.stack_reserve_bytes > 0 && static_sram >= max_static && !spec.code_in_ram {
+        return Err(CodegenError::new(
+            "target-image",
+            format!(
+                "`{target_label}` static SRAM footprint {static_sram} B leaves fewer than {} B stack in {} B SRAM",
+                spec.stack_reserve_bytes, spec.sram_budget_bytes
+            ),
+        ));
+    }
+    if spec.code_in_ram && spec.stack_reserve_bytes > 0 && static_sram > max_static {
+        return Err(CodegenError::new(
+            "target-image",
+            format!(
+                "`{target_label}` RAM image footprint ({static_sram} B) exceeds RAM minus stack reserve ({max_static} B)"
+            ),
+        ));
+    }
+    Ok(static_sram)
 }
 
-/// Flash a Direct-Boot `.bin` image onto a physical ESP32-C6 at flash offset `0x0` using `esptool` v5.
-pub fn flash_esp32c6_bin(bin_path: &Path, port: &str) -> Result<String, CodegenError> {
-    let esptool = find_tool("/bin/esptool", "esptool");
-    let out = Command::new(esptool)
-        .arg("--chip")
-        .arg("esp32c6")
-        .arg("--port")
-        .arg(port)
-        .arg("--after")
-        .arg("hard-reset")
-        .arg("write-flash")
-        .arg("0x0")
-        .arg(bin_path)
-        .output()
-        .map_err(|e| CodegenError::new("esptool", format!("failed to invoke `{esptool}`: {e}")))?;
+/// Build an ELF + target deliverable image (`ElfOnly`, `RawBin`, or `Uf2`) driven by `TargetSpec`.
+pub fn build_target_image(
+    module: &zev_mir::MirModule,
+    opts: &CodegenOptions,
+    out_path: &Path,
+) -> Result<TargetBuildArtifact, CodegenError> {
+    let spec = opts.effective_spec()?;
+    let ll = crate::emit_llvm_ir_with_options(module, opts)?;
+    match spec.image {
+        ImageFormat::ElfOnly => {
+            let elf = compile_ll_to_elf(&ll, out_path, opts)?;
+            let image_size = fs::metadata(&elf.elf_path).map(|m| m.len()).unwrap_or(0);
+            let sram_static_bytes = measure_static_sram(&elf.elf_path, &spec, 0)?;
+            Ok(TargetBuildArtifact {
+                image_path: elf.elf_path.clone(),
+                elf,
+                bin_path: None,
+                uf2_path: None,
+                bin_size: 0,
+                image_size,
+                uf2_blocks: 0,
+                sram_static_bytes,
+            })
+        }
+        ImageFormat::RawBin => {
+            let elf_path = out_path.with_extension("elf");
+            let elf = compile_ll_to_elf(&ll, &elf_path, opts)?;
+            let bytes = objcopy_elf_to_bin(&elf.elf_path, out_path)?;
+            let sram_static_bytes = validate_bin_against_spec(&spec, &elf.elf_path, &bytes)?;
+            let bin_size = bytes.len() as u64;
+            Ok(TargetBuildArtifact {
+                elf,
+                image_path: out_path.to_path_buf(),
+                bin_path: Some(out_path.to_path_buf()),
+                uf2_path: None,
+                bin_size,
+                image_size: bin_size,
+                uf2_blocks: 0,
+                sram_static_bytes,
+            })
+        }
+        ImageFormat::Uf2 {
+            family_id,
+            target_base,
+        } => {
+            let elf_path = out_path.with_extension("elf");
+            let bin_path = out_path.with_extension("bin");
+            let elf = compile_ll_to_elf(&ll, &elf_path, opts)?;
+            let bytes = objcopy_elf_to_bin(&elf.elf_path, &bin_path)?;
+            let sram_static_bytes = validate_bin_against_spec(&spec, &elf.elf_path, &bytes)?;
+            let uf2 = pack_uf2(&bytes, target_base, family_id);
+            let uf2_blocks = (uf2.len() / 512) as u32;
+            fs::write(out_path, &uf2).map_err(|e| {
+                CodegenError::new("io", format!("failed to write {}: {e}", out_path.display()))
+            })?;
+            Ok(TargetBuildArtifact {
+                elf,
+                image_path: out_path.to_path_buf(),
+                bin_path: Some(bin_path),
+                uf2_path: Some(out_path.to_path_buf()),
+                bin_size: bytes.len() as u64,
+                image_size: uf2.len() as u64,
+                uf2_blocks,
+                sram_static_bytes,
+            })
+        }
+    }
+}
 
+fn resolve_flash_arg(spec: &TargetSpec, arg: &str) -> String {
+    let p = Path::new(arg);
+    if !p.is_absolute()
+        && (arg.ends_with(".py") || arg.ends_with(".sh") || arg.contains('/'))
+        && !p.exists()
+    {
+        if let Some(root) = &spec.root_dir {
+            let cand = root.join(p);
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+        for root in discover_spec_roots() {
+            let cand = root.join(p);
+            if cand.is_file() {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    arg.to_string()
+}
+
+/// Flash a compiled target image using `spec.flash_cmd` (`{image}`, `{elf}`, `{port}`).
+pub fn flash_target_image(
+    spec: &TargetSpec,
+    image_path: &Path,
+    port: Option<&str>,
+) -> Result<String, CodegenError> {
+    let label = spec.board_name.as_deref().unwrap_or(&spec.chip_name);
+    if spec.flash_cmd.is_empty() {
+        return Err(CodegenError::new(
+            "flash",
+            format!("target `{label}` does not declare `[run].flash_cmd` in its board TOML"),
+        ));
+    }
+    let eff_port = port
+        .or(spec.default_port.as_deref())
+        .unwrap_or("/dev/ttyACM0");
+    let image_str = image_path.to_string_lossy();
+    let elf_path = image_path.with_extension("elf");
+    let elf_str = elf_path.to_string_lossy();
+
+    let mut expanded = Vec::with_capacity(spec.flash_cmd.len());
+    for tok in &spec.flash_cmd {
+        let sub = tok
+            .replace("{image}", &image_str)
+            .replace("{elf}", &elf_str)
+            .replace("{port}", eff_port);
+        expanded.push(resolve_flash_arg(spec, &sub));
+    }
+
+    let raw_prog = &expanded[0];
+    let bin_cand = Path::new("/bin").join(raw_prog);
+    let prog = if !raw_prog.contains('/') && bin_cand.is_file() {
+        bin_cand.to_string_lossy().into_owned()
+    } else {
+        raw_prog.clone()
+    };
+
+    let out = Command::new(&prog)
+        .args(&expanded[1..])
+        .output()
+        .map_err(|e| CodegenError::new("flash", format!("failed to invoke `{prog}`: {e}")))?;
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
@@ -1165,11 +1455,37 @@ pub fn flash_esp32c6_bin(bin_path: &Path, port: &str) -> Result<String, CodegenE
     );
     if !out.status.success() {
         return Err(CodegenError::new(
-            "esptool",
-            format!("esptool exited with {}:\n{}", out.status, combined.trim()),
+            "flash",
+            format!(
+                "flash command `{}` exited with {}:\n{}",
+                expanded.join(" "),
+                out.status,
+                combined.trim()
+            ),
         ));
     }
     Ok(combined)
+}
+
+/// Legacy compatibility helper delegating via `esp32c6_pico` TOML spec.
+pub fn objcopy_elf_to_esp32c6_bin(
+    elf_path: &Path,
+    out_bin: &Path,
+) -> Result<(u64, [u8; 8]), CodegenError> {
+    let spec = TargetSpec::resolve(None, Some("esp32c6_pico"))?;
+    let bytes = objcopy_elf_to_bin(elf_path, out_bin)?;
+    let _ = validate_bin_against_spec(&spec, elf_path, &bytes)?;
+    let mut magic = [0u8; 8];
+    if bytes.len() >= 8 {
+        magic.copy_from_slice(&bytes[..8]);
+    }
+    Ok((bytes.len() as u64, magic))
+}
+
+/// Legacy compatibility flasher delegating via `esp32c6_pico` TOML spec.
+pub fn flash_esp32c6_bin(bin_path: &Path, port: &str) -> Result<String, CodegenError> {
+    let spec = TargetSpec::resolve(None, Some("esp32c6_pico"))?;
+    flash_target_image(&spec, bin_path, Some(port))
 }
 
 pub(crate) fn read_elf32_sym_addr(elf_path: &Path, target_name: &str) -> Option<u32> {
@@ -1233,244 +1549,62 @@ pub(crate) fn read_elf32_sym_addr(elf_path: &Path, target_name: &str) -> Option<
 /// Convert a linked ATmega328P `.elf` into a raw Flash `.bin` image via `/bin/llvm-objcopy -O binary`,
 /// verifying reset `jmp` vector at `0x0000`, `<= 32,256 B` Optiboot Flash budget, and `< 1,792 B`
 /// static SRAM budget (reserving `>= 256 B` hardware call stack in the 2 KB SRAM).
+/// Legacy compatibility helper delegating via `arduino_uno` TOML spec.
 pub fn objcopy_elf_to_avr_bin(
     elf_path: &Path,
     out_bin: &Path,
 ) -> Result<(u64, u64), CodegenError> {
-    if let Some(parent) = out_bin.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                CodegenError::new("io", format!("failed to create {}: {e}", parent.display()))
-            })?;
-        }
-    }
-    let objcopy = find_tool("/bin/llvm-objcopy", "llvm-objcopy");
-    let out = Command::new(objcopy)
-        .arg("-O")
-        .arg("binary")
-        .arg(elf_path)
-        .arg(out_bin)
-        .output()
-        .map_err(|e| {
-            CodegenError::new("llvm-objcopy", format!("failed to invoke `{objcopy}`: {e}"))
-        })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(CodegenError::new(
-            "llvm-objcopy",
-            format!("llvm-objcopy exited with {}: {}", out.status, stderr.trim()),
-        ));
-    }
-
-    let bytes = fs::read(out_bin).map_err(|e| {
-        CodegenError::new("io", format!("failed to read {}: {e}", out_bin.display()))
-    })?;
-    if bytes.len() < 4 || bytes.len() > 32_256 {
-        return Err(CodegenError::new(
-            "avr-image",
-            format!(
-                "generated AVR .bin size {} B is out of ATmega328P Optiboot bounds (4..=32256 B)",
-                bytes.len()
-            ),
-        ));
-    }
-    let word0 = u16::from_le_bytes([bytes[0], bytes[1]]);
-    if (word0 & 0xFE0E) != 0x940C {
-        return Err(CodegenError::new(
-            "avr-image",
-            format!("expected AVR `jmp` instruction at 0x0000, got word 0x{word0:04X}"),
-        ));
-    }
-
-    let sram_static_bytes = match (
-        read_elf32_sym_addr(elf_path, "__sdata"),
-        read_elf32_sym_addr(elf_path, "__ebss"),
-    ) {
-        (Some(sdata), Some(ebss)) if ebss >= sdata => u64::from(ebss - sdata),
-        _ => {
-            let sizes = inspect_elf_sizes(elf_path)?;
-            sizes.data + sizes.bss
-        }
-    };
-    if sram_static_bytes >= 1_792 {
-        return Err(CodegenError::new(
-            "avr-image",
-            format!(
-                "static SRAM footprint {sram_static_bytes} B leaves fewer than 256 B of stack in 2,048 B ATmega328P SRAM"
-            ),
-        ));
-    }
-
+    let spec = TargetSpec::resolve(None, Some("arduino_uno"))?;
+    let bytes = objcopy_elf_to_bin(elf_path, out_bin)?;
+    let sram_static_bytes = validate_bin_against_spec(&spec, elf_path, &bytes)?;
     Ok((bytes.len() as u64, sram_static_bytes))
 }
 
-const AVR_STK500V1_FLASH_SCRIPT: &str = r#"
-import sys, time, serial
-
-port, bin_path = sys.argv[1], sys.argv[2]
-data = open(bin_path, "rb").read()
-if len(data) < 4 or len(data) > 32256:
-    raise SystemExit(f"AVR image size {len(data)} B out of Optiboot bounds (4..=32256 B)")
-
-page_size = 128
-padded_len = ((len(data) + page_size - 1) // page_size) * page_size
-padded = data + b"\xFF" * (padded_len - len(data))
-pages = padded_len // page_size
-
-def read_exact(ser, n, timeout=0.6):
-    buf = bytearray()
-    deadline = time.monotonic() + timeout
-    while len(buf) < n and time.monotonic() < deadline:
-        chunk = ser.read(n - len(buf))
-        if chunk:
-            buf.extend(chunk)
-    return bytes(buf)
-
-def cmd(ser, payload, resp_len, what):
-    ser.reset_input_buffer()
-    ser.write(payload)
-    ser.flush()
-    resp = read_exact(ser, resp_len)
-    if len(resp) != resp_len or resp[0] != 0x14 or resp[-1] != 0x10:
-        raise RuntimeError(f"STK500v1 {what} failed: got {resp.hex(' ').upper()}")
-    return resp
-
-ser = serial.Serial(port, 115200, timeout=0.1)
-try:
-    ser.dtr = False
-    time.sleep(0.05)
-    ser.dtr = True
-    time.sleep(0.25)
-    ser.reset_input_buffer()
-
-    synced = False
-    for _ in range(8):
-        ser.reset_input_buffer()
-        ser.write(b"\x30\x20")
-        ser.flush()
-        r = read_exact(ser, 2, 0.25)
-        if r == b"\x14\x10":
-            synced = True
-            break
-        time.sleep(0.05)
-    if not synced:
-        raise RuntimeError("STK_GET_SYNC failed after 8 attempts")
-
-    maj = cmd(ser, b"\x41\x81\x20", 3, "GET_PARAMETER SW_MAJOR")[1]
-    minr = cmd(ser, b"\x41\x82\x20", 3, "GET_PARAMETER SW_MINOR")[1]
-    sign = cmd(ser, b"\x75\x20", 5, "STK_READ_SIGN")[1:4]
-    if sign != b"\x1e\x95\x0f":
-        raise RuntimeError(f"Expected ATmega328P signature 1E 95 0F, got {sign.hex(' ').upper()}")
-
-    print(f"Optiboot {maj}.{minr} synced on {port}: signature={sign.hex(' ').upper()} (ATmega328P)")
-    cmd(ser, b"\x50\x20", 2, "STK_ENTER_PROGMODE")
-
-    for p in range(pages):
-        byte_addr = p * page_size
-        word_addr = byte_addr // 2
-        addr_cmd = bytes([0x55, word_addr & 0xFF, (word_addr >> 8) & 0xFF, 0x20])
-        cmd(ser, addr_cmd, 2, f"STK_LOAD_ADDRESS(write page {p})")
-        chunk = padded[byte_addr : byte_addr + page_size]
-        prog_cmd = bytes([0x64, 0x00, page_size, 0x46]) + chunk + b"\x20"
-        cmd(ser, prog_cmd, 2, f"STK_PROG_PAGE(page {p})")
-
-    for p in range(pages):
-        byte_addr = p * page_size
-        word_addr = byte_addr // 2
-        addr_cmd = bytes([0x55, word_addr & 0xFF, (word_addr >> 8) & 0xFF, 0x20])
-        cmd(ser, addr_cmd, 2, f"STK_LOAD_ADDRESS(read page {p})")
-        read_cmd = bytes([0x74, 0x00, page_size, 0x46, 0x20])
-        resp = cmd(ser, read_cmd, 2 + page_size, f"STK_READ_PAGE(page {p})")
-        got = resp[1:-1]
-        expected = padded[byte_addr : byte_addr + page_size]
-        if got != expected:
-            raise RuntimeError(f"Flash verify mismatch in page {p} @ 0x{byte_addr:04X}")
-
-    cmd(ser, b"\x51\x20", 2, "STK_LEAVE_PROGMODE")
-    print(f"Flashed and verified {pages} page(s) ({len(data)} bytes) at 0x0000..0x{padded_len:04X}")
-finally:
-    ser.close()
-"#;
-
-/// Pack a contiguous RP2040 SRAM payload into standard 512-byte UF2 blocks (`RP2040_FAMILY_ID = 0xE48BFF56`).
-pub fn pack_rp2040_uf2(bin: &[u8], base_addr: u32) -> Vec<u8> {
-    const UF2_MAGIC_START0: u32 = 0x0A32_4655;
-    const UF2_MAGIC_START1: u32 = 0x9E5D_5157;
-    const UF2_MAGIC_END: u32 = 0x0AB1_6F30;
-    const UF2_FLAG_FAMILY_ID_PRESENT: u32 = 0x0000_2000;
-    const RP2040_FAMILY_ID: u32 = 0xE48B_FF56;
-
-    let chunks: Vec<&[u8]> = if bin.is_empty() {
-        vec![&[][..]]
-    } else {
-        bin.chunks(256).collect()
-    };
-    let num_blocks = chunks.len() as u32;
-    let mut out = Vec::with_capacity(chunks.len() * 512);
-    for (idx, chunk) in chunks.iter().enumerate() {
-        let mut blk = [0u8; 512];
-        blk[0..4].copy_from_slice(&UF2_MAGIC_START0.to_le_bytes());
-        blk[4..8].copy_from_slice(&UF2_MAGIC_START1.to_le_bytes());
-        blk[8..12].copy_from_slice(&UF2_FLAG_FAMILY_ID_PRESENT.to_le_bytes());
-        blk[12..16].copy_from_slice(&(base_addr + (idx as u32) * 256).to_le_bytes());
-        blk[16..20].copy_from_slice(&256u32.to_le_bytes());
-        blk[20..24].copy_from_slice(&(idx as u32).to_le_bytes());
-        blk[24..28].copy_from_slice(&num_blocks.to_le_bytes());
-        blk[28..32].copy_from_slice(&RP2040_FAMILY_ID.to_le_bytes());
-        blk[32..32 + chunk.len()].copy_from_slice(chunk);
-        blk[508..512].copy_from_slice(&UF2_MAGIC_END.to_le_bytes());
-        out.extend_from_slice(&blk);
-    }
-    out
+/// Legacy compatibility helper delegating via `arduino_nano_every` TOML spec.
+pub fn objcopy_elf_to_avr_nano_every_bin(
+    elf_path: &Path,
+    out_bin: &Path,
+) -> Result<(u64, u64), CodegenError> {
+    let spec = TargetSpec::resolve(None, Some("arduino_nano_every"))?;
+    let bytes = objcopy_elf_to_bin(elf_path, out_bin)?;
+    let sram_static_bytes = validate_bin_against_spec(&spec, elf_path, &bytes)?;
+    Ok((bytes.len() as u64, sram_static_bytes))
 }
 
-/// Convert a linked RP2040 `NO_FLASH` `.elf` into a raw `.bin` + 512B-blocked `.uf2` at `0x2000_0000`.
+/// Legacy compatibility UF2 packer delegating to [`pack_uf2`].
+pub fn pack_rp2040_uf2(bin: &[u8], base_addr: u32) -> Vec<u8> {
+    let family_id = TargetSpec::resolve(None, Some("rpi_pico_w"))
+        .ok()
+        .and_then(|s| match s.image {
+            ImageFormat::Uf2 { family_id, .. } => Some(family_id),
+            _ => None,
+        })
+        .expect("rpi_pico_w TOML specifies uf2 family_id");
+    pack_uf2(bin, base_addr, family_id)
+}
+
+/// Legacy compatibility helper delegating via `rpi_pico_w` TOML spec.
 pub fn objcopy_elf_to_rp2040_uf2(
     elf_path: &Path,
     out_uf2: &Path,
 ) -> Result<(PathBuf, u64, u64, u32), CodegenError> {
-    if let Some(parent) = out_uf2.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                CodegenError::new("io", format!("failed to create {}: {e}", parent.display()))
-            })?;
+    let spec = TargetSpec::resolve(None, Some("rpi_pico_w"))?;
+    let (family_id, target_base) = match spec.image {
+        ImageFormat::Uf2 {
+            family_id,
+            target_base,
+        } => (family_id, target_base),
+        _ => {
+            return Err(CodegenError::new(
+                "target-image",
+                "rpi_pico_w board TOML is not configured for UF2 image output",
+            ));
         }
-    }
+    };
     let out_bin = out_uf2.with_extension("bin");
-    let objcopy = find_tool("/bin/llvm-objcopy", "llvm-objcopy");
-    let out = Command::new(objcopy)
-        .arg("-O")
-        .arg("binary")
-        .arg(elf_path)
-        .arg(&out_bin)
-        .output()
-        .map_err(|e| {
-            CodegenError::new("llvm-objcopy", format!("failed to invoke `{objcopy}`: {e}"))
-        })?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(CodegenError::new(
-            "llvm-objcopy",
-            format!("llvm-objcopy exited with {}: {}", out.status, stderr.trim()),
-        ));
-    }
-
-    let bytes = fs::read(&out_bin).map_err(|e| {
-        CodegenError::new("io", format!("failed to read {}: {e}", out_bin.display()))
-    })?;
-    let sizes = inspect_elf_sizes(elf_path)?;
-    let padded_bin_len = (bytes.len() as u64).next_multiple_of(256);
-    if bytes.is_empty() || padded_bin_len + sizes.bss > 262_144 {
-        return Err(CodegenError::new(
-            "rp2040-image",
-            format!(
-                "RP2040 SRAM UF2 footprint (bin={}B + bss={}B) leaves fewer than 8 KB stack in 264 KB SRAM",
-                padded_bin_len, sizes.bss
-            ),
-        ));
-    }
-
-    let uf2 = pack_rp2040_uf2(&bytes, 0x2000_0000);
+    let bytes = objcopy_elf_to_bin(elf_path, &out_bin)?;
+    let _ = validate_bin_against_spec(&spec, elf_path, &bytes)?;
+    let uf2 = pack_uf2(&bytes, target_base, family_id);
     let blocks = (uf2.len() / 512) as u32;
     fs::write(out_uf2, &uf2).map_err(|e| {
         CodegenError::new("io", format!("failed to write {}: {e}", out_uf2.display()))
@@ -1478,172 +1612,20 @@ pub fn objcopy_elf_to_rp2040_uf2(
     Ok((out_bin, bytes.len() as u64, uf2.len() as u64, blocks))
 }
 
-const RP2040_TOUCH_1200_SCRIPT: &str = r#"
-import sys, time
-try:
-    import serial
-except Exception as e:
-    raise SystemExit(f"pyserial unavailable for 1200-baud touch: {e}")
-
-port = sys.argv[1]
-try:
-    ser = serial.Serial(port, 1200, timeout=0.1)
-    ser.dtr = False
-    time.sleep(0.05)
-    ser.close()
-except Exception:
-    pass
-"#;
-
-/// Flash an RP2040 `.uf2` image via automatic 1200-baud BOOTSEL touch (if not already in `RPI-RP2`
-/// mass-storage mode), `udisksctl mount --no-user-interaction`, and direct UF2 copy.
+/// Legacy compatibility flasher delegating via `rpi_pico_w` TOML spec.
 pub fn flash_rp2040_uf2(uf2_path: &Path, port: &str) -> Result<String, CodegenError> {
-    let by_label = Path::new("/dev/disk/by-label/RPI-RP2");
-    if !by_label.exists() {
-        if !Path::new(port).exists() {
-            return Err(CodegenError::new(
-                "rp2040-flash",
-                format!(
-                    "neither /dev/disk/by-label/RPI-RP2 nor serial port `{port}` exists; plug in the Pico or hold BOOTSEL"
-                ),
-            ));
-        }
-        let _ = Command::new("python3")
-            .arg("-c")
-            .arg(RP2040_TOUCH_1200_SCRIPT)
-            .arg(port)
-            .output();
-
-        let deadline = Instant::now() + Duration::from_secs(6);
-        while !by_label.exists() {
-            if Instant::now() >= deadline {
-                return Err(CodegenError::new(
-                    "rp2040-flash",
-                    format!(
-                        "RP2040 did not enter BOOTSEL (/dev/disk/by-label/RPI-RP2) after 1200-baud touch on `{port}`; hold BOOTSEL while plugging USB to flash the initial Zev SRAM UF2"
-                    ),
-                ));
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-
-    let query_mount = || -> Option<String> {
-        let out = Command::new("lsblk")
-            .args(["-nr", "-o", "MOUNTPOINT", "/dev/disk/by-label/RPI-RP2"])
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let mp = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if mp.is_empty() { None } else { Some(mp) }
-    };
-
-    let mut mount_point = query_mount();
-    if mount_point.is_none() {
-        let mut last_err = String::new();
-        for _ in 0..8 {
-            let out = Command::new("udisksctl")
-                .args([
-                    "mount",
-                    "--no-user-interaction",
-                    "-b",
-                    "/dev/disk/by-label/RPI-RP2",
-                ])
-                .output()
-                .map_err(|e| {
-                    CodegenError::new("rp2040-flash", format!("failed to invoke udisksctl: {e}"))
-                })?;
-            if out.status.success() {
-                thread::sleep(Duration::from_millis(150));
-                mount_point = query_mount();
-                if mount_point.is_some() {
-                    break;
-                }
-            } else {
-                last_err = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                )
-                .trim()
-                .to_string();
-            }
-            thread::sleep(Duration::from_millis(150));
-        }
-        if mount_point.is_none() {
-            return Err(CodegenError::new(
-                "rp2040-flash",
-                format!("failed to mount /dev/disk/by-label/RPI-RP2: {last_err}"),
-            ));
-        }
-    }
-
-    let mount_dir = mount_point.unwrap();
-    let dest = Path::new(&mount_dir).join("firmware.uf2");
-    let uf2_bytes = fs::read(uf2_path).map_err(|e| {
-        CodegenError::new(
-            "io",
-            format!("failed to read {}: {e}", uf2_path.display()),
-        )
-    })?;
-    {
-        use std::io::Write;
-        let mut f = fs::File::create(&dest).map_err(|e| {
-            CodegenError::new(
-                "rp2040-flash",
-                format!("failed to write {}: {e}", dest.display()),
-            )
-        })?;
-        f.write_all(&uf2_bytes).map_err(|e| {
-            CodegenError::new("rp2040-flash", format!("UF2 write failed: {e}"))
-        })?;
-        let _ = f.sync_all();
-    }
-
-    let reboot_deadline = Instant::now() + Duration::from_secs(6);
-    while by_label.exists() && Instant::now() < reboot_deadline {
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    let cdc_deadline = Instant::now() + Duration::from_secs(5);
-    while !Path::new(port).exists() && Instant::now() < cdc_deadline {
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    Ok(format!(
-        "Flashed RP2040 SRAM UF2 ({} bytes, {} block(s)) via `{mount_dir}`; USB CDC port `{port}` present={}\n",
-        uf2_bytes.len(),
-        uf2_bytes.len() / 512,
-        Path::new(port).exists()
-    ))
+    let spec = TargetSpec::resolve(None, Some("rpi_pico_w"))?;
+    flash_target_image(&spec, uf2_path, Some(port))
 }
 
-/// Flash a raw AVR Flash `.bin` image onto an Arduino Uno R3 (`ATmega328P` / Optiboot) at `0x0000`
-/// using STK500v1 over `pyserial` (`115200` baud) with full page readback verification.
+/// Legacy compatibility flasher delegating via `arduino_uno` TOML spec.
 pub fn flash_avr_uno_bin(bin_path: &Path, port: &str) -> Result<String, CodegenError> {
-    let out = Command::new("python3")
-        .arg("-c")
-        .arg(AVR_STK500V1_FLASH_SCRIPT)
-        .arg(port)
-        .arg(bin_path)
-        .output()
-        .map_err(|e| CodegenError::new("avr-flash", format!("failed to invoke `python3`: {e}")))?;
-
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    if !out.status.success() {
-        return Err(CodegenError::new(
-            "avr-flash",
-            format!("AVR STK500v1 flasher exited with {}:\n{}", out.status, combined.trim()),
-        ));
-    }
-    Ok(combined)
+    let spec = TargetSpec::resolve(None, Some("arduino_uno"))?;
+    flash_target_image(&spec, bin_path, Some(port))
 }
 
-pub use crate::avr_mega0::{flash_avr_nano_every_bin, objcopy_elf_to_avr_nano_every_bin};
+/// Legacy compatibility flasher delegating via `arduino_nano_every` TOML spec.
+pub fn flash_avr_nano_every_bin(bin_path: &Path, port: &str) -> Result<String, CodegenError> {
+    let spec = TargetSpec::resolve(None, Some("arduino_nano_every"))?;
+    flash_target_image(&spec, bin_path, Some(port))
+}

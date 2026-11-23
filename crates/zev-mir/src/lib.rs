@@ -4672,4 +4672,295 @@ mod tests {
         }
         assert!(saw_unsigned_shr);
     }
+
+    #[test]
+    fn sys_isr_callbacks_seed_isr_queue_and_rom_call_lowers_with_const_bound() {
+        let sp = Span::new(0, 0, 1, 1);
+        let items = vec![
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Const(ConstDecl {
+                    ty: ty_prim(PrimType::Usize),
+                    name: id("ROM_STACK"),
+                    value: expr_int(48),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Watch {
+                        elem: Box::new(ty_prim(PrimType::U32)),
+                    },
+                    name: id("w_route"),
+                    init: Some(expr_int(0)),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Watch {
+                        elem: Box::new(ty_prim(PrimType::U32)),
+                    },
+                    name: id("w_ack"),
+                    init: Some(expr_int(0)),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::OsPrimitive(OsPrimitiveDecl {
+                    attrs: vec![],
+                    ty: OsPrimitiveType::Watch {
+                        elem: Box::new(ty_prim(PrimType::U32)),
+                    },
+                    name: id("w_fault"),
+                    init: Some(expr_int(0)),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
+                    name: id("on_route"),
+                    params: vec![
+                        Param {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("a"),
+                            span: sp,
+                        },
+                        Param {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("b"),
+                            span: sp,
+                        },
+                    ],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Expr(expr_method(
+                                expr_id("w_route"),
+                                "publish",
+                                vec![expr_id("a")],
+                            )),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
+                    name: id("on_ack"),
+                    params: vec![Param {
+                        ty: ty_prim(PrimType::U32),
+                        name: id("s"),
+                        span: sp,
+                    }],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Expr(expr_method(
+                                expr_id("w_ack"),
+                                "publish",
+                                vec![expr_id("s")],
+                            )),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
+                    name: id("on_fault"),
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![Stmt::new(
+                            StmtKind::Expr(expr_method(
+                                expr_id("w_fault"),
+                                "publish",
+                                vec![expr_int(1)],
+                            )),
+                            sp,
+                        )],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+            Item {
+                attrs: vec![],
+                is_pub: false,
+                kind: ItemKind::Fn(FnDecl {
+                    attrs: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
+                    name: id("main"),
+                    params: vec![],
+                    is_variadic: false,
+                    ret_type: ty_prim(PrimType::Void),
+                    error_spec: None,
+                    body: Some(Block::new(
+                        vec![
+                            Stmt::new(
+                                StmtKind::Expr(expr_method(
+                                    expr_id("sys"),
+                                    "set_irq_router",
+                                    vec![expr_id("on_route"), expr_id("on_ack")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(expr_method(
+                                    expr_id("sys"),
+                                    "set_fault_handler",
+                                    vec![expr_id("on_fault")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::VarDecl {
+                                    ty: ty_prim(PrimType::U32),
+                                    name: id("v"),
+                                    init: Some(expr_method(
+                                        expr_id("sys"),
+                                        "rom_call_u32",
+                                        vec![expr_int(0x18), expr_id("ROM_STACK"), expr_int(1)],
+                                    )),
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(expr_method(
+                                    expr_id("sys"),
+                                    "rom_call_void",
+                                    vec![expr_int(0x20), expr_int(16), expr_id("v")],
+                                )),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::If {
+                                    cond: Expr::new(ExprKind::Literal(Literal::Bool(false)), sp),
+                                    then_block: Block::new(
+                                        vec![Stmt::new(
+                                            StmtKind::Expr(expr_method(
+                                                expr_id("sys"),
+                                                "rom_call_noreturn",
+                                                vec![expr_int(0x30), expr_id("v")],
+                                            )),
+                                            sp,
+                                        )],
+                                        sp,
+                                    ),
+                                    else_block: None,
+                                },
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(expr_method(expr_id("w_route"), "read", vec![])),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(expr_method(expr_id("w_ack"), "read", vec![])),
+                                sp,
+                            ),
+                            Stmt::new(
+                                StmtKind::Expr(expr_method(expr_id("w_fault"), "read", vec![])),
+                                sp,
+                            ),
+                        ],
+                        sp,
+                    )),
+                    span: sp,
+                }),
+                span: sp,
+            },
+        ];
+
+        let mir = lower_program(&Program::new(items, sp)).expect("lower ok");
+        let vis = crate::opt::analyze_visibility(&mir);
+        assert!(vis.isr_contended_globals.contains("w_ack"));
+        assert!(vis.isr_contended_globals.contains("w_fault"));
+        assert!(!vis.isr_contended_globals.contains("w_route"));
+
+        let mut saw_u32_bound = false;
+        let mut saw_void_bound = false;
+        let mut saw_noreturn = false;
+        for step in &mir.boot.steps {
+            if let MirBootStep::Stmt(s) = step {
+                match s {
+                    MirStmt::Assign {
+                        value:
+                            MirExpr {
+                                kind: MirExprKind::RomCallU32 { stack_bound: 48, .. },
+                                ..
+                            },
+                        ..
+                    } => saw_u32_bound = true,
+                    MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, args })
+                        if method == "rom_call_void" =>
+                    {
+                        if let Some(MirExpr {
+                            kind: MirExprKind::IntLit(16),
+                            ..
+                        }) = args.get(1)
+                        {
+                            saw_void_bound = true;
+                        }
+                    }
+                    MirStmt::If { then_body, .. } => {
+                        for inner in then_body {
+                            if matches!(
+                                inner,
+                                MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, .. })
+                                    if method == "rom_call_noreturn"
+                            ) {
+                                saw_noreturn = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_u32_bound && saw_void_bound && saw_noreturn);
+    }
 }

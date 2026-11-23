@@ -966,6 +966,12 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                     self.register_expr(e);
                 }
             }
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                self.register_expr(addr);
+                for a in args {
+                    self.register_expr(a);
+                }
+            }
             MirExprKind::PrimRead(ro) => match ro.as_ref() {
                 MirPrimReadOp::WatchRead { target, elem_ty } => {
                     self.register_prim_target(target);
@@ -4265,12 +4271,82 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 "tick" | "tick_ms" => {
                     let _ = writeln!(self.out, "{pad}syn_sys_tick();");
                 }
+                "tick_by" => {
+                    let ms = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "0U".to_string());
+                    let _ = writeln!(self.out, "{pad}syn_sys_tick_by((uint32_t)({ms}));");
+                }
                 "set_putc" => {
                     let cb = args
                         .first()
                         .map(|a| self.fmt_expr(a, vars))
                         .unwrap_or_else(|| "NULL".to_string());
                     let _ = writeln!(self.out, "{pad}syn_sys_set_putc((syn_putc_fn_t)({cb}));");
+                }
+                "set_clock_ms" => {
+                    let cb = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}syn_sys_set_clock_ms((syn_clock_ms_fn_t)({cb}));"
+                    );
+                }
+                "set_exit" => {
+                    let cb = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let _ = writeln!(self.out, "{pad}syn_sys_set_exit((syn_exit_fn_t)({cb}));");
+                }
+                "set_fault_handler" => {
+                    let cb = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}syn_sys_set_fault_handler((syn_fault_fn_t)({cb}));"
+                    );
+                }
+                "set_idle" => {
+                    let cb = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let _ = writeln!(self.out, "{pad}syn_sys_set_idle((syn_idle_fn_t)({cb}));");
+                }
+                "set_irq_router" => {
+                    let route_cb = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let ack_cb = args
+                        .get(1)
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}syn_sys_set_irq_router((syn_irq_route_fn_t)({route_cb}), (syn_irq_ack_fn_t)({ack_cb}));"
+                    );
+                }
+                "rom_call_void" => {
+                    if let Some(addr) = args.first() {
+                        let abi_args = if args.len() > 2 { &args[2..] } else { &[] };
+                        let call_s = self.fmt_rom_call_expr("void", addr, abi_args, vars);
+                        let _ = writeln!(self.out, "{pad}{call_s};");
+                    }
+                }
+                "rom_call_noreturn" => {
+                    if let Some(addr) = args.first() {
+                        let abi_args = &args[1..];
+                        let call_s = self.fmt_rom_call_expr("void", addr, abi_args, vars);
+                        let _ = writeln!(self.out, "{pad}{call_s};");
+                        let _ = writeln!(self.out, "{pad}syn_sim_exit(0);");
+                    }
                 }
                 _ => {
                     for a in args {
@@ -4983,7 +5059,35 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 MirSysQuery::SleepDepth => "(uint32_t)syn_allowed_sleep_depth()".to_string(),
                 MirSysQuery::WfiCount => "g_syn_sleep.enter_count".to_string(),
             },
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                self.fmt_rom_call_expr("uint32_t", addr, args, vars)
+            }
         }
+    }
+
+    fn fmt_rom_call_expr(
+        &self,
+        ret_c: &str,
+        addr: &MirExpr,
+        abi_args: &[MirExpr],
+        vars: &[MirVar],
+    ) -> String {
+        let addr_s = self.fmt_expr(addr, vars);
+        let param_tys = if abi_args.is_empty() {
+            "void".to_string()
+        } else {
+            abi_args
+                .iter()
+                .map(|a| self.c_type(&a.ty))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let arg_vals = abi_args
+            .iter()
+            .map(|a| format!("({})({})", self.c_type(&a.ty), self.fmt_expr(a, vars)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("(({ret_c} (*)({param_tys}))(uintptr_t)({addr_s}))({arg_vals})")
     }
 
     fn fmt_const_endian_bytes(bits: u8, big_endian: bool, val: i128) -> String {
@@ -5980,6 +6084,106 @@ mod sys_tick_and_putc_c_tests {
         assert!(c_code.contains("syn_sys_tick();"));
 
         let tmp = std::env::temp_dir().join(format!("zev_sys_putc_test_{}", std::process::id()));
+        let c_path = tmp.with_extension("c");
+        let bin_path = tmp.with_extension("bin");
+        std::fs::write(&c_path, &c_code).expect("write c");
+        let st = std::process::Command::new("cc")
+            .args([
+                "-std=c99",
+                "-O1",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                c_path.to_str().unwrap(),
+                "-o",
+                bin_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("invoke cc");
+        let _ = std::fs::remove_file(&c_path);
+        assert!(st.success(), "generated C99 failed cc -Werror");
+        let run_st = std::process::Command::new(&bin_path)
+            .status()
+            .expect("run compiled C99");
+        let _ = std::fs::remove_file(&bin_path);
+        assert!(run_st.success(), "compiled C99 runtime assertions failed");
+    }
+
+    #[test]
+    fn explicit_sys_hooks_and_rom_call_emit_and_run_cleanly() {
+        let src = r#"
+            byte_ring<64> log_ring;
+            watch<u32> hw_clock = 700;
+
+            fn my_putc(u8 c) {
+                bool _ok = log_ring.push_byte(c);
+            }
+            u32 my_clock() {
+                return hw_clock.read();
+            }
+            fn my_idle(u32 ms, u32 depth) {
+                u32 step = ms;
+                if (step == 0u32) {
+                    step = 1u32;
+                }
+                hw_clock.publish(hw_clock.read() + step);
+                u32 _d = depth;
+            }
+            fn my_exit(i32 code) {
+                println(f"exit={code}");
+            }
+            fn my_fault() {}
+            fn my_route(u32 src, u32 slot) {
+                u32 _x = src + slot;
+            }
+            fn my_ack(u32 slot) {
+                u32 _x = slot;
+            }
+
+            task sleeper() {
+                loop {
+                    sys.delay(5ms);
+                    sys.tick_by(10u32);
+                    u32 now = sys.now_ms();
+                    println(f"t={now}");
+                    assert(now >= 705u32);
+                    assert(log_ring.len() > 0);
+                    sys.exit(0);
+                }
+            }
+
+            fn main() {
+                sys.set_putc(my_putc);
+                sys.set_clock_ms(my_clock);
+                sys.set_idle(my_idle);
+                sys.set_exit(my_exit);
+                sys.set_fault_handler(my_fault);
+                sys.set_irq_router(my_route, my_ack);
+                spawn sleeper() @normal;
+                if (false) {
+                    u32 _r = sys.rom_call_u32(0x10usize, 16, 1u32);
+                    sys.rom_call_void(0x20usize, 8, 2u32);
+                    sys.rom_call_noreturn(0x30usize, 3u32);
+                }
+            }
+        "#;
+        let prog = zev_parser::parse_str(src).expect("parse ok");
+        let mono = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, Some("<test>"))],
+            &zev_sema::AnalyzeOptions::default(),
+        );
+        assert!(mono.diagnostics.is_empty(), "diags: {:?}", mono.diagnostics);
+        let mir = zev_mir::lower_program(&mono.programs[0]).expect("mir lower ok");
+        let c_code = emit_c_with_options(&mir, &CodegenOptions::default());
+        assert!(c_code.contains("syn_sys_set_clock_ms((syn_clock_ms_fn_t)(syn_fn_my_clock));"));
+        assert!(c_code.contains("syn_sys_set_idle((syn_idle_fn_t)(syn_fn_my_idle));"));
+        assert!(c_code.contains("syn_sys_set_exit((syn_exit_fn_t)(syn_fn_my_exit));"));
+        assert!(c_code.contains("syn_sys_set_fault_handler((syn_fault_fn_t)(syn_fn_my_fault));"));
+        assert!(c_code.contains("syn_sys_set_irq_router((syn_irq_route_fn_t)(syn_fn_my_route), (syn_irq_ack_fn_t)(syn_fn_my_ack));"));
+        assert!(c_code.contains("syn_sys_tick_by((uint32_t)"));
+        assert!(c_code.contains("(uint32_t (*)(uint32_t))(uintptr_t)"));
+
+        let tmp = std::env::temp_dir().join(format!("zev_sys_hooks_test_{}", std::process::id()));
         let c_path = tmp.with_extension("c");
         let bin_path = tmp.with_extension("bin");
         std::fs::write(&c_path, &c_code).expect("write c");

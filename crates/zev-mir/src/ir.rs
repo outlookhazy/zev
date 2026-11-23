@@ -1135,6 +1135,12 @@ pub enum MirExprKind {
     NowTicks,
     /// Portable kernel state query (`sys.current_prio()`, `sys.sleep_depth()`, `sys.wfi_count()`).
     SysQuery(MirSysQuery),
+    /// Fixed-address / BootROM call returning `u32` with compile-time static stack bound.
+    RomCallU32 {
+        addr: Box<MirExpr>,
+        stack_bound: u32,
+        args: Vec<MirExpr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

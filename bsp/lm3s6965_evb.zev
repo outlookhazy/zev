@@ -19,6 +19,7 @@ pub fn init_board() {
             hw.TIMER0.tamatchr = 0;
         }
     }
+    sys.set_putc(console_putc);
 }
 
 pub fn clear_motor_enable() {

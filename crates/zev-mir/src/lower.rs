@@ -3088,6 +3088,45 @@ fn extract_boost_arg(args: &[CallArg]) -> Option<MirPriority> {
     None
 }
 
+fn lower_rom_call_args_be<B: LowerBackend>(
+    args: &[CallArg],
+    has_stack_bound: bool,
+    span: Span,
+    be: &mut B,
+) -> Result<(MirExpr, u32, Vec<MirExpr>), MirLowerError> {
+    let fixed = if has_stack_bound { 2 } else { 1 };
+    if args.len() < fixed {
+        return Err(MirLowerError {
+            message: format!("sys.rom_call_* expects at least {fixed} argument(s)"),
+            span,
+        });
+    }
+    let stack_bound = if has_stack_bound {
+        match eval_const_expr(&args[1].value, be.syms()) {
+            Some(ConstVal::Int(v)) => u32::try_from(v).map_err(|_| MirLowerError {
+                message: format!("sys.rom_call_* stack_bound ({v}) out of u32 range"),
+                span: args[1].span,
+            })?,
+            _ => {
+                return Err(MirLowerError {
+                    message: "sys.rom_call_* stack_bound must be a compile-time constant integer"
+                        .to_string(),
+                    span: args[1].span,
+                });
+            }
+        }
+    } else {
+        0
+    };
+    let raw_addr = be.lower_sub(&args[0].value, Some(&MirType::Usize))?;
+    let addr = coerce_expr_if_needed(raw_addr, &MirType::Usize);
+    let mut abi_args = Vec::with_capacity(args.len() - fixed);
+    for a in &args[fixed..] {
+        abi_args.push(be.lower_sub(&a.value, None)?);
+    }
+    Ok((addr, stack_bound, abi_args))
+}
+
 fn eval_const_expr(expr: &Expr, syms: &ModuleSymbols) -> Option<ConstVal> {
     match &expr.kind {
         ExprKind::Literal(Literal::Int(v)) => Some(ConstVal::Int(*v as i128)),
@@ -4029,7 +4068,12 @@ impl<'a> DirectLowerCtx<'a> {
                     out.push(stmt_op);
                 } else {
                     let me = self.lower_expr_with_stmts(e, None, &mut out)?;
-                    if !me.ty.is_void() || matches!(me.kind, MirExprKind::CallDirect { .. }) {
+                    if !me.ty.is_void()
+                        || matches!(
+                            me.kind,
+                            MirExprKind::CallDirect { .. } | MirExprKind::RomCallU32 { .. }
+                        )
+                    {
                         out.push(MirStmt::Expr(me));
                     }
                 }
@@ -4507,7 +4551,12 @@ impl<'a> DirectLowerCtx<'a> {
                     op: MirAssignOp::Assign,
                     value: fb_val,
                 });
-            } else if !fb_val.ty.is_void() || matches!(fb_val.kind, MirExprKind::CallDirect { .. }) {
+            } else if !fb_val.ty.is_void()
+                || matches!(
+                    fb_val.kind,
+                    MirExprKind::CallDirect { .. } | MirExprKind::RomCallU32 { .. }
+                )
+            {
                 fb_stmts.push(MirStmt::Expr(fb_val));
             }
         } else {
@@ -5885,7 +5934,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                     self.cur_stmts.push(op_stmt);
                 } else {
                     let me = self.lower_expr(e, None)?;
-                    if !me.ty.is_void() || matches!(me.kind, MirExprKind::CallDirect { .. }) {
+                    if !me.ty.is_void()
+                        || matches!(
+                            me.kind,
+                            MirExprKind::CallDirect { .. } | MirExprKind::RomCallU32 { .. }
+                        )
+                    {
                         self.cur_stmts.push(MirStmt::Expr(me));
                     }
                 }
@@ -6588,7 +6642,10 @@ impl<'a> CoroutineLowerCtx<'a> {
                     Ok(MirExpr::new(MirExprKind::Var(out_vid), ok_ty))
                 } else {
                     if !fb_val.ty.is_void()
-                        || matches!(fb_val.kind, MirExprKind::CallDirect { .. })
+                        || matches!(
+                            fb_val.kind,
+                            MirExprKind::CallDirect { .. } | MirExprKind::RomCallU32 { .. }
+                        )
                     {
                         self.cur_stmts.push(MirStmt::Expr(fb_val));
                     }
@@ -6709,7 +6766,11 @@ impl<'a> CoroutineLowerCtx<'a> {
                         } else {
                             let tail_val = self.lower_expr(tail_expr, Some(&ok_ty))?;
                             if tail_val.ty.is_void() {
-                                if matches!(tail_val.kind, MirExprKind::CallDirect { .. }) {
+                                if matches!(
+                                    tail_val.kind,
+                                    MirExprKind::CallDirect { .. }
+                                        | MirExprKind::RomCallU32 { .. }
+                                ) {
                                     self.cur_stmts.push(MirStmt::Expr(tail_val));
                                 }
                             } else {
@@ -8849,6 +8910,18 @@ fn lower_common_expr<B: LowerBackend>(
                                 MirType::U32,
                             ));
                         }
+                        "rom_call_u32" => {
+                            let (addr, stack_bound, abi_args) =
+                                lower_rom_call_args_be(args, true, expr.span, be)?;
+                            return Ok(MirExpr::new(
+                                MirExprKind::RomCallU32 {
+                                    addr: Box::new(addr),
+                                    stack_bound,
+                                    args: abi_args,
+                                },
+                                MirType::U32,
+                            ));
+                        }
                         _ => {}
                     }
                 }
@@ -10099,12 +10172,17 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
             method,
             args,
         } => {
-            // 1. `sys.*` intrinsics (excluding pure value queries `now_ms`, `now_ticks`, `current_prio`, `sleep_depth`, `wfi_count`)
+            // 1. `sys.*` intrinsics (excluding expression queries `now_ms`, `now_ticks`, `current_prio`, `sleep_depth`, `wfi_count`, `rom_call_u32`)
             if let ExprKind::Ident(id) = &receiver.kind {
                 if id.name == "sys"
                     && !matches!(
                         method.name.as_str(),
-                        "now_ms" | "now_ticks" | "current_prio" | "sleep_depth" | "wfi_count"
+                        "now_ms"
+                            | "now_ticks"
+                            | "current_prio"
+                            | "sleep_depth"
+                            | "wfi_count"
+                            | "rom_call_u32"
                     )
                 {
                     if matches!(method.name.as_str(), "log" | "println" | "print" | "puts") {
@@ -10134,12 +10212,38 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             })));
                         }
                     }
+                    if method.name == "rom_call_void" {
+                        let (addr, stack_bound, mut abi_args) =
+                            lower_rom_call_args_be(args, true, expr.span, be)?;
+                        let mut sys_args = Vec::with_capacity(2 + abi_args.len());
+                        sys_args.push(addr);
+                        sys_args.push(MirExpr::new(
+                            MirExprKind::IntLit(stack_bound as i128),
+                            MirType::U32,
+                        ));
+                        sys_args.append(&mut abi_args);
+                        return Ok(Some(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                            method: "rom_call_void".to_string(),
+                            args: sys_args,
+                        })));
+                    }
+                    if method.name == "rom_call_noreturn" {
+                        let (addr, _, mut abi_args) =
+                            lower_rom_call_args_be(args, false, expr.span, be)?;
+                        let mut sys_args = Vec::with_capacity(1 + abi_args.len());
+                        sys_args.push(addr);
+                        sys_args.append(&mut abi_args);
+                        return Ok(Some(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                            method: "rom_call_noreturn".to_string(),
+                            args: sys_args,
+                        })));
+                    }
                     let mut largs = Vec::new();
                     for (idx, a) in args.iter().enumerate() {
                         let exp = match (method.name.as_str(), idx) {
                             ("log", 0) | ("log_kv", 0) | ("log_hex", 0) => Some(&MirType::Str),
                             ("log_kv", 1) | ("exit", 0) => Some(&MirType::I32),
-                            ("log_hex", 1) | ("pend_irq", 0) => Some(&MirType::U32),
+                            ("log_hex", 1) | ("pend_irq", 0) | ("tick_by", 0) => Some(&MirType::U32),
                             _ => None,
                         };
                         let lowered = be.lower_sub(&a.value, exp)?;

@@ -1,16 +1,19 @@
 //! Hardware Single-Stack + `.data`/`.bss` High-Water Mark Proof (`stack_sizes`).
 //!
-//! Computes exact worst-case bare-metal SRAM consumption across:
-//! - **ARM Cortex-M3 (`thumbv7m-none-eabi`, `65,536 B` SRAM)**:
+//! Computes exact worst-case bare-metal SRAM consumption across pure ISA targets:
+//! - **ARM Cortex-M (`arm-cortex-m`)**:
 //!   `/bin/opt` -> `/bin/llc --stack-size-section` -> `/bin/ld.lld` -> `/bin/llvm-size`
 //!   + `/bin/llvm-readobj --stack-sizes` + `/bin/llvm-objdump -d` + `32 B` NVIC HW exception frame.
-//! - **Espressif ESP32-C6 (`riscv32-unknown-none-elf`, `524,288 B` HP-SRAM)**:
+//! - **RISC-V (`riscv32`)**:
 //!   `/bin/opt` -> `/bin/llc --stack-size-section` -> `/bin/ld.lld` -> `/bin/llvm-size`
 //!   + `/bin/llvm-readobj --stack-sizes` + `/bin/llvm-objdump -d` + `64 B` trap context frame.
-//! - **Microchip ATmega328P (`avr`, `2,048 B` SRAM)**:
-//!   `/bin/opt` -> `/bin/llc -mcpu=atmega328p` -> `/bin/ld.lld` -> `/bin/llvm-size`
+//! - **AVR (`avr`)**:
+//!   `/bin/opt` -> `/bin/llc` -> `/bin/ld.lld` -> `/bin/llvm-size`
 //!   + `/bin/llvm-objdump -d` AVR prologue/call-edge analysis (`push` depth + `2 * rcall .+0`
 //!   + `sbiw r28, K` / `subi+sbci` SP subtracts + `2 B` return-PC per call + `2 B` vector push).
+//!
+//! Stack-bounded ROM ABI wrappers (`@__syn_rom_call_*_sb<N>` / `@__syn_rom_noreturn_*`) supply
+//! compile-time verified constant bounds directly via their `_sb<N>` suffix.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -21,31 +24,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use zev_mir::MirModule;
 
-use crate::esp32c6::assign_esp32c6_irq_routes;
-use crate::nvic::sanitize_ident;
+use crate::arm_cortex_m::sanitize_ident;
+use crate::riscv32::assign_rv_irq_routes_for_spec;
+use crate::target_spec::{CpuIsa, TargetSpec};
 use crate::toolchain::{
-    CodegenError, CodegenOptions, TargetArch, inspect_elf_sizes, link_obj_to_elf,
-    optimize_ll_with_opt, synthesize_linker_script,
+    CodegenError, CodegenOptions, inspect_elf_sizes, link_obj_to_elf, optimize_ll_with_opt,
+    synthesize_target_linker_script,
 };
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Hardware SRAM budget in bytes for supported bare-metal targets.
-pub const fn target_sram_budget_bytes(target: TargetArch) -> Option<u64> {
-    match target {
-        TargetArch::Thumbv7mNoneEabi => Some(65_536),
-        TargetArch::Thumbv6mRp2040 => Some(270_336),
-        TargetArch::Riscv32Esp32C6 => Some(524_288),
-        TargetArch::AvrAtmega328p => Some(2_048),
-        TargetArch::AvrAtmega4809 => Some(6_144),
-        TargetArch::HostX86_64Linux => None,
-    }
-}
-
 /// Hardware single-stack + `.data`/`.bss` high-water proof for a compiled bare-metal ELF.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardwareStackProof {
-    pub target: TargetArch,
+    pub isa: CpuIsa,
+    pub chip_name: String,
+    pub board_name: Option<String>,
+    pub code_in_ram: bool,
     pub opt_level: String,
     pub text_bytes: u64,
     pub data_bytes: u64,
@@ -68,33 +63,19 @@ pub struct HardwareStackProof {
 }
 
 impl HardwareStackProof {
-    /// Human-readable hardware stack + `.data`/`.bss` high-water proof table for `zevc ram --target`.
+    /// Human-readable hardware stack + `.data`/`.bss` high-water proof table for `zevc ram`.
     pub fn format_table(&self) -> String {
-        let (target_label, analyzer_label) = match self.target {
-            TargetArch::Thumbv7mNoneEabi => (
-                "ARM Cortex-M3 (thumbv7m-none-eabi)",
-                "LLVM .stack_sizes + ELF call graph + 32B NVIC frame",
-            ),
-            TargetArch::Thumbv6mRp2040 => (
-                "Raspberry Pi RP2040 Pico W (thumbv6m-none-eabi, NO_FLASH SRAM)",
-                "LLVM .stack_sizes + ELF call graph + 32B NVIC frame",
-            ),
-            TargetArch::Riscv32Esp32C6 => (
-                "Espressif ESP32-C6 (riscv32-unknown-none-elf, rv32imac)",
-                "LLVM .stack_sizes + ELF call graph + 64B trap context frame",
-            ),
-            TargetArch::AvrAtmega328p => (
-                "Microchip ATmega328P AVR (avr / Arduino Uno R3)",
-                "AVR ELF disassembly (push + sbiw/rcall.+0 + 2B return PC + 2B IRQ push)",
-            ),
-            TargetArch::AvrAtmega4809 => (
-                "Microchip ATmega4809 AVR (avrxmega3 / Arduino Nano Every)",
-                "AVR ELF disassembly (push + sbiw/rcall.+0 + 2B return PC + 2B IRQ push)",
-            ),
-            TargetArch::HostX86_64Linux => (
-                "Host x86_64",
-                "unsupported",
-            ),
+        let target_label = match &self.board_name {
+            Some(board) => format!("{} / {} ({})", board, self.chip_name, self.isa.as_str()),
+            None => format!("{} ({})", self.chip_name, self.isa.as_str()),
+        };
+        let analyzer_label = match self.isa {
+            CpuIsa::ArmCortexM => "LLVM .stack_sizes + ELF call graph + 32B NVIC frame",
+            CpuIsa::Riscv32 => "LLVM .stack_sizes + ELF call graph + 64B trap context frame",
+            CpuIsa::Avr => {
+                "AVR ELF disassembly (push + sbiw/rcall.+0 + 2B return PC + 2B IRQ push)"
+            }
+            CpuIsa::HostX86_64Linux => "unsupported",
         };
 
         let mut out = String::new();
@@ -106,12 +87,12 @@ impl HardwareStackProof {
 
         out.push_str("1. Linked ELF Section Footprint (/bin/llvm-size)\n");
         out.push_str("--------------------------------------------------------------------------------\n");
-        let text_label = if self.target == TargetArch::Thumbv6mRp2040 {
+        let text_label = if self.code_in_ram {
             "SRAM Code (.text + .rodata)"
         } else {
             "Flash Code (.text)"
         };
-        let static_label = if self.target == TargetArch::Thumbv6mRp2040 {
+        let static_label = if self.code_in_ram {
             "Static SRAM (.text + .data + .bss)"
         } else {
             "Static SRAM (.data + .bss)"
@@ -169,7 +150,7 @@ impl HardwareStackProof {
 
         out.push_str("3. Total SRAM High-Water Budget Verdict\n");
         out.push_str("--------------------------------------------------------------------------------\n");
-        let static_sram_lbl = if self.target == TargetArch::Thumbv6mRp2040 {
+        let static_sram_lbl = if self.code_in_ram {
             "Static SRAM (.text + .data + .bss)"
         } else {
             "Static SRAM (.data + .bss)"
@@ -236,11 +217,28 @@ fn find_tool(preferred_abs: &'static str, fallback_name: &'static str) -> &'stat
     }
 }
 
+fn parse_rom_call_stack_bound(sym: &str) -> Option<u64> {
+    let s = sym.trim_start_matches('@');
+    if !s.starts_with("__syn_rom_call_") {
+        return None;
+    }
+    let (_, tail) = s.rsplit_once("_sb")?;
+    tail.parse::<u64>().ok()
+}
+
+fn is_exempt_indirect_wrapper(sym: &str) -> bool {
+    let s = sym.trim_start_matches('@');
+    s == "__syn_sched_loop"
+        || s.starts_with("__syn_rom_call_")
+        || s.starts_with("__syn_rom_noreturn_")
+}
+
 fn compile_ll_to_obj_with_stack_sizes(
     ll_path: &Path,
     opt_ll_path: &Path,
     obj_path: &Path,
     opts: &CodegenOptions,
+    spec: &TargetSpec,
 ) -> Result<PathBuf, CodegenError> {
     let llc_flag = opts.llc_opt_flag()?;
     let llc_input: PathBuf = if opts.is_opt_o0() {
@@ -252,34 +250,21 @@ fn compile_ll_to_obj_with_stack_sizes(
 
     let llc = find_tool("/bin/llc", "llc");
     let mut cmd = Command::new(llc);
-    cmd.arg(format!("-mtriple={}", opts.target.triple()));
-    match opts.target {
-        TargetArch::Thumbv7mNoneEabi => {
-            cmd.arg("-mcpu=cortex-m3")
-                .arg("-function-sections")
-                .arg("-data-sections")
-                .arg("--stack-size-section");
+    cmd.arg(format!("-mtriple={}", spec.triple));
+    if spec.isa != CpuIsa::HostX86_64Linux {
+        if !spec.cpu.is_empty() {
+            cmd.arg(format!("-mcpu={}", spec.cpu));
         }
-        TargetArch::Thumbv6mRp2040 => {
-            cmd.arg("-mcpu=cortex-m0plus")
-                .arg("-function-sections")
-                .arg("-data-sections")
-                .arg("--stack-size-section");
+        if !spec.features.is_empty() {
+            cmd.arg(format!("-mattr={}", spec.features));
         }
-        TargetArch::Riscv32Esp32C6 => {
-            cmd.arg("-mcpu=generic-rv32")
-                .arg("-mattr=+m,+a,+c")
-                .arg("-relocation-model=static")
-                .arg("-function-sections")
-                .arg("-data-sections")
-                .arg("--stack-size-section");
+        if spec.isa == CpuIsa::Riscv32 {
+            cmd.arg("-relocation-model=static");
         }
-        TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
-            cmd.arg(format!("-mcpu={}", opts.target.avr_mcpu()))
-                .arg("-function-sections")
-                .arg("-data-sections");
+        cmd.arg("-function-sections").arg("-data-sections");
+        if !spec.isa.is_avr() {
+            cmd.arg("--stack-size-section");
         }
-        TargetArch::HostX86_64Linux => {}
     }
     cmd.arg(llc_flag)
         .arg("-filetype=obj")
@@ -642,7 +627,7 @@ fn parse_ll_indirect_callers(ll_text: &str) -> BTreeSet<String> {
         let Some(ref caller) = cur_fn else {
             continue;
         };
-        if caller == "__syn_sched_loop" || caller == "__syn_rp2040_usb_boot_reset" {
+        if is_exempt_indirect_wrapper(caller) {
             continue;
         }
         if t.starts_with(';') || t.contains(" asm ") || !is_ll_call_line(t) {
@@ -685,7 +670,7 @@ fn parse_signed_rel_offset(tok: &str) -> Option<i64> {
     }
 }
 
-fn extract_esp32c6_tramp_sp_alloc(insns: &[(u64, String, String)]) -> Option<u64> {
+fn extract_rv_tramp_sp_alloc(insns: &[(u64, String, String)]) -> Option<u64> {
     for (_, mnem, ops) in insns {
         if (mnem == "addi" || mnem == "c.addi16sp") && ops.starts_with("sp,") {
             let last = ops.rsplit(',').next()?.trim();
@@ -976,7 +961,7 @@ fn analyze_avr_disasm(
 }
 
 fn build_arm_or_rv_call_graph(
-    target: TargetArch,
+    isa: CpuIsa,
     disasm: &DisasmData,
     ll_text: &str,
     frame_sizes: &BTreeMap<String, u64>,
@@ -989,23 +974,18 @@ fn build_arm_or_rv_call_graph(
         if fn_name == "__syn_rv_vector_table" {
             continue;
         }
-        let check_indirect =
-            fn_name != "__syn_sched_loop" && fn_name != "__syn_rp2040_usb_boot_reset";
+        let check_indirect = !is_exempt_indirect_wrapper(fn_name);
         for (_, mnem, ops) in insns {
-            let is_call = match target {
-                TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
-                    matches!(mnem.as_str(), "bl" | "bl.w" | "blx")
-                }
-                TargetArch::Riscv32Esp32C6 => {
+            let is_call = match isa {
+                CpuIsa::ArmCortexM => matches!(mnem.as_str(), "bl" | "bl.w" | "blx"),
+                CpuIsa::Riscv32 => {
                     matches!(mnem.as_str(), "jal" | "jalr" | "c.jal" | "c.jalr" | "call")
                 }
                 _ => false,
             };
-            let is_tail_branch = match target {
-                TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
-                    matches!(mnem.as_str(), "b" | "b.w" | "b.n" | "bx")
-                }
-                TargetArch::Riscv32Esp32C6 => {
+            let is_tail_branch = match isa {
+                CpuIsa::ArmCortexM => matches!(mnem.as_str(), "b" | "b.w" | "b.n" | "bx"),
+                CpuIsa::Riscv32 => {
                     matches!(mnem.as_str(), "j" | "c.j" | "jr" | "c.jr" | "tail")
                 }
                 _ => false,
@@ -1014,13 +994,11 @@ fn build_arm_or_rv_call_graph(
                 if let Some(sym) = extract_angle_symbol(ops) {
                     add_edge(&mut graph, fn_name, sym, 0);
                 } else if check_indirect {
-                    match target {
-                        TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040
-                            if mnem == "blx" =>
-                        {
+                    match isa {
+                        CpuIsa::ArmCortexM if mnem == "blx" => {
                             indirect_callers.insert(fn_name.clone());
                         }
-                        TargetArch::Riscv32Esp32C6
+                        CpuIsa::Riscv32
                             if matches!(mnem.as_str(), "jalr" | "c.jalr")
                                 && !is_riscv_ra_target(ops) =>
                         {
@@ -1036,11 +1014,9 @@ fn build_arm_or_rv_call_graph(
                     }
                 } else if check_indirect && ll_indirect_callers.contains(fn_name) {
                     let op_clean = ops.split(';').next().unwrap_or("").trim();
-                    let is_indirect_tail = match target {
-                        TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
-                            mnem == "bx" && op_clean != "lr"
-                        }
-                        TargetArch::Riscv32Esp32C6 => {
+                    let is_indirect_tail = match isa {
+                        CpuIsa::ArmCortexM => mnem == "bx" && op_clean != "lr",
+                        CpuIsa::Riscv32 => {
                             matches!(mnem.as_str(), "jr" | "c.jr") && !is_riscv_ra_target(op_clean)
                         }
                         _ => false,
@@ -1143,18 +1119,20 @@ fn walk_worst_stack(
     res
 }
 
-/// Compile `mir` for `opts.target` (`Thumbv7mNoneEabi`, `Thumbv6mRp2040`, `Riscv32Esp32C6`, `AvrAtmega328p`, or `AvrAtmega4809`)
-/// and prove worst-case hardware single-stack + `.data`/`.bss` SRAM high-water mark against target limits.
+/// Compile `mir` using the resolved `TargetSpec` and prove worst-case hardware
+/// single-stack + `.data`/`.bss` SRAM high-water mark against `spec.sram_budget_bytes`.
 pub fn analyze_hardware_stack_high_water(
     mir: &MirModule,
     opts: &CodegenOptions,
 ) -> Result<HardwareStackProof, CodegenError> {
-    let sram_budget_bytes = target_sram_budget_bytes(opts.target).ok_or_else(|| {
-        CodegenError::new(
+    let spec = opts.effective_spec()?;
+    if spec.isa == CpuIsa::HostX86_64Linux {
+        return Err(CodegenError::new(
             "stack-sizes",
-            "hardware stack high-water proof only supports bare-metal targets (`cortex-m3`, `rp2040`, `esp32c6`, `avr`, `nano-every`)",
-        )
-    })?;
+            "hardware stack high-water proof only supports bare-metal embedded targets",
+        ));
+    }
+    let sram_budget_bytes = u64::from(spec.sram_budget_bytes);
 
     let temp = TempProofDir::create("zev-stack-proof")?;
     let ll_path = temp.dir.join("firmware.ll");
@@ -1167,16 +1145,17 @@ pub fn analyze_hardware_stack_high_water(
     fs::write(&ll_path, &raw_ll).map_err(|e| {
         CodegenError::new("io", format!("failed to write {}: {e}", ll_path.display()))
     })?;
-    let ld_script = synthesize_linker_script(opts);
+    let ld_script = synthesize_target_linker_script(&spec);
     fs::write(&ld_path, &ld_script).map_err(|e| {
         CodegenError::new("io", format!("failed to write {}: {e}", ld_path.display()))
     })?;
 
-    let used_ll_path = compile_ll_to_obj_with_stack_sizes(&ll_path, &opt_ll_path, &obj_path, opts)?;
+    let used_ll_path =
+        compile_ll_to_obj_with_stack_sizes(&ll_path, &opt_ll_path, &obj_path, opts, &spec)?;
     link_obj_to_elf(&obj_path, &ld_path, &elf_path)?;
 
     let (text_bytes, data_bytes, bss_bytes) = inspect_elf_text_data_bss(&elf_path)?;
-    let static_sram_bytes = if opts.target == TargetArch::Thumbv6mRp2040 {
+    let static_sram_bytes = if spec.code_in_ram {
         text_bytes.saturating_add(data_bytes).saturating_add(bss_bytes)
     } else {
         data_bytes.saturating_add(bss_bytes)
@@ -1187,15 +1166,15 @@ pub fn analyze_hardware_stack_high_water(
     let ll_text = fs::read_to_string(&used_ll_path).unwrap_or(raw_ll);
     let ll_indirect_callers = parse_ll_indirect_callers(&ll_text);
 
-    let (mut frame_sizes, mut graph, mut indirect_callers) = if opts.target.is_avr() {
+    let (mut frame_sizes, mut graph, mut indirect_callers) = if spec.isa.is_avr() {
         analyze_avr_disasm(&disasm, &ll_indirect_callers)
     } else {
         let readobj_raw = run_readobj_stack_sizes(&obj_path)?;
         let mut frames = parse_llvm_readobj_stack_sizes(&readobj_raw);
-        if opts.target == TargetArch::Riscv32Esp32C6 {
+        if spec.isa == CpuIsa::Riscv32 {
             for (sym, insns) in &disasm.fn_insns {
-                if sym.starts_with("__syn_rv_irq_tramp_") || sym == "__syn_esp32c6_trap_entry" {
-                    let parsed_alloc = extract_esp32c6_tramp_sp_alloc(insns).unwrap_or(64);
+                if sym.starts_with("__syn_rv_irq_tramp_") || sym == "__syn_rv_exc_tramp" {
+                    let parsed_alloc = extract_rv_tramp_sp_alloc(insns).unwrap_or(64);
                     frames
                         .entry(sym.clone())
                         .and_modify(|v| {
@@ -1208,7 +1187,7 @@ pub fn analyze_hardware_stack_high_water(
             }
         }
         let (g, disasm_ind) = build_arm_or_rv_call_graph(
-            opts.target,
+            spec.isa,
             &disasm,
             &ll_text,
             &frames,
@@ -1218,12 +1197,27 @@ pub fn analyze_hardware_stack_high_water(
         (frames, g, ind_map)
     };
 
+    // Add declared compile-time constant `_sb<N>` stack bounds for `@__syn_rom_call_*` wrappers.
+    let known_syms: BTreeSet<String> = disasm
+        .elf_symbols
+        .iter()
+        .cloned()
+        .chain(frame_sizes.keys().cloned())
+        .collect();
+    for sym in known_syms {
+        if let Some(sb) = parse_rom_call_stack_bound(&sym) {
+            frame_sizes
+                .entry(sym)
+                .and_modify(|v| *v = v.saturating_add(sb))
+                .or_insert(sb);
+        }
+    }
+
     // Merge indirect callers observed in `.ll` + disassembly, and wire conservative edges
     // to non-entry, non-coroutine user functions (`__syn_fn_*` excluding `__syn_fn_step_*`) + `extern "C"`.
-    let step_edge_cost = if opts.target.is_avr() { 2 } else { 0 };
+    let step_edge_cost = if spec.isa.is_avr() { 2 } else { 0 };
     for caller in &ll_indirect_callers {
-        if caller != "__syn_sched_loop"
-            && caller != "__syn_rp2040_usb_boot_reset"
+        if !is_exempt_indirect_wrapper(caller)
             && (disasm.elf_symbols.contains(caller) || frame_sizes.contains_key(caller))
         {
             indirect_callers
@@ -1245,7 +1239,7 @@ pub fn analyze_hardware_stack_high_water(
             }
         }
         for (caller, cost) in &indirect_callers {
-            if caller == "__syn_sched_loop" || caller == "__syn_rp2040_usb_boot_reset" {
+            if is_exempt_indirect_wrapper(caller) {
                 continue;
             }
             for target in &indirect_targets {
@@ -1286,9 +1280,8 @@ pub fn analyze_hardware_stack_high_water(
     } else {
         let fallback_boot = [
             "Reset_Handler",
-            "__syn_esp32c6_reset",
+            "__syn_rv_reset",
             "__syn_avr_entry",
-            "__syn_avr_mega0_entry",
             "_start",
         ]
         .into_iter()
@@ -1329,8 +1322,8 @@ pub fn analyze_hardware_stack_high_water(
 
     // 3. Worst-case preempting ISR stack (including hardware interrupt frame overhead)
     let (worst_isr_stack_bytes, worst_isr_name, worst_isr_path, isr_hw_overhead_bytes) =
-        match opts.target {
-            TargetArch::Thumbv7mNoneEabi | TargetArch::Thumbv6mRp2040 => {
+        match spec.isa {
+            CpuIsa::ArmCortexM => {
                 let hw_frame = 32u64;
                 let mut candidates = Vec::new();
                 for st_sym in ["SysTick_Handler", "__syn_systick_isr"] {
@@ -1363,24 +1356,24 @@ pub fn analyze_hardware_stack_high_water(
                     &mut has_cycle,
                 )
             }
-            TargetArch::Riscv32Esp32C6 => {
-                let routes = assign_esp32c6_irq_routes(&mir.irq_vectors)?;
+            CpuIsa::Riscv32 => {
+                let routes = assign_rv_irq_routes_for_spec(&mir.irq_vectors, &spec)?;
                 if routes.is_empty()
                     && !disasm.elf_symbols.contains("__syn_systick_isr")
-                    && !disasm.elf_symbols.contains("__syn_esp32c6_trap_entry")
+                    && !disasm.elf_symbols.contains("__syn_rv_exc_tramp")
                 {
                     (0, "(none)".to_string(), Vec::new(), 0)
                 } else {
                     let mut tramp_candidates = Vec::new();
-                    let cpu_ints: BTreeSet<u8> = routes.iter().map(|r| r.cpu_int).collect();
-                    for c in cpu_ints {
+                    let cpu_slots: BTreeSet<u8> = routes.iter().map(|r| r.cpu_slot).collect();
+                    for c in cpu_slots {
                         let tramp = format!("__syn_rv_irq_tramp_{c}");
                         if disasm.elf_symbols.contains(&tramp) || frame_sizes.contains_key(&tramp) {
                             tramp_candidates.push(tramp);
                         }
                     }
-                    if disasm.elf_symbols.contains("__syn_esp32c6_trap_entry") {
-                        tramp_candidates.push("__syn_esp32c6_trap_entry".to_string());
+                    if disasm.elf_symbols.contains("__syn_rv_exc_tramp") {
+                        tramp_candidates.push("__syn_rv_exc_tramp".to_string());
                     }
                     if !tramp_candidates.is_empty() {
                         // Trap trampoline frame already carries the 64 B context save in `frame_sizes`
@@ -1416,7 +1409,7 @@ pub fn analyze_hardware_stack_high_water(
                     }
                 }
             }
-            TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => {
+            CpuIsa::Avr => {
                 let hw_frame = 2u64;
                 let mut candidates = Vec::new();
                 for v in &mir.irq_vectors {
@@ -1441,7 +1434,7 @@ pub fn analyze_hardware_stack_high_water(
                     &mut has_cycle,
                 )
             }
-            TargetArch::HostX86_64Linux => unreachable!(),
+            CpuIsa::HostX86_64Linux => unreachable!(),
         };
 
     // Retain only non-dot ELF symbols in `frame_sizes` for clean reporting
@@ -1454,8 +1447,11 @@ pub fn analyze_hardware_stack_high_water(
     let within_budget = total_high_water_bytes <= sram_budget_bytes;
 
     Ok(HardwareStackProof {
-        target: opts.target,
-        opt_level: opts.opt_level.clone(),
+        isa: spec.isa,
+        chip_name: spec.chip_name,
+        board_name: spec.board_name,
+        code_in_ram: spec.code_in_ram,
+        opt_level: spec.opt_level,
         text_bytes,
         data_bytes,
         bss_bytes,
@@ -1715,17 +1711,48 @@ entry:
   call void %step(ptr null)
   ret void
 }
-define void @__syn_rp2040_usb_boot_reset(ptr %rom_fn) {
+define void @__syn_rom_call_u32_a2_i32_i32_sb32(i32 %fn_addr, i32 %a0, i32 %a1) {
 entry:
-  call void %rom_fn()
+  %fp = inttoptr i32 %fn_addr to ptr
+  %r = call i32 %fp(i32 %a0, i32 %a1)
   ret void
+}
+define void @__syn_rom_noreturn_a2_i32_i32(i32 %fn_addr, i32 %a0, i32 %a1) {
+entry:
+  %fp = inttoptr i32 %fn_addr to ptr
+  call void %fp(i32 %a0, i32 %a1)
+  unreachable
 }
 "#;
         let ll_indirect = parse_ll_indirect_callers(ll);
         assert!(ll_indirect.contains("__syn_fn_dispatch"));
         assert!(!ll_indirect.contains("__syn_fn_asm_only"));
         assert!(!ll_indirect.contains("__syn_sched_loop"));
-        assert!(!ll_indirect.contains("__syn_rp2040_usb_boot_reset"));
+        assert!(!ll_indirect.contains("__syn_rom_call_u32_a2_i32_i32_sb32"));
+        assert!(!ll_indirect.contains("__syn_rom_noreturn_a2_i32_i32"));
+        assert_eq!(parse_rom_call_stack_bound("__syn_rom_call_u32_a2_i32_i32_sb32"), Some(32));
+        assert_eq!(parse_rom_call_stack_bound("__syn_rom_noreturn_a2_i32_i32"), None);
+
+        let mut sb_frames = BTreeMap::from([("__syn_boot".to_string(), 8u64)]);
+        if let Some(sb) = parse_rom_call_stack_bound("__syn_rom_call_u32_a2_i32_i32_sb32") {
+            sb_frames.insert("__syn_rom_call_u32_a2_i32_i32_sb32".to_string(), sb);
+        }
+        let mut sb_graph = EdgeGraph::new();
+        add_edge(&mut sb_graph, "__syn_boot", "__syn_rom_call_u32_a2_i32_i32_sb32", 0);
+        let mut visiting = BTreeSet::new();
+        let mut memo = BTreeMap::new();
+        let mut has_cycle = false;
+        let (depth, path) = walk_worst_stack(
+            "__syn_boot",
+            &sb_frames,
+            &sb_graph,
+            &BTreeSet::new(),
+            &mut visiting,
+            &mut memo,
+            &mut has_cycle,
+        );
+        assert_eq!(depth, 40);
+        assert!(path.iter().any(|p| p.contains("__syn_rom_call_u32_a2_i32_i32_sb32 (32B)")));
 
         let thumb_disasm = r#"
 00000100 <__syn_fn_dispatch>:
@@ -1741,7 +1768,7 @@ entry:
         ll_thumb.insert("__syn_fn_tail".to_string());
         let thumb_parsed = parse_objdump_disassembly(thumb_disasm);
         let (_, thumb_indirect) = build_arm_or_rv_call_graph(
-            TargetArch::Thumbv7mNoneEabi,
+            CpuIsa::ArmCortexM,
             &thumb_parsed,
             "",
             &BTreeMap::new(),
@@ -1762,7 +1789,7 @@ entry:
 "#;
         let rv_parsed = parse_objdump_disassembly(rv_disasm);
         let (_, rv_indirect) = build_arm_or_rv_call_graph(
-            TargetArch::Riscv32Esp32C6,
+            CpuIsa::Riscv32,
             &rv_parsed,
             "",
             &BTreeMap::new(),

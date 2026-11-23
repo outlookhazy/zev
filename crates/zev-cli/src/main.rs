@@ -339,29 +339,262 @@ enum RamExecOutcome {
     CompileErr(String),
 }
 
-fn execute_ram_command(
+fn discover_manifest_for_inputs(
+    files: &[PathBuf],
+) -> Result<Option<(PathBuf, zev_codegen_llvm::ProjectManifest)>, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("failed to get cwd: {e}"))?;
+    if let Some(first) = files.first() {
+        let abs = if first.is_absolute() {
+            first.clone()
+        } else {
+            cwd.join(first)
+        };
+        if let Some(parent) = abs.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Some(found) = zev_codegen_llvm::ProjectManifest::discover(parent)
+                .map_err(|e| e.to_string())?
+            {
+                return Ok(Some(found));
+            }
+        }
+    }
+    zev_codegen_llvm::ProjectManifest::discover(&cwd).map_err(|e| e.to_string())
+}
+
+fn resolve_target_spec_for_inputs(
+    files: &[PathBuf],
+    manifest_dir: Option<&Path>,
+    chip: Option<&str>,
+    board: Option<&str>,
+) -> Result<zev_codegen_llvm::TargetSpec, String> {
+    if board.is_some_and(|b| Path::new(b).extension().is_some_and(|e| e == "toml"))
+        || chip.is_some_and(|c| Path::new(c).extension().is_some_and(|e| e == "toml"))
+    {
+        return zev_codegen_llvm::TargetSpec::resolve(chip, board).map_err(|e| e.to_string());
+    }
+
+    let mut custom_roots: Vec<PathBuf> = Vec::new();
+    let mut push_root = |p: PathBuf| {
+        if (p.join("chips").is_dir() || p.join("boards").is_dir()) && !custom_roots.contains(&p) {
+            custom_roots.push(p);
+        }
+    };
+    if let Some(mdir) = manifest_dir {
+        push_root(mdir.to_path_buf());
+    }
+    if let Some(first) = files.first() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let abs = if first.is_absolute() {
+                first.clone()
+            } else {
+                cwd.join(first)
+            };
+            let mut cur = abs.parent();
+            while let Some(d) = cur {
+                push_root(d.to_path_buf());
+                cur = d.parent();
+            }
+        }
+    }
+
+    for root in &custom_roots {
+        if let Ok(spec) = zev_codegen_llvm::TargetSpec::load_from_root(root, chip, board) {
+            return Ok(spec);
+        }
+        if let Some(bname) = board {
+            let bpath = root.join("boards").join(format!("{bname}.toml"));
+            if bpath.is_file() {
+                let chip_arg = chip.map(|c| {
+                    let cpath = root.join("chips").join(format!("{c}.toml"));
+                    if cpath.is_file() {
+                        cpath.to_string_lossy().into_owned()
+                    } else {
+                        c.to_string()
+                    }
+                });
+                if let Ok(spec) = zev_codegen_llvm::TargetSpec::resolve(
+                    chip_arg.as_deref(),
+                    Some(bpath.to_string_lossy().as_ref()),
+                ) {
+                    return Ok(spec);
+                }
+            }
+        }
+    }
+
+    zev_codegen_llvm::TargetSpec::resolve(chip, board).map_err(|e| e.to_string())
+}
+
+fn resolve_llvm_options_for_cli(
+    files: &[PathBuf],
+    target: Option<&str>,
+    board: Option<&str>,
+    chip: Option<&str>,
+) -> Result<zev_codegen_llvm::CodegenOptions, String> {
+    if target.is_some() && (board.is_some() || chip.is_some()) {
+        return Err("cannot combine legacy `--target` with `--board` or `--chip`".to_string());
+    }
+    if board.is_some() || chip.is_some() {
+        let manifest = discover_manifest_for_inputs(files)?;
+        let mdir = manifest.as_ref().map(|(d, _)| d.as_path());
+        let spec = resolve_target_spec_for_inputs(files, mdir, chip, board)?;
+        Ok(zev_codegen_llvm::CodegenOptions::from_spec(spec))
+    } else {
+        resolve_llvm_options(target)
+    }
+}
+
+struct ResolvedProjectBuild {
+    files: Vec<PathBuf>,
+    include_dirs: Vec<PathBuf>,
+    spec: zev_codegen_llvm::TargetSpec,
+    opts: zev_codegen_llvm::CodegenOptions,
+    port: Option<String>,
+}
+
+fn resolve_project_build_inputs(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
-    target: Option<&str>,
+    board: Option<&str>,
+    chip: Option<&str>,
+    port: Option<&str>,
     opt_level: Option<&str>,
-) -> RamExecOutcome {
-    let llvm_opts = match target {
-        None => None,
-        Some(t) => match resolve_llvm_options(Some(t)) {
-            Ok(mut o) => {
-                if o.target == zev_codegen_llvm::TargetArch::HostX86_64Linux {
-                    return RamExecOutcome::UsageErr(format!(
-                        "unsupported `--target {t}` for `zevc ram` (expected `cortex-m3`, `esp32c6`, `avr`, `nano-every`, or `rp2040`)"
-                    ));
-                }
-                if let Some(lvl) = opt_level {
-                    o.opt_level = lvl.to_string();
-                }
-                Some(o)
+) -> Result<ResolvedProjectBuild, String> {
+    let manifest = discover_manifest_for_inputs(files)?;
+    let (manifest_dir, resolved_files, eff_board, eff_chip, eff_port, eff_opt) =
+        match manifest {
+            Some((mdir, m)) => {
+                let rfiles = if files.is_empty() {
+                    let Some(ref entry) = m.entry else {
+                        return Err(format!(
+                            "no input `.zev` files given and `{}` has no `entry` field",
+                            mdir.join("zev.toml").display()
+                        ));
+                    };
+                    let resolved = if entry.is_absolute() {
+                        entry.clone()
+                    } else {
+                        mdir.join(entry)
+                    };
+                    vec![resolved]
+                } else {
+                    files.to_vec()
+                };
+                (
+                    Some(mdir),
+                    rfiles,
+                    board.map(str::to_string).or(m.board),
+                    chip.map(str::to_string).or(m.chip),
+                    port.map(str::to_string).or(m.port),
+                    opt_level.map(str::to_string).or(m.opt_level),
+                )
             }
-            Err(err) => return RamExecOutcome::UsageErr(err),
-        },
-    };
+            None => {
+                if files.is_empty() {
+                    return Err(
+                        "no input `.zev` files given and no `zev.toml` found in current or parent directories"
+                            .to_string(),
+                    );
+                }
+                (
+                    None,
+                    files.to_vec(),
+                    board.map(str::to_string),
+                    chip.map(str::to_string),
+                    port.map(str::to_string),
+                    opt_level.map(str::to_string),
+                )
+            }
+        };
+
+    if eff_board.is_none() && eff_chip.is_none() {
+        return Err(
+            "no target specified: pass `--board <name>`, `--chip <name>`, or set `board`/`chip` in `zev.toml`"
+                .to_string(),
+        );
+    }
+
+    let mut resolved_includes = include_dirs.to_vec();
+    if let Some(ref mdir) = manifest_dir {
+        if !resolved_includes.contains(mdir) {
+            resolved_includes.push(mdir.clone());
+        }
+    }
+
+    let spec = resolve_target_spec_for_inputs(
+        &resolved_files,
+        manifest_dir.as_deref(),
+        eff_chip.as_deref(),
+        eff_board.as_deref(),
+    )?;
+    if spec.isa == zev_codegen_llvm::CpuIsa::HostX86_64Linux {
+        return Err("host x86_64 target is not valid for embedded firmware builds".to_string());
+    }
+    let mut opts = zev_codegen_llvm::CodegenOptions::from_spec(spec.clone());
+    if let Some(lvl) = eff_opt {
+        opts.opt_level = lvl;
+    }
+
+    Ok(ResolvedProjectBuild {
+        files: resolved_files,
+        include_dirs: resolved_includes,
+        spec,
+        opts,
+        port: eff_port,
+    })
+}
+
+fn print_target_build_summary(
+    spec: &zev_codegen_llvm::TargetSpec,
+    res: &zev_codegen_llvm::TargetBuildArtifact,
+) {
+    let label = spec
+        .board_name
+        .as_deref()
+        .map(|b| format!("{b} ({})", spec.chip_name))
+        .unwrap_or_else(|| spec.chip_name.clone());
+    match spec.image {
+        zev_codegen_llvm::ImageFormat::Uf2 { .. } => {
+            println!(
+                "Built {label} UF2 image: {} ({} bytes / {} block(s), raw bin={} bytes / {} B SRAM)",
+                res.image_path.display(),
+                res.image_size,
+                res.uf2_blocks,
+                res.bin_size,
+                spec.sram_budget_bytes
+            );
+        }
+        zev_codegen_llvm::ImageFormat::RawBin => {
+            println!(
+                "Built {label} image: {} ({} bytes flash / {} B, {} bytes static SRAM / {} B)",
+                res.image_path.display(),
+                res.image_size,
+                spec.effective_flash_size(),
+                res.sram_static_bytes,
+                spec.sram_budget_bytes
+            );
+        }
+        zev_codegen_llvm::ImageFormat::ElfOnly => {
+            println!(
+                "Built {label} ELF: {} ({} bytes static SRAM / {} B)",
+                res.image_path.display(),
+                res.sram_static_bytes,
+                spec.sram_budget_bytes
+            );
+        }
+    }
+    print!("{}", res.elf.sizes.raw_output);
+    println!(
+        "Zero-heap audit: undefined_symbols={}, allocator_symbols={}",
+        res.elf.audit.undefined_symbols.len(),
+        res.elf.audit.heap_or_libc_symbols.len()
+    );
+}
+
+fn run_ram_analysis(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+    llvm_opts: Option<zev_codegen_llvm::CodegenOptions>,
+) -> RamExecOutcome {
     let (_, mir) = match compile_to_mir_with_includes(files, include_dirs) {
         Ok(res) => res,
         Err(err) => return RamExecOutcome::CompileErr(err),
@@ -384,6 +617,46 @@ fn execute_ram_command(
             within_budget: true,
         }
     }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn execute_ram_command(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+    target: Option<&str>,
+    opt_level: Option<&str>,
+) -> RamExecOutcome {
+    execute_ram_command_with_spec(files, include_dirs, target, None, None, opt_level)
+}
+
+fn execute_ram_command_with_spec(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+    target: Option<&str>,
+    board: Option<&str>,
+    chip: Option<&str>,
+    opt_level: Option<&str>,
+) -> RamExecOutcome {
+    let llvm_opts = if target.is_none() && board.is_none() && chip.is_none() {
+        None
+    } else {
+        match resolve_llvm_options_for_cli(files, target, board, chip) {
+            Ok(mut o) => {
+                if o.target == zev_codegen_llvm::TargetArch::HostX86_64Linux {
+                    return RamExecOutcome::UsageErr(format!(
+                        "unsupported target `{}` for `zevc ram` (expected embedded `--board`, `--chip`, or `--target <cortex-m3|esp32c6|avr|nano-every|rp2040>`)",
+                        target.or(board).or(chip).unwrap_or("host")
+                    ));
+                }
+                if let Some(lvl) = opt_level {
+                    o.opt_level = lvl.to_string();
+                }
+                Some(o)
+            }
+            Err(err) => return RamExecOutcome::UsageErr(err),
+        }
+    };
+    run_ram_analysis(files, include_dirs, llvm_opts)
 }
 
 fn main() -> ExitCode {
@@ -467,11 +740,15 @@ fn main() -> ExitCode {
             files,
             include_dirs,
             target,
+            board,
+            chip,
             opt_level,
-        } => match execute_ram_command(
+        } => match execute_ram_command_with_spec(
             &files,
             &include_dirs,
             target.as_deref(),
+            board.as_deref(),
+            chip.as_deref(),
             opt_level.as_deref(),
         ) {
             RamExecOutcome::Output {
@@ -543,10 +820,17 @@ fn main() -> ExitCode {
             files,
             include_dirs,
             target,
+            board,
+            chip,
             opt_level,
             output,
         } => {
-            let mut opts = match resolve_llvm_options(target.as_deref()) {
+            let mut opts = match resolve_llvm_options_for_cli(
+                &files,
+                target.as_deref(),
+                board.as_deref(),
+                chip.as_deref(),
+            ) {
                 Ok(o) => o,
                 Err(err) => {
                     eprintln!("error: {err}");
@@ -601,6 +885,156 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 },
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Build {
+            files,
+            include_dirs,
+            board,
+            chip,
+            opt_level,
+            emit_ll,
+            output,
+        } => {
+            let built = match resolve_project_build_inputs(
+                &files,
+                &include_dirs,
+                board.as_deref(),
+                chip.as_deref(),
+                None,
+                opt_level.as_deref(),
+            ) {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::from(2);
+                }
+            };
+            match compile_to_mir_with_includes(&built.files, &built.include_dirs) {
+                Ok((_, mir)) => {
+                    let default_ext = match built.spec.image {
+                        zev_codegen_llvm::ImageFormat::Uf2 { .. } => "uf2",
+                        zev_codegen_llvm::ImageFormat::RawBin => "bin",
+                        zev_codegen_llvm::ImageFormat::ElfOnly => "elf",
+                    };
+                    let out_path = output
+                        .unwrap_or_else(|| default_output_with_ext(&built.files, default_ext));
+                    match zev_codegen_llvm::build_target_image(&mir, &built.opts, &out_path) {
+                        Ok(res) => {
+                            if emit_ll {
+                                let ll_out = out_path.with_extension("ll");
+                                if res.elf.ll_path != ll_out {
+                                    if let Err(e) = std::fs::copy(&res.elf.ll_path, &ll_out) {
+                                        eprintln!(
+                                            "error: failed to copy LLVM IR to `{}`: {e}",
+                                            ll_out.display()
+                                        );
+                                        return ExitCode::FAILURE;
+                                    }
+                                }
+                                println!("Emitted LLVM IR: {}", ll_out.display());
+                            }
+                            print_target_build_summary(&built.spec, &res);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Flash {
+            files,
+            include_dirs,
+            board,
+            chip,
+            port,
+            opt_level,
+            output,
+        } => {
+            let built = match resolve_project_build_inputs(
+                &files,
+                &include_dirs,
+                board.as_deref(),
+                chip.as_deref(),
+                port.as_deref(),
+                opt_level.as_deref(),
+            ) {
+                Ok(b) => b,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::from(2);
+                }
+            };
+            match compile_to_mir_with_includes(&built.files, &built.include_dirs) {
+                Ok((_, mir)) => {
+                    let ext = match built.spec.image {
+                        zev_codegen_llvm::ImageFormat::Uf2 { .. } => "uf2",
+                        zev_codegen_llvm::ImageFormat::RawBin => "bin",
+                        zev_codegen_llvm::ImageFormat::ElfOnly => "elf",
+                    };
+                    let mut temp_holder: Option<TempWorkDir> = None;
+                    let out_path = match output {
+                        Some(p) => p,
+                        None => {
+                            let temp = match TempWorkDir::create("zevc-flash") {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                            let p = temp.dir.join(format!("firmware.{ext}"));
+                            temp_holder = Some(temp);
+                            p
+                        }
+                    };
+                    let res = match zev_codegen_llvm::build_target_image(&mir, &built.opts, &out_path)
+                    {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    print_target_build_summary(&built.spec, &res);
+                    let target_label = built
+                        .spec
+                        .board_name
+                        .as_deref()
+                        .unwrap_or(&built.spec.chip_name);
+                    let port_display = built
+                        .port
+                        .as_deref()
+                        .or(built.spec.default_port.as_deref())
+                        .unwrap_or("<default>");
+                    println!("Flashing {target_label} on `{port_display}`...");
+                    match zev_codegen_llvm::flash_target_image(
+                        &built.spec,
+                        &res.image_path,
+                        built.port.as_deref(),
+                    ) {
+                        Ok(flash_out) => {
+                            print!("{flash_out}");
+                            drop(temp_holder);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
+                    }
+                }
                 Err(err) => {
                     eprintln!("{err}");
                     ExitCode::FAILURE
@@ -1710,5 +2144,136 @@ fn main() {
             execute_ram_command(&[root.join("examples/sim_demo.zev")], &[], Some("host"), None),
             RamExecOutcome::UsageErr(_)
         ));
+    }
+
+    #[test]
+    fn board_flag_ram_and_zev_toml_project_resolution() {
+        let root = repo_root();
+        match execute_ram_command_with_spec(
+            &[root.join("examples/pico_w_demo.zev")],
+            &[],
+            None,
+            Some("rpi_pico_w"),
+            None,
+            None,
+        ) {
+            RamExecOutcome::Output {
+                text,
+                within_budget,
+            } => {
+                assert!(within_budget, "rpi_pico_w budget fail:\n{text}");
+                assert!(text.contains("rp2040"));
+                assert!(text.contains("270336 B"));
+                assert!(text.contains("PASS"));
+            }
+            other => panic!(
+                "expected RAM output for --board rpi_pico_w, got usage/compile error: {:?}",
+                matches!(other, RamExecOutcome::Output { .. })
+            ),
+        }
+
+        assert!(matches!(
+            execute_ram_command_with_spec(
+                &[root.join("examples/arduino_uno_demo.zev")],
+                &[],
+                Some("avr"),
+                Some("arduino_uno"),
+                None,
+                None,
+            ),
+            RamExecOutcome::UsageErr(_)
+        ));
+
+        let temp = TempWorkDir::create("zevc-manifest-test").expect("temp dir");
+        std::fs::create_dir_all(temp.dir.join("chips")).unwrap();
+        std::fs::create_dir_all(temp.dir.join("boards")).unwrap();
+        std::fs::create_dir_all(temp.dir.join("src")).unwrap();
+        std::fs::write(
+            temp.dir.join("chips/my_cm3.toml"),
+            r#"[chip]
+name = "my_cm3"
+isa = "arm-cortex-m"
+cpu = "cortex-m3"
+triple = "thumbv7m-none-eabi"
+datalayout = "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"
+ptr_bits = 32
+opt_level = "-O2"
+has_thumb2 = true
+
+[memory]
+flash_base = 0x0000_0000
+flash_size = 131072
+ram_base = 0x2000_0000
+ram_size = 32768
+stack_reserve_bytes = 512
+
+[irq]
+model = "cortex-m-nvic"
+max_irqs = 64
+min_vector_irqs = 16
+
+[image]
+format = "elf"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.dir.join("boards/my_board.toml"),
+            r#"[board]
+name = "my_board"
+chip = "my_cm3"
+
+[run]
+default_port = "/dev/ttyUSB9"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.dir.join("zev.toml"),
+            r#"[project]
+name = "custom_sensor"
+entry = "src/app.zev"
+board = "my_board"
+port = "/dev/ttyACM7"
+opt_level = "-Oz"
+"#,
+        )
+        .unwrap();
+        let entry_path = temp.dir.join("src/app.zev");
+        std::fs::write(
+            &entry_path,
+            r#"
+fn putc(u8 _c) {}
+fn main() {
+    sys.set_putc(putc);
+    sys.exit(0);
+}
+"#,
+        )
+        .unwrap();
+
+        let (mdir, manifest) =
+            zev_codegen_llvm::ProjectManifest::discover(&temp.dir.join("src"))
+                .expect("manifest parse")
+                .expect("manifest found");
+        assert_eq!(mdir, temp.dir);
+        assert_eq!(manifest.entry.as_deref(), Some(Path::new("src/app.zev")));
+
+        let resolved =
+            resolve_project_build_inputs(&[entry_path], &[], None, None, None, None)
+                .expect("resolve custom project");
+        assert_eq!(resolved.spec.chip_name, "my_cm3");
+        assert_eq!(resolved.spec.board_name.as_deref(), Some("my_board"));
+        assert_eq!(resolved.spec.ram_size, 32768);
+        assert_eq!(resolved.opts.opt_level, "-Oz");
+        assert_eq!(resolved.port.as_deref(), Some("/dev/ttyACM7"));
+
+        let (_, mir) =
+            compile_to_mir_with_includes(&resolved.files, &resolved.include_dirs).unwrap();
+        let out_elf = temp.dir.join("custom.elf");
+        let built =
+            zev_codegen_llvm::build_target_image(&mir, &resolved.opts, &out_elf).unwrap();
+        assert!(built.image_path.is_file());
+        assert_eq!(built.elf.audit.undefined_symbols.len(), 0);
     }
 }

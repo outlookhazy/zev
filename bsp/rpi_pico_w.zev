@@ -25,7 +25,19 @@ pub struct UsbCdcState {
     [7]u8 line_coding;
 }
 
+pub fn pico_exit(i32 code) {
+    if (code == 0x4255) {
+        hw.reset_usb_boot(0, 0);
+    }
+}
+
+pub fn pico_fault() {
+    hw.reset_usb_boot(0, 0);
+}
+
 pub fn init_clocks() {
+    sys.set_exit(pico_exit);
+    sys.set_fault_handler(pico_fault);
     critical {
         // 1. Disable clock resus and bring up 12 MHz crystal oscillator (XOSC).
         hw.CLOCKS.clk_sys_resus_ctrl = 0;

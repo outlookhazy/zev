@@ -1,37 +1,35 @@
-//! Bare-Metal 8-Bit AVR (`avr`) CPU Vector Table, `.data`/`.bss` Startup,
+//! Pure-ISA 8-Bit AVR (`avr`) CPU Vector Table, `.data`/`.bss` Startup,
 //! `SREG` Critical Sections, `avr_signalcc` Wrappers, `sleep` Idle Hook, and `avr-libgcc` Shims.
 //!
-//! Zero peripheral drivers live here — watchdog disarm, `USART0`, `Timer0`, and `SMCR`
-//! sleep configuration are written 100% in `.zev`.
+//! Zero chip/board names or peripheral MMIO addresses live here — watchdog disarm, clocking,
+//! UART TX/RX, sleep configuration, and tick timers are driven solely by `TargetSpec` and `.zev`.
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
 
-use crate::toolchain::TargetArch;
+use crate::target_spec::{CpuIsa, IrqModel, TargetSpec};
+use crate::toolchain::CodegenError;
 
-/// Total ATmega328P interrupt vectors (`0..=25`).
-pub const AVR_ATMEGA328P_VECTOR_COUNT: u32 = 26;
-
-/// Validate user-attached IRQ vector numbers against ATmega328P vector slots `1..=25`
-/// (excluding slot `0` RESET).
+/// Validate user-attached IRQ vector numbers against declarative `vector_slots` (`1..vector_slots`).
 pub fn validate_avr_irq_vectors(
     vectors: &[zev_mir::MirIrqVector],
-) -> Result<BTreeSet<u32>, crate::CodegenError> {
+    vector_slots: u32,
+) -> Result<BTreeSet<u32>, CodegenError> {
     let mut attached = BTreeSet::new();
     for v in vectors {
         if v.irq_num == 0 {
-            return Err(crate::CodegenError::new(
+            return Err(CodegenError::new(
                 "llvm-ir",
-                "ATmega328P IRQ vector 0 is the RESET vector and cannot be attached",
+                "AVR IRQ vector 0 is the RESET vector and cannot be attached",
             ));
         }
-        if v.irq_num >= AVR_ATMEGA328P_VECTOR_COUNT {
-            return Err(crate::CodegenError::new(
+        if v.irq_num >= vector_slots {
+            return Err(CodegenError::new(
                 "llvm-ir",
                 format!(
-                    "ATmega328P IRQ vector {} exceeds vector table range (1..={})",
+                    "AVR IRQ vector {} exceeds vector table range (1..={})",
                     v.irq_num,
-                    AVR_ATMEGA328P_VECTOR_COUNT - 1
+                    vector_slots.saturating_sub(1)
                 ),
             ));
         }
@@ -40,39 +38,50 @@ pub fn validate_avr_irq_vectors(
     Ok(attached)
 }
 
-/// Emit ATmega328P 26-slot `.vectors` table (`jmp`), `.text.startup` `.data`/`.bss` init,
+/// Emit pure-ISA AVR `.vectors` table (`jmp` or `rjmp`), `.text.startup` `.data`/`.bss` init,
 /// `@__syn_avr_entry`, and `avr_signalcc` wrappers for attached vectors.
 pub fn emit_avr_startup_ir(
     out: &mut String,
-    initial_sp: u32,
+    spec: &TargetSpec,
     sz: &str,
     attached_irqs: &BTreeSet<u32>,
 ) {
-    let fn_as = TargetArch::AvrAtmega328p.fn_addrspace_attr();
-    let call_kw = TargetArch::AvrAtmega328p.call_kw();
+    let (vector_slots, slot_words) = match spec.irq {
+        IrqModel::AvrVectored {
+            vector_slots,
+            slot_words,
+            ..
+        } => (vector_slots, slot_words),
+        _ => (26, 2),
+    };
+    let br_inst = if slot_words <= 1 { "rjmp" } else { "jmp" };
+    let fn_as = CpuIsa::Avr.fn_addrspace_attr();
+    let call_kw = CpuIsa::Avr.call_kw();
+    let initial_sp = spec.initial_sp();
     let sp_lo = initial_sp & 0xFF;
     let sp_hi = (initial_sp >> 8) & 0xFF;
 
     let _ = writeln!(
         out,
-        "; ── ATmega328P AVR 26-Slot Flash Vector Table (@ 0x0000) ──"
+        "; ── AVR ({}) {vector_slots}-Slot Flash Vector Table (@ 0x{:04X}) ──",
+        spec.cpu, spec.flash_base
     );
     let _ = writeln!(out, "module asm \".section .vectors, \\22ax\\22, @progbits\"");
     let _ = writeln!(out, "module asm \".global _start\"");
     let _ = writeln!(out, "module asm \"_start:\"");
-    let _ = writeln!(out, "module asm \"  jmp __syn_avr_reset\"");
-    for vec_idx in 1..AVR_ATMEGA328P_VECTOR_COUNT {
+    let _ = writeln!(out, "module asm \"  {br_inst} __syn_avr_reset\"");
+    for vec_idx in 1..vector_slots {
         if attached_irqs.contains(&vec_idx) {
-            let _ = writeln!(out, "module asm \"  jmp __syn_avr_vec_{vec_idx}\"");
+            let _ = writeln!(out, "module asm \"  {br_inst} __syn_avr_vec_{vec_idx}\"");
         } else {
-            let _ = writeln!(out, "module asm \"  jmp __syn_avr_unhandled_irq\"");
+            let _ = writeln!(out, "module asm \"  {br_inst} __syn_avr_unhandled_irq\"");
         }
     }
 
     let _ = writeln!(
         out,
         r#"
-; ── Reset, Flash->SRAM .data/.rodata Copy & .bss Zeroing ──
+; ── Reset, Stack Pointer, Flash->SRAM .data/.rodata Copy & .bss Zeroing ──
 module asm ".section .text.startup, \22ax\22, @progbits"
 module asm ".global __syn_avr_reset"
 module asm ".global __do_copy_data"
@@ -112,8 +121,7 @@ module asm "  breq 4f"
 module asm "  st  X+, r1"
 module asm "  rjmp 3b"
 module asm "4:"
-module asm "  call __syn_avr_entry"
-module asm "5: rjmp 5b"
+module asm "  {br_inst} __syn_avr_entry"
 
 @__sdata = external global i8
 @__edata = external global i8
@@ -148,13 +156,12 @@ entry:
     }
 }
 
-/// Emit architectural 8-bit AVR CPU runtime primitives (`SREG` critical sections, tear-free
-/// `@__syn_avr_read_ms`, `sleep` idle hook, and per-section weak `avr-libgcc` integer mul/divmod
-/// shims backed by pure SSA `#99` helpers; `@__syn_uart_putc` is emitted uniformly from `.zev`
-/// `console_putc` / `sys.set_putc`).
+/// Emit pure-ISA AVR CPU runtime primitives (`SREG` critical sections, tear-free
+/// `@__syn_avr_read_ms`, `@__syn_uart_putc`, `@__syn_platform_exit`, `sei; sleep; cli`,
+/// and weak `avr-libgcc` integer mul/divmod shims).
 pub fn emit_avr_hal_ir(out: &mut String, sz: &str) {
-    let fn_as = TargetArch::AvrAtmega328p.fn_addrspace_attr();
-    let call_kw = TargetArch::AvrAtmega328p.call_kw();
+    let fn_as = CpuIsa::Avr.fn_addrspace_attr();
+    let call_kw = CpuIsa::Avr.call_kw();
     let _ = writeln!(
         out,
         r#"; ── AVR Architectural CPU Primitives: SREG, Tear-Free Tick Read, Sleep ──
@@ -185,8 +192,15 @@ entry:
   ret i32 %t
 }}
 
+define void @__syn_uart_putc(i8 %c){fn_as} nounwind noinline{sz} {{
+entry:
+  {call_kw} void @__syn_on_putc(i8 %c)
+  ret void
+}}
+
 define void @__syn_platform_exit(i32 %code){fn_as} noreturn nounwind{sz} {{
 entry:
+  {call_kw} void @__syn_on_exit(i32 %code)
   br label %halt
 halt:
   call void asm sideeffect "nop", "~{{memory}}"()
@@ -210,7 +224,7 @@ entry:
 define void @__syn_idle_sleep(){fn_as} nounwind{sz} {{
 entry:
   %pm = {call_kw} i32 @__syn_crit_enter()
-  %now = load volatile i32, ptr @__syn_tick_ms, align 4
+  %now = {call_kw} i32 @__syn_now_ms()
   {call_kw} void @__syn_wake_timers(i32 %now)
   %any_ready = {call_kw} i1 @__syn_any_ready_task()
   br i1 %any_ready, label %restore, label %do_sleep
@@ -224,6 +238,7 @@ do_sleep:
   %wc = load volatile i32, ptr @__syn_wfi_count, align 4
   %wc1 = add i32 %wc, 1
   store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
+  {call_kw} void @__syn_on_idle(i32 0, i32 %depth)
   call void asm sideeffect "sei\0Asleep\0Acli", "~{{memory}}"()
   br label %restore
 restore:
@@ -239,8 +254,8 @@ restore:
 /// `__udivmodsi4`, `__divmodsi4`, `__udivmodhi4`, `__divmodhi4`, `__udivmodqi4`,
 /// `__divmodqi4`, `@__muldi3`) backed by pure SSA `#99` helpers (shared across all AVR targets).
 pub(crate) fn emit_avr_libgcc_arith_shims_ir(out: &mut String) {
-    let fn_as = TargetArch::AvrAtmega328p.fn_addrspace_attr();
-    let call_kw = TargetArch::AvrAtmega328p.call_kw();
+    let fn_as = CpuIsa::Avr.fn_addrspace_attr();
+    let call_kw = CpuIsa::Avr.call_kw();
     let _ = writeln!(
         out,
         r#"; ── Freestanding AVR libgcc Arithmetic ABI Shims (Garbage-Collected per Symbol) ──

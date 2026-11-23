@@ -1,0 +1,9 @@
+# TI Stellaris EK-LM3S6965 EVB (QEMU Cortex-M3 Board)
+
+[board]
+name = "lm3s6965_evb"
+chip = "lm3s6965"
+
+[run]
+qemu_machine = "lm3s6965evb"
+semihosting = true

@@ -1,41 +1,40 @@
-//! Direct LLVM 23 IR + Freestanding Bare-Metal ARM Cortex-M3 & ESP32-C6 (`rv32imac`) Backend (`zev-codegen-llvm`).
+//! Direct LLVM 23 IR + Declarative Bare-Metal ISA Backends (`zev-codegen-llvm`).
 //!
-//! Lowers [`zev_mir::MirModule`] directly into modern LLVM 23 opaque-pointer SSA IR (`.ll`) with
-//! zero C, zero `.s` files, and zero libc:
-//! - **ARM Cortex-M3 (`thumbv7m-none-eabi`, `lm3s6965evb`)**: synthesizes `.isr_vector`,
-//!   `@Reset_Handler`, `@SysTick_Handler`, linker script, `.elf`, and runs in `qemu-system-arm`.
-//! - **Espressif ESP32-C6 (`riscv32-unknown-none-elf`, `rv32imac` Direct-Boot)**: synthesizes
-//!   the `0xAEDB041D` x2 Direct-Boot header, `@_start` at `0x42000008`, `TIMG0`/`TIMG1`/`LP_WDT`/`SWD`
-//!   watchdog disarm, 16 MHz `SYSTIMER`, `USB_DEVICE` (`/dev/ttyACM0`) serial console, HP-SRAM
-//!   `.iram1` WS2812B RGB driver (`GPIO8`), and `BOOT` button (`GPIO9`) into a flashable `.bin`!
+//! Pure-ISA backends (`arm_cortex_m`, `avr`, `riscv32`, plus host simulation IR) driven by
+//! declarative TOML target specifications (`chips/*.toml`, `boards/*.toml`, `zev.toml`) and
+//! explicit `sys.*` OS hooks + stack-bounded ROM ABI calls.
 
+pub mod arm_cortex_m;
 pub mod avr;
-pub mod avr_mega0;
-pub mod esp32c6;
 pub mod mir_codegen;
-pub mod nvic;
-pub mod rp2040;
+pub mod riscv32;
 pub mod runtime_ir;
 pub mod stack_sizes;
+pub mod target_spec;
 pub mod toolchain;
 
 use std::path::Path;
 
-pub use avr_mega0::{flash_avr_nano_every_bin, objcopy_elf_to_avr_nano_every_bin};
-pub use esp32c6::ESP32C6_DIRECT_BOOT_MAGIC;
+pub use arm_cortex_m::NvicMap;
 pub use mir_codegen::emit_llvm_ir_with_options;
-pub use nvic::NvicMap;
-pub use rp2040::RP2040_UF2_FAMILY_ID;
+pub use riscv32::RvIrqRoute;
 pub use stack_sizes::{HardwareStackProof, analyze_hardware_stack_high_water};
+pub use target_spec::{CpuIsa, ImageFormat, IrqModel, ProjectManifest, TargetSpec};
 pub use toolchain::{
     AvrImageResult, CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
     Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, Rp2040ImageResult,
-    TargetArch, compile_ll_to_elf, compile_ll_to_obj, flash_avr_uno_bin, flash_esp32c6_bin,
-    flash_rp2040_uf2, inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf,
-    objcopy_elf_to_avr_bin, objcopy_elf_to_esp32c6_bin, objcopy_elf_to_rp2040_uf2,
-    optimize_ll_with_opt, pack_rp2040_uf2, run_elf_in_qemu, synthesize_linker_script,
-    verify_ll_with_opt,
+    TargetArch, TargetBuildArtifact, build_target_image, compile_ll_to_elf, compile_ll_to_obj,
+    flash_avr_nano_every_bin, flash_avr_uno_bin, flash_esp32c6_bin, flash_rp2040_uf2,
+    flash_target_image, inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf,
+    objcopy_elf_to_avr_bin, objcopy_elf_to_avr_nano_every_bin, objcopy_elf_to_esp32c6_bin,
+    objcopy_elf_to_rp2040_uf2, optimize_ll_with_opt, pack_rp2040_uf2, pack_uf2, run_elf_in_qemu,
+    synthesize_linker_script, synthesize_target_linker_script, verify_ll_with_opt,
 };
+
+/// Legacy constant retained for external integration test compatibility (values now live in `chips/esp32c6.toml`).
+pub const ESP32C6_DIRECT_BOOT_MAGIC: [u8; 8] = [0x1d, 0x04, 0xdb, 0xae, 0x1d, 0x04, 0xdb, 0xae];
+/// Legacy constant retained for external integration test compatibility (values now live in `chips/rp2040.toml`).
+pub const RP2040_UF2_FAMILY_ID: u32 = 0xE48B_FF56;
 
 /// Emit freestanding ARM Cortex-M3 (`thumbv7m-none-eabi`) LLVM 23 `.ll` IR from `MirModule`.
 pub fn emit_llvm_ir(module: &zev_mir::MirModule) -> Result<String, CodegenError> {
@@ -302,8 +301,8 @@ mod tests {
         );
         let ll_src = std::fs::read_to_string(&img.elf.ll_path).expect("read esp32c6_demo.ll");
         assert!(
-            disasm.contains("<__syn_esp32c6_reset>:"),
-            "expected __syn_esp32c6_reset startup routine in .text:\n{disasm}"
+            disasm.contains("<__syn_rv_reset>:"),
+            "expected __syn_rv_reset startup routine in .text:\n{disasm}"
         );
         assert!(
             ll_src.contains("bsp_esp32c6_pico__init_soc")
@@ -3202,13 +3201,11 @@ mod tests {
         assert!(esp_ll.contains("call __syn_vec_irq_12"));
         assert!(esp_ll.contains("call __syn_vec_irq_19"));
         assert!(esp_ll.contains("call __syn_vec_irq_37"));
-        assert!(esp_ll.contains("0x20001008"));
-        assert!(esp_ll.contains("INTMTX src_id=5 -> cpu_int=1 (0x60010014)"));
-        assert!(esp_ll.contains("INTMTX src_id=37 -> cpu_int=6 (0x60010094)"));
-        assert!(esp_ll.contains("PLIC_MXINT1_PRI_REG (0x20001014) = 1"));
-        assert!(esp_ll.contains("PLIC_MXINT_TYPE_REG (0x20001004)"));
-        assert!(esp_ll.contains("PLIC_MXINT_THRESH_REG (0x20001090) = 1"));
-        assert!(esp_ll.contains("PLIC_MXINT_ENABLE_REG (0x20001000)"));
+        assert!(esp_ll.contains("call __syn_on_rv_irq_ack"));
+        assert!(esp_ll.contains("call void @__syn_on_rv_irq_route(i32 5, i32 1)"));
+        assert!(esp_ll.contains("call void @__syn_on_rv_irq_route(i32 12, i32 2)"));
+        assert!(esp_ll.contains("call void @__syn_on_rv_irq_route(i32 19, i32 5)"));
+        assert!(esp_ll.contains("call void @__syn_on_rv_irq_route(i32 37, i32 6)"));
         assert!(esp_ll.contains("csrw mtvec, $0"));
         assert!(esp_ll.contains("csrw mie, $0"));
         assert!(esp_ll.contains("csrsi mstatus, 8"));
@@ -3502,19 +3499,19 @@ mod tests {
                 cond_selector: None,
             }],
         };
-        let six_routes = esp32c6::assign_esp32c6_irq_routes(&(0..6u32).map(mk_vec).collect::<Vec<_>>())
+        let six_routes = riscv32::assign_rv_irq_routes(&(0..6u32).map(mk_vec).collect::<Vec<_>>(), 76, 32, &[0, 3, 4, 7])
             .expect("6 routes");
-        let assigned_cpus: Vec<u8> = six_routes.iter().map(|r| r.cpu_int).collect();
+        let assigned_cpus: Vec<u8> = six_routes.iter().map(|r| r.cpu_slot).collect();
         assert_eq!(assigned_cpus, vec![1, 2, 5, 6, 8, 9]);
 
         let oob_src = [mk_vec(77)];
         assert!(
-            esp32c6::assign_esp32c6_irq_routes(&oob_src).is_err(),
+            riscv32::assign_rv_irq_routes(&oob_src, 76, 32, &[0, 3, 4, 7]).is_err(),
             "ESP32-C6 INTMTX src_id=77 must fail"
         );
         let too_many: Vec<_> = (0..29u32).map(mk_vec).collect();
         assert!(
-            esp32c6::assign_esp32c6_irq_routes(&too_many).is_err(),
+            riscv32::assign_rv_irq_routes(&too_many, 76, 32, &[0, 3, 4, 7]).is_err(),
             ">28 ESP32-C6 external IRQ sources must fail"
         );
 
@@ -3698,7 +3695,7 @@ fn main() {
 
     #[test]
     fn avr_irq_vector_validation_rejects_reserved_and_out_of_range_slots() {
-        assert!(avr::validate_avr_irq_vectors(&[]).expect("empty ok").is_empty());
+        assert!(avr::validate_avr_irq_vectors(&[], 26).expect("empty ok").is_empty());
 
         let make_vec = |irq_num: u32, irq_name: &str| zev_mir::MirIrqVector {
             irq_name: irq_name.to_string(),
@@ -3717,12 +3714,12 @@ fn main() {
         let attached = avr::validate_avr_irq_vectors(&[
             make_vec(11, "IRQ_TIMER1_COMPA"),
             make_vec(14, "IRQ_TIMER0_COMPA"),
-        ])
+        ], 26)
         .expect("slots 11 and 14 are valid user vectors on ATmega328P");
         assert!(attached.contains(&11) && attached.contains(&14));
 
         for (bad_num, name) in [(0, "RESET"), (26, "OOB")] {
-            let err = avr::validate_avr_irq_vectors(&[make_vec(bad_num, name)])
+            let err = avr::validate_avr_irq_vectors(&[make_vec(bad_num, name)], 26)
                 .expect_err("reserved/out-of-range vector must be rejected");
             assert!(
                 !err.message.is_empty(),
@@ -3825,9 +3822,9 @@ fn main() {
         for (name, src) in [
             ("runtime_ir.rs", include_str!("runtime_ir.rs")),
             ("avr.rs", include_str!("avr.rs")),
-            ("avr_mega0.rs", include_str!("avr_mega0.rs")),
-            ("esp32c6.rs", include_str!("esp32c6.rs")),
-            ("rp2040.rs", include_str!("rp2040.rs")),
+            ("arm_cortex_m.rs", include_str!("arm_cortex_m.rs")),
+            ("riscv32.rs", include_str!("riscv32.rs")),
+            ("target_spec.rs", include_str!("target_spec.rs")),
         ] {
             for pat in forbidden {
                 assert!(
@@ -3841,7 +3838,7 @@ fn main() {
     #[test]
     fn avr_mega0_irq_vector_validation_rejects_reserved_and_out_of_range_slots() {
         assert!(
-            avr_mega0::validate_avr_mega0_irq_vectors(&[])
+            avr::validate_avr_irq_vectors(&[], 40)
                 .expect("empty ok")
                 .is_empty()
         );
@@ -3860,12 +3857,12 @@ fn main() {
             }],
         };
 
-        let attached = avr_mega0::validate_avr_mega0_irq_vectors(&[
+        let attached = avr::validate_avr_irq_vectors(&[
             make_vec(12, "IRQ_TCB0_INT"),
             make_vec(35, "IRQ_PORTE_PORT"),
             make_vec(36, "IRQ_TCB3_INT"),
             make_vec(39, "IRQ_USART3_TXC"),
-        ])
+        ], 40)
         .expect("slots 12, 35, 36, 39 are all valid on pure-ISA ATmega4809");
         assert!(
             attached.contains(&12)
@@ -3875,7 +3872,7 @@ fn main() {
         );
 
         for (bad_num, name) in [(0, "RESET"), (40, "OOB")] {
-            let err = avr_mega0::validate_avr_mega0_irq_vectors(&[make_vec(bad_num, name)])
+            let err = avr::validate_avr_irq_vectors(&[make_vec(bad_num, name)], 40)
                 .expect_err("reserved/out-of-range ATmega4809 vector must be rejected");
             assert!(
                 !err.message.is_empty(),
@@ -3887,8 +3884,8 @@ fn main() {
     #[test]
     fn atmega4809_standalone_builds_bin_disasm_and_stack_proof() {
         assert!(
-            !include_str!("avr_mega0.rs").contains("inttoptr"),
-            "avr_mega0.rs must remain 100% peripheral-free pure avrxmega3 ISA/CPU"
+            !include_str!("avr.rs").contains("inttoptr"),
+            "avr.rs must remain 100% peripheral-free pure AVR ISA/CPU"
         );
 
         let src = r#"
@@ -3941,6 +3938,7 @@ task blinker(*signal s) {
 }
 
 fn main() {
+    sys.set_putc(console_putc);
     PORTE.dirset = 0x04;
     IRQ_TCB3_INT.attach(systick_isr());
     IRQ_TCB0_INT.attach(tcb0_isr(&tick_sig));
@@ -3976,8 +3974,8 @@ fn main() {
         assert!(standalone_raw_ll.contains("define void @__syn_sys_tick("));
         assert!(standalone_raw_ll.contains("@__syn_fn_console_putc(i8 %c)"));
         for req_sym in [
-            "__syn_avr_mega0_reset",
-            "__syn_avr_mega0_entry",
+            "__syn_avr_reset",
+            "__syn_avr_entry",
             "__syn_uart_putc",
             "__syn_avr_vec_12",
             "__syn_avr_vec_36",
@@ -4050,7 +4048,7 @@ fn main() {
         assert_eq!(proof.sram_budget_bytes, 6_144);
         assert!(proof.within_budget, "proof table:\n{}", proof.format_table());
         assert!(!proof.has_cycle, "unexpected cycle in ATmega4809 call graph");
-        assert!(proof.format_table().contains("ATmega4809"));
+        assert!(proof.format_table().to_ascii_lowercase().contains("atmega4809"));
     }
 
     #[test]
@@ -4081,7 +4079,7 @@ fn main() {
             "unexpected Rust-hardcoded `__syn_avr_systick_isr` in Nano Every demo"
         );
         for req_sym in [
-            "__syn_avr_mega0_reset",
+            "__syn_avr_reset",
             "__syn_uart_putc",
             "__syn_avr_vec_12",
             "__syn_avr_vec_16",
@@ -4313,11 +4311,13 @@ print("OK")
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn python3 for MuxTO flasher syntax & CRC check");
+        let updi_py = std::fs::read(repo_root().join("tools/flash_avr_updi.py"))
+            .expect("read tools/flash_avr_updi.py");
         child
             .stdin
             .take()
             .unwrap()
-            .write_all(avr_mega0::AVR_MUXTO_JTAG2UPDI_FLASH_SCRIPT.as_bytes())
+            .write_all(&updi_py)
             .expect("feed flasher script");
         let out = child.wait_with_output().expect("wait python3");
         assert!(
@@ -6119,6 +6119,520 @@ fn main() {
                 && ep0_body.contains("i32 67, 1")
                 && ep0_body.contains("utf16_str_desc_byte({ ptr, i32 } %"),
             "expected pooled @.str.* slice pairs in ep0_desc_byte:\n{ep0_body}"
+        );
+    }
+
+    #[test]
+    fn loads_all_builtin_chips_and_boards() {
+        let expectations = [
+            ("lm3s6965_evb", "lm3s6965", CpuIsa::ArmCortexM, 65_536u32, 262_144u32, true, false),
+            ("rpi_pico_w", "rp2040", CpuIsa::ArmCortexM, 270_336, 270_336, false, true),
+            ("arduino_uno", "atmega328p", CpuIsa::Avr, 2_048, 32_256, false, true),
+            ("arduino_nano_every", "atmega4809", CpuIsa::Avr, 6_144, 49_152, false, true),
+            ("esp32c6_pico", "esp32c6", CpuIsa::Riscv32, 524_288, 4_194_304, false, true),
+        ];
+        for (board, chip, isa, sram_budget, eff_flash, has_qemu, has_flash_cmd) in expectations {
+            let bspec = TargetSpec::resolve(None, Some(board))
+                .unwrap_or_else(|e| panic!("failed to resolve board `{board}`: {e}"));
+            assert_eq!(bspec.board_name.as_deref(), Some(board));
+            assert_eq!(bspec.chip_name, chip);
+            assert_eq!(bspec.isa, isa);
+            assert_eq!(bspec.sram_budget_bytes, sram_budget);
+            assert_eq!(bspec.effective_flash_size(), eff_flash);
+            assert_eq!(bspec.qemu_machine.is_some(), has_qemu);
+            assert_eq!(!bspec.flash_cmd.is_empty(), has_flash_cmd);
+            match board {
+                "lm3s6965_evb" => assert_eq!(bspec.image, ImageFormat::ElfOnly),
+                "rpi_pico_w" => assert_eq!(
+                    bspec.image,
+                    ImageFormat::Uf2 {
+                        family_id: RP2040_UF2_FAMILY_ID,
+                        target_base: 0x2000_0000,
+                    }
+                ),
+                _ => assert_eq!(bspec.image, ImageFormat::RawBin),
+            }
+
+            let cspec = TargetSpec::resolve(Some(chip), None)
+                .unwrap_or_else(|e| panic!("failed to resolve chip `{chip}`: {e}"));
+            assert_eq!(cspec.chip_name, chip);
+            assert_eq!(cspec.isa, isa);
+            assert_eq!(cspec.board_name, None);
+        }
+    }
+
+    #[test]
+    fn compiler_is_100_percent_chip_and_board_agnostic() {
+        let src_dir = repo_root().join("crates/zev-codegen-llvm/src");
+        let core_files = [
+            "target_spec.rs",
+            "arm_cortex_m.rs",
+            "avr.rs",
+            "riscv32.rs",
+            "runtime_ir.rs",
+            "mir_codegen.rs",
+            "stack_sizes.rs",
+        ];
+        let forbidden_core = [
+            "lm3s",
+            "rp2040",
+            "atmega",
+            "esp32",
+            "arduino_uno",
+            "nano_every",
+            "rpi_pico",
+            "targetarch",
+            "console_putc",
+            "sys_now_ms",
+            "0x4000",
+            "0x600",
+            "0x5011",
+        ];
+        for fname in core_files {
+            let text = std::fs::read_to_string(src_dir.join(fname))
+                .unwrap_or_else(|e| panic!("failed to read {fname}: {e}"))
+                .to_ascii_lowercase();
+            for needle in forbidden_core {
+                assert!(
+                    !text.contains(needle),
+                    "core compiler file `{fname}` must stay chip/board agnostic, found `{needle}`"
+                );
+            }
+        }
+
+        let toolchain_src = std::fs::read_to_string(src_dir.join("toolchain.rs"))
+            .expect("read toolchain.rs")
+            .to_ascii_lowercase();
+        for needle in [
+            "import serial",
+            "pyserial",
+            "stk500",
+            "0x4000_c000",
+            "0x600c",
+            "0x5011",
+        ] {
+            assert!(
+                !toolchain_src.contains(needle),
+                "toolchain.rs must not contain embedded flashers or peripheral MMIO (`{needle}`)"
+            );
+        }
+    }
+
+    #[test]
+    fn brand_new_custom_chips_and_boards_build_and_prove_stack_with_zero_compiler_edits() {
+        let root = test_out_dir().join("synthetic_zero_compiler_edit");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("chips")).unwrap();
+        std::fs::create_dir_all(root.join("boards")).unwrap();
+
+        std::fs::write(
+            root.join("chips/syn_cm4.toml"),
+            r#"[chip]
+name = "syn_cm4"
+isa = "arm-cortex-m"
+cpu = "cortex-m4"
+triple = "thumbv7em-none-eabi"
+datalayout = "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"
+ptr_bits = 32
+opt_level = "-O2"
+code_in_ram = true
+has_thumb2 = true
+has_vtor = true
+
+[memory]
+flash_base = 0x2000_0000
+flash_size = 131072
+ram_base = 0x2000_0000
+ram_size = 131072
+stack_reserve_bytes = 2048
+
+[irq]
+model = "cortex-m-nvic"
+max_irqs = 48
+min_vector_irqs = 32
+
+[image]
+format = "uf2"
+uf2_family_id = 0x5775_5A57
+uf2_target_base = 0x2000_0000
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("boards/syn_cm4_uf2.toml"),
+            "[board]\nname = \"syn_cm4_uf2\"\nchip = \"syn_cm4\"\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("chips/syn_rv32.toml"),
+            r#"[chip]
+name = "syn_rv32"
+isa = "riscv32"
+cpu = "generic-rv32"
+features = "+m,+a,+c"
+triple = "riscv32-unknown-none-elf"
+datalayout = "e-m:e-p:32:32-i64:64-n32-S128"
+ptr_bits = 32
+opt_level = "-O2"
+iram_in_data = true
+
+[memory]
+flash_base = 0x4200_0000
+flash_size = 2097152
+ram_base = 0x4080_0000
+ram_size = 262144
+stack_reserve_bytes = 1024
+
+[irq]
+model = "riscv-vectored"
+vector_slots = 32
+max_irq_source = 64
+reserved_slots = [0, 3, 4, 7]
+
+[image]
+format = "raw-bin"
+header_magic_words = [0x1122_3344, 0x5566_7788]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("boards/syn_rv32_bin.toml"),
+            "[board]\nname = \"syn_rv32_bin\"\nchip = \"syn_rv32\"\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("chips/syn_avr64.toml"),
+            r#"[chip]
+name = "syn_avr64"
+isa = "avr"
+cpu = "atmega640"
+triple = "avr"
+datalayout = "e-P1-p:16:8-i8:8-i16:8-i32:8-i64:8-f32:8-f64:8-n8:16-a:8"
+ptr_bits = 16
+opt_level = "-Os"
+rodata_in_ram = true
+
+[memory]
+flash_base = 0x0000_0000
+flash_size = 65536
+ram_base = 0x0000_0200
+ram_size = 8192
+stack_reserve_bytes = 256
+
+[irq]
+model = "avr-vectored"
+vector_slots = 57
+slot_words = 2
+data_ram_offset = 0x0080_0000
+
+[image]
+format = "raw-bin"
+reset_first_word_mask = 0xFE0E
+reset_first_word_value = 0x940C
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("boards/syn_avr64_bin.toml"),
+            "[board]\nname = \"syn_avr64_bin\"\nchip = \"syn_avr64\"\n\n[memory]\nusable_flash_size = 61440\n",
+        )
+        .unwrap();
+
+        std::fs::write(
+            root.join("zev.toml"),
+            "[project]\nname = \"syn_proj\"\nentry = \"app.zev\"\nboard = \"syn_cm4_uf2\"\n",
+        )
+        .unwrap();
+        let (mdir, manifest) = ProjectManifest::discover(&root)
+            .expect("parse zev.toml")
+            .expect("manifest discovered");
+        assert_eq!(mdir, root);
+        assert_eq!(manifest.board.as_deref(), Some("syn_cm4_uf2"));
+
+        let src_32 = |with_irq_router: bool| {
+            let route_decls = if with_irq_router {
+                "fn syn_route(u32 _irq, u32 _slot) {}\nfn syn_ack(u32 _slot) {}\n"
+            } else {
+                ""
+            };
+            let route_reg = if with_irq_router {
+                "sys.set_irq_router(syn_route, syn_ack);\n    "
+            } else {
+                ""
+            };
+            format!(
+                r#"
+mmio SynUartRegs {{
+    @rw u32 dr @ 0x00;
+}}
+mmio SYN_UART : SynUartRegs @ 0x4000_2000;
+irq IRQ_SYN = 1;
+watch<u32> seq_cnt = 0;
+
+fn syn_putc(u8 c) {{
+    SYN_UART.dr = c as u32;
+}}
+{route_decls}
+isr syn_timer_isr(*watch<u32> w) {{
+    state u32 n = 0;
+    n += 1;
+    w.publish(n);
+    sys.tick();
+}}
+
+fn main() {{
+    sys.set_putc(syn_putc);
+    {route_reg}IRQ_SYN.attach(syn_timer_isr(&seq_cnt));
+    println(f"SYN={{seq_cnt.read()}}");
+    sys.exit(0);
+}}
+"#
+            )
+        };
+        let src_avr = r#"
+mmio SynUartRegs {
+    @rw u8 dr @ 0x00;
+}
+mmio SYN_UART : SynUartRegs @ 0x0040;
+irq IRQ_SYN = 1;
+watch<u32> seq_cnt = 0;
+
+fn syn_putc(u8 c) {
+    SYN_UART.dr = c;
+}
+
+isr syn_timer_isr(*watch<u32> w) {
+    state u32 n = 0;
+    n += 1;
+    w.publish(n);
+    sys.tick();
+}
+
+fn main() {
+    sys.set_putc(syn_putc);
+    IRQ_SYN.attach(syn_timer_isr(&seq_cnt));
+    println(f"SYN={seq_cnt.read()}");
+    sys.exit(0);
+}
+"#;
+
+        let cm4_spec = TargetSpec::load_from_root(&root, None, Some("syn_cm4_uf2")).unwrap();
+        let cm4_opts = CodegenOptions::from_spec(cm4_spec);
+        let cm4_mir = compile_src_mir(&src_32(false));
+        let cm4_art =
+            build_target_image(&cm4_mir, &cm4_opts, &root.join("syn_cm4.uf2")).unwrap();
+        assert!(cm4_art.uf2_path.as_ref().unwrap().is_file());
+        assert!(cm4_art.uf2_blocks >= 1);
+        assert!(cm4_art.elf.audit.is_zero_heap_freestanding());
+        let cm4_proof = analyze_hardware_stack_high_water(&cm4_mir, &cm4_opts).unwrap();
+        assert!(cm4_proof.within_budget);
+
+        let rv32_spec = TargetSpec::load_from_root(&root, None, Some("syn_rv32_bin")).unwrap();
+        let rv32_opts = CodegenOptions::from_spec(rv32_spec);
+        let rv32_mir = compile_src_mir(&src_32(true));
+        let rv32_art =
+            build_target_image(&rv32_mir, &rv32_opts, &root.join("syn_rv32.bin")).unwrap();
+        let rv32_bytes = std::fs::read(rv32_art.bin_path.as_ref().unwrap()).unwrap();
+        assert_eq!(&rv32_bytes[..8], &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
+        assert!(rv32_art.elf.audit.is_zero_heap_freestanding());
+        let rv32_proof = analyze_hardware_stack_high_water(&rv32_mir, &rv32_opts).unwrap();
+        assert!(rv32_proof.within_budget);
+
+        let avr_spec = TargetSpec::load_from_root(&root, None, Some("syn_avr64_bin")).unwrap();
+        assert_eq!(avr_spec.effective_flash_size(), 61_440);
+        let avr_opts = CodegenOptions::from_spec(avr_spec);
+        let avr_mir = compile_src_mir(src_avr);
+        let avr_art =
+            build_target_image(&avr_mir, &avr_opts, &root.join("syn_avr64.bin")).unwrap();
+        assert!(avr_art.bin_path.as_ref().unwrap().is_file());
+        assert!(avr_art.bin_size > 0 && avr_art.bin_size <= 61_440);
+        assert!(avr_art.elf.audit.is_zero_heap_freestanding());
+        let avr_proof = analyze_hardware_stack_high_water(&avr_mir, &avr_opts).unwrap();
+        assert!(avr_proof.within_budget);
+    }
+
+    #[test]
+    fn application_level_console_and_clock_customization_without_cli_flags() {
+        let spec = TargetSpec::resolve(None, Some("lm3s6965_evb")).unwrap();
+        let opts = CodegenOptions::from_spec(spec);
+
+        let unset_mir = compile_src_mir(
+            r#"
+fn main() {
+    println("plain");
+    sys.exit(0);
+}
+"#,
+        );
+        let unset_ll = emit_llvm_ir_with_options(&unset_mir, &opts).unwrap();
+        assert!(!unset_ll.contains("@__syn_hook_tag_putc"));
+        assert!(!unset_ll.contains("@__syn_hook_fn_putc"));
+        assert!(!unset_ll.contains("@__syn_hook_tag_clock_ms"));
+
+        let direct_mir = compile_src_mir(
+            r#"
+mmio UartRegs {
+    @wo u32 dr @ 0x00;
+}
+mmio UART0 : UartRegs @ 0x4000_C000;
+
+fn uart_putc(u8 c) {
+    UART0.dr = c as u32;
+}
+
+u32 hw_ms() {
+    return 42u32 + sys.now_ticks();
+}
+
+fn main() {
+    sys.set_putc(uart_putc);
+    sys.set_clock_ms(hw_ms);
+    println("direct");
+    u32 _t = sys.now_ms();
+    sys.exit(0);
+}
+"#,
+        );
+        let direct_ll = emit_llvm_ir_with_options(&direct_mir, &opts).unwrap();
+        assert!(!direct_ll.contains("@__syn_hook_tag_putc"));
+        assert!(!direct_ll.contains("@__syn_hook_fn_putc"));
+        assert!(!direct_ll.contains("@__syn_hook_tag_clock_ms"));
+        let putc_wrap_start = direct_ll.find("define void @__syn_on_putc(").unwrap();
+        let putc_wrap_end = direct_ll[putc_wrap_start..].find("\n}\n").unwrap() + putc_wrap_start;
+        assert!(direct_ll[putc_wrap_start..putc_wrap_end].contains("call void @__syn_fn_uart_putc("));
+        let clk_wrap_start = direct_ll.find("define i32 @__syn_now_ms(").unwrap();
+        let clk_wrap_end = direct_ll[clk_wrap_start..].find("\n}\n").unwrap() + clk_wrap_start;
+        assert!(direct_ll[clk_wrap_start..clk_wrap_end].contains("call i32 @__syn_fn_hw_ms()"));
+
+        let tag_mir = compile_src_mir(
+            r#"
+mmio UartRegs {
+    @wo u32 dr @ 0x00;
+}
+mmio UART0 : UartRegs @ 0x4000_C000;
+
+fn uart_a(u8 c) {
+    UART0.dr = c as u32;
+}
+
+fn uart_b(u8 c) {
+    UART0.dr = c as u32;
+}
+
+fn main() {
+    sys.set_putc(uart_a);
+    println("a");
+    sys.set_putc(uart_b);
+    println("b");
+    sys.exit(0);
+}
+"#,
+        );
+        let tag_ll = emit_llvm_ir_with_options(&tag_mir, &opts).unwrap();
+        assert!(tag_ll.contains("@__syn_hook_tag_putc = internal global i8 0, align 1"));
+        assert!(!tag_ll.contains("@__syn_hook_fn_putc"));
+        let tag_wrap_start = tag_ll.find("define void @__syn_on_putc(").unwrap();
+        let tag_wrap_end = tag_ll[tag_wrap_start..].find("\n}\n").unwrap() + tag_wrap_start;
+        let tag_wrap = &tag_ll[tag_wrap_start..tag_wrap_end];
+        assert!(tag_wrap.contains("switch i8 %tag, label %fallback"));
+        assert!(tag_wrap.contains("call void @__syn_fn_uart_a("));
+        assert!(tag_wrap.contains("call void @__syn_fn_uart_b("));
+        assert!(!tag_wrap.contains("call void %fp("));
+    }
+
+    #[test]
+    fn sys_hooks_static_tag_switch_and_rom_call_stack_bound_in_qemu() {
+        let src = r#"
+mmio UartRegs {
+    @wo u32 dr @ 0x00;
+}
+mmio StubRam {
+    @rw u32 code @ 0x00;
+    @rw u32 idle_hits @ 0x10;
+    @rw u32 exit_seen @ 0x14;
+}
+mmio UART0 : UartRegs @ 0x4000_C000;
+mmio STUB : StubRam @ 0x2000_7F00;
+
+fn putc_plain(u8 c) {
+    UART0.dr = c as u32;
+}
+
+fn putc_upper(u8 c) {
+    u8 ch = c;
+    if (c >= 'a' && c <= 'z') {
+        ch = c - 32u8;
+    }
+    UART0.dr = ch as u32;
+}
+
+u32 custom_clock_ms() {
+    return 777_000u32 + STUB.idle_hits;
+}
+
+fn on_idle_hook(u32 _in_sim, u32 _depth) {
+    STUB.idle_hits = STUB.idle_hits + 1u32;
+}
+
+fn on_exit_hook(i32 code) {
+    STUB.exit_seen = (code as u32) + 1u32;
+    println(f"ON_EXIT_HOOK seen={STUB.exit_seen}");
+}
+
+task runner() {
+    delay(3ms);
+    u32 now = sys.now_ms();
+    assert(now >= 777_003u32);
+    assert(STUB.idle_hits >= 3u32);
+
+    // Thumb-1 `adds r0, r0, r1` (0x1840) ; `bx lr` (0x4770) written into SRAM 0x2000_7F00
+    STUB.code = 0x4770_1840u32;
+    u32 rom_sum = sys.rom_call_u32(0x2000_7F01usize, 128, 100u32, 23u32);
+    assert(rom_sum == 123u32);
+
+    println(f"SYS_HOOKS_OK now={now} idle={STUB.idle_hits} rom={rom_sum}");
+    sys.exit(0);
+}
+
+fn main() {
+    STUB.idle_hits = 0u32;
+    STUB.exit_seen = 0u32;
+    sys.use_systick(12_000_000);
+    sys.set_clock_ms(custom_clock_ms);
+    sys.set_idle(on_idle_hook);
+    sys.set_exit(on_exit_hook);
+
+    sys.set_putc(putc_plain);
+    println("mode=plain");
+    sys.set_putc(putc_upper);
+    println("mode=upper");
+    sys.set_putc(putc_plain);
+
+    spawn runner() @normal;
+}
+"#;
+        let (mir, ll, res) = run_zev_cortex_m_qemu("sys_hooks_tag_switch_rom_call", src);
+        verify_ll_with_opt(&res.build.ll_path).expect("opt verify sys_hooks qemu test");
+        assert!(ll.contains("@__syn_hook_tag_putc = internal global i8 0, align 1"));
+        assert!(ll.contains("@__syn_rom_call_u32_a2_i32_i32_sb128"));
+        assert!(res.exec.stdout.contains("mode=plain"), "stdout:\n{}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("MODE=UPPER"), "stdout:\n{}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("SYS_HOOKS_OK now=777"), "stdout:\n{}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("rom=123"), "stdout:\n{}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("ON_EXIT_HOOK seen=1"), "stdout:\n{}", res.exec.stdout);
+
+        let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::default()).unwrap();
+        let table = proof.format_table();
+        assert!(proof.within_budget, "stack budget fail:\n{table}");
+        assert!(
+            table.contains("__syn_rom_call_u32_a2_i32_i32_sb128"),
+            "missing stack-bounded rom call in table:\n{table}"
+        );
+        assert!(
+            table.contains("128B") || table.contains("128 B"),
+            "missing 128B frame attribution in table:\n{table}"
         );
     }
 }

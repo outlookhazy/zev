@@ -2698,18 +2698,18 @@ impl Analyzer {
             }
         }
 
-        // 2. Check all `extern "C"` and `sys.set_putc` callback arguments for yielding, boot-spawning, or boot-attaching functions.
+        // 2. Check all `extern "C"` and `sys.*` hook callback arguments for yielding, boot-spawning, or boot-attaching functions.
         let cb_sites = self.call_graph.extern_callbacks.clone();
         for site in &cb_sites {
             if let Some(cb_node) = self.call_graph.nodes.get(&site.callback_fn).cloned() {
-                let is_sys_putc = site.extern_fn == "sys.set_putc";
+                let is_sys_hook = site.extern_fn.starts_with("sys.");
                 if cb_node.any_yield_effect.can_yield() {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
                     let sub_chain = self
                         .call_graph
                         .shortest_any_yield_chain(&site.callback_fn)
                         .join(" -> ");
-                    let (msg, note) = if is_sys_putc {
+                    let (msg, note) = if site.extern_fn == "sys.set_putc" {
                         (
                             format!(
                                 "cannot pass yielding function '{}' to 'sys.set_putc': console byte-sink callbacks must be non-yielding",
@@ -2718,6 +2718,17 @@ impl Analyzer {
                             format!(
                                 "yield chain: sys.set_putc(...) callback -> {}; pass a non-yielding `fn(u8)` callback",
                                 sub_chain
+                            ),
+                        )
+                    } else if is_sys_hook {
+                        (
+                            format!(
+                                "cannot pass yielding function '{}' to '{}': system hook callbacks must be non-yielding",
+                                site.callback_fn, site.extern_fn
+                            ),
+                            format!(
+                                "yield chain: {}(...) callback -> {}; pass a non-yielding `fn` callback",
+                                site.extern_fn, sub_chain
                             ),
                         )
                     } else {
@@ -2744,8 +2755,8 @@ impl Analyzer {
                 }
                 if cb_node.spawns_in_boot {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
-                    let target_desc = if is_sys_putc {
-                        "'sys.set_putc'".to_string()
+                    let target_desc = if is_sys_hook {
+                        format!("'{}'", site.extern_fn)
                     } else {
                         format!("extern \"C\" function '{}'", site.extern_fn)
                     };
@@ -2763,8 +2774,8 @@ impl Analyzer {
                 }
                 if cb_node.attaches_in_boot {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
-                    let target_desc = if is_sys_putc {
-                        "'sys.set_putc'".to_string()
+                    let target_desc = if is_sys_hook {
+                        format!("'{}'", site.extern_fn)
                     } else {
                         format!("extern \"C\" function '{}'", site.extern_fn)
                     };
@@ -9629,6 +9640,29 @@ impl<'a> BodyChecker<'a> {
                 ExprVal::scalar(Ty::void(), span)
             }
 
+            "tick_by" => {
+                if args.len() != 1 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!("'sys.tick_by(u32 ms)' expects 1 argument, found {}", args.len()),
+                    ));
+                    for a in args {
+                        let _ = self.check_expr_infallible(&a.value);
+                    }
+                } else {
+                    let av = self.check_expr_infallible(&args[0].value);
+                    if !av.ty.is_assignable_to(&Ty::u32()) && !av.ty.is_error() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            args[0].span,
+                            format!("'sys.tick_by' expects `u32` milliseconds, found '{}'", av.ty),
+                        ));
+                    }
+                }
+                ExprVal::scalar(Ty::void(), span)
+            }
+
             "set_putc" => {
                 if self.in_isr() {
                     self.sema.emit(Diagnostic::new(
@@ -9654,41 +9688,117 @@ impl<'a> BodyChecker<'a> {
                         let _ = self.check_expr_infallible(&a.value);
                     }
                 } else {
-                    let av = self.check_expr_infallible(&args[0].value);
-                    if av.ty != expected_ty && !av.ty.is_error() {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            args[0].span,
-                            format!(
-                                "'sys.set_putc' expects callback of type '{}', found '{}'",
-                                expected_ty, av.ty
-                            ),
-                        ));
-                    }
-                    for cb_fn in &av.prov.fn_callbacks {
-                        if let Some(fn_info) = self.sema.functions.get(cb_fn) {
-                            if fn_info.error_spec.is_fallible() {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::TypeMismatch,
-                                    args[0].span,
-                                    format!(
-                                        "cannot pass fallible function '{}' (`error`) to 'sys.set_putc': console byte-sink callbacks must not fail",
-                                        cb_fn
-                                    ),
-                                ));
-                            }
-                        }
-                        self.sema
-                            .call_graph
-                            .add_extern_callback(ExternCallbackSite {
-                                extern_fn: "sys.set_putc".to_string(),
-                                callback_fn: cb_fn.clone(),
-                                span: args[0].span,
-                            });
-                    }
+                    self.check_sys_callback_arg(
+                        "set_putc",
+                        "console byte-sink",
+                        &args[0],
+                        &expected_ty,
+                    );
                 }
                 ExprVal::scalar(Ty::void(), span)
             }
+
+            "set_clock_ms" | "set_exit" | "set_fault_handler" | "set_idle" => {
+                if self.in_isr() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        span,
+                        format!("cannot call 'sys.{}' inside an ISR", m),
+                    ));
+                }
+                let (sig_desc, role_desc, expected_ty) = match m {
+                    "set_clock_ms" => (
+                        "fn() -> u32",
+                        "clock-source",
+                        Ty::FnPtr {
+                            params: vec![],
+                            ret: Box::new(Ty::u32()),
+                        },
+                    ),
+                    "set_exit" => (
+                        "fn(i32)",
+                        "exit-handler",
+                        Ty::FnPtr {
+                            params: vec![Ty::Prim(PrimType::I32)],
+                            ret: Box::new(Ty::void()),
+                        },
+                    ),
+                    "set_fault_handler" => (
+                        "fn()",
+                        "fault-handler",
+                        Ty::FnPtr {
+                            params: vec![],
+                            ret: Box::new(Ty::void()),
+                        },
+                    ),
+                    "set_idle" => (
+                        "fn(u32, u32)",
+                        "idle-hook",
+                        Ty::FnPtr {
+                            params: vec![Ty::u32(), Ty::u32()],
+                            ret: Box::new(Ty::void()),
+                        },
+                    ),
+                    _ => unreachable!(),
+                };
+                if args.len() != 1 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "'sys.{}({})' expects 1 argument, found {}",
+                            m,
+                            sig_desc,
+                            args.len()
+                        ),
+                    ));
+                    for a in args {
+                        let _ = self.check_expr_infallible(&a.value);
+                    }
+                } else {
+                    self.check_sys_callback_arg(m, role_desc, &args[0], &expected_ty);
+                }
+                ExprVal::scalar(Ty::void(), span)
+            }
+
+            "set_irq_router" => {
+                if self.in_isr() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidControlFlow,
+                        span,
+                        "cannot call 'sys.set_irq_router' inside an ISR",
+                    ));
+                }
+                let route_ty = Ty::FnPtr {
+                    params: vec![Ty::u32(), Ty::u32()],
+                    ret: Box::new(Ty::void()),
+                };
+                let ack_ty = Ty::FnPtr {
+                    params: vec![Ty::u32()],
+                    ret: Box::new(Ty::void()),
+                };
+                if args.len() != 2 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "'sys.set_irq_router(fn(u32, u32), fn(u32))' expects 2 arguments, found {}",
+                            args.len()
+                        ),
+                    ));
+                    for a in args {
+                        let _ = self.check_expr_infallible(&a.value);
+                    }
+                } else {
+                    self.check_sys_callback_arg("set_irq_router", "IRQ-route", &args[0], &route_ty);
+                    self.check_sys_callback_arg("set_irq_router", "IRQ-ack", &args[1], &ack_ty);
+                }
+                ExprVal::scalar(Ty::void(), span)
+            }
+
+            "rom_call_u32" => self.check_sys_rom_call(m, args, span, true, Ty::u32()),
+            "rom_call_void" => self.check_sys_rom_call(m, args, span, true, Ty::void()),
+            "rom_call_noreturn" => self.check_sys_rom_call(m, args, span, false, Ty::void()),
 
             "now_ticks" | "now_ms" | "current_prio" | "sleep_depth" | "wfi_count" => {
                 if !args.is_empty() {
@@ -9863,7 +9973,16 @@ impl<'a> BodyChecker<'a> {
                     "use_systick",
                     "tick",
                     "tick_ms",
+                    "tick_by",
                     "set_putc",
+                    "set_clock_ms",
+                    "set_exit",
+                    "set_fault_handler",
+                    "set_idle",
+                    "set_irq_router",
+                    "rom_call_u32",
+                    "rom_call_void",
+                    "rom_call_noreturn",
                     "now_ms",
                     "now_ticks",
                     "current_prio",
@@ -9897,6 +10016,147 @@ impl<'a> BodyChecker<'a> {
                 ExprVal::error(span)
             }
         }
+    }
+
+    fn check_sys_callback_arg(
+        &mut self,
+        method_name: &str,
+        role_desc: &str,
+        arg: &CallArg,
+        expected_ty: &Ty,
+    ) {
+        let av = self.check_expr_infallible(&arg.value);
+        if av.ty != *expected_ty && !av.ty.is_error() {
+            let msg = if method_name == "set_putc" {
+                format!(
+                    "'sys.set_putc' expects callback of type '{}', found '{}'",
+                    expected_ty, av.ty
+                )
+            } else {
+                format!(
+                    "'sys.{}' expects {} callback of type '{}', found '{}'",
+                    method_name, role_desc, expected_ty, av.ty
+                )
+            };
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                arg.span,
+                msg,
+            ));
+        }
+        for cb_fn in &av.prov.fn_callbacks {
+            if let Some(fn_info) = self.sema.functions.get(cb_fn) {
+                if fn_info.error_spec.is_fallible() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        arg.span,
+                        format!(
+                            "cannot pass fallible function '{}' (`error`) to 'sys.{}': {} callbacks must not fail",
+                            cb_fn, method_name, role_desc
+                        ),
+                    ));
+                }
+            }
+            self.sema
+                .call_graph
+                .add_extern_callback(ExternCallbackSite {
+                    extern_fn: format!("sys.{}", method_name),
+                    callback_fn: cb_fn.clone(),
+                    span: arg.span,
+                });
+        }
+    }
+
+    fn check_sys_rom_call(
+        &mut self,
+        method_name: &str,
+        args: &[CallArg],
+        span: Span,
+        has_stack_bound: bool,
+        ret_ty: Ty,
+    ) -> ExprVal {
+        let fixed = if has_stack_bound { 2 } else { 1 };
+        let max_args = fixed + 4;
+        if args.len() < fixed || args.len() > max_args {
+            let sig = if has_stack_bound {
+                format!("'sys.{}(usize fn_addr, usize stack_bound, ...args)'", method_name)
+            } else {
+                format!("'sys.{}(usize fn_addr, ...args)'", method_name)
+            };
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                span,
+                format!(
+                    "{} expects {}..={} arguments (up to 4 ABI register args), found {}",
+                    sig,
+                    fixed,
+                    max_args,
+                    args.len()
+                ),
+            ));
+            for a in args {
+                let _ = self.check_expr_infallible(&a.value);
+            }
+            return ExprVal::scalar(ret_ty, span);
+        }
+
+        let addr_val = self.check_expr_infallible(&args[0].value);
+        if !addr_val.ty.is_assignable_to(&Ty::usize()) && !addr_val.ty.is_error() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                args[0].span,
+                format!(
+                    "'sys.{}' argument 1 (`fn_addr`) expects `usize` address, found '{}'",
+                    method_name, addr_val.ty
+                ),
+            ));
+        }
+
+        if has_stack_bound {
+            let bound_val = self.check_expr_infallible(&args[1].value);
+            if !bound_val.ty.is_assignable_to(&Ty::usize()) && !bound_val.ty.is_error() {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    args[1].span,
+                    format!(
+                        "'sys.{}' argument 2 (`stack_bound`) expects `usize` bytes, found '{}'",
+                        method_name, bound_val.ty
+                    ),
+                ));
+            }
+            let const_bound = self
+                .eval_const_usize_expr(&args[1].value)
+                .and_then(|v| u32::try_from(v).ok());
+            if const_bound.is_none() {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::InvalidOperation,
+                    args[1].span,
+                    format!(
+                        "'sys.{}' argument 2 (`stack_bound`) must be a non-negative compile-time constant integer (`0..={}`)",
+                        method_name,
+                        u32::MAX
+                    ),
+                ));
+            }
+        }
+
+        for (idx, a) in args[fixed..].iter().enumerate() {
+            let av = self.check_expr_infallible(&a.value);
+            if !av.ty.is_integer() && !matches!(av.ty, Ty::Ptr(_)) && !av.ty.is_error() {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    a.span,
+                    format!(
+                        "'sys.{}' ABI argument {} must be an integer or pointer, found '{}'",
+                        method_name,
+                        fixed + idx + 1,
+                        av.ty
+                    ),
+                ));
+            }
+        }
+
+        ExprVal::scalar(ret_ty, span)
     }
 
     fn check_os_primitive_method(
@@ -11736,7 +11996,7 @@ impl<'a> BodyChecker<'a> {
 // Small Pure Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.set_putc(fn(u8))`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
+const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.tick_by(u32 ms)`, `sys.set_putc(fn(u8))`, `sys.set_clock_ms(fn() -> u32)`, `sys.set_exit(fn(i32))`, `sys.set_fault_handler(fn())`, `sys.set_idle(fn(u32, u32))`, `sys.set_irq_router(fn(u32, u32), fn(u32))`, `sys.rom_call_u32(usize fn_addr, usize stack_bound, ...) -> u32`, `sys.rom_call_void(usize fn_addr, usize stack_bound, ...)`, `sys.rom_call_noreturn(usize fn_addr, ...)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
 
 fn is_string_arg_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Str)
@@ -11980,11 +12240,14 @@ fn is_sys_exit_expr(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::MethodCall {
             receiver, method, ..
-        } => matches!(&receiver.kind, ExprKind::Ident(id) if id.name == "sys") && method.name == "exit",
+        } => {
+            matches!(&receiver.kind, ExprKind::Ident(id) if id.name == "sys")
+                && matches!(method.name.as_str(), "exit" | "rom_call_noreturn")
+        }
         ExprKind::Call { callee, .. } => match &callee.kind {
             ExprKind::Field { target, field } => {
                 matches!(&target.kind, ExprKind::Ident(id) if id.name == "sys")
-                    && field.name == "exit"
+                    && matches!(field.name.as_str(), "exit" | "rom_call_noreturn")
             }
             _ => false,
         },

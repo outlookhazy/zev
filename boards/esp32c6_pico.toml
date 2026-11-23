@@ -1,0 +1,9 @@
+# Waveshare ESP32-C6-Pico (ESP32-C6 Direct-Boot + USB JTAG/Serial)
+
+[board]
+name = "esp32c6_pico"
+chip = "esp32c6"
+
+[run]
+flash_cmd = ["esptool", "--chip", "esp32c6", "--port", "{port}", "--after", "hard-reset", "write-flash", "0x0", "{image}"]
+default_port = "/dev/ttyACM0"

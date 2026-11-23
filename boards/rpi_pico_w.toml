@@ -1,0 +1,9 @@
+# Raspberry Pi Pico W (RP2040 SRAM UF2 Board)
+
+[board]
+name = "rpi_pico_w"
+chip = "rp2040"
+
+[run]
+flash_cmd = ["python3", "tools/flash_rp2040_uf2.py", "{image}", "{port}"]
+default_port = "/dev/ttyACM0"

@@ -1,0 +1,31 @@
+# Raspberry Pi RP2040 (Dual ARM Cortex-M0+, SRAM NO_FLASH UF2 Target Specification)
+
+[chip]
+name = "rp2040"
+isa = "arm-cortex-m"
+cpu = "cortex-m0plus"
+triple = "thumbv6m-none-eabi"
+datalayout = "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"
+ptr_bits = 32
+opt_level = "-O2"
+code_in_ram = true
+has_thumb2 = false
+has_vtor = true
+allow_sleep_deep = false
+
+[memory]
+flash_base = 0x2000_0000
+flash_size = 270336
+ram_base = 0x2000_0000
+ram_size = 270336
+stack_reserve_bytes = 8192
+
+[irq]
+model = "cortex-m-nvic"
+max_irqs = 32
+min_vector_irqs = 32
+
+[image]
+format = "uf2"
+uf2_family_id = 0xE48B_FF56
+uf2_target_base = 0x2000_0000

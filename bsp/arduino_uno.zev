@@ -25,6 +25,7 @@ pub fn init_mcu_core() {
         hw.TIFR.tifr0 = 0x02;
         hw.TIMSK_REGS.timsk0 = 0x02;
     }
+    sys.set_putc(console_putc);
 }
 
 pub fn console_putc(u8 b) {

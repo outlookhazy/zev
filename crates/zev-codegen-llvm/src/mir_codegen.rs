@@ -22,10 +22,11 @@ use zev_mir::{
     VarRole,
 };
 
-use crate::esp32c6::{Esp32C6IrqRoute, assign_esp32c6_irq_routes};
-use crate::nvic::{NvicMap, emit_cortex_m_startup_ir, sanitize_ident};
+use crate::arm_cortex_m::{NvicMap, build_nvic_map, emit_arm_cortex_m_startup_ir, sanitize_ident};
+use crate::riscv32::{RvIrqRoute, assign_rv_irq_routes_for_spec, emit_riscv32_startup_ir};
 use crate::runtime_ir::{RuntimeIrFeatures, emit_kernel_runtime_ir_with_features};
-use crate::toolchain::{CodegenError, CodegenOptions, TargetArch};
+use crate::target_spec::{CpuIsa, IrqModel, TargetSpec};
+use crate::toolchain::{CodegenError, CodegenOptions};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Module-wide Lowering Metadata
@@ -78,8 +79,9 @@ impl SsaVal {
 struct ModuleCtx<'a> {
     module: &'a MirModule,
     opts: &'a CodegenOptions,
+    spec: TargetSpec,
     nvic: NvicMap,
-    esp32c6_irq_routes: Vec<Esp32C6IrqRoute>,
+    rv_irq_routes: Vec<RvIrqRoute>,
     avr_irq_vectors: BTreeSet<u32>,
     mmio_layouts: HashMap<String, MirMmioLayout>,
     mmio_instances: HashMap<String, MirMmioInstance>,
@@ -101,23 +103,152 @@ struct ModuleCtx<'a> {
     dma_layout_structs: BTreeSet<String>,
     vis: zev_mir::opt::VisibilityReport,
     rt_features: RuntimeIrFeatures,
-    avr_mega0_putc: AvrMega0PutcMode,
+    hooks: ResolvedSysHooks,
+    rom_wrappers: BTreeSet<RomWrapperSpec>,
     strings: Vec<String>,
     string_dedup: HashMap<String, usize>,
     const_blobs: Vec<String>,
     const_blob_dedup: HashMap<String, usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum HookKind {
+    Putc,
+    ClockMs,
+    Exit,
+    FaultHandler,
+    Idle,
+    IrqRoute,
+    IrqAck,
+}
+
+impl HookKind {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Putc => "putc",
+            Self::ClockMs => "clock_ms",
+            Self::Exit => "exit",
+            Self::FaultHandler => "fault",
+            Self::Idle => "idle",
+            Self::IrqRoute => "rv_irq_route",
+            Self::IrqAck => "rv_irq_ack",
+        }
+    }
+
+    const fn wrapper_sym(self) -> &'static str {
+        match self {
+            Self::Putc => "@__syn_on_putc",
+            Self::ClockMs => "@__syn_now_ms",
+            Self::Exit => "@__syn_on_exit",
+            Self::FaultHandler => "@__syn_on_fault",
+            Self::Idle => "@__syn_on_idle",
+            Self::IrqRoute => "@__syn_on_rv_irq_route",
+            Self::IrqAck => "@__syn_on_rv_irq_ack",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum AvrMega0PutcMode {
-    Noop,
-    DirectStatic {
+enum StaticHookMode {
+    Unset,
+    DirectUnconditional {
+        fn_name: String,
         symbol: String,
-        elide_set_putc_store: bool,
     },
-    DynamicGlobal {
-        fallback_symbol: Option<String>,
+    TagSwitch {
+        arms: Vec<(String, String)>,
+        global_sym: String,
     },
+    Indirect {
+        global_sym: String,
+    },
+}
+
+impl StaticHookMode {
+    fn tag_index_for(&self, fn_name: &str) -> Option<usize> {
+        if let Self::TagSwitch { arms, .. } = self {
+            arms.iter()
+                .position(|(name, _)| name == fn_name)
+                .map(|idx| idx + 1)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedSysHooks {
+    putc: StaticHookMode,
+    clock_ms: StaticHookMode,
+    exit: StaticHookMode,
+    fault_handler: StaticHookMode,
+    idle: StaticHookMode,
+    irq_route: StaticHookMode,
+    irq_ack: StaticHookMode,
+}
+
+impl Default for ResolvedSysHooks {
+    fn default() -> Self {
+        Self {
+            putc: StaticHookMode::Unset,
+            clock_ms: StaticHookMode::Unset,
+            exit: StaticHookMode::Unset,
+            fault_handler: StaticHookMode::Unset,
+            idle: StaticHookMode::Unset,
+            irq_route: StaticHookMode::Unset,
+            irq_ack: StaticHookMode::Unset,
+        }
+    }
+}
+
+impl ResolvedSysHooks {
+    fn mode(&self, kind: HookKind) -> &StaticHookMode {
+        match kind {
+            HookKind::Putc => &self.putc,
+            HookKind::ClockMs => &self.clock_ms,
+            HookKind::Exit => &self.exit,
+            HookKind::FaultHandler => &self.fault_handler,
+            HookKind::Idle => &self.idle,
+            HookKind::IrqRoute => &self.irq_route,
+            HookKind::IrqAck => &self.irq_ack,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum RomWrapperKind {
+    U32,
+    Void,
+    Noreturn,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RomWrapperSpec {
+    kind: RomWrapperKind,
+    stack_bound: u32,
+    param_llvm_tys: Vec<String>,
+}
+
+impl RomWrapperSpec {
+    fn symbol(&self) -> String {
+        let mut sig_suffix = String::new();
+        for ty in &self.param_llvm_tys {
+            sig_suffix.push('_');
+            sig_suffix.push_str(&sanitize_ident(ty));
+        }
+        let n = self.param_llvm_tys.len();
+        match self.kind {
+            RomWrapperKind::U32 => {
+                format!("@__syn_rom_call_u32_a{n}{sig_suffix}_sb{}", self.stack_bound)
+            }
+            RomWrapperKind::Void => {
+                format!("@__syn_rom_call_void_a{n}{sig_suffix}_sb{}", self.stack_bound)
+            }
+            RomWrapperKind::Noreturn => {
+                format!("@__syn_rom_noreturn_a{n}{sig_suffix}")
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -137,11 +268,11 @@ struct ExternLlvmSig {
 
 impl<'a> ModuleCtx<'a> {
     const fn fn_as(&self) -> &'static str {
-        self.opts.target.fn_addrspace_attr()
+        self.spec.isa.fn_addrspace_attr()
     }
 
     const fn call_kw(&self) -> &'static str {
-        self.opts.target.call_kw()
+        self.spec.isa.call_kw()
     }
 }
 
@@ -158,30 +289,31 @@ pub fn emit_llvm_ir_with_options(
     module: &MirModule,
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
-    let nvic = NvicMap::from_irq_vectors(&module.irq_vectors);
-    if opts.target == TargetArch::Thumbv6mRp2040 {
-        crate::rp2040::validate_rp2040_irq_vectors(&module.irq_vectors)?;
-    }
-    let esp32c6_irq_routes = if opts.target == TargetArch::Riscv32Esp32C6 {
-        assign_esp32c6_irq_routes(&module.irq_vectors)?
+    let spec = opts.effective_spec()?;
+    let nvic = if spec.isa == CpuIsa::ArmCortexM {
+        build_nvic_map(&module.irq_vectors, &spec)?
+    } else {
+        NvicMap::default()
+    };
+    let rv_irq_routes = if spec.isa == CpuIsa::Riscv32 {
+        assign_rv_irq_routes_for_spec(&module.irq_vectors, &spec)?
     } else {
         Vec::new()
     };
-    let avr_irq_vectors = match opts.target {
-        TargetArch::AvrAtmega328p => crate::avr::validate_avr_irq_vectors(&module.irq_vectors)?,
-        TargetArch::AvrAtmega4809 => {
-            crate::avr_mega0::validate_avr_mega0_irq_vectors(&module.irq_vectors)?
+    let avr_irq_vectors = match &spec.irq {
+        IrqModel::AvrVectored { vector_slots, .. } if spec.isa == CpuIsa::Avr => {
+            crate::avr::validate_avr_irq_vectors(&module.irq_vectors, *vector_slots)?
         }
         _ => BTreeSet::new(),
     };
     let mut rt_features = scan_module_runtime_features(module);
-    rt_features.uses_rv_irqs =
-        opts.target == TargetArch::Riscv32Esp32C6 && !module.irq_vectors.is_empty();
+    rt_features.uses_rv_irqs = spec.isa == CpuIsa::Riscv32 && !module.irq_vectors.is_empty();
     let mut ctx = ModuleCtx {
         module,
         opts,
+        spec,
         nvic,
-        esp32c6_irq_routes,
+        rv_irq_routes,
         avr_irq_vectors,
         mmio_layouts: HashMap::new(),
         mmio_instances: HashMap::new(),
@@ -203,7 +335,8 @@ pub fn emit_llvm_ir_with_options(
         dma_layout_structs: zev_mir::collect_dma_layout_structs(module),
         vis: zev_mir::opt::VisibilityReport::effective_for(module),
         rt_features,
-        avr_mega0_putc: AvrMega0PutcMode::Noop,
+        hooks: ResolvedSysHooks::default(),
+        rom_wrappers: BTreeSet::new(),
         strings: Vec::new(),
         string_dedup: HashMap::new(),
         const_blobs: Vec::new(),
@@ -211,70 +344,43 @@ pub fn emit_llvm_ir_with_options(
     };
 
     ctx.prepare()?;
-    ctx.rt_features.console_putc_sym = ctx.find_console_putc_symbol();
-    ctx.rt_features.now_ms_sym = ctx.find_sys_now_ms_symbol();
-    if opts.target.is_avr() {
-        ctx.avr_mega0_putc = ctx.resolve_avr_mega0_putc();
-    }
+    ctx.hooks = ctx.resolve_sys_hooks();
+    ctx.rt_features.uses_clock_hook = !matches!(ctx.hooks.clock_ms, StaticHookMode::Unset);
 
     let mut out = String::with_capacity(64 * 1024);
 
     // 1. Target header + cooperative OS kernel & HAL (emitting soft-float & fmt helpers on demand)
-    emit_kernel_runtime_ir_with_features(&mut out, module.spawned_tasks.len(), opts, &ctx.rt_features);
+    emit_kernel_runtime_ir_with_features(&mut out, module.spawned_tasks.len(), opts, &ctx.rt_features)?;
 
-    // 2. Cortex-M vector table, ESP32-C6 Direct-Boot entry, AVR vector tables, or host `main` entry wrapper
-    match opts.target {
-        TargetArch::Thumbv7mNoneEabi => {
-            emit_cortex_m_startup_ir(&mut out, opts.initial_sp(), &ctx.nvic);
+    // 2. Pure-ISA vector tables, startup reset routines, and software/boot IRQ dispatchers
+    match ctx.spec.isa {
+        CpuIsa::ArmCortexM => {
+            emit_arm_cortex_m_startup_ir(&mut out, &ctx.spec, opts.fn_size_attrs(), &ctx.nvic);
             emit_cm_irq_dispatch_ir(&mut out, &ctx);
         }
-        TargetArch::Thumbv6mRp2040 => {
-            crate::rp2040::emit_rp2040_startup_ir(
-                &mut out,
-                opts.initial_sp(),
-                opts.fn_size_attrs(),
-                &ctx.nvic,
-            );
-            emit_cm_irq_dispatch_ir(&mut out, &ctx);
+        CpuIsa::Riscv32 => {
+            emit_riscv32_startup_ir(&mut out, &ctx.spec, opts.fn_size_attrs(), &ctx.rv_irq_routes);
+            emit_rv_irq_dispatch_ir(&mut out, &ctx);
         }
-        TargetArch::Riscv32Esp32C6 => {
-            crate::esp32c6::emit_esp32c6_startup_ir(
-                &mut out,
-                opts.initial_sp(),
-                opts.fn_size_attrs(),
-                &ctx.esp32c6_irq_routes,
-            );
-            emit_esp32c6_irq_dispatch_ir(&mut out, &ctx);
-        }
-        TargetArch::AvrAtmega328p => {
+        CpuIsa::Avr => {
             crate::avr::emit_avr_startup_ir(
                 &mut out,
-                opts.initial_sp(),
+                &ctx.spec,
                 opts.fn_size_attrs(),
                 &ctx.avr_irq_vectors,
             );
-            ctx.emit_avr_mega0_uart_putc_ir(&mut out);
             emit_avr_irq_dispatch_ir(&mut out, &ctx);
         }
-        TargetArch::AvrAtmega4809 => {
-            crate::avr_mega0::emit_avr_mega0_startup_ir(
-                &mut out,
-                opts.initial_sp(),
-                opts.fn_size_attrs(),
-                &ctx.avr_irq_vectors,
-            );
-            ctx.emit_avr_mega0_uart_putc_ir(&mut out);
-            emit_avr_irq_dispatch_ir(&mut out, &ctx);
-        }
-        TargetArch::HostX86_64Linux => {
+        CpuIsa::HostX86_64Linux => {
             emit_host_entry_ir(&mut out, &ctx);
         }
     }
 
-    // 3. User struct type declarations + Host MMIO backing buffers + ISR static state globals
+    // 3. User struct type declarations + Host MMIO backing buffers + ISR / hook static state globals
     ctx.emit_struct_types_ir(&mut out);
     ctx.emit_mmio_host_buffers_ir(&mut out);
     ctx.emit_isr_state_and_selector_globals_ir(&mut out);
+    ctx.emit_sys_hook_globals_ir(&mut out);
 
     // 4. OS primitive type declarations, global instances, and typed helper functions
     ctx.emit_primitives_ir(&mut out);
@@ -308,7 +414,11 @@ pub fn emit_llvm_ir_with_options(
     // 11. Sequential `main()` boot sequence (`@__syn_boot`)
     ctx.emit_boot_ir(&mut out)?;
 
-    // 12. Pooled string literal constants (`@.str.<k>`)
+    // 12. Explicit `sys.*` hook wrappers and stack-bounded ROM call wrappers
+    ctx.emit_sys_hooks_ir(&mut out);
+    ctx.emit_rom_wrappers_ir(&mut out);
+
+    // 13. Pooled string literal constants (`@.str.<k>`)
     ctx.emit_string_constants_ir(&mut out);
 
     Ok(out)
@@ -353,11 +463,11 @@ fn emit_cm_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
     );
 }
 
-fn emit_esp32c6_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
+fn emit_rv_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
     emit_sw_irq_dispatch_ir(
         out,
-        "@__syn_esp32c6_dispatch_irq",
-        "; ── ESP32-C6 Software/Matrix IRQ Dispatcher ──",
+        "@__syn_rv_dispatch_irq",
+        "; ── RISC-V Software/Boot IRQ Dispatcher ──",
         ctx,
     );
 }
@@ -366,7 +476,7 @@ fn emit_avr_irq_dispatch_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
     emit_sw_irq_dispatch_ir(
         out,
         "@__syn_avr_dispatch_irq",
-        "; ── ATmega328P Software/Vector IRQ Dispatcher ──",
+        "; ── AVR Software/Vector IRQ Dispatcher ──",
         ctx,
     );
 }
@@ -399,9 +509,7 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
         uses_fmt_float_sci: false,
         uses_rv_irqs: false,
         uses_sys_tick: false,
-        uses_set_putc: false,
-        console_putc_sym: None,
-        now_ms_sym: None,
+        uses_clock_hook: false,
     };
 
     fn scan_ty(ty: &MirType, feat: &mut RuntimeIrFeatures) {
@@ -533,6 +641,12 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                 scan_place(array_place, feat);
             }
             MirExprKind::CallDirect { args, .. } => {
+                for a in args {
+                    scan_expr(a, feat);
+                }
+            }
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                scan_expr(addr, feat);
                 for a in args {
                     scan_expr(a, feat);
                 }
@@ -785,10 +899,8 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                 MirStmt::Intrinsic(iop) => match iop {
                     MirIntrinsicOp::UseSystick { hz } => scan_expr(hz, feat),
                     MirIntrinsicOp::SysOp { method, args } => {
-                        if matches!(method.as_str(), "tick" | "tick_ms") {
+                        if matches!(method.as_str(), "tick" | "tick_ms" | "tick_by") {
                             feat.uses_sys_tick = true;
-                        } else if method == "set_putc" {
-                            feat.uses_set_putc = true;
                         }
                         for a in args {
                             scan_expr(a, feat);
@@ -1182,69 +1294,7 @@ impl<'a> ModuleCtx<'a> {
         Ok(())
     }
 
-    fn find_console_putc_symbol(&self) -> Option<String> {
-        let mut candidates: Vec<(u8, &str, String)> = Vec::new();
-        for f in &self.module.functions {
-            if (f.name == "console_putc" || f.name.ends_with("__console_putc"))
-                && !f.is_yielding
-                && !f.error_spec.has_error()
-                && f.ret_ty == MirType::Void
-                && f.params.len() == 1
-                && f.vars[f.params[0].0].ty == MirType::U8
-            {
-                if let Some(sig) = self.fn_sigs.get(&f.name) {
-                    let rank = if f.name == "console_putc" {
-                        0
-                    } else if f.name.starts_with("bsp__") {
-                        1
-                    } else {
-                        2
-                    };
-                    candidates.push((rank, f.name.as_str(), sig.symbol.clone()));
-                }
-            }
-        }
-        candidates.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        candidates.into_iter().next().map(|(_, _, sym)| sym)
-    }
-
-    fn find_sys_now_ms_symbol(&self) -> Option<String> {
-        let mut candidates: Vec<(u8, &str, String)> = Vec::new();
-        for f in &self.module.functions {
-            if (f.name == "sys_now_ms" || f.name.ends_with("__sys_now_ms"))
-                && !f.is_yielding
-                && !f.error_spec.has_error()
-                && f.ret_ty == MirType::U32
-                && f.params.is_empty()
-            {
-                if let Some(sig) = self.fn_sigs.get(&f.name) {
-                    let rank = if f.name == "sys_now_ms" {
-                        0
-                    } else if f.name.starts_with("bsp__") {
-                        1
-                    } else {
-                        2
-                    };
-                    candidates.push((rank, f.name.as_str(), sig.symbol.clone()));
-                }
-            }
-        }
-        candidates.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-        candidates.into_iter().next().map(|(_, _, sym)| sym)
-    }
-
-    fn resolve_avr_mega0_putc(&self) -> AvrMega0PutcMode {
-        let console_sym = self.find_console_putc_symbol();
-        if !self.rt_features.uses_set_putc {
-            return match console_sym {
-                Some(symbol) => AvrMega0PutcMode::DirectStatic {
-                    symbol,
-                    elide_set_putc_store: true,
-                },
-                None => AvrMega0PutcMode::Noop,
-            };
-        }
-
+    fn resolve_sys_hooks(&self) -> ResolvedSysHooks {
         fn unwrap_fn_addr(mut e: &MirExpr) -> Option<&str> {
             while let MirExprKind::Cast { expr, .. } = &e.kind {
                 e = expr;
@@ -1256,43 +1306,248 @@ impl<'a> ModuleCtx<'a> {
             }
         }
 
-        fn collect_stmts<'a>(stmts: &'a [MirStmt], out: &mut Vec<Option<&'a str>>) {
+        fn record_hook_call<'a>(
+            method: &str,
+            args: &'a [MirExpr],
+            sites: &mut BTreeMap<HookKind, Vec<Option<&'a str>>>,
+        ) {
+            match method {
+                "set_putc" => sites
+                    .entry(HookKind::Putc)
+                    .or_default()
+                    .push(args.first().and_then(unwrap_fn_addr)),
+                "set_clock_ms" => sites
+                    .entry(HookKind::ClockMs)
+                    .or_default()
+                    .push(args.first().and_then(unwrap_fn_addr)),
+                "set_exit" => sites
+                    .entry(HookKind::Exit)
+                    .or_default()
+                    .push(args.first().and_then(unwrap_fn_addr)),
+                "set_fault_handler" => sites
+                    .entry(HookKind::FaultHandler)
+                    .or_default()
+                    .push(args.first().and_then(unwrap_fn_addr)),
+                "set_idle" => sites
+                    .entry(HookKind::Idle)
+                    .or_default()
+                    .push(args.first().and_then(unwrap_fn_addr)),
+                "set_irq_router" => {
+                    sites
+                        .entry(HookKind::IrqRoute)
+                        .or_default()
+                        .push(args.first().and_then(unwrap_fn_addr));
+                    sites
+                        .entry(HookKind::IrqAck)
+                        .or_default()
+                        .push(args.get(1).and_then(unwrap_fn_addr));
+                }
+                _ => {}
+            }
+        }
+
+        fn collect_stmts<'a>(
+            stmts: &'a [MirStmt],
+            sites: &mut BTreeMap<HookKind, Vec<Option<&'a str>>>,
+        ) {
             for s in stmts {
                 match s {
-                    MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, args })
-                        if method == "set_putc" =>
-                    {
-                        out.push(args.first().and_then(unwrap_fn_addr));
+                    MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, args }) => {
+                        record_hook_call(method, args, sites);
                     }
                     MirStmt::If {
                         then_body,
                         else_body,
                         ..
                     } => {
-                        collect_stmts(then_body, out);
-                        collect_stmts(else_body, out);
+                        collect_stmts(then_body, sites);
+                        collect_stmts(else_body, sites);
                     }
-                    MirStmt::While { body, .. } => collect_stmts(body, out),
-                    MirStmt::Switch {
-                        arms, default, ..
-                    } => {
+                    MirStmt::While { body, .. } => collect_stmts(body, sites),
+                    MirStmt::Switch { arms, default, .. } => {
                         for (_, b) in arms {
-                            collect_stmts(b, out);
+                            collect_stmts(b, sites);
                         }
-                        collect_stmts(default, out);
+                        collect_stmts(default, sites);
                     }
                     _ => {}
                 }
             }
         }
 
-        let mut sites = Vec::new();
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum WalkStop {
+            Continue,
+            FnReturns,
+            ProgramExits,
+        }
+
+        fn stmts_may_return_or_exit(stmts: &[MirStmt]) -> bool {
+            for s in stmts {
+                match s {
+                    MirStmt::Return(_) | MirStmt::Error { .. } => return true,
+                    MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, .. })
+                        if matches!(method.as_str(), "exit" | "stop" | "rom_call_noreturn") =>
+                    {
+                        return true;
+                    }
+                    MirStmt::If {
+                        then_body,
+                        else_body,
+                        ..
+                    } => {
+                        if stmts_may_return_or_exit(then_body)
+                            || stmts_may_return_or_exit(else_body)
+                        {
+                            return true;
+                        }
+                    }
+                    MirStmt::While { body, .. } => {
+                        if stmts_may_return_or_exit(body) {
+                            return true;
+                        }
+                    }
+                    MirStmt::Switch { arms, default, .. } => {
+                        if arms.iter().any(|(_, b)| stmts_may_return_or_exit(b))
+                            || stmts_may_return_or_exit(default)
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+
+        fn walk_expr_uncond(
+            expr: &MirExpr,
+            fn_map: &HashMap<&str, &MirFnBody>,
+            active: &mut BTreeSet<String>,
+            uncond: &mut BTreeSet<HookKind>,
+        ) -> WalkStop {
+            match &expr.kind {
+                MirExprKind::CallDirect {
+                    callee,
+                    is_extern_c: false,
+                    args,
+                } => {
+                    for a in args {
+                        if walk_expr_uncond(a, fn_map, active, uncond) == WalkStop::ProgramExits {
+                            return WalkStop::ProgramExits;
+                        }
+                    }
+                    if !active.contains(callee.as_str()) {
+                        if let Some(MirFnBody::Direct(body)) = fn_map.get(callee.as_str()) {
+                            active.insert(callee.clone());
+                            let st = walk_stmts_uncond(body, fn_map, active, uncond);
+                            active.remove(callee.as_str());
+                            if st == WalkStop::ProgramExits {
+                                return WalkStop::ProgramExits;
+                            }
+                        }
+                    }
+                    WalkStop::Continue
+                }
+                MirExprKind::Unary { expr: sub, .. } | MirExprKind::Cast { expr: sub, .. } => {
+                    walk_expr_uncond(sub, fn_map, active, uncond)
+                }
+                _ => WalkStop::Continue,
+            }
+        }
+
+        fn walk_stmt_uncond(
+            stmt: &MirStmt,
+            fn_map: &HashMap<&str, &MirFnBody>,
+            active: &mut BTreeSet<String>,
+            uncond: &mut BTreeSet<HookKind>,
+        ) -> WalkStop {
+            match stmt {
+                MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, .. }) => {
+                    match method.as_str() {
+                        "set_putc" => {
+                            uncond.insert(HookKind::Putc);
+                        }
+                        "set_clock_ms" => {
+                            uncond.insert(HookKind::ClockMs);
+                        }
+                        "set_exit" => {
+                            uncond.insert(HookKind::Exit);
+                        }
+                        "set_fault_handler" => {
+                            uncond.insert(HookKind::FaultHandler);
+                        }
+                        "set_idle" => {
+                            uncond.insert(HookKind::Idle);
+                        }
+                        "set_irq_router" => {
+                            uncond.insert(HookKind::IrqRoute);
+                            uncond.insert(HookKind::IrqAck);
+                        }
+                        "exit" | "stop" | "rom_call_noreturn" => return WalkStop::ProgramExits,
+                        _ => {}
+                    }
+                    WalkStop::Continue
+                }
+                MirStmt::Return(_) | MirStmt::Error { .. } => WalkStop::FnReturns,
+                MirStmt::Expr(e) | MirStmt::Assign { value: e, .. } => {
+                    walk_expr_uncond(e, fn_map, active, uncond)
+                }
+                MirStmt::If {
+                    then_body,
+                    else_body,
+                    ..
+                } => {
+                    if stmts_may_return_or_exit(then_body) || stmts_may_return_or_exit(else_body) {
+                        WalkStop::FnReturns
+                    } else {
+                        WalkStop::Continue
+                    }
+                }
+                MirStmt::While { body, .. } => {
+                    if stmts_may_return_or_exit(body) {
+                        WalkStop::FnReturns
+                    } else {
+                        WalkStop::Continue
+                    }
+                }
+                MirStmt::Switch { arms, default, .. } => {
+                    if arms.iter().any(|(_, b)| stmts_may_return_or_exit(b))
+                        || stmts_may_return_or_exit(default)
+                    {
+                        WalkStop::FnReturns
+                    } else {
+                        WalkStop::Continue
+                    }
+                }
+                _ => WalkStop::Continue,
+            }
+        }
+
+        fn walk_stmts_uncond(
+            stmts: &[MirStmt],
+            fn_map: &HashMap<&str, &MirFnBody>,
+            active: &mut BTreeSet<String>,
+            uncond: &mut BTreeSet<HookKind>,
+        ) -> WalkStop {
+            for s in stmts {
+                let st = walk_stmt_uncond(s, fn_map, active, uncond);
+                if st != WalkStop::Continue {
+                    return st;
+                }
+            }
+            WalkStop::Continue
+        }
+
+        let mut sites: BTreeMap<HookKind, Vec<Option<&str>>> = BTreeMap::new();
         for step in &self.module.boot.steps {
             if let MirBootStep::Stmt(s) = step {
                 collect_stmts(std::slice::from_ref(s), &mut sites);
             }
         }
+        let mut fn_map: HashMap<&str, &MirFnBody> = HashMap::new();
         for f in &self.module.functions {
+            fn_map.insert(f.name.as_str(), &f.body);
             match &f.body {
                 MirFnBody::Direct(stmts) => collect_stmts(stmts, &mut sites),
                 MirFnBody::Coroutine { blocks, .. } => {
@@ -1311,61 +1566,304 @@ impl<'a> ModuleCtx<'a> {
             collect_stmts(&isr.body, &mut sites);
         }
 
-        if console_sym.is_none() && sites.len() == 1 {
-            if let Some(fname) = sites[0] {
-                if let Some(sig) = self.fn_sigs.get(fname) {
-                    return AvrMega0PutcMode::DirectStatic {
-                        symbol: sig.symbol.clone(),
-                        elide_set_putc_store: true,
-                    };
+        let mut uncond_hooks = BTreeSet::new();
+        if self.module.boot.present {
+            let mut active = BTreeSet::new();
+            for step in &self.module.boot.steps {
+                if let MirBootStep::Stmt(s) = step {
+                    if walk_stmt_uncond(s, &fn_map, &mut active, &mut uncond_hooks)
+                        == WalkStop::ProgramExits
+                    {
+                        break;
+                    }
                 }
             }
         }
-        AvrMega0PutcMode::DynamicGlobal {
-            fallback_symbol: console_sym,
+
+        let resolve_one = |kind: HookKind| -> StaticHookMode {
+            let Some(entries) = sites.get(&kind) else {
+                return StaticHookMode::Unset;
+            };
+            if entries.is_empty() {
+                return StaticHookMode::Unset;
+            }
+            if entries.iter().all(Option::is_some) {
+                let mut arms: Vec<(String, String)> = Vec::new();
+                let mut seen = BTreeSet::new();
+                let mut all_resolved = true;
+                for name_opt in entries {
+                    let fname = name_opt.expect("checked is_some");
+                    if seen.insert(fname.to_string()) {
+                        if let Some(sig) = self.fn_sigs.get(fname) {
+                            arms.push((fname.to_string(), sig.symbol.clone()));
+                        } else {
+                            all_resolved = false;
+                            break;
+                        }
+                    }
+                }
+                if all_resolved {
+                    if arms.len() == 1 && uncond_hooks.contains(&kind) {
+                        let (fn_name, symbol) = arms.into_iter().next().expect("len 1");
+                        return StaticHookMode::DirectUnconditional { fn_name, symbol };
+                    }
+                    return StaticHookMode::TagSwitch {
+                        arms,
+                        global_sym: format!("@__syn_hook_tag_{}", kind.suffix()),
+                    };
+                }
+            }
+            StaticHookMode::Indirect {
+                global_sym: format!("@__syn_hook_fn_{}", kind.suffix()),
+            }
+        };
+
+        ResolvedSysHooks {
+            putc: resolve_one(HookKind::Putc),
+            clock_ms: resolve_one(HookKind::ClockMs),
+            exit: resolve_one(HookKind::Exit),
+            fault_handler: resolve_one(HookKind::FaultHandler),
+            idle: resolve_one(HookKind::Idle),
+            irq_route: resolve_one(HookKind::IrqRoute),
+            irq_ack: resolve_one(HookKind::IrqAck),
         }
     }
 
-    fn emit_avr_mega0_uart_putc_ir(&self, out: &mut String) {
+    fn emit_sys_hook_globals_ir(&self, out: &mut String) {
+        let fn_ptr_ty = self.spec.isa.fn_ptr_llvm_ty();
+        let ptr_al = self.ptr_align();
+        let all_kinds = [
+            HookKind::Putc,
+            HookKind::ClockMs,
+            HookKind::Exit,
+            HookKind::FaultHandler,
+            HookKind::Idle,
+            HookKind::IrqRoute,
+            HookKind::IrqAck,
+        ];
+        let mut any = false;
+        for kind in all_kinds {
+            match self.hooks.mode(kind) {
+                StaticHookMode::TagSwitch { ref global_sym, .. } => {
+                    if !any {
+                        let _ = writeln!(out, "; ── Explicit `sys.*` Hook Static Dispatch State ──");
+                        any = true;
+                    }
+                    let _ = writeln!(out, "{global_sym} = internal global i8 0, align 1");
+                }
+                StaticHookMode::Indirect { global_sym } => {
+                    if !any {
+                        let _ = writeln!(out, "; ── Explicit `sys.*` Hook Static Dispatch State ──");
+                        any = true;
+                    }
+                    let _ = writeln!(
+                        out,
+                        "{global_sym} = internal global {fn_ptr_ty} null, align {ptr_al}"
+                    );
+                }
+                StaticHookMode::Unset | StaticHookMode::DirectUnconditional { .. } => {}
+            }
+        }
+        if any {
+            let _ = writeln!(out);
+        }
+    }
+
+    fn emit_hook_wrapper(
+        &self,
+        out: &mut String,
+        kind: HookKind,
+        params_sig: &str,
+        ret_ty: &str,
+        section_attr: &str,
+        fallback_body: &str,
+        pre_call_ir: &str,
+        pass_args: &str,
+    ) {
         let fn_sz = self.opts.fn_size_attrs();
         let fn_as = self.fn_as();
         let call_kw = self.call_kw();
-        match &self.avr_mega0_putc {
-            AvrMega0PutcMode::Noop => {
-                let _ = writeln!(
-                    out,
-                    "define void @__syn_uart_putc(i8 %c){fn_as} nounwind noinline{fn_sz} {{\nentry:\n  ret void\n}}\n"
-                );
+        let fn_ptr_ty = self.spec.isa.fn_ptr_llvm_ty();
+        let ptr_al = self.ptr_align();
+        let sym = kind.wrapper_sym();
+        let emit_call_and_ret = |callee: &str| -> String {
+            if ret_ty == "void" {
+                format!("{pre_call_ir}  {call_kw} void {callee}({pass_args})\n  ret void")
+            } else {
+                format!("{pre_call_ir}  %rv = {call_kw} {ret_ty} {callee}({pass_args})\n  ret {ret_ty} %rv")
             }
-            AvrMega0PutcMode::DirectStatic { symbol, .. } => {
-                let _ = writeln!(
-                    out,
-                    "define void @__syn_uart_putc(i8 %c){fn_as} nounwind noinline{fn_sz} {{\nentry:\n  {call_kw} void {symbol}(i8 %c)\n  ret void\n}}\n"
-                );
-            }
-            AvrMega0PutcMode::DynamicGlobal { fallback_symbol } => {
-                let fb = if let Some(sym) = fallback_symbol {
-                    format!("  {call_kw} void {sym}(i8 %c)\n  ret void")
-                } else {
-                    "  ret void".to_string()
-                };
-                let _ = writeln!(
-                    out,
-                    r#"@__syn_user_putc_fn = internal global ptr addrspace(1) null, align 1
+        };
 
-define void @__syn_uart_putc(i8 %c){fn_as} nounwind noinline{fn_sz} {{
-entry:
-  %fp = load ptr addrspace(1), ptr @__syn_user_putc_fn, align 1
-  %has = icmp ne ptr addrspace(1) %fp, null
-  br i1 %has, label %do_call, label %fallback
-do_call:
-  {call_kw} void %fp(i8 %c)
-  ret void
-fallback:
-{fb}
-}}
-"#
+        match self.hooks.mode(kind) {
+            StaticHookMode::Unset => {
+                let _ = writeln!(
+                    out,
+                    "define {ret_ty} {sym}({params_sig}){fn_as} nounwind{fn_sz}{section_attr} {{\nentry:\n{fallback_body}\n}}\n"
                 );
+            }
+            StaticHookMode::DirectUnconditional { symbol, .. } => {
+                let body = emit_call_and_ret(symbol);
+                let _ = writeln!(
+                    out,
+                    "define {ret_ty} {sym}({params_sig}){fn_as} nounwind{fn_sz}{section_attr} {{\nentry:\n{body}\n}}\n"
+                );
+            }
+            StaticHookMode::TagSwitch { arms, global_sym } => {
+                let _ = writeln!(
+                    out,
+                    "define {ret_ty} {sym}({params_sig}){fn_as} nounwind{fn_sz}{section_attr} {{\nentry:"
+                );
+                let _ = writeln!(out, "  %tag = load i8, ptr {global_sym}, align 1");
+                let _ = writeln!(out, "  switch i8 %tag, label %fallback [");
+                for (i, _) in arms.iter().enumerate() {
+                    let tag = i + 1;
+                    let _ = writeln!(out, "    i8 {tag}, label %arm_{tag}");
+                }
+                let _ = writeln!(out, "  ]");
+                for (i, (_, fn_sym)) in arms.iter().enumerate() {
+                    let tag = i + 1;
+                    let _ = writeln!(out, "arm_{tag}:");
+                    let _ = writeln!(out, "{}", emit_call_and_ret(fn_sym));
+                }
+                let _ = writeln!(out, "fallback:\n{fallback_body}\n}}\n");
+            }
+            StaticHookMode::Indirect { global_sym } => {
+                let call_body = emit_call_and_ret("%fp");
+                let _ = writeln!(
+                    out,
+                    "define {ret_ty} {sym}({params_sig}){fn_as} nounwind{fn_sz}{section_attr} {{\nentry:\n  %fp = load {fn_ptr_ty}, ptr {global_sym}, align {ptr_al}\n  %has = icmp ne {fn_ptr_ty} %fp, null\n  br i1 %has, label %do_call, label %fallback\ndo_call:\n{call_body}\nfallback:\n{fallback_body}\n}}\n"
+                );
+            }
+        }
+    }
+
+    fn emit_sys_hooks_ir(&self, out: &mut String) {
+        let _ = writeln!(out, "; ── Explicit `sys.*` Hook Wrappers (Zero-RAM when Unconditional/Unset) ──");
+        let putc_fallback = if self.spec.isa == CpuIsa::HostX86_64Linux {
+            "  %z = zext i8 %c to i32\n  %r = call i32 @putchar(i32 %z)\n  ret void"
+        } else if self.spec.isa == CpuIsa::ArmCortexM && self.spec.semihosting && self.spec.has_thumb2 {
+            "  %ch = alloca i8, align 1\n  store i8 %c, ptr %ch, align 1\n  call void asm sideeffect \"mov r0, #0x03\\0Abkpt #0xab\", \"{r1},~{r0},~{memory}\"(ptr %ch)\n  ret void"
+        } else {
+            "  ret void"
+        };
+        let iram_sec = if self.spec.isa.is_riscv() && self.spec.iram_in_data {
+            " section \".iram1\""
+        } else {
+            ""
+        };
+        self.emit_hook_wrapper(
+            out,
+            HookKind::Putc,
+            "i8 %c",
+            "void",
+            "",
+            putc_fallback,
+            "",
+            "i8 %c",
+        );
+        self.emit_hook_wrapper(
+            out,
+            HookKind::ClockMs,
+            "",
+            "i32",
+            "",
+            "  %t = load volatile i32, ptr @__syn_tick_ms, align 4\n  ret i32 %t",
+            "",
+            "",
+        );
+        self.emit_hook_wrapper(
+            out,
+            HookKind::Exit,
+            "i32 %code",
+            "void",
+            "",
+            "  ret void",
+            "",
+            "i32 %code",
+        );
+        self.emit_hook_wrapper(
+            out,
+            HookKind::FaultHandler,
+            "",
+            "void",
+            iram_sec,
+            "  ret void",
+            "",
+            "",
+        );
+        self.emit_hook_wrapper(
+            out,
+            HookKind::Idle,
+            "i32 %in_sim, i32 %depth",
+            "void",
+            "",
+            "  ret void",
+            "",
+            "i32 %in_sim, i32 %depth",
+        );
+        if self.spec.isa.is_riscv() {
+            self.emit_hook_wrapper(
+                out,
+                HookKind::IrqRoute,
+                "i32 %src, i32 %slot",
+                "void",
+                "",
+                "  ret void",
+                "",
+                "i32 %src, i32 %slot",
+            );
+            self.emit_hook_wrapper(
+                out,
+                HookKind::IrqAck,
+                "i32 %slot",
+                "void",
+                iram_sec,
+                "  ret void",
+                "",
+                "i32 %slot",
+            );
+        }
+    }
+
+    fn emit_rom_wrappers_ir(&self, out: &mut String) {
+        if self.rom_wrappers.is_empty() {
+            return;
+        }
+        let usize_ty = self.spec.isa.usize_llvm_ty();
+        let fn_ptr_ty = self.spec.isa.fn_ptr_llvm_ty();
+        let fn_as = self.fn_as();
+        let call_kw = self.call_kw();
+        let fn_sz = self.opts.fn_size_attrs();
+        let _ = writeln!(out, "; ── Stack-Bounded ROM / Firmware ABI Wrappers ──");
+        for w in &self.rom_wrappers {
+            let sym = w.symbol();
+            let mut def_params = vec![format!("{usize_ty} %addr")];
+            let mut call_args = Vec::with_capacity(w.param_llvm_tys.len());
+            for (i, pty) in w.param_llvm_tys.iter().enumerate() {
+                def_params.push(format!("{pty} %a{i}"));
+                call_args.push(format!("{pty} %a{i}"));
+            }
+            let def_sig = def_params.join(", ");
+            let pass_args = call_args.join(", ");
+            match w.kind {
+                RomWrapperKind::U32 => {
+                    let _ = writeln!(
+                        out,
+                        "define i32 {sym}({def_sig}){fn_as} nounwind noinline{fn_sz} {{\nentry:\n  %fp = inttoptr {usize_ty} %addr to {fn_ptr_ty}\n  %rv = {call_kw} i32 %fp({pass_args})\n  ret i32 %rv\n}}\n"
+                    );
+                }
+                RomWrapperKind::Void => {
+                    let _ = writeln!(
+                        out,
+                        "define void {sym}({def_sig}){fn_as} nounwind noinline{fn_sz} {{\nentry:\n  %fp = inttoptr {usize_ty} %addr to {fn_ptr_ty}\n  {call_kw} void %fp({pass_args})\n  ret void\n}}\n"
+                    );
+                }
+                RomWrapperKind::Noreturn => {
+                    let _ = writeln!(
+                        out,
+                        "define void {sym}({def_sig}){fn_as} noreturn nounwind noinline{fn_sz} {{\nentry:\n  %fp = inttoptr {usize_ty} %addr to {fn_ptr_ty}\n  {call_kw} void %fp({pass_args})\n  unreachable\n}}\n"
+                    );
+                }
             }
         }
     }
@@ -1388,7 +1886,7 @@ fallback:
                 self.visit_struct(sub, by_name, visited);
             }
         }
-        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
         let mut offset = 0usize;
         let mut max_align = 1usize;
         let mut llvm_off = 0usize;
@@ -1770,6 +2268,12 @@ fallback:
                     self.scan_expr_for_prims(a);
                 }
             }
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                self.scan_expr_for_prims(addr);
+                for a in args {
+                    self.scan_expr_for_prims(a);
+                }
+            }
             MirExprKind::MakePrimView { ptr, cap, kind } => {
                 self.scan_expr_for_prims(ptr);
                 let n = (*cap).max(1);
@@ -1965,7 +2469,7 @@ fallback:
         vars: &[MirVar],
         child_slots: &[MirChildCallSlot],
     ) -> CoroutineFrameLayout {
-        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
         let mut field_llvm_tys = Vec::new();
         // Field 0 is always `i32` (`_pc`)
         field_llvm_tys.push("i32".to_string());
@@ -2113,15 +2617,15 @@ fallback:
     }
 
     fn ptr_align(&self) -> usize {
-        if self.opts.target.is_avr() {
+        if self.spec.isa.is_avr() {
             1
         } else {
-            (self.opts.target.ptr_bits() / 8) as usize
+            (self.spec.isa.ptr_bits() / 8) as usize
         }
     }
 
     fn llvm_scalar_abi_align(&self, natural_align: usize) -> usize {
-        if self.opts.target.is_avr() {
+        if self.spec.isa.is_avr() {
             1
         } else {
             natural_align
@@ -2129,17 +2633,15 @@ fallback:
     }
 
     fn pool_hdr_llvm_size(&self) -> (usize, usize) {
-        match self.opts.target {
-            TargetArch::HostX86_64Linux => (24, 8),
-            TargetArch::Thumbv7mNoneEabi
-            | TargetArch::Thumbv6mRp2040
-            | TargetArch::Riscv32Esp32C6 => (16, 4),
-            TargetArch::AvrAtmega328p | TargetArch::AvrAtmega4809 => (12, 1),
+        match self.spec.isa {
+            CpuIsa::HostX86_64Linux => (24, 8),
+            CpuIsa::ArmCortexM | CpuIsa::Riscv32 => (16, 4),
+            CpuIsa::Avr => (12, 1),
         }
     }
 
     fn llvm_abi_size_align(&self, ty: &MirType, dma_safe: bool) -> (usize, usize) {
-        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
         let ptr_al = self.ptr_align();
         match ty {
             MirType::Void => (0, 1),
@@ -2253,10 +2755,10 @@ fallback:
             MirType::F32 => "float".to_string(),
             MirType::F64 => "double".to_string(),
             MirType::EndianInt { .. } => "i32".to_string(),
-            MirType::Usize | MirType::Isize => self.opts.target.usize_llvm_ty().to_string(),
+            MirType::Usize | MirType::Isize => self.spec.isa.usize_llvm_ty().to_string(),
             MirType::Ptr(_) | MirType::MmioPtr(_) | MirType::Str => "ptr".to_string(),
-            MirType::FnPtr { .. } => self.opts.target.fn_ptr_llvm_ty().to_string(),
-            MirType::Slice(_) => format!("{{ ptr, {} }}", self.opts.target.usize_llvm_ty()),
+            MirType::FnPtr { .. } => self.spec.isa.fn_ptr_llvm_ty().to_string(),
+            MirType::Slice(_) => format!("{{ ptr, {} }}", self.spec.isa.usize_llvm_ty()),
             MirType::Array { elem, len } => {
                 let n = (*len).max(1);
                 format!("[{n} x {}]", self.llvm_ty(elem))
@@ -2265,10 +2767,10 @@ fallback:
             MirType::Primitive(pk) => format!("%prim.{}", sanitize_ident(&pk.mangle_name())),
             MirType::Lease(_) => "{ ptr, ptr, i8 }".to_string(),
             MirType::PrimView(MirPrimViewKind::ByteRing) => {
-                format!("{{ ptr, {} }}", self.opts.target.usize_llvm_ty())
+                format!("{{ ptr, {} }}", self.spec.isa.usize_llvm_ty())
             }
             MirType::PrimView(MirPrimViewKind::Inbox { .. }) => {
-                format!("{{ ptr, ptr, {} }}", self.opts.target.usize_llvm_ty())
+                format!("{{ ptr, ptr, {} }}", self.spec.isa.usize_llvm_ty())
             }
             MirType::Result { ok, .. } => {
                 let ok_ty = if ok.is_void() {
@@ -2366,7 +2868,7 @@ fallback:
                     MirBinOp::Shr => {
                         let sh = (r as u32) & 63;
                         if lhs.ty.is_unsigned() {
-                            let ptr_bits = self.opts.target.ptr_bits();
+                            let ptr_bits = self.spec.isa.ptr_bits();
                             let masked = if lhs.ty == MirType::Bool {
                                 (l as u128) & 1
                             } else {
@@ -2397,7 +2899,7 @@ fallback:
                 expr: sub,
                 target_ty,
             } => {
-                let ptr_bits = self.opts.target.ptr_bits();
+                let ptr_bits = self.spec.isa.ptr_bits();
                 if *target_ty == MirType::Bool {
                     if sub.ty.is_float() {
                         let f = f64::from_bits(self.eval_const_float_bits(sub));
@@ -2495,8 +2997,7 @@ fallback:
     }
 
     fn emit_mmio_host_buffers_ir(&self, out: &mut String) {
-        if self.opts.target != TargetArch::HostX86_64Linux || self.module.mmio_instances.is_empty()
-        {
+        if self.spec.isa != CpuIsa::HostX86_64Linux || self.module.mmio_instances.is_empty() {
             return;
         }
         let _ = writeln!(out, "; ── Host Simulation MMIO Backing Buffers ──");
@@ -2516,7 +3017,7 @@ fallback:
     }
 
     fn emit_isr_state_and_selector_globals_ir(&mut self, out: &mut String) {
-        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
         let mut emitted_state = BTreeSet::new();
         let mut state_lines = Vec::new();
         let mut selector_syms = BTreeSet::new();
@@ -2605,7 +3106,7 @@ fallback:
                 return self.const_expr_to_llvm(&init, target_ty);
             }
         }
-        let ptr_bits = self.opts.target.ptr_bits();
+        let ptr_bits = self.spec.isa.ptr_bits();
         match target_ty {
             MirType::Bool => {
                 if self.eval_const_int(expr) != 0 {
@@ -2783,7 +3284,7 @@ fallback:
                         self.const_place_to_llvm_ptr(place).unwrap_or_else(|| "null".to_string())
                     }
                     MirExprKind::MmioAddr(inst) => {
-                        if self.opts.target == TargetArch::HostX86_64Linux {
+                        if self.spec.isa == CpuIsa::HostX86_64Linux {
                             format!("@__zev_mmio_buf_{}", sanitize_ident(inst))
                         } else {
                             let addr = self
@@ -2807,7 +3308,7 @@ fallback:
                     MirExprKind::IntLit(0) => "null".to_string(),
                     MirExprKind::IntLit(v) => {
                         let dst_ptr = if matches!(target_ty, MirType::FnPtr { .. }) {
-                            self.opts.target.fn_ptr_llvm_ty()
+                            self.spec.isa.fn_ptr_llvm_ty()
                         } else {
                             "ptr"
                         };
@@ -2823,7 +3324,7 @@ fallback:
                 }
             }
             MirType::Slice(elem) => {
-                let usize_ty = self.opts.target.usize_llvm_ty();
+                let usize_ty = self.spec.isa.usize_llvm_ty();
                 match &expr.kind {
                     MirExprKind::Cast { expr: sub, .. } => self.const_expr_to_llvm(sub, target_ty),
                     MirExprKind::StringLit(s) => {
@@ -2915,7 +3416,7 @@ fallback:
             }
             MirType::PrimView(vk) => {
                 if let MirExprKind::MakePrimView { ptr, cap, .. } = &expr.kind {
-                    let usize_ty = self.opts.target.usize_llvm_ty();
+                    let usize_ty = self.spec.isa.usize_llvm_ty();
                     let pconst = self.const_expr_to_llvm(ptr, &ptr.ty);
                     let n = (*cap).max(1);
                     match vk {
@@ -3038,7 +3539,7 @@ fallback:
     }
 
     fn wrap_const_ptr_as_view(&self, raw_ptr: &str, pk: &MirPrimKind) -> Option<String> {
-        let usize_ty = self.opts.target.usize_llvm_ty();
+        let usize_ty = self.spec.isa.usize_llvm_ty();
         match pk {
             MirPrimKind::ByteRing { cap } => {
                 let n = (*cap).max(1);
@@ -3068,10 +3569,10 @@ fallback:
         if self.struct_order.is_empty() {
             return;
         }
-        let usize_ty = self.opts.target.usize_llvm_ty();
+        let usize_ty = self.spec.isa.usize_llvm_ty();
         let fn_sz = self.opts.fn_size_attrs();
         let fn_as = self.fn_as();
-        let tmp_al = if self.opts.target.is_avr() {
+        let tmp_al = if self.spec.isa.is_avr() {
             1
         } else {
             4
@@ -3283,7 +3784,7 @@ ok_bb:
         }
 
         // Emit static global primitive instances
-        let ptr_bytes = (self.opts.target.ptr_bits() / 8) as usize;
+        let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
         let prims = self.module.primitives.clone();
         for p in &prims {
             if p.dead_stripped {
@@ -3632,7 +4133,7 @@ none:
                 }
                 MirPrimKind::Pool { .. } => {
                     let ptr_al = self.ptr_align();
-                    let usize_ty = self.opts.target.usize_llvm_ty();
+                    let usize_ty = self.spec.isa.usize_llvm_ty();
                     let (hdr_sz, _) = self.pool_hdr_llvm_size();
                     let slots_fidx = if 32usize.saturating_sub(hdr_sz) > 0 {
                         2
@@ -3754,7 +4255,7 @@ entry:
                     );
                 }
                 MirPrimKind::DmaSlot { .. } => {
-                    let usize_ty = self.opts.target.usize_llvm_ty();
+                    let usize_ty = self.spec.isa.usize_llvm_ty();
                     let _ = writeln!(
                         out,
                         r#"define {{ i32, i32 }} @__syn_slot_park_{id}(ptr %s, {{ ptr, ptr, i8 }} %lease){fn_as} nounwind{fn_sz} {{
@@ -3864,7 +4365,7 @@ entry:
                 }
                 MirPrimKind::ByteRing { cap } => {
                     let c = (*cap).max(1) as i32;
-                    let usize_ty = self.opts.target.usize_llvm_ty();
+                    let usize_ty = self.spec.isa.usize_llvm_ty();
                     let slice_ty = format!("{{ ptr, {usize_ty} }}");
                     let res_slice_ty = format!("{{ {slice_ty}, i32 }}");
                     let to_usize = |src: &str, dst: &str| -> String {
@@ -4501,7 +5002,7 @@ done:
         // Emit capacity-erased unsized `*byte_ring` view helpers (pure SSA, zero non-entry allocas)
         if self.uses_byte_ring_view {
             let (crit_enter, crit_exit) = crit_pair(vis.is_byte_ring_view_contended(), call_kw);
-            let usize_ty = self.opts.target.usize_llvm_ty();
+            let usize_ty = self.spec.isa.usize_llvm_ty();
             let slice_ty = format!("{{ ptr, {usize_ty} }}");
             let res_slice_ty = format!("{{ {slice_ty}, i32 }}");
             let to_usize = |src: &str, dst: &str| -> String {
@@ -5181,7 +5682,7 @@ entry:
                     args.push(format!("ptr {cur_ptr}"));
                 }
                 MirBakedArg::MmioAddr(inst_name) => {
-                    if self.opts.target == TargetArch::HostX86_64Linux {
+                    if self.spec.isa == CpuIsa::HostX86_64Linux {
                         args.push(format!("ptr @__zev_mmio_buf_{}", sanitize_ident(inst_name)));
                     } else {
                         let addr = self
@@ -5558,10 +6059,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn stack_align(&self, lty: &str) -> u32 {
-        if self.ctx.opts.target.is_avr() {
+        if self.ctx.spec.isa.is_avr() {
             return 1;
         }
-        let ptr_bits = self.ctx.opts.target.ptr_bits();
+        let ptr_bits = self.ctx.spec.isa.ptr_bits();
         if lty == "double" || lty == "i64" || (lty == "ptr" && ptr_bits == 64) {
             8
         } else {
@@ -5649,7 +6150,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
     fn emit_avr_safe_i32_load(&mut self, ptr_repr: &str, contended: bool) -> String {
         let val = self.next_tmp();
-        if self.ctx.opts.target.is_avr() && contended {
+        if self.ctx.spec.isa.is_avr() && contended {
             let call_kw = self.call_kw();
             let pm = self.next_tmp();
             self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
@@ -6335,7 +6836,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pk = MirPrimKind::ByteRing { cap: *cap };
                 let id = sanitize_ident(&pk.mangle_name());
                 let rptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
                 let slice_ty = format!("{{ ptr, {usize_ty} }}");
                 let sl_val = self.next_tmp();
                 self.emit_line(format!(
@@ -6599,7 +7100,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             } => {
                 let call_kw = self.call_kw();
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let slice_ty = format!("{{ ptr, {usize_ty} }}");
                 let sl_val = self.next_tmp();
                 self.emit_line(format!(
@@ -6690,7 +7191,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{wait_lbl}"));
 
                 self.start_block(&ok_lbl);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
                 let slice_ty = format!("{{ ptr, {usize_ty} }}");
                 let s0 = self.next_tmp();
                 let s1 = self.next_tmp();
@@ -7326,7 +7827,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
         let prio = sp.priority.as_u8();
         let core = sp.core_pin.map_or(-1i8, |c| c as i8);
-        let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
+        let fn_ptr_ty = self.ctx.spec.isa.fn_ptr_llvm_ty();
         let call_kw = self.call_kw();
         self.emit_line(format!(
             "{call_kw} void @__syn_activate_task(i32 {slot_id}, {fn_ptr_ty} {step_sym}, ptr {fsym}, i8 {prio}, i8 {core})"
@@ -7647,7 +8148,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 chunks,
             } => {
                 let call_kw = self.call_kw();
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let bv = self.emit_expr(buf)?;
                 let bptr = self.next_tmp();
@@ -7706,7 +8207,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 boost,
             } => {
                 let call_kw = self.call_kw();
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(ring)?;
                 self.emit_line(format!(
                     "{call_kw} void @__syn_fmt_init_ring(ptr %__fmt_sink, ptr {hdr}, i32 {cap32})"
@@ -7760,7 +8261,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
     fn emit_fmt_chunk(&mut self, sink: &str, ch: &MirFmtChunk) -> Result<(), CodegenError> {
         let call_kw = self.call_kw();
-        let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+        let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
         match ch {
             MirFmtChunk::Literal(s) => {
                 let bytes = zev_ast::decoded_string_bytes(s);
@@ -7788,7 +8289,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 match fmt {
                     MirIntFmt::Dec => {
                         let is64 = *bits == 64
-                            || (*bits == 0 && self.ctx.opts.target.ptr_bits() == 64);
+                            || (*bits == 0 && self.ctx.spec.isa.ptr_bits() == 64);
                         if is64 {
                             let v64 = self.coerce(vv, "i64", *signed);
                             let fn_sym = if *signed {
@@ -8031,7 +8532,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     MirType::Ptr(_) => {
                         self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 48)"));
                         self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 120)"));
-                        if self.ctx.opts.target.ptr_bits() == 64 {
+                        if self.ctx.spec.isa.ptr_bits() == 64 {
                             let addr64 = self.coerce(ev, "i64", false);
                             self.emit_line(format!(
                                 "{call_kw} void @__syn_fmt_u64_hex(ptr {sink}, i64 {}, i8 0, i32 1)",
@@ -8076,7 +8577,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     | MirType::Isize
                     | MirType::EndianInt { signed: true, .. } => {
                         if matches!(elem_ty, MirType::Isize)
-                            && self.ctx.opts.target.ptr_bits() == 64
+                            && self.ctx.spec.isa.ptr_bits() == 64
                         {
                             let v64 = self.coerce(ev, "i64", true);
                             self.emit_line(format!(
@@ -8093,7 +8594,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     }
                     _ => {
                         if matches!(elem_ty, MirType::Usize)
-                            && self.ctx.opts.target.ptr_bits() == 64
+                            && self.ctx.spec.isa.ptr_bits() == 64
                         {
                             let v64 = self.coerce(ev, "i64", false);
                             self.emit_line(format!(
@@ -8185,7 +8686,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     fn emit_byte_ring_view_parts(&mut self, view: &MirExpr) -> Result<(String, String), CodegenError> {
-        let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+        let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
         let vty = format!("{{ ptr, {usize_ty} }}");
         let vv = self.emit_expr(view)?;
         let hdr = self.next_tmp();
@@ -8200,7 +8701,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         &mut self,
         view: &MirExpr,
     ) -> Result<(String, String, String), CodegenError> {
-        let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+        let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
         let vty = format!("{{ ptr, ptr, {usize_ty} }}");
         let vv = self.emit_expr(view)?;
         let hdr = self.next_tmp();
@@ -8436,6 +8937,46 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{call_kw} void @__syn_set_priority(i32 {p})"));
             }
             MirIntrinsicOp::SysOp { method, args } => {
+                match method.as_str() {
+                    "set_putc" => return self.emit_hook_registration(HookKind::Putc, args.first()),
+                    "set_clock_ms" => {
+                        return self.emit_hook_registration(HookKind::ClockMs, args.first());
+                    }
+                    "set_exit" => return self.emit_hook_registration(HookKind::Exit, args.first()),
+                    "set_fault_handler" => {
+                        return self.emit_hook_registration(HookKind::FaultHandler, args.first());
+                    }
+                    "set_idle" => return self.emit_hook_registration(HookKind::Idle, args.first()),
+                    "set_irq_router" => {
+                        self.emit_hook_registration(HookKind::IrqRoute, args.first())?;
+                        return self.emit_hook_registration(HookKind::IrqAck, args.get(1));
+                    }
+                    "rom_call_void" => {
+                        if args.len() >= 2 {
+                            let sb = u32::try_from(self.ctx.eval_const_int(&args[1]).max(0))
+                                .unwrap_or(0);
+                            let _ = self.emit_rom_call_invocation(
+                                RomWrapperKind::Void,
+                                &args[0],
+                                sb,
+                                &args[2..],
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    "rom_call_noreturn" => {
+                        if let Some(addr_expr) = args.first() {
+                            let _ = self.emit_rom_call_invocation(
+                                RomWrapperKind::Noreturn,
+                                addr_expr,
+                                0,
+                                &args[1..],
+                            )?;
+                        }
+                        return Ok(());
+                    }
+                    _ => {}
+                }
                 let mut ev = Vec::new();
                 for a in args {
                     ev.push((self.emit_expr(a)?, a.ty.clone()));
@@ -8509,25 +9050,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "tick" | "tick_ms" => {
                         self.emit_line(format!("{call_kw} void @__syn_sys_tick()"));
                     }
-                    "set_putc" => {
-                        let elide = self.ctx.opts.target.is_avr()
-                            && matches!(
-                                self.ctx.avr_mega0_putc,
-                                AvrMega0PutcMode::DirectStatic {
-                                    elide_set_putc_store: true,
-                                    ..
-                                }
-                            );
-                        if !elide {
-                            if let Some((fp_val, _)) = ev.first() {
-                                let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
-                                let ptr_al = self.ctx.ptr_align();
-                                let coerced = self.coerce(fp_val.clone(), fn_ptr_ty, false);
-                                self.emit_line(format!(
-                                    "store {} {}, ptr @__syn_user_putc_fn, align {ptr_al}",
-                                    coerced.ty, coerced.repr
-                                ));
-                            }
+                    "tick_by" => {
+                        if let Some((ms, mty)) = ev.first() {
+                            let m32 = self.coerce(ms.clone(), "i32", !mty.is_unsigned());
+                            self.emit_line(format!(
+                                "{call_kw} void @__syn_sys_tick_by(i32 {})",
+                                m32.repr
+                            ));
                         }
                     }
                     "assert" => {
@@ -8540,6 +9069,91 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
         }
         Ok(())
+    }
+
+    fn emit_hook_registration(
+        &mut self,
+        kind: HookKind,
+        expr_opt: Option<&MirExpr>,
+    ) -> Result<(), CodegenError> {
+        let Some(mut expr) = expr_opt else {
+            return Ok(());
+        };
+        let mode = self.ctx.hooks.mode(kind).clone();
+        match mode {
+            StaticHookMode::Unset | StaticHookMode::DirectUnconditional { .. } => Ok(()),
+            StaticHookMode::TagSwitch { ref global_sym, .. } => {
+                while let MirExprKind::Cast { expr: inner, .. } = &expr.kind {
+                    expr = inner;
+                }
+                if let MirExprKind::FnAddr(fn_name) = &expr.kind {
+                    if let Some(tag) = mode.tag_index_for(fn_name) {
+                        self.emit_line(format!("store i8 {tag}, ptr {global_sym}, align 1"));
+                    }
+                }
+                Ok(())
+            }
+            StaticHookMode::Indirect { global_sym } => {
+                let fp_val = self.emit_expr(expr)?;
+                let fn_ptr_ty = self.ctx.spec.isa.fn_ptr_llvm_ty();
+                let ptr_al = self.ctx.ptr_align();
+                let coerced = self.coerce(fp_val, fn_ptr_ty, false);
+                self.emit_line(format!(
+                    "store {} {}, ptr {global_sym}, align {ptr_al}",
+                    coerced.ty, coerced.repr
+                ));
+                Ok(())
+            }
+        }
+    }
+
+    fn emit_rom_call_invocation(
+        &mut self,
+        kind: RomWrapperKind,
+        addr_expr: &MirExpr,
+        stack_bound: u32,
+        abi_args: &[MirExpr],
+    ) -> Result<Option<SsaVal>, CodegenError> {
+        let call_kw = self.call_kw();
+        let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
+        let addr_raw = self.emit_expr(addr_expr)?;
+        let addr_v = self.coerce(addr_raw, &usize_ty, false);
+
+        let mut param_llvm_tys = Vec::with_capacity(abi_args.len());
+        let mut call_args = Vec::with_capacity(1 + abi_args.len());
+        call_args.push(format!("{usize_ty} {}", addr_v.repr));
+        for arg in abi_args {
+            let pty = self.ctx.llvm_ty(&arg.ty);
+            let av = self.emit_expr(arg)?;
+            let cv = self.coerce(av, &pty, !arg.ty.is_unsigned());
+            param_llvm_tys.push(pty);
+            call_args.push(format!("{} {}", cv.ty, cv.repr));
+        }
+
+        let wrapper = RomWrapperSpec {
+            kind,
+            stack_bound,
+            param_llvm_tys,
+        };
+        let sym = wrapper.symbol();
+        self.ctx.rom_wrappers.insert(wrapper);
+        let args_str = call_args.join(", ");
+        match kind {
+            RomWrapperKind::U32 => {
+                let rv = self.next_tmp();
+                self.emit_line(format!("{rv} = {call_kw} i32 {sym}({args_str})"));
+                Ok(Some(SsaVal::new("i32", rv)))
+            }
+            RomWrapperKind::Void => {
+                self.emit_line(format!("{call_kw} void {sym}({args_str})"));
+                Ok(None)
+            }
+            RomWrapperKind::Noreturn => {
+                self.emit_line(format!("{call_kw} void {sym}({args_str})"));
+                self.emit_term("unreachable");
+                Ok(None)
+            }
+        }
     }
 
     // ── Places, Typed MMIO Addressing & Wire-Endian Load/Store ───────────────
@@ -8560,7 +9174,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             _ => ("i32", 4u32, 4usize),
         };
 
-        let is_host64 = self.ctx.opts.target == TargetArch::HostX86_64Linux;
+        let is_host64 = self.ctx.spec.isa == CpuIsa::HostX86_64Linux;
         let idx_ty = if is_host64 { "i64" } else { "i32" };
         let ptr_tmp = if let Some(idx_expr) = index {
             let iv = self.emit_expr(idx_expr)?;
@@ -8658,7 +9272,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             } => {
                 let (bptr, bty, bpacked) = self.emit_place_ptr(base)?;
                 let iv = self.emit_expr(index)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let ic = self.coerce(iv, &usize_ty, false);
                 let ety = self.ctx.llvm_ty(elem_ty);
                 if *is_slice {
@@ -8759,7 +9373,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 if dst_lty == "ptr" || dst_lty == "ptr addrspace(1)" {
                     if *v == 0 {
                         Ok(SsaVal::new(dst_lty, "null"))
-                    } else if self.ctx.opts.target.ptr_bits() == 16 {
+                    } else if self.ctx.spec.isa.ptr_bits() == 16 {
                         let t = self.next_tmp();
                         let v16 = *v as i16;
                         self.emit_line(format!("{t} = inttoptr i16 {v16} to {dst_lty}"));
@@ -8808,7 +9422,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let idx = self.ctx.intern_string(s);
                 let slen = zev_ast::decoded_string_byte_len(s);
                 if matches!(expr.ty, MirType::Slice(_)) {
-                    let usize_ty = self.ctx.opts.target.usize_llvm_ty();
+                    let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
                     let r0 = self.next_tmp();
                     let r1 = self.next_tmp();
@@ -8875,7 +9489,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirExprKind::MakePrimView { ptr, cap, kind } => {
                 let pv = self.emit_expr(ptr)?;
                 let pc = self.coerce(pv, "ptr", false);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let n = (*cap).max(1);
                 match kind {
                     MirPrimViewKind::ByteRing => {
@@ -8932,7 +9546,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         format!("unknown MMIO peripheral instance `{inst}`"),
                     ));
                 }
-                if self.ctx.opts.target == TargetArch::HostX86_64Linux {
+                if self.ctx.spec.isa == CpuIsa::HostX86_64Linux {
                     Ok(SsaVal::new(
                         "ptr",
                         format!("@__zev_mmio_buf_{}", sanitize_ident(inst)),
@@ -8961,7 +9575,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(self.coerce(SsaVal::new(lty, val), &dst_lty, !expr.ty.is_unsigned()))
             }
             MirExprKind::FnAddr(fname) => {
-                let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
+                let fn_ptr_ty = self.ctx.spec.isa.fn_ptr_llvm_ty();
                 if let Some(sig) = self.ctx.fn_sigs.get(fname) {
                     Ok(SsaVal::new(fn_ptr_ty, sig.symbol.clone()))
                 } else {
@@ -9124,7 +9738,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
             }
             MirExprKind::SliceLen(sl_expr) => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sv = self.emit_expr(sl_expr)?;
                 let len = self.next_tmp();
@@ -9132,7 +9746,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(SsaVal::new(usize_ty, len))
             }
             MirExprKind::ArrayLen(n) => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 Ok(SsaVal::new(usize_ty, format!("{n}")))
             }
             MirExprKind::Index {
@@ -9140,7 +9754,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 index,
                 is_slice,
             } => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let iv = self.emit_expr(index)?;
                 let ic = self.coerce(iv, &usize_ty, false);
                 let ety = self.ctx.llvm_ty(&expr.ty);
@@ -9174,7 +9788,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 elem_ty,
                 base_is_array,
             } => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let ety = self.ctx.llvm_ty(elem_ty);
                 let st_v = self.emit_expr(start)?;
@@ -9264,7 +9878,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 len,
                 ..
             } => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let (ap, aty_mir, _) = self.emit_place_ptr(array_place)?;
                 let aty = self.ctx.llvm_ty(&aty_mir);
@@ -9361,7 +9975,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let any = self.next_tmp();
                         let locked = self.next_tmp();
                         let out_v = self.next_tmp();
-                        let pm = if self.ctx.opts.target.is_avr() {
+                        let pm = if self.ctx.spec.isa.is_avr() {
                             let pm = self.next_tmp();
                             self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
                             Some(pm)
@@ -9393,13 +10007,23 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(SsaVal::new("ptr", p))
             }
             MirExprKind::LeaseAddr { lease, .. } => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let lv = self.emit_expr(lease)?;
                 let p = self.next_tmp();
                 let a = self.next_tmp();
                 self.emit_line(format!("{p} = extractvalue {{ ptr, ptr, i8 }} {}, 0", lv.repr));
                 self.emit_line(format!("{a} = ptrtoint ptr {p} to {usize_ty}"));
                 Ok(SsaVal::new(usize_ty, a))
+            }
+            MirExprKind::RomCallU32 {
+                addr,
+                stack_bound,
+                args,
+            } => {
+                let rv = self
+                    .emit_rom_call_invocation(RomWrapperKind::U32, addr, *stack_bound, args)?
+                    .expect("u32 rom_call returns i32");
+                Ok(self.coerce(rv, &dst_lty, false))
             }
         }
     }
@@ -9470,7 +10094,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 let contended = self.ctx.vis.is_prim_family_contended(&pk);
                 let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
             MirPrimReadOp::InboxIsEmpty {
@@ -9555,7 +10179,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let pp_ty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
                 let pptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let n = (*cap).max(1);
                 let wh_p = self.next_tmp();
@@ -9611,7 +10235,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let id = sanitize_ident(&pk.mangle_name());
                 let pptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
                     "{res} = {call_kw} {usize_ty} @__syn_pool_avail_{id}(ptr {pptr})"
@@ -9629,7 +10253,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let id = sanitize_ident(&pk.mangle_name());
                 let pptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
                     "{res} = {call_kw} {usize_ty} @__syn_pool_in_use_{id}(ptr {pptr})"
@@ -9664,7 +10288,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let id = sanitize_ident(&pk.mangle_name());
                 let pptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
                     "{res} = {call_kw} {usize_ty} @__syn_pool_cap_{id}(ptr {pptr})"
@@ -9749,7 +10373,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let id = sanitize_ident(&pk.mangle_name());
                 let sptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let res = self.next_tmp();
                 self.emit_line(format!(
                     "{res} = {call_kw} {usize_ty} @__syn_slot_addr_{id}(ptr {sptr})"
@@ -9765,7 +10389,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pk = MirPrimKind::ByteRing { cap: *cap };
                 let id = sanitize_ident(&pk.mangle_name());
                 let rptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sv = self.emit_expr(src)?;
                 let sc = self.coerce(sv, &sl_ty, false);
@@ -9807,7 +10431,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let rptr = self.resolve_prim_ptr(target)?;
                 let lv = self.emit_expr(len)?;
                 let l32 = self.coerce(lv, "i32", false);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
                 let res_ty = format!("{{ {{ ptr, {usize_ty} }}, i32 }}");
                 let rv = self.next_tmp();
                 self.emit_line(format!(
@@ -9820,7 +10444,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pk = MirPrimKind::ByteRing { cap: *cap };
                 let id = sanitize_ident(&pk.mangle_name());
                 let rptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sl = self.next_tmp();
                 self.emit_line(format!(
@@ -9832,7 +10456,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pk = MirPrimKind::ByteRing { cap: *cap };
                 let id = sanitize_ident(&pk.mangle_name());
                 let rptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let dv = self.emit_expr(dst)?;
                 let dc = self.coerce(dv, &sl_ty, false);
@@ -9878,7 +10502,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 let contended = self.ctx.vis.is_prim_family_contended(&pk);
                 let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
             MirPrimReadOp::ByteRingFreeSpace { target, cap } => {
@@ -9889,7 +10513,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!(
                     "{fs} = {call_kw} i32 @__syn_ring_free_space_{id}(ptr {rptr})"
                 ));
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", fs), &usize_ty, false))
             }
             MirPrimReadOp::ByteRingIsEmpty { target, cap } => {
@@ -9977,11 +10601,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 let contended = self.ctx.vis.is_inbox_view_contended(elem_ty);
                 let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
             MirPrimReadOp::InboxViewCap { view, .. } => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let vty = format!("{{ ptr, ptr, {usize_ty} }}");
                 let vv = self.emit_expr(view)?;
                 let cap_u = self.next_tmp();
@@ -10018,7 +10642,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirPrimReadOp::ByteRingViewPush { view, src, boost } => {
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sv = self.emit_expr(src)?;
                 let sc = self.coerce(sv, &sl_ty, false);
@@ -10049,7 +10673,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirPrimReadOp::ByteRingViewGrantWrite { view, len } => {
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let res_slice_ty = format!("{{ {{ ptr, {usize_ty} }}, i32 }}");
                 let lv = self.emit_expr(len)?;
                 let l32 = self.coerce(lv, "i32", false);
@@ -10062,7 +10686,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirPrimReadOp::ByteRingViewReadSlice { view } => {
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sv = self.next_tmp();
                 self.emit_line(format!(
@@ -10072,7 +10696,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirPrimReadOp::ByteRingViewPop { view, dst } => {
                 let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let dv = self.emit_expr(dst)?;
                 let dc = self.coerce(dv, &sl_ty, false);
@@ -10114,11 +10738,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 let contended = self.ctx.vis.is_byte_ring_view_contended();
                 let cnt = self.emit_avr_safe_i32_load(&cnt_p, contended);
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", cnt), &usize_ty, false))
             }
             MirPrimReadOp::ByteRingViewCap { view } => {
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let vty = format!("{{ ptr, {usize_ty} }}");
                 let vv = self.emit_expr(view)?;
                 let cap_u = self.next_tmp();
@@ -10131,7 +10755,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!(
                     "{fs} = {call_kw} i32 @__syn_ring_view_free_space(ptr {hdr}, i32 {cap32})"
                 ));
-                let usize_ty = self.ctx.opts.target.usize_llvm_ty().to_string();
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 Ok(self.coerce(SsaVal::new("i32", fs), &usize_ty, false))
             }
             MirPrimReadOp::ByteRingViewIsEmpty { view } => {
@@ -10246,7 +10870,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let fp_addr = self.var_ptr(vid);
                 let fp_val = self.load_from_place_ptr(&fp_addr, &fp_ty, false);
-                let fn_ptr_ty = self.ctx.opts.target.fn_ptr_llvm_ty();
+                let fn_ptr_ty = self.ctx.spec.isa.fn_ptr_llvm_ty();
                 let fp_ptr = self.coerce(fp_val, fn_ptr_ty, false);
                 let ret_lty = self.ctx.llvm_ty(&ret.host_value_type());
                 let mut call_args = Vec::new();

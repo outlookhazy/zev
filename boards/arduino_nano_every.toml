@@ -1,0 +1,9 @@
+# Arduino Nano Every (ATmega4809 + SAMD11 MuxTO JTAG2UPDI)
+
+[board]
+name = "arduino_nano_every"
+chip = "atmega4809"
+
+[run]
+flash_cmd = ["python3", "tools/flash_avr_updi.py", "{image}", "{port}"]
+default_port = "/dev/ttyACM0"

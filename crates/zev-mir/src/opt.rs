@@ -385,6 +385,7 @@ struct ScanAcc {
     isr_contended_prim_mangles: BTreeSet<String>,
     isr_fnptr_sigs: Vec<(Vec<MirType>, MirType)>,
     isr_calls_real_extern_c: bool,
+    sys_isr_callbacks: BTreeSet<String>,
 }
 
 struct ScanCtx<'a> {
@@ -420,6 +421,23 @@ impl<'a> ScanCtx<'a> {
             self.acc.isr_contended_prim_mangles.insert(pk.mangle_name());
         } else if let Some(pk) = self.prim_kinds.get(name) {
             self.acc.isr_contended_prim_mangles.insert(pk.mangle_name());
+        }
+    }
+
+    fn record_sys_isr_callback(&mut self, arg: Option<&MirExpr>, params: &[MirType], ret: &MirType) {
+        let Some(mut expr) = arg else {
+            return;
+        };
+        while let MirExprKind::Cast { expr: inner, .. } = &expr.kind {
+            expr = inner;
+        }
+        if let MirExprKind::FnAddr(name) = &expr.kind {
+            self.acc.sys_isr_callbacks.insert(name.clone());
+        } else {
+            let sig = (params.to_vec(), ret.clone());
+            if !self.acc.isr_fnptr_sigs.contains(&sig) {
+                self.acc.isr_fnptr_sigs.push(sig);
+            }
         }
     }
 
@@ -669,6 +687,12 @@ impl<'a> ScanCtx<'a> {
                         self.acc.isr_calls_real_extern_c = true;
                     }
                 }
+                for a in args {
+                    self.visit_expr(a, in_isr, callees);
+                }
+            }
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                self.visit_expr(addr, in_isr, callees);
                 for a in args {
                     self.visit_expr(a, in_isr, callees);
                 }
@@ -1035,9 +1059,14 @@ impl<'a> ScanCtx<'a> {
             MirStmt::Intrinsic(intr) => match intr {
                 MirIntrinsicOp::UseSystick { hz } => self.visit_expr(hz, in_isr, callees),
                 MirIntrinsicOp::SetPriority { .. } => {}
-                MirIntrinsicOp::SysOp { args, .. } => {
+                MirIntrinsicOp::SysOp { method, args } => {
                     for a in args {
                         self.visit_expr(a, in_isr, callees);
+                    }
+                    if method == "set_fault_handler" {
+                        self.record_sys_isr_callback(args.first(), &[], &MirType::Void);
+                    } else if method == "set_irq_router" {
+                        self.record_sys_isr_callback(args.get(1), &[MirType::U32], &MirType::Void);
                     }
                 }
             },
@@ -1421,6 +1450,10 @@ pub fn analyze_visibility(module: &MirModule) -> VisibilityReport {
         for callee in isr_callees {
             isr_queue.push_back(callee);
         }
+    }
+
+    for callee in ctx.acc.sys_isr_callbacks.clone() {
+        isr_queue.push_back(callee);
     }
 
     let mut visited_isr_fns: BTreeSet<String> = BTreeSet::new();
@@ -1880,6 +1913,7 @@ fn is_pure_static_immediate(
         | MirExprKind::FromBytes { .. }
         | MirExprKind::PrimRead(_)
         | MirExprKind::CallDirect { .. }
+        | MirExprKind::RomCallU32 { .. }
         | MirExprKind::ResultIsErr(_)
         | MirExprKind::ResultErr(_)
         | MirExprKind::ResultVal(_)
@@ -2193,6 +2227,23 @@ fn mir_expr_eq(a: &MirExpr, b: &MirExpr) -> bool {
                 && aa.len() == ab.len()
                 && aa.iter().zip(ab.iter()).all(|(x, y)| mir_expr_eq(x, y))
         }
+        (
+            MirExprKind::RomCallU32 {
+                addr: aa,
+                stack_bound: sa,
+                args: xa,
+            },
+            MirExprKind::RomCallU32 {
+                addr: ab,
+                stack_bound: sb,
+                args: xb,
+            },
+        ) => {
+            sa == sb
+                && mir_expr_eq(aa, ab)
+                && xa.len() == xb.len()
+                && xa.iter().zip(xb.iter()).all(|(x, y)| mir_expr_eq(x, y))
+        }
         (MirExprKind::PrimRead(pa), MirExprKind::PrimRead(pb)) => {
             match (pa.as_ref(), pb.as_ref()) {
                 (
@@ -2338,6 +2389,12 @@ impl VarUsageInfo {
             }
             MirExprKind::CallDirect { callee, args, .. } => {
                 self.indirect_fnptr_callees.insert(callee.clone());
+                for a in args {
+                    self.visit_expr(a);
+                }
+            }
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                self.visit_expr(addr);
                 for a in args {
                     self.visit_expr(a);
                 }
@@ -2849,6 +2906,9 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
         MirExprKind::ArrayLit { elems, .. } | MirExprKind::CallDirect { args: elems, .. } => {
             elems.iter().any(|e| expr_reads_var(e, target))
         }
+        MirExprKind::RomCallU32 { addr, args, .. } => {
+            expr_reads_var(addr, target) || args.iter().any(|e| expr_reads_var(e, target))
+        }
         MirExprKind::PrimRead(op) => match op.as_ref() {
             MirPrimReadOp::WatchRead { target: t, .. }
             | MirPrimReadOp::InboxTryRecv { target: t, .. }
@@ -3175,6 +3235,12 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
                 subst_expr(e, target, repl);
             }
         }
+        MirExprKind::RomCallU32 { addr, args, .. } => {
+            subst_expr(addr, target, repl);
+            for e in args {
+                subst_expr(e, target, repl);
+            }
+        }
         MirExprKind::PrimRead(op) => match op.as_mut() {
             MirPrimReadOp::WatchRead { target: t, .. }
             | MirPrimReadOp::InboxTryRecv { target: t, .. }
@@ -3488,6 +3554,12 @@ fn collect_fn_addrs_and_calls_expr<'a>(
                     .or_default()
                     .push(args.clone());
             }
+            for a in args {
+                collect_fn_addrs_and_calls_expr(a, addr_taken_fns, call_sites);
+            }
+        }
+        MirExprKind::RomCallU32 { addr, args, .. } => {
+            collect_fn_addrs_and_calls_expr(addr, addr_taken_fns, call_sites);
             for a in args {
                 collect_fn_addrs_and_calls_expr(a, addr_taken_fns, call_sites);
             }

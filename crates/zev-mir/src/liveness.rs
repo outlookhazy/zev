@@ -764,6 +764,12 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
                 collect_expr_uses(a, uses);
             }
         }
+        MirExprKind::RomCallU32 { addr, args, .. } => {
+            collect_expr_uses(addr, uses);
+            for a in args {
+                collect_expr_uses(a, uses);
+            }
+        }
         MirExprKind::LeaseGet { lease, .. } | MirExprKind::LeaseAddr { lease, .. } => {
             collect_expr_uses(lease, uses);
         }
@@ -829,6 +835,12 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
         MirExprKind::ArrayLit { elems, .. } | MirExprKind::CallDirect { args: elems, .. } => {
             for e in elems {
                 collect_addr_of_vars(e, out);
+            }
+        }
+        MirExprKind::RomCallU32 { addr, args, .. } => {
+            collect_addr_of_vars(addr, out);
+            for a in args {
+                collect_addr_of_vars(a, out);
             }
         }
         MirExprKind::PrimRead(ro) => match ro.as_ref() {
@@ -941,6 +953,14 @@ fn collect_alias_sources_expr(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
         }
         MirExprKind::CallDirect { args, .. } => {
             if type_may_carry_alias(&expr.ty) {
+                for a in args {
+                    collect_alias_sources_expr(a, out);
+                }
+            }
+        }
+        MirExprKind::RomCallU32 { addr, args, .. } => {
+            if type_may_carry_alias(&expr.ty) {
+                collect_alias_sources_expr(addr, out);
                 for a in args {
                     collect_alias_sources_expr(a, out);
                 }

@@ -1,0 +1,30 @@
+# Espressif ESP32-C6 (RISC-V rv32imac Direct-Boot Target Specification)
+
+[chip]
+name = "esp32c6"
+isa = "riscv32"
+cpu = "generic-rv32"
+features = "+m,+a,+c"
+triple = "riscv32-unknown-none-elf"
+datalayout = "e-m:e-p:32:32-i64:64-n32-S128"
+ptr_bits = 32
+opt_level = "-O2"
+iram_in_data = true
+
+[memory]
+flash_base = 0x4200_0000
+flash_size = 4194304
+ram_base = 0x4080_0000
+ram_size = 458752
+stack_reserve_bytes = 1024
+sram_budget_bytes = 524288
+
+[irq]
+model = "riscv-vectored"
+vector_slots = 32
+max_irq_source = 76
+reserved_slots = [0, 3, 4, 7]
+
+[image]
+format = "raw-bin"
+header_magic_words = [0xAEDB_041D, 0xAEDB_041D]

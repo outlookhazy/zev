@@ -233,6 +233,7 @@ task usb_cmd_worker(
 
 // ── Sequential Boot + Low-Priority Telemetry Supervisor ──────────────────────
 fn main() {
+    sys.set_putc(console_putc);
     bsp.init_clocks();
     sys.use_systick(125_000_000);
     bsp.init_usb_cdc();

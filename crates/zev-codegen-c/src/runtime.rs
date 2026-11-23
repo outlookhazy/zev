@@ -383,7 +383,17 @@ static SYN_UNUSED inline void syn_exit_critical(void) {{
 #endif
 }}
 
+typedef uint32_t (*syn_clock_ms_fn_t)(void);
+static SYN_UNUSED syn_clock_ms_fn_t g_syn_user_clock_ms = NULL;
+
+static SYN_UNUSED inline void syn_sys_set_clock_ms(syn_clock_ms_fn_t fn) {{
+    g_syn_user_clock_ms = fn;
+}}
+
 static SYN_UNUSED inline uint32_t syn_now_ms(void) {{
+    if (g_syn_user_clock_ms != NULL) {{
+        return g_syn_user_clock_ms();
+    }}
     return g_syn_tick_ms;
 }}
 
@@ -424,11 +434,49 @@ static SYN_UNUSED inline void syn_sys_set_putc(syn_putc_fn_t fn) {{
     g_syn_user_putc = fn;
 }}
 
-static SYN_UNUSED inline void syn_sys_tick(void) {{
+typedef void (*syn_exit_fn_t)(int32_t);
+static SYN_UNUSED syn_exit_fn_t g_syn_user_exit = NULL;
+
+static SYN_UNUSED inline void syn_sys_set_exit(syn_exit_fn_t fn) {{
+    g_syn_user_exit = fn;
+}}
+
+typedef void (*syn_fault_fn_t)(void);
+static SYN_UNUSED syn_fault_fn_t g_syn_user_fault = NULL;
+
+static SYN_UNUSED inline void syn_sys_set_fault_handler(syn_fault_fn_t fn) {{
+    g_syn_user_fault = fn;
+}}
+
+typedef void (*syn_idle_fn_t)(uint32_t, uint32_t);
+static SYN_UNUSED syn_idle_fn_t g_syn_user_idle = NULL;
+
+static SYN_UNUSED inline void syn_sys_set_idle(syn_idle_fn_t fn) {{
+    g_syn_user_idle = fn;
+}}
+
+typedef void (*syn_irq_route_fn_t)(uint32_t, uint32_t);
+typedef void (*syn_irq_ack_fn_t)(uint32_t);
+static SYN_UNUSED syn_irq_route_fn_t g_syn_user_irq_route = NULL;
+static SYN_UNUSED syn_irq_ack_fn_t g_syn_user_irq_ack = NULL;
+
+static SYN_UNUSED inline void syn_sys_set_irq_router(
+    syn_irq_route_fn_t route_fn,
+    syn_irq_ack_fn_t ack_fn
+) {{
+    g_syn_user_irq_route = route_fn;
+    g_syn_user_irq_ack = ack_fn;
+}}
+
+static SYN_UNUSED inline void syn_sys_tick_by(uint32_t ms) {{
     syn_enter_critical();
-    g_syn_tick_ms += 1U;
+    g_syn_tick_ms += ms;
     g_syn_sleep.systick_configured = true;
     syn_exit_critical();
+}}
+
+static SYN_UNUSED inline void syn_sys_tick(void) {{
+    syn_sys_tick_by(1U);
 }}
 
 static SYN_UNUSED inline void syn_user_putc_cstr(const void *msg) {{
@@ -1657,6 +1705,11 @@ void syn_sim_stop(void) {{
 void syn_sim_exit(int32_t code) {{
     g_syn_sim_exit_code = (int)code;
     g_syn_sim_stopped = true;
+    if (g_syn_user_exit != NULL) {{
+        syn_exit_fn_t fn = g_syn_user_exit;
+        g_syn_user_exit = NULL;
+        fn(code);
+    }}
 #if !defined(SYN_FREESTANDING) && !defined(SYN_NO_MAIN)
     fflush(stdout);
     exit((int)code);
@@ -1676,7 +1729,7 @@ void syn_sim_log(uint32_t tag, uint32_t a, uint32_t b) {{
 }}
 
 uint32_t syn_sim_now_ms(void) {{
-    return g_syn_tick_ms;
+    return syn_now_ms();
 }}
 
 uint32_t syn_sim_last_sleep_depth(void) {{
@@ -1756,6 +1809,9 @@ void syn_sim_advance_ms(uint32_t delta_ms) {{
         }} else if (depth == SYN_SLEEP_DEEP) {{
             g_syn_sleep.deep_sleep_count++;
         }}
+        if (g_syn_user_idle != NULL) {{
+            g_syn_user_idle(1U, (uint32_t)depth);
+        }}
         g_syn_tick_ms += 1U;
         syn_sim_pump_ready();
     }}
@@ -1827,6 +1883,11 @@ static SYN_UNUSED inline void syn_sched_run_tickless_loop(void) {{
                    (allowed == SYN_SLEEP_DEEP)  ? "DEEP"  : "NONE",
                    (unsigned)wake_tick);
 #endif
+        }}
+
+        if (g_syn_user_idle != NULL) {{
+            uint32_t sleep_ms = (!has_wake || wake_tick <= now) ? 0U : (wake_tick - now);
+            g_syn_user_idle(sleep_ms, (uint32_t)allowed);
         }}
 
 #if defined(SYN_FREESTANDING) && defined(__ARM_ARCH)

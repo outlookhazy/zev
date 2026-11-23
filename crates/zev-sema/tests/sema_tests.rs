@@ -5933,6 +5933,132 @@ fn regression_l_h1_shift_preserves_lhs_integer_type() {
     );
 }
 
+#[test]
+fn explicit_sys_hooks_and_rom_call_validation() {
+    // 1. Positive usage across all explicit `sys.*` OS hooks + compile-time bounded ROM calls
+    let model = expect_ok(
+        r#"
+        const usize ROM_LOOKUP_STACK = 32;
+        irq IRQ_TIMER = 1;
+
+        fn uart_putc(u8 c) { usize _u = (usize)c; }
+        u32 read_ms() { return 42; }
+        fn on_exit(i32 code) { i32 _c = code; }
+        fn on_fault() {}
+        fn on_idle(u32 ms, u32 depth) { u32 _x = ms + depth; }
+        fn on_route(u32 src, u32 slot) { u32 _x = src + slot; }
+        fn on_ack(u32 slot) { u32 _s = slot; }
+
+        isr tick_isr() {
+            sys.tick_by(10);
+        }
+
+        u32 lookup_rom(usize tbl, u32 code) {
+            u32 r = sys.rom_call_u32(0x18usize, ROM_LOOKUP_STACK, tbl, code);
+            sys.rom_call_void(0x20usize, 16, r);
+            return r;
+        }
+
+        fn reboot_bootrom() {
+            sys.rom_call_noreturn(0x100usize, 0u32, 0u32);
+        }
+
+        u32 diverging_fn() {
+            sys.rom_call_noreturn(0x100usize);
+        }
+
+        task worker() {
+            u32 x = lookup_rom(0x14usize, 0x4255u32);
+            if (x == 999) {
+                u32 _d = diverging_fn();
+                sys.rom_call_noreturn(0x200usize);
+            }
+            loop {
+                checkpoint();
+            }
+        }
+
+        fn main() {
+            sys.set_putc(uart_putc);
+            sys.set_clock_ms(read_ms);
+            sys.set_exit(on_exit);
+            sys.set_fault_handler(on_fault);
+            sys.set_idle(on_idle);
+            sys.set_irq_router(on_route, on_ack);
+            if (false) {
+                reboot_bootrom();
+            }
+            IRQ_TIMER.attach(tick_isr);
+            spawn worker() @normal;
+        }
+        "#,
+    );
+    assert_eq!(model.fn_effect("read_ms"), FnEffect::NonYielding);
+    assert_eq!(model.fn_effect("on_ack"), FnEffect::NonYielding);
+
+    // 2. Wrong signatures and arities -> TypeMismatch
+    for bad in [
+        "fn main() { sys.tick_by(); }",
+        "fn main() { sys.tick_by(true); }",
+        "i32 bad() { return 0; } fn main() { sys.set_clock_ms(bad); }",
+        "fn bad(u32 x) {} fn main() { sys.set_exit(bad); }",
+        "fn bad(u8 x) {} fn main() { sys.set_fault_handler(bad); }",
+        "fn bad(u32 x) {} fn main() { sys.set_idle(bad); }",
+        "fn route(u32 a, u32 b) {} fn bad_ack() {} fn main() { sys.set_irq_router(route, bad_ack); }",
+        "fn bad_route(u32 a) {} fn ack(u32 s) {} fn main() { sys.set_irq_router(bad_route, ack); }",
+        "fn main() { sys.set_irq_router(ack); }",
+        "fn main() { u32 x = sys.rom_call_u32(0x10usize); }",
+        "fn main() { sys.rom_call_void(0x10usize, 16, 1, 2, 3, 4, 5); }",
+        "fn main() { sys.rom_call_noreturn(0x10usize, 1, 2, 3, 4, 5); }",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::TypeMismatch);
+    }
+
+    // 3. Fallible (`error`) callback rejected on all new hooks -> TypeMismatch
+    for bad_fallible in [
+        "u32 f() error { error; } fn main() { sys.set_clock_ms(f); }",
+        "fn f(i32 c) error { error; } fn main() { sys.set_exit(f); }",
+        "fn f() error { error; } fn main() { sys.set_fault_handler(f); }",
+        "fn f(u32 a, u32 b) error { error; } fn main() { sys.set_idle(f); }",
+        "fn r(u32 a, u32 b) error { error; } fn ack(u32 s) {} fn main() { sys.set_irq_router(r, ack); }",
+        "fn r(u32 a, u32 b) {} fn ack(u32 s) error { error; } fn main() { sys.set_irq_router(r, ack); }",
+    ] {
+        expect_err_kind(bad_fallible, DiagnosticKind::TypeMismatch);
+    }
+
+    // 4. Yielding callbacks rejected on all new hooks -> YieldingCallbackToExternC
+    for bad_yielding in [
+        "u32 f() { checkpoint(); return 1; } fn main() { sys.set_clock_ms(f); }",
+        "fn f(i32 c) { i32 _c = c; checkpoint(); } fn main() { sys.set_exit(f); }",
+        "fn f() { checkpoint(); } fn main() { sys.set_fault_handler(f); }",
+        "fn f(u32 a, u32 b) { u32 _x = a + b; checkpoint(); } fn main() { sys.set_idle(f); }",
+        "fn r(u32 a, u32 b) { u32 _x = a + b; checkpoint(); } fn ack(u32 s) {} fn main() { sys.set_irq_router(r, ack); }",
+        "fn r(u32 a, u32 b) {} fn ack(u32 s) { u32 _s = s; checkpoint(); } fn main() { sys.set_irq_router(r, ack); }",
+    ] {
+        expect_err_kind(bad_yielding, DiagnosticKind::YieldingCallbackToExternC);
+    }
+
+    // 5. Calling any `sys.set_*` inside an `isr` rejected -> InvalidControlFlow
+    for bad_in_isr in [
+        "irq IRQ0 = 1; u32 f() { return 0; } isr h() { sys.set_clock_ms(f); } fn main() { IRQ0.attach(h); }",
+        "irq IRQ0 = 1; fn f(i32 c) {} isr h() { sys.set_exit(f); } fn main() { IRQ0.attach(h); }",
+        "irq IRQ0 = 1; fn f() {} isr h() { sys.set_fault_handler(f); } fn main() { IRQ0.attach(h); }",
+        "irq IRQ0 = 1; fn f(u32 a, u32 b) {} isr h() { sys.set_idle(f); } fn main() { IRQ0.attach(h); }",
+        "irq IRQ0 = 1; fn r(u32 a, u32 b) {} fn ack(u32 s) {} isr h() { sys.set_irq_router(r, ack); } fn main() { IRQ0.attach(h); }",
+    ] {
+        expect_err_kind(bad_in_isr, DiagnosticKind::InvalidControlFlow);
+    }
+
+    // 6. Non-constant or negative `stack_bound` rejected -> InvalidOperation
+    for bad_bound in [
+        "fn call_it(usize dyn_sb) { u32 _x = sys.rom_call_u32(0x10usize, dyn_sb); } fn main() { call_it(32); }",
+        "fn main() { sys.rom_call_void(0x10usize, (usize)(-4i32)); }",
+        "fn main() { usize sb = 16; sys.rom_call_void(0x10usize, sb); }",
+    ] {
+        expect_err_kind(bad_bound, DiagnosticKind::InvalidOperation);
+    }
+}
+
 
 
 

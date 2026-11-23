@@ -1,0 +1,28 @@
+# TI Stellaris LM3S6965 (ARM Cortex-M3) Chip Target Specification
+
+[chip]
+name = "lm3s6965"
+isa = "arm-cortex-m"
+cpu = "cortex-m3"
+triple = "thumbv7m-none-eabi"
+datalayout = "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"
+ptr_bits = 32
+opt_level = "-O2"
+code_in_ram = false
+has_thumb2 = true
+has_vtor = false
+
+[memory]
+flash_base = 0x0000_0000
+flash_size = 262144
+ram_base = 0x2000_0000
+ram_size = 65536
+stack_reserve_bytes = 512
+
+[irq]
+model = "cortex-m-nvic"
+max_irqs = 240
+min_vector_irqs = 32
+
+[image]
+format = "elf"

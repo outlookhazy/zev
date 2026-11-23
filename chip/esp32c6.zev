@@ -209,3 +209,19 @@ pub irq IRQ_GSPI2            = 72;
 pub const u32 PIN_RGB_LED      = 8;
 pub const u32 PIN_BOOT_BTN     = 9;
 pub const u32 RMT_SIG_OUT0_IDX = 71;
+
+pub fn route_irq(u32 src_id, u32 cpu_slot) {
+    INTMTX.map[src_id as usize] = cpu_slot;
+    PLIC_MX.pri[cpu_slot as usize] = 1;
+    u32 bit = 1u32 << (cpu_slot & 31u32);
+    PLIC_MX.int_type = PLIC_MX.int_type & (~bit);
+    PLIC_MX.thresh = 1;
+    PLIC_MX.enable = PLIC_MX.enable | bit;
+}
+
+pub fn ack_irq(u32 cpu_slot) {
+    u32 bit = 1u32 << (cpu_slot & 31u32);
+    u32 prev = PLIC_MX.clear;
+    PLIC_MX.clear = prev | bit;
+    PLIC_MX.clear = prev;
+}

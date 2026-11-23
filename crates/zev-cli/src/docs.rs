@@ -470,12 +470,19 @@ format-string parser, zero global handler registry):
 ## 2. Portable Built-Ins, `.zev` BSP Hooks & `sys.*` Namespace
 - `assert(cond);` / `delay(10ms);` / `checkpoint();` / `set_priority(@low);`
 - `sys.use_systick(u32 hz);` — Configures core timer (`12_000_000` on QEMU LM3S, `125_000_000` RP2040, `170_000_000` STM32G4).
-- `sys.tick();` / `sys.tick_ms();` — Advances the 1 ms scheduler tick from a pure-`.zev` timer `isr` (e.g., `Timer0` on Uno, `TCB3` on ATmega4809).
-- `pub fn console_putc(u8 c)` / `fn sys_now_ms() -> u32` / `sys.set_putc(fn(u8))` — Pure-`.zev` BSP console & timebase hooks automatically wired into `print`/`println`/`sys.now_ms` so zero board peripheral MMIO lives in Rust/LLVM.
+- `sys.tick();` / `sys.tick_ms();` / `sys.tick_by(u32 ms);` — Advances the 1 ms scheduler tick from a pure-`.zev` timer `isr` (e.g., `Timer0` on Uno, `TCB3` on ATmega4809).
+- Explicit OS hooks wired directly from `.zev` `bsp.*` / application code (zero hardcoded board MMIO or magic symbol names in Rust/LLVM):
+  - `sys.set_putc(fn(u8))` — Console output backend for `print` / `println` / `sys.log`.
+  - `sys.set_clock_ms(fn() -> u32)` — Monotonic millisecond hardware clock reader backing `sys.now_ms()`.
+  - `sys.set_exit(fn(i32))` — Target shutdown/reboot handler invoked by `sys.exit(code)`.
+  - `sys.set_fault_handler(fn())` — Hardware fault hook invoked before halt on fatal traps.
+  - `sys.set_idle(fn(u32, u32))` — Idle sleep hook (`(in_sim, sleep_depth)`).
+  - `sys.set_irq_router(fn(u32, u32), fn(u32))` — RISC-V interrupt matrix routing and acknowledge hooks (`route(irq, slot)`, `ack(irq)`).
+  - `sys.rom_call_u32` / `sys.rom_call_void` / `sys.rom_call_noreturn` — Stack-bounded external ROM ABI calls (`stack_bound` proved statically via `.stack_sizes`).
 - `sys.now_ms() -> u32` / `sys.now_ticks() -> u32` — Current monotonic millisecond tick counter.
 - `sys.log(*u8 msg);` / `sys.log_kv(*u8 label, i32 val);` / `sys.log_hex(*u8 label, u32 val);`
 - `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` in QEMU & host sim).
-- `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then exits sim/QEMU or resets RP2040 BootROM on `0x4255`).
+- `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then invokes `sys.set_exit` handler or target exit).
 
 ## 3. Typed `mmio` Register Blocks & Boot-Tree `irq.attach(...)` / `attach_shared(...)`
 - **Core-vs-Library Hardware Drivers**: Chip register maps (`chip.stm32g4`, `chip.lm3s6965`, `chip.esp32c6`)
@@ -508,9 +515,9 @@ isr dma_rx_isr(*DmaRegs dma, u32 clr) {
             "target", "cli", "ram", "sim", "c99", "llvm", "elf", "qemu", "cortex-m", "cortex-m3",
             "esp32", "esp32c6", "riscv", "avr", "atmega328p", "uno", "arduino", "atmega4809",
             "nano-every", "nano", "updi", "rp2040", "pico", "pico-w", "cortex-m0plus", "uf2",
-            "svd", "import-svd",
+            "svd", "import-svd", "board", "chip", "toml", "build", "flash",
         ],
-        summary: "CLI workflow: `check [--json]`, `ram`, `import-svd`, `run`, `run-qemu`, ESP32-C6, AVR, and RP2040",
+        summary: "CLI workflow: `build --board`, `flash --board`, `ram --board`, `chips/*.toml` + `boards/*.toml`, `zev.toml`, `import-svd`",
         body: "\
 # Zev Topic Guide: `targets`
 
@@ -522,74 +529,82 @@ zevc check examples/motor_controller.zev examples/motor_support.zev
 zevc check --json app.zev             # Structured JSON diagnostics + dual-spec & monomorphized lists
 ```
 
-## 2. SVD Hardware Generation & Static SRAM + Stack Proofs (`zevc import-svd`, `zevc ram`)
+## 2. Declarative Target Specs & `zev.toml` (`build`, `flash`, `ram`)
+Targets are defined declaratively in `chips/<chip>.toml` + `boards/<board>.toml` (with zero compiler edits for new chips/boards):
+- `zevc build --board <board> [-Oz] [--emit-ll] [files...] [-o out]`
+- `zevc flash --board <board> [--port <dev>] [-Oz] [files...]`
+- `zevc ram --board <board> [files...]` (also supports `--chip <chip>` or legacy `--target <name>`)
+- Optional `zev.toml` project manifest sets defaults (`entry`, `board`, `chip`, `port`, `opt_level`) so `zevc build` / `zevc flash` work with zero extra CLI flags.
+
+```bash
+zevc ram examples/motor_controller.zev examples/motor_support.zev
+zevc ram --board lm3s6965_evb examples/cortex_m_demo.zev
+zevc ram --board esp32c6_pico examples/esp32c6_demo.zev
+zevc ram --board arduino_uno examples/arduino_uno_demo.zev
+zevc ram --board arduino_nano_every examples/arduino_nano_every_demo.zev
+zevc ram --board rpi_pico_w examples/pico_w_demo.zev
+```
+
+## 3. SVD Hardware Generation (`zevc import-svd`)
 Generate typed `.zev` `pub mmio` layouts, peripheral base addresses, and `pub irq` tokens directly
-from any vendor CMSIS-SVD file, inspect exact 32-bit/64-bit `.bss`/ISR `state`/union RAM budgets
-(with singleton constant-folding `[singleton -> folded]`, dead-`watch` stripping & IRQ-mask elision telemetry), or run a hardware single-stack +
-`.bss` high-water proof (`--target <cortex-m3|esp32c6|avr|nano-every|rp2040>` using LLVM `.stack_sizes` / AVR disassembly):
+from any vendor CMSIS-SVD file:
 ```bash
 zevc import-svd vendor/STM32G474.svd -o chip/stm32g474.zev
 zevc check -I chip examples/motor_controller.zev examples/motor_support.zev
-zevc ram examples/motor_controller.zev examples/motor_support.zev
-zevc ram --target esp32c6 examples/esp32c6_demo.zev
-zevc ram --target avr examples/arduino_uno_demo.zev
-zevc ram --target nano-every examples/arduino_nano_every_demo.zev
-zevc ram --target rp2040 examples/pico_w_demo.zev
 ```
 
-## 3. Stage 0: Freestanding C99 & Sanitized Host Simulation (`emit-c`, `run`)
+## 4. Stage 0: Freestanding C99 & Sanitized Host Simulation (`emit-c`, `run`)
 ```bash
 zevc emit-c examples/sim_demo.zev -o build/sim_demo.c
 zevc run --sanitize examples/sim_demo.zev
 zevc run --max-ticks 50 app.zev       # Bounds infinite `loop every` / `checkpoint()` firmware loops!
 ```
 
-## 4. Stage 1A: Native LLVM 23 -> Bare-Metal ARM Cortex-M3 ELF & QEMU
+## 5. Stage 1A: ARM Cortex-M3 (`lm3s6965_evb`) ELF & QEMU
 Synthesizes `.isr_vector`, `Reset_Handler`, `SysTick_Handler`, and linker script with zero C/libc.
 Supports `-O0`, `-O1`, `-O2` (default), `-O3`, `-Os`, and `-Oz` (`--opt-level <level>`):
 ```bash
-zevc emit-llvm examples/cortex_m_demo.zev -o build/cm3.ll       # Raw readable LLVM IR
-zevc emit-llvm -Oz examples/cortex_m_demo.zev -o build/cm3.ll   # `opt` + `minsize` optimized IR
-zevc build-elf -Oz examples/cortex_m_demo.zev -o build/cm3.elf
+zevc emit-llvm --board lm3s6965_evb examples/cortex_m_demo.zev -o build/cm3.ll
+zevc build --board lm3s6965_evb -Oz examples/cortex_m_demo.zev -o build/cm3.elf
 zevc run-qemu -Oz examples/cortex_m_demo.zev
 zevc run-qemu --max-ticks 50 app.zev  # Deterministic SysTick cap for non-terminating firmware!
 ```
 
-## 5. Stage 1B: Bare-Metal Espressif ESP32-C6 (`riscv32imac` Direct-Boot)
-Synthesizes `0xAEDB041D` x2 ROM Direct-Boot header, `@_start` at `0x42000008`, and `INTMTX`/`mtvec`;
-watchdog disarm (`TIMG0`/`TIMG1`/`LP_WDT`/`SWD`), 16 MHz `SYSTIMER` (`sys_now_ms`), `USB_DEVICE` (`console_putc`), and RMT WS2812B (GPIO8) all live in pure `.zev`:
+## 6. Stage 1B: Espressif ESP32-C6 (`esp32c6_pico`, `riscv32imac` Direct-Boot)
+Synthesizes `0xAEDB041D` x2 ROM Direct-Boot header, `@_start` at `0x42000008`, and `mtvec` dispatch;
+`route_irq`/`ack_irq`, watchdog disarm (`TIMG0`/`TIMG1`/`LP_WDT`/`SWD`), `SYSTIMER` (`sys.set_clock_ms`), and `USB_DEVICE` (`sys.set_putc`) live in pure `.zev`:
 ```bash
-zevc emit-llvm --target esp32c6 examples/esp32c6_demo.zev -o build/esp32c6.ll
-zevc build-esp32c6 -Oz examples/esp32c6_demo.zev -o build/esp32c6_demo.bin
-zevc flash-esp32c6 -Oz examples/esp32c6_demo.zev --port /dev/ttyACM0
+zevc emit-llvm --board esp32c6_pico examples/esp32c6_demo.zev -o build/esp32c6.ll
+zevc build --board esp32c6_pico -Oz examples/esp32c6_demo.zev -o build/esp32c6_demo.bin
+zevc flash --board esp32c6_pico -Oz examples/esp32c6_demo.zev --port /dev/ttyACM0
 ```
 
-## 6. Stage 1C: Bare-Metal Microchip ATmega328P / Arduino Uno R3 (`avr` Optiboot)
-Synthesizes the 26-slot Flash vector table, `.data`/`.rodata`/`.bss` startup, `SREG`, and `avr-libgcc` shims;
-WDT disarm, `Timer0` 1 kHz `sys.tick()` ISR, and `115200 8N1` `USART0` (`console_putc`) live in pure `.zev`:
+## 7. Stage 1C: Microchip ATmega328P / Arduino Uno R3 (`arduino_uno`, `avr` Optiboot)
+Synthesizes Flash vector table, `.data`/`.rodata`/`.bss` startup, `SREG`, and `avr-libgcc` shims;
+WDT disarm, `Timer0` 1 kHz `sys.tick()` ISR, and `115200 8N1` `USART0` (`sys.set_putc`) live in pure `.zev`:
 ```bash
-zevc emit-llvm --target avr examples/arduino_uno_demo.zev -o build/uno.ll
-zevc build-avr examples/arduino_uno_demo.zev -o build/uno_demo.bin
-zevc flash-avr examples/arduino_uno_demo.zev --port /dev/ttyACM0
+zevc emit-llvm --board arduino_uno examples/arduino_uno_demo.zev -o build/uno.ll
+zevc build --board arduino_uno examples/arduino_uno_demo.zev -o build/uno_demo.bin
+zevc flash --board arduino_uno examples/arduino_uno_demo.zev --port /dev/ttyACM0
 ```
 
-## 7. Stage 1D: Bare-Metal Microchip ATmega4809 / Arduino Nano Every (`avrxmega3` UPDI)
-Synthesizes pure-ISA 40-slot Flash vectors + `.data`/`.bss` startup (zero peripheral MMIO in Rust), while
+## 8. Stage 1D: Microchip ATmega4809 / Arduino Nano Every (`arduino_nano_every`, `avrxmega3` UPDI)
+Synthesizes pure-ISA Flash vectors + `.data`/`.bss` startup, while
 `bsp.init_board()` configures `CPU.ccp` WDT/clock unlock, `FUSE.OSCCFG` 16/20 MHz auto-calibration,
-`SLPCTRL`, `isr systick_isr` (`TCB3` 1 kHz `sys.tick()`), and `pub fn console_putc(u8)` (`115200 8N1` `USART3`) in `.zev`:
+`SLPCTRL`, `isr systick_isr` (`TCB3` 1 kHz `sys.tick()`), and `sys.set_putc` (`115200 8N1` `USART3`) in `.zev`:
 ```bash
-zevc emit-llvm --target nano-every examples/arduino_nano_every_demo.zev -o build/nano.ll
-zevc build-nano-every examples/arduino_nano_every_demo.zev -o build/nano_every_demo.bin
-zevc flash-nano-every examples/arduino_nano_every_demo.zev --port /dev/ttyACM0
+zevc emit-llvm --board arduino_nano_every examples/arduino_nano_every_demo.zev -o build/nano.ll
+zevc build --board arduino_nano_every examples/arduino_nano_every_demo.zev -o build/nano_every_demo.bin
+zevc flash --board arduino_nano_every examples/arduino_nano_every_demo.zev --port /dev/ttyACM0
 ```
 
-## 8. Stage 1E: Bare-Metal Raspberry Pi Pico / Pico W (`rp2040` SRAM UF2)
-Synthesizes ARMv6-M `.entry` (`0x2000_0000`), `[48 x ptr]` `.isr_vector`, `SysTick`, and BootROM `0x4255` reset;
-125 MHz `PLL_SYS`/48 MHz `PLL_USB` clocks and Full-Speed USB 1.1 CDC-ACM (`VID=0x2E8A`, `PID=0x000A`, `1200`-baud `RPI-RP2` auto-reset, `console_putc`) are written 100% in `.zev`:
+## 9. Stage 1E: Raspberry Pi Pico / Pico W (`rpi_pico_w`, `rp2040` SRAM UF2)
+Synthesizes ARMv6-M `.entry` (`0x2000_0000`), `[48 x ptr]` `.isr_vector`, and `SysTick`;
+125 MHz `PLL_SYS`/48 MHz `PLL_USB`, BootROM reset (`sys.rom_call_u32` + `sys.rom_call_noreturn`), `sys.set_exit`, and Full-Speed USB 1.1 CDC-ACM live 100% in `.zev`:
 ```bash
-zevc emit-llvm --target rp2040 examples/pico_w_demo.zev -o build/pico_w.ll
-zevc build-rp2040 examples/pico_w_demo.zev -o build/pico_w_demo.uf2
-zevc flash-rp2040 examples/pico_w_demo.zev --port /dev/ttyACM2
+zevc emit-llvm --board rpi_pico_w examples/pico_w_demo.zev -o build/pico_w.ll
+zevc build --board rpi_pico_w examples/pico_w_demo.zev -o build/pico_w_demo.uf2
+zevc flash --board rpi_pico_w examples/pico_w_demo.zev --port /dev/ttyACM2
 ```
 ",
     },

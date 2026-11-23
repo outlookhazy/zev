@@ -78,6 +78,7 @@ pub fn init_board() {
     hw.TCB3.ctrla = hw.BIT_TCB_ENABLE;
     sys.use_systick(f_cpu);
     hw.IRQ_TCB3_INT.attach(systick_isr(hw.TCB3));
+    sys.set_putc(console_putc);
 
     init_board_gpio();
 }

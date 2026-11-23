@@ -1,0 +1,29 @@
+# Microchip ATmega328P (AVR, 16-bit pointers, 26-slot vector table)
+
+[chip]
+name = "atmega328p"
+isa = "avr"
+cpu = "atmega328p"
+triple = "avr"
+datalayout = "e-P1-p:16:8-i8:8-i16:8-i32:8-i64:8-f32:8-f64:8-n8:16-a:8"
+ptr_bits = 16
+opt_level = "-Os"
+rodata_in_ram = true
+
+[memory]
+flash_base = 0x0000_0000
+flash_size = 32768
+ram_base = 0x0000_0100
+ram_size = 2048
+stack_reserve_bytes = 256
+
+[irq]
+model = "avr-vectored"
+vector_slots = 26
+slot_words = 2
+data_ram_offset = 0x0080_0000
+
+[image]
+format = "raw-bin"
+reset_first_word_mask = 0xFE0E
+reset_first_word_value = 0x940C

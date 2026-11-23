@@ -140,6 +140,13 @@ pub mmio PpbRegs {
     @wo u32 nvic_ispr @ 0x200;
 }
 
+pub mmio BootromHdrRegs {
+    @ro u32 magic        @ 0x00;
+    @ro u16 fn_table     @ 0x04;
+    @ro u16 data_table   @ 0x06;
+    @ro u16 table_lookup @ 0x08;
+}
+
 pub mmio SYSINFO     : SysinfoRegs  @ 0x4000_0000;
 pub mmio CLOCKS      : ClocksRegs   @ 0x4000_8000;
 pub mmio RESETS      : ResetsRegs   @ 0x4000_C000;
@@ -160,7 +167,17 @@ pub mmio USBCTRL_SET : UsbCtrlRegs  @ 0x5011_2000;
 pub mmio USBCTRL_CLR : UsbCtrlRegs  @ 0x5011_3000;
 pub mmio PIO0        : PioRegs      @ 0x5020_0000;
 pub mmio SIO         : SioRegs      @ 0xD000_0000;
-pub mmio PPB         : PpbRegs      @ 0xE000_E000;
+pub mmio BOOTROM_HDR : BootromHdrRegs @ 0x0000_0010;
+pub mmio PPB         : PpbRegs        @ 0xE000_E000;
+
+pub fn reset_usb_boot(u32 usb_activity_gpio_pin_mask, u32 disable_interface_mask) {
+    critical {
+        usize lookup = BOOTROM_HDR.table_lookup as usize;
+        u32 fn_table = BOOTROM_HDR.fn_table as u32;
+        u32 ub_fn = sys.rom_call_u32(lookup, 32, fn_table, 0x4255u32);
+        sys.rom_call_noreturn(ub_fn as usize, usb_activity_gpio_pin_mask, disable_interface_mask);
+    }
+}
 
 // RP2040 Cortex-M0+ NVIC IRQ indices (hardware/regs/intctrl.h)
 pub irq IRQ_TIMER_0  = 0;

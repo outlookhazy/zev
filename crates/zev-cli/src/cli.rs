@@ -11,6 +11,8 @@ pub enum Command {
         files: Vec<PathBuf>,
         include_dirs: Vec<PathBuf>,
         target: Option<String>,
+        board: Option<String>,
+        chip: Option<String>,
         opt_level: Option<String>,
     },
     EmitC {
@@ -29,6 +31,26 @@ pub enum Command {
         files: Vec<PathBuf>,
         include_dirs: Vec<PathBuf>,
         target: Option<String>,
+        board: Option<String>,
+        chip: Option<String>,
+        opt_level: Option<String>,
+        output: Option<PathBuf>,
+    },
+    Build {
+        files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
+        board: Option<String>,
+        chip: Option<String>,
+        opt_level: Option<String>,
+        emit_ll: bool,
+        output: Option<PathBuf>,
+    },
+    Flash {
+        files: Vec<PathBuf>,
+        include_dirs: Vec<PathBuf>,
+        board: Option<String>,
+        chip: Option<String>,
+        port: Option<String>,
         opt_level: Option<String>,
         output: Option<PathBuf>,
     },
@@ -118,32 +140,35 @@ COMMANDS:
     doc [topic | code | --list]             Built-in Zev language primer, 8 topic guides & error explainers
     import-svd <chip.svd> [-o <out.zev>]    Convert a CMSIS-SVD XML description into Zev mmio/irq declarations
     check [--json] [-I <dir>] <files...>    Parse and statically verify .zev source files
-    ram [--target <t>] [OPT] [-I <dir>] <files...> Print static SRAM budget (+ optional HW stack proof)
+    build [--board <b>] [--chip <c>] [--emit-ll] [OPT] [-o <out>] [files...]
+                                            Build ELF/BIN/UF2/LLVM IR from TOML specs (`zev.toml` aware)
+    flash [--board <b>] [--chip <c>] [--port <p>] [OPT] [-o <out>] [files...]
+                                            Build and flash firmware using board TOML `flash_cmd` (`zev.toml` aware)
+    ram [--board <b> | --chip <c> | --target <t>] [OPT] [-I <dir>] <files...>
+                                            Print static SRAM budget (+ optional HW stack proof)
     emit-c [-I <dir>] <files...> [-o <out>] Emit freestanding C99 source + synthesized cooperative kernel
     run [-I <dir>] <files...> [OPTIONS]     Compile emitted C99 via clang and run deterministic host simulation
-    emit-llvm [OPT] <files...> [-o <out.ll>] Emit LLVM 23 IR (raw by default, or optimized via opt w/ -O1..-Oz)
-    build-elf [OPT] <files...> [-o <elf>]   Synthesize vector table + linker script and link Cortex-M3 .elf
-    run-qemu [OPT] <files...>               Build bare-metal ARM Cortex-M3 .elf and run in qemu-system-arm
-    build-esp32c6 [OPT] <files...> [-o <bin>] Synthesize Direct-Boot header + RV32IMAC .elf/.bin for ESP32-C6
-    flash-esp32c6 [OPT] <files...> [--port] Build Direct-Boot .bin and flash ESP32-C6 via esptool (default /dev/ttyACM0)
-    build-avr [OPT] <files...> [-o <bin>]   Synthesize vectors + ATmega328P AVR .elf/.bin for Arduino Uno R3 (default -Os)
-    flash-avr [OPT] <files...> [--port]     Build AVR .bin and flash Arduino Uno R3 via STK500v1 Optiboot (aliases: build-uno/flash-uno)
-    build-nano-every [OPT] <files...> [-o]  Synthesize 40-slot vectors + ATmega4809 .elf/.bin for Arduino Nano Every (alias: build-atmega4809)
-    flash-nano-every [OPT] <files...> [-p]  Build ATmega4809 .bin and flash Arduino Nano Every via MuxTO UPDI (alias: flash-atmega4809)
-    build-rp2040 [OPT] <files...> [-o <uf2>] Synthesize ARMv6-M vectors + SRAM UF2 for RP2040 Pico/Pico W (alias: build-pico)
-    flash-rp2040 [OPT] <files...> [--port]  Build SRAM UF2 and flash RP2040 Pico via 1200-baud + RPI-RP2 (alias: flash-pico)
+    emit-llvm [--board <b> | --chip <c> | --target <t>] [OPT] <files...> [-o <out.ll>]
+                                            Emit LLVM 23 IR (raw by default, or optimized via opt w/ -O1..-Oz)
+    build-elf / run-qemu / build-esp32c6 / flash-esp32c6 / build-avr / flash-avr /
+    build-nano-every / flash-nano-every / build-rp2040 / flash-rp2040
+                                            Legacy target-specific aliases for `build --board` / `flash --board`
     help                                    Show this help message
 
-MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr, build-nano-every, flash-nano-every, build-rp2040, flash-rp2040):
+MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build, flash, build-*, flash-*, run-qemu):
     -I <dir> | --include <dir>              Add a module search root directory for `import` resolution (repeatable)
 
-CHECK OPTIONS:
-    --json                                  Emit structured machine-readable JSON diagnostics
+CHECK & TARGET OPTIONS:
+    --json                                  Emit structured machine-readable JSON diagnostics (`check`)
+    --board <name|path.toml>                Select board spec from `boards/<name>.toml` (or `.toml` path)
+    --chip <name|path.toml>                 Select/override chip spec from `chips/<name>.toml` (or `.toml` path)
+    --emit-ll                               Emit `.ll` LLVM IR instead of linking (`build` only)
+    -p <dev> | --port <dev>                 Serial/flash port override (`flash` / `flash-*`, else board default)
 
-LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build-elf, run-qemu, build-esp32c6, flash-esp32c6, build-avr, flash-avr, build-nano-every, flash-nano-every, build-rp2040, flash-rp2040):
-    -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default -O2; -Os on AVR; raw on emit-llvm)
+LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build, flash, build-*, flash-*, run-qemu):
+    -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default from chip TOML or -O2)
     --opt-level <O0|O1|O2|O3|Os|Oz>         Explicit long-form optimization level selector
-    --target <cortex-m3|esp32c6|avr|nano-every|rp2040|host> Target selector (`ram`: MCUs; `emit-llvm`: +host)
+    --target <cortex-m3|esp32c6|avr|nano-every|rp2040|host> Legacy target alias (`ram`: MCUs; `emit-llvm`: +host)
 
 RUN & RUN-QEMU OPTIONS:
     --sanitize                              Compile C99 host binary with -fsanitize=address,undefined (`run` only)
@@ -186,6 +211,8 @@ where
         "import-svd" => parse_import_svd(&raw[1..]),
         "check" => parse_check(&raw[1..]),
         "ram" => parse_ram(&raw[1..]),
+        "build" => parse_build(&raw[1..]),
+        "flash" => parse_flash(&raw[1..]),
         "emit-c" => match parse_files_with_output(&raw[1..], "emit-c")? {
             Some((files, include_dirs, output)) => Ok(Command::EmitC {
                 files,
@@ -291,7 +318,7 @@ where
         },
         "run" => parse_run(&raw[1..]),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, `flash-nano-every`, `build-rp2040`, or `flash-rp2040`; try `zevc --help`)"
+            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build`, `flash`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, `flash-nano-every`, `build-rp2040`, or `flash-rp2040`; try `zevc --help`)"
         )),
     }
 }
@@ -446,15 +473,60 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
     })
 }
 
+fn try_parse_board_or_chip_arg(
+    args: &[String],
+    i: &mut usize,
+    board: &mut Option<String>,
+    chip: &mut Option<String>,
+    subcmd: &str,
+) -> Result<bool, String> {
+    let arg = &args[*i];
+    if arg == "--board" {
+        *i += 1;
+        if *i >= args.len() || args[*i].is_empty() {
+            return Err(format!("`--board` requires a board name or `.toml` path for `zevc {subcmd}`"));
+        }
+        *board = Some(args[*i].clone());
+        return Ok(true);
+    }
+    if let Some(val) = arg.strip_prefix("--board=") {
+        if val.is_empty() {
+            return Err(format!("`--board=` requires a board name or `.toml` path for `zevc {subcmd}`"));
+        }
+        *board = Some(val.to_string());
+        return Ok(true);
+    }
+    if arg == "--chip" {
+        *i += 1;
+        if *i >= args.len() || args[*i].is_empty() {
+            return Err(format!("`--chip` requires a chip name or `.toml` path for `zevc {subcmd}`"));
+        }
+        *chip = Some(args[*i].clone());
+        return Ok(true);
+    }
+    if let Some(val) = arg.strip_prefix("--chip=") {
+        if val.is_empty() {
+            return Err(format!("`--chip=` requires a chip name or `.toml` path for `zevc {subcmd}`"));
+        }
+        *chip = Some(val.to_string());
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 fn parse_ram(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
     let mut target: Option<String> = None;
+    let mut board: Option<String> = None;
+    let mut chip: Option<String> = None;
     let mut opt_level: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, "ram")? {
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "ram")?
+            || try_parse_board_or_chip_arg(args, &mut i, &mut board, &mut chip, "ram")?
+        {
             i += 1;
             continue;
         }
@@ -496,13 +568,15 @@ fn parse_ram(args: &[String]) -> Result<Command, String> {
         }
         i += 1;
     }
-    if files.is_empty() {
+    if files.is_empty() && board.is_none() && chip.is_none() {
         return Err("`zevc ram` requires at least one `.zev` input file".to_string());
     }
     Ok(Command::Ram {
         files,
         include_dirs,
         target,
+        board,
+        chip,
         opt_level,
     })
 }
@@ -623,12 +697,16 @@ fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
     let mut target: Option<String> = None;
+    let mut board: Option<String> = None;
+    let mut chip: Option<String> = None;
     let mut opt_level: Option<String> = None;
     let mut output: Option<PathBuf> = None;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, "emit-llvm")? {
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "emit-llvm")?
+            || try_parse_board_or_chip_arg(args, &mut i, &mut board, &mut chip, "emit-llvm")?
+        {
             i += 1;
             continue;
         }
@@ -680,13 +758,152 @@ fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
         }
         i += 1;
     }
-    if files.is_empty() {
+    if files.is_empty() && board.is_none() && chip.is_none() {
         return Err("`zevc emit-llvm` requires at least one `.zev` input file".to_string());
     }
     Ok(Command::EmitLlvm {
         files,
         include_dirs,
         target,
+        board,
+        chip,
+        opt_level,
+        output,
+    })
+}
+
+fn parse_build(args: &[String]) -> Result<Command, String> {
+    let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
+    let mut board: Option<String> = None;
+    let mut chip: Option<String> = None;
+    let mut opt_level: Option<String> = None;
+    let mut emit_ll = false;
+    let mut output: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "build")?
+            || try_parse_board_or_chip_arg(args, &mut i, &mut board, &mut chip, "build")?
+        {
+            i += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--emit-ll" => emit_ll = true,
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() || args[i].is_empty() {
+                    return Err("`-o` requires an output path for `zevc build`".to_string());
+                }
+                output = Some(PathBuf::from(&args[i]));
+            }
+            "--opt-level" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`--opt-level` requires `O0..Oz` for `zevc build`".to_string());
+                }
+                opt_level = Some(normalize_opt_level(&args[i])?);
+            }
+            _ if arg.starts_with("-o=") => {
+                output = Some(PathBuf::from(&arg[3..]));
+            }
+            _ if arg.starts_with("--output=") => {
+                output = Some(PathBuf::from(&arg[9..]));
+            }
+            _ if arg.starts_with("--opt-level=") => {
+                opt_level = Some(normalize_opt_level(&arg["--opt-level=".len()..])?);
+            }
+            _ if is_short_opt_flag(arg) => {
+                opt_level = Some(normalize_opt_level(arg)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unexpected option `{arg}` for `zevc build`"));
+            }
+            _ => files.push(PathBuf::from(arg)),
+        }
+        i += 1;
+    }
+    Ok(Command::Build {
+        files,
+        include_dirs,
+        board,
+        chip,
+        opt_level,
+        emit_ll,
+        output,
+    })
+}
+
+fn parse_flash(args: &[String]) -> Result<Command, String> {
+    let mut files = Vec::new();
+    let mut include_dirs = Vec::new();
+    let mut board: Option<String> = None;
+    let mut chip: Option<String> = None;
+    let mut port: Option<String> = None;
+    let mut opt_level: Option<String> = None;
+    let mut output: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "flash")?
+            || try_parse_board_or_chip_arg(args, &mut i, &mut board, &mut chip, "flash")?
+        {
+            i += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "-p" | "--port" => {
+                i += 1;
+                if i >= args.len() || args[i].is_empty() {
+                    return Err("`--port` requires a serial device or mount path for `zevc flash`".to_string());
+                }
+                port = Some(args[i].clone());
+            }
+            "-o" | "--output" => {
+                i += 1;
+                if i >= args.len() || args[i].is_empty() {
+                    return Err("`-o` requires an output path for `zevc flash`".to_string());
+                }
+                output = Some(PathBuf::from(&args[i]));
+            }
+            "--opt-level" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("`--opt-level` requires `O0..Oz` for `zevc flash`".to_string());
+                }
+                opt_level = Some(normalize_opt_level(&args[i])?);
+            }
+            _ if arg.starts_with("--port=") => {
+                port = Some(arg["--port=".len()..].to_string());
+            }
+            _ if arg.starts_with("-o=") => {
+                output = Some(PathBuf::from(&arg[3..]));
+            }
+            _ if arg.starts_with("--output=") => {
+                output = Some(PathBuf::from(&arg[9..]));
+            }
+            _ if arg.starts_with("--opt-level=") => {
+                opt_level = Some(normalize_opt_level(&arg["--opt-level=".len()..])?);
+            }
+            _ if is_short_opt_flag(arg) => {
+                opt_level = Some(normalize_opt_level(arg)?);
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unexpected option `{arg}` for `zevc flash`"));
+            }
+            _ => files.push(PathBuf::from(arg)),
+        }
+        i += 1;
+    }
+    Ok(Command::Flash {
+        files,
+        include_dirs,
+        board,
+        chip,
+        port,
         opt_level,
         output,
     })
@@ -940,6 +1157,8 @@ mod tests {
                 ],
                 include_dirs: vec![],
                 target: None,
+                board: None,
+                chip: None,
                 opt_level: None,
             }
         );
@@ -957,6 +1176,8 @@ mod tests {
                 files: vec![PathBuf::from("examples/cortex_m_demo.zev")],
                 include_dirs: vec![],
                 target: Some("cortex-m3".to_string()),
+                board: None,
+                chip: None,
                 opt_level: Some("-O2".to_string()),
             }
         );
@@ -975,6 +1196,8 @@ mod tests {
                 files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
                 include_dirs: vec![PathBuf::from("libs")],
                 target: Some("esp32c6".to_string()),
+                board: None,
+                chip: None,
                 opt_level: Some("-Oz".to_string()),
             }
         );
@@ -985,6 +1208,8 @@ mod tests {
                 files: vec![PathBuf::from("examples/arduino_uno_demo.zev")],
                 include_dirs: vec![],
                 target: Some("avr".to_string()),
+                board: None,
+                chip: None,
                 opt_level: Some("-Os".to_string()),
             }
         );
@@ -1002,6 +1227,8 @@ mod tests {
                 files: vec![PathBuf::from("examples/arduino_nano_every_demo.zev")],
                 include_dirs: vec![],
                 target: Some("nano-every".to_string()),
+                board: None,
+                chip: None,
                 opt_level: Some("-Os".to_string()),
             }
         );
@@ -1031,6 +1258,8 @@ mod tests {
                 files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
                 include_dirs: vec![],
                 target: None,
+                board: None,
+                chip: None,
                 opt_level: None,
                 output: Some(PathBuf::from("out.ll")),
             }
@@ -1052,6 +1281,8 @@ mod tests {
                 files: vec![PathBuf::from("examples/esp32c6_demo.zev")],
                 include_dirs: vec![],
                 target: Some("esp32c6".to_string()),
+                board: None,
+                chip: None,
                 opt_level: Some("-Oz".to_string()),
                 output: Some(PathBuf::from("out.ll")),
             }
@@ -1276,6 +1507,8 @@ mod tests {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
                 target: None,
+                board: None,
+                chip: None,
                 opt_level: None,
             }
         );
@@ -1315,6 +1548,8 @@ mod tests {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
                 target: None,
+                board: None,
+                chip: None,
                 opt_level: None,
                 output: None,
             }
@@ -1472,6 +1707,8 @@ mod tests {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: Vec::new(),
                 target: Some("avr".to_string()),
+                board: None,
+                chip: None,
                 opt_level: None,
                 output: None,
             }
@@ -1483,6 +1720,8 @@ mod tests {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: Vec::new(),
                 target: Some("nano-every".to_string()),
+                board: None,
+                chip: None,
                 opt_level: None,
                 output: None,
             }
@@ -1494,6 +1733,8 @@ mod tests {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: Vec::new(),
                 target: Some("rp2040".to_string()),
+                board: None,
+                chip: None,
                 opt_level: None,
                 output: None,
             }
@@ -1505,6 +1746,8 @@ mod tests {
                 files: vec![PathBuf::from("examples/pico_w_demo.zev")],
                 include_dirs: Vec::new(),
                 target: Some("rp2040".to_string()),
+                board: None,
+                chip: None,
                 opt_level: Some("-O2".to_string()),
             }
         );
@@ -1514,6 +1757,101 @@ mod tests {
         assert!(parse_args(["check", "-I="]).is_err());
         assert!(parse_args(["check", "--include="]).is_err());
         assert!(parse_args(["check", "-I", "", "app.zev"]).is_err());
+    }
+
+    #[test]
+    fn parses_unified_build_and_flash_and_board_chip_flags() {
+        assert_eq!(
+            parse_args([
+                "build",
+                "--board",
+                "rpi_pico_w",
+                "--emit-ll",
+                "-Oz",
+                "-I",
+                "bsp",
+                "examples/pico_w_demo.zev",
+                "-o",
+                "pico.uf2",
+            ])
+            .unwrap(),
+            Command::Build {
+                files: vec![PathBuf::from("examples/pico_w_demo.zev")],
+                include_dirs: vec![PathBuf::from("bsp")],
+                board: Some("rpi_pico_w".to_string()),
+                chip: None,
+                opt_level: Some("-Oz".to_string()),
+                emit_ll: true,
+                output: Some(PathBuf::from("pico.uf2")),
+            }
+        );
+
+        assert_eq!(
+            parse_args([
+                "build",
+                "--chip=esp32c6",
+                "--opt-level=O2",
+            ])
+            .unwrap(),
+            Command::Build {
+                files: Vec::new(),
+                include_dirs: Vec::new(),
+                board: None,
+                chip: Some("esp32c6".to_string()),
+                opt_level: Some("-O2".to_string()),
+                emit_ll: false,
+                output: None,
+            }
+        );
+
+        assert_eq!(
+            parse_args(["build"]).unwrap(),
+            Command::Build {
+                files: Vec::new(),
+                include_dirs: Vec::new(),
+                board: None,
+                chip: None,
+                opt_level: None,
+                emit_ll: false,
+                output: None,
+            }
+        );
+
+        assert_eq!(
+            parse_args([
+                "flash",
+                "--board=arduino_uno",
+                "--port",
+                "/dev/ttyACM0",
+                "examples/arduino_uno_demo.zev",
+            ])
+            .unwrap(),
+            Command::Flash {
+                files: vec![PathBuf::from("examples/arduino_uno_demo.zev")],
+                include_dirs: Vec::new(),
+                board: Some("arduino_uno".to_string()),
+                chip: None,
+                port: Some("/dev/ttyACM0".to_string()),
+                opt_level: None,
+                output: None,
+            }
+        );
+
+        assert_eq!(
+            parse_args(["ram", "--board", "rpi_pico_w", "examples/pico_w_demo.zev"]).unwrap(),
+            Command::Ram {
+                files: vec![PathBuf::from("examples/pico_w_demo.zev")],
+                include_dirs: Vec::new(),
+                target: None,
+                board: Some("rpi_pico_w".to_string()),
+                chip: None,
+                opt_level: None,
+            }
+        );
+
+        assert!(parse_args(["build", "--board"]).is_err());
+        assert!(parse_args(["build", "--chip="]).is_err());
+        assert!(parse_args(["flash", "--port"]).is_err());
     }
 
     #[test]
