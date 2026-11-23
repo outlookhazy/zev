@@ -2320,7 +2320,9 @@ impl<'a> Monomorphizer<'a> {
         matches.sort_by(|a, b| b.0.cmp(&a.0));
         let top_score = matches[0].0;
         let tied = matches.iter().take_while(|m| m.0 == top_score).count();
-        let (_, entry, bound_types, bound_consts) = matches.into_iter().next().unwrap();
+        let Some((_, entry, bound_types, bound_consts)) = matches.into_iter().next() else {
+            return None;
+        };
 
         if tied > 1 {
             let human_st = self
@@ -2623,10 +2625,9 @@ impl<'a> Monomorphizer<'a> {
                 let r_start = Box::new(self.rewrite_expr(start, env, scopes, Some(&r_vt)).0);
                 let r_end = Box::new(self.rewrite_expr(end, env, scopes, Some(&r_vt)).0);
                 scopes.push(BTreeMap::new());
-                scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(var_name.name.clone(), r_vt.clone());
+                if let Some(top) = scopes.last_mut() {
+                    top.insert(var_name.name.clone(), r_vt.clone());
+                }
                 let r_body = self.rewrite_block(body, env, scopes);
                 scopes.pop();
                 StmtKind::ForRange {
@@ -2647,10 +2648,9 @@ impl<'a> Monomorphizer<'a> {
                 let r_et = self.rewrite_type_expr(elem_ty, env);
                 let r_iter = Box::new(self.rewrite_expr(iter, env, scopes, None).0);
                 scopes.push(BTreeMap::new());
-                scopes
-                    .last_mut()
-                    .unwrap()
-                    .insert(elem_name.name.clone(), r_et.clone());
+                if let Some(top) = scopes.last_mut() {
+                    top.insert(elem_name.name.clone(), r_et.clone());
+                }
                 let r_body = self.rewrite_block(body, env, scopes);
                 scopes.pop();
                 StmtKind::ForEach {
@@ -3650,10 +3650,9 @@ impl<'a> Monomorphizer<'a> {
                 scopes.push(BTreeMap::new());
                 let err_param = clause.err_param.as_ref().map(|ep| {
                     let rty = self.rewrite_type_expr(&ep.ty, env);
-                    scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(ep.name.name.clone(), rty.clone());
+                    if let Some(top) = scopes.last_mut() {
+                        top.insert(ep.name.name.clone(), rty.clone());
+                    }
                     CatchParam {
                         ty: rty,
                         name: ep.name.clone(),
@@ -3662,10 +3661,9 @@ impl<'a> Monomorphizer<'a> {
                 });
                 let partial_param = clause.partial_param.as_ref().map(|pp| {
                     let rty = self.rewrite_type_expr(&pp.ty, env);
-                    scopes
-                        .last_mut()
-                        .unwrap()
-                        .insert(pp.name.name.clone(), rty.clone());
+                    if let Some(top) = scopes.last_mut() {
+                        top.insert(pp.name.name.clone(), rty.clone());
+                    }
                     CatchParam {
                         ty: rty,
                         name: pp.name.clone(),

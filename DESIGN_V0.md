@@ -7,7 +7,7 @@ In desktop and server software, the operating system lives outside the binary be
 **Elevator Pitch:**
 > *Go's "batteries-included" concurrency composability—backed by a zero-heap, single-stack cooperative bare-metal scheduler instead of a garbage collector.*
 
-Where [SyntropicOS](../SyntropicOS/README.md) pushes C99 to its limits via Duff's-device protothreads, manual state structs, and custom AST linters, **Zev** (`zevc` / `.zev`) makes the cooperative kernel, static coroutine packing, and ISR/task safety native to the compiler.
+Where traditional embedded C pushes C99 to its limits via Duff's-device protothreads, manual state structs, and external static linters, **Zev** (`zevc` / `.zev`) makes the cooperative kernel, static coroutine packing, and ISR/task safety native to the compiler.
 
 ---
 

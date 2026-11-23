@@ -28,9 +28,25 @@ use crate::arm_cortex_m::sanitize_ident;
 use crate::riscv32::assign_rv_irq_routes_for_spec;
 use crate::target_spec::{CpuIsa, TargetSpec};
 use crate::toolchain::{
-    CodegenError, CodegenOptions, inspect_elf_sizes, link_obj_to_elf, optimize_ll_with_opt,
-    synthesize_target_linker_script,
+    CodegenError, CodegenOptions, find_tool, inspect_elf_sizes, link_obj_to_elf,
+    optimize_ll_with_opt, synthesize_target_linker_script,
 };
+
+fn parse_rom_call_stack_bound(sym: &str) -> Option<u64> {
+    let s = sym.trim_start_matches('@');
+    if !s.starts_with("__syn_rom_call_") {
+        return None;
+    }
+    let (_, tail) = s.rsplit_once("_sb")?;
+    tail.parse::<u64>().ok()
+}
+
+fn is_exempt_indirect_wrapper(sym: &str) -> bool {
+    let s = sym.trim_start_matches('@');
+    s == "__syn_sched_loop"
+        || s.starts_with("__syn_rom_call_")
+        || s.starts_with("__syn_rom_noreturn_")
+}
 
 static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -88,7 +104,7 @@ impl HardwareStackProof {
         let _ = writeln!(out, "  Analyzer : {analyzer_label}");
         out.push_str("================================================================================\n\n");
 
-        out.push_str("1. Linked ELF Section Footprint (/bin/llvm-size)\n");
+        out.push_str("1. Linked ELF Section Footprint (llvm-size)\n");
         out.push_str("--------------------------------------------------------------------------------\n");
         let text_label = if self.code_in_ram {
             "SRAM Code (.text + .rodata)"
@@ -180,7 +196,10 @@ impl HardwareStackProof {
             "Hardware SRAM Budget", self.sram_budget_bytes
         );
         let margin: i64 = (self.sram_budget_bytes as i64) - (self.total_high_water_bytes as i64);
-        let verdict = if self.within_budget {
+        let verdict = if self.has_cycle {
+            "UNBOUNDED (recursion cycle detected in call graph; static stack bound cannot be proven)"
+                .to_string()
+        } else if self.within_budget {
             format!("PASS ({margin} B headroom remaining)")
         } else {
             format!("FAIL (exceeds SRAM budget by {} B!)", -margin)
@@ -212,30 +231,6 @@ impl Drop for TempProofDir {
     }
 }
 
-fn find_tool(preferred_abs: &'static str, fallback_name: &'static str) -> &'static str {
-    if Path::new(preferred_abs).exists() {
-        preferred_abs
-    } else {
-        fallback_name
-    }
-}
-
-fn parse_rom_call_stack_bound(sym: &str) -> Option<u64> {
-    let s = sym.trim_start_matches('@');
-    if !s.starts_with("__syn_rom_call_") {
-        return None;
-    }
-    let (_, tail) = s.rsplit_once("_sb")?;
-    tail.parse::<u64>().ok()
-}
-
-fn is_exempt_indirect_wrapper(sym: &str) -> bool {
-    let s = sym.trim_start_matches('@');
-    s == "__syn_sched_loop"
-        || s.starts_with("__syn_rom_call_")
-        || s.starts_with("__syn_rom_noreturn_")
-}
-
 fn compile_ll_to_obj_with_stack_sizes(
     ll_path: &Path,
     opt_ll_path: &Path,
@@ -252,7 +247,7 @@ fn compile_ll_to_obj_with_stack_sizes(
     };
 
     let llc = find_tool("/bin/llc", "llc");
-    let mut cmd = Command::new(llc);
+    let mut cmd = Command::new(&llc);
     cmd.arg(format!("-mtriple={}", spec.triple));
     if spec.isa != CpuIsa::HostX86_64Linux {
         if !spec.cpu.is_empty() {
@@ -290,7 +285,7 @@ fn compile_ll_to_obj_with_stack_sizes(
 
 fn inspect_elf_text_data_bss(elf_path: &Path) -> Result<(u64, u64, u64), CodegenError> {
     let llvm_size = find_tool("/bin/llvm-size", "llvm-size");
-    let out = Command::new(llvm_size)
+    let out = Command::new(&llvm_size)
         .arg("-A")
         .arg(elf_path)
         .output()
@@ -335,7 +330,7 @@ fn inspect_elf_text_data_bss(elf_path: &Path) -> Result<(u64, u64, u64), Codegen
 
 fn run_readobj_stack_sizes(obj_path: &Path) -> Result<String, CodegenError> {
     let readobj = find_tool("/bin/llvm-readobj", "llvm-readobj");
-    let out = Command::new(readobj)
+    let out = Command::new(&readobj)
         .arg("--stack-sizes")
         .arg(obj_path)
         .output()
@@ -357,7 +352,7 @@ fn run_readobj_stack_sizes(obj_path: &Path) -> Result<String, CodegenError> {
 
 fn run_objdump_disasm(elf_path: &Path) -> Result<String, CodegenError> {
     let objdump = find_tool("/bin/llvm-objdump", "llvm-objdump");
-    let out = Command::new(objdump)
+    let out = Command::new(&objdump)
         .arg("-d")
         .arg(elf_path)
         .output()
@@ -1451,7 +1446,7 @@ pub fn analyze_hardware_stack_high_water(
         .max(sched_task_stack_bytes)
         .saturating_add(worst_isr_stack_bytes);
     let total_high_water_bytes = static_sram_bytes.saturating_add(peak_stack_bytes);
-    let within_budget = total_high_water_bytes <= sram_budget_bytes;
+    let within_budget = !has_cycle && total_high_water_bytes <= sram_budget_bytes;
 
     Ok(HardwareStackProof {
         isa: spec.isa,

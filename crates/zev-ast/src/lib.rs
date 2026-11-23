@@ -14,6 +14,9 @@
 
 use std::fmt;
 
+pub mod builtins;
+pub use builtins::{BuiltinFn, SYS_NAMESPACE, SysMethod};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Source Spans & Identifiers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1118,8 +1121,8 @@ pub const RAW_BYTE_ESCAPE_PUA_BASE: u32 = 0xE000;
 pub fn push_raw_byte_escape(s: &mut String, byte: u8) {
     if byte <= 0x7F {
         s.push(byte as char);
-    } else {
-        s.push(char::from_u32(RAW_BYTE_ESCAPE_PUA_BASE + byte as u32).unwrap());
+    } else if let Some(ch) = char::from_u32(RAW_BYTE_ESCAPE_PUA_BASE + byte as u32) {
+        s.push(ch);
     }
 }
 

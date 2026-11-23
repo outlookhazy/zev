@@ -1,5 +1,6 @@
 CARGO ?= cargo
 PORT  ?= /dev/ttyACM0
+BUILD_DIR ?= $(or $(TMPDIR),/tmp)/zev-build
 ZEVC  := $(CARGO) run --quiet --bin zevc --
 
 .PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every pico flash-pico nucleo-f334r8 flash-nucleo-f334r8
@@ -42,31 +43,31 @@ qemu:
 	$(ZEVC) run-qemu examples/cortex_m_demo.zev
 
 esp32c6:
-	$(ZEVC) build --board esp32c6_pico examples/esp32c6_demo.zev -o /tmp/zev-esp32c6/esp32c6_demo.bin
+	$(ZEVC) build --board esp32c6_pico examples/esp32c6_demo.zev -o $(BUILD_DIR)/esp32c6/esp32c6_demo.bin
 
 flash-esp32c6:
 	$(ZEVC) flash --board esp32c6_pico examples/esp32c6_demo.zev --port $(PORT)
 
 uno:
-	$(ZEVC) build --board arduino_uno examples/arduino_uno_demo.zev -o /tmp/zev-avr/arduino_uno_demo.bin
+	$(ZEVC) build --board arduino_uno examples/arduino_uno_demo.zev -o $(BUILD_DIR)/avr/arduino_uno_demo.bin
 
 flash-uno:
 	$(ZEVC) flash --board arduino_uno examples/arduino_uno_demo.zev --port $(PORT)
 
 nano-every:
-	$(ZEVC) build --board arduino_nano_every examples/arduino_nano_every_demo.zev -o /tmp/zev-nano-every/arduino_nano_every_demo.bin
+	$(ZEVC) build --board arduino_nano_every examples/arduino_nano_every_demo.zev -o $(BUILD_DIR)/nano-every/arduino_nano_every_demo.bin
 
 flash-nano-every:
 	$(ZEVC) flash --board arduino_nano_every examples/arduino_nano_every_demo.zev --port $(PORT)
 
 pico:
-	$(ZEVC) build --board rpi_pico_w examples/pico_w_demo.zev -o /tmp/zev-rp2040/pico_w_demo.uf2
+	$(ZEVC) build --board rpi_pico_w examples/pico_w_demo.zev -o $(BUILD_DIR)/rp2040/pico_w_demo.uf2
 
 flash-pico:
 	$(ZEVC) flash --board rpi_pico_w examples/pico_w_demo.zev --port $(PORT)
 
 nucleo-f334r8:
-	$(ZEVC) build --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev -o /tmp/zev-f334r8/nucleo_f334r8_demo.bin
+	$(ZEVC) build --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev -o $(BUILD_DIR)/f334r8/nucleo_f334r8_demo.bin
 
 flash-nucleo-f334r8:
 	$(ZEVC) flash --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev --port $(PORT)

@@ -850,7 +850,8 @@ mod tests {
             });
             let c_src = zev_codegen_c::emit_c(&mir);
             assert!(!c_src.is_empty(), "empty C99 output for {}", e.code);
-            let mut clang = std::process::Command::new("/bin/clang")
+            let clang_bin = crate::runner::find_clang();
+            let mut clang = std::process::Command::new(&clang_bin)
                 .args([
                     "-std=c99",
                     "-fsyntax-only",
@@ -869,7 +870,9 @@ mod tests {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
-                .expect("spawn /bin/clang for doc snippet verification");
+                .unwrap_or_else(|err| {
+                    panic!("spawn `{clang_bin}` for doc snippet verification: {err}")
+                });
             {
                 use std::io::Write as _;
                 clang

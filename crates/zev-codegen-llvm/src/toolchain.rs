@@ -753,15 +753,86 @@ pub fn synthesize_linker_script(opts: &CodegenOptions) -> String {
     }
 }
 
-pub(crate) fn find_tool(preferred_abs: &'static str, fallback_name: &'static str) -> &'static str {
-    if Path::new(preferred_abs).exists() {
-        preferred_abs
-    } else {
-        fallback_name
+/// Locate an external LLVM/QEMU executable portably:
+/// `ZEV_LLVM_PREFIX` -> `PATH` -> `preferred_abs` -> versioned `name-23..name-18` -> `name`.
+pub fn find_tool(preferred_abs: &str, name: &str) -> String {
+    fn is_llvm_tool(name: &str) -> bool {
+        matches!(
+            name,
+            "clang"
+                | "opt"
+                | "llc"
+                | "ld.lld"
+                | "llvm-size"
+                | "llvm-objcopy"
+                | "llvm-objdump"
+                | "llvm-readobj"
+                | "llvm-nm"
+        )
     }
+
+    fn exe_candidate(dir: &Path, base: &str) -> Option<PathBuf> {
+        let p = dir.join(base);
+        if p.is_file() {
+            return Some(p);
+        }
+        #[cfg(windows)]
+        {
+            let with_exe = dir.join(format!("{base}.exe"));
+            if with_exe.is_file() {
+                return Some(with_exe);
+            }
+        }
+        None
+    }
+
+    if let Some(prefix) = std::env::var_os("ZEV_LLVM_PREFIX") {
+        let p = PathBuf::from(prefix);
+        for dir in [p.join("bin"), p] {
+            if let Some(found) = exe_candidate(&dir, name) {
+                return found.to_string_lossy().into_owned();
+            }
+        }
+    }
+
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|v| std::env::split_paths(&v).collect())
+        .unwrap_or_default();
+
+    for dir in &path_dirs {
+        if let Some(found) = exe_candidate(dir, name) {
+            return found.to_string_lossy().into_owned();
+        }
+    }
+
+    if !preferred_abs.is_empty() && Path::new(preferred_abs).is_file() {
+        return preferred_abs.to_string();
+    }
+
+    if is_llvm_tool(name) {
+        for ver in (18..=23).rev() {
+            let vname = format!("{name}-{ver}");
+            for dir in &path_dirs {
+                if let Some(found) = exe_candidate(dir, &vname) {
+                    return found.to_string_lossy().into_owned();
+                }
+            }
+            for sys_dir in [
+                Path::new("/usr/bin"),
+                Path::new("/bin"),
+                Path::new("/opt/homebrew/opt/llvm/bin"),
+            ] {
+                if let Some(found) = exe_candidate(sys_dir, &vname) {
+                    return found.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+
+    name.to_string()
 }
 
-/// Optimize textual LLVM 23 `.ll` IR via `/bin/opt` (`default<O1|O2|O3>`).
+/// Optimize textual LLVM `.ll` IR via `opt` (`default<O1|O2|O3>`).
 pub fn optimize_ll_with_opt(
     in_ll: &Path,
     out_ll: &Path,
@@ -778,7 +849,7 @@ pub fn optimize_ll_with_opt(
     }
 
     let opt = find_tool("/bin/opt", "opt");
-    let mut cmd = Command::new(opt);
+    let mut cmd = Command::new(&opt);
     cmd.arg(format!("-mtriple={}", spec.triple));
     if spec.isa != CpuIsa::HostX86_64Linux && !spec.cpu.is_empty() {
         cmd.arg(format!("-mcpu={}", spec.cpu));
@@ -806,7 +877,7 @@ pub fn optimize_ll_with_opt(
     Ok(())
 }
 
-/// Compile textual LLVM 23 `.ll` IR to an ELF object file `.o` via `/bin/opt` + `/bin/llc`.
+/// Compile textual LLVM `.ll` IR to an ELF object file `.o` via `opt` + `llc`.
 pub fn compile_ll_to_obj(
     ll_path: &Path,
     obj_path: &Path,
@@ -823,7 +894,7 @@ pub fn compile_ll_to_obj(
     };
 
     let llc = find_tool("/bin/llc", "llc");
-    let mut cmd = Command::new(llc);
+    let mut cmd = Command::new(&llc);
     cmd.arg(format!("-mtriple={}", spec.triple));
     if spec.isa != CpuIsa::HostX86_64Linux {
         if !spec.cpu.is_empty() {
@@ -857,14 +928,14 @@ pub fn compile_ll_to_obj(
     Ok(())
 }
 
-/// Link a compiled `.o` object into a freestanding Cortex-M3 `.elf` via `/bin/ld.lld`.
+/// Link a compiled `.o` object into a freestanding `.elf` via `ld.lld`.
 pub fn link_obj_to_elf(
     obj_path: &Path,
     ld_path: &Path,
     elf_path: &Path,
 ) -> Result<(), CodegenError> {
     let lld = find_tool("/bin/ld.lld", "ld.lld");
-    let out = Command::new(lld)
+    let out = Command::new(&lld)
         .arg("-T")
         .arg(ld_path)
         .arg("--gc-sections")
@@ -884,10 +955,10 @@ pub fn link_obj_to_elf(
     Ok(())
 }
 
-/// Inspect `.text`, `.data`, and `.bss` sizes of a linked `.elf` using `/bin/llvm-size`.
+/// Inspect `.text`, `.data`, and `.bss` sizes of a linked `.elf` using `llvm-size`.
 pub fn inspect_elf_sizes(elf_path: &Path) -> Result<ElfSectionSizes, CodegenError> {
     let llvm_size = find_tool("/bin/llvm-size", "llvm-size");
-    let out = Command::new(llvm_size)
+    let out = Command::new(&llvm_size)
         .arg(elf_path)
         .output()
         .map_err(|e| {
@@ -1088,7 +1159,7 @@ pub fn run_elf_in_qemu(
     let qemu = find_tool("/bin/qemu-system-arm", "qemu-system-arm");
     let start = Instant::now();
 
-    let mut child = Command::new(qemu)
+    let mut child = Command::new(&qemu)
         .arg("-M")
         .arg(&qemu_opts.machine)
         .arg("-cpu")
@@ -1111,17 +1182,21 @@ pub fn run_elf_in_qemu(
         .spawn()
         .map_err(|e| CodegenError::new("qemu", format!("failed to spawn `{qemu}`: {e}")))?;
 
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
+    let stdout_opt = child.stdout.take();
+    let stderr_opt = child.stderr.take();
 
     let out_handle = thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
+        if let Some(mut stdout_pipe) = stdout_opt {
+            let _ = stdout_pipe.read_to_end(&mut buf);
+        }
         String::from_utf8_lossy(&buf).into_owned()
     });
     let err_handle = thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
+        if let Some(mut stderr_pipe) = stderr_opt {
+            let _ = stderr_pipe.read_to_end(&mut buf);
+        }
         String::from_utf8_lossy(&buf).into_owned()
     });
 
@@ -1167,7 +1242,7 @@ pub fn run_elf_in_qemu(
 /// Verify textual `.ll` IR using LLVM 23 `/bin/opt -passes=verify -disable-output`.
 pub fn verify_ll_with_opt(ll_path: &Path) -> Result<(), CodegenError> {
     let opt = find_tool("/bin/opt", "opt");
-    let out = Command::new(opt)
+    let out = Command::new(&opt)
         .arg("-passes=verify")
         .arg("-disable-output")
         .arg(ll_path)
@@ -1224,7 +1299,7 @@ pub fn objcopy_elf_to_bin(elf_path: &Path, out_bin: &Path) -> Result<Vec<u8>, Co
         }
     }
     let objcopy = find_tool("/bin/llvm-objcopy", "llvm-objcopy");
-    let out = Command::new(objcopy)
+    let out = Command::new(&objcopy)
         .arg("-O")
         .arg("binary")
         .arg(elf_path)
@@ -1460,9 +1535,8 @@ pub fn flash_target_image(
     }
 
     let raw_prog = &expanded[0];
-    let bin_cand = Path::new("/bin").join(raw_prog);
-    let prog = if !raw_prog.contains('/') && bin_cand.is_file() {
-        bin_cand.to_string_lossy().into_owned()
+    let prog = if !raw_prog.contains('/') && !raw_prog.contains('\\') {
+        find_tool("", raw_prog)
     } else {
         raw_prog.clone()
     };
@@ -1602,7 +1676,7 @@ pub fn pack_rp2040_uf2(bin: &[u8], base_addr: u32) -> Vec<u8> {
             ImageFormat::Uf2 { family_id, .. } => Some(family_id),
             _ => None,
         })
-        .expect("rpi_pico_w TOML specifies uf2 family_id");
+        .unwrap_or(crate::RP2040_UF2_FAMILY_ID);
     pack_uf2(bin, base_addr, family_id)
 }
 

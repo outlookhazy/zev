@@ -2288,12 +2288,9 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
         // Topologically sort yielding functions so callees precede callers!
         let ordered_yielding = self.toposort_yielding_fns();
         for fname in &ordered_yielding {
-            let func = self
-                .m
-                .functions
-                .iter()
-                .find(|f| f.name == *fname)
-                .unwrap();
+            let Some(func) = self.m.functions.iter().find(|f| f.name == *fname) else {
+                continue;
+            };
             if let MirFnBody::Coroutine { child_slots, .. } = &func.body {
                 let env_ret = func.envelope_return_type();
                 let ret_opt = if env_ret.is_void() {

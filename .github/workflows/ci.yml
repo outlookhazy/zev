@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Clang, LLVM, LLD, and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm lld qemu-system-arm
+
+      - name: Run workspace test suite
+        run: cargo test --workspace -- --test-threads=4
+
+      - name: Verify built-in docs and example checks
+        run: make doc && make check
+
+      - name: Run Host ASan/UBSan simulations
+        run: |
+          make demo
+          cargo run --quiet --bin zevc -- run --sanitize examples/portable_controller_demo.zev
+
+      - name: Run QEMU Cortex-M3 firmware tests
+        run: |
+          make qemu
+          cargo run --quiet --bin zevc -- run-qemu examples/portable_controller_demo.zev
+
+      - name: Build bare-metal firmware images
+        run: make nucleo-f334r8 esp32c6 pico uno nano-every

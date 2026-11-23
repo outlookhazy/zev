@@ -24,7 +24,7 @@ pub use toolchain::{
     AvrImageResult, CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
     Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, Rp2040ImageResult,
     TargetArch, TargetBuildArtifact, build_target_image, compile_ll_to_elf, compile_ll_to_obj,
-    flash_avr_nano_every_bin, flash_avr_uno_bin, flash_esp32c6_bin, flash_rp2040_uf2,
+    find_tool, flash_avr_nano_every_bin, flash_avr_uno_bin, flash_esp32c6_bin, flash_rp2040_uf2,
     flash_target_image, inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf,
     objcopy_elf_to_avr_bin, objcopy_elf_to_avr_nano_every_bin, objcopy_elf_to_esp32c6_bin,
     objcopy_elf_to_rp2040_uf2, optimize_ll_with_opt, pack_rp2040_uf2, pack_uf2, run_elf_in_qemu,
@@ -197,7 +197,7 @@ mod tests {
     use std::time::Instant;
 
     fn test_out_dir() -> PathBuf {
-        PathBuf::from(format!("/tmp/zev-llvm-tests-{}", std::process::id()))
+        std::env::temp_dir().join(format!("zev-llvm-tests-{}", std::process::id()))
     }
 
     fn repo_root() -> PathBuf {
@@ -278,9 +278,9 @@ mod tests {
             img.bin_size
         );
 
-        // 3. Inspect RISC-V disassembly via `/bin/llvm-objdump -d` to verify `@_start` at `0x42000008`
+        // 3. Inspect RISC-V disassembly via `llvm-objdump -d` to verify `@_start` at `0x42000008`
         //    and `.iram1` WS2812B waveform driver at `0x40800000`!
-        let objdump = Command::new("/bin/llvm-objdump")
+        let objdump = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
             .arg("-d")
             .arg(&img.elf.elf_path)
             .output()
@@ -2454,7 +2454,8 @@ mod tests {
         let raw_ll_path = dir.join("fnptr_no_fsec.ll");
         let raw_obj_path = dir.join("fnptr_no_fsec.o");
         std::fs::write(&raw_ll_path, &raw_ll).unwrap();
-        let llc_out = Command::new("/bin/llc")
+        let llc = crate::toolchain::find_tool("/bin/llc", "llc");
+        let llc_out = Command::new(&llc)
             .arg("-mtriple=thumbv7m-none-eabi")
             .arg("-mcpu=cortex-m3")
             .arg("-filetype=obj")
@@ -2462,7 +2463,7 @@ mod tests {
             .arg("-o")
             .arg(&raw_obj_path)
             .output()
-            .expect("invoke /bin/llc without --function-sections");
+            .expect("invoke llc without --function-sections");
         assert!(
             llc_out.status.success(),
             "llc without --function-sections failed:\n{}",
@@ -3233,10 +3234,10 @@ mod tests {
                 .any(|s| s == "__syn_vec_irq_37")
         );
 
-        let nm = Command::new("/bin/llvm-nm")
+        let nm = Command::new(crate::toolchain::find_tool("/bin/llvm-nm", "llvm-nm"))
             .arg(&img.elf.elf_path)
             .output()
-            .expect("invoke /bin/llvm-nm");
+            .expect("invoke llvm-nm");
         assert!(nm.status.success());
         let nm_out = String::from_utf8_lossy(&nm.stdout);
         let vt_line = nm_out
@@ -3609,7 +3610,7 @@ fn main() {
         std::fs::write(&h_ll_path, &host_ll_64).unwrap();
         verify_ll_with_opt(&h_ll_path).expect("opt verify host 64 idx");
         compile_ll_to_obj(&h_ll_path, &h_obj_path, &h_opts).expect("llc host 64 idx");
-        let link = Command::new("/bin/clang")
+        let link = Command::new(crate::toolchain::find_tool("/bin/clang", "clang"))
             .args([
                 h_obj_path.to_str().unwrap(),
                 "-o",
@@ -3670,7 +3671,8 @@ fn main() {
             img.sram_static_bytes
         );
 
-        let objdump = Command::new("/bin/llvm-objdump")
+        let objdump_bin = crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump");
+        let objdump = Command::new(&objdump_bin)
             .args(["-d", "--start-address=0x0000", "--stop-address=0x0068"])
             .arg(&img.elf.elf_path)
             .output()
@@ -3680,7 +3682,7 @@ fn main() {
         assert!(disasm.contains("00000000 <_start>:"), "disasm:\n{disasm}");
         assert!(disasm.contains("__syn_avr_reset") || disasm.contains("jmp"), "disasm:\n{disasm}");
 
-        let full_objdump = Command::new("/bin/llvm-objdump")
+        let full_objdump = Command::new(&objdump_bin)
             .arg("-d")
             .arg(&img.elf.elf_path)
             .output()
@@ -3791,7 +3793,7 @@ fn main() {
             assert_eq!(mend, 0x0AB1_6F30);
         }
 
-        let objdump = Command::new("/bin/llvm-objdump")
+        let objdump = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
             .args(["-d", "--start-address=0x20000000", "--stop-address=0x20000020"])
             .arg(&img.elf.elf_path)
             .output()
@@ -3998,7 +4000,8 @@ fn main() {
             img.sram_static_bytes
         );
 
-        let vec_objdump = Command::new("/bin/llvm-objdump")
+        let objdump_bin = crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump");
+        let vec_objdump = Command::new(&objdump_bin)
             .args(["-d", "--start-address=0x0000", "--stop-address=0x00a0"])
             .arg(&img.elf.elf_path)
             .output()
@@ -4014,7 +4017,7 @@ fn main() {
             "expected 40 `jmp` vectors in 0x0000..0x00A0, got {jmp_count}:\n{vec_disasm}"
         );
 
-        let full_objdump = Command::new("/bin/llvm-objdump")
+        let full_objdump = Command::new(&objdump_bin)
             .arg("-d")
             .arg(&img.elf.elf_path)
             .output()
@@ -4144,7 +4147,7 @@ fn main() {
             }
         }
 
-        let disasm_out = Command::new("/bin/llvm-objdump")
+        let disasm_out = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
             .args(["-d", "--symbolize-operands"])
             .arg(&img.elf.elf_path)
             .output()
@@ -6170,7 +6173,10 @@ fn main() {
             "avr.rs",
             "riscv32.rs",
             "runtime_ir.rs",
-            "mir_codegen.rs",
+            "mir_codegen/mod.rs",
+            "mir_codegen/module_emit.rs",
+            "mir_codegen/fn_builder.rs",
+            "mir_codegen/expr_emit.rs",
             "stack_sizes.rs",
         ];
         let forbidden_core = [
@@ -6978,5 +6984,50 @@ fn main() {
         assert!(rp_proof.within_budget, "rpi_pico_w over SRAM budget");
 
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn stack_high_water_marks_recursive_call_cycle_unbounded() {
+        let src = r#"
+watch<u32> in_w = 5;
+watch<u32> out_w = 0;
+
+u32 fib(u32 n) {
+    if (n <= 1u32) {
+        return n;
+    }
+    return fib(n - 1u32) + fib(n - 2u32);
+}
+
+task worker() {
+    u32 v = fib(in_w.read());
+    out_w.publish(v);
+    loop {
+        delay(50ms);
+    }
+}
+
+fn main() {
+    spawn worker() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse recursive fact");
+        let (mono_progs, _) =
+            zev_sema::analyze_and_monomorphize_programs(&[prog], &zev_sema::AnalyzeOptions::default())
+                .into_result()
+                .expect("non-yielding recursion passes sema");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower recursive fact to MIR");
+        let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::default())
+            .expect("stack analysis for recursive fact");
+        assert!(proof.has_cycle, "expected recursion cycle to be flagged");
+        assert!(
+            !proof.within_budget,
+            "recursive cycle must not claim within_budget == true"
+        );
+        let table = proof.format_table();
+        assert!(
+            table.contains("UNBOUNDED"),
+            "expected UNBOUNDED verdict in stack table:\n{table}"
+        );
     }
 }

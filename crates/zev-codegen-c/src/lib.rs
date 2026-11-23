@@ -49,10 +49,65 @@ mod tests {
         }
     }
 
-    /// Compile `c_src` + `harness_c` with `/bin/clang -std=c99 -Wall -Wextra -Werror -fsanitize=address,undefined`,
+    fn find_clang() -> String {
+        fn exe_candidate(dir: &std::path::Path, base: &str) -> Option<std::path::PathBuf> {
+            let p = dir.join(base);
+            if p.is_file() {
+                return Some(p);
+            }
+            #[cfg(windows)]
+            {
+                let with_exe = dir.join(format!("{base}.exe"));
+                if with_exe.is_file() {
+                    return Some(with_exe);
+                }
+            }
+            None
+        }
+
+        if let Some(prefix) = std::env::var_os("ZEV_LLVM_PREFIX") {
+            let p = std::path::PathBuf::from(prefix);
+            for dir in [p.join("bin"), p] {
+                if let Some(found) = exe_candidate(&dir, "clang") {
+                    return found.to_string_lossy().into_owned();
+                }
+            }
+        }
+        let path_dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+            .map(|v| std::env::split_paths(&v).collect())
+            .unwrap_or_default();
+        for dir in &path_dirs {
+            if let Some(found) = exe_candidate(dir, "clang") {
+                return found.to_string_lossy().into_owned();
+            }
+        }
+        if std::path::Path::new("/bin/clang").is_file() {
+            return "/bin/clang".to_string();
+        }
+        for ver in (18..=23).rev() {
+            let vname = format!("clang-{ver}");
+            for dir in &path_dirs {
+                if let Some(found) = exe_candidate(dir, &vname) {
+                    return found.to_string_lossy().into_owned();
+                }
+            }
+            for sys_dir in [
+                std::path::Path::new("/usr/bin"),
+                std::path::Path::new("/bin"),
+                std::path::Path::new("/opt/homebrew/opt/llvm/bin"),
+            ] {
+                if let Some(found) = exe_candidate(sys_dir, &vname) {
+                    return found.to_string_lossy().into_owned();
+                }
+            }
+        }
+        "clang".to_string()
+    }
+
+    /// Compile `c_src` + `harness_c` with `clang -std=c99 -Wall -Wextra -Werror -fsanitize=address,undefined`,
     /// verify object file has zero `malloc`/`calloc`/`realloc` symbols, and run the binary!
     fn compile_and_run_clang_sanitized(test_name: &str, c_src: &str, extra_driver_c: Option<&str>) -> String {
-        let dir = format!("/tmp/zev-c-tests-{}/{test_name}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("zev-c-tests-{}", std::process::id())).join(test_name);
         fs::create_dir_all(&dir).expect("mkdir test dir");
 
         let full_c = match extra_driver_c {
@@ -60,13 +115,14 @@ mod tests {
             None => c_src.to_string(),
         };
 
-        let c_path = format!("{dir}/gen.c");
-        let obj_path = format!("{dir}/gen.o");
-        let bin_path = format!("{dir}/gen_bin");
+        let c_path = dir.join("gen.c");
+        let obj_path = dir.join("gen.o");
+        let bin_path = dir.join("gen_bin");
         fs::write(&c_path, &full_c).expect("write gen.c");
 
+        let clang = find_clang();
         // 1. Compile object file (without ASan instrumentation) to verify ZERO heap allocator symbols!
-        let obj_out = Command::new("/bin/clang")
+        let obj_out = Command::new(&clang)
             .args([
                 "-std=c99",
                 "-Wall",
@@ -74,10 +130,10 @@ mod tests {
                 "-Werror",
                 "-O2",
                 "-c",
-                &c_path,
-                "-o",
-                &obj_path,
             ])
+            .arg(&c_path)
+            .arg("-o")
+            .arg(&obj_path)
             .output()
             .expect("invoke clang -c");
         if !obj_out.status.success() {
@@ -101,7 +157,7 @@ mod tests {
         }
 
         // 2. Compile & link with AddressSanitizer + UndefinedBehaviorSanitizer and execute!
-        let bin_out = Command::new("/bin/clang")
+        let bin_out = Command::new(&clang)
             .args([
                 "-std=c99",
                 "-Wall",
@@ -110,10 +166,10 @@ mod tests {
                 "-g",
                 "-fsanitize=address,undefined",
                 "-fno-sanitize-recover=all",
-                &c_path,
-                "-o",
-                &bin_path,
             ])
+            .arg(&c_path)
+            .arg("-o")
+            .arg(&bin_path)
             .output()
             .expect("invoke clang sanitizer build");
         if !bin_out.status.success() {
@@ -1781,12 +1837,15 @@ fn main() {
         let c_code = emit_c(&mir);
 
         // Verify freestanding mode (-DSYN_FREESTANDING) compiles with zero warnings!
-        let fs_dir = format!("/tmp/zev-c-tests-{}/freestanding_check", std::process::id());
+        let fs_dir = std::env::temp_dir()
+            .join(format!("zev-c-tests-{}", std::process::id()))
+            .join("freestanding_check");
         fs::create_dir_all(&fs_dir).unwrap();
-        let fs_c = format!("{fs_dir}/fs.c");
-        let fs_o = format!("{fs_dir}/fs.o");
+        let fs_c = fs_dir.join("fs.c");
+        let fs_o = fs_dir.join("fs.o");
         fs::write(&fs_c, &c_code).unwrap();
-        let fs_out = Command::new("/bin/clang")
+        let clang = find_clang();
+        let fs_out = Command::new(&clang)
             .args([
                 "-std=c99",
                 "-Wall",
@@ -1794,10 +1853,10 @@ fn main() {
                 "-Werror",
                 "-DSYN_FREESTANDING",
                 "-c",
-                &fs_c,
-                "-o",
-                &fs_o,
             ])
+            .arg(&fs_c)
+            .arg("-o")
+            .arg(&fs_o)
             .output()
             .unwrap();
         assert!(
@@ -2009,12 +2068,15 @@ fn main() {
     }
 
     fn assert_freestanding_compiles(test_name: &str, c_src: &str) {
-        let fs_dir = format!("/tmp/zev-c-tests-{}/{test_name}_fs", std::process::id());
+        let fs_dir = std::env::temp_dir()
+            .join(format!("zev-c-tests-{}", std::process::id()))
+            .join(format!("{test_name}_fs"));
         fs::create_dir_all(&fs_dir).unwrap();
-        let fs_c = format!("{fs_dir}/fs.c");
-        let fs_o = format!("{fs_dir}/fs.o");
+        let fs_c = fs_dir.join("fs.c");
+        let fs_o = fs_dir.join("fs.o");
         fs::write(&fs_c, c_src).unwrap();
-        let fs_out = Command::new("/bin/clang")
+        let clang = find_clang();
+        let fs_out = Command::new(&clang)
             .args([
                 "-std=c99",
                 "-Wall",
@@ -2022,10 +2084,10 @@ fn main() {
                 "-Werror",
                 "-DSYN_FREESTANDING",
                 "-c",
-                &fs_c,
-                "-o",
-                &fs_o,
             ])
+            .arg(&fs_c)
+            .arg("-o")
+            .arg(&fs_o)
             .output()
             .expect("invoke clang -DSYN_FREESTANDING -c");
         assert!(

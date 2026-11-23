@@ -207,6 +207,13 @@ fn search_dirs_for_file(
         push_unique(inc.clone());
     }
 
+    if let Ok(zev_home) = std::env::var("ZEV_HOME") {
+        let trimmed = zev_home.trim();
+        if !trimmed.is_empty() {
+            push_unique(PathBuf::from(trimmed));
+        }
+    }
+
     dirs
 }
 
@@ -461,77 +468,7 @@ fn collect_import_aware_generic_names_with_entries(
     out
 }
 
-/// Embedded fallback source lookup for built-in library modules when no disk override exists.
-pub fn embedded_module_source(dot_path: &str) -> Option<&'static str> {
-    match dot_path {
-        "arch.cortex_m" => Some(include_str!("../../../arch/cortex_m.zev")),
-        "chip.stm32g4" => Some(include_str!("../../../chip/stm32g4.zev")),
-        "chip.stm32f334" => Some(include_str!("../../../chip/stm32f334.zev")),
-        "chip.stm32f3" | "chip.stm32f3.mod" => {
-            Some(include_str!("../../../chip/stm32f3/mod.zev"))
-        }
-        "chip.stm32f3.adc" => Some(include_str!("../../../chip/stm32f3/adc.zev")),
-        "chip.stm32f3.bxcan" => Some(include_str!("../../../chip/stm32f3/bxcan.zev")),
-        "chip.stm32f3.dac_comp" => Some(include_str!("../../../chip/stm32f3/dac_comp.zev")),
-        "chip.stm32f3.dma" => Some(include_str!("../../../chip/stm32f3/dma.zev")),
-        "chip.stm32f3.flash" => Some(include_str!("../../../chip/stm32f3/flash.zev")),
-        "chip.stm32f3.gpio" => Some(include_str!("../../../chip/stm32f3/gpio.zev")),
-        "chip.stm32f3.hrtim" => Some(include_str!("../../../chip/stm32f3/hrtim.zev")),
-        "chip.stm32f3.i2c" => Some(include_str!("../../../chip/stm32f3/i2c.zev")),
-        "chip.stm32f3.rcc" => Some(include_str!("../../../chip/stm32f3/rcc.zev")),
-        "chip.stm32f3.spi" => Some(include_str!("../../../chip/stm32f3/spi.zev")),
-        "chip.stm32f3.tim" => Some(include_str!("../../../chip/stm32f3/tim.zev")),
-        "chip.stm32f3.uart" => Some(include_str!("../../../chip/stm32f3/uart.zev")),
-        "chip.lm3s6965" => Some(include_str!("../../../chip/lm3s6965.zev")),
-        "chip.esp32c6" => Some(include_str!("../../../chip/esp32c6.zev")),
-        "chip.rp2040" => Some(include_str!("../../../chip/rp2040.zev")),
-        "chip.atmega328p" => Some(include_str!("../../../chip/atmega328p.zev")),
-        "bsp.sim" => Some(include_str!("../../../bsp/sim.zev")),
-        "bsp.motor_drive" => Some(include_str!("../../../bsp/motor_drive.zev")),
-        "bsp.lm3s6965_evb" => Some(include_str!("../../../bsp/lm3s6965_evb.zev")),
-        "bsp.nucleo_f334r8" => Some(include_str!("../../../bsp/nucleo_f334r8.zev")),
-        "bsp.esp32c6_pico" => Some(include_str!("../../../bsp/esp32c6_pico.zev")),
-        "bsp.rpi_pico_w" => Some(include_str!("../../../bsp/rpi_pico_w.zev")),
-        "bsp.rpi_pico_w_board" => Some(include_str!("../../../bsp/rpi_pico_w_board.zev")),
-        "bsp.arduino_uno" => Some(include_str!("../../../bsp/arduino_uno.zev")),
-        "std.math" => Some(include_str!("../../../std/math.zev")),
-        "std.str" => Some(include_str!("../../../std/str.zev")),
-        "std.fmt" => Some(include_str!("../../../std/fmt.zev")),
-        "std.io" => Some(include_str!("../../../std/io.zev")),
-        "std.bus" => Some(include_str!("../../../std/bus.zev")),
-        "hal/sim.time" => Some(include_str!("../../../hal/sim/time.zev")),
-        "hal/sim.gpio" => Some(include_str!("../../../hal/sim/gpio.zev")),
-        "hal/sim.pwm" => Some(include_str!("../../../hal/sim/pwm.zev")),
-        "hal/sim.adc" => Some(include_str!("../../../hal/sim/adc.zev")),
-        "hal/sim.i2c" => Some(include_str!("../../../hal/sim/i2c.zev")),
-        "hal/sim.spi" => Some(include_str!("../../../hal/sim/spi.zev")),
-        "hal/stm32f3.time" => Some(include_str!("../../../hal/stm32f3/time.zev")),
-        "hal/stm32f3.gpio" => Some(include_str!("../../../hal/stm32f3/gpio.zev")),
-        "hal/stm32f3.pwm" => Some(include_str!("../../../hal/stm32f3/pwm.zev")),
-        "hal/stm32f3.adc" => Some(include_str!("../../../hal/stm32f3/adc.zev")),
-        "hal/stm32f3.i2c" => Some(include_str!("../../../hal/stm32f3/i2c.zev")),
-        "hal/stm32f3.spi" => Some(include_str!("../../../hal/stm32f3/spi.zev")),
-        "hal/esp32c6.time" => Some(include_str!("../../../hal/esp32c6/time.zev")),
-        "hal/esp32c6.gpio" => Some(include_str!("../../../hal/esp32c6/gpio.zev")),
-        "hal/esp32c6.pwm" => Some(include_str!("../../../hal/esp32c6/pwm.zev")),
-        "hal/esp32c6.adc" => Some(include_str!("../../../hal/esp32c6/adc.zev")),
-        "hal/esp32c6.i2c" => Some(include_str!("../../../hal/esp32c6/i2c.zev")),
-        "hal/esp32c6.spi" => Some(include_str!("../../../hal/esp32c6/spi.zev")),
-        "hal/lm3s6965.time" => Some(include_str!("../../../hal/lm3s6965/time.zev")),
-        "hal/lm3s6965.gpio" => Some(include_str!("../../../hal/lm3s6965/gpio.zev")),
-        "hal/lm3s6965.pwm" => Some(include_str!("../../../hal/lm3s6965/pwm.zev")),
-        "hal/lm3s6965.adc" => Some(include_str!("../../../hal/lm3s6965/adc.zev")),
-        "hal/lm3s6965.i2c" => Some(include_str!("../../../hal/lm3s6965/i2c.zev")),
-        "hal/lm3s6965.spi" => Some(include_str!("../../../hal/lm3s6965/spi.zev")),
-        "hal/rp2040.time" => Some(include_str!("../../../hal/rp2040/time.zev")),
-        "hal/rp2040.gpio" => Some(include_str!("../../../hal/rp2040/gpio.zev")),
-        "hal/rp2040.pwm" => Some(include_str!("../../../hal/rp2040/pwm.zev")),
-        "hal/rp2040.adc" => Some(include_str!("../../../hal/rp2040/adc.zev")),
-        "hal/rp2040.i2c" => Some(include_str!("../../../hal/rp2040/i2c.zev")),
-        "hal/rp2040.spi" => Some(include_str!("../../../hal/rp2040/spi.zev")),
-        _ => None,
-    }
-}
+include!(concat!(env!("OUT_DIR"), "/embedded_modules.rs"));
 
 /// Recursively resolve all `import` declarations across `programs` + `include_dirs`, enforce
 /// `pub` visibility and acyclic module graphs (`E0030`), canonicalize non-root module symbols to
@@ -696,7 +633,9 @@ impl ModuleLinker {
         let mut seen_extern_c: BTreeMap<String, (FnDecl, usize)> = BTreeMap::new();
 
         for (prog_idx, key) in order.iter().enumerate() {
-            let m = self.loaded.get(key).expect("loaded module in order").clone();
+            let Some(m) = self.loaded.get(key).cloned() else {
+                continue;
+            };
             let mut diags = Vec::new();
             let rewritten = rewrite_program(
                 &m.program,
@@ -2886,5 +2825,25 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
                 && types_structurally_equal(rx, ry)
         }
         _ => a.kind == b.kind,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::embedded_module_source;
+
+    #[test]
+    fn embedded_modules_generated_from_disk_tree() {
+        assert!(embedded_module_source("chip.atmega4809").is_some());
+        assert!(embedded_module_source("bsp.arduino_nano_every").is_some());
+        assert!(embedded_module_source("hal/rp2040.gpio").is_some());
+        assert!(embedded_module_source("chip.stm32f3").is_some());
+        assert_eq!(
+            embedded_module_source("chip.stm32f3"),
+            embedded_module_source("chip.stm32f3.mod")
+        );
+        assert!(embedded_module_source("arch.cortex_m").is_some());
+        assert!(embedded_module_source("std.fmt").is_some());
+        assert!(embedded_module_source("nonexistent.mod").is_none());
     }
 }

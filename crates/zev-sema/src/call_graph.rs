@@ -689,15 +689,17 @@ impl CallGraph {
                         if !self.indices.contains_key(w) {
                             self.strongconnect(w);
                             let lw = self.lowlink[w];
-                            let lv = self.lowlink.get_mut(v).unwrap();
-                            if lw < *lv {
-                                *lv = lw;
+                            if let Some(lv) = self.lowlink.get_mut(v) {
+                                if lw < *lv {
+                                    *lv = lw;
+                                }
                             }
                         } else if self.on_stack.contains(w) {
                             let iw = self.indices[w];
-                            let lv = self.lowlink.get_mut(v).unwrap();
-                            if iw < *lv {
-                                *lv = iw;
+                            if let Some(lv) = self.lowlink.get_mut(v) {
+                                if iw < *lv {
+                                    *lv = iw;
+                                }
                             }
                         }
                     }

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,12 +34,8 @@ impl Drop for TempWorkDir {
     }
 }
 
-fn find_clang() -> &'static str {
-    if Path::new("/bin/clang").exists() {
-        "/bin/clang"
-    } else {
-        "clang"
-    }
+pub(crate) fn find_clang() -> String {
+    zev_codegen_llvm::find_tool("/bin/clang", "clang")
 }
 
 pub fn compile_and_run_c99(
@@ -56,7 +52,7 @@ pub fn compile_and_run_c99(
         .map_err(|e| format!("failed to write generated C99 to `{}`: {e}", c_path.display()))?;
 
     let clang = find_clang();
-    let mut cc = Command::new(clang);
+    let mut cc = Command::new(&clang);
     cc.arg("-std=c99").arg("-O2");
     if sanitize {
         cc.arg("-g").arg("-fsanitize=address,undefined");

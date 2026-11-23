@@ -4,6 +4,8 @@ use crate::error::ParseError;
 use crate::token::{LexedFormatPart, Token, TokenKind};
 use zev_ast::*;
 
+const MAX_PARSER_RECURSION_DEPTH: usize = 24;
+
 #[derive(Copy, Clone)]
 struct Checkpoint {
     pos: usize,
@@ -37,6 +39,8 @@ pub struct Parser<'a> {
     import_aliases: BTreeSet<String>,
     /// Active lexical value scopes inside `fn` / `task` / `isr` bodies.
     value_scopes: Vec<BTreeSet<String>>,
+    /// Current nesting depth across recursive expression, statement, block, and type parsers.
+    recursion_depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -65,6 +69,7 @@ impl<'a> Parser<'a> {
             generic_const_params: BTreeSet::new(),
             import_aliases: BTreeSet::new(),
             value_scopes: Vec::new(),
+            recursion_depth: 0,
         };
         p.prescan_top_level();
         p
@@ -86,6 +91,7 @@ impl<'a> Parser<'a> {
             generic_const_params: self.generic_const_params.clone(),
             import_aliases: self.import_aliases.clone(),
             value_scopes: self.value_scopes.clone(),
+            recursion_depth: self.recursion_depth,
         }
     }
 
@@ -608,6 +614,15 @@ impl<'a> Parser<'a> {
 
     fn err_at(&self, message: impl Into<String>, span: Span) -> ParseError {
         ParseError::new(message, span, self.source, self.filename)
+    }
+
+    fn check_recursion_depth(&self, span: Span) -> Result<(), ParseError> {
+        if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
+            return Err(self
+                .err_at("maximum parser nesting depth exceeded", span)
+                .with_doc_topic("syntax"));
+        }
+        Ok(())
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -2104,6 +2119,14 @@ impl<'a> Parser<'a> {
 
     /// Parse `<Arg1, Arg2, ...>` generic arguments (splitting `>>` cleanly via `expect_type_gt`).
     fn parse_generic_args(&mut self) -> Result<(Vec<GenericArg>, Span), ParseError> {
+        self.check_recursion_depth(self.peek_span())?;
+        self.recursion_depth += 1;
+        let res = self.parse_generic_args_impl();
+        self.recursion_depth -= 1;
+        res
+    }
+
+    fn parse_generic_args_impl(&mut self) -> Result<(Vec<GenericArg>, Span), ParseError> {
         self.check_generic_lifetime_after_decl_name()?;
         let lt_tok = self.expect(&TokenKind::Lt)?;
 
@@ -2156,6 +2179,14 @@ impl<'a> Parser<'a> {
     /// `<<` (`TokenKind::Shl`), `+`, `-`, `*`, `/`, `%`, casts, and unary ops while stopping
     /// cleanly before closing `>` and `>>` (`TokenKind::Shr`).
     fn parse_generic_const_expr(&mut self) -> Result<Expr, ParseError> {
+        self.check_recursion_depth(self.peek_span())?;
+        self.recursion_depth += 1;
+        let res = self.parse_generic_const_expr_impl();
+        self.recursion_depth -= 1;
+        res
+    }
+
+    fn parse_generic_const_expr_impl(&mut self) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_generic_bitxor_expr()?;
         while self.eat(&TokenKind::Pipe) {
             let rhs = self.parse_generic_bitxor_expr()?;
@@ -2207,9 +2238,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_generic_shl_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_additive_expr()?;
+        let mut lhs = self.parse_binary_expr(9)?;
         while self.eat(&TokenKind::Shl) {
-            let rhs = self.parse_additive_expr()?;
+            let rhs = self.parse_binary_expr(9)?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr::new(
                 ExprKind::Binary {
@@ -2407,6 +2438,14 @@ impl<'a> Parser<'a> {
     /// Parse a standalone [`TypeExpr`] (handles prefix `*T`, `[]T`, `[N]T`, `fn(...) -> Ret`,
     /// OS primitives, built-in primitives, qualified paths, and postfix `T*`, `T[]`, `T[N]`).
     pub fn parse_type(&mut self) -> Result<TypeExpr, ParseError> {
+        self.check_recursion_depth(self.peek_span())?;
+        self.recursion_depth += 1;
+        let res = self.parse_type_impl();
+        self.recursion_depth -= 1;
+        res
+    }
+
+    fn parse_type_impl(&mut self) -> Result<TypeExpr, ParseError> {
         let start = self.peek_span();
 
         // Trap foreign modifiers/references in type position:
@@ -2672,11 +2711,14 @@ impl<'a> Parser<'a> {
                                 let _ = self.eat(&TokenKind::ColonColon);
                                 let (args, gt_span) = self.parse_generic_args()?;
                                 if segs.len() == 1 {
-                                    let base = segs.pop().unwrap();
-                                    TypeExpr::new(
-                                        TypeKind::Generic { base, args },
-                                        start.merge(gt_span),
-                                    )
+                                    if let Some(base) = segs.pop() {
+                                        TypeExpr::new(
+                                            TypeKind::Generic { base, args },
+                                            start.merge(gt_span),
+                                        )
+                                    } else {
+                                        return Err(self.err_at("expected type name", start));
+                                    }
                                 } else {
                                     TypeExpr::new(
                                         TypeKind::GenericPath { path: segs, args },
@@ -2684,12 +2726,13 @@ impl<'a> Parser<'a> {
                                     )
                                 }
                             } else if segs.len() > 1 {
-                                let end = segs.last().unwrap().span;
+                                let end = segs.last().map_or(start, |s| s.span);
                                 TypeExpr::new(TypeKind::Path(segs), start.merge(end))
-                            } else {
-                                let only = segs.pop().unwrap();
+                            } else if let Some(only) = segs.pop() {
                                 let span = only.span;
                                 TypeExpr::new(TypeKind::Named(only), span)
+                            } else {
+                                return Err(self.err_at("expected type name", start));
                             }
                         }
                     }
@@ -2942,6 +2985,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_block_inner(&mut self, allow_tail_expr: bool) -> Result<Block, ParseError> {
+        self.check_recursion_depth(self.peek_span())?;
+        self.recursion_depth += 1;
+        let res = self.parse_block_inner_impl(allow_tail_expr);
+        self.recursion_depth -= 1;
+        res
+    }
+
+    fn parse_block_inner_impl(&mut self, allow_tail_expr: bool) -> Result<Block, ParseError> {
         let lb = self.expect(&TokenKind::LBrace)?;
         let prev_allow = self.allow_struct_lit;
         self.allow_struct_lit = true;
@@ -3667,7 +3718,9 @@ impl<'a> Parser<'a> {
                         span,
                     })
                 } else if rest.len() == 1 {
-                    let name = rest.pop().expect("len 1");
+                    let Some(name) = rest.pop() else {
+                        return Err(self.err_at("expected pattern identifier", first.span));
+                    };
                     let span = first.span.merge(name.span);
                     Ok(SwitchPat::Ident {
                         prefix: Some(first),
@@ -3678,7 +3731,8 @@ impl<'a> Parser<'a> {
                     let mut path = Vec::with_capacity(1 + rest.len());
                     path.push(first);
                     path.extend(rest);
-                    let span = path[0].span.merge(path.last().unwrap().span);
+                    let end = path.last().map_or(path[0].span, |id| id.span);
+                    let span = path[0].span.merge(end);
                     Ok(SwitchPat::Qualified { path, span })
                 }
             }
@@ -3901,14 +3955,18 @@ impl<'a> Parser<'a> {
     // ─────────────────────────────────────────────────────────────────────────
 
     pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
-        self.parse_or_fallback_expr()
+        self.check_recursion_depth(self.peek_span())?;
+        self.recursion_depth += 1;
+        let res = self.parse_or_fallback_expr_impl();
+        self.recursion_depth -= 1;
+        res
     }
 
     /// Lowest precedence: `expr or fallback_expr` (right-associative).
-    fn parse_or_fallback_expr(&mut self) -> Result<Expr, ParseError> {
-        let lhs = self.parse_logical_or_expr()?;
+    fn parse_or_fallback_expr_impl(&mut self) -> Result<Expr, ParseError> {
+        let lhs = self.parse_binary_expr(1)?;
         if self.eat(&TokenKind::KwOr) {
-            let rhs = self.parse_or_fallback_expr()?;
+            let rhs = self.parse_expr()?;
             let span = lhs.span.merge(rhs.span);
             Ok(Expr::new(
                 ExprKind::Or {
@@ -3922,196 +3980,38 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_logical_or_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_logical_and_expr()?;
-        while self.eat(&TokenKind::PipePipe) {
-            let rhs = self.parse_logical_and_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op: BinaryOp::Or,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
+    fn peek_binary_op_prec(&self) -> Option<(BinaryOp, u8)> {
+        match self.peek_kind() {
+            TokenKind::PipePipe => Some((BinaryOp::Or, 1)),
+            TokenKind::AmpAmp => Some((BinaryOp::And, 2)),
+            TokenKind::EqEq => Some((BinaryOp::Eq, 3)),
+            TokenKind::BangEq => Some((BinaryOp::Ne, 3)),
+            TokenKind::Lt => Some((BinaryOp::Lt, 4)),
+            TokenKind::LtEq => Some((BinaryOp::Le, 4)),
+            TokenKind::Gt => Some((BinaryOp::Gt, 4)),
+            TokenKind::GtEq => Some((BinaryOp::Ge, 4)),
+            TokenKind::Pipe => Some((BinaryOp::BitOr, 5)),
+            TokenKind::Caret => Some((BinaryOp::BitXor, 6)),
+            TokenKind::Amp => Some((BinaryOp::BitAnd, 7)),
+            TokenKind::Shl => Some((BinaryOp::Shl, 8)),
+            TokenKind::Shr => Some((BinaryOp::Shr, 8)),
+            TokenKind::Plus => Some((BinaryOp::Add, 9)),
+            TokenKind::Minus => Some((BinaryOp::Sub, 9)),
+            TokenKind::Star => Some((BinaryOp::Mul, 10)),
+            TokenKind::Slash => Some((BinaryOp::Div, 10)),
+            TokenKind::Percent => Some((BinaryOp::Rem, 10)),
+            _ => None,
         }
-        Ok(lhs)
     }
 
-    fn parse_logical_and_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_equality_expr()?;
-        while self.eat(&TokenKind::AmpAmp) {
-            let rhs = self.parse_equality_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op: BinaryOp::And,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_equality_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_relational_expr()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::EqEq => BinaryOp::Eq,
-                TokenKind::BangEq => BinaryOp::Ne,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_relational_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_relational_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_bitor_expr()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Lt => BinaryOp::Lt,
-                TokenKind::LtEq => BinaryOp::Le,
-                TokenKind::Gt => BinaryOp::Gt,
-                TokenKind::GtEq => BinaryOp::Ge,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_bitor_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_bitor_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_bitxor_expr()?;
-        while self.eat(&TokenKind::Pipe) {
-            let rhs = self.parse_bitxor_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op: BinaryOp::BitOr,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_bitxor_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_bitand_expr()?;
-        while self.eat(&TokenKind::Caret) {
-            let rhs = self.parse_bitand_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op: BinaryOp::BitXor,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_bitand_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_shift_expr()?;
-        while self.eat(&TokenKind::Amp) {
-            let rhs = self.parse_shift_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op: BinaryOp::BitAnd,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_shift_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_additive_expr()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Shl => BinaryOp::Shl,
-                TokenKind::Shr => BinaryOp::Shr,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_additive_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_additive_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut lhs = self.parse_multiplicative_expr()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Plus => BinaryOp::Add,
-                TokenKind::Minus => BinaryOp::Sub,
-                _ => break,
-            };
-            self.bump();
-            let rhs = self.parse_multiplicative_expr()?;
-            let span = lhs.span.merge(rhs.span);
-            lhs = Expr::new(
-                ExprKind::Binary {
-                    op,
-                    lhs: Box::new(lhs),
-                    rhs: Box::new(rhs),
-                },
-                span,
-            );
-        }
-        Ok(lhs)
-    }
-
-    fn parse_multiplicative_expr(&mut self) -> Result<Expr, ParseError> {
+    fn parse_binary_expr(&mut self, min_prec: u8) -> Result<Expr, ParseError> {
         let mut lhs = self.parse_cast_expr()?;
-        loop {
-            let op = match self.peek_kind() {
-                TokenKind::Star => BinaryOp::Mul,
-                TokenKind::Slash => BinaryOp::Div,
-                TokenKind::Percent => BinaryOp::Rem,
-                _ => break,
-            };
+        while let Some((op, prec)) = self.peek_binary_op_prec() {
+            if prec < min_prec {
+                break;
+            }
             self.bump();
-            let rhs = self.parse_cast_expr()?;
+            let rhs = self.parse_binary_expr(prec + 1)?;
             let span = lhs.span.merge(rhs.span);
             lhs = Expr::new(
                 ExprKind::Binary {

@@ -400,9 +400,10 @@ impl LeaseEnv {
                 }
             }
             if gens.len() == 1 {
-                let g = *gens.iter().next().unwrap();
-                if g > 0 {
-                    self.current_gen.insert(src.clone(), g);
+                if let Some(&g) = gens.iter().next() {
+                    if g > 0 {
+                        self.current_gen.insert(src.clone(), g);
+                    }
                 }
             } else {
                 // Branches diverged on DMA/`byte_ring` invalidations -> bump generation.
