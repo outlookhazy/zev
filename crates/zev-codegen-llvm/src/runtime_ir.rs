@@ -1164,7 +1164,7 @@ exit:
   ret void
 }}
 
-define i1 @__syn_any_ready_task(){fn_as} nounwind{sz} {{
+define i1 @__syn_any_ready_task(){fn_as} nounwind noinline{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop
@@ -1350,7 +1350,7 @@ not_found:
   ret i32 -1
 }}
 
-define void @__syn_reset_poll_round(){fn_as} nounwind{sz} {{
+define void @__syn_reset_poll_round(){fn_as} nounwind noinline{sz} {{
 entry:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop

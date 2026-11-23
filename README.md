@@ -38,11 +38,11 @@ Additional standalone hardware demos target `arduino_uno` (ATmega328P `avr`, Opt
 ## Requirements
 
 - **Rust** stable toolchain (`cargo`, `rustc`)
-- **LLVM / Clang / LLD** (`clang`, `opt`, `llc`, `ld.lld`, `llvm-size`, `llvm-objcopy`, `llvm-objdump`, `llvm-readobj`, `llvm-nm` — LLVM 23 required; CI installs it from apt.llvm.org. Stock LLVM 18 fails to link AVR images and changes stack-proof results)
+- **LLVM / Clang / LLD** (`clang`, `opt`, `llc`, `ld.lld`, `llvm-size`, `llvm-objcopy`, `llvm-objdump`, `llvm-readobj`, `llvm-nm` — LLVM 23+ required and verified at build time; CI installs LLVM 23 from apt.llvm.org)
 - **`qemu-system-arm`** (for `make qemu` and `zevc run-qemu`)
 - **`binutils` (`nm`)** on host C99 test runs
 
-Tool lookup checks `ZEV_LLVM_PREFIX` first (pointing at a custom LLVM install prefix), then `PATH`, then `/bin` and versioned `*-23..*-18` binaries. Override the built-in module/TOML search root with `ZEV_HOME` if running `zevc` outside the repository tree.
+Tool lookup checks `ZEV_LLVM_PREFIX` first (pointing at a custom LLVM install prefix), then `PATH` and versioned `*-23+` / `/usr/lib/llvm-23+/bin` binaries, rejecting backend toolchains older than LLVM 23 with an explicit diagnostic. Override the built-in module/TOML search root with `ZEV_HOME` if running `zevc` outside the repository tree.
 
 ---
 

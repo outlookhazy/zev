@@ -28,8 +28,8 @@ use crate::arm_cortex_m::sanitize_ident;
 use crate::riscv32::assign_rv_irq_routes_for_spec;
 use crate::target_spec::{CpuIsa, TargetSpec};
 use crate::toolchain::{
-    CodegenError, CodegenOptions, find_tool, inspect_elf_sizes, link_obj_to_elf,
-    optimize_ll_with_opt, synthesize_target_linker_script,
+    CodegenError, CodegenOptions, inspect_elf_sizes, link_obj_to_elf, optimize_ll_with_opt,
+    require_llvm_tool, synthesize_target_linker_script,
 };
 
 fn parse_rom_call_stack_bound(sym: &str) -> Option<u64> {
@@ -246,7 +246,7 @@ fn compile_ll_to_obj_with_stack_sizes(
         opt_ll_path.to_path_buf()
     };
 
-    let llc = find_tool("/bin/llc", "llc");
+    let llc = require_llvm_tool("/bin/llc", "llc")?;
     let mut cmd = Command::new(&llc);
     cmd.arg(format!("-mtriple={}", spec.triple));
     if spec.isa != CpuIsa::HostX86_64Linux {
@@ -284,7 +284,7 @@ fn compile_ll_to_obj_with_stack_sizes(
 }
 
 fn inspect_elf_text_data_bss(elf_path: &Path) -> Result<(u64, u64, u64), CodegenError> {
-    let llvm_size = find_tool("/bin/llvm-size", "llvm-size");
+    let llvm_size = require_llvm_tool("/bin/llvm-size", "llvm-size")?;
     let out = Command::new(&llvm_size)
         .arg("-A")
         .arg(elf_path)
@@ -329,7 +329,7 @@ fn inspect_elf_text_data_bss(elf_path: &Path) -> Result<(u64, u64, u64), Codegen
 }
 
 fn run_readobj_stack_sizes(obj_path: &Path) -> Result<String, CodegenError> {
-    let readobj = find_tool("/bin/llvm-readobj", "llvm-readobj");
+    let readobj = require_llvm_tool("/bin/llvm-readobj", "llvm-readobj")?;
     let out = Command::new(&readobj)
         .arg("--stack-sizes")
         .arg(obj_path)
@@ -351,7 +351,7 @@ fn run_readobj_stack_sizes(obj_path: &Path) -> Result<String, CodegenError> {
 }
 
 fn run_objdump_disasm(elf_path: &Path) -> Result<String, CodegenError> {
-    let objdump = find_tool("/bin/llvm-objdump", "llvm-objdump");
+    let objdump = require_llvm_tool("/bin/llvm-objdump", "llvm-objdump")?;
     let out = Command::new(&objdump)
         .arg("-d")
         .arg(elf_path)

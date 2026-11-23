@@ -22,13 +22,15 @@ pub use stack_sizes::{HardwareStackProof, analyze_hardware_stack_high_water};
 pub use target_spec::{CpuIsa, ImageFormat, IrqModel, ProjectManifest, TargetSpec};
 pub use toolchain::{
     AvrImageResult, CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
-    Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, Rp2040ImageResult,
-    TargetArch, TargetBuildArtifact, build_target_image, compile_ll_to_elf, compile_ll_to_obj,
-    find_tool, flash_avr_nano_every_bin, flash_avr_uno_bin, flash_esp32c6_bin, flash_rp2040_uf2,
+    Esp32C6ImageResult, MIN_LLVM_MAJOR, QemuExecOutput, QemuRunOptions, QemuRunResult,
+    Rp2040ImageResult, TargetArch, TargetBuildArtifact, build_target_image,
+    check_llvm_tool_version, compile_ll_to_elf, compile_ll_to_obj, find_tool,
+    flash_avr_nano_every_bin, flash_avr_uno_bin, flash_esp32c6_bin, flash_rp2040_uf2,
     flash_target_image, inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf,
     objcopy_elf_to_avr_bin, objcopy_elf_to_avr_nano_every_bin, objcopy_elf_to_esp32c6_bin,
-    objcopy_elf_to_rp2040_uf2, optimize_ll_with_opt, pack_rp2040_uf2, pack_uf2, run_elf_in_qemu,
-    synthesize_linker_script, synthesize_target_linker_script, verify_ll_with_opt,
+    objcopy_elf_to_rp2040_uf2, optimize_ll_with_opt, pack_rp2040_uf2, pack_uf2,
+    parse_llvm_major_version, require_llvm_tool, run_elf_in_qemu, synthesize_linker_script,
+    synthesize_target_linker_script, verify_ll_with_opt,
 };
 
 /// Legacy constant retained for external integration test compatibility (values now live in `chips/esp32c6.toml`).

@@ -1,13 +1,15 @@
 //! Toolchain driver for LLVM 23 (`llc`), LLD (`ld.lld`), `llvm-size`, ELF32 symbol auditing,
 //! and bare-metal ARM Cortex-M3 execution in `qemu-system-arm`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::target_spec::{CpuIsa, ImageFormat, IrqModel, TargetSpec, discover_spec_roots};
 
@@ -753,83 +755,294 @@ pub fn synthesize_linker_script(opts: &CodegenOptions) -> String {
     }
 }
 
-/// Locate an external LLVM/QEMU executable portably:
-/// `ZEV_LLVM_PREFIX` -> `PATH` -> `preferred_abs` -> versioned `name-23..name-18` -> `name`.
-pub fn find_tool(preferred_abs: &str, name: &str) -> String {
-    fn is_llvm_tool(name: &str) -> bool {
-        matches!(
-            name,
-            "clang"
-                | "opt"
-                | "llc"
-                | "ld.lld"
-                | "llvm-size"
-                | "llvm-objcopy"
-                | "llvm-objdump"
-                | "llvm-readobj"
-                | "llvm-nm"
-        )
-    }
+/// Minimum supported upstream LLVM / LLD major version for `zev-codegen-llvm`.
+pub const MIN_LLVM_MAJOR: u32 = 23;
 
-    fn exe_candidate(dir: &Path, base: &str) -> Option<PathBuf> {
-        let p = dir.join(base);
-        if p.is_file() {
-            return Some(p);
+fn parse_leading_major(s: &str) -> Option<u32> {
+    let trimmed = s.trim_start();
+    let digits_len = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits_len == 0 {
+        return None;
+    }
+    let after = &trimmed[digits_len..];
+    if !after.is_empty()
+        && !after.starts_with('.')
+        && !after.starts_with(' ')
+        && !after.starts_with('-')
+    {
+        return None;
+    }
+    trimmed[..digits_len].parse::<u32>().ok()
+}
+
+/// Extract `(major_version, summary_line)` from `opt`/`llc`/`ld.lld`/`llvm-*`/`clang --version` output.
+pub fn parse_llvm_major_version(version_output: &str) -> Option<(u32, String)> {
+    for raw_line in version_output.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
         }
-        #[cfg(windows)]
-        {
-            let with_exe = dir.join(format!("{base}.exe"));
-            if with_exe.is_file() {
-                return Some(with_exe);
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("apple clang") || lower.contains("apple llvm") {
+            continue;
+        }
+        for marker in ["llvm version ", "clang version "] {
+            if let Some(idx) = lower.find(marker) {
+                if let Some(maj) = parse_leading_major(&line[idx + marker.len()..]) {
+                    return Some((maj, line.to_string()));
+                }
             }
         }
-        None
+        for (idx, _) in lower.match_indices("lld ") {
+            if idx == 0 || lower.as_bytes()[idx - 1].is_ascii_whitespace() {
+                if let Some(maj) = parse_leading_major(&line[idx + 4..]) {
+                    return Some((maj, line.to_string()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn probe_llvm_version(bin: &Path) -> Option<(u32, String)> {
+    type CacheKey = (PathBuf, Option<SystemTime>, Option<u64>);
+    static VERSION_CACHE: OnceLock<Mutex<HashMap<CacheKey, Option<(u32, String)>>>> =
+        OnceLock::new();
+
+    let meta = fs::metadata(bin).ok();
+    let key: CacheKey = (
+        bin.to_path_buf(),
+        meta.as_ref().and_then(|m| m.modified().ok()),
+        meta.as_ref().map(|m| m.len()),
+    );
+
+    let cache = VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(cached) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return cached;
     }
 
-    if let Some(prefix) = std::env::var_os("ZEV_LLVM_PREFIX") {
-        let p = PathBuf::from(prefix);
-        for dir in [p.join("bin"), p] {
+    let parsed = Command::new(bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|out| {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            parse_llvm_major_version(&stdout).or_else(|| parse_llvm_major_version(&stderr))
+        });
+
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, parsed.clone());
+    parsed
+}
+
+fn is_llvm_backend_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "opt"
+            | "llc"
+            | "ld.lld"
+            | "llvm-size"
+            | "llvm-objcopy"
+            | "llvm-objdump"
+            | "llvm-readobj"
+            | "llvm-nm"
+    )
+}
+
+fn is_llvm_tool(name: &str) -> bool {
+    name == "clang" || is_llvm_backend_tool(name)
+}
+
+fn exe_candidate(dir: &Path, base: &str) -> Option<PathBuf> {
+    let p = dir.join(base);
+    if p.is_file() {
+        return Some(p);
+    }
+    #[cfg(windows)]
+    {
+        let with_exe = dir.join(format!("{base}.exe"));
+        if with_exe.is_file() {
+            return Some(with_exe);
+        }
+    }
+    None
+}
+
+fn find_tool_in_dirs(
+    preferred_abs: &str,
+    name: &str,
+    env_prefix: Option<&Path>,
+    path_dirs: &[PathBuf],
+    extra_sys_dirs: &[PathBuf],
+) -> String {
+    if let Some(p) = env_prefix {
+        for dir in [p.join("bin"), p.to_path_buf()] {
             if let Some(found) = exe_candidate(&dir, name) {
                 return found.to_string_lossy().into_owned();
             }
+            if is_llvm_tool(name) {
+                for ver in (MIN_LLVM_MAJOR..=30).rev() {
+                    let vname = format!("{name}-{ver}");
+                    if let Some(found) = exe_candidate(&dir, &vname) {
+                        return found.to_string_lossy().into_owned();
+                    }
+                }
+            }
         }
     }
 
-    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|v| std::env::split_paths(&v).collect())
-        .unwrap_or_default();
+    if !is_llvm_tool(name) {
+        for dir in path_dirs {
+            if let Some(found) = exe_candidate(dir, name) {
+                return found.to_string_lossy().into_owned();
+            }
+        }
+        if !preferred_abs.is_empty() && Path::new(preferred_abs).is_file() {
+            return preferred_abs.to_string();
+        }
+        return name.to_string();
+    }
 
-    for dir in &path_dirs {
+    let mut older_fallback: Option<PathBuf> = None;
+    let mut consider = |cand: PathBuf| -> Option<String> {
+        match probe_llvm_version(&cand) {
+            Some((maj, _)) if maj >= MIN_LLVM_MAJOR => Some(cand.to_string_lossy().into_owned()),
+            Some(_) => {
+                if older_fallback.is_none() {
+                    older_fallback = Some(cand);
+                }
+                None
+            }
+            None if name == "clang" => Some(cand.to_string_lossy().into_owned()),
+            None => {
+                if older_fallback.is_none() {
+                    older_fallback = Some(cand);
+                }
+                None
+            }
+        }
+    };
+
+    for dir in path_dirs {
         if let Some(found) = exe_candidate(dir, name) {
-            return found.to_string_lossy().into_owned();
+            if let Some(ok) = consider(found) {
+                return ok;
+            }
         }
     }
 
     if !preferred_abs.is_empty() && Path::new(preferred_abs).is_file() {
-        return preferred_abs.to_string();
+        if let Some(ok) = consider(PathBuf::from(preferred_abs)) {
+            return ok;
+        }
     }
 
-    if is_llvm_tool(name) {
-        for ver in (18..=23).rev() {
-            let vname = format!("{name}-{ver}");
-            for dir in &path_dirs {
-                if let Some(found) = exe_candidate(dir, &vname) {
-                    return found.to_string_lossy().into_owned();
+    for ver in (MIN_LLVM_MAJOR..=30).rev() {
+        let vname = format!("{name}-{ver}");
+        for dir in path_dirs.iter().chain(extra_sys_dirs.iter()) {
+            if let Some(found) = exe_candidate(dir, &vname) {
+                if let Some(ok) = consider(found) {
+                    return ok;
                 }
             }
-            for sys_dir in [
-                Path::new("/usr/bin"),
-                Path::new("/bin"),
-                Path::new("/opt/homebrew/opt/llvm/bin"),
-            ] {
-                if let Some(found) = exe_candidate(sys_dir, &vname) {
-                    return found.to_string_lossy().into_owned();
+        }
+        for prefix_dir in [
+            PathBuf::from(format!("/usr/lib/llvm-{ver}/bin")),
+            PathBuf::from(format!("/usr/lib/llvm{ver}/bin")),
+            PathBuf::from(format!("/opt/homebrew/opt/llvm@{ver}/bin")),
+        ] {
+            for cand_name in [name, vname.as_str()] {
+                if let Some(found) = exe_candidate(&prefix_dir, cand_name) {
+                    if let Some(ok) = consider(found) {
+                        return ok;
+                    }
                 }
             }
         }
     }
 
+    for brew_dir in extra_sys_dirs {
+        if let Some(found) = exe_candidate(brew_dir, name) {
+            if let Some(ok) = consider(found) {
+                return ok;
+            }
+        }
+    }
+
+    if let Some(old) = older_fallback {
+        return old.to_string_lossy().into_owned();
+    }
+
+    for ver in (14..MIN_LLVM_MAJOR).rev() {
+        let vname = format!("{name}-{ver}");
+        for dir in path_dirs.iter().chain(extra_sys_dirs.iter()) {
+            if let Some(found) = exe_candidate(dir, &vname) {
+                return found.to_string_lossy().into_owned();
+            }
+        }
+        let llvm_dir = PathBuf::from(format!("/usr/lib/llvm-{ver}/bin"));
+        if let Some(found) = exe_candidate(&llvm_dir, name) {
+            return found.to_string_lossy().into_owned();
+        }
+    }
+
     name.to_string()
+}
+
+/// Locate an external LLVM/QEMU executable portably, preferring LLVM >= [`MIN_LLVM_MAJOR`] (`23`):
+/// `ZEV_LLVM_PREFIX` -> `PATH` (>= 23) -> `preferred_abs` (>= 23) -> versioned `23+` -> fallback.
+pub fn find_tool(preferred_abs: &str, name: &str) -> String {
+    let prefix = std::env::var_os("ZEV_LLVM_PREFIX").map(PathBuf::from);
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|v| std::env::split_paths(&v).collect())
+        .unwrap_or_default();
+    let sys_dirs = [
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
+        PathBuf::from("/opt/homebrew/opt/llvm/bin"),
+    ];
+    find_tool_in_dirs(
+        preferred_abs,
+        name,
+        prefix.as_deref(),
+        &path_dirs,
+        &sys_dirs,
+    )
+}
+
+/// Verify that `tool_path` is at least LLVM [`MIN_LLVM_MAJOR`] (`23`), returning a clear
+/// [`CodegenError`] when an older LLVM/LLD toolchain is detected.
+pub fn check_llvm_tool_version(tool_path: &str, tool_name: &str) -> Result<(), CodegenError> {
+    if !is_llvm_backend_tool(tool_name) {
+        return Ok(());
+    }
+    if let Some((major, ver_line)) = probe_llvm_version(Path::new(tool_path)) {
+        if major < MIN_LLVM_MAJOR {
+            return Err(CodegenError::new(
+                "toolchain",
+                format!(
+                    "LLVM {MIN_LLVM_MAJOR} or newer is required for `{tool_name}`, but `{tool_path}` reports `{ver_line}`; install LLVM {MIN_LLVM_MAJOR}+ (e.g. from https://apt.llvm.org) or set ZEV_LLVM_PREFIX to an LLVM {MIN_LLVM_MAJOR}+ installation"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve an LLVM backend tool and verify that its version is >= [`MIN_LLVM_MAJOR`] (`23`).
+pub fn require_llvm_tool(preferred_abs: &str, name: &str) -> Result<String, CodegenError> {
+    let resolved = find_tool(preferred_abs, name);
+    check_llvm_tool_version(&resolved, name)?;
+    Ok(resolved)
 }
 
 /// Optimize textual LLVM `.ll` IR via `opt` (`default<O1|O2|O3>`).
@@ -848,7 +1061,7 @@ pub fn optimize_ll_with_opt(
         }
     }
 
-    let opt = find_tool("/bin/opt", "opt");
+    let opt = require_llvm_tool("/bin/opt", "opt")?;
     let mut cmd = Command::new(&opt);
     cmd.arg(format!("-mtriple={}", spec.triple));
     if spec.isa != CpuIsa::HostX86_64Linux && !spec.cpu.is_empty() {
@@ -893,7 +1106,7 @@ pub fn compile_ll_to_obj(
         &opt_ll_path
     };
 
-    let llc = find_tool("/bin/llc", "llc");
+    let llc = require_llvm_tool("/bin/llc", "llc")?;
     let mut cmd = Command::new(&llc);
     cmd.arg(format!("-mtriple={}", spec.triple));
     if spec.isa != CpuIsa::HostX86_64Linux {
@@ -934,7 +1147,7 @@ pub fn link_obj_to_elf(
     ld_path: &Path,
     elf_path: &Path,
 ) -> Result<(), CodegenError> {
-    let lld = find_tool("/bin/ld.lld", "ld.lld");
+    let lld = require_llvm_tool("/bin/ld.lld", "ld.lld")?;
     let out = Command::new(&lld)
         .arg("-T")
         .arg(ld_path)
@@ -957,7 +1170,7 @@ pub fn link_obj_to_elf(
 
 /// Inspect `.text`, `.data`, and `.bss` sizes of a linked `.elf` using `llvm-size`.
 pub fn inspect_elf_sizes(elf_path: &Path) -> Result<ElfSectionSizes, CodegenError> {
-    let llvm_size = find_tool("/bin/llvm-size", "llvm-size");
+    let llvm_size = require_llvm_tool("/bin/llvm-size", "llvm-size")?;
     let out = Command::new(&llvm_size)
         .arg(elf_path)
         .output()
@@ -1241,7 +1454,7 @@ pub fn run_elf_in_qemu(
 
 /// Verify textual `.ll` IR using LLVM 23 `/bin/opt -passes=verify -disable-output`.
 pub fn verify_ll_with_opt(ll_path: &Path) -> Result<(), CodegenError> {
-    let opt = find_tool("/bin/opt", "opt");
+    let opt = require_llvm_tool("/bin/opt", "opt")?;
     let out = Command::new(&opt)
         .arg("-passes=verify")
         .arg("-disable-output")
@@ -1298,7 +1511,7 @@ pub fn objcopy_elf_to_bin(elf_path: &Path, out_bin: &Path) -> Result<Vec<u8>, Co
             })?;
         }
     }
-    let objcopy = find_tool("/bin/llvm-objcopy", "llvm-objcopy");
+    let objcopy = require_llvm_tool("/bin/llvm-objcopy", "llvm-objcopy")?;
     let out = Command::new(&objcopy)
         .arg("-O")
         .arg("binary")
@@ -1725,4 +1938,94 @@ pub fn flash_avr_uno_bin(bin_path: &Path, port: &str) -> Result<String, CodegenE
 pub fn flash_avr_nano_every_bin(bin_path: &Path, port: &str) -> Result<String, CodegenError> {
     let spec = TargetSpec::resolve(None, Some("arduino_nano_every"))?;
     flash_target_image(&spec, bin_path, Some(port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MIN_LLVM_MAJOR, check_llvm_tool_version, find_tool_in_dirs, parse_llvm_major_version,
+    };
+
+    #[test]
+    fn parses_llvm_lld_and_clang_version_strings() {
+        assert_eq!(
+            parse_llvm_major_version("LLVM (http://llvm.org/):\n  LLVM version 23.1.5\n"),
+            Some((23, "LLVM version 23.1.5".to_string()))
+        );
+        assert_eq!(
+            parse_llvm_major_version("Ubuntu LLVM version 18.1.3\n  Optimized build."),
+            Some((18, "Ubuntu LLVM version 18.1.3".to_string()))
+        );
+        assert_eq!(
+            parse_llvm_major_version("LLD 23.1.5 (compatible with GNU linkers)"),
+            Some((23, "LLD 23.1.5 (compatible with GNU linkers)".to_string()))
+        );
+        assert_eq!(
+            parse_llvm_major_version("Ubuntu LLD 18.1.3 (compatible with GNU linkers)"),
+            Some((18, "Ubuntu LLD 18.1.3 (compatible with GNU linkers)".to_string()))
+        );
+        assert_eq!(
+            parse_llvm_major_version("clang version 23.1.5 (Fedora 23.1.5-2.fc45)"),
+            Some((23, "clang version 23.1.5 (Fedora 23.1.5-2.fc45)".to_string()))
+        );
+        // Apple Xcode clang versions must not be confused with upstream LLVM versions.
+        assert_eq!(
+            parse_llvm_major_version("Apple clang version 16.0.0 (clang-1600.0.26.6)"),
+            None
+        );
+        assert_eq!(MIN_LLVM_MAJOR, 23);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_old_llvm_toolchain_and_prefers_llvm_23_candidate() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("zev-toolchain-ver-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir_old = base.join("old_bin");
+        let dir_new = base.join("new_bin");
+        std::fs::create_dir_all(&dir_old).expect("create old_bin");
+        std::fs::create_dir_all(&dir_new).expect("create new_bin");
+
+        let write_mock = |path: &std::path::Path, banner: &str| {
+            let script = format!("#!/bin/sh\necho \"{banner}\"\n");
+            std::fs::write(path, script).expect("write mock tool");
+            let mut perms = std::fs::metadata(path).expect("stat mock tool").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).expect("chmod mock tool");
+        };
+
+        let old_llc = dir_old.join("llc");
+        let old_lld = dir_old.join("ld.lld");
+        let new_llc_ver = dir_new.join("llc-23");
+        write_mock(&old_llc, "Ubuntu LLVM version 18.1.3");
+        write_mock(&old_lld, "Ubuntu LLD 18.1.3 (compatible with GNU linkers)");
+        write_mock(&new_llc_ver, "LLVM version 23.1.5");
+
+        let err_llc = check_llvm_tool_version(old_llc.to_str().expect("utf8"), "llc")
+            .expect_err("LLVM 18 llc must be rejected");
+        assert!(err_llc.message.contains("LLVM 23 or newer is required"));
+        assert!(err_llc.message.contains("18.1.3"));
+        assert!(err_llc.message.contains("ZEV_LLVM_PREFIX"));
+
+        let err_lld = check_llvm_tool_version(old_lld.to_str().expect("utf8"), "ld.lld")
+            .expect_err("LLD 18 must be rejected");
+        assert!(err_lld.message.contains("LLVM 23 or newer is required"));
+        assert!(err_lld.message.contains("18.1.3"));
+
+        check_llvm_tool_version(new_llc_ver.to_str().expect("utf8"), "llc")
+            .expect("LLVM 23 llc-23 must be accepted");
+
+        // When PATH has LLVM 18 `llc` before `llc-23`, discovery skips 18 and selects `llc-23`.
+        let chosen = find_tool_in_dirs("", "llc", None, &[dir_old.clone(), dir_new.clone()], &[]);
+        assert_eq!(chosen, new_llc_ver.to_string_lossy());
+
+        // When only LLVM 18 exists, discovery returns the old path so `require_llvm_tool`
+        // reports a clear version mismatch rather than "file not found".
+        let fallback = find_tool_in_dirs("", "llc", None, &[dir_old], &[]);
+        assert_eq!(fallback, old_llc.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

@@ -634,6 +634,15 @@ impl ModuleLinker {
 
         for (prog_idx, key) in order.iter().enumerate() {
             let Some(m) = self.loaded.get(key).cloned() else {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ModuleError,
+                    Span::default(),
+                    format!(
+                        "internal compiler error: module `{key:?}` in load order is missing from loaded module table"
+                    ),
+                ));
+                out_programs.push((Program::new(Vec::new(), Span::default()), None));
+                program_extern_c_scopes.push(BTreeSet::new());
                 continue;
             };
             let mut diags = Vec::new();
@@ -941,6 +950,16 @@ impl ModuleLinker {
                 continue;
             };
             let Some(child_loaded) = self.loaded.get(child_key) else {
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::ModuleError,
+                        imp.span,
+                        format!(
+                            "internal compiler error: re-exported module `{child_dot}` (`{child_key:?}`) is missing from loaded module table"
+                        ),
+                    ),
+                    Some(&file_display),
+                );
                 continue;
             };
             let child_exports = child_loaded.exports.clone();
@@ -2830,7 +2849,8 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::embedded_module_source;
+    use super::{ModuleKey, ModuleLinker, embedded_module_source};
+    use crate::diag::DiagnosticKind;
 
     #[test]
     fn embedded_modules_generated_from_disk_tree() {
@@ -2845,5 +2865,29 @@ mod tests {
         assert!(embedded_module_source("arch.cortex_m").is_some());
         assert!(embedded_module_source("std.fmt").is_some());
         assert!(embedded_module_source("nonexistent.mod").is_none());
+    }
+
+    #[test]
+    fn missing_loaded_module_in_order_reports_internal_compiler_error() {
+        let root = zev_parser::parse_str("fn main() { sys.exit(0); }")
+            .expect("parse minimal root program");
+        let roots = [(&root, Some("root.zev"))];
+        let mut linker = ModuleLinker::new(&roots, &[], None, None);
+        linker
+            .load_order
+            .push(ModuleKey::Embedded("ghost.mod".to_owned()));
+
+        let out = linker.run(&roots);
+        assert_eq!(out.diagnostics.len(), 1);
+        assert_eq!(out.diagnostics[0].kind, DiagnosticKind::ModuleError);
+        assert!(
+            out.diagnostics[0]
+                .message
+                .contains("internal compiler error"),
+            "unexpected diagnostic: {}",
+            out.diagnostics[0].message
+        );
+        // Placeholder slot keeps `out.programs` aligned with `order.len() + roots.len()`.
+        assert_eq!(out.programs.len(), 2);
     }
 }
