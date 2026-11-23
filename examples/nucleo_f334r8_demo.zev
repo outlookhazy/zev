@@ -1,0 +1,1040 @@
+// Bare-Metal STMicroelectronics NUCLEO-F334R8 Hardware Shakedown (`thumbv7em-none-eabihf` Cortex-M4F, Zero C)
+//
+// Validates peripherals wired to NUCLEO-F334R8 purely in application code over reusable `bsp.nucleo_f334r8` drivers:
+//   - 72 MHz PLL clocks (HSE-BYP 8 MHz MCO), ResetReason, sleep lock, 96-bit UID, hardware VFP4 FPU (`vdda` + IIR biquad)
+//   - ST-LINK VCP console on USART2 (PA2 TX / PA3 RX @ 115200 8N1) + IRQ38
+//   - Adafruit Ultimate GPS Breakout v3 on USART1 (PA9 TX / PA10 RX @ 9600 8N1) + IRQ37
+//   - TIM2 1.000 kHz IRQ28 sampling LD2 (PA5), User Button B1 (PC13), FIX (PB0/A3), PPS (PC1/A4 & PB1)
+//   - Physical D7 (PA8) <-> A0 (PA0) digital + TIM1_CH1 PWM + HRTIM1_CHA1 (4.608 GHz DLL) + ADC1_IN1 loopback
+//   - ADC1 (CH18 VREFINT + CH1 PA0 + CH2 PA1), DAC1_OUT1 (PA4/A2) -> ADC2_IN1 (PA4), COMP2 (PA7 vs VREFINT)
+//   - Zero-copy `@dma_safe pool<DmaBurst, 2>` + `Lease<DmaBurst>` + `dma_slot` + DMA1_CH1 IRQ11
+//   - bxCAN 2.0B (CAN1) 500 kbps silent loopback, Flash NVS Page 31 (`0x0800_F800`), SPI1 + I2C1 bus probes
+
+import chip.stm32f334 as hw;
+import bsp.nucleo_f334r8 as bsp;
+import std.io as io;
+import std.fmt as fmt;
+import std.bus as bus;
+
+// Shakedown rig wiring pin aliases (kept in app, not in board BSP)
+const u32 RIG_PIN_PB1_LEGACY_PPS = 1;
+
+enum SupEvent {
+    RunShakedown,
+    CmdStatus,
+    CmdSystem,
+    CmdGps,
+    CmdLoopback,
+    CmdHrtim,
+    CmdAnalog,
+    CmdDma,
+    CmdCan,
+    CmdFlashNvs,
+    UserTrigger,
+    Heartbeat,
+}
+
+struct PinSnapshot {
+    u32  tim2_ticks;
+    u32  pc1_pps_edges;
+    u32  pb1_pps_edges;
+    u32  pb0_fix_edges;
+    u32  button_edges;
+    bool pc1_level;
+    bool pb1_level;
+    bool pb0_level;
+    bool button_pressed;
+}
+
+struct GpsSnapshot {
+    u32  raw_bytes;
+    u32  good_sentences;
+    u32  bad_checksums;
+    u32  pmtk_replies;
+    i32  lat_udeg;
+    i32  lon_udeg;
+    i32  alt_dm;
+    u8   fix_quality;
+    u8   sats;
+    bool rmc_active;
+    u8   utc_h;
+    u8   utc_m;
+    u8   utc_s;
+}
+
+struct DmaBurst {
+    [8]u32 src;
+    [8]u32 dst;
+}
+
+struct LoopbackReport {
+    bool dig_low_ok;
+    bool dig_high_ok;
+    u32  pwm25_pct;
+    u32  pwm75_pct;
+    bool ok;
+}
+
+struct AnalogReport {
+    u16  vref_counts;
+    u16  a0_low_counts;
+    u16  a0_high_counts;
+    u16  dac_low_adc2;
+    u16  dac_high_adc2;
+    u16  a1_low_adc1;
+    u16  a1_high_adc1;
+    bool a2_a1_jumper;
+    bool comp_low_out;
+    bool comp_high_out;
+    u32  comp_csr_lo;
+    u32  comp_csr_hi;
+    bool ok;
+}
+
+struct CanReport {
+    bool std_ok;
+    u32  std_id;
+    u8   std_dlc;
+    bool ext_ok;
+    u32  ext_id;
+    u8   ext_dlc;
+    bool ok;
+}
+
+// ── Static Zero-Heap Language-OS Primitives (12 KiB STM32F334R8 SRAM) ───────
+watch<PinSnapshot> pin_watch = PinSnapshot {
+    tim2_ticks: 0u32,
+    pc1_pps_edges: 0u32,
+    pb1_pps_edges: 0u32,
+    pb0_fix_edges: 0u32,
+    button_edges: 0u32,
+    pc1_level: false,
+    pb1_level: false,
+    pb0_level: false,
+    button_pressed: false,
+};
+
+watch<GpsSnapshot> gps_watch = GpsSnapshot {
+    raw_bytes: 0u32,
+    good_sentences: 0u32,
+    bad_checksums: 0u32,
+    pmtk_replies: 0u32,
+    lat_udeg: 0i32,
+    lon_udeg: 0i32,
+    alt_dm: 0i32,
+    fix_quality: 0u8,
+    sats: 0u8,
+    rmc_active: false,
+    utc_h: 0u8,
+    utc_m: 0u8,
+    utc_s: 0u8,
+};
+
+inbox<u32, 8>                  tim2_q;
+inbox<SupEvent, 8>             sup_inbox;
+byte_ring<64>                  console_rx;
+byte_ring<256>                 gps_rx;
+@dma_safe pool<DmaBurst, 2>    dma_pool;
+dma_slot<DmaBurst>             dma_inflight;
+inbox<Lease<DmaBurst>, 2>      dma_done_q;
+
+// ── Synthesized Cortex-M4 NVIC Interrupt Service Routines ─────────────────────
+isr tim2_isr(*inbox<u32, 8> q, *watch<PinSnapshot> pw) {
+    state u32  ticks = 0u32;
+    state bool prev_pc1 = false;
+    state bool prev_pb1 = false;
+    state bool prev_pb0 = false;
+    state bool prev_btn = false;
+    state u32  pc1_edges = 0u32;
+    state u32  pb1_edges = 0u32;
+    state u32  pb0_edges = 0u32;
+    state u32  btn_edges = 0u32;
+
+    bsp.tim2_clear_irq();
+    ticks += 1u32;
+
+    bool pc1 = bsp.gpio_read(bsp.PORT_C, bsp.ARD_A4_PC1);
+    bool pb1 = bsp.gpio_read(bsp.PORT_B, RIG_PIN_PB1_LEGACY_PPS);
+    bool pb0 = bsp.gpio_read(bsp.PORT_B, bsp.ARD_A3_PB0);
+    bool btn = bsp.read_button();
+    bool edge = false;
+
+    if (pc1 && !prev_pc1) {
+        pc1_edges += 1u32;
+        edge = true;
+    }
+    if (pb1 && !prev_pb1) {
+        pb1_edges += 1u32;
+        edge = true;
+    }
+    if (pb0 && !prev_pb0) {
+        pb0_edges += 1u32;
+        edge = true;
+    }
+    if (btn && !prev_btn) {
+        btn_edges += 1u32;
+        edge = true;
+    }
+
+    prev_pc1 = pc1;
+    prev_pb1 = pb1;
+    prev_pb0 = pb0;
+    prev_btn = btn;
+
+    bool quarter_sec = (ticks % 250u32) == 0u32;
+    if (quarter_sec) {
+        bsp.toggle_led();
+        q.post(ticks, boost: @critical);
+    }
+    if (quarter_sec || edge) {
+        pw.publish(PinSnapshot {
+            tim2_ticks: ticks,
+            pc1_pps_edges: pc1_edges,
+            pb1_pps_edges: pb1_edges,
+            pb0_fix_edges: pb0_edges,
+            button_edges: btn_edges,
+            pc1_level: pc1,
+            pb1_level: pb1,
+            pb0_level: pb0,
+            button_pressed: btn,
+        });
+    }
+}
+
+isr usart2_rx_isr(*byte_ring rx, *hw.UsartRegs uart) {
+    state u32 vcp_irqs = 0u32;
+    vcp_irqs += 1u32;
+    uart.icr = 0x0Fu32;
+    for (u32 spin in 0..8) {
+        if ((uart.isr & (1u32 << 5)) == 0u32) {
+            break;
+        }
+        u8 b = (uart.rdr & 0xFFu32) as u8;
+        rx.push_byte(b, boost: @high);
+    }
+}
+
+isr usart1_gps_isr(*byte_ring rx, *hw.UsartRegs uart) {
+    state u32 gps_irqs = 0u32;
+    gps_irqs += 1u32;
+    uart.icr = 0x0Fu32;
+    for (u32 spin in 0..8) {
+        if ((uart.isr & (1u32 << 5)) == 0u32) {
+            break;
+        }
+        u8 b = (uart.rdr & 0xFFu32) as u8;
+        rx.push_byte(b, boost: @high);
+    }
+}
+
+isr dma1_ch1_isr(*dma_slot<DmaBurst> inflight, *inbox<Lease<DmaBurst>, 2> done_q) {
+    state u32 dma_irqs = 0u32;
+    dma_irqs += 1u32;
+    bsp.dma1_ch1_clear_irq();
+    Lease<DmaBurst> done = inflight.take() catch {
+        return;
+    };
+    done_q.post(done, boost: @critical);
+}
+
+// ── Streaming NMEA-0183 Fixed-Point Parser Helpers (over std.io) ─────────────
+usize nmea_verify_payload_len([]u8 buf) {
+    usize star = io.find_byte(buf, '*') catch {
+        return 0;
+    };
+    if (star < 5 || (star + 2) >= buf.len) {
+        return 0;
+    }
+    u8 expected = io.parse_hex_u8(buf[(star + 1)..(star + 3)]) catch {
+        return 0;
+    };
+    u8 calc = io.xor_checksum(buf[0..star]);
+    if (calc != expected) {
+        return 0;
+    }
+    return star;
+}
+
+i32 parse_coord_udeg([]u8 fld, []u8 hemi) {
+    if (fld.len < 4) {
+        return 0i32;
+    }
+    i64 deg_min = 0i64;
+    i64 frac = 0i64;
+    i64 scale = 1i64;
+    bool after_dot = false;
+    u8 frac_digits = 0u8;
+    for (u8 b in fld) {
+        if (b == '.') {
+            after_dot = true;
+            continue;
+        }
+        if (b < '0' || b > '9') {
+            break;
+        }
+        i64 d = (b - '0') as i64;
+        if (!after_dot) {
+            deg_min = (deg_min * 10i64) + d;
+        } else if (frac_digits < 6u8) {
+            frac = (frac * 10i64) + d;
+            scale = scale * 10i64;
+            frac_digits += 1u8;
+        }
+    }
+    i64 deg = deg_min / 100i64;
+    i64 min_int = deg_min % 100i64;
+    i64 min_scaled = (min_int * scale) + frac;
+    i64 udeg = (deg * 1_000_000i64) + ((min_scaled * 1_000_000i64) / (scale * 60i64));
+    if (hemi.len > 0 && (hemi[0] == 'S' || hemi[0] == 'W')) {
+        udeg = -udeg;
+    }
+    return udeg as i32;
+}
+
+i32 parse_alt_dm([]u8 fld) {
+    if (fld.len == 0) {
+        return 0i32;
+    }
+    bool neg = false;
+    usize start = 0;
+    if (fld[0] == '-') {
+        neg = true;
+        start = 1;
+    }
+    i32 whole = 0i32;
+    i32 tenth = 0i32;
+    bool after_dot = false;
+    bool got_tenth = false;
+    for (usize i in start..fld.len) {
+        u8 b = fld[i];
+        if (b == '.') {
+            after_dot = true;
+            continue;
+        }
+        if (b < '0' || b > '9') {
+            break;
+        }
+        i32 d = (b - '0') as i32;
+        if (!after_dot) {
+            whole = (whole * 10i32) + d;
+        } else if (!got_tenth) {
+            tenth = d;
+            got_tenth = true;
+        }
+    }
+    i32 dm = (whole * 10i32) + tenth;
+    if (neg) {
+        return -dm;
+    }
+    return dm;
+}
+
+fn parse_nmea_sentence([]u8 pay, *GpsSnapshot cur) {
+    if (io.starts_with(pay, "PMTK")) {
+        cur.pmtk_replies += 1u32;
+        return;
+    }
+    if (pay.len < 6) {
+        return;
+    }
+    bool is_gga = (pay[2] == 'G' && pay[3] == 'G' && pay[4] == 'A');
+    bool is_rmc = (pay[2] == 'R' && pay[3] == 'M' && pay[4] == 'C');
+    if (is_gga) {
+        []u8 f_lat = io.field_or_empty(pay, ',', 2);
+        []u8 f_ns  = io.field_or_empty(pay, ',', 3);
+        []u8 f_lon = io.field_or_empty(pay, ',', 4);
+        []u8 f_ew  = io.field_or_empty(pay, ',', 5);
+        []u8 f_fix = io.field_or_empty(pay, ',', 6);
+        []u8 f_sat = io.field_or_empty(pay, ',', 7);
+        []u8 f_alt = io.field_or_empty(pay, ',', 9);
+
+        if (f_fix.len > 0 && f_fix[0] >= '0' && f_fix[0] <= '9') {
+            cur.fix_quality = f_fix[0] - '0';
+        }
+        u32 sat_v = io.parse_u32(f_sat) catch { 255u32 };
+        if (sat_v <= 99u32) {
+            cur.sats = sat_v as u8;
+        }
+        if (f_lat.len >= 4 && f_lon.len >= 4 && cur.fix_quality > 0u8) {
+            cur.lat_udeg = parse_coord_udeg(f_lat, f_ns);
+            cur.lon_udeg = parse_coord_udeg(f_lon, f_ew);
+            cur.alt_dm = parse_alt_dm(f_alt);
+        }
+    } else if (is_rmc) {
+        []u8 f_utc = io.field_or_empty(pay, ',', 1);
+        []u8 f_st  = io.field_or_empty(pay, ',', 2);
+        []u8 f_lat = io.field_or_empty(pay, ',', 3);
+        []u8 f_ns  = io.field_or_empty(pay, ',', 4);
+        []u8 f_lon = io.field_or_empty(pay, ',', 5);
+        []u8 f_ew  = io.field_or_empty(pay, ',', 6);
+
+        if (f_utc.len >= 6) {
+            cur.utc_h = (io.parse_u32(f_utc[0..2]) or 0u32) as u8;
+            cur.utc_m = (io.parse_u32(f_utc[2..4]) or 0u32) as u8;
+            cur.utc_s = (io.parse_u32(f_utc[4..6]) or 0u32) as u8;
+        }
+        cur.rmc_active = (f_st.len > 0) && (f_st[0] == 'A');
+        if (cur.rmc_active && f_lat.len >= 4 && f_lon.len >= 4) {
+            cur.lat_udeg = parse_coord_udeg(f_lat, f_ns);
+            cur.lon_udeg = parse_coord_udeg(f_lon, f_ew);
+        }
+    }
+}
+
+// ── Cooperative Tasks ────────────────────────────────────────────────────────
+task gps_nmea_worker(*byte_ring rx, *watch<GpsSnapshot> gw) {
+    u8 line[96];
+    usize len = 0;
+    bool in_frame = false;
+    GpsSnapshot cur = gw.read();
+
+    loop {
+        []u8 chunk = rx.wait_read();
+        usize n = chunk.len;
+        cur.raw_bytes += n as u32;
+
+        for (u8 b in chunk) {
+            if (b == '$') {
+                in_frame = true;
+                len = 0;
+                continue;
+            }
+            if (!in_frame) {
+                continue;
+            }
+            if (b == '\r' || b == '\n') {
+                if (len >= 8) {
+                    usize pay_len = nmea_verify_payload_len(line[0..len]);
+                    if (pay_len > 0) {
+                        cur.good_sentences += 1u32;
+                        parse_nmea_sentence(line[0..pay_len], &cur);
+                    } else {
+                        cur.bad_checksums += 1u32;
+                    }
+                    gw.publish(cur);
+                }
+                in_frame = false;
+                len = 0;
+                continue;
+            }
+            if (len < 96) {
+                line[len] = b;
+                len += 1;
+            } else {
+                in_frame = false;
+                len = 0;
+            }
+        }
+        gw.publish(cur);
+        rx.consume(n);
+    }
+}
+
+task cli_worker(*byte_ring rx, *inbox<SupEvent, 8> sup) {
+    loop {
+        []u8 chunk = rx.wait_read();
+        usize n = chunk.len;
+        []u8 trimmed = io.trim_ascii(chunk);
+        for (u8 ch in trimmed) {
+            if (ch == 'p' || ch == 'P' || ch == '?') {
+                sup.post(CmdStatus, boost: @critical);
+            } else if (ch == 's' || ch == 'S') {
+                sup.post(CmdSystem, boost: @critical);
+            } else if (ch == 'g' || ch == 'G') {
+                sup.post(CmdGps, boost: @critical);
+            } else if (ch == 'l' || ch == 'L') {
+                sup.post(CmdLoopback, boost: @critical);
+            } else if (ch == 'h' || ch == 'H') {
+                sup.post(CmdHrtim, boost: @critical);
+            } else if (ch == 'a' || ch == 'A') {
+                sup.post(CmdAnalog, boost: @critical);
+            } else if (ch == 'd' || ch == 'D') {
+                sup.post(CmdDma, boost: @critical);
+            } else if (ch == 'c' || ch == 'C') {
+                sup.post(CmdCan, boost: @critical);
+            } else if (ch == 'f' || ch == 'F') {
+                sup.post(CmdFlashNvs, boost: @critical);
+            } else if (ch == 'r' || ch == 'R') {
+                sup.post(RunShakedown, boost: @critical);
+            } else if (ch == 'n' || ch == 'N') {
+                sup.post(UserTrigger, boost: @critical);
+            }
+        }
+        rx.consume(n);
+    }
+}
+
+// ── Application-Level Hardware Validation Suites (Built on BSP Primitives) ────
+u32 sample_a0_pwm_pct(u32 duty_pct) {
+    bsp.pwm_tim1_ch1_set_duty(duty_pct);
+
+    // Wait >= 3 ms ticks so OC1PE preload register latches on a clean 1 kHz PWM period boundary.
+    u32 settle_start = sys.now_ms();
+    for (u32 spin in 0..100_000) {
+        if ((sys.now_ms() - settle_start) >= 3u32) {
+            break;
+        }
+    }
+
+    // Align to next 1 ms tick boundary, then sample across 20 full 1 kHz PWM cycles (20 ms).
+    u32 t_wait = sys.now_ms();
+    for (u32 spin in 0..50_000) {
+        if (sys.now_ms() != t_wait) {
+            break;
+        }
+    }
+    u32 t0 = sys.now_ms();
+    u32 highs = 0u32;
+    u32 total = 0u32;
+    for (u32 spin in 0..200_000) {
+        if ((sys.now_ms() - t0) >= 20u32) {
+            break;
+        }
+        if (bsp.gpio_read(bsp.PORT_A, bsp.ARD_A0_PA0)) {
+            highs += 1u32;
+        }
+        total += 1u32;
+    }
+    if (total == 0u32) {
+        return 0u32;
+    }
+    return ((highs * 100u32) + (total / 2u32)) / total;
+}
+
+LoopbackReport run_d7_a0_loopback_test() {
+    bsp.pwm_tim1_ch1_stop();
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A0_PA0, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_DOWN);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_D7_PA8, bsp.GPIO_MODE_OUT, bsp.GPIO_PUPD_NONE);
+
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, false);
+    bsp.delay_us(100u32);
+    bool dig_low_ok = !bsp.gpio_read(bsp.PORT_A, bsp.ARD_A0_PA0);
+
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, true);
+    bsp.delay_us(100u32);
+    bool dig_high_ok = bsp.gpio_read(bsp.PORT_A, bsp.ARD_A0_PA0);
+
+    bsp.pwm_tim1_ch1_start(1000u32, 25u32);
+    u32 pwm25_pct = sample_a0_pwm_pct(25u32);
+    u32 pwm75_pct = sample_a0_pwm_pct(75u32);
+
+    bsp.pwm_tim1_ch1_stop();
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, false);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_D7_PA8, bsp.GPIO_MODE_OUT, bsp.GPIO_PUPD_NONE);
+
+    bool p25_ok = (pwm25_pct >= 19u32) && (pwm25_pct <= 31u32);
+    bool p75_ok = (pwm75_pct >= 69u32) && (pwm75_pct <= 81u32);
+
+    return LoopbackReport {
+        dig_low_ok: dig_low_ok,
+        dig_high_ok: dig_high_ok,
+        pwm25_pct: pwm25_pct,
+        pwm75_pct: pwm75_pct,
+        ok: dig_low_ok && dig_high_ok && p25_ok && p75_ok,
+    };
+}
+
+u16 probe_a1_with_discharge() {
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A1_PA1, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_DOWN);
+    bsp.delay_us(100u32);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A1_PA1, bsp.GPIO_MODE_ANALOG, bsp.GPIO_PUPD_NONE);
+    bsp.delay_us(150u32);
+    return bsp.adc1_read(2u32);
+}
+
+AnalogReport run_analog_test() {
+    u16 vref_counts = bsp.read_vrefint_counts();
+
+    // Sample D7 (PA8) -> A0 (PA0) analog levels via ADC1_IN1, then restore A0 digital input.
+    bsp.pwm_tim1_ch1_stop();
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A0_PA0, bsp.GPIO_MODE_ANALOG, bsp.GPIO_PUPD_NONE);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_D7_PA8, bsp.GPIO_MODE_OUT, bsp.GPIO_PUPD_NONE);
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, false);
+    bsp.delay_us(200u32);
+    u16 a0_low_counts = bsp.adc1_read(1u32);
+
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, true);
+    bsp.delay_us(200u32);
+    u16 a0_high_counts = bsp.adc1_read(1u32);
+
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, false);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A0_PA0, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_DOWN);
+
+    // DAC1_OUT1 (PA4/A2) verified via ADC2_IN1 (PA4) + A2->A1 (PA1/ADC1_IN2) jumper probe.
+    bsp.dac1_enable();
+    bsp.dac1_write(1024u16);
+    bsp.delay_us(200u32);
+    u16 dac_low_adc2 = bsp.adc2_read(1u32);
+    u16 a1_low_adc1 = probe_a1_with_discharge();
+
+    bsp.dac1_write(3072u16);
+    bsp.delay_us(200u32);
+    u16 dac_high_adc2 = bsp.adc2_read(1u32);
+    u16 a1_high_adc1 = probe_a1_with_discharge();
+
+    bsp.dac1_disable();
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A1_PA1, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_NONE);
+
+    // COMP2 (PA7 non-inverting) vs internal VREFINT (~1.23V) with 200 us t_START settle.
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_D11_PA7, bsp.GPIO_MODE_OUT, bsp.GPIO_PUPD_NONE);
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D11_PA7, false);
+    bsp.comp2_enable_vrefint();
+    bsp.delay_us(200u32);
+    u32 comp_csr_lo = bsp.comp2_raw_csr();
+    bool comp_low_out = bsp.comp2_read_out();
+
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D11_PA7, true);
+    bsp.delay_us(200u32);
+    u32 comp_csr_hi = bsp.comp2_raw_csr();
+    bool comp_high_out = bsp.comp2_read_out();
+
+    bsp.comp2_disable();
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D11_PA7, false);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_D11_PA7, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_NONE);
+
+    bool vref_ok = (vref_counts >= 1350u16) && (vref_counts <= 1700u16);
+    bool a0_ok = (a0_low_counts < 150u16) && (a0_high_counts > 3900u16);
+    bool dac_ok = (dac_low_adc2 >= 874u16) && (dac_low_adc2 <= 1174u16)
+        && (dac_high_adc2 >= 2922u16) && (dac_high_adc2 <= 3222u16);
+    bool a2_a1_jumper = (a1_low_adc1 >= 874u16) && (a1_low_adc1 <= 1174u16)
+        && (a1_high_adc1 >= 2922u16) && (a1_high_adc1 <= 3222u16);
+    bool comp_ok = (!comp_low_out) && comp_high_out;
+
+    return AnalogReport {
+        vref_counts: vref_counts,
+        a0_low_counts: a0_low_counts,
+        a0_high_counts: a0_high_counts,
+        dac_low_adc2: dac_low_adc2,
+        dac_high_adc2: dac_high_adc2,
+        a1_low_adc1: a1_low_adc1,
+        a1_high_adc1: a1_high_adc1,
+        a2_a1_jumper: a2_a1_jumper,
+        comp_low_out: comp_low_out,
+        comp_high_out: comp_high_out,
+        comp_csr_lo: comp_csr_lo,
+        comp_csr_hi: comp_csr_hi,
+        ok: vref_ok && a0_ok && dac_ok && comp_ok,
+    };
+}
+
+CanReport run_bxcan_test() {
+    bsp.can1_init(500_000u32, bsp.CAN_MODE_SILENT_LOOPBACK);
+
+    bsp.CanFrame tx1 = bsp.CanFrame {
+        id: 0x123u32,
+        extended: false,
+        dlc: 4u8,
+        data_lo: 0xEFBE_ADDEu32,
+        data_hi: 0u32,
+    };
+    bsp.CanFrame rx1 = bsp.CanFrame {
+        id: 0u32,
+        extended: false,
+        dlc: 0u8,
+        data_lo: 0u32,
+        data_hi: 0u32,
+    };
+    bool std_ok = false;
+    if (bsp.can1_send(&tx1)) {
+        for (u32 spin in 0..40_000) {
+            if (bsp.can1_recv(&rx1)) {
+                std_ok = (!rx1.extended)
+                    && (rx1.id == 0x123u32)
+                    && (rx1.dlc == 4u8)
+                    && (rx1.data_lo == 0xEFBE_ADDEu32);
+                break;
+            }
+        }
+    }
+
+    bsp.CanFrame tx2 = bsp.CanFrame {
+        id: 0x18DAF110u32,
+        extended: true,
+        dlc: 8u8,
+        data_lo: 0x5501_1002u32,
+        data_hi: 0x8877_33AAu32,
+    };
+    bsp.CanFrame rx2 = bsp.CanFrame {
+        id: 0u32,
+        extended: false,
+        dlc: 0u8,
+        data_lo: 0u32,
+        data_hi: 0u32,
+    };
+    bool ext_ok = false;
+    if (bsp.can1_send(&tx2)) {
+        for (u32 spin in 0..40_000) {
+            if (bsp.can1_recv(&rx2)) {
+                ext_ok = rx2.extended
+                    && (rx2.id == 0x18DAF110u32)
+                    && (rx2.dlc == 8u8)
+                    && (rx2.data_lo == 0x5501_1002u32)
+                    && (rx2.data_hi == 0x8877_33AAu32);
+                break;
+            }
+        }
+    }
+
+    bsp.can1_sleep();
+    return CanReport {
+        std_ok: std_ok,
+        std_id: rx1.id,
+        std_dlc: rx1.dlc,
+        ext_ok: ext_ok,
+        ext_id: rx2.id,
+        ext_dlc: rx2.dlc,
+        ok: std_ok && ext_ok,
+    };
+}
+
+// ── Telemetry Printers & Supervisor Orchestration ────────────────────────────
+fn print_udeg(i32 udeg) {
+    u8 buf[24];
+    u8 fb[8] = ['0', '.', '0', '0', '0', '0', '0', '0'];
+    []u8 s = fmt.fmt_fixed_i64(buf[0..24], udeg as i64, 6u8) or fb[0..8];
+    print(f"{s}");
+}
+
+fn print_gps_report() {
+    GpsSnapshot g = gps_watch.read();
+    PinSnapshot p = pin_watch.read();
+    print("[GPS] lat=");
+    print_udeg(g.lat_udeg);
+    print(" lon=");
+    print_udeg(g.lon_udeg);
+    u8 alt_buf[16];
+    u8 alt_fb[3] = ['0', '.', '0'];
+    []u8 alt_s = fmt.fmt_fixed_i64(alt_buf[0..16], g.alt_dm as i64, 1u8) or alt_fb[0..3];
+    println(f" alt={alt_s}m fix_q={g.fix_quality} rmc_ok={g.rmc_active} sats={g.sats} utc={g.utc_h}:{g.utc_m}:{g.utc_s} nmea_ok={g.good_sentences} bad_cs={g.bad_checksums} pmtk={g.pmtk_replies} raw={g.raw_bytes}B");
+    println(f"[PINS] pb0_fix(A3)={p.pb0_level}(edges={p.pb0_fix_edges}) pc1_pps(A4)={p.pc1_level}(edges={p.pc1_pps_edges}) pb1_pps={p.pb1_level}(edges={p.pb1_pps_edges}) btn_b1={p.button_pressed}(edges={p.button_edges}) tim2_ms={p.tim2_ticks}");
+}
+
+u8 reset_reason_code(bsp.ResetReason rr) {
+    switch (rr) {
+        bsp.ResetReason.PowerOn => { return 1u8; }
+        bsp.ResetReason.PinReset => { return 2u8; }
+        bsp.ResetReason.SoftwareReset => { return 3u8; }
+        bsp.ResetReason.IwdgReset => { return 4u8; }
+        bsp.ResetReason.WwdgReset => { return 5u8; }
+        bsp.ResetReason.LowPowerReset => { return 6u8; }
+    }
+}
+
+bool print_system_report(bsp.ResetReason boot_rr) {
+    u32 sysclk = bsp.sysclk_hz();
+    u32 hclk = bsp.hclk_hz();
+    u32 pclk1 = bsp.pclk1_hz();
+    u32 pclk2 = bsp.pclk2_hz();
+    u32 sleep_depth = sys.sleep_depth();
+    u32 uid0 = bsp.read_uid_word(0);
+    u32 uid1 = bsp.read_uid_word(1);
+    u32 uid2 = bsp.read_uid_word(2);
+    u16 vref_cal = bsp.read_vrefint_cal();
+    u32 vdda_mv = bsp.read_vdda_mv();
+    u8 r_code = reset_reason_code(boot_rr);
+
+    bool clk_ok = (sysclk == 72_000_000u32 || sysclk == 64_000_000u32)
+        && (pclk1 == (sysclk / 2u32))
+        && (pclk2 == sysclk);
+    bool uid_nz = (uid0 != 0u32) || (uid1 != 0u32) || (uid2 != 0u32);
+    bool uid_nf = (uid0 != 0xFFFF_FFFFu32) || (uid1 != 0xFFFF_FFFFu32) || (uid2 != 0xFFFF_FFFFu32);
+    bool sleep_ok = sleep_depth == 1u32;
+    bool vdda_ok = (vdda_mv >= 2900u32) && (vdda_mv <= 3600u32);
+    bool ok = clk_ok && uid_nz && uid_nf && sleep_ok && vdda_ok;
+
+    println(f"[SYS] ok={ok} rr={r_code} sysclk={sysclk} hclk={hclk} pclk1={pclk1} pclk2={pclk2} sleep_depth={sleep_depth} vref_cal={vref_cal} vdda={vdda_mv}mV uid=0x{uid2:08x}{uid1:08x}{uid0:08x}");
+    return ok;
+}
+
+bool print_fpu_report() {
+    u32 rt_one = 0u32;
+    if (bsp.sysclk_hz() >= 1_000_000u32) {
+        rt_one = 1u32;
+    }
+    f32 vdda_v = bsp.read_vdda_volts();
+    bool vdda_ok = (vdda_v >= 2.90f32) && (vdda_v <= 3.60f32);
+
+    f32 x0 = 2.5f32 * (rt_one as f32);
+    f32 x1 = 0.0f32;
+    f32 x2 = 0.0f32;
+    f32 y1 = 0.0f32;
+    f32 y2 = 0.0f32;
+    for (u32 i in 0..4096) {
+        f32 y = (0.125f32 * x0) + (0.25f32 * x1) + (0.125f32 * x2) + (0.75f32 * y1) - (0.25f32 * y2);
+        x2 = x1;
+        x1 = x0;
+        y2 = y1;
+        y1 = y;
+    }
+
+    f64 dsum = 0.0f64;
+    f64 scale64 = 0.125f64 * (rt_one as f64);
+    for (u32 i in 1..101) {
+        dsum = dsum + ((i as f64) * scale64);
+    }
+
+    bool math_ok = (y1 > 2.499f32) && (y1 < 2.501f32)
+        && (dsum > 631.24f64) && (dsum < 631.26f64);
+    bool ok = vdda_ok && math_ok;
+
+    println(f"[FPU] ok={ok} vdda={vdda_v:.3}V biquad={y1:.4} accum64={dsum:.2}");
+    return ok;
+}
+
+u32 sample_a0_window_pct(u32 window_ms) {
+    u32 t0 = sys.now_ms();
+    u32 highs = 0u32;
+    u32 total = 0u32;
+    for (u32 outer in 0..50_000) {
+        if ((sys.now_ms() - t0) >= window_ms) {
+            break;
+        }
+        for (u32 inner in 0..64) {
+            if (bsp.gpio_read(bsp.PORT_A, bsp.ARD_A0_PA0)) {
+                highs += 1u32;
+            }
+            total += 1u32;
+        }
+    }
+    if (total == 0u32) {
+        return 0u32;
+    }
+    return ((highs * 100u32) + (total / 2u32)) / total;
+}
+
+bool print_hrtim_report() {
+    bsp.pwm_tim1_ch1_stop();
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A0_PA0, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_DOWN);
+
+    bool pwm_ok = bsp.hrtim1_cha1_pwm_start(100_000u32, 25u32);
+    bool dll_ok = (hw.HRTIM1_COMMON.isr & (1u32 << 16)) != 0u32;
+    bsp.delay_us(200u32);
+    u32 p25 = sample_a0_window_pct(15u32);
+
+    bsp.hrtim1_cha1_set_duty(75u32);
+    bsp.delay_us(200u32);
+    u32 p75 = sample_a0_window_pct(15u32);
+
+    bsp.hrtim1_cha1_stop();
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, false);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_D7_PA8, bsp.GPIO_MODE_OUT, bsp.GPIO_PUPD_NONE);
+
+    bool p25_ok = (p25 >= 19u32) && (p25 <= 31u32);
+    bool p75_ok = (p75 >= 69u32) && (p75 <= 81u32);
+    bool ok = dll_ok && pwm_ok && p25_ok && p75_ok;
+
+    println(f"[HRTIM1 CHA1->A0] ok={ok} dll={dll_ok} pwm={pwm_ok} pwm25={p25}% pwm75={p75}%");
+    return ok;
+}
+
+bool print_flash_nvs_report() {
+    bool erase_ok = bsp.flash_nvs_erase();
+    u32 blank = bsp.flash_nvs_read_u32(0);
+
+    u32 pattern[4] = [0x5A45_5631u32, 0xF334_0072u32, bsp.read_uid_word(0), 0xA55A_CC33u32];
+    bool write_ok = bsp.flash_nvs_write_words(0, pattern[0..4]);
+
+    u32 w0 = bsp.flash_nvs_read_u32(0);
+    u32 w1 = bsp.flash_nvs_read_u32(1);
+    u32 w2 = bsp.flash_nvs_read_u32(2);
+    u32 w3 = bsp.flash_nvs_read_u32(3);
+
+    bool ok = erase_ok
+        && (blank == 0xFFFF_FFFFu32)
+        && write_ok
+        && (w0 == pattern[0])
+        && (w1 == pattern[1])
+        && (w2 == pattern[2])
+        && (w3 == pattern[3]);
+
+    println(f"[FLASH_NVS page31] ok={ok} erase={erase_ok} blank=0x{blank:08x} write={write_ok} w0=0x{w0:08x} w1=0x{w1:08x} w2=0x{w2:08x} w3=0x{w3:08x}");
+    return ok;
+}
+
+bool print_bus_probe_report() {
+    bsp.spi1_init(0u8, 4u8, bsp.SPI1_PINS_PB3_5);
+    bool spi_ok = true;
+    u8 spi_echo = bsp.spi1_transfer_byte(0xA5u8) catch {
+        spi_ok = false;
+        0u8;
+    };
+    bsp.spi1_deinit();
+    bsp.gpio_config(bsp.PORT_B, bsp.PIN_SPI1_SCK_PB3, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_NONE);
+    bsp.gpio_config(bsp.PORT_B, bsp.PIN_SPI1_MISO_PB4, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_NONE);
+    bsp.gpio_config(bsp.PORT_B, bsp.PIN_SPI1_MOSI_PB5, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_NONE);
+
+    bsp.i2c1_init_100k();
+    bool i2c_ack3c = bsp.i2c1_probe_7bit(0x3Cu8);
+    bool i2c_idle = (hw.I2C1.isr & (1u32 << 15)) == 0u32;
+    bsp.i2c1_deinit();
+    bsp.gpio_config(bsp.PORT_B, bsp.PIN_I2C1_SCL_PB6, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_NONE);
+    bsp.gpio_config(bsp.PORT_B, bsp.PIN_I2C1_SDA_PB7, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_NONE);
+
+    bool ok = spi_ok && i2c_idle;
+    println(f"[BUS] ok={ok} spi_ok={spi_ok} spi_rx=0x{spi_echo:02x} i2c_idle={i2c_idle} i2c_0x3c_ack={i2c_ack3c}");
+    return ok;
+}
+
+bool print_loopback_report() {
+    LoopbackReport lb = run_d7_a0_loopback_test();
+    println(f"[LOOPBACK D7(PA8)->A0(PA0)] ok={lb.ok} dig0={lb.dig_low_ok} dig1={lb.dig_high_ok} pwm25={lb.pwm25_pct}% pwm75={lb.pwm75_pct}%");
+    return lb.ok;
+}
+
+bool print_analog_report() {
+    AnalogReport an = run_analog_test();
+    println(f"[ANALOG] ok={an.ok} vref_cnt={an.vref_counts} a0_lo={an.a0_low_counts} a0_hi={an.a0_high_counts} dac_adc2=({an.dac_low_adc2},{an.dac_high_adc2}) a1_probe=({an.a1_low_adc1},{an.a1_high_adc1},jumper={an.a2_a1_jumper}) comp2=({an.comp_low_out},{an.comp_high_out},csr=0x{an.comp_csr_lo:08x}/0x{an.comp_csr_hi:08x})");
+    return an.ok;
+}
+
+bool print_can_report() {
+    CanReport can = run_bxcan_test();
+    println(f"[CAN] ok={can.ok} std(ok={can.std_ok},id=0x{can.std_id:03x},dlc={can.std_dlc}) ext(ok={can.ext_ok},id=0x{can.ext_id:08x},dlc={can.ext_dlc})");
+    return can.ok;
+}
+
+bool run_dma_test() {
+    Lease<DmaBurst> job = dma_pool.try_alloc() catch {
+        println("[DMA] ok=false err=pool_empty");
+        return false;
+    };
+    *DmaBurst jp = job.get();
+    usize base = job.addr();
+    for (usize i in 0..8) {
+        jp.src[i] = 0xCAFE_0000u32 + ((i as u32) * 0x0101u32);
+        jp.dst[i] = 0u32;
+    }
+    dma_inflight.park(job) catch {
+        println("[DMA] ok=false err=slot_busy");
+        return false;
+    };
+    bsp.dma1_ch1_mem2mem_start(base, base + 32, 8);
+    Lease<DmaBurst> done = dma_done_q.recv(timeout: 100ms) catch {
+        bool dropped = dma_inflight.release();
+        println(f"[DMA] ok=false err=timeout dropped={dropped}");
+        return false;
+    };
+    bool ok = true;
+    for (usize i in 0..8) {
+        if (done.get().dst[i] != done.get().src[i]) {
+            ok = false;
+        }
+    }
+    done.release();
+    println(f"[DMA] ok={ok} words=8 pool_avail={dma_pool.avail()}");
+    return ok;
+}
+
+fn run_full_shakedown(bsp.ResetReason boot_rr) {
+    println("--- [NUCLEO-F334R8 Hardware Shakedown] ---");
+    bsp.usart1_write("$PMTK605*31\r\n");
+    bool sys_ok = print_system_report(boot_rr);
+    bool fpu_ok = print_fpu_report();
+    bool lb_ok = print_loopback_report();
+    bool hrtim_ok = print_hrtim_report();
+    bool an_ok = print_analog_report();
+    bool dma_ok = run_dma_test();
+    bool can_ok = print_can_report();
+    bool nvs_ok = print_flash_nvs_report();
+    bool bus_ok = print_bus_probe_report();
+    print_gps_report();
+    GpsSnapshot g = gps_watch.read();
+    bool gps_ok = (g.raw_bytes > 0u32) && (g.good_sentences > 0u32) && (g.bad_checksums == 0u32);
+    bool all_ok = sys_ok && fpu_ok && lb_ok && hrtim_ok && an_ok && dma_ok && can_ok && nvs_ok && bus_ok && gps_ok;
+    println(f"[PASS_SUMMARY] all_ok={all_ok} sys={sys_ok} fpu={fpu_ok} loopback={lb_ok} hrtim={hrtim_ok} analog={an_ok} dma={dma_ok} can={can_ok} flash_nvs={nvs_ok} bus={bus_ok} gps={gps_ok}");
+}
+
+// ── Boot & Supervisor Loop ───────────────────────────────────────────────────
+fn main() {
+    bsp.init_board();
+    bsp.ResetReason boot_rr = bsp.read_reset_reason(true);
+    bsp.adc_init();
+    bsp.usart1_init(9600u32, true); // Adafruit Ultimate GPS (PA9 TX / PA10 RX)
+
+    // Configure external rig GPIOs explicitly in application startup:
+    bsp.gpio_config(bsp.PORT_B, bsp.ARD_A3_PB0, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_UP);   // GPS FIX (PB0/A3)
+    bsp.gpio_config(bsp.PORT_C, bsp.ARD_A4_PC1, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_DOWN); // Arduino A4 PPS (PC1)
+    bsp.gpio_config(bsp.PORT_B, RIG_PIN_PB1_LEGACY_PPS, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_DOWN); // Legacy PB1 PPS probe
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_A0_PA0, bsp.GPIO_MODE_IN, bsp.GPIO_PUPD_DOWN); // D7->A0 RX
+    bsp.gpio_write(bsp.PORT_A, bsp.ARD_D7_PA8, false);
+    bsp.gpio_config(bsp.PORT_A, bsp.ARD_D7_PA8, bsp.GPIO_MODE_OUT, bsp.GPIO_PUPD_NONE); // D7 TX
+
+    bsp.tim2_start_periodic_us(1000u32); // 1.000 kHz pin sampler & LED beat
+
+    hw.IRQ_DMA1_CH1.attach(dma1_ch1_isr(&dma_inflight, &dma_done_q));
+    hw.IRQ_TIM2.attach(tim2_isr(&tim2_q, &pin_watch));
+    hw.IRQ_USART1.attach(usart1_gps_isr(&gps_rx, hw.USART1));
+    hw.IRQ_USART2.attach(usart2_rx_isr(&console_rx, hw.USART2));
+
+    spawn gps_nmea_worker(&gps_rx, &gps_watch) @high;
+    spawn cli_worker(&console_rx, &sup_inbox) @normal;
+
+    set_priority(@low);
+    println("");
+    println("[BOOT] Zev Language-OS on STM32F334R8 NUCLEO-F334R8 (Cortex-M4F, zero C)");
+
+    // Query Adafruit Ultimate GPS firmware version over USART1 TX (PA9) and allow >=1.5s NMEA/PPS capture.
+    bsp.usart1_write("$PMTK605*31\r\n");
+    delay(1500ms);
+
+    run_full_shakedown(boot_rr);
+
+    u32 hb_count = 0u32;
+    loop {
+        for (u32 i in 0..8) {
+            u32 _t = tim2_q.try_recv() or 0u32;
+        }
+        SupEvent ev = sup_inbox.recv(timeout: 2000ms) or Heartbeat;
+        switch (ev) {
+            RunShakedown => {
+                run_full_shakedown(boot_rr);
+            }
+            CmdStatus => {
+                PinSnapshot p = pin_watch.read();
+                GpsSnapshot g = gps_watch.read();
+                println(f"[CMD F334R8] PONG uptime={sys.now_ms()}ms tim2={p.tim2_ticks} prio={sys.current_prio()} sats={g.sats} fix_q={g.fix_quality} pc1_pps={p.pc1_pps_edges} pb1_pps={p.pb1_pps_edges}");
+            }
+            CmdSystem => {
+                bool _sys = print_system_report(boot_rr);
+                bool _fpu = print_fpu_report();
+                bool _bus = print_bus_probe_report();
+            }
+            CmdGps => {
+                print_gps_report();
+            }
+            CmdLoopback => {
+                bool _ok = print_loopback_report();
+            }
+            CmdHrtim => {
+                bool _ok = print_hrtim_report();
+            }
+            CmdAnalog => {
+                bool _ok = print_analog_report();
+            }
+            CmdDma => {
+                bool _ok = run_dma_test();
+            }
+            CmdCan => {
+                bool _ok = print_can_report();
+            }
+            CmdFlashNvs => {
+                bool _ok = print_flash_nvs_report();
+            }
+            UserTrigger => {
+                u32 boosted = sys.current_prio();
+                println(f"[EVENT] F334R8 Supervisor Trigger prio={boosted} uptime={sys.now_ms()}ms");
+                print_gps_report();
+            }
+            Heartbeat => {
+                hb_count += 1u32;
+                PinSnapshot p = pin_watch.read();
+                GpsSnapshot g = gps_watch.read();
+                print(f"[Zev on NUCLEO-F334R8] hb={hb_count} up={sys.now_ms()}ms tim2={p.tim2_ticks} pc1_pps={p.pc1_pps_edges} pb1_pps={p.pb1_pps_edges} pb0_fix={p.pb0_fix_edges} sats={g.sats} pos=");
+                print_udeg(g.lat_udeg);
+                print(",");
+                print_udeg(g.lon_udeg);
+                println(f" nmea={g.good_sentences}");
+            }
+        }
+    }
+}

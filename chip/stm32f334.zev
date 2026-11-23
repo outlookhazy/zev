@@ -1,0 +1,321 @@
+// STMicroelectronics STM32F334R8 Typed MMIO Register Maps & NVIC IRQ Tokens (RM0364)
+
+pub mmio RccRegs {
+    @rw u32 cr       @ 0x00;
+    @rw u32 cfgr     @ 0x04;
+    @rw u32 cir      @ 0x08;
+    @rw u32 apb2rstr @ 0x0C;
+    @rw u32 apb1rstr @ 0x10;
+    @rw u32 ahbenr   @ 0x14;
+    @rw u32 apb2enr  @ 0x18;
+    @rw u32 apb1enr  @ 0x1C;
+    @rw u32 bdcr     @ 0x20;
+    @rw u32 csr      @ 0x24;
+    @rw u32 ahbrstr  @ 0x28;
+    @rw u32 cfgr2    @ 0x2C;
+    @rw u32 cfgr3    @ 0x30;
+}
+
+pub mmio FlashRegs {
+    @rw u32 acr     @ 0x00;
+    @wo u32 keyr    @ 0x04;
+    @wo u32 optkeyr @ 0x08;
+    @rw u32 sr      @ 0x0C;
+    @rw u32 cr      @ 0x10;
+    @wo u32 ar      @ 0x14;
+    @ro u32 obr     @ 0x1C;
+    @ro u32 wrpr    @ 0x20;
+}
+
+pub mmio FlashNvsPage {
+    @rw [1024]u16 halfwords @ 0x00;
+}
+
+pub mmio DeviceUidRegs {
+    @ro [3]u32 words @ 0x00;
+}
+
+pub mmio VrefCalRegs {
+    @ro u16 vrefint @ 0x00;
+}
+
+pub mmio GpioRegs {
+    @rw u32 moder   @ 0x00;
+    @rw u32 otyper  @ 0x04;
+    @rw u32 ospeedr @ 0x08;
+    @rw u32 pupdr   @ 0x0C;
+    @ro u32 idr     @ 0x10;
+    @rw u32 odr     @ 0x14;
+    @wo u32 bsrr    @ 0x18;
+    @rw u32 afrl    @ 0x20;
+    @rw u32 afrh    @ 0x24;
+    @wo u32 brr     @ 0x28;
+}
+
+pub mmio TimRegs {
+    @rw u32 cr1   @ 0x00;
+    @rw u32 dier  @ 0x0C;
+    // STM32 TIMx_SR is rc_w0 (cleared by writing 0); must not use @w1c.
+    @rw u32 sr    @ 0x10;
+    @wo u32 egr   @ 0x14;
+    @rw u32 ccmr1 @ 0x18;
+    @rw u32 ccer  @ 0x20;
+    @rw u32 cnt   @ 0x24;
+    @rw u32 psc   @ 0x28;
+    @rw u32 arr   @ 0x2C;
+    @rw u32 ccr1  @ 0x34;
+    @rw u32 bdtr  @ 0x44;
+}
+
+pub mmio HrtimMasterRegs {
+    @rw u32 mcr    @ 0x00;
+    @ro u32 misr   @ 0x04;
+    @wo u32 micr   @ 0x08;
+    @rw u32 mdier  @ 0x0C;
+    @rw u32 mcntr  @ 0x10;
+    @rw u32 mper   @ 0x14;
+    @rw u32 mrep   @ 0x18;
+    @rw u32 mcmp1r @ 0x1C;
+    @rw u32 mcmp2r @ 0x24;
+    @rw u32 mcmp3r @ 0x28;
+    @rw u32 mcmp4r @ 0x2C;
+}
+
+pub mmio HrtimTimRegs {
+    @rw u32 timcr   @ 0x00;
+    @ro u32 timisr  @ 0x04;
+    @wo u32 timicr  @ 0x08;
+    @rw u32 timdier @ 0x0C;
+    @rw u32 cnt     @ 0x10;
+    @rw u32 per     @ 0x14;
+    @rw u32 rep     @ 0x18;
+    @rw u32 cmp1r   @ 0x1C;
+    @rw u32 cmp1cr  @ 0x20;
+    @rw u32 cmp2r   @ 0x24;
+    @rw u32 cmp3r   @ 0x28;
+    @rw u32 cmp4r   @ 0x2C;
+    @ro u32 cpt1r   @ 0x30;
+    @ro u32 cpt2r   @ 0x34;
+    @rw u32 dtr     @ 0x38;
+    @rw u32 set1r   @ 0x3C;
+    @rw u32 rst1r   @ 0x40;
+    @rw u32 set2r   @ 0x44;
+    @rw u32 rst2r   @ 0x48;
+    @rw u32 eef1r   @ 0x4C;
+    @rw u32 eef2r   @ 0x50;
+    @rw u32 rstcr   @ 0x54;
+    @rw u32 chpcr   @ 0x58;
+    @rw u32 cpt1cr  @ 0x5C;
+    @rw u32 cpt2cr  @ 0x60;
+    @rw u32 outr    @ 0x64;
+    @rw u32 fltr    @ 0x68;
+}
+
+pub mmio HrtimCommonRegs {
+    @rw u32 cr1     @ 0x00;
+    @rw u32 cr2     @ 0x04;
+    @ro u32 isr     @ 0x08;
+    @wo u32 icr     @ 0x0C;
+    @rw u32 ier     @ 0x10;
+    @rw u32 oenr    @ 0x14;
+    @wo u32 odisr   @ 0x18;
+    @ro u32 odsr    @ 0x1C;
+    @rw u32 bmcr    @ 0x20;
+    @rw u32 bmtrgr  @ 0x24;
+    @rw u32 bmcmpr  @ 0x28;
+    @rw u32 bmper   @ 0x2C;
+    @rw u32 eecr1   @ 0x30;
+    @rw u32 eecr2   @ 0x34;
+    @rw u32 eecr3   @ 0x38;
+    @rw u32 adc1r   @ 0x3C;
+    @rw u32 adc2r   @ 0x40;
+    @rw u32 adc3r   @ 0x44;
+    @rw u32 adc4r   @ 0x48;
+    @rw u32 dllcr   @ 0x4C;
+    @rw u32 fltinr1 @ 0x50;
+    @rw u32 fltinr2 @ 0x54;
+    @rw u32 bdmupdr @ 0x58;
+}
+
+pub mmio UsartRegs {
+    @rw u32 cr1 @ 0x00;
+    @rw u32 cr2 @ 0x04;
+    @rw u32 cr3 @ 0x08;
+    @rw u32 brr @ 0x0C;
+    @ro u32 isr @ 0x1C;
+    @wo u32 icr @ 0x20;
+    @ro u32 rdr @ 0x24;
+    @wo u32 tdr @ 0x28;
+}
+
+pub mmio SpiRegs {
+    @rw u32 cr1   @ 0x00;
+    @rw u32 cr2   @ 0x04;
+    @rw u32 sr    @ 0x08;
+    @rw u8  dr    @ 0x0C;
+    @rw u32 crcpr @ 0x10;
+    @ro u32 rxcrc @ 0x14;
+    @ro u32 txcrc @ 0x18;
+}
+
+pub mmio I2cRegs {
+    @rw u32 cr1      @ 0x00;
+    @rw u32 cr2      @ 0x04;
+    @rw u32 oar1     @ 0x08;
+    @rw u32 oar2     @ 0x0C;
+    @rw u32 timingr  @ 0x10;
+    @rw u32 timeoutr @ 0x14;
+    @ro u32 isr      @ 0x18;
+    @wo u32 icr      @ 0x1C;
+    @ro u32 pecr     @ 0x20;
+    @ro u32 rxdr     @ 0x24;
+    @wo u32 txdr     @ 0x28;
+}
+
+pub mmio IwdgRegs {
+    @wo u32 kr  @ 0x00;
+    @rw u32 pr  @ 0x04;
+    @rw u32 rlr @ 0x08;
+    @ro u32 sr  @ 0x0C;
+    @rw u32 win @ 0x10;
+}
+
+pub mmio DmaRegs {
+    @ro u32 isr    @ 0x00;
+    @wo u32 ifcr   @ 0x04;
+    @rw u32 ccr1   @ 0x08;
+    @rw u32 cndtr1 @ 0x0C;
+    @rw u32 cpar1  @ 0x10;
+    @rw u32 cmar1  @ 0x14;
+    @rw u32 ccr2   @ 0x1C;
+    @rw u32 cndtr2 @ 0x20;
+    @rw u32 cpar2  @ 0x24;
+    @rw u32 cmar2  @ 0x28;
+    @rw u32 ccr3   @ 0x30;
+    @rw u32 cndtr3 @ 0x34;
+    @rw u32 cpar3  @ 0x38;
+    @rw u32 cmar3  @ 0x3C;
+    @rw u32 ccr4   @ 0x44;
+    @rw u32 cndtr4 @ 0x48;
+    @rw u32 cpar4  @ 0x4C;
+    @rw u32 cmar4  @ 0x50;
+    @rw u32 ccr5   @ 0x58;
+    @rw u32 cndtr5 @ 0x5C;
+    @rw u32 cpar5  @ 0x60;
+    @rw u32 cmar5  @ 0x64;
+    @rw u32 ccr6   @ 0x6C;
+    @rw u32 cndtr6 @ 0x70;
+    @rw u32 cpar6  @ 0x74;
+    @rw u32 cmar6  @ 0x78;
+    @rw u32 ccr7   @ 0x80;
+    @rw u32 cndtr7 @ 0x84;
+    @rw u32 cpar7  @ 0x88;
+    @rw u32 cmar7  @ 0x8C;
+}
+
+pub mmio SyscfgCompRegs {
+    @rw u32 cfgr1     @ 0x00;
+    @rw u32 comp1_csr @ 0x1C;
+    @rw u32 comp2_csr @ 0x20;
+}
+
+pub mmio DacRegs {
+    @rw u32 cr      @ 0x00;
+    @wo u32 swtrigr @ 0x04;
+    @rw u32 dhr12r1 @ 0x08;
+    @ro u32 dor1    @ 0x2C;
+}
+
+pub mmio CanRegs {
+    @rw u32 mcr   @ 0x000;
+    @rw u32 msr   @ 0x004;
+    @rw u32 tsr   @ 0x008;
+    @rw u32 rf0r  @ 0x00C;
+    @rw u32 btr   @ 0x01C;
+    @rw u32 ti0r  @ 0x180;
+    @rw u32 tdt0r @ 0x184;
+    @rw u32 tdl0r @ 0x188;
+    @rw u32 tdh0r @ 0x18C;
+    @ro u32 ri0r  @ 0x1B0;
+    @ro u32 rdt0r @ 0x1B4;
+    @ro u32 rdl0r @ 0x1B8;
+    @ro u32 rdh0r @ 0x1BC;
+    @rw u32 fmr   @ 0x200;
+    @rw u32 fm1r  @ 0x204;
+    @rw u32 fs1r  @ 0x20C;
+    @rw u32 ffa1r @ 0x214;
+    @rw u32 fa1r  @ 0x21C;
+    @rw u32 f0r1  @ 0x240;
+    @rw u32 f0r2  @ 0x244;
+}
+
+pub mmio AdcRegs {
+    @rw u32 isr   @ 0x00;
+    @rw u32 ier   @ 0x04;
+    @rw u32 cr    @ 0x08;
+    @rw u32 cfgr  @ 0x0C;
+    @rw u32 smpr1 @ 0x14;
+    @rw u32 smpr2 @ 0x18;
+    @rw u32 sqr1  @ 0x30;
+    @ro u32 dr    @ 0x40;
+}
+
+pub mmio AdcCommonRegs {
+    @ro u32 csr @ 0x00;
+    @rw u32 ccr @ 0x08;
+}
+
+pub mmio RCC           : RccRegs         @ 0x4002_1000;
+pub mmio FLASH         : FlashRegs       @ 0x4002_2000;
+pub mmio FLASH_NVS     : FlashNvsPage    @ 0x0800_F800;
+pub mmio DEVICE_UID    : DeviceUidRegs   @ 0x1FFF_F7AC;
+pub mmio VREFINT_CAL   : VrefCalRegs     @ 0x1FFF_F7BA;
+pub mmio GPIOA         : GpioRegs        @ 0x4800_0000;
+pub mmio GPIOB         : GpioRegs        @ 0x4800_0400;
+pub mmio GPIOC         : GpioRegs        @ 0x4800_0800;
+pub mmio TIM1          : TimRegs         @ 0x4001_2C00;
+pub mmio TIM2          : TimRegs         @ 0x4000_0000;
+pub mmio HRTIM1_MASTER : HrtimMasterRegs @ 0x4001_7400;
+pub mmio HRTIM1_TIMA   : HrtimTimRegs    @ 0x4001_7480;
+pub mmio HRTIM1_COMMON : HrtimCommonRegs @ 0x4001_7780;
+pub mmio USART1        : UsartRegs       @ 0x4001_3800;
+pub mmio USART2        : UsartRegs       @ 0x4000_4400;
+pub mmio SPI1          : SpiRegs         @ 0x4001_3000;
+pub mmio I2C1          : I2cRegs         @ 0x4000_5400;
+pub mmio IWDG          : IwdgRegs        @ 0x4000_3000;
+pub mmio DMA1          : DmaRegs         @ 0x4002_0000;
+pub mmio SYSCFG_COMP   : SyscfgCompRegs  @ 0x4001_0000;
+pub mmio DAC1          : DacRegs         @ 0x4000_7400;
+pub mmio CAN1          : CanRegs         @ 0x4000_6400;
+pub mmio ADC1          : AdcRegs         @ 0x5000_0000;
+pub mmio ADC2          : AdcRegs         @ 0x5000_0100;
+pub mmio ADC12_COMMON  : AdcCommonRegs   @ 0x5000_0300;
+
+pub irq IRQ_DMA1_CH1  = 11;
+pub irq IRQ_DMA1_CH5  = 15;
+pub irq IRQ_TIM2      = 28;
+pub irq IRQ_USART1    = 37;
+pub irq IRQ_USART2    = 38;
+pub irq IRQ_EXTI15_10 = 40;
+
+pub const u32 RCC_AHB_DMA1    = 1 << 0;
+pub const u32 RCC_AHB_GPIOA   = 1 << 17;
+pub const u32 RCC_AHB_GPIOB   = 1 << 18;
+pub const u32 RCC_AHB_GPIOC   = 1 << 19;
+pub const u32 RCC_AHB_ADC12   = 1 << 28;
+
+pub const u32 RCC_APB2_SYSCFG = 1 << 0;
+pub const u32 RCC_APB2_TIM1   = 1 << 11;
+pub const u32 RCC_APB2_SPI1   = 1 << 12;
+pub const u32 RCC_APB2_USART1 = 1 << 14;
+pub const u32 RCC_APB2_HRTIM1 = 1 << 29;
+
+pub const u32 RCC_APB1_TIM2   = 1 << 0;
+pub const u32 RCC_APB1_WWDG   = 1 << 11;
+pub const u32 RCC_APB1_USART2 = 1 << 17;
+pub const u32 RCC_APB1_I2C1   = 1 << 21;
+pub const u32 RCC_APB1_CAN1   = 1 << 25;
+pub const u32 RCC_APB1_PWR    = 1 << 28;
+pub const u32 RCC_APB1_DAC1   = 1 << 29;
+
+pub const u32 RCC_CFGR3_HRTIM1SW_PLL = 1 << 12;

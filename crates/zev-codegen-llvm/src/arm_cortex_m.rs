@@ -315,12 +315,22 @@ data_body:
         ""
     };
 
+    let fpu_enable_ir = if spec.has_fpu {
+        if spec.has_thumb2 {
+            "  call void asm sideeffect \"movw r0, #0xed88\\0Amovt r0, #0xe000\\0Aldr r1, [r0]\\0Aorr r1, r1, #0x00f00000\\0Astr r1, [r0]\\0Adsb\\0Aisb\", \"~{r0},~{r1},~{memory}\"()\n"
+        } else {
+            "  call void asm sideeffect \"ldr r0, =0xE000ED88\\0Aldr r1, [r0]\\0Aorr r1, r1, #0x00F00000\\0Astr r1, [r0]\\0Adsb\\0Aisb\", \"~{r0},~{r1},~{memory}\"()\n"
+        }
+    } else {
+        ""
+    };
+
     let _ = writeln!(
         out,
-        r#"define void @Reset_Handler() #98 {{
+        r#"define void @Reset_Handler() #97 {{
 entry:
   call void asm sideeffect "cpsid i", "~{{memory}}"()
-  ; 1. Zero .bss [__sbss .. __ebss)
+{fpu_enable_ir}  ; 1. Zero .bss [__sbss .. __ebss)
   %sbss_a = ptrtoint ptr @__sbss to i32
   %ebss_a = ptrtoint ptr @__ebss to i32
   br label %bss_loop
@@ -426,6 +436,7 @@ entry:
 
 define void @__syn_use_systick(i32 %hz) nounwind{sz} {{
 entry:
+  store volatile i32 %hz, ptr @__syn_cpu_hz, align 4
   %khz = udiv i32 %hz, 1000
   %sub = sub i32 %khz, 1
   %gt_zero = icmp sgt i32 %sub, 1
@@ -437,6 +448,82 @@ entry:
   store volatile i32 %rvr, ptr inttoptr (i32 -536813548 to ptr), align 4
   store volatile i32 0, ptr inttoptr (i32 -536813544 to ptr), align 4
   store volatile i32 7, ptr inttoptr (i32 -536813552 to ptr), align 4
+  ret void
+}}
+
+define void @__syn_arch_delay_us(i32 %us) nounwind{sz} {{
+entry:
+  %is_zero = icmp eq i32 %us, 0
+  br i1 %is_zero, label %done, label %check_st
+check_st:
+  %csr = load volatile i32, ptr inttoptr (i32 -536813552 to ptr), align 4
+  %rvr_raw = load volatile i32, ptr inttoptr (i32 -536813548 to ptr), align 4
+  %rvr = and i32 %rvr_raw, 16777215
+  %st_en = and i32 %csr, 1
+  %is_en = icmp ne i32 %st_en, 0
+  %rvr_ok = icmp uge i32 %rvr, 999
+  %use_st = and i1 %is_en, %rvr_ok
+  br i1 %use_st, label %st_init, label %nop_init
+st_init:
+  %period = add i32 %rvr, 1
+  %tpu_raw = udiv i32 %period, 1000
+  %tpu_pos = icmp ugt i32 %tpu_raw, 0
+  %tpu = select i1 %tpu_pos, i32 %tpu_raw, i32 1
+  br label %chunk_loop
+chunk_loop:
+  %rem_us = phi i32 [ %us, %st_init ], [ %rem_next, %chunk_next ]
+  %more_chunks = icmp ugt i32 %rem_us, 0
+  br i1 %more_chunks, label %chunk_prep, label %done
+chunk_prep:
+  %gt500 = icmp ugt i32 %rem_us, 500
+  %chunk_us = select i1 %gt500, i32 500, i32 %rem_us
+  %target_ticks = mul i32 %chunk_us, %tpu
+  %max_polls_mul = mul i32 %target_ticks, 8
+  %max_polls = add i32 %max_polls_mul, 256
+  %cvr0 = load volatile i32, ptr inttoptr (i32 -536813544 to ptr), align 4
+  %prev0 = and i32 %cvr0, 16777215
+  br label %st_poll
+st_poll:
+  %prev = phi i32 [ %prev0, %chunk_prep ], [ %now, %st_poll_cont ]
+  %elapsed = phi i32 [ 0, %chunk_prep ], [ %elapsed_next, %st_poll_cont ]
+  %polls = phi i32 [ 0, %chunk_prep ], [ %polls_next, %st_poll_cont ]
+  %cvr_raw = load volatile i32, ptr inttoptr (i32 -536813544 to ptr), align 4
+  %now = and i32 %cvr_raw, 16777215
+  %no_wrap = icmp uge i32 %prev, %now
+  %dt_nw = sub i32 %prev, %now
+  %prev_per = add i32 %prev, %period
+  %dt_wr = sub i32 %prev_per, %now
+  %now_oob = icmp ugt i32 %now, %prev_per
+  %dt_wr_safe = select i1 %now_oob, i32 1, i32 %dt_wr
+  %dt = select i1 %no_wrap, i32 %dt_nw, i32 %dt_wr_safe
+  %elapsed_next = add i32 %elapsed, %dt
+  %polls_next = add i32 %polls, 1
+  %done_ticks = icmp uge i32 %elapsed_next, %target_ticks
+  br i1 %done_ticks, label %chunk_next, label %st_chk_poll
+st_chk_poll:
+  %done_polls = icmp uge i32 %polls_next, %max_polls
+  br i1 %done_polls, label %done, label %st_poll_cont
+st_poll_cont:
+  br label %st_poll
+chunk_next:
+  %rem_next = sub i32 %rem_us, %chunk_us
+  br label %chunk_loop
+nop_init:
+  %hz = load volatile i32, ptr @__syn_cpu_hz, align 4
+  %pu_raw = udiv i32 %hz, 4000000
+  %pu_pos = icmp ugt i32 %pu_raw, 0
+  %per_us = select i1 %pu_pos, i32 %pu_raw, i32 1
+  %loops = mul i32 %us, %per_us
+  br label %nop_loop
+nop_loop:
+  %nrem = phi i32 [ %loops, %nop_init ], [ %nnext, %nop_body ]
+  %nmore = icmp ugt i32 %nrem, 0
+  br i1 %nmore, label %nop_body, label %done
+nop_body:
+  call void asm sideeffect "nop", "~{{memory}}"()
+  %nnext = sub i32 %nrem, 1
+  br label %nop_loop
+done:
   ret void
 }}
 
@@ -473,7 +560,9 @@ entry:
 do_wfi:
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
   %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
-  %any_locks = or i32 %locks, %dma_locks
+  %user_locks = load volatile i32, ptr @__syn_user_sleep_locks, align 4
+  %any0 = or i32 %locks, %dma_locks
+  %any_locks = or i32 %any0, %user_locks
   %locked = icmp ne i32 %any_locks, 0
   %depth = select i1 %locked, i32 1, i32 2
   store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4

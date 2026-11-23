@@ -10,6 +10,101 @@ pub T clamp<T>(T val, T lo, T hi) {
     return val;
 }
 
+pub T min<T>(T a, T b) {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+pub T max<T>(T a, T b) {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+pub u32 abs_i32(i32 v) {
+    if (v < 0i32) {
+        return ((-(v + 1i32)) as u32) + 1u32;
+    }
+    return v as u32;
+}
+
+pub u64 abs_i64(i64 v) {
+    if (v < 0i64) {
+        return ((-(v + 1i64)) as u64) + 1u64;
+    }
+    return v as u64;
+}
+
+pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error {
+    if (frac_digits > 9u8) {
+        error;
+    }
+    u64 mag = abs_i64(scaled);
+    u64 scale = 1u64;
+    for (u8 i in 0..frac_digits) {
+        scale = scale * 10u64;
+    }
+    u64 whole = mag / scale;
+    u64 frac = mag % scale;
+
+    usize pos = 0;
+    if (scaled < 0i64) {
+        if (pos >= dst.len) {
+            error;
+        }
+        dst[pos] = '-';
+        pos += 1;
+    }
+
+    u8 wbuf[20];
+    usize wn = 0;
+    if (whole == 0u64) {
+        wbuf[0] = '0';
+        wn = 1;
+    } else {
+        u64 tmp = whole;
+        for (usize _i in 0..20) {
+            if (tmp == 0u64) {
+                break;
+            }
+            wbuf[wn] = ('0' as u8) + ((tmp % 10u64) as u8);
+            wn += 1;
+            tmp = tmp / 10u64;
+        }
+    }
+    if (wn > dst.len || pos > (dst.len - wn)) {
+        error;
+    }
+    usize wr = wn;
+    while (wr > 0) {
+        wr -= 1;
+        dst[pos] = wbuf[wr];
+        pos += 1;
+    }
+
+    if (frac_digits > 0u8) {
+        usize flen = (frac_digits as usize) + 1;
+        if (flen > dst.len || pos > (dst.len - flen)) {
+            error;
+        }
+        dst[pos] = '.';
+        pos += 1;
+        usize fstart = pos;
+        usize k = frac_digits as usize;
+        u64 ftmp = frac;
+        while (k > 0) {
+            k -= 1;
+            dst[fstart + k] = ('0' as u8) + ((ftmp % 10u64) as u8);
+            ftmp = ftmp / 10u64;
+        }
+        pos += (frac_digits as usize);
+    }
+    return dst[0..pos];
+}
+
 pub u8 hex_nibble_lower(u8 nibble) {
     u8 n = nibble & 15;
     if (n < 10) {

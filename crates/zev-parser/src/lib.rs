@@ -684,6 +684,36 @@ mod tests {
             "syntax",
             "u32 LIMIT",
         );
+        assert_trap(
+            "fn read_button() bool { return true; }",
+            "P0002",
+            "syntax",
+            "bool read_button",
+        );
+        assert_trap(
+            "fn view() []u8 { return buf[0..1]; }",
+            "P0002",
+            "syntax",
+            "[]u8 view",
+        );
+        assert_trap(
+            "fn make_s() MyType { return MyType {}; }",
+            "P0002",
+            "syntax",
+            "MyType make_s",
+        );
+        assert_trap(
+            "fn noop() void { return; }",
+            "P0002",
+            "syntax",
+            "remove `void`",
+        );
+        assert_trap(
+            "fn f() !u16 { return 0; }",
+            "P0007",
+            "errors",
+            "error ParseErr",
+        );
     }
 
     #[test]

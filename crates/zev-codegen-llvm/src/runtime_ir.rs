@@ -165,6 +165,8 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_systick_enabled = global i8 {systick_init}, align 1
 @__syn_sleep_lock_mask = global i32 0, align 4
 @__syn_dma_locks = global i32 0, align 4
+@__syn_user_sleep_locks = global i32 0, align 4
+@__syn_cpu_hz = global i32 8000000, align 4
 @__syn_last_sleep_depth = global i32 2, align 4
 @__syn_wfi_count = global i32 0, align 4
 @__syn_irq_woke_urgent = global i8 0, align 1
@@ -182,6 +184,32 @@ pub fn emit_kernel_runtime_ir_with_features(
         CpuIsa::Avr => crate::avr::emit_avr_hal_ir(out, sz),
         CpuIsa::HostX86_64Linux => emit_host_linux_hal_ir(out, sz),
     }
+
+    let _ = writeln!(
+        out,
+        r#"define void @__syn_lock_sleep(){fn_as} nounwind{sz} {{
+entry:
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  %cur = load volatile i32, ptr @__syn_user_sleep_locks, align 4
+  %next = add i32 %cur, 1
+  store volatile i32 %next, ptr @__syn_user_sleep_locks, align 4
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  ret void
+}}
+
+define void @__syn_unlock_sleep(){fn_as} nounwind{sz} {{
+entry:
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  %cur = load volatile i32, ptr @__syn_user_sleep_locks, align 4
+  %gt0 = icmp ugt i32 %cur, 0
+  %dec = sub i32 %cur, 1
+  %next = select i1 %gt0, i32 %dec, i32 0
+  store volatile i32 %next, ptr @__syn_user_sleep_locks, align 4
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  ret void
+}}
+"#
+    );
 
     if features.uses_sys_tick {
         let _ = writeln!(
@@ -227,6 +255,7 @@ entry:
     }
     emit_scheduler_core_ir(out, spec.isa, sz, features.uses_rv_irqs, features.uses_clock_hook);
 
+    let _ = writeln!(out, "attributes #97 = {{ noreturn nounwind \"no-builtins\" \"no-implicit-float\" }}");
     let _ = writeln!(out, "attributes #98 = {{ noreturn nounwind \"no-builtins\" }}");
     let _ = writeln!(out, "attributes #99 = {{ nounwind \"no-builtins\" }}");
     let _ = writeln!(out);
@@ -320,62 +349,62 @@ exit:
         let _ = writeln!(
             out,
             r#"; ── ARM RTABI (__aeabi_mem*) Shims for -Os / -Oz Lowering ──
-define weak void @__aeabi_memcpy(ptr %dst, ptr %src, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memcpy(ptr %dst, ptr %src, i32 %n) #99 {{
 entry:
   %r = call ptr @memcpy(ptr %dst, ptr %src, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memcpy4(ptr %dst, ptr %src, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memcpy4(ptr %dst, ptr %src, i32 %n) #99 {{
 entry:
   %r = call ptr @memcpy(ptr %dst, ptr %src, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memcpy8(ptr %dst, ptr %src, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memcpy8(ptr %dst, ptr %src, i32 %n) #99 {{
 entry:
   %r = call ptr @memcpy(ptr %dst, ptr %src, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memmove(ptr %dst, ptr %src, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memmove(ptr %dst, ptr %src, i32 %n) #99 {{
 entry:
   %r = call ptr @memmove(ptr %dst, ptr %src, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memmove4(ptr %dst, ptr %src, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memmove4(ptr %dst, ptr %src, i32 %n) #99 {{
 entry:
   %r = call ptr @memmove(ptr %dst, ptr %src, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memmove8(ptr %dst, ptr %src, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memmove8(ptr %dst, ptr %src, i32 %n) #99 {{
 entry:
   %r = call ptr @memmove(ptr %dst, ptr %src, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memset(ptr %dst, i32 %n, i32 %c) #99 {{
+define weak arm_aapcscc void @__aeabi_memset(ptr %dst, i32 %n, i32 %c) #99 {{
 entry:
   %r = call ptr @memset(ptr %dst, i32 %c, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memset4(ptr %dst, i32 %n, i32 %c) #99 {{
+define weak arm_aapcscc void @__aeabi_memset4(ptr %dst, i32 %n, i32 %c) #99 {{
 entry:
   %r = call ptr @memset(ptr %dst, i32 %c, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memset8(ptr %dst, i32 %n, i32 %c) #99 {{
+define weak arm_aapcscc void @__aeabi_memset8(ptr %dst, i32 %n, i32 %c) #99 {{
 entry:
   %r = call ptr @memset(ptr %dst, i32 %c, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memclr(ptr %dst, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memclr(ptr %dst, i32 %n) #99 {{
 entry:
   %r = call ptr @memset(ptr %dst, i32 0, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memclr4(ptr %dst, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memclr4(ptr %dst, i32 %n) #99 {{
 entry:
   %r = call ptr @memset(ptr %dst, i32 0, i32 %n)
   ret void
 }}
-define weak void @__aeabi_memclr8(ptr %dst, i32 %n) #99 {{
+define weak arm_aapcscc void @__aeabi_memclr8(ptr %dst, i32 %n) #99 {{
 entry:
   %r = call ptr @memset(ptr %dst, i32 0, i32 %n)
   ret void
@@ -453,20 +482,20 @@ finish:
   ret { i32, i32 } %p1
 }
 
-define weak { i32, i32 } @__aeabi_uidivmod(i32 %n, i32 %d) #99 {
+define weak arm_aapcscc { i32, i32 } @__aeabi_uidivmod(i32 %n, i32 %d) #99 {
 entry:
   %res = call { i32, i32 } @__syn_udivrem32(i32 %n, i32 %d)
   ret { i32, i32 } %res
 }
 
-define weak i32 @__aeabi_uidiv(i32 %n, i32 %d) #99 {
+define weak arm_aapcscc i32 @__aeabi_uidiv(i32 %n, i32 %d) #99 {
 entry:
   %res = call { i32, i32 } @__syn_udivrem32(i32 %n, i32 %d)
   %q = extractvalue { i32, i32 } %res, 0
   ret i32 %q
 }
 
-define weak { i32, i32 } @__aeabi_idivmod(i32 %a, i32 %b) #99 {
+define weak arm_aapcscc { i32, i32 } @__aeabi_idivmod(i32 %a, i32 %b) #99 {
 entry:
   %sa = icmp slt i32 %a, 0
   %sb = icmp slt i32 %b, 0
@@ -487,14 +516,14 @@ entry:
   ret { i32, i32 } %p1
 }
 
-define weak i32 @__aeabi_idiv(i32 %a, i32 %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_idiv(i32 %a, i32 %b) #99 {
 entry:
-  %res = call { i32, i32 } @__aeabi_idivmod(i32 %a, i32 %b)
+  %res = call arm_aapcscc { i32, i32 } @__aeabi_idivmod(i32 %a, i32 %b)
   %q = extractvalue { i32, i32 } %res, 0
   ret i32 %q
 }
 
-define weak i64 @__aeabi_llsl(i64 %a, i32 %n) #99 {
+define weak arm_aapcscc i64 @__aeabi_llsl(i64 %a, i32 %n) #99 {
 entry:
   %lo = trunc i64 %a to i32
   %hi64 = lshr i64 %a, 32
@@ -532,7 +561,7 @@ pack:
   ret i64 %res
 }
 
-define weak i64 @__aeabi_llsr(i64 %a, i32 %n) #99 {
+define weak arm_aapcscc i64 @__aeabi_llsr(i64 %a, i32 %n) #99 {
 entry:
   %lo = trunc i64 %a to i32
   %hi64 = lshr i64 %a, 32
@@ -570,7 +599,7 @@ pack:
   ret i64 %res
 }
 
-define weak i64 @__aeabi_lasr(i64 %a, i32 %n) #99 {
+define weak arm_aapcscc i64 @__aeabi_lasr(i64 %a, i32 %n) #99 {
 entry:
   %lo = trunc i64 %a to i32
   %hi64 = lshr i64 %a, 32
@@ -609,7 +638,7 @@ pack:
   ret i64 %res
 }
 
-define weak i64 @__aeabi_lmul(i64 %a, i64 %b) #99 {
+define weak arm_aapcscc i64 @__aeabi_lmul(i64 %a, i64 %b) #99 {
 entry:
   %al = trunc i64 %a to i32
   %ah64 = lshr i64 %a, 32
@@ -685,7 +714,13 @@ entry:
 
 define void @__syn_use_systick(i32 %hz) nounwind{sz} {{
 entry:
+  store volatile i32 %hz, ptr @__syn_cpu_hz, align 4
   store i8 1, ptr @__syn_systick_enabled, align 1
+  ret void
+}}
+
+define void @__syn_arch_delay_us(i32 %us) nounwind{sz} {{
+entry:
   ret void
 }}
 
@@ -699,7 +734,9 @@ define void @__syn_idle_sleep() nounwind{sz} {{
 entry:
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
   %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
-  %any_locks = or i32 %locks, %dma_locks
+  %user_locks = load volatile i32, ptr @__syn_user_sleep_locks, align 4
+  %any0 = or i32 %locks, %dma_locks
+  %any_locks = or i32 %any0, %user_locks
   %locked = icmp ne i32 %any_locks, 0
   %depth = select i1 %locked, i32 1, i32 2
   store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4
@@ -1666,7 +1703,7 @@ entry:
 
     if isa.is_arm() {
         out.push_str(
-            r#"define weak { i64, i64 } @__aeabi_uldivmod(i64 %n, i64 %d) #99 {
+            r#"define weak arm_aapcscc { i64, i64 } @__aeabi_uldivmod(i64 %n, i64 %d) #99 {
 entry:
   %rem = alloca i64, align 8
   store i64 0, ptr %rem, align 8
@@ -1677,7 +1714,7 @@ entry:
   ret { i64, i64 } %p1
 }
 
-define weak { i64, i64 } @__aeabi_ldivmod(i64 %a, i64 %b) #99 {
+define weak arm_aapcscc { i64, i64 } @__aeabi_ldivmod(i64 %a, i64 %b) #99 {
 entry:
   %rem = alloca i64, align 8
   store i64 0, ptr %rem, align 8
@@ -3021,223 +3058,223 @@ entry:
     if isa.is_arm() {
         out.push_str(
             r#"; ── ARM RTABI (__aeabi_f* / __aeabi_d*) Soft-Float Shims ──
-define weak float @__aeabi_fadd(float %a, float %b) #99 {
+define weak arm_aapcscc float @__aeabi_fadd(float %a, float %b) #99 {
 entry:
   %r = call float @__addsf3(float %a, float %b)
   ret float %r
 }
-define weak float @__aeabi_fsub(float %a, float %b) #99 {
+define weak arm_aapcscc float @__aeabi_fsub(float %a, float %b) #99 {
 entry:
   %r = call float @__subsf3(float %a, float %b)
   ret float %r
 }
-define weak float @__aeabi_frsub(float %a, float %b) #99 {
+define weak arm_aapcscc float @__aeabi_frsub(float %a, float %b) #99 {
 entry:
   %r = call float @__subsf3(float %b, float %a)
   ret float %r
 }
-define weak float @__aeabi_fmul(float %a, float %b) #99 {
+define weak arm_aapcscc float @__aeabi_fmul(float %a, float %b) #99 {
 entry:
   %r = call float @__mulsf3(float %a, float %b)
   ret float %r
 }
-define weak float @__aeabi_fdiv(float %a, float %b) #99 {
+define weak arm_aapcscc float @__aeabi_fdiv(float %a, float %b) #99 {
 entry:
   %r = call float @__divsf3(float %a, float %b)
   ret float %r
 }
-define weak i32 @__aeabi_f2iz(float %x) #99 {
+define weak arm_aapcscc i32 @__aeabi_f2iz(float %x) #99 {
 entry:
   %r = call i32 @__fixsfsi(float %x)
   ret i32 %r
 }
-define weak i32 @__aeabi_f2uiz(float %x) #99 {
+define weak arm_aapcscc i32 @__aeabi_f2uiz(float %x) #99 {
 entry:
   %r = call i32 @__fixunssfsi(float %x)
   ret i32 %r
 }
-define weak i64 @__aeabi_f2lz(float %x) #99 {
+define weak arm_aapcscc i64 @__aeabi_f2lz(float %x) #99 {
 entry:
   %r = call i64 @__fixsfdi(float %x)
   ret i64 %r
 }
-define weak i64 @__aeabi_f2ulz(float %x) #99 {
+define weak arm_aapcscc i64 @__aeabi_f2ulz(float %x) #99 {
 entry:
   %r = call i64 @__fixunssfdi(float %x)
   ret i64 %r
 }
-define weak float @__aeabi_i2f(i32 %x) #99 {
+define weak arm_aapcscc float @__aeabi_i2f(i32 %x) #99 {
 entry:
   %r = call float @__floatsisf(i32 %x)
   ret float %r
 }
-define weak float @__aeabi_ui2f(i32 %x) #99 {
+define weak arm_aapcscc float @__aeabi_ui2f(i32 %x) #99 {
 entry:
   %r = call float @__floatunsisf(i32 %x)
   ret float %r
 }
-define weak float @__aeabi_l2f(i64 %x) #99 {
+define weak arm_aapcscc float @__aeabi_l2f(i64 %x) #99 {
 entry:
   %r = call float @__floatdisf(i64 %x)
   ret float %r
 }
-define weak float @__aeabi_ul2f(i64 %x) #99 {
+define weak arm_aapcscc float @__aeabi_ul2f(i64 %x) #99 {
 entry:
   %r = call float @__floatundisf(i64 %x)
   ret float %r
 }
-define weak i32 @__aeabi_fcmpeq(float %a, float %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_fcmpeq(float %a, float %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
   %ok = icmp eq i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_fcmplt(float %a, float %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_fcmplt(float %a, float %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
   %ok = icmp slt i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_fcmple(float %a, float %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_fcmple(float %a, float %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 1)
   %ok = icmp sle i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_fcmpgt(float %a, float %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_fcmpgt(float %a, float %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
   %ok = icmp sgt i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_fcmpge(float %a, float %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_fcmpge(float %a, float %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f32(float %a, float %b, i32 -1)
   %ok = icmp sge i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_fcmpun(float %a, float %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_fcmpun(float %a, float %b) #99 {
 entry:
   %r = call i32 @__unordsf2(float %a, float %b)
   ret i32 %r
 }
 
-define weak double @__aeabi_f2d(float %a) #99 {
+define weak arm_aapcscc double @__aeabi_f2d(float %a) #99 {
 entry:
   %r = call double @__extendsfdf2(float %a)
   ret double %r
 }
-define weak float @__aeabi_d2f(double %a) #99 {
+define weak arm_aapcscc float @__aeabi_d2f(double %a) #99 {
 entry:
   %r = call float @__truncdfsf2(double %a)
   ret float %r
 }
-define weak double @__aeabi_dadd(double %a, double %b) #99 {
+define weak arm_aapcscc double @__aeabi_dadd(double %a, double %b) #99 {
 entry:
   %r = call double @__adddf3(double %a, double %b)
   ret double %r
 }
-define weak double @__aeabi_dsub(double %a, double %b) #99 {
+define weak arm_aapcscc double @__aeabi_dsub(double %a, double %b) #99 {
 entry:
   %r = call double @__subdf3(double %a, double %b)
   ret double %r
 }
-define weak double @__aeabi_drsub(double %a, double %b) #99 {
+define weak arm_aapcscc double @__aeabi_drsub(double %a, double %b) #99 {
 entry:
   %r = call double @__subdf3(double %b, double %a)
   ret double %r
 }
-define weak double @__aeabi_dmul(double %a, double %b) #99 {
+define weak arm_aapcscc double @__aeabi_dmul(double %a, double %b) #99 {
 entry:
   %r = call double @__muldf3(double %a, double %b)
   ret double %r
 }
-define weak double @__aeabi_ddiv(double %a, double %b) #99 {
+define weak arm_aapcscc double @__aeabi_ddiv(double %a, double %b) #99 {
 entry:
   %r = call double @__divdf3(double %a, double %b)
   ret double %r
 }
-define weak i32 @__aeabi_d2iz(double %x) #99 {
+define weak arm_aapcscc i32 @__aeabi_d2iz(double %x) #99 {
 entry:
   %r = call i32 @__fixdfsi(double %x)
   ret i32 %r
 }
-define weak i32 @__aeabi_d2uiz(double %x) #99 {
+define weak arm_aapcscc i32 @__aeabi_d2uiz(double %x) #99 {
 entry:
   %r = call i32 @__fixunsdfsi(double %x)
   ret i32 %r
 }
-define weak i64 @__aeabi_d2lz(double %x) #99 {
+define weak arm_aapcscc i64 @__aeabi_d2lz(double %x) #99 {
 entry:
   %r = call i64 @__fixdfdi(double %x)
   ret i64 %r
 }
-define weak i64 @__aeabi_d2ulz(double %x) #99 {
+define weak arm_aapcscc i64 @__aeabi_d2ulz(double %x) #99 {
 entry:
   %r = call i64 @__fixunsdfdi(double %x)
   ret i64 %r
 }
-define weak double @__aeabi_i2d(i32 %x) #99 {
+define weak arm_aapcscc double @__aeabi_i2d(i32 %x) #99 {
 entry:
   %r = call double @__floatsidf(i32 %x)
   ret double %r
 }
-define weak double @__aeabi_ui2d(i32 %x) #99 {
+define weak arm_aapcscc double @__aeabi_ui2d(i32 %x) #99 {
 entry:
   %r = call double @__floatunsidf(i32 %x)
   ret double %r
 }
-define weak double @__aeabi_l2d(i64 %x) #99 {
+define weak arm_aapcscc double @__aeabi_l2d(i64 %x) #99 {
 entry:
   %r = call double @__floatdidf(i64 %x)
   ret double %r
 }
-define weak double @__aeabi_ul2d(i64 %x) #99 {
+define weak arm_aapcscc double @__aeabi_ul2d(i64 %x) #99 {
 entry:
   %r = call double @__floatundidf(i64 %x)
   ret double %r
 }
-define weak i32 @__aeabi_dcmpeq(double %a, double %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_dcmpeq(double %a, double %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
   %ok = icmp eq i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_dcmplt(double %a, double %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_dcmplt(double %a, double %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
   %ok = icmp slt i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_dcmple(double %a, double %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_dcmple(double %a, double %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 1)
   %ok = icmp sle i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_dcmpgt(double %a, double %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_dcmpgt(double %a, double %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
   %ok = icmp sgt i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_dcmpge(double %a, double %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_dcmpge(double %a, double %b) #99 {
 entry:
   %c = call i32 @__syn_cmp_f64(double %a, double %b, i32 -1)
   %ok = icmp sge i32 %c, 0
   %r = zext i1 %ok to i32
   ret i32 %r
 }
-define weak i32 @__aeabi_dcmpun(double %a, double %b) #99 {
+define weak arm_aapcscc i32 @__aeabi_dcmpun(double %a, double %b) #99 {
 entry:
   %r = call i32 @__unorddf2(double %a, double %b)
   ret i32 %r

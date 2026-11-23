@@ -139,6 +139,7 @@ pub struct TargetSpec {
     pub rodata_in_ram: bool,
     pub has_thumb2: bool,
     pub has_vtor: bool,
+    pub has_fpu: bool,
     pub iram_in_data: bool,
     pub allow_sleep_deep: bool,
     pub semihosting: bool,
@@ -179,6 +180,7 @@ impl TargetSpec {
             rodata_in_ram: false,
             has_thumb2: false,
             has_vtor: false,
+            has_fpu: false,
             iram_in_data: false,
             allow_sleep_deep: true,
             semihosting: false,
@@ -344,6 +346,7 @@ impl TargetSpec {
         let rodata_in_ram = cdoc.opt_bool("chip", "rodata_in_ram")?.unwrap_or(false);
         let has_thumb2 = cdoc.opt_bool("chip", "has_thumb2")?.unwrap_or(false);
         let has_vtor = cdoc.opt_bool("chip", "has_vtor")?.unwrap_or(false);
+        let has_fpu = cdoc.opt_bool("chip", "has_fpu")?.unwrap_or(false);
         let iram_in_data = cdoc.opt_bool("chip", "iram_in_data")?.unwrap_or(false);
         let allow_sleep_deep = cdoc.opt_bool("chip", "allow_sleep_deep")?.unwrap_or(true);
         let mut semihosting = cdoc.opt_bool("chip", "semihosting")?.unwrap_or(false);
@@ -476,6 +479,7 @@ impl TargetSpec {
             rodata_in_ram,
             has_thumb2,
             has_vtor,
+            has_fpu,
             iram_in_data,
             allow_sleep_deep,
             semihosting,

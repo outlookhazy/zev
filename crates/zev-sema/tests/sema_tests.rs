@@ -6059,6 +6059,40 @@ fn explicit_sys_hooks_and_rom_call_validation() {
     }
 }
 
+#[test]
+fn sys_timing_and_sleep_lock_intrinsics_verify_cleanly() {
+    let ok = r#"
+irq IRQ_T = 1;
+fn custom_delay(u32 us) { u32 _x = us; sys.nop(); }
+isr t_isr() {
+    sys.nop();
+    sys.delay_us(5u32);
+    sys.lock_sleep();
+    sys.unlock_sleep();
+}
+fn main() {
+    sys.set_delay_us(custom_delay);
+    IRQ_T.attach(t_isr);
+    sys.lock_sleep();
+    assert(sys.sleep_depth() == 1);
+    sys.delay_us(20);
+    sys.unlock_sleep();
+    sys.nop();
+}
+"#;
+    let prog = zev_parser::parse_str(ok).unwrap();
+    zev_sema::analyze_program(&prog).expect("sys.nop/delay_us/set_delay_us/lock_sleep should verify");
+
+    expect_err_kind("fn main() { sys.nop(1); }", DiagnosticKind::TypeMismatch);
+    expect_err_kind("fn main() { sys.lock_sleep(1); }", DiagnosticKind::TypeMismatch);
+    expect_err_kind("fn main() { sys.unlock_sleep(1); }", DiagnosticKind::TypeMismatch);
+    expect_err_kind("fn main() { sys.delay_us(); }", DiagnosticKind::TypeMismatch);
+    expect_err_kind("fn main() { sys.delay_us(true); }", DiagnosticKind::TypeMismatch);
+    expect_err_kind("fn bad(u8 us) {} fn main() { sys.set_delay_us(bad); }", DiagnosticKind::TypeMismatch);
+    expect_err_kind("fn y(u32 us) { u32 _x = us; checkpoint(); } fn main() { sys.set_delay_us(y); }", DiagnosticKind::YieldingCallbackToExternC);
+    expect_err_kind("irq IRQ0 = 1; fn f(u32 us) { u32 _x = us; } isr h() { sys.set_delay_us(f); } fn main() { IRQ0.attach(h); }", DiagnosticKind::InvalidControlFlow);
+}
+
 
 
 

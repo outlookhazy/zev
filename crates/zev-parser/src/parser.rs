@@ -665,6 +665,32 @@ impl<'a> Parser<'a> {
         .with_hint(hint)
     }
 
+    fn trap_p0002_postfix_return(
+        &self,
+        fn_name: &str,
+        ret_hint: Option<&str>,
+        span: Span,
+    ) -> ParseError {
+        let hint = match ret_hint {
+            Some("void") => format!(
+                "remove `void`; `fn {fn_name}(...) {{ ... }}` already returns `void`"
+            ),
+            Some(rt) => format!(
+                "put the return type before the function name without `fn`: `{rt} {fn_name}(...) {{ ... }}` (`fn name(...)` is only for `void`-returning functions with C-style `Type name` parameters)"
+            ),
+            None => format!(
+                "put the return type before the function name without `fn`: `u16 {fn_name}(u16 x) {{ ... }}` (`fn name(...)` is only for `void`-returning functions with C-style `Type name` parameters)"
+            ),
+        };
+        self.err_at(
+            format!("postfix return type after `fn {fn_name}(...)` is not valid in Zev"),
+            span,
+        )
+        .with_code("P0002")
+        .with_doc_topic("syntax")
+        .with_hint(hint)
+    }
+
     fn trap_p0003(&self, which: &str, span: Span) -> ParseError {
         self.err_at(
             format!(
@@ -1587,6 +1613,41 @@ impl<'a> Parser<'a> {
                 &name.name,
                 ret_hint.as_deref(),
                 arrow.span.merge(end_span),
+            ));
+        }
+
+        if self.at(&TokenKind::Bang) {
+            let bang = self.bump();
+            return Err(self.trap_p0007(
+                "Zig-style `!Type` error-union return type",
+                bang.span,
+            ));
+        }
+
+        if !self.at(&TokenKind::LBrace)
+            && !self.at(&TokenKind::Semi)
+            && !self.at(&TokenKind::KwError)
+            && !self.at(&TokenKind::Eof)
+            && matches!(
+                self.peek_kind(),
+                TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::Star
+            )
+        {
+            if matches!(self.peek_kind(), TokenKind::Ident(_))
+                && self.peek_n_kind(1) == TokenKind::Bang
+            {
+                let start = self.peek_span();
+                return Err(self.trap_p0007(
+                    "Zig-style `ErrType!Type` error-union return type",
+                    start.merge(self.peek_n_span(1)),
+                ));
+            }
+            let start = self.peek_span();
+            let (ret_hint, end_span) = self.sniff_type_display_and_span(start);
+            return Err(self.trap_p0002_postfix_return(
+                &name.name,
+                ret_hint.as_deref(),
+                start.merge(end_span),
             ));
         }
 

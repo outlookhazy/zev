@@ -6635,4 +6635,93 @@ fn main() {
             "missing 128B frame attribution in table:\n{table}"
         );
     }
+
+    #[test]
+    fn cortex_m4f_fpu_cpacr_eabihf_vfp_and_104b_nvic_frame() {
+        let spec = TargetSpec::resolve(None, Some("stm32f334r8"))
+            .or_else(|_| TargetSpec::resolve(Some("stm32f334r8"), None))
+            .expect("resolve stm32f334r8 spec");
+        assert!(spec.has_fpu, "stm32f334r8 should enable has_fpu");
+        assert_eq!(spec.triple, "thumbv7em-none-eabihf");
+
+        let src = r#"
+mmio FpuTestUart {
+    @rw u32 dr @ 0x00;
+}
+mmio FPU_UART : FpuTestUart @ 0x4000_4400;
+irq IRQ_TIM_FPU = 28;
+watch<f32> out_f32 = 0.0f32;
+watch<f64> out_f64 = 0.0;
+
+fn putc_fn(u8 b) {
+    FPU_UART.dr = b as u32;
+}
+
+isr fpu_tick_isr() {
+    sys.tick();
+}
+
+f32 biquad_step(f32 x, f32 b0, f32 z1) {
+    return (x * b0) + z1;
+}
+
+fn main() {
+    sys.use_systick(72_000_000);
+    sys.set_putc(putc_fn);
+    IRQ_TIM_FPU.attach(fpu_tick_isr);
+
+    sys.lock_sleep();
+    assert(sys.sleep_depth() == 1);
+    sys.delay_us(15u32);
+    sys.nop();
+    sys.unlock_sleep();
+
+    f32 x_dyn = (FPU_UART.dr as f32) * 0.001f32;
+    f32 y32 = biquad_step(x_dyn, 0.5f32, 1.25f32);
+    f64 y64 = (y32 as f64) + 1.5;
+    out_f32.publish(y32);
+    out_f64.publish(y64);
+    println(f"FPU y32={y32:.2} y64={y64:.2} sd={sys.sleep_depth()}");
+    sys.exit(0);
+}
+"#;
+        let out_dir = test_out_dir().join("cm4f_fpu_eabihf");
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let opts = CodegenOptions::from_spec(spec);
+        let mir = compile_src_mir(src);
+        let bin_path = out_dir.join("fpu_test.bin");
+        let art = build_target_image(&mir, &opts, &bin_path).expect("build eabihf +vfp4d16sp ELF");
+        assert!(art.elf.audit.is_zero_heap_freestanding());
+
+        let ll_src = std::fs::read_to_string(&art.elf.ll_path).unwrap();
+        assert!(ll_src.contains("arm_aapcscc"), "expected arm_aapcscc RTABI shims");
+        assert!(ll_src.contains("@__syn_user_sleep_locks"));
+        assert!(ll_src.contains("@__syn_arch_delay_us"));
+
+        let dis = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
+            .arg("--triple=thumbv7em-none-eabihf")
+            .arg("--mcpu=cortex-m4")
+            .arg("--mattr=+vfp4d16sp")
+            .arg("-d")
+            .arg(&art.elf.elf_path)
+            .output()
+            .expect("disassemble eabihf ELF");
+        assert!(dis.status.success());
+        let dis_txt = String::from_utf8_lossy(&dis.stdout);
+        assert!(
+            dis_txt.contains("ed88") && dis_txt.contains("e000") && dis_txt.contains("f00000"),
+            "expected CPACR enablement in Reset_Handler disassembly:\n{dis_txt}"
+        );
+        assert!(
+            dis_txt.contains("vmul.f32") || dis_txt.contains("vfma.f32") || dis_txt.contains("vadd.f32"),
+            "expected hardware single-precision VFP instructions:\n{dis_txt}"
+        );
+
+        let proof = analyze_hardware_stack_high_water(&mir, &opts).unwrap();
+        assert_eq!(proof.isr_hw_overhead_bytes, 104);
+        assert!(proof.format_table().contains("104B NVIC FPU frame"));
+        assert!(proof.within_budget, "stack budget fail:\n{}", proof.format_table());
+    }
 }

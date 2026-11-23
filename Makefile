@@ -2,7 +2,7 @@ CARGO ?= cargo
 PORT  ?= /dev/ttyACM0
 ZEVC  := $(CARGO) run --quiet --bin zevc --
 
-.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every pico flash-pico
+.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every pico flash-pico nucleo-f334r8 flash-nucleo-f334r8
 
 all: test
 
@@ -25,6 +25,7 @@ check:
 	$(ZEVC) check examples/arduino_uno_demo.zev
 	$(ZEVC) check examples/arduino_nano_every_demo.zev
 	$(ZEVC) check examples/pico_w_demo.zev
+	$(ZEVC) check examples/nucleo_f334r8_demo.zev
 
 ram:
 	$(ZEVC) ram examples/motor_controller.zev examples/motor_support.zev
@@ -58,6 +59,12 @@ pico:
 
 flash-pico:
 	$(ZEVC) flash --board rpi_pico_w examples/pico_w_demo.zev --port $(PORT)
+
+nucleo-f334r8:
+	$(ZEVC) build --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev -o /tmp/zev-f334r8/nucleo_f334r8_demo.bin
+
+flash-nucleo-f334r8:
+	$(ZEVC) flash --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev --port $(PORT)
 
 test:
 	$(CARGO) test --workspace -- --test-threads=2

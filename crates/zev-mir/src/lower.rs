@@ -10243,7 +10243,7 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                         let exp = match (method.name.as_str(), idx) {
                             ("log", 0) | ("log_kv", 0) | ("log_hex", 0) => Some(&MirType::Str),
                             ("log_kv", 1) | ("exit", 0) => Some(&MirType::I32),
-                            ("log_hex", 1) | ("pend_irq", 0) | ("tick_by", 0) => Some(&MirType::U32),
+                            ("log_hex", 1) | ("pend_irq", 0) | ("tick_by", 0) | ("delay_us", 0) => Some(&MirType::U32),
                             _ => None,
                         };
                         let lowered = be.lower_sub(&a.value, exp)?;

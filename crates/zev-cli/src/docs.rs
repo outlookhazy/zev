@@ -477,9 +477,13 @@ format-string parser, zero global handler registry):
   - `sys.set_exit(fn(i32))` — Target shutdown/reboot handler invoked by `sys.exit(code)`.
   - `sys.set_fault_handler(fn())` — Hardware fault hook invoked before halt on fatal traps.
   - `sys.set_idle(fn(u32, u32))` — Idle sleep hook (`(in_sim, sleep_depth)`).
+  - `sys.set_delay_us(fn(u32))` — Microsecond busy-wait hook invoked by `sys.delay_us(u32)` (defaults to Cortex-M `SysTick` polling scaled by `sys.use_systick(hz)`).
   - `sys.set_irq_router(fn(u32, u32), fn(u32))` — RISC-V interrupt matrix routing and acknowledge hooks (`route(irq, slot)`, `ack(irq)`).
   - `sys.rom_call_u32` / `sys.rom_call_void` / `sys.rom_call_noreturn` — Stack-bounded external ROM ABI calls (`stack_bound` proved statically via `.stack_sizes`).
 - `sys.now_ms() -> u32` / `sys.now_ticks() -> u32` — Current monotonic millisecond tick counter.
+- `sys.nop();` — Single-cycle CPU no-op barrier for short MMIO settle delays.
+- `sys.delay_us(u32 us);` — Bounded microsecond delay (invokes `sys.set_delay_us` hook or target timer/loop fallback).
+- `sys.lock_sleep();` / `sys.unlock_sleep();` — Nested reference-counted deep-sleep inhibit (keeps high-speed PLLs/clocks active while active peripherals require them).
 - `sys.log(*u8 msg);` / `sys.log_kv(*u8 label, i32 val);` / `sys.log_hex(*u8 label, u32 val);`
 - `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` in QEMU & host sim).
 - `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then invokes `sys.set_exit` handler or target exit).
@@ -516,6 +520,7 @@ isr dma_rx_isr(*DmaRegs dma, u32 clr) {
             "esp32", "esp32c6", "riscv", "avr", "atmega328p", "uno", "arduino", "atmega4809",
             "nano-every", "nano", "updi", "rp2040", "pico", "pico-w", "cortex-m0plus", "uf2",
             "svd", "import-svd", "board", "chip", "toml", "build", "flash",
+            "stm32", "stm32f334", "fpu",
         ],
         summary: "CLI workflow: `build --board`, `flash --board`, `ram --board`, `chips/*.toml` + `boards/*.toml`, `zev.toml`, `import-svd`",
         body: "\
@@ -605,6 +610,14 @@ Synthesizes ARMv6-M `.entry` (`0x2000_0000`), `[48 x ptr]` `.isr_vector`, and `S
 zevc emit-llvm --board rpi_pico_w examples/pico_w_demo.zev -o build/pico_w.ll
 zevc build --board rpi_pico_w examples/pico_w_demo.zev -o build/pico_w_demo.uf2
 zevc flash --board rpi_pico_w examples/pico_w_demo.zev --port /dev/ttyACM2
+```
+
+## 10. STMicroelectronics STM32F334R8 / NUCLEO-F334R8 (`nucleo_f334r8`, Cortex-M4F + FPU)
+Targets `thumbv7em-none-eabihf` (`+vfp4d16sp`, `has_fpu = true`): `Reset_Handler` enables `SCB->CPACR` (`CP10`/`CP11` full access) before `main`, `.stack_sizes` accounts for the `104 B` hardware NVIC FPU exception frame on `isr`s, and `bsp.nucleo_f334r8` configures 72 MHz HSE-BYP PLL (64 MHz HSI/2 fallback), `HRTIM1`, `ADC1/2`, `DAC1`, `COMP2`, `bxCAN1`, `SPI1`, `I2C1`, `DMA1`, and Flash NVS:
+```bash
+zevc ram --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
+zevc build --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev -o build/nucleo_f334r8_demo.elf
+zevc flash --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
 ```
 ",
     },
@@ -765,6 +778,9 @@ mod tests {
             "esp32",
             "esp32c6",
             "qemu",
+            "stm32",
+            "stm32f334",
+            "fpu",
             "err",
             "catch",
         ] {

@@ -70,6 +70,9 @@ impl HardwareStackProof {
             None => format!("{} ({})", self.chip_name, self.isa.as_str()),
         };
         let analyzer_label = match self.isa {
+            CpuIsa::ArmCortexM if self.isr_hw_overhead_bytes == 104 => {
+                "LLVM .stack_sizes + ELF call graph + 104B NVIC FPU frame"
+            }
             CpuIsa::ArmCortexM => "LLVM .stack_sizes + ELF call graph + 32B NVIC frame",
             CpuIsa::Riscv32 => "LLVM .stack_sizes + ELF call graph + 64B trap context frame",
             CpuIsa::Avr => {
@@ -1324,7 +1327,11 @@ pub fn analyze_hardware_stack_high_water(
     let (worst_isr_stack_bytes, worst_isr_name, worst_isr_path, isr_hw_overhead_bytes) =
         match spec.isa {
             CpuIsa::ArmCortexM => {
-                let hw_frame = 32u64;
+                let (hw_frame, hw_label) = if spec.has_fpu {
+                    (104u64, "<HW NVIC FPU frame (104B)>")
+                } else {
+                    (32u64, "<HW NVIC frame (32B)>")
+                };
                 let mut candidates = Vec::new();
                 for st_sym in ["SysTick_Handler", "__syn_systick_isr"] {
                     if disasm.elf_symbols.contains(st_sym) || frame_sizes.contains_key(st_sym) {
@@ -1348,7 +1355,7 @@ pub fn analyze_hardware_stack_high_water(
                 pick_worst_isr(
                     &candidates,
                     hw_frame,
-                    "<HW NVIC frame (32B)>",
+                    hw_label,
                     &frame_sizes,
                     &graph,
                     &mut visiting,

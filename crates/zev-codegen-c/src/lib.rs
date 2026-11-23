@@ -6311,4 +6311,45 @@ fn main() {
             "expected syn_slice_u8 compound literal in C99:\n{c_code}"
         );
     }
+
+    #[test]
+    fn sys_nop_delay_us_and_sleep_lock_runtime_asan() {
+        let src = r#"
+watch<u32> delay_hits = 0;
+
+fn host_us_delay(u32 us) {
+    delay_hits.publish(delay_hits.read() + us);
+    sys.nop();
+}
+
+fn main() {
+    sys.nop();
+    assert(sys.sleep_depth() == 2);
+    sys.lock_sleep();
+    assert(sys.sleep_depth() == 1);
+    sys.lock_sleep();
+    assert(sys.sleep_depth() == 1);
+    sys.unlock_sleep();
+    assert(sys.sleep_depth() == 1);
+    sys.unlock_sleep();
+    assert(sys.sleep_depth() == 2);
+
+    // Extra unlock saturates safely at 0.
+    sys.unlock_sleep();
+    assert(sys.sleep_depth() == 2);
+
+    sys.set_delay_us(host_us_delay);
+    sys.delay_us(42);
+    assert(delay_hits.read() == 42);
+    println(f"SYS_TIMING_LOCK_OK depth={sys.sleep_depth()} hits={delay_hits.read()}");
+    sys.exit(0);
+}
+"#;
+        let (_mir, _c_code, stdout) =
+            run_zev_c_sim_and_freestanding("sys_nop_delay_us_sleep_lock_asan", src);
+        assert!(
+            stdout.contains("SYS_TIMING_LOCK_OK depth=2 hits=42"),
+            "stdout:\n{stdout}"
+        );
+    }
 }

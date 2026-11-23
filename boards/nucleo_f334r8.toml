@@ -1,0 +1,13 @@
+# STMicroelectronics NUCLEO-F334R8 (STM32F334R8Tx ST-LINK VCP + MSC)
+
+[board]
+name = "nucleo_f334r8"
+chip = "stm32f334r8"
+
+[memory]
+# Reserve the final 2 KiB flash page (0x0800_F800..0x0801_0000) for Flash NVS.
+usable_flash_size = 63488
+
+[run]
+flash_cmd = ["python3", "tools/flash_stm32_msc.py", "{image}", "{port}", "NODE_F334R8"]
+default_port = "/dev/ttyACM0"

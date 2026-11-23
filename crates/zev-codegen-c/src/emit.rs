@@ -4333,6 +4333,32 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                         "{pad}syn_sys_set_irq_router((syn_irq_route_fn_t)({route_cb}), (syn_irq_ack_fn_t)({ack_cb}));"
                     );
                 }
+                "set_delay_us" => {
+                    let cb = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let _ = writeln!(
+                        self.out,
+                        "{pad}syn_sys_set_delay_us((syn_delay_us_fn_t)({cb}));"
+                    );
+                }
+                "delay_us" => {
+                    let us = args
+                        .first()
+                        .map(|a| self.fmt_expr(a, vars))
+                        .unwrap_or_else(|| "0U".to_string());
+                    let _ = writeln!(self.out, "{pad}syn_sys_delay_us((uint32_t)({us}));");
+                }
+                "nop" => {
+                    let _ = writeln!(self.out, "{pad}syn_sys_nop();");
+                }
+                "lock_sleep" => {
+                    let _ = writeln!(self.out, "{pad}syn_sys_lock_sleep();");
+                }
+                "unlock_sleep" => {
+                    let _ = writeln!(self.out, "{pad}syn_sys_unlock_sleep();");
+                }
                 "rom_call_void" => {
                     if let Some(addr) = args.first() {
                         let abi_args = if args.len() > 2 { &args[2..] } else { &[] };
