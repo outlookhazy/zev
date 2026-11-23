@@ -91,16 +91,38 @@ enum ModuleLoc {
     NotFound,
 }
 
+fn effective_module_lookup(
+    segments: &[String],
+    dot_path: &str,
+    hal_dir: Option<&str>,
+) -> (Vec<String>, String) {
+    if segments.first().map(String::as_str) == Some("hal") && segments.len() >= 2 {
+        let eff_hal = hal_dir.unwrap_or("hal/sim");
+        let mut mapped_segs: Vec<String> = eff_hal
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        mapped_segs.extend(segments[1..].iter().cloned());
+        let embed_key = format!("{eff_hal}.{}", segments[1..].join("."));
+        (mapped_segs, embed_key)
+    } else {
+        (segments.to_vec(), dot_path.to_string())
+    }
+}
+
 fn resolve_module_loc_in_dirs(
     segments: &[String],
     dot_path: &str,
     candidate_dirs: &[PathBuf],
+    hal_dir: Option<&str>,
 ) -> ModuleLoc {
     if segments.is_empty() {
         return ModuleLoc::NotFound;
     }
+    let (eff_segments, embed_key) = effective_module_lookup(segments, dot_path, hal_dir);
     let mut rel_file = PathBuf::new();
-    for seg in segments {
+    for seg in &eff_segments {
         rel_file.push(seg);
     }
     let mut rel_mod = rel_file.clone();
@@ -123,7 +145,7 @@ fn resolve_module_loc_in_dirs(
         }
     }
 
-    if let Some(src) = embedded_module_source(dot_path) {
+    if let Some(src) = embedded_module_source(&embed_key) {
         return ModuleLoc::Embedded(src);
     }
     ModuleLoc::NotFound
@@ -242,13 +264,23 @@ pub fn collect_import_aware_generic_names(
     roots: &[(&str, Option<&Path>)],
     include_dirs: &[PathBuf],
 ) -> BTreeSet<String> {
-    collect_import_aware_generic_names_with_entries(roots, &[], include_dirs)
+    collect_import_aware_generic_names_with_entries(roots, &[], include_dirs, None)
+}
+
+/// Variant of [`collect_import_aware_generic_names`] resolving `hal.*` via `hal_dir`.
+pub fn collect_import_aware_generic_names_with_hal(
+    roots: &[(&str, Option<&Path>)],
+    include_dirs: &[PathBuf],
+    hal_dir: Option<&str>,
+) -> BTreeSet<String> {
+    collect_import_aware_generic_names_with_entries(roots, &[], include_dirs, hal_dir)
 }
 
 fn collect_import_aware_generic_names_with_entries(
     roots: &[(&str, Option<&Path>)],
     extra_entry_dirs: &[PathBuf],
     include_dirs: &[PathBuf],
+    hal_dir: Option<&str>,
 ) -> BTreeSet<String> {
     let mut entry_dirs = Vec::new();
     for (_, path_opt) in roots {
@@ -276,7 +308,7 @@ fn collect_import_aware_generic_names_with_entries(
         let dirs = search_dirs_for_file(abs.as_deref(), &entry_dirs, include_dirs);
         for (segs, alias) in lex_import_bindings(src) {
             let dot_path = segs.join(".");
-            match resolve_module_loc_in_dirs(&segs, &dot_path, &dirs) {
+            match resolve_module_loc_in_dirs(&segs, &dot_path, &dirs, hal_dir) {
                 ModuleLoc::File(cand) => {
                     if let Ok(mod_src) = std::fs::read_to_string(&cand) {
                         for g in zev_parser::collect_pub_declared_generic_names(&mod_src) {
@@ -300,6 +332,7 @@ fn collect_import_aware_generic_names_with_entries(
 /// Embedded fallback source lookup for built-in library modules when no disk override exists.
 pub fn embedded_module_source(dot_path: &str) -> Option<&'static str> {
     match dot_path {
+        "arch.cortex_m" => Some(include_str!("../../../arch/cortex_m.zev")),
         "chip.stm32g4" => Some(include_str!("../../../chip/stm32g4.zev")),
         "chip.lm3s6965" => Some(include_str!("../../../chip/lm3s6965.zev")),
         "chip.esp32c6" => Some(include_str!("../../../chip/esp32c6.zev")),
@@ -308,9 +341,17 @@ pub fn embedded_module_source(dot_path: &str) -> Option<&'static str> {
         "bsp.lm3s6965_evb" => Some(include_str!("../../../bsp/lm3s6965_evb.zev")),
         "bsp.esp32c6_pico" => Some(include_str!("../../../bsp/esp32c6_pico.zev")),
         "bsp.arduino_uno" => Some(include_str!("../../../bsp/arduino_uno.zev")),
+        "std.math" => Some(include_str!("../../../std/math.zev")),
+        "std.str" => Some(include_str!("../../../std/str.zev")),
         "std.fmt" => Some(include_str!("../../../std/fmt.zev")),
         "std.io" => Some(include_str!("../../../std/io.zev")),
         "std.bus" => Some(include_str!("../../../std/bus.zev")),
+        "hal/sim.time" => Some(include_str!("../../../hal/sim/time.zev")),
+        "hal/sim.gpio" => Some(include_str!("../../../hal/sim/gpio.zev")),
+        "hal/sim.pwm" => Some(include_str!("../../../hal/sim/pwm.zev")),
+        "hal/sim.adc" => Some(include_str!("../../../hal/sim/adc.zev")),
+        "hal/sim.i2c" => Some(include_str!("../../../hal/sim/i2c.zev")),
+        "hal/sim.spi" => Some(include_str!("../../../hal/sim/spi.zev")),
         _ => None,
     }
 }
@@ -322,13 +363,23 @@ pub fn load_and_link_modules(
     programs: &[(&Program, Option<&str>)],
     include_dirs: &[PathBuf],
 ) -> LinkedModulesOutput {
-    let mut linker = ModuleLinker::new(programs, include_dirs);
+    load_and_link_modules_with_hal(programs, include_dirs, None)
+}
+
+/// Variant of [`load_and_link_modules`] resolving `hal.*` via `hal_dir` (default `"hal/sim"`).
+pub fn load_and_link_modules_with_hal(
+    programs: &[(&Program, Option<&str>)],
+    include_dirs: &[PathBuf],
+    hal_dir: Option<&str>,
+) -> LinkedModulesOutput {
+    let mut linker = ModuleLinker::new(programs, include_dirs, hal_dir);
     linker.run(programs)
 }
 
 struct ModuleLinker {
     include_dirs: Vec<PathBuf>,
     entry_dirs: Vec<PathBuf>,
+    hal_dir: Option<String>,
     used_prefixes: BTreeSet<String>,
     visiting: Vec<(ModuleKey, String)>,
     loaded: BTreeMap<ModuleKey, LoadedModule>,
@@ -339,7 +390,11 @@ struct ModuleLinker {
 }
 
 impl ModuleLinker {
-    fn new(programs: &[(&Program, Option<&str>)], include_dirs: &[PathBuf]) -> Self {
+    fn new(
+        programs: &[(&Program, Option<&str>)],
+        include_dirs: &[PathBuf],
+        hal_dir: Option<&str>,
+    ) -> Self {
         let mut entry_dirs = Vec::new();
         for (_, fname) in programs {
             if let Some(dir) = fname.and_then(real_parent_dir) {
@@ -351,6 +406,7 @@ impl ModuleLinker {
         Self {
             include_dirs: include_dirs.to_vec(),
             entry_dirs,
+            hal_dir: hal_dir.map(str::to_owned),
             used_prefixes: BTreeSet::new(),
             visiting: Vec::new(),
             loaded: BTreeMap::new(),
@@ -592,7 +648,13 @@ impl ModuleLinker {
                     }
                 }
                 LocateResult::FoundEmbedded(src) => {
-                    let key = ModuleKey::Embedded(dot_path.clone());
+                    let embed_key = effective_module_lookup(
+                        &imp.path.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+                        &dot_path,
+                        self.hal_dir.as_deref(),
+                    )
+                    .1;
+                    let key = ModuleKey::Embedded(embed_key);
                     self.loaded_module_paths.insert(dot_path.clone());
                     if self.ensure_loaded(
                         key.clone(),
@@ -680,6 +742,7 @@ impl ModuleLinker {
             &[(source.as_str(), disk_path)],
             &self.entry_dirs,
             &self.include_dirs,
+            self.hal_dir.as_deref(),
         );
         let parsed = match zev_parser::parse_str_named_with_generics(
             &source,
@@ -740,7 +803,12 @@ impl ModuleLinker {
     ) -> LocateResult {
         let seg_names: Vec<String> = segments.iter().map(|s| s.name.clone()).collect();
         let candidate_dirs = self.search_dirs(importer_file);
-        match resolve_module_loc_in_dirs(&seg_names, dot_path, &candidate_dirs) {
+        match resolve_module_loc_in_dirs(
+            &seg_names,
+            dot_path,
+            &candidate_dirs,
+            self.hal_dir.as_deref(),
+        ) {
             ModuleLoc::File(p) => LocateResult::FoundFile(p),
             ModuleLoc::Embedded(src) => LocateResult::FoundEmbedded(src),
             ModuleLoc::Ambiguous(file_cand, mod_cand) => {

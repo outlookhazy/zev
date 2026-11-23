@@ -1,0 +1,11 @@
+// Portable HAL microsecond hardware settle spin (host/sim target)
+
+pub fn spin_us(u32 us) {
+    u32 n = us;
+    if (n > 500u32) {
+        n = 500u32;
+    }
+    for (u32 _i in 0..n) {
+        sys.nop();
+    }
+}

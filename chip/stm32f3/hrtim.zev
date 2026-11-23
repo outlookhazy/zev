@@ -1,0 +1,109 @@
+// STMicroelectronics STM32F334 High-Resolution Timer HRTIM1 (4.608 GHz DLL) Setup
+
+import chip.stm32f334 as hw;
+import chip.stm32f3.rcc as rcc;
+import chip.stm32f3.gpio as cgpio;
+import hal.pwm as pwm;
+import std.math as math;
+
+u32 f_hrtim_hz() {
+    u32 sws = (hw.RCC.cfgr >> 2) & 3u32;
+    bool pll_src = (hw.RCC.cfgr3 & hw.RCC_CFGR3_HRTIM1SW_PLL) != 0u32;
+    if (sws == 2u32 && pll_src) {
+        return rcc.sysclk_hz() * 2u32;
+    }
+    return rcc.pclk2_hz();
+}
+
+pub bool dll_calibrate() {
+    u32 sws = (hw.RCC.cfgr >> 2) & 3u32;
+    if (sws == 2u32) {
+        hw.RCC.cfgr3 = hw.RCC.cfgr3 | hw.RCC_CFGR3_HRTIM1SW_PLL;
+    } else {
+        hw.RCC.cfgr3 = hw.RCC.cfgr3 & (~hw.RCC_CFGR3_HRTIM1SW_PLL);
+    }
+    hw.RCC.apb2enr = hw.RCC.apb2enr | hw.RCC_APB2_HRTIM1;
+    u32 _stab = hw.RCC.apb2enr;
+
+    hw.HRTIM1_COMMON.icr = 1u32 << 16;
+    hw.HRTIM1_COMMON.dllcr = 1u32; // One-shot DLL calibration (CAL=1)
+    for (u32 spin in 0..200_000) {
+        if ((hw.HRTIM1_COMMON.isr & (1u32 << 16)) != 0u32) { // DLLRDY
+            return true;
+        }
+    }
+    return false;
+}
+
+pub pwm.Channel cha1_pwm_pa8_start(u32 freq_hz, u16 initial_permil, *bool ok_out) {
+    *ok_out = false;
+    if (freq_hz == 0u32 || !dll_calibrate()) {
+        return pwm.make_channel(1u8, 0u8, 0u8, 0u32, 0u16);
+    }
+
+    u32 f_hrtim = f_hrtim_hz();
+    u32 chosen_ckpsc = 0u32;
+    u32 chosen_per = 0u32;
+    bool found = false;
+    for (u32 ckpsc in 0..8) {
+        u64 hrc = f_hrtim as u64;
+        if (ckpsc <= 5u32) {
+            hrc = (f_hrtim as u64) << (5u32 - ckpsc);
+        } else {
+            hrc = (f_hrtim as u64) >> (ckpsc - 5u32);
+        }
+        u64 per64 = hrc / (freq_hz as u64);
+        if (per64 >= 96u64 && per64 <= 65500u64) {
+            chosen_ckpsc = ckpsc;
+            chosen_per = per64 as u32;
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        return pwm.make_channel(1u8, 0u8, 0u8, 0u32, 0u16);
+    }
+
+    u16 d = math.clamp<u16>(initial_permil, 0u16, 1000u16);
+    u32 cmp = (((chosen_per as u64) * (d as u64)) / 1000u64) as u32;
+    u32 min_cmp = 48u32;
+    if (chosen_per >= 192u32) {
+        min_cmp = 96u32;
+    }
+    if (cmp < min_cmp) {
+        cmp = min_cmp;
+    }
+    if (cmp > (chosen_per - min_cmp)) {
+        cmp = chosen_per - min_cmp;
+    }
+
+    hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr & (~(1u32 << 17));
+    hw.HRTIM1_COMMON.odisr = 1u32;
+    hw.HRTIM1_TIMA.timcr = (1u32 << 27) | (1u32 << 17) | (1u32 << 3) | (chosen_ckpsc & 7u32); // PREEN | TAREPU | CONT | CKPSC
+    hw.HRTIM1_TIMA.cnt = 0u32;
+    hw.HRTIM1_TIMA.per = chosen_per;
+    hw.HRTIM1_TIMA.cmp1r = cmp;
+    hw.HRTIM1_TIMA.set1r = 1u32 << 2; // PER
+    hw.HRTIM1_TIMA.rst1r = 1u32 << 3; // CMP1
+    hw.HRTIM1_COMMON.cr2 = 1u32 << 1; // TASWU
+
+    // PA8 = AF13 (HRTIM1_CHA1). Set high slew & AF before MODER=AF.
+    hw.GPIOA.ospeedr = hw.GPIOA.ospeedr | (3u32 << (8u32 * 2u32));
+    cgpio.config_af(cgpio.PORT_A, 8u32, cgpio.PUPD_NONE, false, 13u32);
+
+    hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr | (1u32 << 17); // TACEN
+    hw.HRTIM1_COMMON.oenr = hw.HRTIM1_COMMON.oenr | 1u32;        // TA1OEN
+    *ok_out = true;
+    return pwm.make_channel(1u8, 0u8, 0u8, chosen_per, d);
+}
+
+pub fn cha1_set_deadtime(u16 rise_ticks, u16 fall_ticks) {
+    u32 r = (rise_ticks as u32) & 0x1FFu32;
+    u32 f = (fall_ticks as u32) & 0x1FFu32;
+    hw.HRTIM1_TIMA.dtr = r | (f << 16);
+}
+
+pub fn cha1_stop() {
+    hw.HRTIM1_COMMON.odisr = 1u32;
+    hw.HRTIM1_MASTER.mcr = hw.HRTIM1_MASTER.mcr & (~(1u32 << 17));
+}

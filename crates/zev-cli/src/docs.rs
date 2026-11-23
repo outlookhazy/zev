@@ -477,13 +477,10 @@ format-string parser, zero global handler registry):
   - `sys.set_exit(fn(i32))` — Target shutdown/reboot handler invoked by `sys.exit(code)`.
   - `sys.set_fault_handler(fn())` — Hardware fault hook invoked before halt on fatal traps.
   - `sys.set_idle(fn(u32, u32))` — Idle sleep hook (`(in_sim, sleep_depth)`).
-  - `sys.set_delay_us(fn(u32))` — Microsecond busy-wait hook invoked by `sys.delay_us(u32)` (defaults to Cortex-M `SysTick` polling scaled by `sys.use_systick(hz)`).
   - `sys.set_irq_router(fn(u32, u32), fn(u32))` — RISC-V interrupt matrix routing and acknowledge hooks (`route(irq, slot)`, `ack(irq)`).
   - `sys.rom_call_u32` / `sys.rom_call_void` / `sys.rom_call_noreturn` — Stack-bounded external ROM ABI calls (`stack_bound` proved statically via `.stack_sizes`).
 - `sys.now_ms() -> u32` / `sys.now_ticks() -> u32` — Current monotonic millisecond tick counter.
-- `sys.nop();` — Single-cycle CPU no-op barrier for short MMIO settle delays.
-- `sys.delay_us(u32 us);` — Bounded microsecond delay (invokes `sys.set_delay_us` hook or target timer/loop fallback).
-- `sys.lock_sleep();` / `sys.unlock_sleep();` — Nested reference-counted deep-sleep inhibit (keeps high-speed PLLs/clocks active while active peripherals require them).
+- `sys.nop();` — Single-cycle CPU no-op barrier for short MMIO settle delays (use `hal.time.spin_us(u32)` for `<50 us` hardware settle delays; DMA sleep-depth clamping is managed automatically by `@dma_safe` `ping_pong` / `pool`).
 - `sys.log(*u8 msg);` / `sys.log_kv(*u8 label, i32 val);` / `sys.log_hex(*u8 label, u32 val);`
 - `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` in QEMU & host sim).
 - `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then invokes `sys.set_exit` handler or target exit).

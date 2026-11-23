@@ -9614,6 +9614,14 @@ fn finish_prim_read_method<B: LowerBackend>(
                 slice_ty,
             ))
         }
+        ("base_addr", MirPrimKind::PingPong { elem, cap }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::PingPongBaseAddr {
+                target,
+                elem_ty: *elem,
+                cap,
+            })),
+            MirType::Usize,
+        )),
         ("push", MirPrimKind::ByteRing { cap }) => {
             let src = if let Some(first) = first_positional_arg(args) {
                 let mut s = lower_fmt_buf_dst_be(first, be)?;
@@ -10243,7 +10251,7 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                         let exp = match (method.name.as_str(), idx) {
                             ("log", 0) | ("log_kv", 0) | ("log_hex", 0) => Some(&MirType::Str),
                             ("log_kv", 1) | ("exit", 0) => Some(&MirType::I32),
-                            ("log_hex", 1) | ("pend_irq", 0) | ("tick_by", 0) | ("delay_us", 0) => Some(&MirType::U32),
+                            ("log_hex", 1) | ("pend_irq", 0) | ("tick_by", 0) => Some(&MirType::U32),
                             _ => None,
                         };
                         let lowered = be.lower_sub(&a.value, exp)?;
@@ -10367,6 +10375,22 @@ fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             elem_ty: *elem,
                             cap,
                         })));
+                    }
+                    ("complete_half", MirPrimKind::PingPong { elem, cap }) => {
+                        let half = if let Some(first) = first_positional_arg(args) {
+                            let raw = be.lower_sub(first, Some(&MirType::U8))?;
+                            coerce_expr_if_needed(raw, &MirType::U8)
+                        } else {
+                            MirExpr::new(MirExprKind::IntLit(0), MirType::U8)
+                        };
+                        return Ok(Some(MirStmt::PrimOp(
+                            MirPrimNonBlockingOp::PingPongCompleteHalf {
+                                target,
+                                elem_ty: *elem,
+                                cap,
+                                half,
+                            },
+                        )));
                     }
                     ("start" | "activate", MirPrimKind::PingPong { elem, cap }) => {
                         return Ok(Some(MirStmt::PrimOp(

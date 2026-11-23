@@ -1,10 +1,36 @@
-// Standard shared bus status & transaction statistics types
+// Standard shared bus status, portable frame/mode types, & transaction statistics
 
 pub enum BusStatus {
     Ok,
     Timeout,
     BusBusy,
     FrameErr,
+}
+
+pub enum SpiMode {
+    Mode0,
+    Mode1,
+    Mode2,
+    Mode3,
+}
+
+pub enum ResetReason {
+    Unknown,
+    PowerOn,
+    PinReset,
+    SoftwareReset,
+    IwdgReset,
+    WwdgReset,
+    LowPowerReset,
+    BrownoutReset,
+}
+
+pub struct CanFrame {
+    u32    id;
+    bool   extended;
+    bool   rtr;
+    u8     dlc;
+    [8]u8  data;
 }
 
 pub struct BusStats {
@@ -19,6 +45,18 @@ pub BusStats stats_zero() {
         rx_frames: 0,
         errors: 0,
     };
+}
+
+pub fn stats_record_tx(*BusStats s) {
+    s.tx_frames += 1;
+}
+
+pub fn stats_record_rx(*BusStats s) {
+    s.rx_frames += 1;
+}
+
+pub fn stats_record_err(*BusStats s) {
+    s.errors += 1;
 }
 
 pub struct StatusCell<T> {

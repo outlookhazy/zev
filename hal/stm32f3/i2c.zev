@@ -1,0 +1,319 @@
+// Portable HAL I2C master bus interface (STM32F3 I2C1, SoftYielding)
+
+import chip.stm32f334 as hw;
+import std.bus as bus;
+
+pub struct Bus {
+    u8   unit; // 1 = I2C1
+    u32  timeout_ms;
+    bool sim_ack;
+}
+
+pub Bus make_bus(u8 unit, u32 timeout_ms, bool sim_ack) {
+    return Bus {
+        unit: unit,
+        timeout_ms: timeout_ms,
+        sim_ack: sim_ack,
+    };
+}
+
+u32 eff_timeout(u32 to_ms) {
+    if (to_ms == 0u32) {
+        return 25u32;
+    }
+    return to_ms;
+}
+
+bool wait_i2c1_free(u32 timeout_ms) {
+    u32 t0 = sys.now_ms();
+    u32 limit = eff_timeout(timeout_ms);
+    for (u32 iter in 0..100_000) {
+        if ((hw.I2C1.isr & (1u32 << 15)) == 0u32) { // BUSY = 0
+            return true;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                return false;
+            }
+            checkpoint();
+        }
+    }
+    return false;
+}
+
+fn finish_stop(u32 timeout_ms) {
+    u32 t0 = sys.now_ms();
+    u32 limit = eff_timeout(timeout_ms);
+    for (u32 iter in 0..200_000) {
+        if ((hw.I2C1.isr & (1u32 << 5)) != 0u32) { // STOPF
+            break;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                break;
+            }
+            checkpoint();
+        }
+    }
+    hw.I2C1.icr = (1u32 << 4) | (1u32 << 5);
+    bool _free = wait_i2c1_free(timeout_ms);
+}
+
+pub bool probe_7bit(*Bus b, u8 addr7) error bus.BusStatus {
+    if (b.unit != 1u8 || addr7 > 127u8) {
+        error bus.BusStatus.FrameErr;
+    }
+    if (!wait_i2c1_free(b.timeout_ms)) {
+        error bus.BusStatus.BusBusy;
+    }
+    hw.I2C1.icr = 0x3F38u32;
+    u32 sadd = ((addr7 & 0x7Fu8) as u32) << 1;
+    hw.I2C1.cr2 = sadd | (1u32 << 25) | (1u32 << 13); // NBYTES=0, AUTOEND, START
+    bool nacked = false;
+    u32 t0 = sys.now_ms();
+    u32 limit = eff_timeout(b.timeout_ms);
+    for (u32 iter in 0..200_000) {
+        u32 st = hw.I2C1.isr;
+        if ((st & (1u32 << 4)) != 0u32) { // NACKF
+            nacked = true;
+            hw.I2C1.icr = 1u32 << 4;
+        }
+        if ((st & (1u32 << 5)) != 0u32) { // STOPF
+            hw.I2C1.icr = (1u32 << 4) | (1u32 << 5);
+            if (!wait_i2c1_free(b.timeout_ms)) {
+                error bus.BusStatus.BusBusy;
+            }
+            return !nacked;
+        }
+        if ((st & ((1u32 << 8) | (1u32 << 9))) != 0u32) { // BERR / ARLO
+            hw.I2C1.icr = (1u32 << 8) | (1u32 << 9);
+            bool _free = wait_i2c1_free(b.timeout_ms);
+            error bus.BusStatus.BusBusy;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                error bus.BusStatus.Timeout;
+            }
+            checkpoint();
+        }
+    }
+    error bus.BusStatus.Timeout;
+}
+
+pub fn write(*Bus b, u8 addr7, []u8 data) error bus.BusStatus {
+    if (b.unit != 1u8 || addr7 > 127u8 || data.len > 255) {
+        error bus.BusStatus.FrameErr;
+    }
+    if (!wait_i2c1_free(b.timeout_ms)) {
+        error bus.BusStatus.BusBusy;
+    }
+    hw.I2C1.icr = 0x3F38u32;
+    u32 sadd = ((addr7 & 0x7Fu8) as u32) << 1;
+    hw.I2C1.cr2 = sadd | ((data.len as u32) << 16) | (1u32 << 25) | (1u32 << 13);
+    u32 t0 = sys.now_ms();
+    u32 limit = eff_timeout(b.timeout_ms);
+    for (u8 byte in data) {
+        bool sent = false;
+        for (u32 iter in 0..200_000) {
+            u32 st = hw.I2C1.isr;
+            if ((st & (1u32 << 4)) != 0u32) {
+                finish_stop(b.timeout_ms);
+                error bus.BusStatus.FrameErr;
+            }
+            if ((st & (1u32 << 1)) != 0u32) { // TXIS
+                hw.I2C1.txdr = byte as u32;
+                sent = true;
+                break;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        if (!sent) {
+            error bus.BusStatus.Timeout;
+        }
+    }
+    for (u32 iter in 0..200_000) {
+        u32 st = hw.I2C1.isr;
+        if ((st & (1u32 << 4)) != 0u32) {
+            finish_stop(b.timeout_ms);
+            error bus.BusStatus.FrameErr;
+        }
+        if ((st & (1u32 << 5)) != 0u32) { // STOPF
+            hw.I2C1.icr = 1u32 << 5;
+            bool _free = wait_i2c1_free(b.timeout_ms);
+            return;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                error bus.BusStatus.Timeout;
+            }
+            checkpoint();
+        }
+    }
+    error bus.BusStatus.Timeout;
+}
+
+pub fn read(*Bus b, u8 addr7, []u8 dst) error bus.BusStatus {
+    if (b.unit != 1u8 || addr7 > 127u8 || dst.len > 255) {
+        error bus.BusStatus.FrameErr;
+    }
+    if (!wait_i2c1_free(b.timeout_ms)) {
+        error bus.BusStatus.BusBusy;
+    }
+    hw.I2C1.icr = 0x3F38u32;
+    u32 sadd = ((addr7 & 0x7Fu8) as u32) << 1;
+    hw.I2C1.cr2 = sadd | (1u32 << 10) | ((dst.len as u32) << 16) | (1u32 << 25) | (1u32 << 13);
+    u32 t0 = sys.now_ms();
+    u32 limit = eff_timeout(b.timeout_ms);
+    for (usize i in 0..dst.len) {
+        bool got = false;
+        for (u32 iter in 0..200_000) {
+            u32 st = hw.I2C1.isr;
+            if ((st & (1u32 << 4)) != 0u32) {
+                finish_stop(b.timeout_ms);
+                error bus.BusStatus.FrameErr;
+            }
+            if ((st & (1u32 << 2)) != 0u32) { // RXNE
+                dst[i] = (hw.I2C1.rxdr & 0xFFu32) as u8;
+                got = true;
+                break;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        if (!got) {
+            error bus.BusStatus.Timeout;
+        }
+    }
+    for (u32 iter in 0..200_000) {
+        if ((hw.I2C1.isr & (1u32 << 5)) != 0u32) {
+            hw.I2C1.icr = 1u32 << 5;
+            bool _free = wait_i2c1_free(b.timeout_ms);
+            return;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                error bus.BusStatus.Timeout;
+            }
+            checkpoint();
+        }
+    }
+    error bus.BusStatus.Timeout;
+}
+
+pub fn write_read(*Bus b, u8 addr7, []u8 tx, []u8 rx) error bus.BusStatus {
+    if (tx.len == 0) {
+        read(b, addr7, rx) catch (bus.BusStatus err) { error err; };
+        return;
+    }
+    if (rx.len == 0) {
+        write(b, addr7, tx) catch (bus.BusStatus err) { error err; };
+        return;
+    }
+    if (b.unit != 1u8 || addr7 > 127u8 || tx.len > 255 || rx.len > 255) {
+        error bus.BusStatus.FrameErr;
+    }
+    if (!wait_i2c1_free(b.timeout_ms)) {
+        error bus.BusStatus.BusBusy;
+    }
+    hw.I2C1.icr = 0x3F38u32;
+    u32 sadd = ((addr7 & 0x7Fu8) as u32) << 1;
+    // TX phase with AUTOEND=0 (ends on TC=1 for clean repeated START)
+    hw.I2C1.cr2 = sadd | ((tx.len as u32) << 16) | (1u32 << 13);
+    u32 t0 = sys.now_ms();
+    u32 limit = eff_timeout(b.timeout_ms);
+    for (u8 byte in tx) {
+        bool sent = false;
+        for (u32 iter in 0..200_000) {
+            u32 st = hw.I2C1.isr;
+            if ((st & (1u32 << 4)) != 0u32) {
+                finish_stop(b.timeout_ms);
+                error bus.BusStatus.FrameErr;
+            }
+            if ((st & (1u32 << 1)) != 0u32) {
+                hw.I2C1.txdr = byte as u32;
+                sent = true;
+                break;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        if (!sent) {
+            error bus.BusStatus.Timeout;
+        }
+    }
+    bool tc_ok = false;
+    for (u32 iter in 0..200_000) {
+        u32 st = hw.I2C1.isr;
+        if ((st & (1u32 << 4)) != 0u32) {
+            finish_stop(b.timeout_ms);
+            error bus.BusStatus.FrameErr;
+        }
+        if ((st & (1u32 << 6)) != 0u32) { // TC
+            tc_ok = true;
+            break;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                error bus.BusStatus.Timeout;
+            }
+            checkpoint();
+        }
+    }
+    if (!tc_ok) {
+        error bus.BusStatus.Timeout;
+    }
+
+    // Repeated START into RX phase with AUTOEND=1
+    hw.I2C1.cr2 = sadd | (1u32 << 10) | ((rx.len as u32) << 16) | (1u32 << 25) | (1u32 << 13);
+    for (usize i in 0..rx.len) {
+        bool got = false;
+        for (u32 iter in 0..200_000) {
+            u32 st = hw.I2C1.isr;
+            if ((st & (1u32 << 4)) != 0u32) {
+                finish_stop(b.timeout_ms);
+                error bus.BusStatus.FrameErr;
+            }
+            if ((st & (1u32 << 2)) != 0u32) {
+                rx[i] = (hw.I2C1.rxdr & 0xFFu32) as u8;
+                got = true;
+                break;
+            }
+            if ((iter & 0x3Fu32) == 0x3Fu32) {
+                if ((sys.now_ms() - t0) >= limit) {
+                    error bus.BusStatus.Timeout;
+                }
+                checkpoint();
+            }
+        }
+        if (!got) {
+            error bus.BusStatus.Timeout;
+        }
+    }
+    for (u32 iter in 0..200_000) {
+        if ((hw.I2C1.isr & (1u32 << 5)) != 0u32) {
+            hw.I2C1.icr = 1u32 << 5;
+            bool _free = wait_i2c1_free(b.timeout_ms);
+            return;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= limit) {
+                error bus.BusStatus.Timeout;
+            }
+            checkpoint();
+        }
+    }
+    error bus.BusStatus.Timeout;
+}

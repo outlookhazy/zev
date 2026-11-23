@@ -13,7 +13,8 @@ code_in_ram = false
 has_thumb2 = true
 has_vtor = true
 has_fpu = true
-allow_sleep_deep = true
+allow_sleep_deep = false
+hal_dir = "hal/stm32f3"
 
 [memory]
 flash_base = 0x0800_0000

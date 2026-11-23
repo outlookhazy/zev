@@ -143,6 +143,7 @@ pub struct TargetSpec {
     pub iram_in_data: bool,
     pub allow_sleep_deep: bool,
     pub semihosting: bool,
+    pub hal_dir: Option<String>,
     pub flash_base: u32,
     pub flash_size: u32,
     pub usable_flash_size: Option<u32>,
@@ -184,6 +185,7 @@ impl TargetSpec {
             iram_in_data: false,
             allow_sleep_deep: true,
             semihosting: false,
+            hal_dir: None,
             flash_base: 0,
             flash_size: 4 * 1024 * 1024,
             usable_flash_size: None,
@@ -350,6 +352,7 @@ impl TargetSpec {
         let iram_in_data = cdoc.opt_bool("chip", "iram_in_data")?.unwrap_or(false);
         let allow_sleep_deep = cdoc.opt_bool("chip", "allow_sleep_deep")?.unwrap_or(true);
         let mut semihosting = cdoc.opt_bool("chip", "semihosting")?.unwrap_or(false);
+        let mut hal_dir = cdoc.opt_str("chip", "hal_dir")?;
 
         let flash_base = cdoc.req_u32("memory", "flash_base")?;
         let flash_size = cdoc.req_u32("memory", "flash_size")?;
@@ -445,6 +448,9 @@ impl TargetSpec {
             if let Some(o) = bdoc.opt_str("board", "opt_level")? {
                 opt_level = o;
             }
+            if let Some(hd) = bdoc.opt_str("board", "hal_dir")? {
+                hal_dir = Some(hd);
+            }
             if let Some(uf) = bdoc.opt_u32("memory", "usable_flash_size")? {
                 usable_flash_size = Some(uf);
             }
@@ -483,6 +489,7 @@ impl TargetSpec {
             iram_in_data,
             allow_sleep_deep,
             semihosting,
+            hal_dir,
             flash_base,
             flash_size,
             usable_flash_size,

@@ -116,6 +116,8 @@ pub struct CodegenOptions {
     pub target: TargetArch,
     /// Optional declarative [`TargetSpec`] loaded from `chips/*.toml` + `boards/*.toml`.
     pub spec: Option<TargetSpec>,
+    /// Target-bound HAL directory override (e.g. `"hal/stm32f3"`), defaulting to `"hal/sim"`.
+    pub hal_dir: Option<String>,
     /// Flash base address override.
     pub flash_origin: u32,
     /// Flash size in bytes override.
@@ -135,6 +137,7 @@ impl Default for CodegenOptions {
         Self {
             target: TargetArch::Thumbv7mNoneEabi,
             spec: None,
+            hal_dir: None,
             flash_origin: 0x0000_0000,
             flash_len: 256 * 1024,
             ram_origin: 0x2000_0000,
@@ -168,6 +171,7 @@ impl CodegenOptions {
         };
         Self {
             target,
+            hal_dir: spec.hal_dir.clone(),
             flash_origin: spec.flash_base,
             flash_len: spec.effective_flash_size(),
             ram_origin: spec.ram_base,
@@ -219,6 +223,7 @@ impl CodegenOptions {
             Err(_) => Self {
                 target: TargetArch::Riscv32Esp32C6,
                 spec: None,
+                hal_dir: None,
                 flash_origin: 0x4200_0000,
                 flash_len: 4 * 1024 * 1024,
                 ram_origin: 0x4080_0000,
@@ -235,6 +240,7 @@ impl CodegenOptions {
             Err(_) => Self {
                 target: TargetArch::AvrAtmega328p,
                 spec: None,
+                hal_dir: None,
                 flash_origin: 0x0000_0000,
                 flash_len: 32_256,
                 ram_origin: 0x0000_0100,
@@ -255,6 +261,7 @@ impl CodegenOptions {
             Err(_) => Self {
                 target: TargetArch::AvrAtmega4809,
                 spec: None,
+                hal_dir: None,
                 flash_origin: 0x0000_0000,
                 flash_len: 49_152,
                 ram_origin: 0x0000_2800,
@@ -271,6 +278,7 @@ impl CodegenOptions {
             Err(_) => Self {
                 target: TargetArch::Thumbv6mRp2040,
                 spec: None,
+                hal_dir: None,
                 flash_origin: 0x2000_0000,
                 flash_len: 264 * 1024,
                 ram_origin: 0x2000_0000,

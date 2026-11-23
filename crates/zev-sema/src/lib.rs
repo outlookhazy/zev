@@ -31,7 +31,9 @@ pub use model::{
     SemanticModel, SpawnedTaskInstance, SubsystemInfo, TaskInfo,
 };
 pub use modules::{
-    LinkedModulesOutput, collect_import_aware_generic_names, load_and_link_modules,
+    LinkedModulesOutput, collect_import_aware_generic_names,
+    collect_import_aware_generic_names_with_hal, load_and_link_modules,
+    load_and_link_modules_with_hal,
 };
 pub use monomorphize::{
     MAX_GENERIC_DEPTH, MAX_MONOMORPHIZED_INSTANCES, MonomorphizeOutput, mangle_type_expr,
@@ -91,7 +93,11 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
     programs: &[(&'a Program, Option<&'a str>)],
     opts: &AnalyzeOptions,
 ) -> MonomorphizedAnalysisOutput {
-    let linked = modules::load_and_link_modules(programs, &opts.include_dirs);
+    let linked = modules::load_and_link_modules_with_hal(
+        programs,
+        &opts.include_dirs,
+        opts.hal_dir.as_deref(),
+    );
     if !linked.diagnostics.is_empty() {
         let mut diagnostics = linked.diagnostics;
         if programs.len() == 1 {

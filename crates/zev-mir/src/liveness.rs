@@ -566,7 +566,8 @@ fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
             collect_expr_uses(value, uses);
         }
         MirPrimNonBlockingOp::ByteRingConsume { target, len, .. }
-        | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. } => {
+        | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. }
+        | MirPrimNonBlockingOp::PingPongCompleteHalf { target, half: len, .. } => {
             collect_prim_target_uses(target, uses);
             collect_expr_uses(len, uses);
         }
@@ -703,6 +704,7 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             | MirPrimReadOp::SignalIsSet { target }
             | MirPrimReadOp::SignalTryWait { target }
             | MirPrimReadOp::PingPongDmaBuf { target, .. }
+            | MirPrimReadOp::PingPongBaseAddr { target, .. }
             | MirPrimReadOp::ByteRingReadSlice { target, .. }
             | MirPrimReadOp::ByteRingTryPopByte { target, .. }
             | MirPrimReadOp::ByteRingLen { target, .. }
@@ -1123,7 +1125,8 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
                 collect_addr_of_vars(value, &mut taken);
             }
             MirPrimNonBlockingOp::ByteRingConsume { len, .. }
-            | MirPrimNonBlockingOp::ByteRingCommitWrite { len, .. } => {
+            | MirPrimNonBlockingOp::ByteRingCommitWrite { len, .. }
+            | MirPrimNonBlockingOp::PingPongCompleteHalf { half: len, .. } => {
                 collect_addr_of_vars(len, &mut taken);
             }
             MirPrimNonBlockingOp::ByteRingViewConsume { view, len }

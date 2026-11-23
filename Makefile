@@ -25,7 +25,7 @@ check:
 	$(ZEVC) check examples/arduino_uno_demo.zev
 	$(ZEVC) check examples/arduino_nano_every_demo.zev
 	$(ZEVC) check examples/pico_w_demo.zev
-	$(ZEVC) check examples/nucleo_f334r8_demo.zev
+	$(ZEVC) check --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
 
 ram:
 	$(ZEVC) ram examples/motor_controller.zev examples/motor_support.zev

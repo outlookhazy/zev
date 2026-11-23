@@ -1,0 +1,92 @@
+// STMicroelectronics STM32F334R8 Internal Flash Page 31 NVS Driver (0x0800_F800)
+
+import chip.stm32f334 as hw;
+
+fn flash_unlock() {
+    if ((hw.FLASH.cr & (1u32 << 7)) != 0u32) {
+        hw.FLASH.keyr = 0x4567_0123u32;
+        hw.FLASH.keyr = 0xCDEF_89ABu32;
+    }
+    hw.FLASH.sr = (1u32 << 5) | (1u32 << 4) | (1u32 << 2);
+}
+
+fn flash_lock() {
+    hw.FLASH.cr = hw.FLASH.cr | (1u32 << 7);
+}
+
+bool flash_wait_idle() {
+    for (u32 spin in 0..2_000_000) {
+        if ((hw.FLASH.sr & 1u32) == 0u32) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub bool flash_nvs_erase() {
+    flash_unlock();
+    if (!flash_wait_idle()) {
+        flash_lock();
+        return false;
+    }
+    hw.FLASH.cr = hw.FLASH.cr | (1u32 << 1); // PER
+    hw.FLASH.ar = 0x0800_F800u32;
+    hw.FLASH.cr = hw.FLASH.cr | (1u32 << 6); // STRT
+    bool idle_ok = flash_wait_idle();
+    u32 sr = hw.FLASH.sr;
+    hw.FLASH.sr = (1u32 << 5) | (1u32 << 4) | (1u32 << 2);
+    hw.FLASH.cr = hw.FLASH.cr & (~(1u32 << 1));
+    flash_lock();
+    return idle_ok && ((sr & 0x14u32) == 0u32);
+}
+
+pub bool flash_nvs_write_u16(usize halfword_idx, u16 val) {
+    if (halfword_idx >= 1024) {
+        return false;
+    }
+    flash_unlock();
+    if (!flash_wait_idle()) {
+        flash_lock();
+        return false;
+    }
+    hw.FLASH.cr = hw.FLASH.cr | 1u32; // PG = 1
+    hw.FLASH_NVS.halfwords[halfword_idx] = val;
+    bool idle_ok = flash_wait_idle();
+    u32 sr = hw.FLASH.sr;
+    hw.FLASH.sr = (1u32 << 5) | (1u32 << 4) | (1u32 << 2);
+    hw.FLASH.cr = hw.FLASH.cr & (~1u32);
+    flash_lock();
+    if (!idle_ok || ((sr & 0x14u32) != 0u32)) {
+        return false;
+    }
+    return hw.FLASH_NVS.halfwords[halfword_idx] == val;
+}
+
+pub bool flash_nvs_write_words(usize word_idx, []u32 words) {
+    if (word_idx > 512 || words.len > (512 - word_idx)) {
+        return false;
+    }
+    for (usize i in 0..words.len) {
+        u32 w = words[i];
+        u16 lo = (w & 0xFFFFu32) as u16;
+        u16 hi = ((w >> 16) & 0xFFFFu32) as u16;
+        usize h_idx = (word_idx + i) * 2;
+        if (!flash_nvs_write_u16(h_idx, lo)) {
+            return false;
+        }
+        if (!flash_nvs_write_u16(h_idx + 1, hi)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pub u32 flash_nvs_read_u32(usize word_idx) {
+    if (word_idx >= 512) {
+        return 0xFFFF_FFFFu32;
+    }
+    usize h_idx = word_idx * 2;
+    u32 lo = hw.FLASH_NVS.halfwords[h_idx] as u32;
+    u32 hi = hw.FLASH_NVS.halfwords[h_idx + 1] as u32;
+    return lo | (hi << 16);
+}

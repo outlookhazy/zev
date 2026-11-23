@@ -1,0 +1,74 @@
+// STMicroelectronics STM32F3xx General-Purpose & Advanced Timers (TIM2 / TIM1 PWM)
+
+import chip.stm32f334 as hw;
+import chip.stm32f3.rcc as rcc;
+import chip.stm32f3.gpio as cgpio;
+import hal.pwm as pwm;
+import std.math as math;
+
+pub fn tim2_start_periodic_us(u32 period_us) {
+    u32 ticks = period_us;
+    if (ticks == 0u32) {
+        ticks = 1u32;
+    }
+    hw.RCC.apb1enr = hw.RCC.apb1enr | hw.RCC_APB1_TIM2;
+    u32 _stab = hw.RCC.apb1enr;
+
+    u32 mhz = rcc.tim_pclk1_hz() / 1_000_000u32;
+    if (mhz == 0u32) {
+        mhz = 1u32;
+    }
+    hw.TIM2.cr1 = 0u32;
+    hw.TIM2.psc = mhz - 1u32;
+    hw.TIM2.arr = ticks - 1u32;
+    hw.TIM2.cnt = 0u32;
+    hw.TIM2.egr = 1u32;
+    hw.TIM2.sr = 0u32;   // rc_w0
+    hw.TIM2.dier = 1u32; // UIE
+    hw.TIM2.cr1 = 1u32;  // CEN
+}
+
+pub fn tim2_clear_irq() {
+    hw.TIM2.sr = 0u32;
+}
+
+pub pwm.Channel tim1_pwm_ch1_pa8_start(u32 freq_hz, u16 initial_permil) {
+    u32 eff_freq = freq_hz;
+    if (eff_freq == 0u32) {
+        eff_freq = 1000u32;
+    }
+    u32 period = 1_000_000u32 / eff_freq;
+    if (period == 0u32) {
+        period = 1u32;
+    }
+    u16 d = math.clamp<u16>(initial_permil, 0u16, 1000u16);
+
+    hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOA;
+    hw.RCC.apb2enr = hw.RCC.apb2enr | hw.RCC_APB2_TIM1;
+    u32 _stab = hw.RCC.apb2enr;
+
+    cgpio.config_af(cgpio.PORT_A, 8u32, cgpio.PUPD_NONE, false, 6u32); // PA8 AF6 = TIM1_CH1
+
+    u32 mhz = rcc.tim_pclk2_hz() / 1_000_000u32;
+    if (mhz == 0u32) {
+        mhz = 1u32;
+    }
+    hw.TIM1.cr1 = 0u32;
+    hw.TIM1.psc = mhz - 1u32; // 1 MHz timer clock
+    hw.TIM1.arr = period - 1u32;
+    hw.TIM1.cr1 = 1u32 << 7; // ARPE
+    hw.TIM1.ccmr1 = 0x68u32; // PWM Mode 1 + OC1PE
+    hw.TIM1.ccr1 = (((period as u64) * (d as u64)) / 1000u64) as u32;
+    hw.TIM1.ccer = 1u32;       // CC1E
+    hw.TIM1.bdtr = 1u32 << 15; // MOE
+    hw.TIM1.egr = 1u32;
+    hw.TIM1.cr1 = hw.TIM1.cr1 | 1u32;
+
+    return pwm.make_channel(0u8, 1u8, 0u8, period, d);
+}
+
+pub fn tim1_pwm_ch1_stop() {
+    hw.TIM1.bdtr = 0u32;
+    hw.TIM1.ccer = 0u32;
+    hw.TIM1.cr1 = 0u32;
+}

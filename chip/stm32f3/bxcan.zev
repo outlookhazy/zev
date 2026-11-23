@@ -1,0 +1,151 @@
+// STMicroelectronics STM32F3xx bxCAN1 (CAN 2.0B) Silicon Driver over std.bus.CanFrame
+
+import chip.stm32f334 as hw;
+import chip.stm32f3.rcc as rcc;
+import chip.stm32f3.gpio as cgpio;
+import std.bus as bus;
+
+pub const u8 CAN_MODE_NORMAL          = 0u8;
+pub const u8 CAN_MODE_LOOPBACK        = 1u8;
+pub const u8 CAN_MODE_SILENT_LOOPBACK = 2u8;
+
+pub fn can1_init(u32 bitrate, u8 mode) {
+    if (bitrate == 0u32) {
+        return;
+    }
+    hw.RCC.apb1enr = hw.RCC.apb1enr | hw.RCC_APB1_CAN1;
+    u32 _stab = hw.RCC.apb1enr;
+
+    if (mode != CAN_MODE_SILENT_LOOPBACK) {
+        hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOA;
+        u32 _staba = hw.RCC.ahbenr;
+        cgpio.config_af(cgpio.PORT_A, 11u32, cgpio.PUPD_NONE, false, 9u32); // CAN_RX
+        cgpio.config_af(cgpio.PORT_A, 12u32, cgpio.PUPD_NONE, false, 9u32); // CAN_TX
+    }
+
+    hw.CAN1.mcr = hw.CAN1.mcr & (~2u32);
+    hw.CAN1.mcr = hw.CAN1.mcr | 1u32;
+    for (u32 spin in 0..40_000) {
+        if ((hw.CAN1.msr & 1u32) != 0u32) {
+            break;
+        }
+    }
+
+    u32 pclk = rcc.pclk1_hz();
+    u32 clks_per_bit = pclk / bitrate;
+    u32 brp = 1u32;
+    u32 ts1 = 10u32;
+    u32 ts2 = 3u32;
+    if ((clks_per_bit >= 18u32) && ((clks_per_bit % 18u32) == 0u32)) {
+        brp = clks_per_bit / 18u32;
+        ts1 = 11u32;
+        ts2 = 4u32;
+    } else if (clks_per_bit >= 16u32) {
+        brp = clks_per_bit / 16u32;
+    }
+    if (brp == 0u32) {
+        brp = 1u32;
+    }
+    if (brp > 1024u32) {
+        brp = 1024u32;
+    }
+    u32 btr = ((brp - 1u32) & 0x3FFu32) | ((ts1 & 0xFu32) << 16) | ((ts2 & 7u32) << 20);
+    if (mode == CAN_MODE_LOOPBACK) {
+        btr = btr | (1u32 << 30);
+    } else if (mode == CAN_MODE_SILENT_LOOPBACK) {
+        btr = btr | (3u32 << 30); // SILM | LBKM
+    }
+    hw.CAN1.btr = btr;
+
+    hw.CAN1.mcr = hw.CAN1.mcr & (~1u32);
+    for (u32 spin in 0..40_000) {
+        if ((hw.CAN1.msr & 1u32) == 0u32) {
+            break;
+        }
+    }
+
+    // Filter bank 0: 32-bit mask accept-all -> FIFO 0.
+    hw.CAN1.fmr = hw.CAN1.fmr | 1u32;
+    hw.CAN1.fa1r = hw.CAN1.fa1r & (~1u32);
+    hw.CAN1.fs1r = hw.CAN1.fs1r | 1u32;
+    hw.CAN1.fm1r = hw.CAN1.fm1r & (~1u32);
+    hw.CAN1.f0r1 = 0u32;
+    hw.CAN1.f0r2 = 0u32;
+    hw.CAN1.fa1r = hw.CAN1.fa1r | 1u32;
+    hw.CAN1.fmr = hw.CAN1.fmr & (~1u32);
+
+    for (u32 _d in 0..4) {
+        if ((hw.CAN1.rf0r & 3u32) == 0u32) {
+            break;
+        }
+        hw.CAN1.rf0r = hw.CAN1.rf0r | (1u32 << 5);
+    }
+}
+
+pub bool can1_send(*bus.CanFrame tx) {
+    if ((hw.CAN1.tsr & (1u32 << 26)) == 0u32) {
+        return false;
+    }
+    u8 dlc = tx.dlc;
+    if (dlc > 8u8) {
+        dlc = 8u8;
+    }
+    u32 dlo = (tx.data[0] as u32)
+        | ((tx.data[1] as u32) << 8)
+        | ((tx.data[2] as u32) << 16)
+        | ((tx.data[3] as u32) << 24);
+    u32 dhi = (tx.data[4] as u32)
+        | ((tx.data[5] as u32) << 8)
+        | ((tx.data[6] as u32) << 16)
+        | ((tx.data[7] as u32) << 24);
+
+    hw.CAN1.tdt0r = dlc as u32;
+    hw.CAN1.tdl0r = dlo;
+    hw.CAN1.tdh0r = dhi;
+    u32 rtr_bit = 0u32;
+    if (tx.rtr) {
+        rtr_bit = 1u32 << 1;
+    }
+    u32 tir = 1u32;
+    if (tx.extended) {
+        tir = ((tx.id & 0x1FFF_FFFFu32) << 3) | (1u32 << 2) | rtr_bit | 1u32;
+    } else {
+        tir = ((tx.id & 0x7FFu32) << 21) | rtr_bit | 1u32;
+    }
+    hw.CAN1.ti0r = tir;
+    return true;
+}
+
+pub bool can1_recv(*bus.CanFrame rx) {
+    if ((hw.CAN1.rf0r & 3u32) == 0u32) {
+        return false;
+    }
+    u32 ri = hw.CAN1.ri0r;
+    u32 rdt = hw.CAN1.rdt0r;
+    u32 rdl = hw.CAN1.rdl0r;
+    u32 rdh = hw.CAN1.rdh0r;
+    hw.CAN1.rf0r = hw.CAN1.rf0r | (1u32 << 5);
+
+    bool ext = (ri & 4u32) != 0u32;
+    rx.extended = ext;
+    rx.rtr = (ri & 2u32) != 0u32;
+    if (ext) {
+        rx.id = (ri >> 3) & 0x1FFF_FFFFu32;
+    } else {
+        rx.id = (ri >> 21) & 0x7FFu32;
+    }
+    rx.dlc = (rdt & 0xFu32) as u8;
+    rx.data[0] = (rdl & 0xFFu32) as u8;
+    rx.data[1] = ((rdl >> 8) & 0xFFu32) as u8;
+    rx.data[2] = ((rdl >> 16) & 0xFFu32) as u8;
+    rx.data[3] = ((rdl >> 24) & 0xFFu32) as u8;
+    rx.data[4] = (rdh & 0xFFu32) as u8;
+    rx.data[5] = ((rdh >> 8) & 0xFFu32) as u8;
+    rx.data[6] = ((rdh >> 16) & 0xFFu32) as u8;
+    rx.data[7] = ((rdh >> 24) & 0xFFu32) as u8;
+    return true;
+}
+
+pub fn can1_sleep() {
+    hw.CAN1.mcr = hw.CAN1.mcr | 2u32;
+}

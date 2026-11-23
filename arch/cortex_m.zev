@@ -1,0 +1,79 @@
+// ARM Cortex-M Core Architectural MMIO & Wait/Reset Primitives (ARMv6-M / ARMv7-M / ARMv7E-M)
+
+pub mmio SysTickRegs {
+    @rw u32 csr   @ 0x00;
+    @rw u32 rvr   @ 0x04;
+    @rw u32 cvr   @ 0x08;
+    @ro u32 calib @ 0x0C;
+}
+
+pub mmio ScbRegs {
+    @ro u32 cpuid @ 0x00;
+    @rw u32 icsr  @ 0x04;
+    @rw u32 vtor  @ 0x08;
+    @rw u32 aircr @ 0x0C;
+    @rw u32 scr   @ 0x10;
+}
+
+pub mmio SYSTICK : SysTickRegs @ 0xE000_E010;
+pub mmio SCB     : ScbRegs     @ 0xE000_ED00;
+
+pub fn spin_us(u32 us) {
+    if (us == 0u32) {
+        return;
+    }
+    u32 csr = SYSTICK.csr;
+    u32 rvr = SYSTICK.rvr & 0x00FF_FFFFu32;
+    if ((csr & 1u32) != 0u32 && rvr >= 999u32) {
+        u32 period = rvr + 1u32;
+        u32 ticks_per_us = period / 1000u32;
+        if (ticks_per_us == 0u32) {
+            ticks_per_us = 1u32;
+        }
+        u32 rem_us = us;
+        for (u32 chunk in 0..2000) {
+            if (rem_us == 0u32) {
+                break;
+            }
+            u32 slice_us = rem_us;
+            if (slice_us > 500u32) {
+                slice_us = 500u32;
+            }
+            rem_us -= slice_us;
+            u32 target_ticks = slice_us * ticks_per_us;
+            u32 max_polls = (target_ticks * 8u32) + 256u32;
+            u32 prev = SYSTICK.cvr & 0x00FF_FFFFu32;
+            u32 elapsed = 0u32;
+            for (u32 _p in 0..max_polls) {
+                u32 now = SYSTICK.cvr & 0x00FF_FFFFu32;
+                u32 dt = 0u32;
+                if (prev >= now) {
+                    dt = prev - now;
+                } else {
+                    u32 wrapped = prev + period;
+                    if (now <= wrapped) {
+                        dt = wrapped - now;
+                    } else {
+                        dt = 1u32;
+                    }
+                }
+                elapsed += dt;
+                prev = now;
+                if (elapsed >= target_ticks) {
+                    break;
+                }
+            }
+        }
+        return;
+    }
+
+    // Fallback prior to SysTick initialization (conservative internal oscillator rate).
+    u32 loops = us * 8u32;
+    for (u32 _i in 0..loops) {
+        sys.nop();
+    }
+}
+
+pub fn system_reset() {
+    SCB.aircr = 0x05FA_0004u32;
+}

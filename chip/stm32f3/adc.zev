@@ -1,0 +1,107 @@
+// STMicroelectronics STM32F3xx ADC1/ADC2 Calibration, VREFINT, & HAL Channel Factory
+
+import chip.stm32f334 as hw;
+import chip.stm32f3.rcc as rcc;
+import hal.time as htime;
+import hal.adc as hadc;
+import std.bus as bus;
+
+pub fn set_sample_time(u8 unit, u32 ch, u32 smp) {
+    u32 s = smp & 7u32;
+    if (unit == 1u8) {
+        if (ch <= 9u32) {
+            u32 sh = ch * 3u32;
+            hw.ADC1.smpr1 = (hw.ADC1.smpr1 & (~(7u32 << sh))) | (s << sh);
+        } else if (ch <= 18u32) {
+            u32 sh = (ch - 10u32) * 3u32;
+            hw.ADC1.smpr2 = (hw.ADC1.smpr2 & (~(7u32 << sh))) | (s << sh);
+        }
+    } else if (unit == 2u8) {
+        if (ch <= 9u32) {
+            u32 sh = ch * 3u32;
+            hw.ADC2.smpr1 = (hw.ADC2.smpr1 & (~(7u32 << sh))) | (s << sh);
+        } else if (ch <= 18u32) {
+            u32 sh = (ch - 10u32) * 3u32;
+            hw.ADC2.smpr2 = (hw.ADC2.smpr2 & (~(7u32 << sh))) | (s << sh);
+        }
+    }
+}
+
+fn calibrate_and_enable(*hw.AdcRegs adc) {
+    adc.cr = (adc.cr & (~(3u32 << 28))) | (1u32 << 28); // ADVREGEN = 01b
+    htime.spin_us(20u32);
+
+    if ((adc.cr & 1u32) == 0u32) {
+        adc.cr = (adc.cr & (~(1u32 << 30))) | (1u32 << 31); // ADCAL = 1
+        for (u32 spin in 0..100_000) {
+            if ((adc.cr & (1u32 << 31)) == 0u32) {
+                break;
+            }
+        }
+        htime.spin_us(5u32);
+        adc.isr = 1u32;
+        adc.cr = adc.cr | 1u32; // ADEN = 1
+        for (u32 spin in 0..100_000) {
+            if ((adc.isr & 1u32) != 0u32) {
+                break;
+            }
+        }
+    }
+}
+
+pub fn init_adc12() {
+    hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_ADC12;
+    u32 _stab = hw.RCC.ahbenr;
+
+    u32 ckmode = 1u32;
+    if (rcc.hclk_hz() > 36_000_000u32) {
+        ckmode = 2u32;
+    }
+    hw.ADC12_COMMON.ccr = (hw.ADC12_COMMON.ccr & (~(3u32 << 16))) | (ckmode << 16) | (1u32 << 22);
+    calibrate_and_enable(hw.ADC1);
+    calibrate_and_enable(hw.ADC2);
+
+    // Long sample time (601.5 cycles = 7) for high-Z and VREFINT channels.
+    set_sample_time(1u8, 1u32, 7u32);
+    set_sample_time(1u8, 2u32, 7u32);
+    set_sample_time(1u8, 18u32, 7u32);
+    set_sample_time(2u8, 1u32, 7u32);
+}
+
+pub u16 read_vrefint_cal() {
+    return hw.VREFINT_CAL.vrefint;
+}
+
+pub u16 read_vrefint_counts() error bus.BusStatus {
+    hadc.Channel ch18 = hadc.make_channel(1u8, 18u8, 3300u16, 1525u16);
+    u16 raw = hadc.read_u16(&ch18) catch (bus.BusStatus err) {
+        error err;
+    };
+    return raw;
+}
+
+pub u32 read_vdda_mv() error bus.BusStatus {
+    u16 raw = read_vrefint_counts() catch (bus.BusStatus err) {
+        error err;
+    };
+    u16 cal = read_vrefint_cal();
+    if (raw == 0u16 || cal < 1000u16 || cal > 2200u16) {
+        return 3300u32;
+    }
+    return (3300u32 * (cal as u32)) / (raw as u32);
+}
+
+pub f32 read_vdda_volts() error bus.BusStatus {
+    u16 raw = read_vrefint_counts() catch (bus.BusStatus err) {
+        error err;
+    };
+    u16 cal = read_vrefint_cal();
+    if (raw == 0u16 || cal < 1000u16 || cal > 2200u16) {
+        return 3.30f32;
+    }
+    return (3.30f32 * (cal as f32)) / (raw as f32);
+}
+
+pub hadc.Channel channel(u8 unit, u8 ch, u16 vdda_mv) {
+    return hadc.make_channel(unit, ch, vdda_mv, 0u16);
+}

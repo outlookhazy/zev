@@ -1,0 +1,7 @@
+// Portable HAL microsecond hardware settle spin (STM32F3 Cortex-M4 SysTick)
+
+import arch.cortex_m as cm;
+
+pub fn spin_us(u32 us) {
+    cm.spin_us(us);
+}

@@ -118,7 +118,6 @@ enum HookKind {
     Exit,
     FaultHandler,
     Idle,
-    DelayUs,
     IrqRoute,
     IrqAck,
 }
@@ -131,7 +130,6 @@ impl HookKind {
             Self::Exit => "exit",
             Self::FaultHandler => "fault",
             Self::Idle => "idle",
-            Self::DelayUs => "delay_us",
             Self::IrqRoute => "rv_irq_route",
             Self::IrqAck => "rv_irq_ack",
         }
@@ -144,7 +142,6 @@ impl HookKind {
             Self::Exit => "@__syn_on_exit",
             Self::FaultHandler => "@__syn_on_fault",
             Self::Idle => "@__syn_on_idle",
-            Self::DelayUs => "@__syn_on_delay_us",
             Self::IrqRoute => "@__syn_on_rv_irq_route",
             Self::IrqAck => "@__syn_on_rv_irq_ack",
         }
@@ -186,7 +183,6 @@ struct ResolvedSysHooks {
     exit: StaticHookMode,
     fault_handler: StaticHookMode,
     idle: StaticHookMode,
-    delay_us: StaticHookMode,
     irq_route: StaticHookMode,
     irq_ack: StaticHookMode,
 }
@@ -199,7 +195,6 @@ impl Default for ResolvedSysHooks {
             exit: StaticHookMode::Unset,
             fault_handler: StaticHookMode::Unset,
             idle: StaticHookMode::Unset,
-            delay_us: StaticHookMode::Unset,
             irq_route: StaticHookMode::Unset,
             irq_ack: StaticHookMode::Unset,
         }
@@ -214,7 +209,6 @@ impl ResolvedSysHooks {
             HookKind::Exit => &self.exit,
             HookKind::FaultHandler => &self.fault_handler,
             HookKind::Idle => &self.idle,
-            HookKind::DelayUs => &self.delay_us,
             HookKind::IrqRoute => &self.irq_route,
             HookKind::IrqAck => &self.irq_ack,
         }
@@ -683,6 +677,11 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                     target,
                     elem_ty,
                     cap,
+                }
+                | MirPrimReadOp::PingPongBaseAddr {
+                    target,
+                    elem_ty,
+                    cap,
                 } => {
                     scan_prim_target(target, feat);
                     scan_ty(elem_ty, feat);
@@ -872,6 +871,16 @@ fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
                     } => {
                         scan_prim_target(target, feat);
                         scan_ty(elem_ty, feat);
+                    }
+                    MirPrimNonBlockingOp::PingPongCompleteHalf {
+                        target,
+                        elem_ty,
+                        half,
+                        ..
+                    } => {
+                        scan_prim_target(target, feat);
+                        scan_ty(elem_ty, feat);
+                        scan_expr(half, feat);
                     }
                     MirPrimNonBlockingOp::LeaseRelease {
                         value, elem_ty, ..
@@ -1338,10 +1347,6 @@ impl<'a> ModuleCtx<'a> {
                     .entry(HookKind::Idle)
                     .or_default()
                     .push(args.first().and_then(unwrap_fn_addr)),
-                "set_delay_us" => sites
-                    .entry(HookKind::DelayUs)
-                    .or_default()
-                    .push(args.first().and_then(unwrap_fn_addr)),
                 "set_irq_router" => {
                     sites
                         .entry(HookKind::IrqRoute)
@@ -1490,9 +1495,6 @@ impl<'a> ModuleCtx<'a> {
                         "set_idle" => {
                             uncond.insert(HookKind::Idle);
                         }
-                        "set_delay_us" => {
-                            uncond.insert(HookKind::DelayUs);
-                        }
                         "set_irq_router" => {
                             uncond.insert(HookKind::IrqRoute);
                             uncond.insert(HookKind::IrqAck);
@@ -1637,7 +1639,6 @@ impl<'a> ModuleCtx<'a> {
             exit: resolve_one(HookKind::Exit),
             fault_handler: resolve_one(HookKind::FaultHandler),
             idle: resolve_one(HookKind::Idle),
-            delay_us: resolve_one(HookKind::DelayUs),
             irq_route: resolve_one(HookKind::IrqRoute),
             irq_ack: resolve_one(HookKind::IrqAck),
         }
@@ -1652,7 +1653,6 @@ impl<'a> ModuleCtx<'a> {
             HookKind::Exit,
             HookKind::FaultHandler,
             HookKind::Idle,
-            HookKind::DelayUs,
             HookKind::IrqRoute,
             HookKind::IrqAck,
         ];
@@ -1815,19 +1815,6 @@ impl<'a> ModuleCtx<'a> {
             "  ret void",
             "",
             "i32 %in_sim, i32 %depth",
-        );
-        self.emit_hook_wrapper(
-            out,
-            HookKind::DelayUs,
-            "i32 %us",
-            "void",
-            "",
-            &format!(
-                "  {} void @__syn_arch_delay_us(i32 %us)\n  ret void",
-                self.call_kw()
-            ),
-            "",
-            "i32 %us",
         );
         if self.spec.isa.is_riscv() {
             self.emit_hook_wrapper(
@@ -2212,6 +2199,36 @@ impl<'a> ModuleCtx<'a> {
                 | MirPrimNonBlockingOp::ByteRingCommitWrite { len, .. } => {
                     self.scan_expr_for_prims(len);
                 }
+                MirPrimNonBlockingOp::PingPongFlip {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimNonBlockingOp::PingPongSetActive {
+                    target,
+                    elem_ty,
+                    cap,
+                    ..
+                } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::PingPong {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    });
+                }
+                MirPrimNonBlockingOp::PingPongCompleteHalf {
+                    target,
+                    elem_ty,
+                    cap,
+                    half,
+                } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::PingPong {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    });
+                    self.scan_expr_for_prims(half);
+                }
                 _ => {}
             },
             MirStmt::SpawnActivate { args, .. } => {
@@ -2439,6 +2456,22 @@ impl<'a> ModuleCtx<'a> {
                     self.scan_prim_target_for_prims(target);
                     self.register_prim_kind(&MirPrimKind::DmaSlot {
                         elem: Box::new(elem_ty.clone()),
+                    });
+                }
+                MirPrimReadOp::PingPongDmaBuf {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PingPongBaseAddr {
+                    target,
+                    elem_ty,
+                    cap,
+                } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::PingPong {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
                     });
                 }
                 _ => {}
@@ -4133,6 +4166,20 @@ entry:
   %wh = load i8, ptr %wh_p, align 1
   store i8 %wh, ptr %rh_p, align 1
   %next = xor i8 %wh, 1
+  store i8 %next, ptr %wh_p, align 1
+  store i8 1, ptr %cr_p, align 1
+  {call_kw} void @__syn_wake_waiters(ptr %pp, i32 -1)
+{crit_exit}  ret void
+}}
+
+define void @__syn_pp_complete_half_{id}(ptr %pp, i8 %half){fn_as} nounwind{fn_sz} {{
+entry:
+{crit_enter}  %wh_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 0
+  %rh_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 1
+  %cr_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 2
+  %c = and i8 %half, 1
+  store i8 %c, ptr %rh_p, align 1
+  %next = xor i8 %c, 1
   store i8 %next, ptr %wh_p, align 1
   store i8 1, ptr %cr_p, align 1
   {call_kw} void @__syn_wake_waiters(ptr %pp, i32 -1)
@@ -8836,6 +8883,25 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pptr = self.resolve_prim_ptr(target)?;
                 self.emit_line(format!("{call_kw} void @__syn_pp_flip_{id}(ptr {pptr})"));
             }
+            MirPrimNonBlockingOp::PingPongCompleteHalf {
+                target,
+                elem_ty,
+                cap,
+                half,
+            } => {
+                let pk = MirPrimKind::PingPong {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let pptr = self.resolve_prim_ptr(target)?;
+                let hv = self.emit_expr(half)?;
+                let h8 = self.coerce(hv, "i8", false);
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_pp_complete_half_{id}(ptr {pptr}, i8 {})",
+                    h8.repr
+                ));
+            }
             MirPrimNonBlockingOp::PingPongSetActive {
                 target,
                 elem_ty,
@@ -8975,9 +9041,6 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         return self.emit_hook_registration(HookKind::FaultHandler, args.first());
                     }
                     "set_idle" => return self.emit_hook_registration(HookKind::Idle, args.first()),
-                    "set_delay_us" => {
-                        return self.emit_hook_registration(HookKind::DelayUs, args.first());
-                    }
                     "set_irq_router" => {
                         self.emit_hook_registration(HookKind::IrqRoute, args.first())?;
                         return self.emit_hook_registration(HookKind::IrqAck, args.get(1));
@@ -9090,25 +9153,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             ));
                         }
                     }
-                    "delay_us" => {
-                        if let Some((us, _)) = ev.first() {
-                            let u32v = self.coerce(us.clone(), "i32", false);
-                            self.emit_line(format!(
-                                "{call_kw} void @__syn_on_delay_us(i32 {})",
-                                u32v.repr
-                            ));
-                        }
-                    }
                     "nop" => {
                         self.emit_line(
                             "call void asm sideeffect \"nop\", \"~{memory}\"()".to_string(),
                         );
-                    }
-                    "lock_sleep" => {
-                        self.emit_line(format!("{call_kw} void @__syn_lock_sleep()"));
-                    }
-                    "unlock_sleep" => {
-                        self.emit_line(format!("{call_kw} void @__syn_unlock_sleep()"));
                     }
                     "assert" => {
                         if let Some((cond, _)) = ev.first() {
@@ -10023,8 +10071,6 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     MirSysQuery::SleepDepth => {
                         let m = self.next_tmp();
                         let dl = self.next_tmp();
-                        let ul = self.next_tmp();
-                        let mdl = self.next_tmp();
                         let any = self.next_tmp();
                         let locked = self.next_tmp();
                         let out_v = self.next_tmp();
@@ -10041,14 +10087,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         self.emit_line(format!(
                             "{dl} = load volatile i32, ptr @__syn_dma_locks, align 4"
                         ));
-                        self.emit_line(format!(
-                            "{ul} = load volatile i32, ptr @__syn_user_sleep_locks, align 4"
-                        ));
                         if let Some(pm) = pm {
                             self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
                         }
-                        self.emit_line(format!("{mdl} = or i32 {m}, {dl}"));
-                        self.emit_line(format!("{any} = or i32 {mdl}, {ul}"));
+                        self.emit_line(format!("{any} = or i32 {m}, {dl}"));
                         self.emit_line(format!("{locked} = icmp ne i32 {any}, 0"));
                         self.emit_line(format!("{out_v} = select i1 {locked}, i32 1, i32 2"));
                         out_v
@@ -10262,6 +10304,26 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{s0} = insertvalue {sl_ty} poison, ptr {buf_p}, 0"));
                 self.emit_line(format!("{s1} = insertvalue {sl_ty} {s0}, {usize_ty} {n}, 1"));
                 Ok(SsaVal::new(sl_ty, s1))
+            }
+            MirPrimReadOp::PingPongBaseAddr {
+                target,
+                elem_ty,
+                cap,
+            } => {
+                let pk = MirPrimKind::PingPong {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                let pp_ty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
+                let pptr = self.resolve_prim_ptr(target)?;
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
+                let b0 = self.next_tmp();
+                let addr = self.next_tmp();
+                self.emit_line(format!(
+                    "{b0} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 4, i32 0"
+                ));
+                self.emit_line(format!("{addr} = ptrtoint ptr {b0} to {usize_ty}"));
+                Ok(SsaVal::new(usize_ty, addr))
             }
             MirPrimReadOp::PoolTryAlloc {
                 target,

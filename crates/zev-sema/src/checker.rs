@@ -37,6 +37,8 @@ pub struct AnalyzeOptions {
     pub default_tick_period_us: u64,
     /// Explicit module search directories (`-I` include paths) checked by module resolution.
     pub include_dirs: Vec<PathBuf>,
+    /// Target-bound HAL directory override (e.g. `"hal/stm32f3"`), defaulting to `"hal/sim"`.
+    pub hal_dir: Option<String>,
 }
 
 impl Default for AnalyzeOptions {
@@ -44,6 +46,7 @@ impl Default for AnalyzeOptions {
         Self {
             default_tick_period_us: DEFAULT_TICK_PERIOD_US,
             include_dirs: Vec::new(),
+            hal_dir: None,
         }
     }
 }
@@ -9837,7 +9840,7 @@ impl<'a> BodyChecker<'a> {
                 ExprVal::scalar(Ty::void(), span)
             }
 
-            "nop" | "lock_sleep" | "unlock_sleep" => {
+            "nop" => {
                 if !args.is_empty() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -9847,64 +9850,6 @@ impl<'a> BodyChecker<'a> {
                     for a in args {
                         let _ = self.check_expr_infallible(&a.value);
                     }
-                }
-                ExprVal::scalar(Ty::void(), span)
-            }
-
-            "delay_us" => {
-                if args.len() != 1 {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        span,
-                        format!("'sys.delay_us(u32 us)' expects 1 argument, found {}", args.len()),
-                    ));
-                    for a in args {
-                        let _ = self.check_expr_infallible(&a.value);
-                    }
-                } else {
-                    let av = self.check_expr_infallible(&args[0].value);
-                    if !av.ty.is_assignable_to(&Ty::u32()) && !av.ty.is_error() {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            args[0].span,
-                            format!("'sys.delay_us' expects `u32` microseconds, found '{}'", av.ty),
-                        ));
-                    }
-                }
-                ExprVal::scalar(Ty::void(), span)
-            }
-
-            "set_delay_us" => {
-                if self.in_isr() {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::InvalidControlFlow,
-                        span,
-                        "cannot call 'sys.set_delay_us' inside an ISR",
-                    ));
-                }
-                let expected_ty = Ty::FnPtr {
-                    params: vec![Ty::u32()],
-                    ret: Box::new(Ty::void()),
-                };
-                if args.len() != 1 {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        span,
-                        format!(
-                            "'sys.set_delay_us(fn(u32))' expects 1 argument, found {}",
-                            args.len()
-                        ),
-                    ));
-                    for a in args {
-                        let _ = self.check_expr_infallible(&a.value);
-                    }
-                } else {
-                    self.check_sys_callback_arg(
-                        "set_delay_us",
-                        "microsecond-delay",
-                        &args[0],
-                        &expected_ty,
-                    );
                 }
                 ExprVal::scalar(Ty::void(), span)
             }
@@ -10052,7 +9997,6 @@ impl<'a> BodyChecker<'a> {
                     "set_fault_handler",
                     "set_idle",
                     "set_irq_router",
-                    "set_delay_us",
                     "rom_call_u32",
                     "rom_call_void",
                     "rom_call_noreturn",
@@ -10063,10 +10007,7 @@ impl<'a> BodyChecker<'a> {
                     "wfi_count",
                     "trace_sleep",
                     "pend_irq",
-                    "lock_sleep",
-                    "unlock_sleep",
                     "nop",
-                    "delay_us",
                     "exit",
                     "log",
                     "log_kv",
@@ -10453,6 +10394,10 @@ impl<'a> BodyChecker<'a> {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
                     ExprVal::scalar(Ty::void(), span)
                 }
+                "complete_half" => {
+                    self.expect_single_elem(m, &pos_vals, &Ty::u8(), span);
+                    ExprVal::scalar(Ty::void(), span)
+                }
                 "wait_chunk" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
                     self.record_direct_yield(
@@ -10480,7 +10425,7 @@ impl<'a> BodyChecker<'a> {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
                     ExprVal::scalar(Ty::Slice(elem.clone()), span)
                 }
-                "half_len" | "cap" => {
+                "half_len" | "cap" | "base_addr" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
                     ExprVal::scalar(Ty::usize(), span)
                 }
@@ -12073,7 +12018,7 @@ impl<'a> BodyChecker<'a> {
 // Small Pure Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.tick_by(u32 ms)`, `sys.set_putc(fn(u8))`, `sys.set_clock_ms(fn() -> u32)`, `sys.set_exit(fn(i32))`, `sys.set_fault_handler(fn())`, `sys.set_idle(fn(u32, u32))`, `sys.set_irq_router(fn(u32, u32), fn(u32))`, `sys.set_delay_us(fn(u32))`, `sys.rom_call_u32(usize fn_addr, usize stack_bound, ...) -> u32`, `sys.rom_call_void(usize fn_addr, usize stack_bound, ...)`, `sys.rom_call_noreturn(usize fn_addr, ...)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.lock_sleep()`, `sys.unlock_sleep()`, `sys.nop()`, `sys.delay_us(u32 us)`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
+const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.tick_by(u32 ms)`, `sys.set_putc(fn(u8))`, `sys.set_clock_ms(fn() -> u32)`, `sys.set_exit(fn(i32))`, `sys.set_fault_handler(fn())`, `sys.set_idle(fn(u32, u32))`, `sys.set_irq_router(fn(u32, u32), fn(u32))`, `sys.rom_call_u32(usize fn_addr, usize stack_bound, ...) -> u32`, `sys.rom_call_void(usize fn_addr, usize stack_bound, ...)`, `sys.rom_call_noreturn(usize fn_addr, ...)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.nop()`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
 
 fn is_string_arg_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Str)

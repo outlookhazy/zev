@@ -1,0 +1,39 @@
+// Standard zero-heap integer & floating-point clamping, bounds, and magnitude utilities
+
+pub T clamp<T>(T val, T lo, T hi) {
+    if (val < lo) {
+        return lo;
+    }
+    if (val > hi) {
+        return hi;
+    }
+    return val;
+}
+
+pub T min<T>(T a, T b) {
+    if (a < b) {
+        return a;
+    }
+    return b;
+}
+
+pub T max<T>(T a, T b) {
+    if (a > b) {
+        return a;
+    }
+    return b;
+}
+
+pub u32 abs_i32(i32 v) {
+    if (v < 0i32) {
+        return ((-(v + 1i32)) as u32) + 1u32;
+    }
+    return v as u32;
+}
+
+pub u64 abs_i64(i64 v) {
+    if (v < 0i64) {
+        return ((-(v + 1i64)) as u64) + 1u64;
+    }
+    return v as u64;
+}

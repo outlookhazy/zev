@@ -1224,12 +1224,12 @@ import drivers.nonexistent as drv;
 fn main() {}",
         good_zev: "\
 import chip.stm32g4 as hw;
-import std.fmt as fmt;
+import std.math as math;
 
 pub const u32 MAX_DUTY = 1000;
 
 fn main() {
-    hw.TIM1.ccr[0] = fmt.clamp<u32>(500, 0, MAX_DUTY);
+    hw.TIM1.ccr[0] = math.clamp<u32>(500, 0, MAX_DUTY);
 }",
     },
     ErrorDoc {

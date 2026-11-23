@@ -6,7 +6,7 @@
 
 import chip.stm32g4 as hw;
 import bsp.motor_drive as bsp;
-import std.fmt as fmt;
+import std.math as math;
 
 watch<u32> flash_diag_status = 0;
 
@@ -47,11 +47,11 @@ u16 adc_read_rpm(u8 pwm_ch) {
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
     i32 err = (target as i32) - (actual as i32);
-    i32 next_int = fmt.clamp(*integral + err, -10000, 10000);
+    i32 next_int = math.clamp(*integral + err, -10000, 10000);
     *integral = next_int;
 
     i32 out = (err / 2) + (next_int / 16);
-    u16 duty = fmt.clamp(out, 0, 1000) as u16;
+    u16 duty = math.clamp(out, 0, 1000) as u16;
     return duty;
 }
 

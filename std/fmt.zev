@@ -1,48 +1,17 @@
-// Standard formatting and numeric clamping utilities
+// Standard zero-heap fixed-point and hexadecimal formatting utilities
 
-pub T clamp<T>(T val, T lo, T hi) {
-    if (val < lo) {
-        return lo;
-    }
-    if (val > hi) {
-        return hi;
-    }
-    return val;
+import std.math as math;
+
+pub enum FmtErr {
+    Overflow,
+    InvalidPrecision,
 }
 
-pub T min<T>(T a, T b) {
-    if (a < b) {
-        return a;
-    }
-    return b;
-}
-
-pub T max<T>(T a, T b) {
-    if (a > b) {
-        return a;
-    }
-    return b;
-}
-
-pub u32 abs_i32(i32 v) {
-    if (v < 0i32) {
-        return ((-(v + 1i32)) as u32) + 1u32;
-    }
-    return v as u32;
-}
-
-pub u64 abs_i64(i64 v) {
-    if (v < 0i64) {
-        return ((-(v + 1i64)) as u64) + 1u64;
-    }
-    return v as u64;
-}
-
-pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error {
+pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error FmtErr {
     if (frac_digits > 9u8) {
-        error;
+        error InvalidPrecision;
     }
-    u64 mag = abs_i64(scaled);
+    u64 mag = math.abs_i64(scaled);
     u64 scale = 1u64;
     for (u8 i in 0..frac_digits) {
         scale = scale * 10u64;
@@ -53,7 +22,7 @@ pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error {
     usize pos = 0;
     if (scaled < 0i64) {
         if (pos >= dst.len) {
-            error;
+            error Overflow;
         }
         dst[pos] = '-';
         pos += 1;
@@ -76,7 +45,7 @@ pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error {
         }
     }
     if (wn > dst.len || pos > (dst.len - wn)) {
-        error;
+        error Overflow;
     }
     usize wr = wn;
     while (wr > 0) {
@@ -88,7 +57,7 @@ pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error {
     if (frac_digits > 0u8) {
         usize flen = (frac_digits as usize) + 1;
         if (flen > dst.len || pos > (dst.len - flen)) {
-            error;
+            error Overflow;
         }
         dst[pos] = '.';
         pos += 1;
@@ -106,17 +75,17 @@ pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error {
 }
 
 pub u8 hex_nibble_lower(u8 nibble) {
-    u8 n = nibble & 15;
-    if (n < 10) {
-        return 48 + n;
+    u8 n = nibble & 15u8;
+    if (n < 10u8) {
+        return ('0' as u8) + n;
     }
-    return 87 + n;
+    return ('a' as u8) + (n - 10u8);
 }
 
 pub u8 hex_nibble_upper(u8 nibble) {
-    u8 n = nibble & 15;
-    if (n < 10) {
-        return 48 + n;
+    u8 n = nibble & 15u8;
+    if (n < 10u8) {
+        return ('0' as u8) + n;
     }
-    return 55 + n;
+    return ('A' as u8) + (n - 10u8);
 }

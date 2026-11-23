@@ -1,0 +1,21 @@
+// STMicroelectronics STM32F3xx DMA1 Mem-to-Mem Helper
+
+import chip.stm32f334 as hw;
+
+pub fn dma1_ch1_mem2mem_start(usize src_addr, usize dst_addr, u32 words) {
+    hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_DMA1;
+    u32 _stab = hw.RCC.ahbenr;
+
+    hw.DMA1.ccr1 = 0u32;
+    hw.DMA1.ifcr = 0x0Fu32;
+    hw.DMA1.cpar1 = src_addr as u32;
+    hw.DMA1.cmar1 = dst_addr as u32;
+    hw.DMA1.cndtr1 = words;
+    // MEM2MEM | MSIZE=32b | PSIZE=32b | MINC | PINC | TCIE | EN
+    hw.DMA1.ccr1 = (1u32 << 14) | (2u32 << 10) | (2u32 << 8) | (1u32 << 7) | (1u32 << 6) | (1u32 << 1) | 1u32;
+}
+
+pub fn dma1_ch1_clear_irq() {
+    hw.DMA1.ifcr = 0x0Fu32;
+    hw.DMA1.ccr1 = 0u32;
+}

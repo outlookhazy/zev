@@ -6313,42 +6313,165 @@ fn main() {
     }
 
     #[test]
-    fn sys_nop_delay_us_and_sleep_lock_runtime_asan() {
+    fn sys_nop_and_dma_sleep_depth_runtime_asan() {
         let src = r#"
-watch<u32> delay_hits = 0;
-
-fn host_us_delay(u32 us) {
-    delay_hits.publish(delay_hits.read() + us);
-    sys.nop();
-}
+@dma_safe ping_pong<u8, 8> pp;
 
 fn main() {
     sys.nop();
     assert(sys.sleep_depth() == 2);
-    sys.lock_sleep();
+    pp.start();
     assert(sys.sleep_depth() == 1);
-    sys.lock_sleep();
-    assert(sys.sleep_depth() == 1);
-    sys.unlock_sleep();
-    assert(sys.sleep_depth() == 1);
-    sys.unlock_sleep();
+    pp.stop();
     assert(sys.sleep_depth() == 2);
-
-    // Extra unlock saturates safely at 0.
-    sys.unlock_sleep();
-    assert(sys.sleep_depth() == 2);
-
-    sys.set_delay_us(host_us_delay);
-    sys.delay_us(42);
-    assert(delay_hits.read() == 42);
-    println(f"SYS_TIMING_LOCK_OK depth={sys.sleep_depth()} hits={delay_hits.read()}");
+    println(f"SYS_NOP_OK depth={sys.sleep_depth()}");
     sys.exit(0);
 }
 "#;
         let (_mir, _c_code, stdout) =
-            run_zev_c_sim_and_freestanding("sys_nop_delay_us_sleep_lock_asan", src);
+            run_zev_c_sim_and_freestanding("sys_nop_dma_sleep_asan", src);
         assert!(
-            stdout.contains("SYS_TIMING_LOCK_OK depth=2 hits=42"),
+            stdout.contains("SYS_NOP_OK depth=2"),
+            "stdout:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn circular_ping_pong_std_math_str_and_hal_sim_asan() {
+        let src = r#"
+import std.math as math;
+import std.str as str;
+import hal.gpio as gpio;
+import hal.pwm as pwm;
+import hal.adc as adc;
+import hal.i2c as i2c;
+import hal.spi as spi;
+import hal.time as htime;
+
+mmio FlagMmio {
+    @rw u32 half @ 0x00;
+}
+mmio DMA_FLAG : FlagMmio @ 0x4002_0000;
+irq IRQ_DMA_RX = 15;
+
+@dma_safe ping_pong<u8, 16> rx_pp;
+watch<usize> dma_base = 0usize;
+watch<u32> parsed_sum = 0u32;
+
+isr dma_rx_isr(*ping_pong<u8, 16> pp) {
+    u8 h = (DMA_FLAG.half & 1u32) as u8;
+    pp.complete_half(h);
+}
+
+task rx_worker(*ping_pong<u8, 16> pp, *watch<u32> out) {
+    u8 local[16];
+    u32 running = 0u32;
+    loop {
+        []u8 ch = pp.wait_chunk();
+        usize n = ch.len;
+        if (n > 16) {
+            n = 16;
+        }
+        for (usize i in 0..n) {
+            local[i] = ch[i];
+        }
+        []u8 t = str.trim_ascii(local[0..n]);
+        u32 v = str.parse_u32(t) or 0u32;
+        running += v;
+        out.publish(running);
+    }
+}
+
+fn main() {
+    assert(math.clamp<i32>(-5, 0, 10) == 0);
+    assert(math.abs_i32(-42) == 42u32);
+    assert(str.xor_checksum("PMTK605") == 0x31u8);
+    htime.spin_us(5u32);
+
+    gpio.Pin pin = gpio.make_pin(0u8, 5u8, false, false);
+    gpio.write(&pin, true);
+    assert(gpio.read(&pin));
+
+    pwm.Channel p_ch = pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 250u16);
+    pwm.set_duty_permil(&p_ch, 750u16);
+    assert(p_ch.duty_permil == 750u16);
+
+    rx_pp.start();
+    dma_base.publish(rx_pp.base_addr());
+    IRQ_DMA_RX.attach(dma_rx_isr(&rx_pp));
+    spawn rx_worker(&rx_pp, &parsed_sum);
+
+    adc.Channel a_ch = adc.make_channel(1u8, 1u8, 3300u16, 2048u16);
+    u16 raw = adc.read_u16(&a_ch) or 0u16;
+    assert(raw == 2048u16);
+
+    i2c.Bus ibus = i2c.make_bus(1u8, 25u32, true);
+    bool ack = i2c.probe_7bit(&ibus, 0x3Cu8) or false;
+    assert(ack);
+
+    spi.Bus sbus = spi.make_bus(1u8, 25u32, 0x5Au8);
+    u8 rx_b = spi.transfer_byte(&sbus, 0xA5u8) or 0u8;
+    assert(rx_b == 0x5Au8);
+
+    loop {
+        delay(50ms);
+    }
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse circular_pp_hal_sim");
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, None)],
+            &zev_sema::AnalyzeOptions::default(),
+        );
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema circular_pp_hal_sim: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = zev_mir::lower_programs(&analyzed.programs).expect("lower circular_pp_hal_sim");
+        let c_code = emit_c(&mir);
+        assert_freestanding_compiles("circular_pp_hal_sim", &c_code);
+
+        let driver = r#"
+int main(void) {
+    syn_boot_init();
+    syn_sim_pump_ready();
+
+    uintptr_t base = (uintptr_t)syn_watch_usize_read(&dma_base);
+    if (base == 0U) {
+        fprintf(stderr, "Expected non-zero rx_pp.base_addr()\n");
+        return 1;
+    }
+
+    memcpy((uint8_t *)base, "0000000000000125", 16U);
+    memcpy((uint8_t *)base + 16U, "0000000000000275", 16U);
+
+    uint32_t half = 0U;
+    for (size_t i = 0U; i < sizeof(half); ++i) {
+        __zev_mmio_buf_DMA_FLAG[i] = (uint8_t)((half >> (i * 8U)) & 0xFFU);
+    }
+    syn_sim_pend_irq(15U);
+    syn_sim_pump_ready();
+
+    half = 1U;
+    for (size_t i = 0U; i < sizeof(half); ++i) {
+        __zev_mmio_buf_DMA_FLAG[i] = (uint8_t)((half >> (i * 8U)) & 0xFFU);
+    }
+    syn_sim_pend_irq(15U);
+    syn_sim_pump_ready();
+
+    uint32_t sum = syn_watch_u32_read(&parsed_sum);
+    if (sum != 400U) {
+        fprintf(stderr, "Expected parsed_sum == 400, got %u\n", (unsigned)sum);
+        return 2;
+    }
+    printf("CIRCULAR_PP_HAL_SIM_OK sum=%u\n", (unsigned)sum);
+    return 0;
+}
+"#;
+        let stdout = compile_and_run_clang_sanitized("circular_pp_hal_sim", &c_code, Some(driver));
+        assert!(
+            stdout.contains("CIRCULAR_PP_HAL_SIM_OK sum=400"),
             "stdout:\n{stdout}"
         );
     }

@@ -335,7 +335,6 @@ typedef enum {{
 typedef struct {{
     volatile uint32_t dma_lock_mask;
     volatile uint32_t dma_active_locks;
-    volatile uint32_t user_sleep_locks;
     uint32_t enter_count;
     uint32_t light_sleep_count;
     uint32_t deep_sleep_count;
@@ -350,7 +349,6 @@ static SYN_UNUSED volatile uint32_t g_syn_crit_nesting = 0U;
 static SYN_UNUSED syn_sleep_coord_t g_syn_sleep = {{
     .dma_lock_mask = 0U,
     .dma_active_locks = 0U,
-    .user_sleep_locks = 0U,
     .enter_count = 0U,
     .light_sleep_count = 0U,
     .deep_sleep_count = 0U,
@@ -411,53 +409,23 @@ static SYN_UNUSED inline void syn_sleep_unlock_dma(uint32_t bit) {{
     syn_exit_critical();
 }}
 
-/* Active hardware DMA primitives (`ping_pong`, `@dma_safe pool`) or explicit `sys.lock_sleep()`
- * clamp `allowed_sleep_depth` from `SYN_SLEEP_DEEP` down to `SYN_SLEEP_LIGHT`. */
+/* Active hardware DMA primitives (`ping_pong`, `@dma_safe pool`) automatically clamp
+ * `allowed_sleep_depth` from `SYN_SLEEP_DEEP` down to `SYN_SLEEP_LIGHT`. */
 static SYN_UNUSED inline syn_sleep_depth_t syn_allowed_sleep_depth(void) {{
     if (g_syn_sleep.max_depth == SYN_SLEEP_NONE) {{
         return SYN_SLEEP_NONE;
     }}
-    if ((g_syn_sleep.dma_lock_mask != 0U || g_syn_sleep.dma_active_locks != 0U || g_syn_sleep.user_sleep_locks != 0U)
+    if ((g_syn_sleep.dma_lock_mask != 0U || g_syn_sleep.dma_active_locks != 0U)
         && g_syn_sleep.max_depth > SYN_SLEEP_LIGHT) {{
         return SYN_SLEEP_LIGHT;
     }}
     return g_syn_sleep.max_depth;
 }}
 
-static SYN_UNUSED inline void syn_sys_lock_sleep(void) {{
-    syn_enter_critical();
-    g_syn_sleep.user_sleep_locks++;
-    syn_exit_critical();
-}}
-
-static SYN_UNUSED inline void syn_sys_unlock_sleep(void) {{
-    syn_enter_critical();
-    if (g_syn_sleep.user_sleep_locks > 0U) {{
-        g_syn_sleep.user_sleep_locks--;
-    }}
-    syn_exit_critical();
-}}
-
 static SYN_UNUSED inline void syn_sys_nop(void) {{
 #if defined(__GNUC__) || defined(__clang__)
     __asm__ volatile("" ::: "memory");
 #endif
-}}
-
-typedef void (*syn_delay_us_fn_t)(uint32_t);
-static SYN_UNUSED syn_delay_us_fn_t g_syn_user_delay_us = NULL;
-
-static SYN_UNUSED inline void syn_sys_set_delay_us(syn_delay_us_fn_t fn) {{
-    g_syn_user_delay_us = fn;
-}}
-
-static SYN_UNUSED inline void syn_sys_delay_us(uint32_t us) {{
-    if (g_syn_user_delay_us != NULL) {{
-        g_syn_user_delay_us(us);
-        return;
-    }}
-    (void)us;
-    syn_sys_nop();
 }}
 
 static SYN_UNUSED inline void syn_sys_use_systick(uint32_t hz) {{
@@ -1084,6 +1052,23 @@ static SYN_UNUSED inline void syn_pp_hdr_flip(syn_pp_hdr_t *h) {{
     uint8_t completed = h->write_idx;
     h->write_idx = (uint8_t)(completed ^ 1U);
     h->ready_idx = completed;
+    h->ready_len = (h->pending_write_len > 0U) ? h->pending_write_len : h->cap;
+    h->pending_write_len = 0U;
+    h->chunk_ready = true;
+    syn_task_t *w = h->waiter;
+    h->waiter = NULL;
+    if (w != NULL) {{
+        syn_task_wake_from_isr_or_task(w, SYN_NO_BOOST);
+    }}
+    syn_exit_critical();
+}}
+
+static SYN_UNUSED inline void syn_pp_hdr_complete_half(syn_pp_hdr_t *h, uint8_t half) {{
+    if (h == NULL) {{ return; }}
+    syn_enter_critical();
+    uint8_t completed = (uint8_t)(half & 1U);
+    h->ready_idx = completed;
+    h->write_idx = (uint8_t)(completed ^ 1U);
     h->ready_len = (h->pending_write_len > 0U) ? h->pending_write_len : h->cap;
     h->pending_write_len = 0U;
     h->chunk_ready = true;

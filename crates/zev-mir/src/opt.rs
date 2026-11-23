@@ -759,6 +759,11 @@ impl<'a> ScanCtx<'a> {
                     target,
                     elem_ty,
                     cap,
+                }
+                | MirPrimReadOp::PingPongBaseAddr {
+                    target,
+                    elem_ty,
+                    cap,
                 } => {
                     let kind = MirPrimKind::PingPong {
                         elem: Box::new(elem_ty.clone()),
@@ -985,6 +990,19 @@ impl<'a> ScanCtx<'a> {
                     cap: *cap,
                 };
                 self.visit_prim_target(target, &kind, in_isr, callees);
+            }
+            MirPrimNonBlockingOp::PingPongCompleteHalf {
+                target,
+                elem_ty,
+                cap,
+                half,
+            } => {
+                let kind = MirPrimKind::PingPong {
+                    elem: Box::new(elem_ty.clone()),
+                    cap: *cap,
+                };
+                self.visit_prim_target(target, &kind, in_isr, callees);
+                self.visit_expr(half, in_isr, callees);
             }
             MirPrimNonBlockingOp::LeaseRelease { value, elem_ty, .. } => {
                 if in_isr {
@@ -2408,6 +2426,7 @@ impl VarUsageInfo {
                 | MirPrimReadOp::SignalIsSet { target }
                 | MirPrimReadOp::SignalTryWait { target }
                 | MirPrimReadOp::PingPongDmaBuf { target, .. }
+                | MirPrimReadOp::PingPongBaseAddr { target, .. }
                 | MirPrimReadOp::PoolTryAlloc { target, .. }
                 | MirPrimReadOp::PoolAvail { target, .. }
                 | MirPrimReadOp::PoolInUse { target, .. }
@@ -2513,7 +2532,10 @@ impl VarUsageInfo {
                     self.visit_place_exprs(target);
                 }
                 MirPrimNonBlockingOp::ByteRingConsume { target, len, .. }
-                | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. } => {
+                | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. }
+                | MirPrimNonBlockingOp::PingPongCompleteHalf {
+                    target, half: len, ..
+                } => {
                     self.visit_prim_target(target);
                     self.visit_expr(len);
                 }
@@ -2918,6 +2940,7 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
             | MirPrimReadOp::SignalIsSet { target: t }
             | MirPrimReadOp::SignalTryWait { target: t }
             | MirPrimReadOp::PingPongDmaBuf { target: t, .. }
+            | MirPrimReadOp::PingPongBaseAddr { target: t, .. }
             | MirPrimReadOp::PoolTryAlloc { target: t, .. }
             | MirPrimReadOp::PoolAvail { target: t, .. }
             | MirPrimReadOp::PoolInUse { target: t, .. }
@@ -3043,6 +3066,11 @@ fn stmt_reads_var(stmt: &MirStmt, target: VarId) -> bool {
             }
             | MirPrimNonBlockingOp::ByteRingCommitWrite {
                 target: t, len, ..
+            }
+            | MirPrimNonBlockingOp::PingPongCompleteHalf {
+                target: t,
+                half: len,
+                ..
             } => prim_target_reads_var(t, target) || expr_reads_var(len, target),
             MirPrimNonBlockingOp::InboxViewPost { view, value, .. } => {
                 expr_reads_var(view, target) || expr_reads_var(value, target)
@@ -3250,6 +3278,7 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
             | MirPrimReadOp::SignalIsSet { target: t }
             | MirPrimReadOp::SignalTryWait { target: t }
             | MirPrimReadOp::PingPongDmaBuf { target: t, .. }
+            | MirPrimReadOp::PingPongBaseAddr { target: t, .. }
             | MirPrimReadOp::PoolTryAlloc { target: t, .. }
             | MirPrimReadOp::PoolAvail { target: t, .. }
             | MirPrimReadOp::PoolInUse { target: t, .. }
@@ -3371,6 +3400,11 @@ fn subst_stmt(stmt: &mut MirStmt, target: VarId, repl: &MirExpr) {
             }
             | MirPrimNonBlockingOp::ByteRingCommitWrite {
                 target: t, len, ..
+            }
+            | MirPrimNonBlockingOp::PingPongCompleteHalf {
+                target: t,
+                half: len,
+                ..
             } => {
                 subst_prim_target(t, target, repl);
                 subst_expr(len, target, repl);
@@ -3619,6 +3653,7 @@ fn collect_fn_addrs_and_calls_expr<'a>(
             | MirPrimReadOp::SignalIsSet { target }
             | MirPrimReadOp::SignalTryWait { target }
             | MirPrimReadOp::PingPongDmaBuf { target, .. }
+            | MirPrimReadOp::PingPongBaseAddr { target, .. }
             | MirPrimReadOp::PoolTryAlloc { target, .. }
             | MirPrimReadOp::PoolAvail { target, .. }
             | MirPrimReadOp::PoolInUse { target, .. }
@@ -3798,7 +3833,10 @@ fn collect_fn_addrs_and_calls_stmt(
                 collect_fn_addrs_and_calls_place(target, addr_taken_fns, call_sites);
             }
             MirPrimNonBlockingOp::ByteRingConsume { target, len, .. }
-            | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. } => {
+            | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. }
+            | MirPrimNonBlockingOp::PingPongCompleteHalf {
+                target, half: len, ..
+            } => {
                 if let MirPrimTarget::PtrExpr(pe) = target {
                     collect_fn_addrs_and_calls_expr(pe, addr_taken_fns, call_sites);
                 }

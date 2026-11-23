@@ -1,0 +1,113 @@
+// STMicroelectronics STM32F3xx USART2 Console & USART1 Circular DMA1_CH5 Driver
+
+import chip.stm32f334 as hw;
+import chip.stm32f3.rcc as rcc;
+import chip.stm32f3.gpio as cgpio;
+
+pub fn usart2_init_vcp(u32 baud, bool rx_irq) {
+    if (baud == 0u32) {
+        return;
+    }
+    hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOA;
+    hw.RCC.apb1enr = hw.RCC.apb1enr | hw.RCC_APB1_USART2;
+    u32 _stab = hw.RCC.apb1enr;
+
+    cgpio.config_af(cgpio.PORT_A, 2u32, cgpio.PUPD_NONE, false, 7u32);
+    cgpio.config_af(cgpio.PORT_A, 3u32, cgpio.PUPD_UP, false, 7u32);
+
+    u32 clk = rcc.pclk1_hz();
+    hw.USART2.cr1 = 0u32;
+    hw.USART2.brr = (clk + (baud / 2u32)) / baud;
+    hw.USART2.icr = 0x0Fu32;
+    u32 cr1 = (1u32 << 3) | (1u32 << 2) | 1u32; // TE | RE | UE
+    if (rx_irq) {
+        cr1 = cr1 | (1u32 << 5); // RXNEIE
+    }
+    hw.USART2.cr1 = cr1;
+}
+
+pub fn usart2_tx_byte(u8 b) {
+    for (u32 spin in 0..100_000) {
+        if ((hw.USART2.isr & (1u32 << 7)) != 0u32) {
+            break;
+        }
+    }
+    hw.USART2.tdr = b as u32;
+}
+
+pub u32 usart1_clk_hz() {
+    u32 sw = hw.RCC.cfgr3 & 3u32;
+    if (sw == 0u32) {
+        return rcc.pclk1_hz();
+    }
+    if (sw == 1u32) {
+        return rcc.sysclk_hz();
+    }
+    if (sw == 2u32) {
+        return 32_768u32;
+    }
+    return 8_000_000u32;
+}
+
+pub fn usart1_init_gps_dma_circular(u32 baud, usize buf_addr, u32 total_bytes) {
+    if (baud == 0u32 || total_bytes == 0u32) {
+        return;
+    }
+    hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOA | hw.RCC_AHB_DMA1;
+    u32 _stab_ahb = hw.RCC.ahbenr;
+    hw.RCC.apb2enr = hw.RCC.apb2enr | hw.RCC_APB2_USART1;
+    u32 _stab_apb2 = hw.RCC.apb2enr;
+
+    cgpio.config_af(cgpio.PORT_A, 9u32, cgpio.PUPD_NONE, false, 7u32);
+    cgpio.config_af(cgpio.PORT_A, 10u32, cgpio.PUPD_UP, false, 7u32);
+
+    hw.USART1.cr1 = 0u32;
+    hw.USART1.cr3 = 0u32;
+    // STM32F334 RCC_CFGR3.USART1SW==00 defaults to PCLK1 (36 MHz); select SYSCLK (72 MHz).
+    hw.RCC.cfgr3 = (hw.RCC.cfgr3 & (~3u32)) | 1u32;
+    u32 clk = usart1_clk_hz();
+    hw.USART1.brr = (clk + (baud / 2u32)) / baud;
+
+    // Configure DMA1 Channel 5 (RM0364 Table 28: USART1_RX -> 0x4001_3824).
+    hw.DMA1.ccr5 = 0u32;
+    hw.DMA1.ifcr = 0x000F_0000u32; // CGIF5 | CTCIF5 | CHTIF5 | CTEIF5
+    hw.DMA1.cpar5 = 0x4001_3824u32;
+    hw.DMA1.cmar5 = buf_addr as u32;
+    hw.DMA1.cndtr5 = total_bytes;
+    // MINC | CIRC | HTIE | TCIE | EN (8-bit P->M circular transfer)
+    hw.DMA1.ccr5 = (1u32 << 7) | (1u32 << 5) | (1u32 << 2) | (1u32 << 1) | 1u32;
+
+    hw.USART1.icr = 0x0Fu32;
+    hw.USART1.cr3 = (1u32 << 12) | (1u32 << 6); // OVRDIS | DMAR
+    hw.USART1.cr1 = (1u32 << 3) | (1u32 << 2) | 1u32; // TE | RE | UE
+}
+
+// Clear DMA1_CH5 + USART1 error flags and return bit0=HTIF5 (half 0 done), bit1=TCIF5 (half 1 done).
+pub u8 usart1_dma_rx_ack() {
+    u32 st = hw.DMA1.isr;
+    hw.DMA1.ifcr = 0x000F_0000u32;
+    hw.USART1.icr = 0x0Fu32;
+    u8 flags = 0u8;
+    if ((st & (1u32 << 18)) != 0u32) { // HTIF5
+        flags = flags | 1u8;
+    }
+    if ((st & (1u32 << 17)) != 0u32) { // TCIF5
+        flags = flags | 2u8;
+    }
+    return flags;
+}
+
+pub fn usart1_putc(u8 b) {
+    for (u32 spin in 0..100_000) {
+        if ((hw.USART1.isr & (1u32 << 7)) != 0u32) {
+            break;
+        }
+    }
+    hw.USART1.tdr = b as u32;
+}
+
+pub fn usart1_write([]u8 data) {
+    for (u8 b in data) {
+        usart1_putc(b);
+    }
+}

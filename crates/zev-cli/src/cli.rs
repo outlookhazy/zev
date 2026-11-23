@@ -5,6 +5,8 @@ pub enum Command {
     Check {
         files: Vec<PathBuf>,
         include_dirs: Vec<PathBuf>,
+        board: Option<String>,
+        chip: Option<String>,
         json: bool,
     },
     Ram {
@@ -139,7 +141,8 @@ USAGE:
 COMMANDS:
     doc [topic | code | --list]             Built-in Zev language primer, 8 topic guides & error explainers
     import-svd <chip.svd> [-o <out.zev>]    Convert a CMSIS-SVD XML description into Zev mmio/irq declarations
-    check [--json] [-I <dir>] <files...>    Parse and statically verify .zev source files
+    check [--board <b> | --chip <c>] [--json] [-I <dir>] <files...>
+                                            Parse and statically verify .zev source files (with target-bound `hal.*`)
     build [--board <b>] [--chip <c>] [--emit-ll] [OPT] [-o <out>] [files...]
                                             Build ELF/BIN/UF2/LLVM IR from TOML specs (`zev.toml` aware)
     flash [--board <b>] [--chip <c>] [--port <p>] [OPT] [-o <out>] [files...]
@@ -445,11 +448,15 @@ fn parse_doc(args: &[String]) -> Result<Command, String> {
 fn parse_check(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
+    let mut board: Option<String> = None;
+    let mut chip: Option<String> = None;
     let mut json = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, "check")? {
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "check")?
+            || try_parse_board_or_chip_arg(args, &mut i, &mut board, &mut chip, "check")?
+        {
             i += 1;
             continue;
         }
@@ -469,6 +476,8 @@ fn parse_check(args: &[String]) -> Result<Command, String> {
     Ok(Command::Check {
         files,
         include_dirs,
+        board,
+        chip,
         json,
     })
 }
@@ -1138,7 +1147,29 @@ mod tests {
             Command::Check {
                 files: vec![PathBuf::from("a.zev"), PathBuf::from("b.zev")],
                 include_dirs: vec![],
+                board: None,
+                chip: None,
                 json: true,
+            }
+        );
+        assert_eq!(
+            parse_args(["check", "--board", "nucleo_f334r8", "a.zev"]).unwrap(),
+            Command::Check {
+                files: vec![PathBuf::from("a.zev")],
+                include_dirs: vec![],
+                board: Some("nucleo_f334r8".to_string()),
+                chip: None,
+                json: false,
+            }
+        );
+        assert_eq!(
+            parse_args(["check", "--chip=stm32f334r8", "a.zev"]).unwrap(),
+            Command::Check {
+                files: vec![PathBuf::from("a.zev")],
+                include_dirs: vec![],
+                board: None,
+                chip: Some("stm32f334r8".to_string()),
+                json: false,
             }
         );
     }
@@ -1494,6 +1525,8 @@ mod tests {
             Command::Check {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
+                board: None,
+                chip: None,
                 json: true,
             }
         );

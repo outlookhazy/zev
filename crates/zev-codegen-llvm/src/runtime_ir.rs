@@ -165,7 +165,6 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_systick_enabled = global i8 {systick_init}, align 1
 @__syn_sleep_lock_mask = global i32 0, align 4
 @__syn_dma_locks = global i32 0, align 4
-@__syn_user_sleep_locks = global i32 0, align 4
 @__syn_cpu_hz = global i32 8000000, align 4
 @__syn_last_sleep_depth = global i32 2, align 4
 @__syn_wfi_count = global i32 0, align 4
@@ -184,32 +183,6 @@ pub fn emit_kernel_runtime_ir_with_features(
         CpuIsa::Avr => crate::avr::emit_avr_hal_ir(out, sz),
         CpuIsa::HostX86_64Linux => emit_host_linux_hal_ir(out, sz),
     }
-
-    let _ = writeln!(
-        out,
-        r#"define void @__syn_lock_sleep(){fn_as} nounwind{sz} {{
-entry:
-  %pm = {call_kw} i32 @__syn_crit_enter()
-  %cur = load volatile i32, ptr @__syn_user_sleep_locks, align 4
-  %next = add i32 %cur, 1
-  store volatile i32 %next, ptr @__syn_user_sleep_locks, align 4
-  {call_kw} void @__syn_crit_exit(i32 %pm)
-  ret void
-}}
-
-define void @__syn_unlock_sleep(){fn_as} nounwind{sz} {{
-entry:
-  %pm = {call_kw} i32 @__syn_crit_enter()
-  %cur = load volatile i32, ptr @__syn_user_sleep_locks, align 4
-  %gt0 = icmp ugt i32 %cur, 0
-  %dec = sub i32 %cur, 1
-  %next = select i1 %gt0, i32 %dec, i32 0
-  store volatile i32 %next, ptr @__syn_user_sleep_locks, align 4
-  {call_kw} void @__syn_crit_exit(i32 %pm)
-  ret void
-}}
-"#
-    );
 
     if features.uses_sys_tick {
         let _ = writeln!(
@@ -719,11 +692,6 @@ entry:
   ret void
 }}
 
-define void @__syn_arch_delay_us(i32 %us) nounwind{sz} {{
-entry:
-  ret void
-}}
-
 define void @__syn_nvic_pend_irq(i32 %irq) nounwind{sz} {{
 entry:
   call void @__syn_host_dispatch_irq(i32 %irq)
@@ -734,9 +702,7 @@ define void @__syn_idle_sleep() nounwind{sz} {{
 entry:
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
   %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
-  %user_locks = load volatile i32, ptr @__syn_user_sleep_locks, align 4
-  %any0 = or i32 %locks, %dma_locks
-  %any_locks = or i32 %any0, %user_locks
+  %any_locks = or i32 %locks, %dma_locks
   %locked = icmp ne i32 %any_locks, 0
   %depth = select i1 %locked, i32 1, i32 2
   store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4

@@ -1,0 +1,38 @@
+// STMicroelectronics STM32F3xx DAC1 & COMP2 Analog Peripherals
+
+import chip.stm32f334 as hw;
+import chip.stm32f3.gpio as cgpio;
+
+pub fn dac1_enable_pa4() {
+    hw.RCC.apb1enr = hw.RCC.apb1enr | hw.RCC_APB1_DAC1;
+    u32 _stab = hw.RCC.apb1enr;
+    cgpio.config(cgpio.PORT_A, 4u32, cgpio.MODE_ANALOG, cgpio.PUPD_NONE);
+    hw.DAC1.cr = 1u32;
+}
+
+pub fn dac1_write(u16 val_12b) {
+    hw.DAC1.dhr12r1 = (val_12b & 0x0FFFu16) as u32;
+}
+
+pub fn dac1_disable_pa4() {
+    hw.DAC1.cr = 0u32;
+    cgpio.config(cgpio.PORT_A, 4u32, cgpio.MODE_IN, cgpio.PUPD_NONE);
+}
+
+pub fn comp2_enable_pa7_vrefint() {
+    hw.RCC.apb2enr = hw.RCC.apb2enr | hw.RCC_APB2_SYSCFG;
+    u32 _stab = hw.RCC.apb2enr;
+    hw.SYSCFG_COMP.comp2_csr = (3u32 << 4) | 1u32; // INM=VREFINT, INP=PA7, EN=1
+}
+
+pub bool comp2_read_out() {
+    return (hw.SYSCFG_COMP.comp2_csr & (1u32 << 30)) != 0u32;
+}
+
+pub u32 comp2_raw_csr() {
+    return hw.SYSCFG_COMP.comp2_csr;
+}
+
+pub fn comp2_disable() {
+    hw.SYSCFG_COMP.comp2_csr = 0u32;
+}

@@ -658,6 +658,19 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                         cap: *cap,
                     });
                 }
+                MirPrimNonBlockingOp::PingPongCompleteHalf {
+                    target,
+                    elem_ty,
+                    cap,
+                    half,
+                } => {
+                    self.register_prim_target(target);
+                    self.register_prim_kind(&MirPrimKind::PingPong {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    });
+                    self.register_expr(half);
+                }
                 MirPrimNonBlockingOp::LeaseRelease { value, elem_ty, .. } => {
                     self.register_type(&MirType::Lease(Box::new(elem_ty.clone())));
                     self.register_expr(value);
@@ -1077,6 +1090,11 @@ static SYN_UNUSED inline void syn_builtin_assert(bool cond) { if (!cond) { for (
                     self.register_prim_kind(&MirPrimKind::Signal);
                 }
                 MirPrimReadOp::PingPongDmaBuf {
+                    target,
+                    elem_ty,
+                    cap,
+                }
+                | MirPrimReadOp::PingPongBaseAddr {
                     target,
                     elem_ty,
                     cap,
@@ -4104,6 +4122,14 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                 let ptr = self.fmt_prim_ptr(target, vars);
                 let _ = writeln!(self.out, "{pad}syn_pp_hdr_flip(&({ptr})->hdr);");
             }
+            MirPrimNonBlockingOp::PingPongCompleteHalf { target, half, .. } => {
+                let ptr = self.fmt_prim_ptr(target, vars);
+                let h = self.fmt_expr(half, vars);
+                let _ = writeln!(
+                    self.out,
+                    "{pad}syn_pp_hdr_complete_half(&({ptr})->hdr, (uint8_t)({h}));"
+                );
+            }
             MirPrimNonBlockingOp::PingPongSetActive { target, active, .. } => {
                 let ptr = self.fmt_prim_ptr(target, vars);
                 let _ = writeln!(
@@ -4333,31 +4359,8 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                         "{pad}syn_sys_set_irq_router((syn_irq_route_fn_t)({route_cb}), (syn_irq_ack_fn_t)({ack_cb}));"
                     );
                 }
-                "set_delay_us" => {
-                    let cb = args
-                        .first()
-                        .map(|a| self.fmt_expr(a, vars))
-                        .unwrap_or_else(|| "NULL".to_string());
-                    let _ = writeln!(
-                        self.out,
-                        "{pad}syn_sys_set_delay_us((syn_delay_us_fn_t)({cb}));"
-                    );
-                }
-                "delay_us" => {
-                    let us = args
-                        .first()
-                        .map(|a| self.fmt_expr(a, vars))
-                        .unwrap_or_else(|| "0U".to_string());
-                    let _ = writeln!(self.out, "{pad}syn_sys_delay_us((uint32_t)({us}));");
-                }
                 "nop" => {
                     let _ = writeln!(self.out, "{pad}syn_sys_nop();");
-                }
-                "lock_sleep" => {
-                    let _ = writeln!(self.out, "{pad}syn_sys_lock_sleep();");
-                }
-                "unlock_sleep" => {
-                    let _ = writeln!(self.out, "{pad}syn_sys_unlock_sleep();");
                 }
                 "rom_call_void" => {
                     if let Some(addr) = args.first() {
@@ -4803,6 +4806,10 @@ static SYN_UNUSED inline void syn_{mangle}_cancel_rx(syn_{mangle}_t *r, const sy
                     }
                     .mangle_name();
                     format!("syn_{mangle}_dma_buf({})", self.fmt_prim_ptr(target, vars))
+                }
+                MirPrimReadOp::PingPongBaseAddr { target, .. } => {
+                    let ptr = self.fmt_prim_ptr(target, vars);
+                    format!("((uintptr_t)(&({ptr})->buf[0][0]))")
                 }
                 MirPrimReadOp::ByteRingPush {
                     target,

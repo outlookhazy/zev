@@ -10,7 +10,7 @@
 
 import chip.atmega328p as hw;
 import bsp.arduino_uno as bsp;
-import std.io as io;
+import std.str as str;
 
 struct SerialPort {
     byte_ring<64> rx;
@@ -134,7 +134,7 @@ task serial_cmd_worker(*SerialPort port, *watch<u32> edges_w) {
     loop {
         []u8 chunk = rx.wait_read();
         usize n = chunk.len;
-        []u8 trimmed = io.trim_ascii(chunk);
+        []u8 trimmed = str.trim_ascii(chunk);
         for (u8 ch in trimmed) {
             if (ch == 'p' || ch == 'P' || ch == '?') {
                 cmds += 1;

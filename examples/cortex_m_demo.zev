@@ -2,16 +2,16 @@
 //
 // End-to-end zero-C, zero-heap, zero-glue Language-OS demonstration running on real
 // emulated Cortex-M3 silicon in `qemu-system-arm`:
-//   1. Real `.zev` `chip.lm3s6965` + `bsp.lm3s6965_evb` + `std.fmt` modules with typed `mmio`
+//   1. Real `.zev` `chip.lm3s6965` + `bsp.lm3s6965_evb` + `std.math` modules with typed `mmio`
 //   2. Parameterized `isr` handlers + ISR-private `state` + Boot-Tree `hw.IRQ_*.attach(...)`
-//   3. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `loop every 1ms`, `noyield`, `fmt.clamp`)
+//   3. Hardware `SysTick` 1ms periodic `motor_control` (`@critical`, `loop every 1ms`, `noyield`, `math.clamp`)
 //   4. Zero-copy `@dma_safe ping_pong<u8, 64>` + `packed struct` `u16be` + `error`/`catch` + `{err}`
 //   5. Real NVIC IRQ5 (`UART0`) & IRQ0 (`GPIOA`) hardware preemption via `NVIC.ispr[0]` MMIO
 //   6. ISR `boost: @critical` priority elevation into `sup_inbox` + automatic `@low` restore + `wfi` sleep
 
 import chip.lm3s6965 as hw;
 import bsp.lm3s6965_evb as bsp;
-import std.fmt as fmt;
+import std.math as math;
 
 packed struct CmdFrame {
     u8    op;
@@ -76,11 +76,11 @@ u16 adc_read_rpm(u8 pwm_ch) {
 
 u16 pi_step(u16 target, u16 actual, i32 *integral) {
     i32 err = (target as i32) - (actual as i32);
-    i32 next_i = fmt.clamp(*integral + err, -8000, 8000);
+    i32 next_i = math.clamp(*integral + err, -8000, 8000);
     *integral = next_i;
 
     i32 out = (err / 2) + (next_i / 8);
-    u16 duty = fmt.clamp(out, 0, 1000) as u16;
+    u16 duty = math.clamp(out, 0, 1000) as u16;
     return duty;
 }
 

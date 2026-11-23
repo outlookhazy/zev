@@ -171,6 +171,8 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             let valid = [
                 "wait_chunk",
                 "flip",
+                "complete_half",
+                "base_addr",
                 "start",
                 "activate",
                 "stop",
@@ -187,12 +189,12 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
                     Some(format!("`.wait_chunk() -> []{}`", elem))
                 }
                 "swap" | "post" | "send" | "notify" | "complete" | "commit" | "publish" => {
-                    Some("`.flip()` (zero-copy buffer swap in DMA ISR)".to_string())
+                    Some("`.flip()` or `.complete_half(u8 half)` (zero-copy buffer swap in DMA ISR)".to_string())
                 }
                 _ => closest_match(method, valid, 2).map(|m| format!("`.{}()`", m)),
             };
             let table = format!(
-                "valid methods on `{}`: `.wait_chunk([timeout: <dur>]) -> []{}` (task), `.flip()` (ISR swap), `.start()`, `.stop()`",
+                "valid methods on `{}`: `.wait_chunk([timeout: <dur>]) -> []{}` (task), `.flip()` / `.complete_half(u8 half)` (ISR swap), `.base_addr() -> usize`, `.start()`, `.stop()`",
                 prim, elem
             );
             (direct, table)

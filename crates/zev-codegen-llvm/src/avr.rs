@@ -216,31 +216,6 @@ entry:
   ret void
 }}
 
-define void @__syn_arch_delay_us(i32 %us){fn_as} nounwind{sz} {{
-entry:
-  %is_zero = icmp eq i32 %us, 0
-  br i1 %is_zero, label %done, label %calc
-calc:
-  %pm = {call_kw} i32 @__syn_crit_enter()
-  %hz = load volatile i32, ptr @__syn_cpu_hz, align 4
-  {call_kw} void @__syn_crit_exit(i32 %pm)
-  %raw_pu = udiv i32 %hz, 4000000
-  %gt0 = icmp ugt i32 %raw_pu, 0
-  %per_us = select i1 %gt0, i32 %raw_pu, i32 1
-  %loops = mul i32 %us, %per_us
-  br label %loop
-loop:
-  %rem = phi i32 [ %loops, %calc ], [ %next, %body ]
-  %more = icmp ugt i32 %rem, 0
-  br i1 %more, label %body, label %done
-body:
-  call void asm sideeffect "nop", "~{{memory}}"()
-  %next = sub i32 %rem, 1
-  br label %loop
-done:
-  ret void
-}}
-
 define void @__syn_nvic_pend_irq(i32 %irq){fn_as} nounwind{sz} {{
 entry:
   %pm = {call_kw} i32 @__syn_crit_enter()
@@ -259,9 +234,7 @@ entry:
 do_sleep:
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
   %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
-  %user_locks = load volatile i32, ptr @__syn_user_sleep_locks, align 4
-  %any0 = or i32 %locks, %dma_locks
-  %any_locks = or i32 %any0, %user_locks
+  %any_locks = or i32 %locks, %dma_locks
   %locked = icmp ne i32 %any_locks, 0
   %depth = select i1 %locked, i32 1, i32 2
   store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4

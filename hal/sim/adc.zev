@@ -1,0 +1,34 @@
+// Portable HAL ADC channel interface (host/sim target)
+
+import std.bus as bus;
+
+pub struct Channel {
+    u8  unit;
+    u8  ch;
+    u16 vdda_mv;
+    u16 sim_counts;
+}
+
+pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv, u16 sim_counts) {
+    return Channel {
+        unit: unit,
+        ch: ch,
+        vdda_mv: vdda_mv,
+        sim_counts: sim_counts,
+    };
+}
+
+pub u16 read_u16(*Channel c) error bus.BusStatus {
+    checkpoint();
+    if (c.unit == 0u8) {
+        error bus.BusStatus.FrameErr;
+    }
+    return c.sim_counts & 0x0FFFu16;
+}
+
+pub u32 read_mv(*Channel c) error bus.BusStatus {
+    u16 raw = read_u16(c) catch (bus.BusStatus err) {
+        error err;
+    };
+    return ((raw as u32) * (c.vdda_mv as u32)) / 4095u32;
+}

@@ -689,6 +689,12 @@ pub enum MirPrimNonBlockingOp {
         elem_ty: MirType,
         cap: usize,
     },
+    PingPongCompleteHalf {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+        half: MirExpr,
+    },
     PingPongSetActive {
         target: MirPrimTarget,
         elem_ty: MirType,
@@ -1190,6 +1196,11 @@ pub enum MirPrimReadOp {
         target: MirPrimTarget,
     },
     PingPongDmaBuf {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+    },
+    PingPongBaseAddr {
         target: MirPrimTarget,
         elem_ty: MirType,
         cap: usize,

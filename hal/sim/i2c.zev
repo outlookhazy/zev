@@ -1,0 +1,60 @@
+// Portable HAL I2C master bus interface (host/sim target)
+
+import std.bus as bus;
+
+pub struct Bus {
+    u8   unit;
+    u32  timeout_ms;
+    bool sim_ack;
+}
+
+pub Bus make_bus(u8 unit, u32 timeout_ms, bool sim_ack) {
+    return Bus {
+        unit: unit,
+        timeout_ms: timeout_ms,
+        sim_ack: sim_ack,
+    };
+}
+
+pub bool probe_7bit(*Bus b, u8 addr7) error bus.BusStatus {
+    checkpoint();
+    if (addr7 > 127u8 || b.unit == 0u8) {
+        error bus.BusStatus.FrameErr;
+    }
+    return b.sim_ack;
+}
+
+pub fn write(*Bus b, u8 addr7, []u8 data) error bus.BusStatus {
+    checkpoint();
+    if (b.unit == 0u8 || addr7 > 127u8 || data.len > 255) {
+        error bus.BusStatus.FrameErr;
+    }
+    if (!b.sim_ack) {
+        error bus.BusStatus.FrameErr;
+    }
+    return;
+}
+
+pub fn read(*Bus b, u8 addr7, []u8 dst) error bus.BusStatus {
+    checkpoint();
+    if (b.unit == 0u8 || addr7 > 127u8 || dst.len > 255) {
+        error bus.BusStatus.FrameErr;
+    }
+    if (!b.sim_ack) {
+        error bus.BusStatus.FrameErr;
+    }
+    for (usize i in 0..dst.len) {
+        dst[i] = 0u8;
+    }
+    return;
+}
+
+pub fn write_read(*Bus b, u8 addr7, []u8 tx, []u8 rx) error bus.BusStatus {
+    write(b, addr7, tx) catch (bus.BusStatus err) {
+        error err;
+    };
+    read(b, addr7, rx) catch (bus.BusStatus err) {
+        error err;
+    };
+    return;
+}

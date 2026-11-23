@@ -1,0 +1,193 @@
+// STMicroelectronics STM32F3xx RCC Clock Tree, Reset Reason, UID, & IWDG
+
+import chip.stm32f334 as hw;
+import std.bus as bus;
+
+pub u32 sysclk_hz() {
+    u32 cfgr = hw.RCC.cfgr;
+    u32 sws = (cfgr >> 2) & 3u32;
+    if (sws == 0u32 || sws == 1u32) {
+        return 8_000_000u32;
+    }
+    if (sws == 2u32) {
+        u32 pll_in = 4_000_000u32;
+        if ((cfgr & (1u32 << 16)) != 0u32) {
+            u32 prediv = (hw.RCC.cfgr2 & 0xFu32) + 1u32;
+            pll_in = 8_000_000u32 / prediv;
+        }
+        u32 mul = ((cfgr >> 18) & 0xFu32) + 2u32;
+        if (mul > 16u32) {
+            mul = 16u32;
+        }
+        return pll_in * mul;
+    }
+    return 8_000_000u32;
+}
+
+pub u32 hclk_hz() {
+    u32 sys_hz = sysclk_hz();
+    u32 hpre = (hw.RCC.cfgr >> 4) & 0xFu32;
+    if (hpre < 8u32) {
+        return sys_hz;
+    }
+    if (hpre < 12u32) {
+        return sys_hz >> (hpre - 7u32);
+    }
+    return sys_hz >> (hpre - 6u32);
+}
+
+pub u32 pclk1_hz() {
+    u32 hclk = hclk_hz();
+    u32 ppre1 = (hw.RCC.cfgr >> 8) & 7u32;
+    if (ppre1 < 4u32) {
+        return hclk;
+    }
+    return hclk >> (ppre1 - 3u32);
+}
+
+pub u32 pclk2_hz() {
+    u32 hclk = hclk_hz();
+    u32 ppre2 = (hw.RCC.cfgr >> 11) & 7u32;
+    if (ppre2 < 4u32) {
+        return hclk;
+    }
+    return hclk >> (ppre2 - 3u32);
+}
+
+pub u32 tim_pclk1_hz() {
+    u32 pclk1 = pclk1_hz();
+    u32 ppre1 = (hw.RCC.cfgr >> 8) & 7u32;
+    if (ppre1 >= 4u32) {
+        return pclk1 * 2u32;
+    }
+    return pclk1;
+}
+
+pub u32 tim_pclk2_hz() {
+    u32 pclk2 = pclk2_hz();
+    u32 ppre2 = (hw.RCC.cfgr >> 11) & 7u32;
+    if (ppre2 >= 4u32) {
+        return pclk2 * 2u32;
+    }
+    return pclk2;
+}
+
+// Configure 72 MHz SYSCLK from 8 MHz external clock (HSEBYP x9), falling back to 64 MHz HSI/2 x16.
+pub u32 configure_pll_hse_bypass_72mhz() {
+    hw.RCC.cr = hw.RCC.cr | 1u32; // HSION
+    for (u32 spin in 0..100_000) {
+        if ((hw.RCC.cr & 2u32) != 0u32) {
+            break;
+        }
+    }
+    hw.RCC.cfgr = hw.RCC.cfgr & (~3u32); // SW = HSI
+    for (u32 spin in 0..100_000) {
+        if ((hw.RCC.cfgr & 12u32) == 0u32) {
+            break;
+        }
+    }
+    hw.RCC.cr = hw.RCC.cr & (~(1u32 << 24)); // PLLON = 0
+    for (u32 spin in 0..100_000) {
+        if ((hw.RCC.cr & (1u32 << 25)) == 0u32) {
+            break;
+        }
+    }
+
+    // Flash prefetch + 2 wait states for 48 < HCLK <= 72 MHz.
+    hw.FLASH.acr = (1u32 << 4) | 2u32;
+    for (u32 spin in 0..10_000) {
+        if ((hw.FLASH.acr & 7u32) == 2u32) {
+            break;
+        }
+    }
+
+    // AHB=/1, APB1=/2 (36 MHz max), APB2=/1, clear PLL fields.
+    u32 cfgr_clr = (0xFu32 << 4) | (7u32 << 8) | (7u32 << 11) | (1u32 << 16) | (1u32 << 17) | (0xFu32 << 18);
+    hw.RCC.cfgr = (hw.RCC.cfgr & (~cfgr_clr)) | (4u32 << 8);
+    hw.RCC.cfgr2 = 0u32;
+
+    hw.RCC.cr = (hw.RCC.cr & (~(1u32 << 16))) | (1u32 << 18); // HSEBYP while HSEON=0
+    hw.RCC.cr = hw.RCC.cr | (1u32 << 16);                     // HSEON = 1
+    bool hse_ok = false;
+    for (u32 spin in 0..100_000) {
+        if ((hw.RCC.cr & (1u32 << 17)) != 0u32) {
+            hse_ok = true;
+            break;
+        }
+    }
+    if (hse_ok) {
+        // HSE (8 MHz) * 9 (PLLMUL=7) = 72 MHz SYSCLK, 36 MHz PCLK1, 72 MHz PCLK2.
+        hw.RCC.cfgr = hw.RCC.cfgr | (1u32 << 16) | (7u32 << 18);
+    } else {
+        hw.RCC.cr = hw.RCC.cr & (~((1u32 << 16) | (1u32 << 18)));
+        // HSI/2 (4 MHz) * 16 (PLLMUL=14) = 64 MHz SYSCLK, 32 MHz PCLK1, 64 MHz PCLK2.
+        hw.RCC.cfgr = hw.RCC.cfgr | (14u32 << 18);
+    }
+
+    hw.RCC.cr = hw.RCC.cr | (1u32 << 24);
+    for (u32 spin in 0..200_000) {
+        if ((hw.RCC.cr & (1u32 << 25)) != 0u32) {
+            break;
+        }
+    }
+    if ((hw.RCC.cr & (1u32 << 25)) != 0u32) {
+        hw.RCC.cfgr = (hw.RCC.cfgr & (~3u32)) | 2u32;
+        for (u32 spin in 0..100_000) {
+            if ((hw.RCC.cfgr & 12u32) == 8u32) {
+                break;
+            }
+        }
+    }
+    return sysclk_hz();
+}
+
+pub bus.ResetReason read_reset_reason(bool clear) {
+    u32 csr = hw.RCC.csr;
+    bus.ResetReason r = bus.ResetReason.PowerOn;
+    if ((csr & (1u32 << 29)) != 0u32) {
+        r = bus.ResetReason.IwdgReset;
+    } else if ((csr & (1u32 << 30)) != 0u32) {
+        r = bus.ResetReason.WwdgReset;
+    } else if ((csr & (1u32 << 31)) != 0u32) {
+        r = bus.ResetReason.LowPowerReset;
+    } else if ((csr & (1u32 << 28)) != 0u32) {
+        r = bus.ResetReason.SoftwareReset;
+    } else if ((csr & (1u32 << 26)) != 0u32) {
+        r = bus.ResetReason.PinReset;
+    }
+    if (clear) {
+        hw.RCC.csr = csr | (1u32 << 24); // RMVF
+    }
+    return r;
+}
+
+pub fn iwdg_start_ms(u32 timeout_ms) {
+    u32 ticks = (timeout_ms * 156u32) / 1000u32;
+    if (ticks < 1u32) {
+        ticks = 1u32;
+    }
+    if (ticks > 4095u32) {
+        ticks = 4095u32;
+    }
+    hw.IWDG.kr = 0x5555u32;
+    hw.IWDG.pr = 6u32;
+    hw.IWDG.rlr = ticks;
+    for (u32 spin in 0..100_000) {
+        if ((hw.IWDG.sr & 3u32) == 0u32) {
+            break;
+        }
+    }
+    hw.IWDG.kr = 0xAAAAu32;
+    hw.IWDG.kr = 0xCCCCu32;
+}
+
+pub fn iwdg_feed() {
+    hw.IWDG.kr = 0xAAAAu32;
+}
+
+pub u32 read_uid_word(usize idx) {
+    if (idx >= 3) {
+        return 0u32;
+    }
+    return hw.DEVICE_UID.words[idx];
+}

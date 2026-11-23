@@ -3,14 +3,14 @@
 // 100% of RP2040 peripheral drivers (125 MHz `PLL_SYS` / 48 MHz `PLL_USB` clocks,
 // Full-Speed USB 1.1 CDC-ACM device stack, 1 MHz `TIMER` `ALARM0`, `PIO0` SM0 inverter,
 // dual-channel `DMA` CH0/CH1, and ADC channel 4 die temp) are written in pure `.zev`:
-//   - `chip.rp2040` + `bsp.rpi_pico_w` + `std.io` + `std.bus` + `std.fmt`
+//   - `chip.rp2040` + `bsp.rpi_pico_w` + `std.str` + `std.bus` + `std.math`
 //   - Zero-copy `@dma_safe pool<PioDmaBurst, 4>` + linear `Lease<T>` + `dma_slot<T>` + `StatusCell<u32>`
 //   - Interactive USB CDC commands (`p`, `s`, `d`, `n`) + 1200-baud BootROM `RPI-RP2` auto-reset
 
 import chip.rp2040 as hw;
 import bsp.rpi_pico_w as bsp;
-import std.fmt as fmt;
-import std.io as io;
+import std.math as math;
+import std.str as str;
 import std.bus as bus;
 
 enum SupEvent { UserTrigger, BootReset, Heartbeat }
@@ -128,7 +128,7 @@ fn print_telemetry_line(
     f32 avg_temp
 ) {
     u8 status_buf[64];
-    f32 clamped = fmt.clamp<f32>(avg_temp, -40.0f32, 125.0f32);
+    f32 clamped = math.clamp<f32>(avg_temp, -40.0f32, 125.0f32);
     []u8 status = fmt_buf(status_buf, f"avg={clamped:.2}C");
     println(f"[Zev on RP2040 Pico W] uptime={uptime_ms}ms temp={temp_c:.1}C alarms={alarms} triggers={triggers} prio={prio} {status}");
 }
@@ -152,7 +152,7 @@ task usb_cmd_worker(
     loop {
         []u8 chunk = rx.wait_read();
         usize n = chunk.len;
-        []u8 trimmed = io.trim_ascii(chunk);
+        []u8 trimmed = str.trim_ascii(chunk);
         for (u8 ch in trimmed) {
             if (ch == 'p' || ch == 'P' || ch == '?') {
                 cmds += 1;

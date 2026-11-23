@@ -6060,37 +6060,136 @@ fn explicit_sys_hooks_and_rom_call_validation() {
 }
 
 #[test]
-fn sys_timing_and_sleep_lock_intrinsics_verify_cleanly() {
+fn sys_nop_verifies_and_removed_timing_sleep_intrinsics_rejected() {
     let ok = r#"
 irq IRQ_T = 1;
-fn custom_delay(u32 us) { u32 _x = us; sys.nop(); }
 isr t_isr() {
     sys.nop();
-    sys.delay_us(5u32);
-    sys.lock_sleep();
-    sys.unlock_sleep();
 }
 fn main() {
-    sys.set_delay_us(custom_delay);
     IRQ_T.attach(t_isr);
-    sys.lock_sleep();
-    assert(sys.sleep_depth() == 1);
-    sys.delay_us(20);
-    sys.unlock_sleep();
+    assert(sys.sleep_depth() == 2);
     sys.nop();
 }
 "#;
     let prog = zev_parser::parse_str(ok).unwrap();
-    zev_sema::analyze_program(&prog).expect("sys.nop/delay_us/set_delay_us/lock_sleep should verify");
+    zev_sema::analyze_program(&prog).expect("sys.nop() should verify in tasks and ISRs");
 
     expect_err_kind("fn main() { sys.nop(1); }", DiagnosticKind::TypeMismatch);
-    expect_err_kind("fn main() { sys.lock_sleep(1); }", DiagnosticKind::TypeMismatch);
-    expect_err_kind("fn main() { sys.unlock_sleep(1); }", DiagnosticKind::TypeMismatch);
-    expect_err_kind("fn main() { sys.delay_us(); }", DiagnosticKind::TypeMismatch);
-    expect_err_kind("fn main() { sys.delay_us(true); }", DiagnosticKind::TypeMismatch);
-    expect_err_kind("fn bad(u8 us) {} fn main() { sys.set_delay_us(bad); }", DiagnosticKind::TypeMismatch);
-    expect_err_kind("fn y(u32 us) { u32 _x = us; checkpoint(); } fn main() { sys.set_delay_us(y); }", DiagnosticKind::YieldingCallbackToExternC);
-    expect_err_kind("irq IRQ0 = 1; fn f(u32 us) { u32 _x = us; } isr h() { sys.set_delay_us(f); } fn main() { IRQ0.attach(h); }", DiagnosticKind::InvalidControlFlow);
+    expect_err_kind("fn main() { sys.lock_sleep(); }", DiagnosticKind::UndefinedSymbol);
+    expect_err_kind("fn main() { sys.unlock_sleep(); }", DiagnosticKind::UndefinedSymbol);
+    expect_err_kind("fn main() { sys.delay_us(5u32); }", DiagnosticKind::UndefinedSymbol);
+    expect_err_kind("fn f(u32 us) { u32 _x = us; } fn main() { sys.set_delay_us(f); }", DiagnosticKind::UndefinedSymbol);
+}
+
+#[test]
+fn std_math_str_and_ping_pong_circular_dma_sema() {
+    let ok_src = r#"
+import std.math as math;
+import std.str as str;
+
+@dma_safe ping_pong<u8, 16> pp;
+irq IRQ_DMA = 15;
+
+isr dma_isr(*ping_pong<u8, 16> rx) {
+    rx.complete_half(0u8);
+    rx.complete_half(1u8);
+}
+
+task consumer(*ping_pong<u8, 16> rx) {
+    u8 local[16];
+    loop {
+        []u8 chunk = rx.wait_chunk();
+        usize n = math.min<usize>(chunk.len, 16);
+        for (usize i in 0..n) {
+            local[i] = chunk[i];
+        }
+        []u8 t = str.trim_ascii(local[0..n]);
+        u32 _v = str.parse_u32(t) or 0u32;
+    }
+}
+
+fn main() {
+    i32 c = math.clamp<i32>(-5, 0, 10);
+    u32 a = math.abs_i32(-42);
+    u8 cs = str.xor_checksum("PMTK605");
+    assert(c == 0 && a == 42u32 && cs == 0x31u8);
+    usize dma_ptr = pp.base_addr();
+    assert(dma_ptr != 0usize);
+    pp.start();
+    IRQ_DMA.attach(dma_isr(&pp));
+    spawn consumer(&pp);
+    loop {
+        delay(10ms);
+    }
+}
+"#;
+    let model = expect_ok(ok_src);
+    assert!(model.functions.contains_key("std_math__clamp__i32"));
+    assert!(model.functions.contains_key("std_math__abs_i32"));
+    assert!(model.functions.contains_key("std_str__xor_checksum"));
+
+    expect_err_kind(
+        r#"
+@dma_safe ping_pong<u8, 16> pp;
+irq IRQ_DMA = 15;
+isr dma_isr(*ping_pong<u8, 16> rx) { rx.complete_half(true); }
+fn main() { IRQ_DMA.attach(dma_isr(&pp)); }
+"#,
+        DiagnosticKind::TypeMismatch,
+    );
+    expect_err_kind(
+        r#"
+@dma_safe ping_pong<u8, 16> pp;
+fn main() { usize _x = pp.base_addr(1); }
+"#,
+        DiagnosticKind::TypeMismatch,
+    );
+}
+
+#[test]
+fn hal_dir_target_binding_sim_vs_stm32f3_sema() {
+    let src = r#"
+import hal.gpio as gpio;
+
+fn main() {
+    gpio.Pin p = gpio.make_pin(0u8, 5u8, false, false);
+    gpio.write(&p, true);
+    bool _v = gpio.read(&p);
+}
+"#;
+    let prog = zev_parser::parse_str(src).expect("parse hal test");
+
+    let sim_out = zev_sema::analyze_with_options(
+        std::slice::from_ref(&prog),
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        sim_out.diagnostics.is_empty(),
+        "hal/sim diagnostics: {:?}",
+        sim_out.diagnostics
+    );
+    assert!(sim_out.model.functions.contains_key("hal_gpio__make_pin"));
+    assert!(sim_out.model.functions.contains_key("hal_gpio__write"));
+    assert!(sim_out.model.functions.contains_key("hal_gpio__read"));
+    assert!(!sim_out.model.mmio_instances.contains_key("chip_stm32f334__GPIOA"));
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let f3_opts = AnalyzeOptions {
+        include_dirs: vec![root],
+        hal_dir: Some("hal/stm32f3".to_string()),
+        ..AnalyzeOptions::default()
+    };
+    let f3_out = zev_sema::analyze_with_options(std::slice::from_ref(&prog), &f3_opts);
+    assert!(
+        f3_out.diagnostics.is_empty(),
+        "hal/stm32f3 diagnostics: {:?}",
+        f3_out.diagnostics
+    );
+    assert!(f3_out.model.functions.contains_key("hal_gpio__make_pin"));
+    assert!(f3_out.model.functions.contains_key("hal_gpio__write"));
+    assert!(f3_out.model.functions.contains_key("hal_gpio__read"));
+    assert!(f3_out.model.mmio_instances.contains_key("chip_stm32f334__GPIOA"));
 }
 
 

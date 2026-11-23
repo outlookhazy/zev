@@ -1,7 +1,7 @@
 // Bare-Metal Waveshare ESP32-C6-Pico Firmware (`riscv32imac` Direct-Boot, Zero-C / Zero-IDF)
 //
 // Targets physical ESP32-C6 silicon directly from LLVM 23 `riscv32-unknown-none-elf`:
-//   - Real `.zev` `chip.esp32c6` + `bsp.esp32c6_pico` + `std.fmt` modules with typed `mmio` (`GPIO.in_reg`, `IO_MUX`, `INTMTX`)
+//   - Real `.zev` `chip.esp32c6` + `bsp.esp32c6_pico` + `std.math` + `std.str` modules with typed `mmio` (`GPIO.in_reg`, `IO_MUX`, `INTMTX`)
 //   - Parameterized `isr` + ISR-private `state` wired via Boot-Tree `hw.IRQ_GPIO.attach(...)` into RISC-V `INTMTX` + `mtvec`
 //   - ROM Direct-Boot (`0xAEDB041D` x2 at `0x42000000` -> `@_start` at `0x42000008`)
 //   - 16 MHz hardware `SYSTIMER` (`0x6000A000`) driving drift-free `loop every 20ms` / `loop every 500ms` / `1s` deadlines
@@ -12,8 +12,8 @@
 
 import chip.esp32c6 as hw;
 import bsp.esp32c6_pico as bsp;
-import std.fmt as fmt;
-import std.io as io;
+import std.math as math;
+import std.str as str;
 import std.bus as bus;
 
 const u32 PALETTE_LEN = 5;
@@ -154,7 +154,7 @@ LedSample sample_led_power(u32 slot, u32 color_rgb) {
     u32 g = (color_rgb >> 8) & 0xFF;
     u32 b = color_rgb & 0xFF;
     f32 ch_sum = (r + g + b) as f32;
-    f32 mw = fmt.clamp<f32>(1.5f32 + (ch_sum * 0.24f32), 0.0f32, 180.0f32);
+    f32 mw = math.clamp<f32>(1.5f32 + (ch_sum * 0.24f32), 0.0f32, 180.0f32);
     return LedSample{ slot: (slot % PALETTE_LEN) as u8, mwatts: mw };
 }
 
@@ -254,7 +254,7 @@ task usb_cmd_worker(
     loop {
         []u8 chunk = rx.wait_read();
         usize n = chunk.len;
-        []u8 trimmed = io.trim_ascii(chunk);
+        []u8 trimmed = str.trim_ascii(chunk);
         for (u8 ch in trimmed) {
             if (ch == 'p' || ch == 'P' || ch == '?') {
                 cmds += 1;

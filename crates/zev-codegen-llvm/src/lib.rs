@@ -6670,11 +6670,8 @@ fn main() {
     sys.set_putc(putc_fn);
     IRQ_TIM_FPU.attach(fpu_tick_isr);
 
-    sys.lock_sleep();
-    assert(sys.sleep_depth() == 1);
-    sys.delay_us(15u32);
     sys.nop();
-    sys.unlock_sleep();
+    assert(sys.sleep_depth() == 2);
 
     f32 x_dyn = (FPU_UART.dr as f32) * 0.001f32;
     f32 y32 = biquad_step(x_dyn, 0.5f32, 1.25f32);
@@ -6697,8 +6694,8 @@ fn main() {
 
         let ll_src = std::fs::read_to_string(&art.elf.ll_path).unwrap();
         assert!(ll_src.contains("arm_aapcscc"), "expected arm_aapcscc RTABI shims");
-        assert!(ll_src.contains("@__syn_user_sleep_locks"));
-        assert!(ll_src.contains("@__syn_arch_delay_us"));
+        assert!(!ll_src.contains("@__syn_user_sleep_locks"));
+        assert!(!ll_src.contains("@__syn_arch_delay_us"));
 
         let dis = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
             .arg("--triple=thumbv7em-none-eabihf")
@@ -6723,5 +6720,53 @@ fn main() {
         assert_eq!(proof.isr_hw_overhead_bytes, 104);
         assert!(proof.format_table().contains("104B NVIC FPU frame"));
         assert!(proof.within_budget, "stack budget fail:\n{}", proof.format_table());
+    }
+
+    #[test]
+    fn ping_pong_base_addr_and_complete_half_llvm_ir() {
+        let src = r#"
+irq IRQ_DMA5 = 15;
+@dma_safe ping_pong<u8, 32> gps_pp;
+watch<usize> addr_w = 0usize;
+
+isr dma5_isr(*ping_pong<u8, 32> pp) {
+    pp.complete_half(0u8);
+    pp.complete_half(1u8);
+}
+
+task consumer(*ping_pong<u8, 32> pp, *watch<usize> out) {
+    loop {
+        []u8 chunk = pp.wait_chunk();
+        out.publish(chunk.len);
+    }
+}
+
+fn main() {
+    sys.use_systick(72_000_000);
+    gps_pp.start();
+    addr_w.publish(gps_pp.base_addr());
+    IRQ_DMA5.attach(dma5_isr(&gps_pp));
+    spawn consumer(&gps_pp, &addr_w);
+    loop {
+        delay(50ms);
+    }
+}
+"#;
+        let spec = TargetSpec::resolve(Some("stm32f334r8"), None).expect("resolve stm32f334r8");
+        let opts = CodegenOptions::from_spec(spec);
+        let mir = compile_src_mir(src);
+        let ll = emit_llvm_ir_with_options(&mir, &opts).expect("emit LLVM IR");
+        assert!(
+            ll.contains("@__syn_pp_complete_half_"),
+            "expected complete_half runtime helper in LLVM IR:\n{ll}"
+        );
+        assert!(
+            ll.contains("ptrtoint ptr"),
+            "expected ptrtoint for ping_pong.base_addr() in LLVM IR:\n{ll}"
+        );
+        assert!(
+            ll.contains("i32 0, i32 4, i32 0"),
+            "expected ping_pong base_addr GEP (field 4, index 0) in LLVM IR:\n{ll}"
+        );
     }
 }

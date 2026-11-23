@@ -1,0 +1,62 @@
+// Portable HAL ADC channel interface (STM32F3 ADC1 / ADC2, SoftYielding)
+
+import chip.stm32f334 as hw;
+import std.bus as bus;
+
+pub struct Channel {
+    u8  unit; // 1 = ADC1, 2 = ADC2
+    u8  ch;
+    u16 vdda_mv;
+    u16 sim_counts;
+}
+
+pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv, u16 sim_counts) {
+    return Channel {
+        unit: unit,
+        ch: ch,
+        vdda_mv: vdda_mv,
+        sim_counts: sim_counts,
+    };
+}
+
+u16 read_adc_regs(*hw.AdcRegs adc, u8 ch) error bus.BusStatus {
+    adc.isr = (1u32 << 2) | (1u32 << 3);
+    adc.sqr1 = ((ch as u32) & 0x1Fu32) << 6;
+    adc.cr = adc.cr | (1u32 << 2); // ADSTART = 1
+    u32 t0 = sys.now_ms();
+    for (u32 iter in 0..100_000) {
+        if ((adc.isr & (1u32 << 2)) != 0u32) {
+            return (adc.dr & 0xFFFFu32) as u16;
+        }
+        if ((iter & 0x3Fu32) == 0x3Fu32) {
+            if ((sys.now_ms() - t0) >= 20u32) {
+                error bus.BusStatus.Timeout;
+            }
+            checkpoint();
+        }
+    }
+    error bus.BusStatus.Timeout;
+}
+
+pub u16 read_u16(*Channel c) error bus.BusStatus {
+    if (c.unit == 1u8) {
+        u16 v = read_adc_regs(hw.ADC1, c.ch) catch (bus.BusStatus err) {
+            error err;
+        };
+        return v;
+    }
+    if (c.unit == 2u8) {
+        u16 v = read_adc_regs(hw.ADC2, c.ch) catch (bus.BusStatus err) {
+            error err;
+        };
+        return v;
+    }
+    error bus.BusStatus.FrameErr;
+}
+
+pub u32 read_mv(*Channel c) error bus.BusStatus {
+    u16 raw = read_u16(c) catch (bus.BusStatus err) {
+        error err;
+    };
+    return ((raw as u32) * (c.vdda_mv as u32)) / 4095u32;
+}
