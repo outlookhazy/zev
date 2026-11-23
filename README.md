@@ -38,7 +38,7 @@ Additional standalone hardware demos target `arduino_uno` (ATmega328P `avr`, Opt
 ## Requirements
 
 - **Rust** stable toolchain (`cargo`, `rustc`)
-- **LLVM / Clang / LLD** (`clang`, `opt`, `llc`, `ld.lld`, `llvm-size`, `llvm-objcopy`, `llvm-objdump`, `llvm-readobj`, `llvm-nm` — LLVM 18–23 supported; CI tests stock Ubuntu packages)
+- **LLVM / Clang / LLD** (`clang`, `opt`, `llc`, `ld.lld`, `llvm-size`, `llvm-objcopy`, `llvm-objdump`, `llvm-readobj`, `llvm-nm` — LLVM 23 required; CI installs it from apt.llvm.org. Stock LLVM 18 fails to link AVR images and changes stack-proof results)
 - **`qemu-system-arm`** (for `make qemu` and `zevc run-qemu`)
 - **`binutils` (`nm`)** on host C99 test runs
 

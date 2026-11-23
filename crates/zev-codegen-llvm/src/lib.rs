@@ -3610,8 +3610,10 @@ fn main() {
         std::fs::write(&h_ll_path, &host_ll_64).unwrap();
         verify_ll_with_opt(&h_ll_path).expect("opt verify host 64 idx");
         compile_ll_to_obj(&h_ll_path, &h_obj_path, &h_opts).expect("llc host 64 idx");
+        // `llc` emits a non-PIC object; distro clangs (e.g. Ubuntu) default to PIE links.
         let link = Command::new(crate::toolchain::find_tool("/bin/clang", "clang"))
             .args([
+                "-no-pie",
                 h_obj_path.to_str().unwrap(),
                 "-o",
                 h_exe_path.to_str().unwrap(),

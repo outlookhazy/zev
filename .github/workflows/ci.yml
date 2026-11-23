@@ -13,15 +13,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install Clang, LLVM, LLD, and QEMU
+      # Stock Ubuntu LLVM 18 cannot link the AVR scheduler (R_AVR_7_PCREL out of range) and
+      # changes stack-proof results; pin the LLVM 23 toolchain zevc targets.
+      - name: Install LLVM 23 (Clang, LLD, compiler-rt) and QEMU
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm lld qemu-system-arm
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 23
+          sudo apt-get install -y --no-install-recommends lld-23 libclang-rt-23-dev qemu-system-arm
+          echo "/usr/lib/llvm-23/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain versions
+        run: |
+          clang --version | head -1
+          llc --version | grep -i 'llvm version'
+          ld.lld --version
 
       - name: Run workspace test suite
         run: cargo test --workspace -- --test-threads=4
