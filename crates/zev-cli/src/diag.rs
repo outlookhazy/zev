@@ -10,6 +10,16 @@ pub struct SourceFile {
     line_starts: Vec<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunSummary {
+    pub slot_id: usize,
+    pub instance: String,
+    pub blueprint: String,
+    pub priority: String,
+    pub max_run_kind: String,
+    pub max_run_blocks: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct JsonDiag {
     pub code: Option<String>,
@@ -209,6 +219,7 @@ pub fn format_check_human_ok(
     out
 }
 
+#[cfg(test)]
 pub fn render_check_json_ok(
     files: usize,
     spawned_tasks: usize,
@@ -216,6 +227,26 @@ pub fn render_check_json_ok(
     tick_period_us: u64,
     dual_specialized: &[String],
     monomorphized: &[MonomorphizedInstance],
+) -> String {
+    render_check_json_ok_with_tasks(
+        files,
+        spawned_tasks,
+        primitives,
+        tick_period_us,
+        dual_specialized,
+        monomorphized,
+        &[],
+    )
+}
+
+pub fn render_check_json_ok_with_tasks(
+    files: usize,
+    spawned_tasks: usize,
+    primitives: usize,
+    tick_period_us: u64,
+    dual_specialized: &[String],
+    monomorphized: &[MonomorphizedInstance],
+    task_runs: &[TaskRunSummary],
 ) -> String {
     let mut sorted: Vec<&str> = dual_specialized.iter().map(String::as_str).collect();
     sorted.sort_unstable();
@@ -257,8 +288,26 @@ pub fn render_check_json_ok(
     }
     mono_json.push(']');
 
+    let mut runs_json = String::from("[");
+    for (idx, t) in task_runs.iter().enumerate() {
+        if idx > 0 {
+            runs_json.push_str(", ");
+        }
+        let _ = write!(
+            runs_json,
+            "{{\"slot_id\": {}, \"instance\": \"{}\", \"blueprint\": \"{}\", \"priority\": \"{}\", \"max_run_kind\": \"{}\", \"max_run_blocks\": {}}}",
+            t.slot_id,
+            json_escape(&t.instance),
+            json_escape(&t.blueprint),
+            json_escape(&t.priority),
+            json_escape(&t.max_run_kind),
+            t.max_run_blocks,
+        );
+    }
+    runs_json.push(']');
+
     format!(
-        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"dual_specialized_functions\": {dual_json}, \"monomorphized_instances\": {mono_json}, \"diagnostics\": []}}"
+        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"dual_specialized_functions\": {dual_json}, \"monomorphized_instances\": {mono_json}, \"task_runs\": {runs_json}, \"diagnostics\": []}}"
     )
 }
 
@@ -340,7 +389,7 @@ mod tests {
         let empty_json = render_check_json_ok(1, 2, 3, 1000, &[], &[]);
         assert_eq!(
             empty_json,
-            "{\"ok\": true, \"files\": 1, \"spawned_tasks\": 2, \"primitives\": 3, \"tick_period_us\": 1000, \"dual_specialized_functions\": [], \"monomorphized_instances\": [], \"diagnostics\": []}"
+            "{\"ok\": true, \"files\": 1, \"spawned_tasks\": 2, \"primitives\": 3, \"tick_period_us\": 1000, \"dual_specialized_functions\": [], \"monomorphized_instances\": [], \"task_runs\": [], \"diagnostics\": []}"
         );
         assert_eq!(
             format_check_human_ok(1, 2, 3, 1000, &[], &[]),

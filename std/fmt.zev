@@ -28,7 +28,7 @@ pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error FmtErr {
         pos += 1;
     }
 
-    u8 wbuf[20];
+    [20]u8 wbuf;
     usize wn = 0;
     if (whole == 0u64) {
         wbuf[0] = '0';
@@ -48,10 +48,12 @@ pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error FmtErr {
         error Overflow;
     }
     usize wr = wn;
-    while (wr > 0) {
-        wr -= 1;
-        dst[pos] = wbuf[wr];
-        pos += 1;
+    noyield {
+        while (wr > 0) {
+            wr -= 1;
+            dst[pos] = wbuf[wr];
+            pos += 1;
+        }
     }
 
     if (frac_digits > 0u8) {
@@ -64,10 +66,12 @@ pub []u8 fmt_fixed_i64([]u8 dst, i64 scaled, u8 frac_digits) error FmtErr {
         usize fstart = pos;
         usize k = frac_digits as usize;
         u64 ftmp = frac;
-        while (k > 0) {
-            k -= 1;
-            dst[fstart + k] = ('0' as u8) + ((ftmp % 10u64) as u8);
-            ftmp = ftmp / 10u64;
+        noyield {
+            while (k > 0) {
+                k -= 1;
+                dst[fstart + k] = ('0' as u8) + ((ftmp % 10u64) as u8);
+                ftmp = ftmp / 10u64;
+            }
         }
         pos += (frac_digits as usize);
     }

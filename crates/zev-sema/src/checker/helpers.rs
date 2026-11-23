@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.tick_by(u32 ms)`, `sys.set_putc(fn(u8))`, `sys.set_clock_ms(fn() -> u32)`, `sys.set_exit(fn(i32))`, `sys.set_fault_handler(fn())`, `sys.set_idle(fn(u32, u32))`, `sys.set_irq_router(fn(u32, u32), fn(u32))`, `sys.rom_call_u32(usize fn_addr, usize stack_bound, ...) -> u32`, `sys.rom_call_void(usize fn_addr, usize stack_bound, ...)`, `sys.rom_call_noreturn(usize fn_addr, ...)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.nop()`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
+pub(super) const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.tick_by(u32 ms)`, `sys.set_putc(fn(u8))`, `sys.set_clock_ms(fn() -> u32)`, `sys.set_exit(fn(i32))`, `sys.set_fault_handler(fn())`, `sys.set_idle(fn(u32, u32))`, `sys.set_irq_router(fn(u32, u32), fn(u32))`, `sys.rom_call_u32(usize fn_addr, usize stack_bound, ...) -> u32`, `sys.rom_call_void(usize fn_addr, usize stack_bound, ...)`, `sys.rom_call_noreturn(usize fn_addr, ...)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.fuzz_irqs(u32 seed, u32 irq_mask)`, `sys.nop()`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
 
 pub(super) fn is_string_arg_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Str)
@@ -281,6 +281,13 @@ pub(super) fn stmts_have_break(stmts: &[Stmt]) -> bool {
             }
             StmtKind::Switch { arms, .. } => {
                 if arms.iter().any(|a| block_has_break(&a.body)) {
+                    return true;
+                }
+            }
+            StmtKind::Wait { arms, timer } => {
+                if arms.iter().any(|a| block_has_break(&a.body))
+                    || timer.as_ref().is_some_and(|t| block_has_break(&t.body))
+                {
                     return true;
                 }
             }

@@ -1,4 +1,4 @@
-//! Rich `SemanticModel` exported by `zev-sema` for `zev-mir`, `zev-codegen-c`,
+//! Rich `SemanticModel` exported by `zev-sema` for `zev-mir`, `zev-codegen-llvm`,
 //! `zev-codegen-llvm`, and `zev-cli`.
 
 use std::collections::{BTreeMap, BTreeSet};

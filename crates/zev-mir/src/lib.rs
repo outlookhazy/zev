@@ -18,7 +18,7 @@ pub use lower::{lower_program, lower_programs, MirLowerError};
 pub use ram::{
     collect_dma_layout_structs, compute_ram_report, populate_module_ram_report, ArchRamTotals,
     ChildSlotRamInfo, DualSpecializedFnRam, FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign,
-    SpawnedTaskRam, TargetAbi, VarRamInfo,
+    SpawnedTaskRam, TargetAbi, TaskRunKind, VarRamInfo,
 };
 pub use zev_ast::{decoded_string_byte_len, decoded_string_bytes};
 
@@ -2003,11 +2003,14 @@ mod tests {
             "restart must emit EndInboxTurn + ShareCheckpoint(BlockId(0))"
         );
 
-        let has_inbox_send = bp
-            .blocks
-            .iter()
-            .any(|b| matches!(b.terminator, MirTerminator::Yield(MirYieldKind::InboxSend { .. })));
-        assert!(has_inbox_send, "expected MirYieldKind::InboxSend");
+        let has_inbox_send = bp.blocks.iter().any(|b| {
+            matches!(
+                &b.terminator,
+                MirTerminator::Yield(MirYieldKind::Wait { arms, .. })
+                    if arms.iter().any(|a| matches!(a.op, MirWaitArmOp::InboxSend { .. }))
+            )
+        });
+        assert!(has_inbox_send, "expected MirYieldKind::Wait(InboxSend)");
 
         let has_every_latch_vars_hoisted = bp.blocks.iter().any(|b| match &b.terminator {
             MirTerminator::Yield(MirYieldKind::EveryLatch {
@@ -4054,8 +4057,9 @@ mod tests {
         let mut nullify_count = 0usize;
         for blk in &worker.blocks {
             if matches!(
-                blk.terminator,
-                MirTerminator::Yield(MirYieldKind::PoolAlloc { .. })
+                &blk.terminator,
+                MirTerminator::Yield(MirYieldKind::Wait { arms, .. })
+                    if arms.iter().any(|a| matches!(a.op, MirWaitArmOp::PoolAlloc { .. }))
             ) {
                 saw_alloc = true;
             }

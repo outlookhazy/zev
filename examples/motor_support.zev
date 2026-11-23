@@ -45,7 +45,7 @@ u16 adc_read_rpm(u8 pwm_ch) {
     return filtered_rpm;
 }
 
-u16 pi_step(u16 target, u16 actual, i32 *integral) {
+u16 pi_step(u16 target, u16 actual, *i32 integral) {
     i32 err = (target as i32) - (actual as i32);
     i32 next_int = math.clamp(*integral + err, -10000, 10000);
     *integral = next_int;

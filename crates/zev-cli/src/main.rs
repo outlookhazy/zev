@@ -7,8 +7,8 @@ mod svd;
 
 use cli::{parse_args, Command, HELP_TEXT};
 use diag::{
-    format_check_human_ok, primary_doc_cmd, render_check_json_err, render_check_json_ok, JsonDiag,
-    SourceFile,
+    format_check_human_ok, primary_doc_cmd, render_check_json_err,
+    render_check_json_ok_with_tasks, JsonDiag, SourceFile, TaskRunSummary,
 };
 use runner::TempWorkDir;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -792,15 +792,32 @@ fn main() -> ExitCode {
                 let dual_vec: Vec<String> =
                     bundle.sema.dual_specialized_fns.iter().cloned().collect();
                 if json {
+                    let task_runs: Vec<TaskRunSummary> = zev_mir::lower_programs(&bundle.programs)
+                        .map(|mir| {
+                            mir.ram_report
+                                .spawned_tasks
+                                .iter()
+                                .map(|t| TaskRunSummary {
+                                    slot_id: t.slot_id,
+                                    instance: t.instance_name.clone(),
+                                    blueprint: t.blueprint_name.clone(),
+                                    priority: t.priority.label().to_string(),
+                                    max_run_kind: t.max_run_kind.as_str().to_string(),
+                                    max_run_blocks: t.max_run_blocks,
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     println!(
                         "{}",
-                        render_check_json_ok(
+                        render_check_json_ok_with_tasks(
                             verified_files,
                             bundle.sema.spawned_tasks.len(),
                             bundle.sema.primitives.len(),
                             bundle.sema.tick_period_us,
                             &dual_vec,
                             &bundle.sema.monomorphized_instances,
+                            &task_runs,
                         )
                     );
                 } else {
@@ -863,26 +880,6 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::EmitC {
-            files,
-            include_dirs,
-            output,
-        } => {
-            match compile_to_mir_with_includes(&files, &include_dirs) {
-            Ok((_, mir)) => {
-                let c_src = zev_codegen_c::emit_c(&mir);
-                if let Err(err) = write_output(output.as_deref(), &c_src) {
-                    eprintln!("error: {err}");
-                    return ExitCode::FAILURE;
-                }
-                ExitCode::SUCCESS
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
-            }
-        }
         Command::Run {
             files,
             include_dirs,
@@ -890,22 +887,41 @@ fn main() -> ExitCode {
             max_ticks,
             run_args,
         } => {
-            match compile_to_mir_with_includes(&files, &include_dirs) {
-            Ok((_, mir)) => {
-                let c_src = zev_codegen_c::emit_c(&mir);
-                match runner::compile_and_run_c99(&c_src, sanitize, max_ticks, &run_args) {
-                    Ok(0) => ExitCode::SUCCESS,
-                    Ok(code) => ExitCode::from((code.clamp(1, 255)) as u8),
+            let mut opts = zev_codegen_llvm::CodegenOptions::host_linux();
+            opts.opt_level = if sanitize {
+                "-O1".to_string()
+            } else {
+                "-O2".to_string()
+            };
+            if let Some(ticks) = max_ticks {
+                opts.max_ticks = ticks.min(i32::MAX as u64) as u32;
+            }
+            match compile_to_mir_with_includes_and_targets(
+                &files,
+                &include_dirs,
+                opts.hal_dir.as_deref(),
+                opts.board_module.as_deref(),
+            ) {
+                Ok((_, mir)) => match zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &opts) {
+                    Ok(ll_src) => {
+                        match runner::compile_and_run_host_llvm(&ll_src, sanitize, &run_args) {
+                            Ok(0) => ExitCode::SUCCESS,
+                            Ok(code) => ExitCode::from((code.clamp(1, 255)) as u8),
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                ExitCode::FAILURE
+                            }
+                        }
+                    }
                     Err(err) => {
                         eprintln!("error: {err}");
                         ExitCode::FAILURE
                     }
+                },
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
                 }
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
             }
         }
         Command::EmitLlvm {
@@ -1617,6 +1633,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diag::render_check_json_ok;
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1638,14 +1655,20 @@ mod tests {
         assert!(mc_mir.ram_report.mcu32.union_bytes_saved > 0);
         assert_eq!(mc_mir.ram_report.mcu32.heap_bytes, 0);
 
-        let mc_c = zev_codegen_c::emit_c(&mc_mir);
-        let mc_exit = runner::compile_and_run_c99(&mc_c, true, Some(25), &[]).unwrap();
+        let mut mc_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        mc_opts.max_ticks = 25;
+        let mc_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&mc_mir, &mc_opts).unwrap();
+        let mc_exit = runner::compile_and_run_host_llvm(&mc_ll, true, &[]).unwrap();
         assert_eq!(mc_exit, 0);
 
         let (_, sim_mir) =
             compile_to_mir(&[root.join("examples/sim_demo.zev")]).expect("sim_demo must check");
-        let sim_c = zev_codegen_c::emit_c(&sim_mir);
-        let sim_exit = runner::compile_and_run_c99(&sim_c, true, None, &[]).unwrap();
+        let sim_ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &sim_mir,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        let sim_exit = runner::compile_and_run_host_llvm(&sim_ll, true, &[]).unwrap();
         assert_eq!(sim_exit, 0);
 
         let (_, cm3_mir) = compile_to_mir(&[root.join("examples/cortex_m_demo.zev")])
@@ -1709,6 +1732,7 @@ mod tests {
                 "P0011",
             ),
             ("p12.zev", "chan<u32, 4> q;\nfn main() {}\n", "P0012"),
+            ("p14.zev", "fn main() { u8 buf[8]; }\n", "P0014"),
         ];
 
         for (fname, src, expected_code) in cases {
@@ -1890,13 +1914,13 @@ T clamp<T>(T val, T lo, T hi) {
 
 fn check_dynamic_slice([]u8 dyn_tag) {
     // 1. Statically proven buffer fit (`worst = 4 + 5 = 9 <= 16`) requires NO `or`/`catch`!
-    u8 static_buf[16];
+    [16]u8 static_buf;
     u16 rpm = 2400;
     []u8 fit_line = fmt_buf(static_buf, f\"rpm={rpm}\");
     println(fit_line);
 
     // 2. Dynamic `[]u8` slice hole uses `catch (FmtErr err, []u8 partial)` cleanly!
-    u8 small_buf[10];
+    [10]u8 small_buf;
     []u8 trunc_line = fmt_buf(small_buf, f\"tag={dyn_tag}\") catch (FmtErr err, []u8 partial) {
         partial
     };
@@ -1909,7 +1933,7 @@ fn main() {
         len: 8
     };
     f32 ratio = clamp<f32>(1.75f32, 0.0f32, 1.0f32);
-    u8 long_tag[12] = [65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76];
+    [12]u8 long_tag = [65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76];
     check_dynamic_slice(long_tag[0..12]);
     println(f\"len={vec.len} ratio={ratio:.2}\");
     sys.exit(0);
@@ -1963,10 +1987,12 @@ fn main() {
         assert!(ram_table.contains("FixedVec<u32, 8>"), "ram_table=\n{ram_table}");
         assert!(ram_table.contains("clamp<f32>"), "ram_table=\n{ram_table}");
 
-        // 3. Verify emitted C99 runs cleanly under ASan/UBSan (`fit_line` + `trunc_line` + `println(f"...")`)
-        let c_src = zev_codegen_c::emit_c(&mir);
-        let c_exit = runner::compile_and_run_c99(&c_src, true, Some(10), &[]).unwrap();
-        assert_eq!(c_exit, 0);
+        // 3. Verify emitted host LLVM IR runs cleanly under ASan/UBSan (`fit_line` + `trunc_line` + `println(f"...")`)
+        let mut wave2_host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        wave2_host_opts.max_ticks = 10;
+        let wave2_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &wave2_host_opts).unwrap();
+        let host_exit = runner::compile_and_run_host_llvm(&wave2_ll, true, &[]).unwrap();
+        assert_eq!(host_exit, 0);
 
         // 4. Verify E0028..E0033 diagnostics and `zevc doc` explainers (45 total)
         let doc_list = docs::lookup_doc(None, true).unwrap();
@@ -1975,7 +2001,7 @@ fn main() {
         let wave2_errs = [
             (
                 "e28.zev",
-                "fn main() { u8 dst[8]; u32 rpm = 1800; []u8 s = fmt_buf(dst, f\"rpm={rpm}\"); }\n",
+                "fn main() { [8]u8 dst; u32 rpm = 1800; []u8 s = fmt_buf(dst, f\"rpm={rpm}\"); }\n",
                 "E0028",
             ),
             (
@@ -2118,10 +2144,12 @@ fn main() {
 
         let (_, mir) = compile_to_mir(&[src_path]).expect("parity.zev must check & lower");
 
-        // 1. Verify host C99 simulation with --max-ticks 15
-        let c_src = zev_codegen_c::emit_c(&mir);
-        let c_exit = runner::compile_and_run_c99(&c_src, true, Some(15), &[]).unwrap();
-        assert_eq!(c_exit, 0);
+        // 1. Verify host LLVM simulation with --max-ticks 15
+        let mut host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        host_opts.max_ticks = 15;
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &host_opts).unwrap();
+        let host_exit = runner::compile_and_run_host_llvm(&host_ll, true, &[]).unwrap();
+        assert_eq!(host_exit, 0);
 
         // 2. Verify Cortex-M3 QEMU with --max-ticks 15
         let mut q_opts = zev_codegen_llvm::CodegenOptions::default();
@@ -2417,5 +2445,585 @@ fn main() {
             zev_codegen_llvm::build_target_image(&mir, &resolved.opts, &out_elf).unwrap();
         assert!(built.image_path.is_file());
         assert_eq!(built.elf.audit.undefined_symbols.len(), 0);
+    }
+
+    #[test]
+    fn host_fuzz_irqs_fires_attached_isr_on_crit_exit() {
+        let temp = TempWorkDir::create("zev_fuzz_irqs_host").unwrap();
+        let main_path = temp.dir.join("app.zev");
+        std::fs::write(
+            &main_path,
+            r#"
+watch<u32> ticks = 0;
+irq IRQ_FUZZ = 3;
+
+isr on_fuzz(*watch<u32> w) {
+    w.publish(w.read() + 1);
+}
+
+task runner(*watch<u32> w) {
+    for (u32 i in 0..40) {
+        critical {
+            sys.nop();
+        }
+        checkpoint();
+    }
+    u32 hits = w.read();
+    println(f"fuzz_hits={hits}");
+    assert(hits > 0);
+    sys.exit(0);
+}
+
+fn main() {
+    IRQ_FUZZ.attach(on_fuzz(&ticks));
+    sys.fuzz_irqs(0xCAFE_BABEu32, 1u32 << 3);
+    spawn runner(&ticks) @normal;
+}
+"#,
+        )
+        .unwrap();
+        let (_, mir) = compile_to_mir_with_includes(&[main_path], &[]).unwrap();
+        let ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .expect("emit host fuzz_irqs IR");
+        let code = runner::compile_and_run_host_llvm(&ll, true, &[])
+            .expect("host sanitize run should succeed");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn host_fuzz_irqs_no_lost_wakeups_across_primitives() {
+        let temp = TempWorkDir::create("zev_fuzz_lost_wakeups").unwrap();
+        let main_path = temp.dir.join("app.zev");
+        std::fs::write(
+            &main_path,
+            r#"
+inbox<u32, 2> fq;
+watch<u32> fq_sent = 0;
+
+signal fsig;
+watch<u32> sig_req = 0;
+watch<u32> sig_ack = 0;
+
+byte_ring<8> fring;
+watch<u32> ring_sent = 0;
+
+watch<u32> fw = 0;
+watch<u32> w_req = 0;
+
+pool<u32, 1> fpool;
+inbox<Lease<u32>, 1> prelease_q;
+signal pool_rel_sig;
+
+watch<u32> done_mask = 0;
+
+irq IRQ_INBOX = 1;
+irq IRQ_SIG   = 2;
+irq IRQ_RING  = 3;
+irq IRQ_WATCH = 4;
+irq IRQ_POOL  = 5;
+
+isr on_fq(*inbox<u32, 2> q, *watch<u32> sent) {
+    u32 s = sent.read();
+    if (s < 35u32 && !q.is_full()) {
+        q.try_post(s + 1u32, boost: @critical);
+        sent.publish(s + 1u32);
+    }
+}
+
+isr on_fsig(*signal s, *watch<u32> req, *watch<u32> ack) {
+    u32 r = req.read();
+    if (r > ack.read()) {
+        ack.publish(r);
+        s.notify(boost: @high);
+    }
+}
+
+isr on_fring(*byte_ring<8> r, *watch<u32> sent) {
+    u32 s = sent.read();
+    if (s < 35u32 && r.free_space() > 0) {
+        [1]u8 b = [(s & 0x7fu32) as u8];
+        r.push(b[0..1]);
+        sent.publish(s + 1u32);
+    }
+}
+
+isr on_fwatch(*watch<u32> w) {
+    w.publish(w.read() + 1u32);
+}
+
+isr on_fpool(*inbox<Lease<u32>, 1> rel_q, *signal done_s) {
+    Lease<u32> l = rel_q.try_recv() catch { return; };
+    l.release();
+    done_s.notify(boost: @high);
+}
+
+u32 wait_watch_helper(*watch<u32> w) {
+    return w.wait_change(timeout: 500ms) catch {
+        return 999999u32;
+    };
+}
+
+task t_inbox(*inbox<u32, 2> q, *watch<u32> dm) {
+    for (u32 i in 0..35) {
+        u32 v = q.recv();
+        if (v != i + 1u32) {
+            println(f"INBOX_FAIL i={i} v={v}");
+            sys.exit(2);
+        }
+        critical { sys.nop(); }
+    }
+    critical { dm.publish(dm.read() | 1u32); }
+    loop { delay(5000ms); }
+}
+
+task t_signal(*signal s, *watch<u32> req, *watch<u32> dm) {
+    for (u32 i in 0..35) {
+        req.publish(i + 1u32);
+        critical { sys.nop(); }
+        s.wait();
+    }
+    critical { dm.publish(dm.read() | 2u32); }
+    loop { delay(5000ms); }
+}
+
+task t_ring(*byte_ring<8> r, *watch<u32> dm) {
+    u32 got = 0u32;
+    while (got < 35u32) {
+        []u8 c = r.wait_read();
+        for (usize j in 0..c.len) {
+            u8 exp = (got & 0x7fu32) as u8;
+            if (c[j] != exp) {
+                println(f"RING_FAIL got={got} c={c[j]} exp={exp}");
+                sys.exit(3);
+            }
+            got += 1u32;
+        }
+        r.consume(c.len);
+        critical { sys.nop(); }
+    }
+    critical { dm.publish(dm.read() | 4u32); }
+    loop { delay(5000ms); }
+}
+
+task t_watch(*watch<u32> w, *watch<u32> dm) {
+    u32 prev = 0u32;
+    for (u32 i in 0..20) {
+        u32 v = 0u32;
+        if ((i & 1u32) == 0u32) {
+            v = wait_watch_helper(w);
+        } else {
+            v = w.wait_change(timeout: 500ms) catch { 999999u32 };
+        }
+        if (v == 999999u32 || v <= prev) {
+            println(f"WATCH_FAIL i={i} v={v} prev={prev}");
+            sys.exit(4);
+        }
+        prev = v;
+        critical { sys.nop(); }
+    }
+    critical { dm.publish(dm.read() | 8u32); }
+    loop { delay(5000ms); }
+}
+
+task t_pool(*pool<u32, 1> p, *inbox<Lease<u32>, 1> rel_q, *signal rel_s, *watch<u32> dm) {
+    for (u32 i in 0..20) {
+        Lease<u32> l1 = p.alloc();
+        *u32 p1 = l1.get();
+        *p1 = i;
+        rel_q.send(l1);
+        Lease<u32> l2 = p.alloc();
+        *u32 p2 = l2.get();
+        *p2 = i + 100u32;
+        l2.release();
+        rel_s.wait();
+        critical { sys.nop(); }
+    }
+    critical { dm.publish(dm.read() | 16u32); }
+    loop { delay(5000ms); }
+}
+
+task t_pacer(*watch<u32> dm) {
+    while (dm.read() != 31u32) {
+        delay(1ms);
+        critical { sys.nop(); }
+    }
+    println("fuzz_no_lost_wakeups_ok");
+    sys.exit(0);
+}
+
+fn main() {
+    IRQ_INBOX.attach(on_fq(&fq, &fq_sent));
+    IRQ_SIG.attach(on_fsig(&fsig, &sig_req, &sig_ack));
+    IRQ_RING.attach(on_fring(&fring, &ring_sent));
+    IRQ_WATCH.attach(on_fwatch(&fw));
+    IRQ_POOL.attach(on_fpool(&prelease_q, &pool_rel_sig));
+    sys.fuzz_irqs(0xDEAD_BEEFu32, (1u32 << 1) | (1u32 << 2) | (1u32 << 3) | (1u32 << 4) | (1u32 << 5));
+    spawn t_inbox(&fq, &done_mask) @normal;
+    spawn t_signal(&fsig, &sig_req, &done_mask) @normal;
+    spawn t_ring(&fring, &done_mask) @normal;
+    spawn t_watch(&fw, &done_mask) @normal;
+    spawn t_pool(&fpool, &prelease_q, &pool_rel_sig, &done_mask) @normal;
+    spawn t_pacer(&done_mask) @low;
+}
+"#,
+        )
+        .unwrap();
+        let (_, mir) = compile_to_mir_with_includes(&[main_path], &[]).unwrap();
+        let ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .expect("emit host lost-wakeup stress IR");
+        let code = runner::compile_and_run_host_llvm(&ll, true, &[])
+            .expect("host sanitize lost-wakeup stress should pass");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn host_fuzz_irqs_std_sync_semaphore_flags_latch_and_barrier() {
+        let temp = TempWorkDir::create("zev_std_sync_host").unwrap();
+        let main_path = temp.dir.join("app.zev");
+        std::fs::write(
+            &main_path,
+            r#"
+import std.sync as sync;
+
+sync.Semaphore sem;
+watch<u32> sem_released = 0;
+
+sync.EventFlags flags;
+sync.Latch gate;
+sync.Barrier<3> barrier;
+
+watch<u32> barrier_trips = 0;
+watch<u32> done_mask = 0;
+
+irq IRQ_SEM = 1;
+irq IRQ_FLAGS = 2;
+irq IRQ_LATCH = 3;
+
+isr on_sem(*sync.Semaphore s, *watch<u32> rel) {
+    u32 r = rel.read();
+    if (r < 25u32) {
+        rel.publish(r + 1u32);
+        s.release();
+    }
+}
+
+isr on_flags(*sync.EventFlags f) {
+    f.set(0x03u32);
+}
+
+isr on_latch(*sync.Latch g) {
+    if (!g.is_ready()) {
+        g.arrive();
+    }
+}
+
+task t_sem_worker(*sync.Semaphore s, *watch<u32> dm) {
+    for (u32 i in 0..25) {
+        s.acquire();
+        critical { sys.nop(); }
+    }
+    critical { dm.publish(dm.read() | 1u32); }
+    loop { delay(5000ms); }
+}
+
+task t_flags_worker(*sync.EventFlags f, *sync.Latch g, *watch<u32> dm) {
+    g.wait();
+    assert(g.is_ready());
+    u32 got = f.wait_all(0x03u32);
+    assert((got & 0x03u32) == 0x03u32);
+    f.clear(0x03u32);
+    critical { dm.publish(dm.read() | 2u32); }
+    loop { delay(5000ms); }
+}
+
+task t_barrier_peer(u32 id, *sync.Barrier<3> b, *sync.Latch g, *watch<u32> trips, *watch<u32> dm) {
+    g.wait();
+    for (u32 r in 0..5) {
+        if (b.wait()) {
+            critical { trips.publish(trips.read() + 1u32); }
+        }
+        checkpoint();
+    }
+    critical { dm.publish(dm.read() | (1u32 << (2u32 + id))); }
+    loop { delay(5000ms); }
+}
+
+task t_pacer(*watch<u32> dm, *watch<u32> trips) {
+    while (dm.read() != 31u32) {
+        delay(1ms);
+        critical { sys.nop(); }
+    }
+    assert(trips.read() == 5u32);
+    println("std_sync_fuzz_ok");
+    sys.exit(0);
+}
+
+fn main() {
+    sem.init(0u32);
+    IRQ_SEM.attach(on_sem(&sem, &sem_released));
+    IRQ_FLAGS.attach(on_flags(&flags));
+    IRQ_LATCH.attach(on_latch(&gate));
+    sys.fuzz_irqs(0xBAD_C0FFEu32, (1u32 << 1) | (1u32 << 2) | (1u32 << 3));
+    spawn t_sem_worker(&sem, &done_mask) @normal;
+    spawn t_flags_worker(&flags, &gate, &done_mask) @normal;
+    spawn t_barrier_peer(0u32, &barrier, &gate, &barrier_trips, &done_mask) @normal;
+    spawn t_barrier_peer(1u32, &barrier, &gate, &barrier_trips, &done_mask) @normal;
+    spawn t_barrier_peer(2u32, &barrier, &gate, &barrier_trips, &done_mask) @normal;
+    spawn t_pacer(&done_mask, &barrier_trips) @low;
+}
+"#,
+        )
+        .unwrap();
+        let (_, mir) = compile_to_mir_with_includes(&[main_path], &[]).unwrap();
+        let ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .expect("emit host std.sync fuzz IR");
+        let code = runner::compile_and_run_host_llvm(&ll, true, &[])
+            .expect("host sanitize std.sync fuzz run should pass");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn host_fuzz_irqs_wait_block_multi_arm_priority_and_deadline() {
+        let temp = TempWorkDir::create("zev_wait_block_host").unwrap();
+        let main_path = temp.dir.join("app.zev");
+        std::fs::write(
+            &main_path,
+            r#"
+signal hi_sig;
+inbox<u32, 4> hi_q;
+inbox<u32, 8> lo_q;
+watch<u32> w_chg = 0;
+byte_ring<16> rx_ring;
+pool<u32, 1> work_pool;
+dma_slot<u32> pool_sink;
+
+watch<u32> hi_hits = 0;
+watch<u32> sig_hits = 0;
+watch<u32> rx_bytes = 0;
+watch<u32> dl_beats = 0;
+watch<u32> seq = 0;
+
+irq IRQ_WAIT_FEED = 2;
+
+isr on_feed(*inbox<u32, 8> q, *signal s, *watch<u32> seq_w) {
+    u32 n = seq_w.read();
+    if (n < 30u32 && !q.is_full()) {
+        q.try_post(n + 1u32, boost: @high);
+        if ((n & 3u32) == 0u32) {
+            s.notify(boost: @critical);
+        }
+        seq_w.publish(n + 1u32);
+    }
+}
+
+task multi_waiter() {
+    u32 next_beat = sys.now_ms() + 10u32;
+    loop {
+        wait {
+            hi_sig.wait() => {
+                sig_hits.publish(sig_hits.read() + 1u32);
+            }
+            u32 h = hi_q.recv() => {
+                hi_hits.publish(hi_hits.read() + h);
+            }
+            u32 lo = lo_q.recv() => {
+                u32 _tmp = lo;
+            }
+            []u8 chunk = rx_ring.wait_read() => {
+                rx_bytes.publish(rx_bytes.read() + (chunk.len as u32));
+                rx_ring.consume(chunk.len);
+            }
+            u32 wv = w_chg.wait_change() => {
+                u32 _wv = wv;
+            }
+            Lease<u32> l = work_pool.alloc() => {
+                *u32 lp = l.get();
+                *lp = 1u32;
+                pool_sink.park(l) catch { sys.exit(1); };
+            }
+            deadline next_beat => {
+                dl_beats.publish(dl_beats.read() + 1u32);
+                next_beat += 10u32;
+            }
+        }
+        if (dl_beats.read() >= 3u32 && sig_hits.read() > 0u32) {
+            println(f"wait_fuzz_ok beats={dl_beats.read()} sigs={sig_hits.read()}");
+            sys.exit(0);
+        }
+    }
+}
+
+task pacer() {
+    loop {
+        delay(1ms);
+        critical { sys.nop(); }
+    }
+}
+
+fn main() {
+    IRQ_WAIT_FEED.attach(on_feed(&lo_q, &hi_sig, &seq));
+    sys.fuzz_irqs(0x55AA_1234u32, 1u32 << 2);
+    spawn multi_waiter() @normal;
+    spawn pacer() @low;
+    hi_q.try_post(42u32);
+    [1]u8 pkt = [0x5Au8];
+    rx_ring.push(pkt[0..1]);
+}
+"#,
+        )
+        .unwrap();
+        let (_, mir) = compile_to_mir_with_includes(&[main_path], &[]).unwrap();
+        let ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .expect("emit host wait_block IR");
+        let code = runner::compile_and_run_host_llvm(&ll, true, &[])
+            .expect("host sanitize wait_block run should pass");
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn host_runtime_panic_traps_and_int_min_div_safe() {
+        let temp = TempWorkDir::create("zev_traps_host").unwrap();
+        let safe_path = temp.dir.join("safe.zev");
+        std::fs::write(
+            &safe_path,
+            r#"
+watch<i32> wn = -2147483647 - 1;
+watch<i32> wd = -1;
+fn main() {
+    i32 n = wn.read();
+    i32 d = wd.read();
+    assert((n / d) == n);
+    assert((n % d) == 0);
+    sys.exit(0);
+}
+"#,
+        )
+        .unwrap();
+        let (_, mir_s) = compile_to_mir_with_includes(&[safe_path], &[]).unwrap();
+        let ll_s = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir_s,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        let code_s = runner::compile_and_run_host_llvm(&ll_s, true, &[]).unwrap();
+        assert_eq!(code_s, 0);
+
+        for (name, src) in [
+            (
+                "idx.zev",
+                "watch<usize> i = 2; fn main() { [2]u8 a = [1, 2]; u8 _v = a[i.read()]; }\n",
+            ),
+            (
+                "slice.zev",
+                "watch<usize> e = 5; fn main() { [2]u8 a = [1, 2]; []u8 _s = a[0..e.read()]; }\n",
+            ),
+            (
+                "div.zev",
+                "watch<i32> d = 0; fn main() { i32 _v = 9 / d.read(); }\n",
+            ),
+        ] {
+            let p = temp.dir.join(name);
+            std::fs::write(&p, src).unwrap();
+            let (_, mir) = compile_to_mir_with_includes(&[p], &[]).unwrap();
+            let ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+                &mir,
+                &zev_codegen_llvm::CodegenOptions::host_linux(),
+            )
+            .unwrap();
+            let code = runner::compile_and_run_host_llvm(&ll, true, &[]).unwrap();
+            assert_eq!(code, 101, "{name} should exit 101");
+        }
+    }
+
+    #[test]
+    fn ram_and_check_json_classify_task_run_bounds() {
+        let temp = TempWorkDir::create("zev_run_bounds").unwrap();
+        let src_path = temp.dir.join("run_bounds.zev");
+        std::fs::write(
+            &src_path,
+            r#"
+watch<u32> w = 0;
+
+task t_straight() {
+    loop {
+        delay(5ms);
+    }
+}
+
+task t_for() {
+    u32 acc = 0;
+    loop {
+        for (u32 i in 0..8) {
+            acc += i;
+        }
+        w.publish(acc);
+        delay(5ms);
+    }
+}
+
+task t_spin() {
+    loop {
+        noyield {
+            while (w.read() == 0) {}
+        }
+        delay(5ms);
+    }
+}
+
+fn main() {
+    spawn t_straight() @high;
+    spawn t_for() @normal;
+    spawn t_spin() @low;
+}
+"#,
+        )
+        .unwrap();
+        let (bundle, mir) = compile_to_mir_with_includes(&[src_path], &[]).unwrap();
+        let table = mir.ram_report.format_table();
+        assert!(table.contains("max non-yield run: straight-line"), "table=\n{table}");
+        assert!(table.contains("max non-yield run: bounded-for"), "table=\n{table}");
+        assert!(table.contains("max non-yield run: noyield-spin"), "table=\n{table}");
+
+        let task_runs: Vec<TaskRunSummary> = mir
+            .ram_report
+            .spawned_tasks
+            .iter()
+            .map(|t| TaskRunSummary {
+                slot_id: t.slot_id,
+                instance: t.instance_name.clone(),
+                blueprint: t.blueprint_name.clone(),
+                priority: t.priority.label().to_string(),
+                max_run_kind: t.max_run_kind.as_str().to_string(),
+                max_run_blocks: t.max_run_blocks,
+            })
+            .collect();
+        let dual_vec: Vec<String> = bundle.sema.dual_specialized_fns.iter().cloned().collect();
+        let json = render_check_json_ok_with_tasks(
+            bundle.programs.len(),
+            bundle.sema.spawned_tasks.len(),
+            bundle.sema.primitives.len(),
+            bundle.sema.tick_period_us,
+            &dual_vec,
+            &bundle.sema.monomorphized_instances,
+            &task_runs,
+        );
+        assert!(json.contains("\"blueprint\": \"t_straight\""), "json={json}");
+        assert!(json.contains("\"max_run_kind\": \"straight-line\""), "json={json}");
+        assert!(json.contains("\"blueprint\": \"t_for\""), "json={json}");
+        assert!(json.contains("\"max_run_kind\": \"bounded-for\""), "json={json}");
+        assert!(json.contains("\"blueprint\": \"t_spin\""), "json={json}");
+        assert!(json.contains("\"max_run_kind\": \"noyield-spin\""), "json={json}");
     }
 }

@@ -378,10 +378,97 @@ entry:
 
 /// Emit pure-ISA RV32 architectural CPU primitives (`mstatus`, `@__syn_uart_putc`,
 /// `@__syn_platform_exit`, `@__syn_use_systick`, `@__syn_nvic_pend_irq`, `@__syn_idle_sleep`).
-pub fn emit_riscv32_hal_ir(out: &mut String, spec: &TargetSpec, sz: &str) {
+pub fn emit_riscv32_hal_ir(
+    out: &mut String,
+    spec: &TargetSpec,
+    sz: &str,
+    enable_irqs: bool,
+    can_wfi_on_deadline: bool,
+) {
+    let idle_sleep_ir = if !enable_irqs {
+        r#"define void @__syn_idle_sleep() nounwind{sz} {{
+entry:
+  %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
+  %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
+  %any_locks = or i32 %locks, %dma_locks
+  %locked = icmp ne i32 %any_locks, 0
+  %depth = select i1 %locked, i32 1, i32 2
+  store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4
+  %wc = load volatile i32, ptr @__syn_wfi_count, align 4
+  %wc1 = add i32 %wc, 1
+  store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
+  %ign = call i32 @__syn_now_ms()
+  call void @__syn_on_idle(i32 0, i32 %depth)
+  call void asm sideeffect "nop\0Anop\0Anop\0Anop", "~{{memory}}"()
+  ret void
+}}"#
+        .to_string()
+    } else if can_wfi_on_deadline {
+        r#"define void @__syn_idle_sleep() nounwind{sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %now = call i32 @__syn_now_ms()
+  call void @__syn_wake_timers(i32 %now)
+  %any_ready = call i1 @__syn_any_ready_task()
+  br i1 %any_ready, label %restore, label %do_sleep
+do_sleep:
+  %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
+  %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
+  %any_locks = or i32 %locks, %dma_locks
+  %locked = icmp ne i32 %any_locks, 0
+  %depth = select i1 %locked, i32 1, i32 2
+  store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4
+  %wc = load volatile i32, ptr @__syn_wfi_count, align 4
+  %wc1 = add i32 %wc, 1
+  store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
+  call void @__syn_on_idle(i32 0, i32 %depth)
+  call void asm sideeffect "wfi\0Acsrsi mstatus, 8\0Acsrci mstatus, 8", "~{{memory}}"()
+  br label %restore
+restore:
+  call void @__syn_crit_exit(i32 %pm)
+  ret void
+}}"#
+        .to_string()
+    } else {
+        r#"define void @__syn_idle_sleep() nounwind{sz} {{
+entry:
+  %pm = call i32 @__syn_crit_enter()
+  %now = call i32 @__syn_now_ms()
+  call void @__syn_wake_timers(i32 %now)
+  %any_ready = call i1 @__syn_any_ready_task()
+  br i1 %any_ready, label %restore, label %do_sleep
+do_sleep:
+  %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
+  %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
+  %any_locks = or i32 %locks, %dma_locks
+  %locked = icmp ne i32 %any_locks, 0
+  %depth = select i1 %locked, i32 1, i32 2
+  store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4
+  %wc = load volatile i32, ptr @__syn_wfi_count, align 4
+  %wc1 = add i32 %wc, 1
+  store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
+  call void @__syn_on_idle(i32 0, i32 %depth)
+  %has_dl = load volatile i8, ptr @__syn_has_deadline_waiter, align 1
+  %no_dl = icmp eq i8 %has_dl, 0
+  br i1 %no_dl, label %do_wfi, label %do_poll
+do_wfi:
+  call void asm sideeffect "wfi\0Acsrsi mstatus, 8\0Acsrci mstatus, 8", "~{{memory}}"()
+  br label %restore
+do_poll:
+  call void @__syn_crit_exit(i32 %pm)
+  call void asm sideeffect "nop\0Anop\0Anop\0Anop", "~{{memory}}"()
+  ret void
+restore:
+  call void @__syn_crit_exit(i32 %pm)
+  ret void
+}}"#
+        .to_string()
+    };
+    let idle_sleep_ir = idle_sleep_ir.replace("{sz}", sz).replace("{{", "{").replace("}}", "}");
+
     let _ = writeln!(
         out,
-        r#"; ── RISC-V ({}) Pure-ISA CPU Primitives: mstatus & Idle Poll ──
+        r#"; ── RISC-V ({}) Pure-ISA CPU Primitives: mstatus & Idle Sleep ──
 define i32 @__syn_crit_enter() nounwind alwaysinline {{
 entry:
   %pm = call i32 asm sideeffect "csrrci $0, mstatus, 8", "=r,~{{memory}}"()
@@ -423,22 +510,7 @@ entry:
   ret void
 }}
 
-define void @__syn_idle_sleep() nounwind{sz} {{
-entry:
-  %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4
-  %dma_locks = load volatile i32, ptr @__syn_dma_locks, align 4
-  %any_locks = or i32 %locks, %dma_locks
-  %locked = icmp ne i32 %any_locks, 0
-  %depth = select i1 %locked, i32 1, i32 2
-  store volatile i32 %depth, ptr @__syn_last_sleep_depth, align 4
-  %wc = load volatile i32, ptr @__syn_wfi_count, align 4
-  %wc1 = add i32 %wc, 1
-  store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
-  %ign = call i32 @__syn_now_ms()
-  call void @__syn_on_idle(i32 0, i32 %depth)
-  call void asm sideeffect "nop\0Anop\0Anop\0Anop", "~{{memory}}"()
-  ret void
-}}
+{idle_sleep_ir}
 "#,
         spec.cpu
     );

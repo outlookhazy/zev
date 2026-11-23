@@ -315,6 +315,12 @@ impl Analyzer {
         // `extern "C"` callback checks, boot-tree spawn & IRQ attach unrolling, and cycle detection.
         self.run_whole_program_verification();
 
+        let main_decl_opt = all_items.iter().find_map(|(item, _, _)| match &item.kind {
+            ItemKind::Fn(f) if f.name.name == "main" => Some(f),
+            _ => None,
+        });
+        self.check_task_slot_limit(main_decl_opt);
+
         let main_can_yield = self
             .functions
             .get("main")
@@ -1926,6 +1932,7 @@ impl Analyzer {
     pub(super) fn resolve_os_primitive(&mut self, os: &OsPrimitiveType, span: Span) -> ResolvedOsPrimitive {
         match os {
             OsPrimitiveType::Signal => ResolvedOsPrimitive::Signal,
+            OsPrimitiveType::WaitQueue => ResolvedOsPrimitive::WaitQueue,
             OsPrimitiveType::Inbox { elem, cap } => {
                 if *cap == 0 {
                     self.emit(Diagnostic::new(
@@ -3675,6 +3682,230 @@ impl Analyzer {
                     visiting.remove(&callee);
                 }
             }
+        }
+    }
+
+    fn check_task_slot_limit(&mut self, main_decl: Option<&FnDecl>) {
+        const MAX_TASKS: usize = 32;
+        fn expr_can_yield(expr: &Expr, cg: &CallGraph) -> bool {
+            match &expr.kind {
+                ExprKind::Call { callee, args, .. } => {
+                    if let ExprKind::Ident(id) = &callee.kind {
+                        if let Some(node) = cg.nodes.get(&id.name) {
+                            if node.can_yield {
+                                return true;
+                            }
+                        }
+                        if matches!(id.name.as_str(), "delay" | "sleep" | "checkpoint") {
+                            return true;
+                        }
+                    }
+                    expr_can_yield(callee, cg)
+                        || args.iter().any(|a| expr_can_yield(&a.value, cg))
+                }
+                ExprKind::MethodCall {
+                    receiver,
+                    method,
+                    args,
+                } => {
+                    if matches!(
+                        method.name.as_str(),
+                        "wait_chunk"
+                            | "wait_read"
+                            | "recv"
+                            | "send"
+                            | "wait"
+                            | "wait_change"
+                            | "alloc"
+                            | "commit_wait"
+                            | "delay"
+                    ) {
+                        return true;
+                    }
+                    expr_can_yield(receiver, cg)
+                        || args.iter().any(|a| expr_can_yield(&a.value, cg))
+                }
+                ExprKind::Unary { expr: inner, .. } | ExprKind::Cast { expr: inner, .. }
+                | ExprKind::Field { target: inner, .. } => expr_can_yield(inner, cg),
+                ExprKind::Binary { lhs, rhs, .. }
+                | ExprKind::Index {
+                    target: lhs,
+                    index: rhs,
+                }
+                | ExprKind::Or {
+                    expr: lhs,
+                    fallback: rhs,
+                } => expr_can_yield(lhs, cg) || expr_can_yield(rhs, cg),
+                ExprKind::Slice { target, start, end } => {
+                    expr_can_yield(target, cg)
+                        || start.as_ref().is_some_and(|e| expr_can_yield(e, cg))
+                        || end.as_ref().is_some_and(|e| expr_can_yield(e, cg))
+                }
+                ExprKind::StructLit { fields, .. } => {
+                    fields.iter().any(|f| expr_can_yield(&f.value, cg))
+                }
+                ExprKind::ArrayLit(elems) => elems.iter().any(|e| expr_can_yield(e, cg)),
+                ExprKind::FormatString(parts) => parts.iter().any(|p| match p {
+                    FormatPart::Hole { expr: e, .. } => expr_can_yield(e, cg),
+                    _ => false,
+                }),
+                ExprKind::Catch { expr: inner, clause } => {
+                    expr_can_yield(inner, cg)
+                        || clause.body.stmts.iter().any(|s| stmt_can_yield(s, false, cg))
+                }
+                ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Priority(_) => false,
+            }
+        }
+        fn stmt_has_boot_spawn(stmt: &Stmt, cg: &CallGraph) -> bool {
+            match &stmt.kind {
+                StmtKind::Spawn(_) => true,
+                StmtKind::Expr(e) => expr_has_boot_spawn(e, cg),
+                StmtKind::VarDecl { init: Some(e), .. } => expr_has_boot_spawn(e, cg),
+                StmtKind::Assign { value: e, .. } => expr_has_boot_spawn(e, cg),
+                StmtKind::If {
+                    then_block,
+                    else_block,
+                    ..
+                } => {
+                    then_block.stmts.iter().any(|s| stmt_has_boot_spawn(s, cg))
+                        || else_block
+                            .as_ref()
+                            .is_some_and(|b| b.stmts.iter().any(|s| stmt_has_boot_spawn(s, cg)))
+                }
+                StmtKind::Switch { arms, .. } => arms
+                    .iter()
+                    .any(|a| a.body.stmts.iter().any(|s| stmt_has_boot_spawn(s, cg))),
+                StmtKind::Wait { .. } => false,
+                StmtKind::Block(b) | StmtKind::NoYield { body: b } | StmtKind::Critical { body: b } => {
+                    b.stmts.iter().any(|s| stmt_has_boot_spawn(s, cg))
+                }
+                _ => false,
+            }
+        }
+        fn expr_has_boot_spawn(expr: &Expr, cg: &CallGraph) -> bool {
+            match &expr.kind {
+                ExprKind::Call { callee, args, .. } => {
+                    let direct = if let ExprKind::Ident(id) = &callee.kind {
+                        cg.nodes
+                            .get(&id.name)
+                            .is_some_and(|n| n.spawns_in_boot || n.attaches_in_boot)
+                    } else {
+                        false
+                    };
+                    direct || args.iter().any(|a| expr_has_boot_spawn(&a.value, cg))
+                }
+                ExprKind::MethodCall { method, .. } => {
+                    matches!(method.name.as_str(), "attach" | "attach_shared")
+                }
+                _ => false,
+            }
+        }
+        fn stmt_can_yield(stmt: &Stmt, manual_yield: bool, cg: &CallGraph) -> bool {
+            match &stmt.kind {
+                StmtKind::Loop { body } => {
+                    !manual_yield
+                        || body
+                            .stmts
+                            .iter()
+                            .any(|s| stmt_can_yield(s, manual_yield, cg))
+                }
+                StmtKind::LoopEvery { .. } => true,
+                StmtKind::Expr(e)
+                | StmtKind::VarDecl { init: Some(e), .. }
+                | StmtKind::Assign { value: e, .. }
+                | StmtKind::Return(Some(e)) => expr_can_yield(e, cg),
+                StmtKind::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    expr_can_yield(cond, cg)
+                        || then_block
+                            .stmts
+                            .iter()
+                            .any(|s| stmt_can_yield(s, manual_yield, cg))
+                        || else_block.as_ref().is_some_and(|b| {
+                            b.stmts.iter().any(|s| stmt_can_yield(s, manual_yield, cg))
+                        })
+                }
+                StmtKind::Switch { scrutinee, arms } => {
+                    expr_can_yield(scrutinee, cg)
+                        || arms.iter().any(|a| {
+                            a.body
+                                .stmts
+                                .iter()
+                                .any(|s| stmt_can_yield(s, manual_yield, cg))
+                        })
+                }
+                StmtKind::Wait { .. } => true,
+                StmtKind::While { cond, body } => {
+                    let is_true = matches!(&cond.kind, ExprKind::Literal(Literal::Bool(true)));
+                    (is_true && !manual_yield)
+                        || expr_can_yield(cond, cg)
+                        || body
+                            .stmts
+                            .iter()
+                            .any(|s| stmt_can_yield(s, manual_yield, cg))
+                }
+                StmtKind::ForRange {
+                    start, end, body, ..
+                } => {
+                    expr_can_yield(start, cg)
+                        || expr_can_yield(end, cg)
+                        || body
+                            .stmts
+                            .iter()
+                            .any(|s| stmt_can_yield(s, manual_yield, cg))
+                }
+                StmtKind::ForEach { iter, body, .. } => {
+                    expr_can_yield(iter, cg)
+                        || body
+                            .stmts
+                            .iter()
+                            .any(|s| stmt_can_yield(s, manual_yield, cg))
+                }
+                StmtKind::Critical { body } | StmtKind::Block(body) => {
+                    body.stmts.iter().any(|s| stmt_can_yield(s, manual_yield, cg))
+                }
+                StmtKind::NoYield { .. } => false,
+                _ => false,
+            }
+        }
+        let main_becomes_task = main_decl.is_some_and(|md| {
+            let Some(body) = &md.body else {
+                return false;
+            };
+            let manual_yield = has_attr_manual_yield(&md.attrs);
+            let stmts = &body.stmts;
+            let tail = match stmts.iter().rposition(|s| stmt_has_boot_spawn(s, &self.call_graph)) {
+                Some(idx) => &stmts[idx + 1..],
+                None => stmts.as_slice(),
+            };
+            tail.iter().any(|s| stmt_can_yield(s, manual_yield, &self.call_graph))
+        });
+        let total = self.spawned_tasks.len() + usize::from(main_becomes_task);
+        if total > MAX_TASKS {
+            let (span, msg) = if self.spawned_tasks.len() > MAX_TASKS {
+                (
+                    self.spawned_tasks[MAX_TASKS].span,
+                    format!(
+                        "program instantiates {} static task slots (max {} supported by scheduler bitmasks)",
+                        total, MAX_TASKS
+                    ),
+                )
+            } else {
+                let sp = main_decl.map_or_else(Span::dummy, |m| m.name.span);
+                (
+                    sp,
+                    format!(
+                        "program instantiates {} tasks plus the 'main()' supervisor task ({} total, max {} supported by scheduler bitmasks)",
+                        self.spawned_tasks.len(),
+                        total,
+                        MAX_TASKS
+                    ),
+                )
+            };
+            self.emit(Diagnostic::new(DiagnosticKind::InvalidSpawnContext, span, msg));
         }
     }
 }

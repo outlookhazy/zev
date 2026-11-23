@@ -396,9 +396,12 @@ init_default_st:
     };
 
     let scr_update_ir = if spec.allow_sleep_deep {
-        r#"  %scr_old = load volatile i32, ptr inttoptr (i32 -536810224 to ptr), align 4
+        r#"  %has_dl = load volatile i8, ptr @__syn_has_deadline_waiter, align 1
+  %dl_active = icmp ne i8 %has_dl, 0
+  %block_deep = or i1 %locked, %dl_active
+  %scr_old = load volatile i32, ptr inttoptr (i32 -536810224 to ptr), align 4
   %scr_clr = and i32 %scr_old, -5
-  %scr_bit = select i1 %locked, i32 0, i32 4
+  %scr_bit = select i1 %block_deep, i32 0, i32 4
   %scr_new = or i32 %scr_clr, %scr_bit
   store volatile i32 %scr_new, ptr inttoptr (i32 -536810224 to ptr), align 4"#
     } else {

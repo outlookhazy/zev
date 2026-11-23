@@ -134,7 +134,7 @@ pub fn emit_kernel_runtime_ir_with_features(
   i8   ; 4: is_buf  (0 => UART; 1 => bounded byte buffer; 2 => byte_ring header/buf)
 }}
 
-%SynRingHdr = type {{ i32, i32, i32, i32, i32, i32, i8, [0 x i8] }}
+%SynRingHdr = type {{ i32, i32, i32, i32, i32, i32, i32, i8, [0 x i8] }}
 "#
     );
     let _ = writeln!(
@@ -150,7 +150,7 @@ pub fn emit_kernel_runtime_ir_with_features(
   i8,  ; 6: polled_round (1=polled in current Poll pass)
   i8,  ; 7: has_timeout
   i8,  ; 8: boosted
-  i8,  ; 9: core_pin
+  i8,  ; 9: slot_id (0..31)
   i32, ; 10: due_tick (starvation deadline)
   i32, ; 11: wake_tick (timer / timeout deadline)
   ptr  ; 12: wait_obj (primitive pointer while BLOCKED_PRIM)
@@ -170,18 +170,36 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_wfi_count = global i32 0, align 4
 @__syn_irq_woke_urgent = global i8 0, align 1
 @__syn_current_task = global ptr null, align 4{cm_boot_global}
+@__syn_ready_mask = internal global [4 x i32] zeroinitializer, align 4
+@__syn_earliest_deadline = internal global i32 0, align 4
+@__syn_has_deadline_waiter = internal global i8 0, align 1
 "#
     );
 
     let sz = opts.fn_size_attrs();
+    let rv_can_wfi_on_deadline =
+        features.uses_rv_irqs && (features.uses_sys_tick || !features.uses_clock_hook);
 
     match spec.isa {
         CpuIsa::ArmCortexM => {
             crate::arm_cortex_m::emit_arm_cortex_m_hal_ir(out, &spec, sz, features.uses_clock_hook)
         }
-        CpuIsa::Riscv32 => crate::riscv32::emit_riscv32_hal_ir(out, &spec, sz),
+        CpuIsa::Riscv32 => crate::riscv32::emit_riscv32_hal_ir(
+            out,
+            &spec,
+            sz,
+            features.uses_rv_irqs,
+            rv_can_wfi_on_deadline,
+        ),
         CpuIsa::Avr => crate::avr::emit_avr_hal_ir(out, sz),
         CpuIsa::HostX86_64Linux => emit_host_linux_hal_ir(out, sz),
+    }
+
+    if spec.isa != CpuIsa::HostX86_64Linux {
+        let _ = writeln!(
+            out,
+            "\ndefine void @__syn_fuzz_irqs(i32 %seed, i32 %mask){fn_as} nounwind{sz} {{\nentry:\n  ret void\n}}\n"
+        );
     }
 
     if features.uses_sys_tick {
@@ -662,13 +680,113 @@ fn emit_host_linux_hal_ir(out: &mut String, sz: &str) {
 declare i32 @putchar(i32) nounwind
 declare void @exit(i32) noreturn nounwind
 
+@__syn_host_in_boot = global i8 1, align 1
+@__syn_host_spin_polls = global i32 0, align 4
+@__syn_host_crit_depth = internal global i32 0, align 4
+@__syn_fuzz_prng = internal global i32 0, align 4
+@__syn_fuzz_irq_mask = internal global i32 0, align 4
+@__syn_fuzz_in_dispatch = internal global i8 0, align 1
+
+define void @__syn_fuzz_irqs(i32 %seed, i32 %mask) nounwind{sz} {{
+entry:
+  %z = icmp eq i32 %seed, 0
+  %init = select i1 %z, i32 1831565813, i32 %seed
+  store i32 %init, ptr @__syn_fuzz_prng, align 4
+  store i32 %mask, ptr @__syn_fuzz_irq_mask, align 4
+  ret void
+}}
+
+define i32 @__syn_host_now_ms() nounwind{sz} {{
+entry:
+  %in_boot = load i8, ptr @__syn_host_in_boot, align 1
+  %boot_done = icmp eq i8 %in_boot, 0
+  br i1 %boot_done, label %chk_st, label %ret_tick
+chk_st:
+  %st_en = load i8, ptr @__syn_systick_enabled, align 1
+  %has_st = icmp ne i8 %st_en, 0
+  br i1 %has_st, label %bump_poll, label %ret_tick
+bump_poll:
+  %sp = load i32, ptr @__syn_host_spin_polls, align 4
+  %sp1 = add i32 %sp, 1
+  %roll = icmp sge i32 %sp1, 256
+  br i1 %roll, label %adv_tick, label %save_poll
+save_poll:
+  store i32 %sp1, ptr @__syn_host_spin_polls, align 4
+  br label %ret_tick
+adv_tick:
+  store i32 0, ptr @__syn_host_spin_polls, align 4
+  %t0 = load volatile i32, ptr @__syn_tick_ms, align 4
+  %t1 = add i32 %t0, 1
+  store volatile i32 %t1, ptr @__syn_tick_ms, align 4
+  br label %ret_tick
+ret_tick:
+  %t = load volatile i32, ptr @__syn_tick_ms, align 4
+  ret i32 %t
+}}
+
 define i32 @__syn_crit_enter() nounwind{sz} {{
 entry:
-  ret i32 0
+  %d = load i32, ptr @__syn_host_crit_depth, align 4
+  %d1 = add i32 %d, 1
+  store i32 %d1, ptr @__syn_host_crit_depth, align 4
+  ret i32 %d
 }}
 
 define void @__syn_crit_exit(i32 %pm) nounwind{sz} {{
 entry:
+  store i32 %pm, ptr @__syn_host_crit_depth, align 4
+  %is_outer = icmp eq i32 %pm, 0
+  br i1 %is_outer, label %chk_fuzz, label %done
+chk_fuzz:
+  %in_boot = load i8, ptr @__syn_host_in_boot, align 1
+  %boot_done = icmp eq i8 %in_boot, 0
+  %in_disp = load i8, ptr @__syn_fuzz_in_dispatch, align 1
+  %not_disp = icmp eq i8 %in_disp, 0
+  %mask = load i32, ptr @__syn_fuzz_irq_mask, align 4
+  %has_mask = icmp ne i32 %mask, 0
+  %c0 = and i1 %boot_done, %not_disp
+  %c1 = and i1 %c0, %has_mask
+  br i1 %c1, label %step_rng, label %done
+step_rng:
+  %x0 = load i32, ptr @__syn_fuzz_prng, align 4
+  %xz = icmp eq i32 %x0, 0
+  %xs = select i1 %xz, i32 -1640531527, i32 %x0
+  %s13 = shl i32 %xs, 13
+  %x1 = xor i32 %xs, %s13
+  %s17 = lshr i32 %x1, 17
+  %x2 = xor i32 %x1, %s17
+  %s5 = shl i32 %x2, 5
+  %x3 = xor i32 %x2, %s5
+  store i32 %x3, ptr @__syn_fuzz_prng, align 4
+  %fire_bit = and i32 %x3, 1
+  %do_fire = icmp ne i32 %fire_bit, 0
+  br i1 %do_fire, label %pick_init, label %done
+pick_init:
+  %sh = lshr i32 %x3, 1
+  %start = and i32 %sh, 31
+  br label %pick_loop
+pick_loop:
+  %k = phi i32 [ 0, %pick_init ], [ %knext, %pick_cont ]
+  %kdone = icmp uge i32 %k, 32
+  br i1 %kdone, label %done, label %pick_body
+pick_body:
+  %sum = add i32 %start, %k
+  %irq = and i32 %sum, 31
+  %bit = shl i32 1, %irq
+  %hit = and i32 %mask, %bit
+  %found = icmp ne i32 %hit, 0
+  br i1 %found, label %fire_irq, label %pick_cont
+pick_cont:
+  %knext = add i32 %k, 1
+  br label %pick_loop
+fire_irq:
+  store i8 1, ptr @__syn_fuzz_in_dispatch, align 1
+  store i32 1, ptr @__syn_host_crit_depth, align 4
+  call void @__syn_host_dispatch_irq(i32 %irq)
+  store i32 0, ptr @__syn_host_crit_depth, align 4
+  store i8 0, ptr @__syn_fuzz_in_dispatch, align 1
+  br label %done
+done:
   ret void
 }}
 
@@ -710,6 +828,7 @@ entry:
   %wc1 = add i32 %wc, 1
   store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
   call void @__syn_on_idle(i32 1, i32 %depth)
+  store i32 0, ptr @__syn_host_spin_polls, align 4
   %t = load volatile i32, ptr @__syn_tick_ms, align 4
   %t1 = add i32 %t, 1
   store volatile i32 %t1, ptr @__syn_tick_ms, align 4
@@ -869,6 +988,40 @@ hbody:
 hex_done:
   ret void
 }}
+
+@__syn_panic_prefix = private unnamed_addr constant [9 x i8] c"[PANIC] \00", align 1
+@__syn_panic_idx = private unnamed_addr constant [21 x i8] c"index out of bounds\0A\00", align 1
+@__syn_panic_slc = private unnamed_addr constant [27 x i8] c"slice bounds out of range\0A\00", align 1
+@__syn_panic_mmio = private unnamed_addr constant [26 x i8] c"mmio index out of bounds\0A\00", align 1
+@__syn_panic_div = private unnamed_addr constant [18 x i8] c"division by zero\0A\00", align 1
+@__syn_panic_def = private unnamed_addr constant [14 x i8] c"runtime trap\0A\00", align 1
+
+define void @__syn_panic(i8 %reason){fn_as} noreturn nounwind noinline cold{sz} {{
+entry:
+  {call_kw} void @__syn_uart_puts(ptr @__syn_panic_prefix)
+  switch i8 %reason, label %m_def [
+    i8 1, label %m_idx
+    i8 2, label %m_slc
+    i8 3, label %m_mmio
+    i8 4, label %m_div
+  ]
+m_idx:
+  br label %emit
+m_slc:
+  br label %emit
+m_mmio:
+  br label %emit
+m_div:
+  br label %emit
+m_def:
+  br label %emit
+emit:
+  %msg = phi ptr [ @__syn_panic_idx, %m_idx ], [ @__syn_panic_slc, %m_slc ], [ @__syn_panic_mmio, %m_mmio ], [ @__syn_panic_div, %m_div ], [ @__syn_panic_def, %m_def ]
+  {call_kw} void @__syn_uart_puts(ptr %msg)
+  {call_kw} void @__syn_on_fault()
+  {call_kw} void @__syn_platform_exit(i32 101)
+  unreachable
+}}
 "#
     );
 }
@@ -883,6 +1036,32 @@ fn emit_scheduler_core_ir(
     let fn_ptr_ty = isa.fn_ptr_llvm_ty();
     let fn_as = isa.fn_addrspace_attr();
     let call_kw = isa.call_kw();
+    let crit_enter_ss = if isa.is_avr() {
+        format!("  %pm = {call_kw} i32 @__syn_crit_enter()\n")
+    } else {
+        String::new()
+    };
+    let crit_exit_ss = if isa.is_avr() {
+        format!("  {call_kw} void @__syn_crit_exit(i32 %pm)\n")
+    } else {
+        String::new()
+    };
+    let slow_crit_enter_ss = if isa.is_avr() {
+        String::new()
+    } else {
+        format!("  %pm_s = {call_kw} i32 @__syn_crit_enter()\n")
+    };
+    let slow_crit_exit_ss = if isa.is_avr() {
+        String::new()
+    } else {
+        format!("  {call_kw} void @__syn_crit_exit(i32 %pm_s)\n")
+    };
+    let fast_unlock_ss = if isa.is_avr() {
+        "ret_false_fast"
+    } else {
+        "ret_false"
+    };
+    let mask_al = if isa.is_avr() { 1 } else { 4 };
     let _ = writeln!(
         out,
         r#"
@@ -896,6 +1075,78 @@ entry:
   %wp = getelementptr inbounds [4 x i32], ptr @__syn_max_wait, i32 0, i32 %idx
   %w = load i32, ptr %wp, align 4
   ret i32 %w
+}}
+
+define void @__syn_ready_set_task(ptr %tp){fn_as} nounwind noinline{sz} {{
+entry:
+  %sl_p = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 9
+  %sl8 = load i8, ptr %sl_p, align 1
+  %sl = zext i8 %sl8 to i32
+  %s = and i32 %sl, 31
+  %bit = shl i32 1, %s
+  %clr = xor i32 %bit, -1
+  br label %clr_loop
+clr_loop:
+  %i = phi i32 [ 0, %entry ], [ %inext, %clr_loop ]
+  %mp = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 %i
+  %cur = load i32, ptr %mp, align 4
+  %nxt = and i32 %cur, %clr
+  store i32 %nxt, ptr %mp, align 4
+  %inext = add i32 %i, 1
+  %more = icmp ult i32 %inext, 4
+  br i1 %more, label %clr_loop, label %set_bit
+set_bit:
+  %ep_p = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
+  %ep8 = load i8, ptr %ep_p, align 1
+  %ep32 = zext i8 %ep8 to i32
+  %ep_idx = and i32 %ep32, 3
+  %tp_m = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 %ep_idx
+  %old = load i32, ptr %tp_m, align 4
+  %newv = or i32 %old, %bit
+  store i32 %newv, ptr %tp_m, align 4
+  ret void
+}}
+
+define void @__syn_ready_clear_task(ptr %tp){fn_as} nounwind noinline{sz} {{
+entry:
+  %sl_p = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 9
+  %sl8 = load i8, ptr %sl_p, align 1
+  %sl = zext i8 %sl8 to i32
+  %s = and i32 %sl, 31
+  %bit = shl i32 1, %s
+  %clr = xor i32 %bit, -1
+  br label %clr_loop
+clr_loop:
+  %i = phi i32 [ 0, %entry ], [ %inext, %clr_loop ]
+  %mp = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 %i
+  %cur = load i32, ptr %mp, align 4
+  %nxt = and i32 %cur, %clr
+  store i32 %nxt, ptr %mp, align 4
+  %inext = add i32 %i, 1
+  %more = icmp ult i32 %inext, 4
+  br i1 %more, label %clr_loop, label %done
+done:
+  ret void
+}}
+
+define void @__syn_note_deadline(i32 %dl){fn_as} nounwind noinline{sz} {{
+entry:
+  %now = {call_kw} i32 @__syn_now_ms()
+  %d_new = sub i32 %dl, %now
+  %has = load i8, ptr @__syn_has_deadline_waiter, align 1
+  %empty = icmp eq i8 %has, 0
+  br i1 %empty, label %set_new, label %cmp_old
+cmp_old:
+  %cur = load i32, ptr @__syn_earliest_deadline, align 4
+  %d_cur = sub i32 %cur, %now
+  %sooner = icmp slt i32 %d_new, %d_cur
+  br i1 %sooner, label %set_new, label %done
+set_new:
+  store i8 1, ptr @__syn_has_deadline_waiter, align 1
+  store i32 %dl, ptr @__syn_earliest_deadline, align 4
+  ret void
+done:
+  ret void
 }}
 
 define void @__syn_boost_task_ptr(ptr %task, i32 %boost_prio, i32 %now){fn_as} nounwind{sz} {{
@@ -921,6 +1172,12 @@ apply:
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
+  %st_pb = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 2
+  %stb = load i8, ptr %st_pb, align 1
+  %is_rb = icmp eq i8 %stb, 1
+  br i1 %is_rb, label %upd_rm, label %done
+upd_rm:
+  {call_kw} void @__syn_ready_set_task(ptr %task)
   br label %done
 done:
   ret void
@@ -947,6 +1204,12 @@ do_restore:
   %due_r = add i32 %now_r, %win_r
   %due_p = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 10
   store i32 %due_r, ptr %due_p, align 4
+  %st_pe = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 2
+  %ste = load i8, ptr %st_pe, align 1
+  %is_re = icmp eq i8 %ste, 1
+  br i1 %is_re, label %upd_re, label %unlock
+upd_re:
+  {call_kw} void @__syn_ready_set_task(ptr %task)
   br label %unlock
 unlock:
   {call_kw} void @__syn_crit_exit(i32 %pm)
@@ -975,9 +1238,17 @@ check_min:
   %lt = icmp slt i8 %p8, %cur_ep
   %min_ep = select i1 %lt, i8 %p8, i8 %cur_ep
   store i8 %min_ep, ptr %ep_ptr, align 1
-  br label %unlock
+  br label %upd_prio_rm
 set_ep:
   store i8 %p8, ptr %ep_ptr, align 1
+  br label %upd_prio_rm
+upd_prio_rm:
+  %st_ps = getelementptr inbounds %SynTask, ptr %cur, i32 0, i32 2
+  %sts = load i8, ptr %st_ps, align 1
+  %is_rs = icmp eq i8 %sts, 1
+  br i1 %is_rs, label %do_set_rs, label %unlock
+do_set_rs:
+  {call_kw} void @__syn_ready_set_task(ptr %cur)
   br label %unlock
 unlock:
   {call_kw} void @__syn_crit_exit(i32 %pm)
@@ -1000,28 +1271,49 @@ ok:
   ret i32 %ep32
 }}
 
-define void @__syn_wake_waiters(ptr %prim, i32 %boost_prio){fn_as} nounwind{sz} {{
+define void @__syn_wake_all_mask(ptr %mask_ptr, i32 %boost_prio){fn_as} nounwind{sz} {{
 entry:
+  %m0 = load volatile i32, ptr %mask_ptr, align {mask_al}
+  %empty = icmp eq i32 %m0, 0
+  br i1 %empty, label %fast_exit, label %scan_init
+fast_exit:
+  ret void
+scan_init:
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  %m = load volatile i32, ptr %mask_ptr, align {mask_al}
   %n = load i32, ptr @__syn_task_count, align 4
   %now = {call_kw} i32 @__syn_now_ms()
   br label %loop
 loop:
-  %i = phi i32 [ 0, %entry ], [ %inext, %cont ]
-  %done = icmp sge i32 %i, %n
+  %i = phi i32 [ 0, %scan_init ], [ %inext, %cont ]
+  %cur_m = phi i32 [ %m, %scan_init ], [ %next_m, %cont ]
+  %rem_z = icmp eq i32 %cur_m, 0
+  %i_done = icmp sge i32 %i, %n
+  %done = or i1 %rem_z, %i_done
   br i1 %done, label %exit, label %body
 body:
+  %bit = shl i32 1, %i
+  %hit = and i32 %cur_m, %bit
+  %is_hit = icmp ne i32 %hit, 0
+  br i1 %is_hit, label %clr_and_check, label %skip_cont
+skip_cont:
+  br label %cont
+clr_and_check:
+  %clr_b = xor i32 %bit, -1
+  %cur_mem = load volatile i32, ptr %mask_ptr, align {mask_al}
+  %up_mem = and i32 %cur_mem, %clr_b
+  store volatile i32 %up_mem, ptr %mask_ptr, align {mask_al}
+  %rem_after = and i32 %cur_m, %clr_b
   %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %i
   %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
   %st = load i8, ptr %st_ptr, align 1
   %is_blk = icmp eq i8 %st, 3
-  br i1 %is_blk, label %chk_obj, label %cont
-chk_obj:
-  %wo_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 12
-  %wo = load ptr, ptr %wo_ptr, align 4
-  %match = icmp eq ptr %wo, %prim
-  br i1 %match, label %wake, label %cont
+  br i1 %is_blk, label %wake, label %stale_cont
+stale_cont:
+  br label %cont
 wake:
   store i8 1, ptr %st_ptr, align 1
+  %wo_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 12
   store ptr null, ptr %wo_ptr, align 4
   %ht_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 7
   store i8 0, ptr %ht_ptr, align 1
@@ -1035,25 +1327,39 @@ wake:
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
+  {call_kw} void @__syn_ready_set_task(ptr %tp)
   {call_kw} void @__syn_boost_task_ptr(ptr %tp, i32 %boost_prio, i32 %now)
+  %ep_fin = load i8, ptr %ep_ptr, align 1
+  %is_urg = icmp eq i8 %ep_fin, 0
+  br i1 %is_urg, label %set_urg, label %cont
+set_urg:
   store volatile i8 1, ptr @__syn_irq_woke_urgent, align 1
   br label %cont
 cont:
+  %next_m = phi i32 [ %cur_m, %skip_cont ], [ %rem_after, %stale_cont ], [ %rem_after, %wake ], [ %rem_after, %set_urg ]
   %inext = add i32 %i, 1
   br label %loop
 exit:
+  {call_kw} void @__syn_crit_exit(i32 %pm)
   ret void
 }}
 
-define void @__syn_wake_one_waiter(ptr %prim, i32 %boost_prio){fn_as} nounwind{sz} {{
+define i8 @__syn_wake_one_mask(ptr %mask_ptr, i32 %boost_prio){fn_as} nounwind{sz} {{
 entry:
+  %m0 = load volatile i32, ptr %mask_ptr, align {mask_al}
+  %empty = icmp eq i32 %m0, 0
+  br i1 %empty, label %fast_none, label %chk_cnt
+fast_none:
+  ret i8 0
+chk_cnt:
+  %pm = {call_kw} i32 @__syn_crit_enter()
   %n = load i32, ptr @__syn_task_count, align 4
-  %empty = icmp sle i32 %n, 0
-  br i1 %empty, label %exit, label %prio_loop
+  %no_t = icmp sle i32 %n, 0
+  br i1 %no_t, label %ret_none, label %prio_loop
 prio_loop:
-  %p = phi i32 [ 0, %entry ], [ %pnext, %prio_next ]
+  %p = phi i32 [ 0, %chk_cnt ], [ %pnext, %prio_next ]
   %pdone = icmp sge i32 %p, 4
-  br i1 %pdone, label %exit, label %prio_body
+  br i1 %pdone, label %ret_none, label %prio_body
 prio_body:
   %rr_ptr = getelementptr inbounds [4 x i32], ptr @__syn_rr_idx, i32 0, i32 %p
   %rr_raw = load i32, ptr %rr_ptr, align 4
@@ -1070,24 +1376,34 @@ slot_body:
   %sum_ge = icmp uge i32 %sum, %n
   %sum_sub = sub i32 %sum, %n
   %idx = select i1 %sum_ge, i32 %sum_sub, i32 %sum
+  %bit = shl i32 1, %idx
+  %cur_m = load volatile i32, ptr %mask_ptr, align {mask_al}
+  %hit = and i32 %cur_m, %bit
+  %is_hit = icmp ne i32 %hit, 0
+  br i1 %is_hit, label %chk_blk, label %slot_next
+chk_blk:
   %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %idx
   %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
   %st = load i8, ptr %st_ptr, align 1
   %is_blk = icmp eq i8 %st, 3
-  br i1 %is_blk, label %chk_obj, label %slot_next
-chk_obj:
-  %wo_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 12
-  %wo = load ptr, ptr %wo_ptr, align 4
-  %match = icmp eq ptr %wo, %prim
-  br i1 %match, label %chk_prio, label %slot_next
+  br i1 %is_blk, label %chk_prio, label %clr_stale
+clr_stale:
+  %clr_s = xor i32 %bit, -1
+  %up_s = and i32 %cur_m, %clr_s
+  store volatile i32 %up_s, ptr %mask_ptr, align {mask_al}
+  br label %slot_next
 chk_prio:
   %ep_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
   %ep = load i8, ptr %ep_ptr, align 1
   %pmatch = icmp eq i8 %ep, %p8
   br i1 %pmatch, label %wake, label %slot_next
 wake:
+  %clr_w = xor i32 %bit, -1
+  %up_w = and i32 %cur_m, %clr_w
+  store volatile i32 %up_w, ptr %mask_ptr, align {mask_al}
   %now = {call_kw} i32 @__syn_now_ms()
   store i8 1, ptr %st_ptr, align 1
+  %wo_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 12
   store ptr null, ptr %wo_ptr, align 4
   %ht_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 7
   store i8 0, ptr %ht_ptr, align 1
@@ -1099,27 +1415,48 @@ wake:
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
+  {call_kw} void @__syn_ready_set_task(ptr %tp)
   {call_kw} void @__syn_boost_task_ptr(ptr %tp, i32 %boost_prio, i32 %now)
+  %ep_fin = load i8, ptr %ep_ptr, align 1
+  %is_urg = icmp eq i8 %ep_fin, 0
+  br i1 %is_urg, label %set_urg, label %ret_woken
+set_urg:
   store volatile i8 1, ptr @__syn_irq_woke_urgent, align 1
-  ret void
+  br label %ret_woken
+ret_woken:
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  ret i8 1
 slot_next:
   %knext = add i32 %k, 1
   br label %slot_loop
 prio_next:
   %pnext = add i32 %p, 1
   br label %prio_loop
-exit:
-  ret void
+ret_none:
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  ret i8 0
 }}
 
 define void @__syn_wake_timers(i32 %now){fn_as} nounwind noinline{sz} {{
 entry:
+  %has_dl = load i8, ptr @__syn_has_deadline_waiter, align 1
+  %no_dl = icmp eq i8 %has_dl, 0
+  br i1 %no_dl, label %exit, label %chk_earl
+chk_earl:
+  %earl = load i32, ptr @__syn_earliest_deadline, align 4
+  %ediff = sub i32 %now, %earl
+  %not_due = icmp slt i32 %ediff, 0
+  br i1 %not_due, label %exit, label %start_scan
+start_scan:
   %n = load i32, ptr @__syn_task_count, align 4
   br label %loop
 loop:
-  %i = phi i32 [ 0, %entry ], [ %inext, %cont ]
+  %i = phi i32 [ 0, %start_scan ], [ %inext, %cont ]
+  %has_rem = phi i8 [ 0, %start_scan ], [ %next_has, %cont ]
+  %best_dl = phi i32 [ 0, %start_scan ], [ %next_best_dl, %cont ]
+  %best_delta = phi i32 [ 2147483647, %start_scan ], [ %next_best_delta, %cont ]
   %done = icmp sge i32 %i, %n
-  br i1 %done, label %exit, label %body
+  br i1 %done, label %save_dl, label %body
 body:
   %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %i
   %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
@@ -1128,18 +1465,30 @@ body:
   br i1 %is_dl, label %chk_wake, label %chk_prim_to
 chk_prim_to:
   %is_prim = icmp eq i8 %st, 3
-  br i1 %is_prim, label %chk_ht, label %cont
+  br i1 %is_prim, label %chk_ht, label %skip_row
+skip_row:
+  br label %cont
 chk_ht:
   %ht_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 7
   %ht = load i8, ptr %ht_ptr, align 1
   %has_to = icmp ne i8 %ht, 0
-  br i1 %has_to, label %chk_wake, label %cont
+  br i1 %has_to, label %chk_wake, label %skip_ht
+skip_ht:
+  br label %cont
 chk_wake:
   %wt_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 11
   %wt = load i32, ptr %wt_ptr, align 4
   %diff = sub i32 %now, %wt
   %expired = icmp sge i32 %diff, 0
-  br i1 %expired, label %do_wake, label %cont
+  br i1 %expired, label %do_wake, label %keep_dl
+keep_dl:
+  %rem_d = sub i32 %wt, %now
+  %empty_rem = icmp eq i8 %has_rem, 0
+  %sooner = icmp slt i32 %rem_d, %best_delta
+  %take_d = or i1 %empty_rem, %sooner
+  %cand_dl = select i1 %take_d, i32 %wt, i32 %best_dl
+  %cand_del = select i1 %take_d, i32 %rem_d, i32 %best_delta
+  br label %cont
 do_wake:
   store i8 1, ptr %st_ptr, align 1
   %wo_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 12
@@ -1156,35 +1505,41 @@ do_wake:
   %due = add i32 %now, %win
   %due_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 10
   store i32 %due, ptr %due_ptr, align 4
+  {call_kw} void @__syn_ready_set_task(ptr %tp)
+  %is_urg_t = icmp eq i8 %ep, 0
+  br i1 %is_urg_t, label %set_urg_t, label %cont
+set_urg_t:
+  store volatile i8 1, ptr @__syn_irq_woke_urgent, align 1
   br label %cont
 cont:
+  %next_has = phi i8 [ %has_rem, %skip_row ], [ %has_rem, %skip_ht ], [ 1, %keep_dl ], [ %has_rem, %do_wake ], [ %has_rem, %set_urg_t ]
+  %next_best_dl = phi i32 [ %best_dl, %skip_row ], [ %best_dl, %skip_ht ], [ %cand_dl, %keep_dl ], [ %best_dl, %do_wake ], [ %best_dl, %set_urg_t ]
+  %next_best_delta = phi i32 [ %best_delta, %skip_row ], [ %best_delta, %skip_ht ], [ %cand_del, %keep_dl ], [ %best_delta, %do_wake ], [ %best_delta, %set_urg_t ]
   %inext = add i32 %i, 1
   br label %loop
+save_dl:
+  store i8 %has_rem, ptr @__syn_has_deadline_waiter, align 1
+  store i32 %best_dl, ptr @__syn_earliest_deadline, align 4
+  br label %exit
 exit:
   ret void
 }}
 
 define i1 @__syn_any_ready_task(){fn_as} nounwind noinline{sz} {{
 entry:
-  %n = load i32, ptr @__syn_task_count, align 4
-  br label %loop
-loop:
-  %i = phi i32 [ 0, %entry ], [ %inext, %cont ]
-  %done = icmp sge i32 %i, %n
-  br i1 %done, label %ret_false, label %body
-body:
-  %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %i
-  %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
-  %st = load i8, ptr %st_ptr, align 1
-  %rdy = icmp eq i8 %st, 1
-  br i1 %rdy, label %ret_true, label %cont
-cont:
-  %inext = add i32 %i, 1
-  br label %loop
-ret_true:
-  ret i1 true
-ret_false:
-  ret i1 false
+  %p0 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 0
+  %p1 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 1
+  %p2 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 2
+  %p3 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 3
+  %m0 = load i32, ptr %p0, align 4
+  %m1 = load i32, ptr %p1, align 4
+  %m2 = load i32, ptr %p2, align 4
+  %m3 = load i32, ptr %p3, align 4
+  %o01 = or i32 %m0, %m1
+  %o23 = or i32 %m2, %m3
+  %all = or i32 %o01, %o23
+  %any = icmp ne i32 %all, 0
+  ret i1 %any
 }}
 
 define i1 @__syn_any_alive_task(){fn_as} nounwind{sz} {{
@@ -1225,11 +1580,43 @@ chk_null:
 chk_irq:
   %woke = load volatile i8, ptr @__syn_irq_woke_urgent, align 1
   %has_woke = icmp ne i8 %woke, 0
-  br i1 %has_woke, label %ret_true, label %scan_init
+  br i1 %has_woke, label %ret_true, label %fast_pre
+fast_pre:
+{crit_enter_ss}  %has_dl = load i8, ptr @__syn_has_deadline_waiter, align 1
+  %dl_armed = icmp ne i8 %has_dl, 0
+  br i1 %dl_armed, label %chk_dl_due, label %fast_mask
+chk_dl_due:
+  %now_f = {call_kw} i32 @__syn_now_ms()
+  %earl = load i32, ptr @__syn_earliest_deadline, align 4
+  %ediff = sub i32 %now_f, %earl
+  %dl_due = icmp sge i32 %ediff, 0
+  br i1 %dl_due, label %scan_init, label %fast_mask
+fast_mask:
+  %sl_p = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 9
+  %sl8 = load i8, ptr %sl_p, align 1
+  %sl = zext i8 %sl8 to i32
+  %sl_m = and i32 %sl, 31
+  %self_bit = shl i32 1, %sl_m
+  %not_self = xor i32 %self_bit, -1
+  %mp0 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 0
+  %mp1 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 1
+  %mp2 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 2
+  %mp3 = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 3
+  %m0 = load i32, ptr %mp0, align 4
+  %m1 = load i32, ptr %mp1, align 4
+  %m2 = load i32, ptr %mp2, align 4
+  %m3 = load i32, ptr %mp3, align 4
+  %a01 = or i32 %m0, %m1
+  %a23 = or i32 %m2, %m3
+  %all = or i32 %a01, %a23
+  %other = and i32 %all, %not_self
+  %has_other = icmp ne i32 %other, 0
+  br i1 %has_other, label %scan_init, label %{fast_unlock_ss}
+ret_false_fast:
+{crit_exit_ss}  br label %ret_false
 scan_init:
   %now = {call_kw} i32 @__syn_now_ms()
-  %pm = {call_kw} i32 @__syn_crit_enter()
-  {call_kw} void @__syn_wake_timers(i32 %now)
+{slow_crit_enter_ss}  {call_kw} void @__syn_wake_timers(i32 %now)
   %my_ep_ptr = getelementptr inbounds %SynTask, ptr %task, i32 0, i32 4
   %my_ep = load i8, ptr %my_ep_ptr, align 1
   %n = load i32, ptr @__syn_task_count, align 4
@@ -1271,11 +1658,9 @@ cont:
   %inext = add i32 %i, 1
   br label %loop
 ret_true_unlock:
-  {call_kw} void @__syn_crit_exit(i32 %pm)
-  br label %ret_true
+{crit_exit_ss}{slow_crit_exit_ss}  br label %ret_true
 ret_false_unlock:
-  {call_kw} void @__syn_crit_exit(i32 %pm)
-  br label %ret_false
+{crit_exit_ss}{slow_crit_exit_ss}  br label %ret_false
 ret_true:
   ret i1 true
 ret_false:
@@ -1293,12 +1678,18 @@ prio_loop:
   %pdone = icmp sge i32 %p, 4
   br i1 %pdone, label %not_found, label %prio_body
 prio_body:
+  %pmask_p = getelementptr inbounds [4 x i32], ptr @__syn_ready_mask, i32 0, i32 %p
+  %pmask = load i32, ptr %pmask_p, align 4
+  %pm_zero = icmp eq i32 %pmask, 0
+  br i1 %pm_zero, label %prio_next, label %prio_has
+prio_has:
   %rr_ptr = getelementptr inbounds [4 x i32], ptr @__syn_rr_idx, i32 0, i32 %p
-  %rr = load i32, ptr %rr_ptr, align 4
-  %p8 = trunc i32 %p to i8
+  %rr_raw = load i32, ptr %rr_ptr, align 4
+  %rr_ok = icmp ult i32 %rr_raw, %n
+  %rr = select i1 %rr_ok, i32 %rr_raw, i32 0
   br label %slot_loop
 slot_loop:
-  %k = phi i32 [ 0, %prio_body ], [ %knext, %slot_next ]
+  %k = phi i32 [ 0, %prio_has ], [ %knext, %slot_next ]
   %kdone = icmp sge i32 %k, %n
   br i1 %kdone, label %prio_next, label %slot_body
 slot_body:
@@ -1306,17 +1697,12 @@ slot_body:
   %sum_ge = icmp uge i32 %sum, %n
   %sum_sub = sub i32 %sum, %n
   %idx = select i1 %sum_ge, i32 %sum_sub, i32 %sum
-  %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %idx
-  %st_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 2
-  %st = load i8, ptr %st_ptr, align 1
-  %rdy = icmp eq i8 %st, 1
-  br i1 %rdy, label %chk_prio, label %slot_next
-chk_prio:
-  %ep_ptr = getelementptr inbounds %SynTask, ptr %tp, i32 0, i32 4
-  %ep = load i8, ptr %ep_ptr, align 1
-  %pmatch = icmp eq i8 %ep, %p8
-  br i1 %pmatch, label %chk_mode, label %slot_next
+  %sbit = shl i32 1, %idx
+  %in_pmask = and i32 %pmask, %sbit
+  %bit_on = icmp ne i32 %in_pmask, 0
+  br i1 %bit_on, label %chk_mode, label %slot_next
 chk_mode:
+  %tp = getelementptr inbounds %SynTask, ptr @__syn_tasks, i32 %idx
   %m0 = icmp eq i8 %mode, 0
   br i1 %m0, label %mode_overdue, label %chk_m1
 mode_overdue:
@@ -1424,12 +1810,16 @@ entry:
   store i8 0, ptr %f6, align 1
   store i8 0, ptr %f7, align 1
   store i8 0, ptr %f8, align 1
-  store i8 %core_pin, ptr %f9, align 1
+  %slot8 = trunc i32 %slot to i8
+  store i8 %slot8, ptr %f9, align 1
   %win = {call_kw} i32 @__syn_starvation_window(i8 %prio)
   %due = add i32 %now, %win
   store i32 %due, ptr %f10, align 4
   store i32 0, ptr %f11, align 4
   store ptr null, ptr %f12, align 4
+  %pm_act = {call_kw} i32 @__syn_crit_enter()
+  {call_kw} void @__syn_ready_set_task(ptr %tp)
+  {call_kw} void @__syn_crit_exit(i32 %pm_act)
   ret void
 }}
 "#
@@ -1526,6 +1916,7 @@ on_more:
   %now_m = {call_kw} i32 @__syn_now_ms()
   %due_m = add i32 %now_m, %win_m
   store i32 %due_m, ptr %due_ptr, align 4
+  {call_kw} void @__syn_ready_set_task(ptr %tp)
   {call_kw} void @__syn_crit_exit(i32 %pm_m)
   br label %tick_loop
 
@@ -1533,8 +1924,11 @@ chk_done:
   %is_done = icmp eq i32 %st, 2
   br i1 %is_done, label %on_done, label %on_wait
 on_done:
+  %pm_d = {call_kw} i32 @__syn_crit_enter()
   store i8 0, ptr %st_ptr, align 1
   store i8 0, ptr %mp_ptr, align 1
+  {call_kw} void @__syn_ready_clear_task(ptr %tp)
+  {call_kw} void @__syn_crit_exit(i32 %pm_d)
   {call_kw} void @__syn_end_inbox_turn(ptr %tp)
   br label %tick_loop
 on_wait:
@@ -3389,7 +3783,7 @@ ring_chk:
   %r_fit = icmp ugt i32 %r_fs, 0
   br i1 %r_fit, label %ring_wr, label %ring_trunc
 ring_wr:
-  %r_bp = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 7, i32 %r_t
+  %r_bp = getelementptr inbounds %SynRingHdr, ptr %r, i32 0, i32 8, i32 %r_t
   store i8 %ch, ptr %r_bp, align 1
   %r_t1 = add i32 %r_t, 1
   %r_wrap = icmp uge i32 %r_t1, %r_cap

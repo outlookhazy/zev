@@ -591,9 +591,9 @@ mod tests {
 
                 [5]u8 raw = [10, 20, 30, 40, 50];
                 []u8 full = raw[0..5];
-                []u8 clamped = full[0..99];
-                []u8 tail = full[3..99];
-                []u8 empty_inv = full[4..2];
+                []u8 clamped = full[0..5];
+                []u8 tail = full[3..5];
+                []u8 empty_inv = full[2..2];
                 sys.log_kv("clamped_len=", clamped.len as i32);
                 sys.log_kv("tail_len=", tail.len as i32);
                 sys.log_kv("tail0=", tail[0] as i32);
@@ -2362,7 +2362,7 @@ mod tests {
         // Part 1 (M1): Float expression appearing ONLY inside `MirPlace::Index` must pull in soft-float shims.
         let src_place_only = r#"
             fn main() {
-                u32 arr[4] = [0, 0, 0, 0];
+                [4]u32 arr = [0, 0, 0, 0];
                 arr[((sys.now_ms() as f32) + 1.5f32) as usize] = 99;
                 if (arr[1] == 99) {
                     sys.exit(0);
@@ -3750,8 +3750,12 @@ fn main() {
             String::from_utf8_lossy(&link.stderr)
         );
         let run = Command::new(&h_exe_path).output().expect("run host exe");
-        assert!(run.status.success());
-        assert_eq!(String::from_utf8_lossy(&run.stdout), "HOST=99,20\n");
+        assert_eq!(run.status.code(), Some(101));
+        let h_out = String::from_utf8_lossy(&run.stdout);
+        assert!(
+            h_out.contains("[PANIC] mmio index out of bounds"),
+            "stdout={h_out}"
+        );
     }
 
     #[test]
@@ -4036,7 +4040,9 @@ irq IRQ_USART3_RXC = 37;
 signal tick_sig;
 
 pub fn console_putc(u8 c) {
-    while ((USART3.status & 0x20) == 0) {}
+    noyield {
+        while ((USART3.status & 0x20) == 0) {}
+    }
     USART3.txd_l = c;
 }
 
@@ -4499,7 +4505,7 @@ fn main() {
 
     // 1. Wrap-around + BipBuffer early wrap in pure LLVM IR on private ring
     assert(bip_rx.push("0123456789AB") == 12);
-    u8 pre[8];
+    [8]u8 pre;
     assert(bip_rx.pop(pre) == 8);
     assert(pre[0] == '0' && pre[7] == '7');
 
@@ -4512,7 +4518,7 @@ fn main() {
     wr[2] = 'Z';
     bip_rx.commit_write(3);
 
-    u8 tail_a[4];
+    [4]u8 tail_a;
     assert(bip_rx.pop(tail_a) == 4);
     assert(tail_a[0] == '8' && tail_a[3] == 'B');
 
@@ -4636,7 +4642,7 @@ usize exercise_ring(*byte_ring r, u8 seed) {
     r.consume(2);
     assert(r.len() == 2);
 
-    u8 popped[4];
+    [4]u8 popped;
     usize npop = r.pop(popped);
     assert(npop == 2);
     assert(popped[0] == 'C');
@@ -4874,7 +4880,7 @@ task reader() {
     println(f"QEMU_FMT_WAKE len={cw_len} b0={first_b} prio={prio}");
 
     assert(tx2.push("0123456789A") == 11);
-    u8 trash[10];
+    [10]u8 trash;
     assert(tx2.pop(trash) == 10);
     usize w = write_fmt_view(&tx2, 0x1A2B) catch { 0 };
     assert(w == 6);
@@ -5022,7 +5028,7 @@ fn main() {
         assert!(analyze_hardware_stack_high_water(&cm3_mir, &host_opts).is_err());
 
         let over_avr_src = r#"
-byte_ring<1900> huge_ring;
+byte_ring<1850> huge_ring;
 task printer() {
     loop every 50ms {
         println(f"len={huge_ring.len()}");
@@ -5343,7 +5349,7 @@ void update_status(*StatusCell<u32> cell, u32 next_val) {
 
 void forward_stream(*DuplexStream io) {
     assert(io.rx.push("PING") == 4);
-    u8 buf[4];
+    [4]u8 buf;
     assert(io.rx.pop(buf) == 4);
     assert(io.tx.push(buf) == 4);
 }
@@ -5355,7 +5361,7 @@ fn main() {
     assert(cell.state.read() == 99u32);
     forward_stream(&io);
     assert(io.tx.len() == 4);
-    u8 out_b[4];
+    [4]u8 out_b;
     assert(uart_tx.pop(out_b) == 4);
     assert(out_b[0] == 'P' && out_b[3] == 'G');
 
@@ -5851,11 +5857,13 @@ fn main() {
     fn l_m1_indirect_fnptr_conservative_stack_bound_end_to_end() {
         let src = r#"
 u32 heavy_leaf(u32 x) {
-    u8 buf[64];
+    [64]u8 buf;
     u32 i = 0;
-    while (i < 64u32) {
-        buf[i] = ((x + i) & 0xff) as u8;
-        i += 1u32;
+    noyield {
+        while (i < 64u32) {
+            buf[i] = ((x + i) & 0xff) as u8;
+            i += 1u32;
+        }
     }
     return (buf[x & 63u32] as u32) + (buf[(x + 17u32) & 63u32] as u32);
 }
@@ -6027,14 +6035,14 @@ fn main() {
         assert!(dma_global_line.contains("align 16") || dma_global_line.contains("align 32"), "{dma_global_line}");
         // B-H2: non-zero-init struct globals (signal / ping_pong) get constant struct init + distinct pp bits
         assert!(ll.contains("global %struct.Outer {"));
-        assert!(dma_global_line.contains("i8 2, [4 x i16]") && dma_global_line.contains("i8 3, [4 x i16]"), "{dma_global_line}");
+        assert!(dma_global_line.contains("i8 2, i32 0, [4 x i16]") && dma_global_line.contains("i8 3, i32 0, [4 x i16]"), "{dma_global_line}");
         // B-L2: folded singleton param `out` of `fold_worker` should NOT allocate dead `%p.out` alloca
         let fw_start = ll.find("define i32 @__syn_task_step_fold_worker(").expect("fold_worker present");
         let fw_end = ll[fw_start..].find("\n}\n").unwrap() + fw_start;
         assert!(mir.visibility.folded_task_vars.contains_key("fold_worker"));
         assert!(!ll[fw_start..fw_end].contains("%p.out = alloca"), "dead folded Param alloca emitted");
 
-        // B-M4: unconditional MMIO array bounds clamping to 0 across bare-metal targets
+        // B-M4: unconditional MMIO array bounds trap via `@__syn_panic(i8 3)` across targets
         let mmio_src = r#"
 mmio ArrRegs {
     @rw [4]u32 arr @ 0x0;
@@ -6062,8 +6070,8 @@ fn main() {
             )
             .expect("emit B-M4 MMIO IR");
             assert!(
-                mmio_ll.contains("icmp ult ") && mmio_ll.contains("select i1 "),
-                "expected unconditional MMIO bounds clamp for {target:?}:\n{mmio_ll}"
+                mmio_ll.contains("icmp ult ") && mmio_ll.contains("@__syn_panic(i8 3)"),
+                "expected unconditional MMIO bounds trap for {target:?}:\n{mmio_ll}"
             );
         }
     }
@@ -6167,8 +6175,8 @@ fn main() {
         let lo_pos = out.find("WAKE_LOW").expect("WAKE_LOW missing");
         assert!(hi_pos < lo_pos, "expected high-priority waiter before low-priority waiter: {out}");
 
-        // IR checks for @__syn_wake_one_waiter, sticky trunc check, and end_inbox_turn on timeout
-        assert!(ll.contains("define void @__syn_wake_one_waiter("));
+        // IR checks for @__syn_wake_all_mask, sticky trunc check, and end_inbox_turn on timeout
+        assert!(ll.contains("define void @__syn_wake_all_mask("));
         assert!(ll.contains("@__syn_rr_idx"));
         let putc_start = ll.find("define weak void @__syn_fmt_putc(").expect("@__syn_fmt_putc");
         let putc_end = ll[putc_start..].find("\n}\n").unwrap() + putc_start;
@@ -6897,8 +6905,8 @@ fn main() {
             "expected ptrtoint for ping_pong.base_addr() in LLVM IR:\n{ll}"
         );
         assert!(
-            ll.contains("i32 0, i32 4, i32 0"),
-            "expected ping_pong base_addr GEP (field 4, index 0) in LLVM IR:\n{ll}"
+            ll.contains("i32 0, i32 5, i32 0"),
+            "expected ping_pong base_addr GEP (field 5, index 0) in LLVM IR:\n{ll}"
         );
     }
 
@@ -7155,5 +7163,362 @@ fn main() {
             table.contains("UNBOUNDED"),
             "expected UNBOUNDED verdict in stack table:\n{table}"
         );
+    }
+
+    #[test]
+    fn wait_block_top_to_bottom_priority_and_deadline_in_qemu() {
+        let src = r#"
+inbox<u32, 4> prio_hi;
+inbox<u32, 4> prio_lo;
+inbox<u32, 4> flood_q;
+watch<u32> beats = 0;
+
+task flooder() {
+    u32 seq = 1u32;
+    loop {
+        flood_q.try_post(seq);
+        seq += 1u32;
+        delay(2ms);
+    }
+}
+
+task consumer() {
+    // Wait until both prio_hi and prio_lo have pending messages before entering `wait`.
+    delay(5ms);
+    u32 first = 0u32;
+    u32 second = 0u32;
+    for (u32 i in 0..2) {
+        wait {
+            u32 h = prio_hi.recv() => {
+                if (i == 0u32) { first = h; } else { second = h; }
+            }
+            u32 l = prio_lo.recv() => {
+                if (i == 0u32) { first = l; } else { second = l; }
+            }
+            timeout 50ms => {
+                sys.exit(9);
+            }
+        }
+    }
+    println(f"order={first},{second}");
+
+    // Even under continuous `flood_q` traffic every 2ms, `deadline next_beat =>` fires on schedule!
+    u32 next_beat = sys.now_ms() + 10u32;
+    loop {
+        wait {
+            u32 f = flood_q.recv() => {
+                u32 _v = f;
+            }
+            deadline next_beat => {
+                beats.publish(beats.read() + 1u32);
+                next_beat += 10u32;
+            }
+        }
+        if (beats.read() >= 3u32) {
+            println(f"beats={beats.read()}");
+            sys.exit(0);
+        }
+    }
+}
+
+fn main() {
+    prio_hi.try_post(111u32);
+    prio_lo.try_post(222u32);
+    spawn consumer() @normal;
+    spawn flooder() @normal;
+}
+"#;
+        let (_mir, _ll, res) = run_zev_cortex_m_qemu("wait_block_prio_dl", src);
+        assert_eq!(res.exec.exit_code, 0, "stderr={}", res.exec.stderr);
+        assert!(res.exec.stdout.contains("order=111,222"), "stdout={}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("beats=3"), "stdout={}", res.exec.stdout);
+    }
+
+    #[test]
+    fn runtime_panic_traps_and_safe_int_min_div_in_qemu() {
+        // 1. Safe non-trapping INT_MIN / -1 and INT_MIN % -1 (evaluated at runtime via watch)
+        let int_min_src = r#"
+watch<i32> w_num = -2147483647 - 1;
+watch<i32> w_den = -1;
+
+fn main() {
+    i32 n = w_num.read();
+    i32 d = w_den.read();
+    i32 q = n / d;
+    i32 r = n % d;
+    println(f"q={q} r={r}");
+    assert(q == n && r == 0);
+    sys.exit(0);
+}
+"#;
+        let (_m0, _l0, res0) = run_zev_cortex_m_qemu("int_min_div", int_min_src);
+        assert_eq!(res0.exec.exit_code, 0, "stderr={}", res0.exec.stderr);
+        assert!(res0.exec.stdout.contains("r=0"), "stdout={}", res0.exec.stdout);
+
+        // 2. All four runtime trap classes exit with code 101 and `[PANIC] ...`
+        let cases: [(&str, &str, &str); 5] = [
+            (
+                "trap_idx_read",
+                r#"
+watch<usize> wi = 4;
+fn main() {
+    [4]u32 a = [1u32, 2u32, 3u32, 4u32];
+    u32 x = a[wi.read()];
+    println(f"x={x}");
+}
+"#,
+                "[PANIC] index out of bounds",
+            ),
+            (
+                "trap_idx_write",
+                r#"
+watch<usize> wi = 5;
+fn main() {
+    [4]u8 a = [1, 2, 3, 4];
+    []u8 s = a[0..4];
+    s[wi.read()] = 9;
+}
+"#,
+                "[PANIC] index out of bounds",
+            ),
+            (
+                "trap_slice_order",
+                r#"
+watch<usize> ws = 3;
+watch<usize> we = 1;
+fn main() {
+    [4]u8 a = [1, 2, 3, 4];
+    []u8 bad = a[ws.read()..we.read()];
+    println(f"n={bad.len}");
+}
+"#,
+                "[PANIC] slice bounds out of range",
+            ),
+            (
+                "trap_mmio_oob",
+                r#"
+mmio Arr { @rw [4]u32 reg @ 0x0; }
+mmio DEV : Arr @ 0x4000_0000;
+watch<usize> wi = 4;
+fn main() {
+    DEV.reg[wi.read()] = 1u32;
+}
+"#,
+                "[PANIC] mmio index out of bounds",
+            ),
+            (
+                "trap_div_zero",
+                r#"
+watch<i32> wd = 0;
+fn main() {
+    i32 x = 42;
+    x /= wd.read();
+    println(f"x={x}");
+}
+"#,
+                "[PANIC] division by zero",
+            ),
+        ];
+
+        for (tag, src, expected_msg) in cases {
+            let prog =
+                zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {tag}: {e:?}"));
+            zev_sema::analyze_program(&prog).unwrap_or_else(|e| panic!("sema {tag}: {e:?}"));
+            let mir = zev_mir::lower_program(&prog).unwrap_or_else(|e| panic!("lower {tag}: {e:?}"));
+            let elf = test_out_dir().join(format!("{tag}.elf"));
+            let res = run_qemu_cortex_m(
+                &mir,
+                &elf,
+                &CodegenOptions::default(),
+                &QemuRunOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("run {tag} QEMU: {e}"));
+            assert!(res.build.audit.is_zero_heap_freestanding());
+            assert_ne!(
+                res.exec.exit_code, 0,
+                "{tag}: expected non-zero panic exit, stdout={}, stderr={}",
+                res.exec.stdout, res.exec.stderr
+            );
+            assert!(
+                res.exec.stdout.contains(expected_msg),
+                "{tag}: expected '{expected_msg}', got stdout={}",
+                res.exec.stdout
+            );
+        }
+    }
+
+    #[test]
+    fn while_cond_auto_checkpoint_yields_cooperatively_in_qemu() {
+        let src = r#"
+watch<bool> done = false;
+
+task spinner() {
+    u32 spins = 0;
+    while (!done.read()) {
+        spins += 1;
+    }
+    println(f"SPINS={spins}");
+    assert(spins > 0);
+    sys.exit(0);
+}
+
+task setter() {
+    sys.delay(4ms);
+    done.publish(true);
+    loop { sys.delay(10ms); }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    spawn spinner() @normal;
+    spawn setter() @normal;
+}
+"#;
+        let (_mir, _ll, res) = run_zev_cortex_m_qemu("while_cond_auto_checkpoint", src);
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        assert!(res.exec.stdout.contains("SPINS="), "stdout={}", res.exec.stdout);
+    }
+
+    #[test]
+    fn restart_zeros_uninitialized_and_mutated_locals_across_yields_in_qemu() {
+        let src = r#"
+watch<u32> restarts = 0;
+
+task worker(u32 base_id) {
+    u32 uninit_acc;
+    [4]u8 scratch;
+    u32 init_acc = 7;
+
+    sys.delay(1ms);
+    u32 round = restarts.read();
+    println(f"ROUND={round} base={base_id} uninit={uninit_acc} s2={scratch[2]} init={init_acc}");
+    assert(base_id == 42);
+    assert(uninit_acc == 0);
+    assert(scratch[0] == 0 && scratch[1] == 0 && scratch[2] == 0 && scratch[3] == 0);
+    assert(init_acc == 7);
+
+    uninit_acc += 99;
+    scratch[2] = 0x5Au8;
+    init_acc += 100;
+    sys.delay(1ms);
+    assert(uninit_acc == 99);
+    assert(scratch[2] == 0x5Au8);
+    assert(init_acc == 107);
+
+    if (round == 0) {
+        restarts.publish(1);
+        restart;
+    }
+
+    println("[PASS] RESTART_ZERO_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    spawn worker(42) @normal;
+}
+"#;
+        let (_mir, _ll, res) = run_zev_cortex_m_qemu("restart_zero_locals", src);
+        assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("ROUND=0 base=42 uninit=0 s2=0 init=7"),
+            "stdout={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("ROUND=1 base=42 uninit=0 s2=0 init=7"),
+            "stdout={}",
+            res.exec.stdout
+        );
+        assert!(res.exec.stdout.contains("[PASS] RESTART_ZERO_OK"), "stdout={}", res.exec.stdout);
+    }
+
+    #[test]
+    fn riscv_wfi_and_cortex_m_sleepdeep_deadline_guard_ir() {
+        // 1. Default `allow_sleep_deep` is `false` (TOML omitted and `TargetSpec::host_linux()`).
+        assert!(!TargetSpec::host_linux().allow_sleep_deep);
+        let cm_toml = r#"
+[chip]
+name = "custom_cm_sleep"
+isa = "arm-cortex-m"
+triple = "thumbv7m-none-eabi"
+datalayout = "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"
+cpu = "cortex-m3"
+has_thumb2 = true
+[memory]
+flash_base = 0x00000000
+flash_size = 0x00040000
+ram_base = 0x20000000
+ram_size = 0x00010000
+"#;
+        let cm_default = TargetSpec::from_tomls(cm_toml, None).unwrap();
+        assert!(!cm_default.allow_sleep_deep);
+
+        // 2. When `allow_sleep_deep = true` is explicitly opted in, `@__syn_idle_sleep` must check
+        //    `@__syn_has_deadline_waiter` before setting `SCB->SCR` SLEEPDEEP (bit 4).
+        let cm_deep_toml = format!("{cm_toml}\n# override\n").replace(
+            "has_thumb2 = true",
+            "has_thumb2 = true\nallow_sleep_deep = true",
+        );
+        let cm_deep_spec = TargetSpec::from_tomls(&cm_deep_toml, None).unwrap();
+        assert!(cm_deep_spec.allow_sleep_deep);
+
+        let src_no_irq = "task t() { loop { delay(5ms); } } fn main() { spawn t() @normal; }\n";
+        let prog_no_irq = zev_parser::parse_str(src_no_irq).unwrap();
+        assert!(zev_sema::analyze_program(&prog_no_irq).is_ok());
+        let mir_no_irq = zev_mir::lower_program(&prog_no_irq).unwrap();
+
+        let mut opts_cm = CodegenOptions::default();
+        opts_cm.spec = Some(cm_deep_spec);
+        let ll_cm = emit_llvm_ir_with_options(&mir_no_irq, &opts_cm).unwrap();
+        let cm_idle_start = ll_cm.find("define void @__syn_idle_sleep()").unwrap();
+        let cm_idle_end = ll_cm[cm_idle_start..].find("\n}\n").unwrap() + cm_idle_start;
+        let cm_idle_fn = &ll_cm[cm_idle_start..cm_idle_end];
+        assert!(cm_idle_fn.contains("@__syn_has_deadline_waiter"), "cm_idle={cm_idle_fn}");
+        assert!(cm_idle_fn.contains("-536810224"), "cm_idle={cm_idle_fn}");
+
+        // Verify Cortex-M deep-sleep IR passes `opt -passes=verify`.
+        let out_dir = test_out_dir();
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let cm_ll_path = out_dir.join("cm_sleepdeep_guard.ll");
+        std::fs::write(&cm_ll_path, &ll_cm).unwrap();
+        verify_ll_with_opt(&cm_ll_path).expect("opt verify cm sleepdeep");
+
+        // 3. RISC-V without attached IRQs uses lightweight 4-nop poll; with attached IRQs uses `wfi`.
+        let esp_spec = TargetSpec::load_from_root(&repo_root(), Some("esp32c6"), None).unwrap();
+        let mut opts_rv = CodegenOptions::default();
+        opts_rv.spec = Some(esp_spec.clone());
+        let ll_rv_poll = emit_llvm_ir_with_options(&mir_no_irq, &opts_rv).unwrap();
+        let p_start = ll_rv_poll.find("define void @__syn_idle_sleep()").unwrap();
+        let p_end = ll_rv_poll[p_start..].find("\n}\n").unwrap() + p_start;
+        let rv_poll_fn = &ll_rv_poll[p_start..p_end];
+        assert!(!rv_poll_fn.contains("\"wfi"), "expected 4-nop poll:\n{rv_poll_fn}");
+        assert!(rv_poll_fn.contains("nop\\0Anop\\0Anop\\0Anop"), "expected 4-nop poll:\n{rv_poll_fn}");
+        let rv_poll_path = test_out_dir().join("rv_idle_poll.ll");
+        std::fs::write(&rv_poll_path, &ll_rv_poll).unwrap();
+        verify_ll_with_opt(&rv_poll_path).expect("opt verify rv poll");
+
+        let src_rv_irq = r#"
+irq Q = 1;
+signal s;
+isr btn_isr(*signal sp) { sp.notify(); }
+task t() { loop { s.wait(); } }
+fn main() {
+    Q.attach(btn_isr(&s));
+    spawn t() @normal;
+}
+"#;
+        let prog_rv_irq = zev_parser::parse_str(src_rv_irq).unwrap();
+        assert!(zev_sema::analyze_program(&prog_rv_irq).is_ok());
+        let mir_rv_irq = zev_mir::lower_program(&prog_rv_irq).unwrap();
+        let ll_rv_wfi = emit_llvm_ir_with_options(&mir_rv_irq, &opts_rv).unwrap();
+        let w_start = ll_rv_wfi.find("define void @__syn_idle_sleep()").unwrap();
+        let w_end = ll_rv_wfi[w_start..].find("\n}\n").unwrap() + w_start;
+        let rv_wfi_fn = &ll_rv_wfi[w_start..w_end];
+        assert!(rv_wfi_fn.contains("wfi\\0Acsrsi mstatus, 8"), "expected wfi:\n{rv_wfi_fn}");
+        let rv_wfi_path = test_out_dir().join("rv_idle_wfi.ll");
+        std::fs::write(&rv_wfi_path, &ll_rv_wfi).unwrap();
+        verify_ll_with_opt(&rv_wfi_path).expect("opt verify rv wfi");
     }
 }

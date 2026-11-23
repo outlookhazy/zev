@@ -360,11 +360,11 @@ mod tests {
             }
 
             extern "C" fn c_register_hook(fn(u32) -> i32 cb);
-            extern "C" i32 c_legacy_hook(void (*cb)(u8));
+            extern "C" i32 c_legacy_hook(fn(u8) cb);
 
             @manual_yield
             task worker(u8 id) {
-                u8 local_arr[4] = [1, 2, 3, 4];
+                [4]u8 local_arr = [1, 2, 3, 4];
                 []u8 sub = local_arr[1..3];
                 ByteReader r = ByteReader { buf: sub, pos: 0 };
                 @manual_yield
@@ -388,7 +388,7 @@ mod tests {
 
         assert!(matches!(prog.items[4].kind, ItemKind::GlobalVar(_)));
 
-        // Function-pointer parameter types `fn(u32) -> i32` and `void (*cb)(u8)` remain valid!
+        // Canonical function-pointer parameter types `fn(u32) -> i32` and `fn(u8)` parse cleanly!
         for idx in [6, 7] {
             match &prog.items[idx].kind {
                 ItemKind::Fn(f) => {
@@ -571,7 +571,7 @@ mod tests {
                     error ShortRead, 2;
                 }
                 fn main() {
-                    u8 buf[8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                    [8]u8 buf = [0, 1, 2, 3, 4, 5, 6, 7];
                     usize n = read_some(buf[0..4]) catch (IoErr e, usize partial) {
                         return;
                     };
@@ -744,7 +744,7 @@ mod tests {
             "fn main() { select { a => {} } }",
             "P0004",
             "primitives",
-            "inbox",
+            "wait {",
         );
     }
 
@@ -889,11 +889,76 @@ mod tests {
             "Lease<",
         );
         assert_trap(
-            "u8 f(lease<u8, 8> *l) { return 0; }",
+            "u8 f(*lease<u8, 8> l) { return 0; }",
             "P0013",
             "dma",
             "Lease<",
         );
+    }
+
+    #[test]
+    fn trap_p0014_c_style_pointers_arrays_and_casts() {
+        assert_trap(
+            "fn main() { u8 buf[16]; }",
+            "P0014",
+            "syntax",
+            "[16]u8 buf",
+        );
+        assert_trap(
+            "fn main() { u8 *p = 0; }",
+            "P0014",
+            "syntax",
+            "*u8",
+        );
+        assert_trap(
+            "fn f(watch<u16> *w) {}",
+            "P0014",
+            "syntax",
+            "*watch<u16>",
+        );
+        assert_trap(
+            "struct S { u8 data[]; }",
+            "P0014",
+            "syntax",
+            "[]u8 data",
+        );
+        assert_trap(
+            "fn f(u8[] s) {}",
+            "P0014",
+            "syntax",
+            "[]u8",
+        );
+        assert_trap(
+            "fn f(u8[4] a) {}",
+            "P0014",
+            "syntax",
+            "[4]u8",
+        );
+        assert_trap(
+            "extern \"C\" i32 reg_cb(void (*cb)(u8));",
+            "P0014",
+            "syntax",
+            "fn(...) cb",
+        );
+        assert_trap(
+            "struct Foo { u32 x; }\nfn f(*void vp) { *Foo p = (Foo*)vp; }",
+            "P0014",
+            "syntax",
+            "*Foo",
+        );
+
+        // Ensure indexing, deref-mul, and plain multiplication never collide with P0014!
+        let ok_src = r#"
+            fn main(*i32 a) {
+                [4]u8 buf = [1, 2, 3, 4];
+                buf[0] = 9;
+                undecl_arr[0] = 1;
+                i32 prod = (*a) * 2;
+                i32 x = buf[0] as i32;
+                x * prod;
+            }
+        "#;
+        parse_str(ok_src).unwrap_or_else(|e| panic!("unexpected parse failure:\n{e}"));
     }
 
     #[test]
@@ -1295,7 +1360,7 @@ pub import chip.stm32f3.{rcc, tim};
                 f32 neg = -0.5;
                 f32 casted = (f32)10 + (a as f32);
 
-                u8 arr[8] = [0, 1, 2, 3, 4, 5, 6, 7];
+                [8]u8 arr = [0, 1, 2, 3, 4, 5, 6, 7];
                 []u8 sl = arr[0..4];
                 u32 acc = 0;
                 for (usize i in 0..4) {
@@ -1408,7 +1473,7 @@ pub import chip.stm32f3.{rcc, tim};
             }
 
             fn main() {
-                u8 raw[16];
+                [16]u8 raw;
                 [16]u8 raw2;
                 FixedVec<u32, 4> v = FixedVec<u32, 4> { data: [1, 2, 3, 4], len: 4 };
                 FixedVec<FixedVec<u8, 4>, 2> nested;
@@ -1477,7 +1542,7 @@ pub import chip.stm32f3.{rcc, tim};
         };
         let stmts = &main_fn.body.as_ref().unwrap().stmts;
 
-        // `u8 raw[16];` and `[16]u8 raw2;` both use `ArrayLen::Fixed(16)`
+        // Both `[16]u8 raw;` and `[16]u8 raw2;` use `ArrayLen::Fixed(16)`
         for idx in [0, 1] {
             match &stmts[idx].kind {
                 StmtKind::VarDecl { ty, .. } => match &ty.kind {
@@ -2450,24 +2515,21 @@ struct Box<T, usize N> {
 
 fn test(*void vp, *i32 a) {
     *MyStruct p1 = (*MyStruct)vp;
-    *MyStruct p2 = (MyStruct*)vp;
     *mod_m.MyStruct p3 = (*mod_m.MyStruct)vp;
-    *mod_m.MyStruct p4 = (mod_m.MyStruct*)vp;
     *Box<u32, 4> p5 = (*Box<u32, 4>)vp;
-    *Box<u32, 4> p6 = (Box<u32, 4>*)vp;
 
     i32 s1 = (*a) - 1;
     i32 s2 = (*a) * 2;
     i32 s3 = (*a) + 3;
 }
 "#;
-        let prog = parse_str(src).expect("C-style struct/generic/path ptr casts must parse");
+        let prog = parse_str(src).expect("prefix struct/generic/path ptr casts must parse");
         let f = match &prog.items[3].kind {
             ItemKind::Fn(f) => f,
             other => panic!("expected Fn, got {other:?}"),
         };
         let stmts = &f.body.as_ref().unwrap().stmts;
-        for idx in 0..6 {
+        for idx in 0..3 {
             assert!(
                 matches!(
                     &stmts[idx].kind,
@@ -2479,7 +2541,7 @@ fn test(*void vp, *i32 a) {
                 "stmt {idx} must parse as Cast"
             );
         }
-        for (idx, expected_op) in [(6usize, BinaryOp::Sub), (7, BinaryOp::Mul), (8, BinaryOp::Add)] {
+        for (idx, expected_op) in [(3usize, BinaryOp::Sub), (4, BinaryOp::Mul), (5, BinaryOp::Add)] {
             assert!(
                 matches!(
                     &stmts[idx].kind,
@@ -2566,5 +2628,50 @@ impl<usize N> FixedVec<f32, N> {
         ] {
             parse_str(bad).expect_err(&format!("expected parse failure for:\n{bad}"));
         }
+    }
+
+    #[test]
+    fn parses_contextual_wait_blocks_and_preserves_wait_identifier() {
+        let src = r#"
+task sup() {
+    u32 wait_cnt = 0;
+    u32 wait = 1;
+    wait {
+        u32 c = q.recv() => { wait_cnt += c; }
+        sig.wait() => { wait_cnt += wait; }
+        timeout 50ms => { wait_cnt += 1; }
+    }
+    u32 dl = sys.now_ms() + 20u32;
+    wait {
+        []u8 chunk = rx.wait_read() => rx.consume(chunk.len);
+        deadline dl => { dl += 20u32; }
+    }
+}
+"#;
+        let prog = parse_str(src).expect("wait { ... } should parse cleanly");
+        let td = match &prog.items[0].kind {
+            ItemKind::Task(t) => t,
+            other => panic!("expected Task, got {other:?}"),
+        };
+        match &td.body.stmts[2].kind {
+            StmtKind::Wait { arms, timer } => {
+                assert_eq!(arms.len(), 2);
+                assert!(arms[0].bind.is_some());
+                assert!(arms[1].bind.is_none());
+                let t = timer.as_ref().expect("timeout arm expected");
+                assert_eq!(t.kind, WaitTimerKind::Timeout);
+            }
+            other => panic!("expected Wait stmt, got {other:?}"),
+        }
+        match &td.body.stmts[4].kind {
+            StmtKind::Wait { arms, timer } => {
+                assert_eq!(arms.len(), 1);
+                let t = timer.as_ref().expect("deadline arm expected");
+                assert_eq!(t.kind, WaitTimerKind::Deadline);
+            }
+            other => panic!("expected second Wait stmt, got {other:?}"),
+        }
+        parse_str("fn main() { wait { a.wait() => {} timeout 5ms => {} deadline 10u32 => {} } }")
+            .expect_err("duplicate timer arm in wait block must fail parse");
     }
 }

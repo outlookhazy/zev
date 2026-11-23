@@ -580,6 +580,7 @@ impl<'a> DirectLowerCtx<'a> {
                 }
                 self.loop_defer_depths.pop();
                 while_body.extend(user_body);
+                while_body.push(MirStmt::BoundedForLatch);
 
                 self.scopes.pop();
 
@@ -707,6 +708,7 @@ impl<'a> DirectLowerCtx<'a> {
                 }
                 self.loop_defer_depths.pop();
                 while_body.extend(user_body);
+                while_body.push(MirStmt::BoundedForLatch);
 
                 self.scopes.pop();
 
@@ -775,6 +777,12 @@ impl<'a> DirectLowerCtx<'a> {
                     discr: d,
                     arms: mir_arms,
                     default: default_body,
+                });
+            }
+            StmtKind::Wait { .. } => {
+                return Err(MirLowerError {
+                    message: "`wait { ... }` encountered inside non-yielding context".to_string(),
+                    span: stmt.span,
                 });
             }
             StmtKind::Continue => {
@@ -1039,6 +1047,13 @@ impl<'a> DirectLowerCtx<'a> {
         *count_entry += 1;
 
         let slot_id = bs.spawned_tasks.len();
+        if slot_id >= 32 {
+            return Err(MirLowerError {
+                message: "program exceeds the 32-task static scheduler limit (`MAX_TASKS = 32`)"
+                    .to_string(),
+                span: sp.span,
+            });
+        }
         let instance_name = format!("{bp_name}_{inst_num}");
         let prio = sp.priority.map_or(MirPriority::Normal, convert_priority);
         let core_pin = sp.core.map(|c| c as u8);

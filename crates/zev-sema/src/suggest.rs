@@ -121,6 +121,21 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             (direct, table)
         }
 
+        ResolvedOsPrimitive::WaitQueue => {
+            let valid = ["prepare_wait", "cancel_wait", "commit_wait", "wake_one", "wake_all"];
+            let direct = match method {
+                "wait" | "block" | "park" => {
+                    Some("`.prepare_wait()` inside `critical { ... }` followed by `.commit_wait([timeout: <dur>])`".to_string())
+                }
+                "wake" | "notify" | "signal" => {
+                    Some("`.wake_one([boost: @prio])` or `.wake_all([boost: @prio])`".to_string())
+                }
+                _ => closest_match(method, valid, 2).map(|m| format!("`.{}()`", m)),
+            };
+            let table = "valid methods on `wait_queue`: `.prepare_wait()`, `.cancel_wait()`, `.commit_wait([timeout: <dur>])`, `.wake_one([boost: @prio]) -> bool`, `.wake_all([boost: @prio])`".to_string();
+            (direct, table)
+        }
+
         ResolvedOsPrimitive::Watch { elem } => {
             let valid = ["read", "publish", "wait_change"];
             let direct = match method {

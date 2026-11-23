@@ -8,9 +8,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::ir::{
-    MirChildCallSlot, MirFnBody, MirFunction, MirIrqVector, MirModule, MirPrimKind,
-    MirPrimViewKind, MirPrimitive, MirPriority, MirSpawnInstance, MirStruct, MirSubsystemGlobal,
-    MirTaskBlueprint, MirType, MirVar, MonomorphizedItemKind, MonomorphizedMirItem, VarRole,
+    MirBlock, MirChildCallSlot, MirExpr, MirExprKind, MirFmtChunk, MirFnBody, MirFunction,
+    MirIntrinsicOp, MirIrqVector, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
+    MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirPrimitive, MirPriority, MirSpawnInstance,
+    MirStmt, MirStruct, MirSubsystemGlobal, MirTaskBlueprint, MirTerminator, MirType, MirVar,
+    MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem, VarRole,
 };
 
 /// Target data-model parameters for C/ABI struct layout calculation.
@@ -91,6 +93,27 @@ pub struct FrameLayoutReport {
     pub singleton_folded_vars: Vec<String>,
 }
 
+/// Static classification of a task's longest non-yielding run between suspension points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskRunKind {
+    /// Only straight-line / branching blocks (plus direct non-looping calls) between yields.
+    StraightLine,
+    /// Contains at least one bounded `for..in` loop without yields, and no unbounded non-yielding spin loops.
+    BoundedFor,
+    /// Contains an un-yielded `while`/spin cycle (e.g., `noyield { while (cond) {} }`, `@manual_yield`, or recursion cycle).
+    NoyieldSpin,
+}
+
+impl TaskRunKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StraightLine => "straight-line",
+            Self::BoundedFor => "bounded-for",
+            Self::NoyieldSpin => "noyield-spin",
+        }
+    }
+}
+
 /// Static RAM allocation for a single `spawn`ed task slot (or `main` supervisor).
 #[derive(Debug, Clone)]
 pub struct SpawnedTaskRam {
@@ -102,6 +125,8 @@ pub struct SpawnedTaskRam {
     pub is_main_supervisor: bool,
     pub provenance_path: Vec<String>,
     pub conditional: bool,
+    pub max_run_kind: TaskRunKind,
+    pub max_run_blocks: usize,
     pub frame_bytes_32: usize,
     pub naive_frame_bytes_32: usize,
     pub union_saved_bytes_32: usize,
@@ -284,6 +309,12 @@ impl RamReport {
                         t.union_saved_bytes_32
                     ));
                 }
+
+                out.push_str(&format!(
+                    "       max non-yield run: {} ({} block(s))\n",
+                    t.max_run_kind.as_str(),
+                    t.max_run_blocks
+                ));
             }
         }
         out.push('\n');
@@ -699,31 +730,31 @@ impl<'a> LayoutCtx<'a> {
         let ptr = abi.ptr_bytes();
         let raw = match kind {
             MirPrimKind::Signal => {
-                // `{ syn_task_t *waiter; volatile bool flag; uint8_t boost_prio; }`
+                // `{ u8 flag; u8 pending_boost; u32 waiter_mask; }`
                 self.struct_layout(
                     &[
-                        SizeAlign::new(ptr, ptr),
                         SizeAlign::new(1, 1),
                         SizeAlign::new(1, 1),
+                        SizeAlign::new(4, 4),
                     ],
                     false,
                 )
             }
+            MirPrimKind::WaitQueue => self.struct_layout(&[SizeAlign::new(4, 4)], false),
             MirPrimKind::Watch { elem } => {
-                // `{ T value; volatile uint32_t seq; }`
+                // `{ T value; u32 gen; u32 waiter_mask; }`
                 let el = self.type_layout(elem, abi);
-                self.struct_layout(&[el, SizeAlign::new(4, 4)], false)
+                self.struct_layout(&[el, SizeAlign::new(4, 4), SizeAlign::new(4, 4)], false)
             }
             MirPrimKind::Inbox { elem, cap } => {
-                // `{ syn_inbox_hdr_t hdr; T buf[N]; uint8_t boost_buf[N]; }`
+                // `{ u32 head, tail, count, rx_waiters, tx_waiters; u8 boosts[N]; T items[N]; }`
                 let hdr = self.struct_layout(
                     &[
-                        SizeAlign::new(ptr, ptr),
-                        SizeAlign::new(ptr, ptr),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(2, 2),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
+                        SizeAlign::new(4, 4),
                     ],
                     false,
                 );
@@ -731,31 +762,29 @@ impl<'a> LayoutCtx<'a> {
                 self.struct_layout(
                     &[
                         hdr,
-                        SizeAlign::new(el.size * cap, el.align),
                         SizeAlign::new(*cap, 1),
+                        SizeAlign::new(el.size * cap, el.align),
                     ],
                     false,
                 )
             }
             MirPrimKind::PingPong { elem, cap } => {
-                // `{ T buf[2][N]; syn_task_t *waiter; uint32_t sleep_lock_bit; uint16_t ready_len; uint8_t write_idx, ready_idx; bool chunk_ready, dma_active; }`
+                // `{ u8 write_half, read_half, chunk_ready, sleep_lock_bit; u32 waiter_mask; T buf0[N]; T buf1[N]; }`
                 let el = self.type_layout(elem, abi);
                 self.struct_layout(
                     &[
-                        SizeAlign::new(el.size * cap * 2, el.align),
-                        SizeAlign::new(ptr, ptr),
+                        SizeAlign::new(1, 1),
+                        SizeAlign::new(1, 1),
+                        SizeAlign::new(1, 1),
+                        SizeAlign::new(1, 1),
                         SizeAlign::new(4, 4),
-                        SizeAlign::new(2, 2),
-                        SizeAlign::new(1, 1),
-                        SizeAlign::new(1, 1),
-                        SizeAlign::new(1, 1),
-                        SizeAlign::new(1, 1),
+                        SizeAlign::new(el.size * cap * 2, el.align),
                     ],
                     false,
                 )
             }
             MirPrimKind::Pool { elem, cap } => {
-                // Header `{ u32 free_mask; u32 full_mask; ptr waiters; u8 dma_safe; u8 cap; }`
+                // Header `{ u32 free_mask; u32 waiter_mask; ptr base_ptr; u8 dma_safe; u8 cap; }`
                 let hdr = self.struct_layout(
                     &[
                         SizeAlign::new(4, 4),
@@ -790,10 +819,10 @@ impl<'a> LayoutCtx<'a> {
                 )
             }
             MirPrimKind::ByteRing { cap } => {
-                // `{ syn_ring_hdr_t hdr; uint8_t buf[N]; }`
+                // `{ u32 head, tail, count, split_end, grant_off, grant_cap, waiter_mask; u8 boost; u8 buf[N]; }`
                 let hdr = self.struct_layout(
                     &[
-                        SizeAlign::new(ptr, ptr),
+                        SizeAlign::new(4, 4),
                         SizeAlign::new(4, 4),
                         SizeAlign::new(4, 4),
                         SizeAlign::new(4, 4),
@@ -836,8 +865,8 @@ fn tcb_bytes(abi: TargetAbi) -> usize {
 
 fn scheduler_bytes(abi: TargetAbi) -> usize {
     match abi {
-        TargetAbi::Mcu32 => 52,
-        TargetAbi::Host64 => 64,
+        TargetAbi::Mcu32 => 76,
+        TargetAbi::Host64 => 88,
     }
 }
 
@@ -934,6 +963,14 @@ pub fn compute_ram_report_with_subsystems(
     let blueprint_frames: Vec<FrameLayoutReport> =
         bp_reports.values().map(|(r, _)| r.clone()).collect();
 
+    let mut run_fn_cache: BTreeMap<String, (TaskRunKind, usize)> = BTreeMap::new();
+    let mut run_visiting: BTreeSet<String> = BTreeSet::new();
+    let mut bp_run_cache: BTreeMap<String, (TaskRunKind, usize)> = BTreeMap::new();
+    for bp in blueprints {
+        let stats = analyze_coro_blocks(&bp.blocks, &fn_map, &mut run_fn_cache, &mut run_visiting);
+        bp_run_cache.insert(bp.name.clone(), stats);
+    }
+
     let mut spawned_tasks = Vec::new();
     for sp in spawned {
         let (bp_rep, m) = bp_reports
@@ -960,6 +997,11 @@ pub fn compute_ram_report_with_subsystems(
                 )
             });
 
+        let (max_run_kind, max_run_blocks) = bp_run_cache
+            .get(&sp.blueprint_name)
+            .copied()
+            .unwrap_or((TaskRunKind::StraightLine, 0));
+
         let saved_32 = m.naive_32.size.saturating_sub(m.packed_32.size);
         let saved_64 = m.naive_64.size.saturating_sub(m.packed_64.size);
 
@@ -972,6 +1014,8 @@ pub fn compute_ram_report_with_subsystems(
             is_main_supervisor: sp.is_main_supervisor,
             provenance_path: sp.provenance_path.clone(),
             conditional: sp.conditional,
+            max_run_kind,
+            max_run_blocks,
             frame_bytes_32: m.packed_32.size,
             naive_frame_bytes_32: m.naive_32.size,
             union_saved_bytes_32: saved_32,
@@ -1450,4 +1494,627 @@ pub fn populate_module_ram_report(module: &mut MirModule) {
         rep.monomorphized_instances = module.monomorphized_instances.clone();
     }
     module.ram_report = rep;
+}
+
+fn analyze_fn_run(
+    fn_name: &str,
+    fn_map: &BTreeMap<&str, &MirFunction>,
+    cache: &mut BTreeMap<String, (TaskRunKind, usize)>,
+    visiting: &mut BTreeSet<String>,
+) -> (TaskRunKind, usize) {
+    if let Some(&cached) = cache.get(fn_name) {
+        return cached;
+    }
+    if !visiting.insert(fn_name.to_string()) {
+        return (TaskRunKind::NoyieldSpin, 1);
+    }
+    let res = if let Some(func) = fn_map.get(fn_name) {
+        match &func.body {
+            MirFnBody::Direct(stmts) => analyze_direct_stmts(stmts, fn_map, cache, visiting),
+            MirFnBody::Coroutine { blocks, .. } => {
+                analyze_coro_blocks(blocks, fn_map, cache, visiting)
+            }
+        }
+    } else {
+        (TaskRunKind::StraightLine, 1)
+    };
+    visiting.remove(fn_name);
+    cache.insert(fn_name.to_string(), res);
+    res
+}
+
+fn fold_place_run(
+    place: &MirPlace,
+    fn_map: &BTreeMap<&str, &MirFunction>,
+    cache: &mut BTreeMap<String, (TaskRunKind, usize)>,
+    visiting: &mut BTreeSet<String>,
+    kind: &mut TaskRunKind,
+    extra_blocks: &mut usize,
+) {
+    match place {
+        MirPlace::Var(_) => {}
+        MirPlace::Deref(expr, _) => {
+            fold_expr_run(expr, fn_map, cache, visiting, kind, extra_blocks);
+        }
+        MirPlace::Field { base, .. } => {
+            fold_place_run(base, fn_map, cache, visiting, kind, extra_blocks);
+        }
+        MirPlace::Index { base, index, .. } => {
+            fold_place_run(base, fn_map, cache, visiting, kind, extra_blocks);
+            fold_expr_run(index, fn_map, cache, visiting, kind, extra_blocks);
+        }
+    }
+}
+
+fn fold_prim_target_run(
+    target: &MirPrimTarget,
+    fn_map: &BTreeMap<&str, &MirFunction>,
+    cache: &mut BTreeMap<String, (TaskRunKind, usize)>,
+    visiting: &mut BTreeSet<String>,
+    kind: &mut TaskRunKind,
+    extra_blocks: &mut usize,
+) {
+    if let MirPrimTarget::PtrExpr(expr) = target {
+        fold_expr_run(expr, fn_map, cache, visiting, kind, extra_blocks);
+    }
+}
+
+fn fold_fmt_chunks_run(
+    chunks: &[MirFmtChunk],
+    fn_map: &BTreeMap<&str, &MirFunction>,
+    cache: &mut BTreeMap<String, (TaskRunKind, usize)>,
+    visiting: &mut BTreeSet<String>,
+    kind: &mut TaskRunKind,
+    extra_blocks: &mut usize,
+) {
+    for ch in chunks {
+        match ch {
+            MirFmtChunk::Literal(_) => {}
+            MirFmtChunk::Int { value, .. }
+            | MirFmtChunk::Float { value, .. }
+            | MirFmtChunk::Bool(value)
+            | MirFmtChunk::Str(value)
+            | MirFmtChunk::Bytes(value)
+            | MirFmtChunk::EnumName { value, .. } => {
+                fold_expr_run(value, fn_map, cache, visiting, kind, extra_blocks);
+            }
+            MirFmtChunk::DebugSlice { slice, .. } => {
+                fold_expr_run(slice, fn_map, cache, visiting, kind, extra_blocks);
+            }
+        }
+    }
+}
+
+fn fold_expr_run(
+    expr: &MirExpr,
+    fn_map: &BTreeMap<&str, &MirFunction>,
+    cache: &mut BTreeMap<String, (TaskRunKind, usize)>,
+    visiting: &mut BTreeSet<String>,
+    kind: &mut TaskRunKind,
+    extra_blocks: &mut usize,
+) {
+    match &expr.kind {
+        MirExprKind::IntLit(_)
+        | MirExprKind::FloatLit(_)
+        | MirExprKind::BoolLit(_)
+        | MirExprKind::StringLit(_)
+        | MirExprKind::TicksLit(_)
+        | MirExprKind::EnumVariant { .. }
+        | MirExprKind::ConstRef(_)
+        | MirExprKind::GlobalPrimAddr(_)
+        | MirExprKind::SubsystemAddr(_)
+        | MirExprKind::MmioAddr(_)
+        | MirExprKind::FnAddr(_)
+        | MirExprKind::Var(_)
+        | MirExprKind::ArrayLen(_)
+        | MirExprKind::ResultIsErr(_)
+        | MirExprKind::ResultErr(_)
+        | MirExprKind::ResultVal(_)
+        | MirExprKind::NowTicks
+        | MirExprKind::SysQuery(_) => {}
+        MirExprKind::MakePrimView { ptr, .. } => {
+            fold_expr_run(ptr, fn_map, cache, visiting, kind, extra_blocks);
+        }
+        MirExprKind::MmioRead { base, index, .. } => {
+            fold_expr_run(base, fn_map, cache, visiting, kind, extra_blocks);
+            if let Some(idx) = index {
+                fold_expr_run(idx, fn_map, cache, visiting, kind, extra_blocks);
+            }
+        }
+        MirExprKind::Unary { expr: inner, .. }
+        | MirExprKind::Cast { expr: inner, .. }
+        | MirExprKind::FieldAccess { base: inner, .. }
+        | MirExprKind::SliceLen(inner)
+        | MirExprKind::FromBytes { slice: inner, .. }
+        | MirExprKind::LeaseGet { lease: inner, .. }
+        | MirExprKind::LeaseAddr { lease: inner, .. } => {
+            fold_expr_run(inner, fn_map, cache, visiting, kind, extra_blocks);
+        }
+        MirExprKind::AddrOfPlace(place) | MirExprKind::ArrayToSlice { array_place: place, .. } => {
+            fold_place_run(place, fn_map, cache, visiting, kind, extra_blocks);
+        }
+        MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::Index {
+            base: lhs,
+            index: rhs,
+            ..
+        } => {
+            fold_expr_run(lhs, fn_map, cache, visiting, kind, extra_blocks);
+            fold_expr_run(rhs, fn_map, cache, visiting, kind, extra_blocks);
+        }
+        MirExprKind::SubSlice {
+            base, start, end, ..
+        } => {
+            fold_expr_run(base, fn_map, cache, visiting, kind, extra_blocks);
+            fold_expr_run(start, fn_map, cache, visiting, kind, extra_blocks);
+            fold_expr_run(end, fn_map, cache, visiting, kind, extra_blocks);
+        }
+        MirExprKind::StructLit { fields, .. } => {
+            for (_, val, _) in fields {
+                fold_expr_run(val, fn_map, cache, visiting, kind, extra_blocks);
+            }
+        }
+        MirExprKind::ArrayLit { elems, .. } => {
+            for elem in elems {
+                fold_expr_run(elem, fn_map, cache, visiting, kind, extra_blocks);
+            }
+        }
+        MirExprKind::PrimRead(op) => match op.as_ref() {
+            MirPrimReadOp::WatchRead { target, .. }
+            | MirPrimReadOp::WatchGen { target, .. }
+            | MirPrimReadOp::InboxTryRecv { target, .. }
+            | MirPrimReadOp::InboxLen { target, .. }
+            | MirPrimReadOp::InboxIsEmpty { target, .. }
+            | MirPrimReadOp::InboxIsFull { target, .. }
+            | MirPrimReadOp::SignalIsSet { target }
+            | MirPrimReadOp::SignalTryWait { target }
+            | MirPrimReadOp::WaitQueueWakeOne { target, .. }
+            | MirPrimReadOp::PingPongDmaBuf { target, .. }
+            | MirPrimReadOp::PingPongBaseAddr { target, .. }
+            | MirPrimReadOp::PoolTryAlloc { target, .. }
+            | MirPrimReadOp::PoolAvail { target, .. }
+            | MirPrimReadOp::PoolInUse { target, .. }
+            | MirPrimReadOp::PoolIsExhausted { target, .. }
+            | MirPrimReadOp::PoolCap { target, .. }
+            | MirPrimReadOp::DmaSlotTake { target, .. }
+            | MirPrimReadOp::DmaSlotRelease { target, .. }
+            | MirPrimReadOp::DmaSlotIsBusy { target, .. }
+            | MirPrimReadOp::DmaSlotIsEmpty { target, .. }
+            | MirPrimReadOp::DmaSlotAddr { target, .. }
+            | MirPrimReadOp::ByteRingReadSlice { target, .. }
+            | MirPrimReadOp::ByteRingTryPopByte { target, .. }
+            | MirPrimReadOp::ByteRingLen { target, .. }
+            | MirPrimReadOp::ByteRingFreeSpace { target, .. }
+            | MirPrimReadOp::ByteRingIsEmpty { target, .. }
+            | MirPrimReadOp::ByteRingIsFull { target, .. } => {
+                fold_prim_target_run(target, fn_map, cache, visiting, kind, extra_blocks);
+            }
+            MirPrimReadOp::InboxTrySend { target, value, .. }
+            | MirPrimReadOp::DmaSlotPark { target, lease: value, .. }
+            | MirPrimReadOp::ByteRingPush { target, src: value, .. }
+            | MirPrimReadOp::ByteRingPushByte { target, byte: value, .. }
+            | MirPrimReadOp::ByteRingGrantWrite { target, len: value, .. }
+            | MirPrimReadOp::ByteRingPop { target, dst: value, .. } => {
+                fold_prim_target_run(target, fn_map, cache, visiting, kind, extra_blocks);
+                fold_expr_run(value, fn_map, cache, visiting, kind, extra_blocks);
+            }
+            MirPrimReadOp::InboxViewTryRecv { view, .. }
+            | MirPrimReadOp::InboxViewLen { view, .. }
+            | MirPrimReadOp::InboxViewCap { view, .. }
+            | MirPrimReadOp::InboxViewIsEmpty { view, .. }
+            | MirPrimReadOp::InboxViewIsFull { view, .. }
+            | MirPrimReadOp::ByteRingViewReadSlice { view }
+            | MirPrimReadOp::ByteRingViewTryPopByte { view }
+            | MirPrimReadOp::ByteRingViewLen { view }
+            | MirPrimReadOp::ByteRingViewCap { view }
+            | MirPrimReadOp::ByteRingViewFreeSpace { view }
+            | MirPrimReadOp::ByteRingViewIsEmpty { view }
+            | MirPrimReadOp::ByteRingViewIsFull { view } => {
+                fold_expr_run(view, fn_map, cache, visiting, kind, extra_blocks);
+            }
+            MirPrimReadOp::InboxViewTrySend { view, value, .. }
+            | MirPrimReadOp::ByteRingViewPush { view, src: value, .. }
+            | MirPrimReadOp::ByteRingViewPushByte { view, byte: value, .. }
+            | MirPrimReadOp::ByteRingViewGrantWrite { view, len: value }
+            | MirPrimReadOp::ByteRingViewPop { view, dst: value } => {
+                fold_expr_run(view, fn_map, cache, visiting, kind, extra_blocks);
+                fold_expr_run(value, fn_map, cache, visiting, kind, extra_blocks);
+            }
+        },
+        MirExprKind::CallDirect { callee, args, .. } => {
+            for a in args {
+                fold_expr_run(a, fn_map, cache, visiting, kind, extra_blocks);
+            }
+            let (ck, cb) = analyze_fn_run(callee, fn_map, cache, visiting);
+            *kind = (*kind).max(ck);
+            *extra_blocks += cb;
+        }
+        MirExprKind::RomCallU32 { addr, args, .. } => {
+            fold_expr_run(addr, fn_map, cache, visiting, kind, extra_blocks);
+            for a in args {
+                fold_expr_run(a, fn_map, cache, visiting, kind, extra_blocks);
+            }
+        }
+    }
+}
+
+fn analyze_direct_stmts(
+    stmts: &[MirStmt],
+    fn_map: &BTreeMap<&str, &MirFunction>,
+    cache: &mut BTreeMap<String, (TaskRunKind, usize)>,
+    visiting: &mut BTreeSet<String>,
+) -> (TaskRunKind, usize) {
+    let mut kind = TaskRunKind::StraightLine;
+    let mut blocks = 1usize;
+
+    for s in stmts {
+        match s {
+            MirStmt::Assign { target, value, .. } => {
+                fold_place_run(target, fn_map, cache, visiting, &mut kind, &mut blocks);
+                fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
+            }
+            MirStmt::Expr(expr)
+            | MirStmt::Intrinsic(MirIntrinsicOp::UseSystick { hz: expr }) => {
+                fold_expr_run(expr, fn_map, cache, visiting, &mut kind, &mut blocks);
+            }
+            MirStmt::PrimOp(op) => match op {
+                MirPrimNonBlockingOp::SignalNotify { target, .. }
+                | MirPrimNonBlockingOp::SignalClear { target }
+                | MirPrimNonBlockingOp::WaitQueuePrepare { target }
+                | MirPrimNonBlockingOp::WaitQueueCancel { target }
+                | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. }
+                | MirPrimNonBlockingOp::PingPongFlip { target, .. }
+                | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
+                | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
+                    fold_prim_target_run(target, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+                MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+                | MirPrimNonBlockingOp::InboxPost { target, value, .. }
+                | MirPrimNonBlockingOp::PingPongCompleteHalf { target, half: value, .. }
+                | MirPrimNonBlockingOp::ByteRingConsume { target, len: value, .. }
+                | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len: value, .. } => {
+                    fold_prim_target_run(target, fn_map, cache, visiting, &mut kind, &mut blocks);
+                    fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+                MirPrimNonBlockingOp::LeaseRelease { value, .. } => {
+                    fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+                MirPrimNonBlockingOp::LeaseNullify { target, .. } => {
+                    fold_place_run(target, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+                MirPrimNonBlockingOp::InboxViewPost { view, value, .. }
+                | MirPrimNonBlockingOp::ByteRingViewConsume { view, len: value }
+                | MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len: value, .. } => {
+                    fold_expr_run(view, fn_map, cache, visiting, &mut kind, &mut blocks);
+                    fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+                MirPrimNonBlockingOp::ByteRingViewClear { view } => {
+                    fold_expr_run(view, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+            },
+            MirStmt::Intrinsic(MirIntrinsicOp::SetPriority { .. })
+            | MirStmt::EnterCritical
+            | MirStmt::ExitCritical
+            | MirStmt::EndInboxTurn
+            | MirStmt::Break
+            | MirStmt::Continue
+            | MirStmt::SetIrqSelector { .. }
+            | MirStmt::BoundedForLatch
+            | MirStmt::ZeroTaskLocals => {}
+            MirStmt::Intrinsic(MirIntrinsicOp::SysOp { args, .. })
+            | MirStmt::SpawnActivate { args, .. } => {
+                for a in args {
+                    fold_expr_run(a, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+            }
+            MirStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                fold_expr_run(cond, fn_map, cache, visiting, &mut kind, &mut blocks);
+                let (tk, tb) = analyze_direct_stmts(then_body, fn_map, cache, visiting);
+                let (ek, eb) = if else_body.is_empty() {
+                    (TaskRunKind::StraightLine, 0)
+                } else {
+                    analyze_direct_stmts(else_body, fn_map, cache, visiting)
+                };
+                kind = kind.max(tk).max(ek);
+                blocks += tb.max(eb);
+            }
+            MirStmt::While { cond, body } => {
+                fold_expr_run(cond, fn_map, cache, visiting, &mut kind, &mut blocks);
+                let is_bounded_for = body.iter().any(|st| matches!(st, MirStmt::BoundedForLatch));
+                let loop_kind = if is_bounded_for {
+                    TaskRunKind::BoundedFor
+                } else {
+                    TaskRunKind::NoyieldSpin
+                };
+                let (bk, bb) = analyze_direct_stmts(body, fn_map, cache, visiting);
+                kind = kind.max(loop_kind).max(bk);
+                blocks += 1 + bb;
+            }
+            MirStmt::Switch {
+                discr,
+                arms,
+                default,
+            } => {
+                fold_expr_run(discr, fn_map, cache, visiting, &mut kind, &mut blocks);
+                let mut max_arm_blocks = 0usize;
+                for (_, arm_body) in arms {
+                    let (ak, ab) = analyze_direct_stmts(arm_body, fn_map, cache, visiting);
+                    kind = kind.max(ak);
+                    max_arm_blocks = max_arm_blocks.max(ab);
+                }
+                if !default.is_empty() {
+                    let (dk, db) = analyze_direct_stmts(default, fn_map, cache, visiting);
+                    kind = kind.max(dk);
+                    max_arm_blocks = max_arm_blocks.max(db);
+                }
+                blocks += max_arm_blocks;
+            }
+            MirStmt::Return(expr_opt) => {
+                if let Some(expr) = expr_opt {
+                    fold_expr_run(expr, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+            }
+            MirStmt::Error { reason, partial } => {
+                if let Some(expr) = reason {
+                    fold_expr_run(expr, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+                if let Some(expr) = partial {
+                    fold_expr_run(expr, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+            }
+            MirStmt::PrintFmt { chunks, .. } => {
+                fold_fmt_chunks_run(chunks, fn_map, cache, visiting, &mut kind, &mut blocks);
+            }
+            MirStmt::FmtBuf { buf, chunks, .. } => {
+                fold_expr_run(buf, fn_map, cache, visiting, &mut kind, &mut blocks);
+                fold_fmt_chunks_run(chunks, fn_map, cache, visiting, &mut kind, &mut blocks);
+            }
+            MirStmt::FmtRing { ring, chunks, .. } => {
+                fold_expr_run(ring, fn_map, cache, visiting, &mut kind, &mut blocks);
+                fold_fmt_chunks_run(chunks, fn_map, cache, visiting, &mut kind, &mut blocks);
+            }
+            MirStmt::MmioWrite {
+                base,
+                index,
+                value,
+                ..
+            } => {
+                fold_expr_run(base, fn_map, cache, visiting, &mut kind, &mut blocks);
+                if let Some(idx) = index {
+                    fold_expr_run(idx, fn_map, cache, visiting, &mut kind, &mut blocks);
+                }
+                fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
+            }
+        }
+    }
+
+    (kind, blocks)
+}
+
+fn tarjan_sccs(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    struct State {
+        index: usize,
+        indices: Vec<Option<usize>>,
+        lowlink: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        sccs: Vec<Vec<usize>>,
+    }
+
+    fn strongconnect(v: usize, adj: &[Vec<usize>], st: &mut State) {
+        st.indices[v] = Some(st.index);
+        st.lowlink[v] = st.index;
+        st.index += 1;
+        st.stack.push(v);
+        st.on_stack[v] = true;
+
+        for &w in &adj[v] {
+            if st.indices[w].is_none() {
+                strongconnect(w, adj, st);
+                st.lowlink[v] = st.lowlink[v].min(st.lowlink[w]);
+            } else if st.on_stack[w] {
+                if let Some(w_idx) = st.indices[w] {
+                    st.lowlink[v] = st.lowlink[v].min(w_idx);
+                }
+            }
+        }
+
+        if Some(st.lowlink[v]) == st.indices[v] {
+            let mut scc = Vec::new();
+            while let Some(w) = st.stack.pop() {
+                st.on_stack[w] = false;
+                scc.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            st.sccs.push(scc);
+        }
+    }
+
+    let n = adj.len();
+    let mut st = State {
+        index: 0,
+        indices: vec![None; n],
+        lowlink: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        sccs: Vec::new(),
+    };
+    for v in 0..n {
+        if st.indices[v].is_none() {
+            strongconnect(v, adj, &mut st);
+        }
+    }
+    st.sccs
+}
+
+fn sccs_have_cycle(sccs: &[Vec<usize>], adj: &[Vec<usize>]) -> bool {
+    sccs.iter().any(|scc| {
+        scc.len() > 1 || scc.first().is_some_and(|&u| adj[u].contains(&u))
+    })
+}
+
+fn analyze_coro_blocks(
+    blocks: &[MirBlock],
+    fn_map: &BTreeMap<&str, &MirFunction>,
+    cache: &mut BTreeMap<String, (TaskRunKind, usize)>,
+    visiting: &mut BTreeSet<String>,
+) -> (TaskRunKind, usize) {
+    if blocks.is_empty() {
+        return (TaskRunKind::StraightLine, 0);
+    }
+
+    let n = blocks.len();
+    let mut id_to_idx: BTreeMap<u16, usize> = BTreeMap::new();
+    for (idx, b) in blocks.iter().enumerate() {
+        id_to_idx.insert(b.id.0, idx);
+    }
+
+    let mut block_kinds = Vec::with_capacity(n);
+    let mut block_weights = Vec::with_capacity(n);
+    let mut adj = vec![Vec::new(); n];
+    let mut adj_free = vec![Vec::new(); n];
+
+    for (idx, b) in blocks.iter().enumerate() {
+        let (mut k, mut w) = analyze_direct_stmts(&b.stmts, fn_map, cache, visiting);
+        match &b.terminator {
+            MirTerminator::Goto(target) => {
+                if let Some(&t_idx) = id_to_idx.get(&target.0) {
+                    adj[idx].push(t_idx);
+                }
+            }
+            MirTerminator::Branch {
+                cond,
+                then_bb,
+                else_bb,
+            } => {
+                fold_expr_run(cond, fn_map, cache, visiting, &mut k, &mut w);
+                if let Some(&t_idx) = id_to_idx.get(&then_bb.0) {
+                    adj[idx].push(t_idx);
+                }
+                if let Some(&e_idx) = id_to_idx.get(&else_bb.0) {
+                    adj[idx].push(e_idx);
+                }
+            }
+            MirTerminator::Switch {
+                discr,
+                arms,
+                default_bb,
+            } => {
+                fold_expr_run(discr, fn_map, cache, visiting, &mut k, &mut w);
+                for (_, arm_bb) in arms {
+                    if let Some(&a_idx) = id_to_idx.get(&arm_bb.0) {
+                        adj[idx].push(a_idx);
+                    }
+                }
+                if let Some(&d_idx) = id_to_idx.get(&default_bb.0) {
+                    adj[idx].push(d_idx);
+                }
+            }
+            MirTerminator::Return(expr_opt) => {
+                if let Some(expr) = expr_opt {
+                    fold_expr_run(expr, fn_map, cache, visiting, &mut k, &mut w);
+                }
+            }
+            MirTerminator::Error { reason, partial } => {
+                if let Some(expr) = reason {
+                    fold_expr_run(expr, fn_map, cache, visiting, &mut k, &mut w);
+                }
+                if let Some(expr) = partial {
+                    fold_expr_run(expr, fn_map, cache, visiting, &mut k, &mut w);
+                }
+            }
+            MirTerminator::Yield(yk) => match yk {
+                MirYieldKind::EveryLatch { .. } | MirYieldKind::ShareCheckpoint { .. } => {}
+                MirYieldKind::DelayPoll { .. } => {}
+                MirYieldKind::Wait { arms, .. } => {
+                    for arm in arms {
+                        match &arm.op {
+                            crate::ir::MirWaitArmOp::InboxRecv { target, .. }
+                            | crate::ir::MirWaitArmOp::InboxSend { target, .. }
+                            | crate::ir::MirWaitArmOp::SignalWait { target, .. }
+                            | crate::ir::MirWaitArmOp::WaitQueueCommit { target, .. }
+                            | crate::ir::MirWaitArmOp::WatchWaitChange { target, .. }
+                            | crate::ir::MirWaitArmOp::PingPongWaitChunk { target, .. }
+                            | crate::ir::MirWaitArmOp::PoolAlloc { target, .. }
+                            | crate::ir::MirWaitArmOp::ByteRingWaitRead { target, .. } => {
+                                fold_prim_target_run(target, fn_map, cache, visiting, &mut k, &mut w);
+                            }
+                            crate::ir::MirWaitArmOp::InboxViewRecv { view, .. }
+                            | crate::ir::MirWaitArmOp::InboxViewSend { view, .. }
+                            | crate::ir::MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                                fold_expr_run(view, fn_map, cache, visiting, &mut k, &mut w);
+                            }
+                        }
+                    }
+                }
+                MirYieldKind::CallYielding { callee, args, .. } => {
+                    for a in args {
+                        fold_expr_run(a, fn_map, cache, visiting, &mut k, &mut w);
+                    }
+                    let (ck, cb) = analyze_fn_run(callee, fn_map, cache, visiting);
+                    k = k.max(ck);
+                    w += cb;
+                }
+                MirYieldKind::PollChild { callee, .. } => {
+                    let (ck, cb) = analyze_fn_run(callee, fn_map, cache, visiting);
+                    k = k.max(ck);
+                    w += cb;
+                }
+            },
+        }
+        let has_for_latch = b.stmts.iter().any(|st| matches!(st, MirStmt::BoundedForLatch));
+        if !has_for_latch {
+            adj_free[idx] = adj[idx].clone();
+        }
+        block_kinds.push(k);
+        block_weights.push(w);
+    }
+
+    let sccs = tarjan_sccs(&adj);
+    let cycle_kind = if !sccs_have_cycle(&sccs, &adj) {
+        TaskRunKind::StraightLine
+    } else {
+        let free_sccs = tarjan_sccs(&adj_free);
+        if !sccs_have_cycle(&free_sccs, &adj_free) {
+            TaskRunKind::BoundedFor
+        } else {
+            TaskRunKind::NoyieldSpin
+        }
+    };
+
+    let mut kind = cycle_kind;
+    for bk in &block_kinds {
+        kind = kind.max(*bk);
+    }
+
+    let mut scc_of = vec![0usize; n];
+    for (scc_id, scc) in sccs.iter().enumerate() {
+        for &u in scc {
+            scc_of[u] = scc_id;
+        }
+    }
+
+    let mut scc_dp = vec![0usize; sccs.len()];
+    for (scc_id, scc) in sccs.iter().enumerate() {
+        let own_weight: usize = scc.iter().map(|&u| block_weights[u]).sum();
+        let mut best_succ = 0usize;
+        for &u in scc {
+            for &v in &adj[u] {
+                let sv = scc_of[v];
+                if sv != scc_id {
+                    best_succ = best_succ.max(scc_dp[sv]);
+                }
+            }
+        }
+        scc_dp[scc_id] = own_weight + best_succ;
+    }
+
+    let max_blocks = scc_dp.into_iter().max().unwrap_or(0);
+    (kind, max_blocks)
 }

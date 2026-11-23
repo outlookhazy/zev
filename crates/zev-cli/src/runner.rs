@@ -38,29 +38,28 @@ pub(crate) fn find_clang() -> String {
     zev_codegen_llvm::find_tool("/bin/clang", "clang")
 }
 
-pub fn compile_and_run_c99(
-    c_source: &str,
+fn compile_host_llvm_binary(
+    temp: &TempWorkDir,
+    ll_source: &str,
     sanitize: bool,
-    max_ticks: Option<u64>,
-    run_args: &[String],
-) -> Result<i32, String> {
-    let temp = TempWorkDir::create("zevc-run")?;
-    let c_path = temp.dir.join("program.c");
+) -> Result<PathBuf, String> {
+    let ll_path = temp.dir.join("program.ll");
     let bin_path = temp.dir.join("program");
 
-    std::fs::write(&c_path, c_source)
-        .map_err(|e| format!("failed to write generated C99 to `{}`: {e}", c_path.display()))?;
+    std::fs::write(&ll_path, ll_source)
+        .map_err(|e| format!("failed to write generated LLVM IR to `{}`: {e}", ll_path.display()))?;
 
     let clang = find_clang();
     let mut cc = Command::new(&clang);
-    cc.arg("-std=c99").arg("-O2");
+    cc.arg("-Wno-override-module").arg("-no-pie");
     if sanitize {
-        cc.arg("-g").arg("-fsanitize=address,undefined");
+        cc.arg("-O1")
+            .arg("-g")
+            .arg("-fsanitize=address,undefined");
+    } else {
+        cc.arg("-O2");
     }
-    if let Some(ticks) = max_ticks {
-        cc.arg(format!("-DSYN_SIM_MAX_TICKS={ticks}"));
-    }
-    cc.arg(&c_path).arg("-o").arg(&bin_path);
+    cc.arg(&ll_path).arg("-o").arg(&bin_path);
 
     let cc_out = cc
         .output()
@@ -73,6 +72,17 @@ pub fn compile_and_run_c99(
             cc_out.status
         ));
     }
+
+    Ok(bin_path)
+}
+
+pub fn compile_and_run_host_llvm(
+    ll_source: &str,
+    sanitize: bool,
+    run_args: &[String],
+) -> Result<i32, String> {
+    let temp = TempWorkDir::create("zevc-run")?;
+    let bin_path = compile_host_llvm_binary(&temp, ll_source, sanitize)?;
 
     let status = Command::new(&bin_path)
         .args(run_args)
@@ -90,18 +100,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compiles_and_runs_c99_program() {
-        let c_src = r#"
-#include <stdio.h>
-int main(void) {
-    int sum = 0;
-    for (int i = 1; i <= 5; i++) {
-        sum += i;
-    }
-    return (sum == 15) ? 0 : 1;
+    fn compiles_and_runs_host_llvm_program() {
+        let ll_src = r#"
+target triple = "x86_64-unknown-linux-gnu"
+define i32 @main() nounwind {
+entry:
+  %sum = add i32 7, 8
+  %ok = icmp eq i32 %sum, 15
+  %ret = select i1 %ok, i32 0, i32 1
+  ret i32 %ret
 }
 "#;
-        let code = compile_and_run_c99(c_src, true, Some(100), &[]).unwrap();
+        let code = compile_and_run_host_llvm(ll_src, true, &[]).unwrap();
         assert_eq!(code, 0);
     }
 }

@@ -14,6 +14,7 @@ pub(super) struct CoroutineLowerCtx<'a> {
     pub(super) error_spec: MirErrorSpec,
     pub(super) manual_yield: bool,
     pub(super) in_noyield: bool,
+    pub(super) is_yielding_fn: bool,
     pub(super) has_restart: bool,
     pub(super) may_hold_boost: bool,
     pub(super) vars: Vec<MirVar>,
@@ -41,6 +42,7 @@ impl<'a> CoroutineLowerCtx<'a> {
             error_spec,
             manual_yield,
             in_noyield: false,
+            is_yielding_fn: false,
             has_restart: false,
             may_hold_boost: false,
             vars: Vec::new(),
@@ -334,6 +336,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 self.has_restart = true;
                 self.emit_defers_down_to(0)?;
                 self.emit_end_inbox_turn();
+                self.cur_stmts.push(MirStmt::ZeroTaskLocals);
                 let dead_bb = self.alloc_bb();
                 self.seal_bb(
                     MirTerminator::Yield(MirYieldKind::ShareCheckpoint {
@@ -381,7 +384,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let latch_bb = self.alloc_bb();
                 let exit_bb = self.alloc_bb();
                 let is_while_true = matches!(cond.kind, ExprKind::Literal(Literal::Bool(true)));
-                let auto_share = is_while_true && !stmt_manual && !self.in_noyield;
+                let auto_share = !stmt_manual && !self.in_noyield;
                 let has_inbox = ast_expr_has_inbox_recv(cond, &self.syms.boost_capable_fns)
                     || ast_stmts_have_inbox_recv(&body.stmts, &self.syms.boost_capable_fns);
                 if self.loop_stack.is_empty() && !has_inbox && self.may_hold_boost {
@@ -683,6 +686,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                         value: MirExpr::new(MirExprKind::IntLit(1), vty),
                     });
                 }
+                self.cur_stmts.push(MirStmt::BoundedForLatch);
                 self.seal_bb(MirTerminator::Goto(cond_bb), exit_bb, false);
             }
             StmtKind::ForEach {
@@ -777,6 +781,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                     op: MirAssignOp::AddAssign,
                     value: MirExpr::new(MirExprKind::IntLit(1), MirType::Usize),
                 });
+                self.cur_stmts.push(MirStmt::BoundedForLatch);
                 self.seal_bb(MirTerminator::Goto(cond_bb), exit_bb, false);
             }
             StmtKind::NoYield { body } => {
@@ -847,6 +852,299 @@ impl<'a> CoroutineLowerCtx<'a> {
                 }
                 self.may_hold_boost = exit_boost;
 
+                if self.cur_bb != join_bb {
+                    self.cur_bb = join_bb;
+                    self.cur_is_resume = false;
+                }
+            }
+            StmtKind::Wait { arms, timer } => {
+                self.emit_end_inbox_turn();
+
+                struct LoweredArmMeta<'b> {
+                    op: MirWaitArmOp,
+                    target_bb: BlockId,
+                    bound_var: Option<(String, VarId)>,
+                    sets_boost: bool,
+                    body: &'b Block,
+                }
+
+                let mut arm_metas: Vec<LoweredArmMeta<'_>> = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    let (receiver, method) = match &arm.call.kind {
+                        ExprKind::MethodCall {
+                            receiver, method, ..
+                        } => (receiver, method.name.as_str()),
+                        _ => {
+                            return Err(MirLowerError {
+                                message: "`wait { ... }` arm must be a direct primitive method call"
+                                    .to_string(),
+                                span: arm.call.span,
+                            });
+                        }
+                    };
+                    let recv_kind = resolve_prim_receiver_kind_be(receiver, self)?.ok_or_else(|| {
+                        MirLowerError {
+                            message: "`wait { ... }` arm receiver is not an OS primitive"
+                                .to_string(),
+                            span: receiver.span,
+                        }
+                    })?;
+
+                    let alloc_arm_dst = |this: &mut Self,
+                                         bind: &Option<(TypeExpr, zev_ast::Ident)>,
+                                         prefix: &str,
+                                         ty: MirType|
+                     -> (VarId, Option<(String, VarId)>) {
+                        if let Some((_, bind_id)) = bind {
+                            let vid = VarId(this.vars.len());
+                            this.vars.push(MirVar {
+                                id: vid,
+                                name: bind_id.name.clone(),
+                                ty,
+                                role: VarRole::UserLocal,
+                                in_noyield_scope: this.in_noyield,
+                                addr_taken: false,
+                                hoisted: false,
+                            });
+                            (vid, Some((bind_id.name.clone(), vid)))
+                        } else {
+                            let vid = this.alloc_temp(prefix, ty);
+                            (vid, None)
+                        }
+                    };
+
+                    let (op, bound_var, sets_boost) = match recv_kind {
+                        LoweredPrimReceiver::InboxView(view, elem) if method == "recv" => {
+                            let (vid, b) = alloc_arm_dst(self, &arm.bind, "wait_inbox", elem.clone());
+                            (
+                                MirWaitArmOp::InboxViewRecv {
+                                    view,
+                                    elem_ty: elem,
+                                    dst_val: Some(vid),
+                                    dst_res: None,
+                                },
+                                b,
+                                true,
+                            )
+                        }
+                        LoweredPrimReceiver::ByteRingView(view) if method == "wait_read" => {
+                            let sty = MirType::Slice(Box::new(MirType::U8));
+                            let (vid, b) = alloc_arm_dst(self, &arm.bind, "wait_ring", sty);
+                            (
+                                MirWaitArmOp::ByteRingViewWaitRead {
+                                    view,
+                                    dst_val: Some(vid),
+                                    dst_res: None,
+                                },
+                                b,
+                                true,
+                            )
+                        }
+                        LoweredPrimReceiver::Sized(target, pkind) => match (method, pkind) {
+                            ("recv", MirPrimKind::Inbox { elem, cap }) => {
+                                let (vid, b) =
+                                    alloc_arm_dst(self, &arm.bind, "wait_inbox", *elem.clone());
+                                (
+                                    MirWaitArmOp::InboxRecv {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        dst_val: Some(vid),
+                                        dst_res: None,
+                                    },
+                                    b,
+                                    true,
+                                )
+                            }
+                            ("wait", MirPrimKind::Signal) => (
+                                MirWaitArmOp::SignalWait {
+                                    target,
+                                    dst_res: None,
+                                },
+                                None,
+                                true,
+                            ),
+                            ("wait_read", MirPrimKind::ByteRing { cap }) => {
+                                let sty = MirType::Slice(Box::new(MirType::U8));
+                                let (vid, b) = alloc_arm_dst(self, &arm.bind, "wait_ring", sty);
+                                (
+                                    MirWaitArmOp::ByteRingWaitRead {
+                                        target,
+                                        cap,
+                                        dst_val: Some(vid),
+                                        dst_res: None,
+                                    },
+                                    b,
+                                    true,
+                                )
+                            }
+                            ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
+                                let sty = MirType::Slice(elem.clone());
+                                let (vid, b) = alloc_arm_dst(self, &arm.bind, "wait_pp", sty);
+                                (
+                                    MirWaitArmOp::PingPongWaitChunk {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        dst_slice: vid,
+                                    },
+                                    b,
+                                    false,
+                                )
+                            }
+                            ("wait_change", MirPrimKind::Watch { elem }) => {
+                                let (last_gen_var, seeded_var) =
+                                    self.prepare_watch_wait_change(&target, &elem);
+                                let (vid, b) =
+                                    alloc_arm_dst(self, &arm.bind, "wait_watch", *elem.clone());
+                                (
+                                    MirWaitArmOp::WatchWaitChange {
+                                        target,
+                                        elem_ty: *elem,
+                                        last_gen_var,
+                                        seeded_var,
+                                        dst_val: Some(vid),
+                                        dst_res: None,
+                                    },
+                                    b,
+                                    false,
+                                )
+                            }
+                            ("alloc", MirPrimKind::Pool { elem, cap }) => {
+                                let lty = MirType::Lease(elem.clone());
+                                let (vid, b) = alloc_arm_dst(self, &arm.bind, "wait_pool", lty);
+                                (
+                                    MirWaitArmOp::PoolAlloc {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        dst_val: Some(vid),
+                                        dst_res: None,
+                                    },
+                                    b,
+                                    false,
+                                )
+                            }
+                            _ => {
+                                return Err(MirLowerError {
+                                    message: format!(
+                                        "unsupported `wait {{ ... }}` arm method `{method}`"
+                                    ),
+                                    span: arm.call.span,
+                                });
+                            }
+                        },
+                        _ => {
+                            return Err(MirLowerError {
+                                message: format!(
+                                    "unsupported `wait {{ ... }}` arm method `{method}`"
+                                ),
+                                span: arm.call.span,
+                            });
+                        }
+                    };
+
+                    let target_bb = self.alloc_bb();
+                    arm_metas.push(LoweredArmMeta {
+                        op,
+                        target_bb,
+                        bound_var,
+                        sets_boost,
+                        body: &arm.body,
+                    });
+                }
+
+                let timer_meta = if let Some(t) = timer {
+                    let dl_var = match t.kind {
+                        zev_ast::WaitTimerKind::Timeout => {
+                            self.emit_wait_deadline_var("wait_deadline", &t.expr)?
+                        }
+                        zev_ast::WaitTimerKind::Deadline => {
+                            let dv = self.lower_expr(&t.expr, Some(&MirType::U32))?;
+                            let dv = coerce_expr_if_needed(dv, &MirType::U32);
+                            let v = self.alloc_temp("wait_deadline", MirType::U32);
+                            self.cur_stmts.push(MirStmt::Assign {
+                                target: MirPlace::Var(v),
+                                op: MirAssignOp::Assign,
+                                value: dv,
+                            });
+                            v
+                        }
+                    };
+                    let t_bb = self.alloc_bb();
+                    Some((dl_var, t_bb, &t.body))
+                } else {
+                    None
+                };
+
+                let poll_bb = self.alloc_bb();
+                let join_bb = self.alloc_bb();
+                let mir_arms: Vec<MirWaitArm> = arm_metas
+                    .iter()
+                    .map(|m| MirWaitArm {
+                        op: m.op.clone(),
+                        target_bb: m.target_bb,
+                    })
+                    .collect();
+                let mir_timer = timer_meta.as_ref().map(|(dl_var, t_bb, _)| MirWaitTimer {
+                    deadline_var: *dl_var,
+                    timeout_bb: *t_bb,
+                    timeout_err_res: None,
+                    release_lease_on_timeout: None,
+                });
+                let first_target = arm_metas
+                    .first()
+                    .map(|m| m.target_bb)
+                    .or_else(|| timer_meta.as_ref().map(|(_, tb, _)| *tb))
+                    .unwrap_or(join_bb);
+
+                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+                self.seal_bb(
+                    MirTerminator::Yield(MirYieldKind::Wait {
+                        arms: mir_arms,
+                        timer: mir_timer,
+                        poll_bb,
+                    }),
+                    first_target,
+                    false,
+                );
+
+                let mut exit_boost = false;
+                for (idx, meta) in arm_metas.iter().enumerate() {
+                    if self.cur_bb != meta.target_bb {
+                        self.cur_bb = meta.target_bb;
+                        self.cur_is_resume = false;
+                    }
+                    self.may_hold_boost = meta.sets_boost;
+                    self.scopes.push();
+                    self.defer_stack.push(Vec::new());
+                    if let Some((name, vid)) = &meta.bound_var {
+                        self.scopes.insert(name.clone(), *vid);
+                    }
+                    self.lower_stmts(&meta.body.stmts)?;
+                    self.pop_and_lower_top_defer_scope()?;
+                    self.scopes.pop();
+                    exit_boost |= self.may_hold_boost;
+                    let next_bb = arm_metas
+                        .get(idx + 1)
+                        .map(|n| n.target_bb)
+                        .or_else(|| timer_meta.as_ref().map(|(_, tb, _)| *tb))
+                        .unwrap_or(join_bb);
+                    self.seal_bb(MirTerminator::Goto(join_bb), next_bb, false);
+                }
+
+                if let Some((_, t_bb, t_body)) = timer_meta {
+                    if self.cur_bb != t_bb {
+                        self.cur_bb = t_bb;
+                        self.cur_is_resume = false;
+                    }
+                    self.may_hold_boost = false;
+                    self.lower_scoped_block(t_body)?;
+                    exit_boost |= self.may_hold_boost;
+                    self.seal_bb(MirTerminator::Goto(join_bb), join_bb, false);
+                }
+
+                self.may_hold_boost = exit_boost;
                 if self.cur_bb != join_bb {
                     self.cur_bb = join_bb;
                     self.cur_is_resume = false;
@@ -1084,6 +1382,70 @@ impl<'a> CoroutineLowerCtx<'a> {
     }
 
     /// Directly lower `VarType dst = <yielding_op>;` without allocating an extra copy temp!
+    pub(super) fn emit_wait_deadline_var(
+        &mut self,
+        prefix: &str,
+        dur_expr: &Expr,
+    ) -> Result<VarId, MirLowerError> {
+        let ticks = self.lower_expr(dur_expr, Some(&MirType::U32))?;
+        let dl_var = self.alloc_temp(prefix, MirType::U32);
+        self.cur_stmts.push(MirStmt::Assign {
+            target: MirPlace::Var(dl_var),
+            op: MirAssignOp::Assign,
+            value: MirExpr::new(
+                MirExprKind::Binary {
+                    op: MirBinOp::Add,
+                    lhs: Box::new(MirExpr::new(MirExprKind::NowTicks, MirType::U32)),
+                    rhs: Box::new(ticks),
+                },
+                MirType::U32,
+            ),
+        });
+        Ok(dl_var)
+    }
+
+    pub(super) fn emit_single_arm_wait(
+        &mut self,
+        op: MirWaitArmOp,
+        timer: Option<MirWaitTimer>,
+        poll_bb: BlockId,
+        resume_bb: BlockId,
+    ) {
+        self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
+        self.seal_bb(
+            MirTerminator::Yield(MirYieldKind::Wait {
+                arms: vec![MirWaitArm {
+                    op,
+                    target_bb: resume_bb,
+                }],
+                timer,
+                poll_bb,
+            }),
+            resume_bb,
+            false,
+        );
+    }
+
+    pub(super) fn prepare_watch_wait_change(
+        &mut self,
+        target: &MirPrimTarget,
+        elem_ty: &MirType,
+    ) -> (VarId, Option<VarId>) {
+        let last_gen_var = self.alloc_temp("watch_gen", MirType::U32);
+        self.cur_stmts.push(MirStmt::Assign {
+            target: MirPlace::Var(last_gen_var),
+            op: MirAssignOp::Assign,
+            value: MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::WatchGen {
+                    target: target.clone(),
+                    elem_ty: elem_ty.clone(),
+                })),
+                MirType::U32,
+            ),
+        });
+        (last_gen_var, None)
+    }
+
     pub(super) fn try_lower_yielding_into_var(
         &mut self,
         expr: &Expr,
@@ -1131,18 +1493,15 @@ impl<'a> CoroutineLowerCtx<'a> {
                             self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::ByteRingViewWaitRead {
+                            self.emit_single_arm_wait(
+                                MirWaitArmOp::ByteRingViewWaitRead {
                                     view,
-                                    timeout_deadline_var: None,
                                     dst_val: Some(dst_vid),
                                     dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
+                                },
+                                None,
+                                poll_bb,
                                 resume_bb,
-                                false,
                             );
                             self.may_hold_boost = true;
                             return Ok(true);
@@ -1153,118 +1512,125 @@ impl<'a> CoroutineLowerCtx<'a> {
                             self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::InboxViewRecv {
+                            self.emit_single_arm_wait(
+                                MirWaitArmOp::InboxViewRecv {
                                     view,
                                     elem_ty: elem,
-                                    timeout_deadline_var: None,
                                     dst_val: Some(dst_vid),
                                     dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
+                                },
+                                None,
+                                poll_bb,
                                 resume_bb,
-                                false,
                             );
                             self.may_hold_boost = true;
                             return Ok(true);
                         }
-                        LoweredPrimReceiver::Sized(target, pkind) => {
-                            match (m, pkind) {
-                        ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
-                            self.emit_end_inbox_turn();
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::PingPongWaitChunk {
-                                    target,
-                                    elem_ty: *elem,
-                                    cap,
-                                    dst_slice: dst_vid,
+                        LoweredPrimReceiver::Sized(target, pkind) => match (m, pkind) {
+                            ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
+                                self.emit_end_inbox_turn();
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::PingPongWaitChunk {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        dst_slice: dst_vid,
+                                    },
+                                    None,
                                     poll_bb,
                                     resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            return Ok(true);
-                        }
-                        ("alloc", MirPrimKind::Pool { elem, cap })
-                            if find_named_arg(args, "timeout").is_none() =>
-                        {
-                            self.emit_end_inbox_turn();
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::PoolAlloc {
-                                    target,
-                                    elem_ty: *elem,
-                                    cap,
-                                    timeout_deadline_var: None,
-                                    dst_val: Some(dst_vid),
-                                    dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            self.may_hold_boost = true;
-                            return Ok(true);
-                        }
-                        ("recv", MirPrimKind::Inbox { elem, cap })
-                            if find_named_arg(args, "timeout").is_none() =>
-                        {
-                            self.emit_end_inbox_turn();
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::InboxRecv {
-                                    target,
-                                    elem_ty: *elem,
-                                    cap,
-                                    timeout_deadline_var: None,
-                                    dst_val: Some(dst_vid),
-                                    dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            self.may_hold_boost = true;
-                            return Ok(true);
-                        }
-                        ("wait_read", MirPrimKind::ByteRing { cap })
-                            if find_named_arg(args, "timeout").is_none() =>
-                        {
-                            self.emit_end_inbox_turn();
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::ByteRingWaitRead {
-                                    target,
-                                    cap,
-                                    timeout_deadline_var: None,
-                                    dst_val: Some(dst_vid),
-                                    dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            self.may_hold_boost = true;
-                            return Ok(true);
-                        }
-                        _ => {}
+                                );
+                                return Ok(true);
                             }
-                        }
+                            ("alloc", MirPrimKind::Pool { elem, cap })
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::PoolAlloc {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        dst_val: Some(dst_vid),
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                self.may_hold_boost = true;
+                                return Ok(true);
+                            }
+                            ("recv", MirPrimKind::Inbox { elem, cap })
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::InboxRecv {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        dst_val: Some(dst_vid),
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                self.may_hold_boost = true;
+                                return Ok(true);
+                            }
+                            ("wait_read", MirPrimKind::ByteRing { cap })
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::ByteRingWaitRead {
+                                        target,
+                                        cap,
+                                        dst_val: Some(dst_vid),
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                self.may_hold_boost = true;
+                                return Ok(true);
+                            }
+                            ("wait_change", MirPrimKind::Watch { elem })
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let (last_gen_var, seeded_var) =
+                                    self.prepare_watch_wait_change(&target, &elem);
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::WatchWaitChange {
+                                        target,
+                                        elem_ty: *elem,
+                                        last_gen_var,
+                                        seeded_var,
+                                        dst_val: Some(dst_vid),
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                return Ok(true);
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -1303,7 +1669,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                     }
                 }
                 let m = method.name.as_str();
-                (m == "send" || m == "wait") && find_named_arg(args, "timeout").is_none()
+                (m == "send" || m == "wait" || m == "wait_change")
+                    && find_named_arg(args, "timeout").is_none()
             }
             _ => false,
         }
@@ -1390,83 +1757,113 @@ impl<'a> CoroutineLowerCtx<'a> {
                             });
                             let poll_bb = self.alloc_bb();
                             let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::InboxViewSend {
+                            self.emit_single_arm_wait(
+                                MirWaitArmOp::InboxViewSend {
                                     view,
                                     elem_ty: elem,
                                     val_var,
-                                    timeout_deadline_var: None,
                                     dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
+                                },
+                                None,
+                                poll_bb,
                                 resume_bb,
-                                false,
                             );
                             return Ok(true);
                         }
-                        LoweredPrimReceiver::Sized(target, pkind) => {
-                            match (m, pkind) {
-                        ("send", MirPrimKind::Inbox { elem, cap })
-                            if find_named_arg(args, "timeout").is_none() =>
-                        {
-                            let vexpr = if let Some(first) = first_positional_arg(args) {
-                                let raw = self.lower_expr(first, Some(&elem))?;
-                                coerce_expr_if_needed(raw, &elem)
-                            } else {
-                                MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
-                            };
-                            let vexpr = consume_moved_lease_be(vexpr, self);
-                            let val_var = self.alloc_temp("inbox_tx", *elem.clone());
-                            self.cur_stmts.push(MirStmt::Assign {
-                                target: MirPlace::Var(val_var),
-                                op: MirAssignOp::Assign,
-                                value: vexpr,
-                            });
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::InboxSend {
-                                    target,
-                                    elem_ty: *elem,
-                                    cap,
-                                    val_var,
-                                    timeout_deadline_var: None,
-                                    dst_res: None,
+                        LoweredPrimReceiver::Sized(target, pkind) => match (m, pkind) {
+                            ("send", MirPrimKind::Inbox { elem, cap })
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                let vexpr = if let Some(first) = first_positional_arg(args) {
+                                    let raw = self.lower_expr(first, Some(&elem))?;
+                                    coerce_expr_if_needed(raw, &elem)
+                                } else {
+                                    MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
+                                };
+                                let vexpr = consume_moved_lease_be(vexpr, self);
+                                let val_var = self.alloc_temp("inbox_tx", *elem.clone());
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(val_var),
+                                    op: MirAssignOp::Assign,
+                                    value: vexpr,
+                                });
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::InboxSend {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        val_var,
+                                        dst_res: None,
+                                    },
+                                    None,
                                     poll_bb,
                                     resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            return Ok(true);
-                        }
-                        ("wait", MirPrimKind::Signal)
-                            if find_named_arg(args, "timeout").is_none() =>
-                        {
-                            self.emit_end_inbox_turn();
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::SignalWait {
-                                    target,
-                                    timeout_deadline_var: None,
-                                    dst_res: None,
-                                    poll_bb,
-                                    resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            self.may_hold_boost = true;
-                            return Ok(true);
-                        }
-                        _ => {}
+                                );
+                                return Ok(true);
                             }
-                        }
+                            ("wait", MirPrimKind::Signal)
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::SignalWait {
+                                        target,
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                self.may_hold_boost = true;
+                                return Ok(true);
+                            }
+                            ("commit_wait", MirPrimKind::WaitQueue)
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::WaitQueueCommit {
+                                        target,
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                self.may_hold_boost = true;
+                                return Ok(true);
+                            }
+                            ("wait_change", MirPrimKind::Watch { elem })
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let (last_gen_var, seeded_var) =
+                                    self.prepare_watch_wait_change(&target, &elem);
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::WatchWaitChange {
+                                        target,
+                                        elem_ty: *elem,
+                                        last_gen_var,
+                                        seeded_var,
+                                        dst_val: None,
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                return Ok(true);
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -1851,62 +2248,46 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     value: vexpr,
                                 });
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                    let dl_var =
-                                        self.alloc_temp("inbox_tx_deadline", MirType::U32);
-                                    self.cur_stmts.push(MirStmt::Assign {
-                                        target: MirPlace::Var(dl_var),
-                                        op: MirAssignOp::Assign,
-                                        value: MirExpr::new(
-                                            MirExprKind::Binary {
-                                                op: MirBinOp::Add,
-                                                lhs: Box::new(MirExpr::new(
-                                                    MirExprKind::NowTicks,
-                                                    MirType::U32,
-                                                )),
-                                                rhs: Box::new(ticks),
-                                            },
-                                            MirType::U32,
-                                        ),
-                                    });
+                                    let dl_var = self.emit_wait_deadline_var("inbox_tx_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: Box::new(MirType::Void),
                                         err: None,
                                     };
                                     let dst_res = self.alloc_temp("inbox_tx_res", rty.clone());
+                                    let release_lease_on_timeout =
+                                        matches!(&elem, MirType::Lease(_)).then(|| (val_var, elem.clone()));
                                     let poll_bb = self.alloc_bb();
                                     let resume_bb = self.alloc_bb();
-                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                    self.seal_bb(
-                                        MirTerminator::Yield(MirYieldKind::InboxViewSend {
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxViewSend {
                                             view,
                                             elem_ty: elem,
                                             val_var,
-                                            timeout_deadline_var: Some(dl_var),
                                             dst_res: Some(dst_res),
-                                            poll_bb,
-                                            resume_bb,
+                                        },
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout,
                                         }),
+                                        poll_bb,
                                         resume_bb,
-                                        false,
                                     );
                                     return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                                 } else {
                                     let poll_bb = self.alloc_bb();
                                     let resume_bb = self.alloc_bb();
-                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                    self.seal_bb(
-                                        MirTerminator::Yield(MirYieldKind::InboxViewSend {
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxViewSend {
                                             view,
                                             elem_ty: elem,
                                             val_var,
-                                            timeout_deadline_var: None,
                                             dst_res: None,
-                                            poll_bb,
-                                            resume_bb,
-                                        }),
+                                        },
+                                        None,
+                                        poll_bb,
                                         resume_bb,
-                                        false,
                                     );
                                     return Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void));
                                 }
@@ -1914,23 +2295,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             "recv" => {
                                 self.emit_end_inbox_turn();
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                    let dl_var = self.alloc_temp("inbox_deadline", MirType::U32);
-                                    self.cur_stmts.push(MirStmt::Assign {
-                                        target: MirPlace::Var(dl_var),
-                                        op: MirAssignOp::Assign,
-                                        value: MirExpr::new(
-                                            MirExprKind::Binary {
-                                                op: MirBinOp::Add,
-                                                lhs: Box::new(MirExpr::new(
-                                                    MirExprKind::NowTicks,
-                                                    MirType::U32,
-                                                )),
-                                                rhs: Box::new(ticks),
-                                            },
-                                            MirType::U32,
-                                        ),
-                                    });
+                                    let dl_var = self.emit_wait_deadline_var("inbox_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: Box::new(elem.clone()),
                                         err: None,
@@ -1938,19 +2303,21 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     let dst_res = self.alloc_temp("inbox_res", rty.clone());
                                     let poll_bb = self.alloc_bb();
                                     let resume_bb = self.alloc_bb();
-                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                    self.seal_bb(
-                                        MirTerminator::Yield(MirYieldKind::InboxViewRecv {
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxViewRecv {
                                             view,
                                             elem_ty: elem,
-                                            timeout_deadline_var: Some(dl_var),
                                             dst_val: None,
                                             dst_res: Some(dst_res),
-                                            poll_bb,
-                                            resume_bb,
+                                        },
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout: None,
                                         }),
+                                        poll_bb,
                                         resume_bb,
-                                        false,
                                     );
                                     self.may_hold_boost = true;
                                     return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
@@ -1958,19 +2325,16 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     let dst_val = self.alloc_temp("inbox_val", elem.clone());
                                     let poll_bb = self.alloc_bb();
                                     let resume_bb = self.alloc_bb();
-                                    self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                    self.seal_bb(
-                                        MirTerminator::Yield(MirYieldKind::InboxViewRecv {
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxViewRecv {
                                             view,
                                             elem_ty: elem.clone(),
-                                            timeout_deadline_var: None,
                                             dst_val: Some(dst_val),
                                             dst_res: None,
-                                            poll_bb,
-                                            resume_bb,
-                                        }),
+                                        },
+                                        None,
+                                        poll_bb,
                                         resume_bb,
-                                        false,
                                     );
                                     self.may_hold_boost = true;
                                     return Ok(MirExpr::new(MirExprKind::Var(dst_val), elem));
@@ -1982,23 +2346,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             self.emit_end_inbox_turn();
                             let slice_ty = MirType::Slice(Box::new(MirType::U8));
                             if let Some(texpr) = find_named_arg(args, "timeout") {
-                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                let dl_var = self.alloc_temp("ring_deadline", MirType::U32);
-                                self.cur_stmts.push(MirStmt::Assign {
-                                    target: MirPlace::Var(dl_var),
-                                    op: MirAssignOp::Assign,
-                                    value: MirExpr::new(
-                                        MirExprKind::Binary {
-                                            op: MirBinOp::Add,
-                                            lhs: Box::new(MirExpr::new(
-                                                MirExprKind::NowTicks,
-                                                MirType::U32,
-                                            )),
-                                            rhs: Box::new(ticks),
-                                        },
-                                        MirType::U32,
-                                    ),
-                                });
+                                let dl_var = self.emit_wait_deadline_var("ring_deadline", texpr)?;
                                 let rty = MirType::Result {
                                     ok: Box::new(slice_ty),
                                     err: None,
@@ -2006,18 +2354,20 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 let dst_res = self.alloc_temp("ring_res", rty.clone());
                                 let poll_bb = self.alloc_bb();
                                 let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::ByteRingViewWaitRead {
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::ByteRingViewWaitRead {
                                         view,
-                                        timeout_deadline_var: Some(dl_var),
                                         dst_val: None,
                                         dst_res: Some(dst_res),
-                                        poll_bb,
-                                        resume_bb,
+                                    },
+                                    Some(MirWaitTimer {
+                                        deadline_var: dl_var,
+                                        timeout_bb: resume_bb,
+                                        timeout_err_res: Some(dst_res),
+                                        release_lease_on_timeout: None,
                                     }),
+                                    poll_bb,
                                     resume_bb,
-                                    false,
                                 );
                                 self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
@@ -2025,374 +2375,373 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 let dst_val = self.alloc_temp("ring_chunk", slice_ty.clone());
                                 let poll_bb = self.alloc_bb();
                                 let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::ByteRingViewWaitRead {
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::ByteRingViewWaitRead {
                                         view,
-                                        timeout_deadline_var: None,
                                         dst_val: Some(dst_val),
                                         dst_res: None,
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
+                                    },
+                                    None,
+                                    poll_bb,
                                     resume_bb,
-                                    false,
                                 );
                                 self.may_hold_boost = true;
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
                             }
                         }
                         LoweredPrimReceiver::ByteRingView(_) => {}
-                        LoweredPrimReceiver::Sized(target, pkind) => {
-                            match (m, pkind) {
-                        ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
-                            self.emit_end_inbox_turn();
-                            let sty = MirType::Slice(elem.clone());
-                            let dst_vid = self.alloc_temp("pp_chunk", sty.clone());
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::PingPongWaitChunk {
-                                    target,
-                                    elem_ty: *elem,
-                                    cap,
-                                    dst_slice: dst_vid,
+                        LoweredPrimReceiver::Sized(target, pkind) => match (m, pkind) {
+                            ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
+                                self.emit_end_inbox_turn();
+                                let sty = MirType::Slice(elem.clone());
+                                let dst_vid = self.alloc_temp("pp_chunk", sty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::PingPongWaitChunk {
+                                        target,
+                                        elem_ty: *elem,
+                                        cap,
+                                        dst_slice: dst_vid,
+                                    },
+                                    None,
                                     poll_bb,
                                     resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            return Ok(MirExpr::new(MirExprKind::Var(dst_vid), sty));
-                        }
-                        ("alloc", MirPrimKind::Pool { elem, cap }) => {
-                            self.emit_end_inbox_turn();
-                            if let Some(texpr) = find_named_arg(args, "timeout") {
-                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                let dl_var = self.alloc_temp("pool_deadline", MirType::U32);
-                                self.cur_stmts.push(MirStmt::Assign {
-                                    target: MirPlace::Var(dl_var),
-                                    op: MirAssignOp::Assign,
-                                    value: MirExpr::new(
-                                        MirExprKind::Binary {
-                                            op: MirBinOp::Add,
-                                            lhs: Box::new(MirExpr::new(
-                                                MirExprKind::NowTicks,
-                                                MirType::U32,
-                                            )),
-                                            rhs: Box::new(ticks),
-                                        },
-                                        MirType::U32,
-                                    ),
-                                });
-                                let lease_ty = MirType::Lease(elem.clone());
-                                let rty = MirType::Result {
-                                    ok: Box::new(lease_ty),
-                                    err: None,
-                                };
-                                let dst_res = self.alloc_temp("pool_res", rty.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::PoolAlloc {
-                                        target,
-                                        elem_ty: *elem,
-                                        cap,
-                                        timeout_deadline_var: Some(dl_var),
-                                        dst_val: None,
-                                        dst_res: Some(dst_res),
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
                                 );
-                                self.may_hold_boost = true;
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
-                            } else {
-                                let lease_ty = MirType::Lease(elem.clone());
-                                let dst_val = self.alloc_temp("pool_lease", lease_ty.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::PoolAlloc {
-                                        target,
-                                        elem_ty: *elem,
-                                        cap,
-                                        timeout_deadline_var: None,
-                                        dst_val: Some(dst_val),
-                                        dst_res: None,
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                self.may_hold_boost = true;
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), lease_ty));
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_vid), sty));
                             }
-                        }
-                        ("send", MirPrimKind::Inbox { elem, cap }) => {
-                            let vexpr = if let Some(first) = first_positional_arg(args) {
-                                let raw = self.lower_expr(first, Some(&elem))?;
-                                coerce_expr_if_needed(raw, &elem)
-                            } else {
-                                MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
-                            };
-                            let vexpr = consume_moved_lease_be(vexpr, self);
-                            let val_var = self.alloc_temp("inbox_tx", *elem.clone());
-                            self.cur_stmts.push(MirStmt::Assign {
-                                target: MirPlace::Var(val_var),
-                                op: MirAssignOp::Assign,
-                                value: vexpr,
-                            });
-                            if let Some(texpr) = find_named_arg(args, "timeout") {
-                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                let dl_var = self.alloc_temp("inbox_tx_deadline", MirType::U32);
-                                self.cur_stmts.push(MirStmt::Assign {
-                                    target: MirPlace::Var(dl_var),
-                                    op: MirAssignOp::Assign,
-                                    value: MirExpr::new(
-                                        MirExprKind::Binary {
-                                            op: MirBinOp::Add,
-                                            lhs: Box::new(MirExpr::new(
-                                                MirExprKind::NowTicks,
-                                                MirType::U32,
-                                            )),
-                                            rhs: Box::new(ticks),
+                            ("alloc", MirPrimKind::Pool { elem, cap }) => {
+                                self.emit_end_inbox_turn();
+                                let lease_ty = MirType::Lease(elem.clone());
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var = self.emit_wait_deadline_var("pool_deadline", texpr)?;
+                                    let rty = MirType::Result {
+                                        ok: Box::new(lease_ty),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("pool_res", rty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::PoolAlloc {
+                                            target,
+                                            elem_ty: *elem,
+                                            cap,
+                                            dst_val: None,
+                                            dst_res: Some(dst_res),
                                         },
-                                        MirType::U32,
-                                    ),
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout: None,
+                                        }),
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    self.may_hold_boost = true;
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let dst_val = self.alloc_temp("pool_lease", lease_ty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::PoolAlloc {
+                                            target,
+                                            elem_ty: *elem,
+                                            cap,
+                                            dst_val: Some(dst_val),
+                                            dst_res: None,
+                                        },
+                                        None,
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    self.may_hold_boost = true;
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_val), lease_ty));
+                                }
+                            }
+                            ("send", MirPrimKind::Inbox { elem, cap }) => {
+                                let vexpr = if let Some(first) = first_positional_arg(args) {
+                                    let raw = self.lower_expr(first, Some(&elem))?;
+                                    coerce_expr_if_needed(raw, &elem)
+                                } else {
+                                    MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
+                                };
+                                let vexpr = consume_moved_lease_be(vexpr, self);
+                                let val_var = self.alloc_temp("inbox_tx", *elem.clone());
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(val_var),
+                                    op: MirAssignOp::Assign,
+                                    value: vexpr,
                                 });
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var = self.emit_wait_deadline_var("inbox_tx_deadline", texpr)?;
+                                    let rty = MirType::Result {
+                                        ok: Box::new(MirType::Void),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("inbox_tx_res", rty.clone());
+                                    let release_lease_on_timeout =
+                                        matches!(elem.as_ref(), MirType::Lease(_))
+                                            .then(|| (val_var, *elem.clone()));
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxSend {
+                                            target,
+                                            elem_ty: *elem,
+                                            cap,
+                                            val_var,
+                                            dst_res: Some(dst_res),
+                                        },
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout,
+                                        }),
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxSend {
+                                            target,
+                                            elem_ty: *elem,
+                                            cap,
+                                            val_var,
+                                            dst_res: None,
+                                        },
+                                        None,
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void));
+                                }
+                            }
+                            ("recv", MirPrimKind::Inbox { elem, cap }) => {
+                                self.emit_end_inbox_turn();
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var = self.emit_wait_deadline_var("inbox_deadline", texpr)?;
+                                    let rty = MirType::Result {
+                                        ok: elem.clone(),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("inbox_res", rty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxRecv {
+                                            target,
+                                            elem_ty: *elem,
+                                            cap,
+                                            dst_val: None,
+                                            dst_res: Some(dst_res),
+                                        },
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout: None,
+                                        }),
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    self.may_hold_boost = true;
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let dst_val = self.alloc_temp("inbox_val", *elem.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::InboxRecv {
+                                            target,
+                                            elem_ty: *elem.clone(),
+                                            cap,
+                                            dst_val: Some(dst_val),
+                                            dst_res: None,
+                                        },
+                                        None,
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    self.may_hold_boost = true;
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_val), *elem));
+                                }
+                            }
+                            ("wait_read", MirPrimKind::ByteRing { cap }) => {
+                                self.emit_end_inbox_turn();
+                                let slice_ty = MirType::Slice(Box::new(MirType::U8));
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var = self.emit_wait_deadline_var("ring_deadline", texpr)?;
+                                    let rty = MirType::Result {
+                                        ok: Box::new(slice_ty),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("ring_res", rty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::ByteRingWaitRead {
+                                            target,
+                                            cap,
+                                            dst_val: None,
+                                            dst_res: Some(dst_res),
+                                        },
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout: None,
+                                        }),
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    self.may_hold_boost = true;
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let dst_val = self.alloc_temp("ring_chunk", slice_ty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::ByteRingWaitRead {
+                                            target,
+                                            cap,
+                                            dst_val: Some(dst_val),
+                                            dst_res: None,
+                                        },
+                                        None,
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    self.may_hold_boost = true;
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
+                                }
+                            }
+                            ("wait", MirPrimKind::Signal) => {
+                                self.emit_end_inbox_turn();
+                                let timer = if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var = self.emit_wait_deadline_var("sig_deadline", texpr)?;
+                                    Some(dl_var)
+                                } else {
+                                    None
+                                };
                                 let rty = MirType::Result {
                                     ok: Box::new(MirType::Void),
                                     err: None,
                                 };
-                                let dst_res = self.alloc_temp("inbox_tx_res", rty.clone());
+                                let dst_res = self.alloc_temp("sig_res", rty.clone());
                                 let poll_bb = self.alloc_bb();
                                 let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::InboxSend {
-                                        target,
-                                        elem_ty: *elem,
-                                        cap,
-                                        val_var,
-                                        timeout_deadline_var: Some(dl_var),
-                                        dst_res: Some(dst_res),
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
-                            } else {
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::InboxSend {
-                                        target,
-                                        elem_ty: *elem,
-                                        cap,
-                                        val_var,
-                                        timeout_deadline_var: None,
-                                        dst_res: None,
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                return Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void));
-                            }
-                        }
-                        ("recv", MirPrimKind::Inbox { elem, cap }) => {
-                            self.emit_end_inbox_turn();
-                            if let Some(texpr) = find_named_arg(args, "timeout") {
-                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                let dl_var = self.alloc_temp("inbox_deadline", MirType::U32);
-                                self.cur_stmts.push(MirStmt::Assign {
-                                    target: MirPlace::Var(dl_var),
-                                    op: MirAssignOp::Assign,
-                                    value: MirExpr::new(
-                                        MirExprKind::Binary {
-                                            op: MirBinOp::Add,
-                                            lhs: Box::new(MirExpr::new(
-                                                MirExprKind::NowTicks,
-                                                MirType::U32,
-                                            )),
-                                            rhs: Box::new(ticks),
-                                        },
-                                        MirType::U32,
-                                    ),
+                                let wait_timer = timer.map(|dl_var| MirWaitTimer {
+                                    deadline_var: dl_var,
+                                    timeout_bb: resume_bb,
+                                    timeout_err_res: Some(dst_res),
+                                    release_lease_on_timeout: None,
                                 });
-                                let rty = MirType::Result {
-                                    ok: elem.clone(),
-                                    err: None,
-                                };
-                                let dst_res = self.alloc_temp("inbox_res", rty.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::InboxRecv {
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::SignalWait {
                                         target,
-                                        elem_ty: *elem,
-                                        cap,
-                                        timeout_deadline_var: Some(dl_var),
-                                        dst_val: None,
                                         dst_res: Some(dst_res),
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                self.may_hold_boost = true;
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
-                            } else {
-                                let dst_val = self.alloc_temp("inbox_val", *elem.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::InboxRecv {
-                                        target,
-                                        elem_ty: *elem.clone(),
-                                        cap,
-                                        timeout_deadline_var: None,
-                                        dst_val: Some(dst_val),
-                                        dst_res: None,
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                self.may_hold_boost = true;
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), *elem));
-                            }
-                        }
-                        ("wait_read", MirPrimKind::ByteRing { cap }) => {
-                            self.emit_end_inbox_turn();
-                            let slice_ty = MirType::Slice(Box::new(MirType::U8));
-                            if let Some(texpr) = find_named_arg(args, "timeout") {
-                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                let dl_var = self.alloc_temp("ring_deadline", MirType::U32);
-                                self.cur_stmts.push(MirStmt::Assign {
-                                    target: MirPlace::Var(dl_var),
-                                    op: MirAssignOp::Assign,
-                                    value: MirExpr::new(
-                                        MirExprKind::Binary {
-                                            op: MirBinOp::Add,
-                                            lhs: Box::new(MirExpr::new(
-                                                MirExprKind::NowTicks,
-                                                MirType::U32,
-                                            )),
-                                            rhs: Box::new(ticks),
-                                        },
-                                        MirType::U32,
-                                    ),
-                                });
-                                let rty = MirType::Result {
-                                    ok: Box::new(slice_ty),
-                                    err: None,
-                                };
-                                let dst_res = self.alloc_temp("ring_res", rty.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::ByteRingWaitRead {
-                                        target,
-                                        cap,
-                                        timeout_deadline_var: Some(dl_var),
-                                        dst_val: None,
-                                        dst_res: Some(dst_res),
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                self.may_hold_boost = true;
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
-                            } else {
-                                let dst_val = self.alloc_temp("ring_chunk", slice_ty.clone());
-                                let poll_bb = self.alloc_bb();
-                                let resume_bb = self.alloc_bb();
-                                self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                                self.seal_bb(
-                                    MirTerminator::Yield(MirYieldKind::ByteRingWaitRead {
-                                        target,
-                                        cap,
-                                        timeout_deadline_var: None,
-                                        dst_val: Some(dst_val),
-                                        dst_res: None,
-                                        poll_bb,
-                                        resume_bb,
-                                    }),
-                                    resume_bb,
-                                    false,
-                                );
-                                self.may_hold_boost = true;
-                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
-                            }
-                        }
-                        ("wait", MirPrimKind::Signal) => {
-                            self.emit_end_inbox_turn();
-                            let timeout_var = if let Some(texpr) = find_named_arg(args, "timeout") {
-                                let ticks = self.lower_expr(texpr, Some(&MirType::U32))?;
-                                let dl_var = self.alloc_temp("sig_deadline", MirType::U32);
-                                self.cur_stmts.push(MirStmt::Assign {
-                                    target: MirPlace::Var(dl_var),
-                                    op: MirAssignOp::Assign,
-                                    value: MirExpr::new(
-                                        MirExprKind::Binary {
-                                            op: MirBinOp::Add,
-                                            lhs: Box::new(MirExpr::new(
-                                                MirExprKind::NowTicks,
-                                                MirType::U32,
-                                            )),
-                                            rhs: Box::new(ticks),
-                                        },
-                                        MirType::U32,
-                                    ),
-                                });
-                                Some(dl_var)
-                            } else {
-                                None
-                            };
-                            let rty = MirType::Result {
-                                ok: Box::new(MirType::Void),
-                                err: None,
-                            };
-                            let dst_res = self.alloc_temp("sig_res", rty.clone());
-                            let poll_bb = self.alloc_bb();
-                            let resume_bb = self.alloc_bb();
-                            self.seal_bb(MirTerminator::Goto(poll_bb), poll_bb, true);
-                            self.seal_bb(
-                                MirTerminator::Yield(MirYieldKind::SignalWait {
-                                    target,
-                                    timeout_deadline_var: timeout_var,
-                                    dst_res: Some(dst_res),
+                                    },
+                                    wait_timer,
                                     poll_bb,
                                     resume_bb,
-                                }),
-                                resume_bb,
-                                false,
-                            );
-                            self.may_hold_boost = true;
-                            return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
-                        }
-                        _ => {}
+                                );
+                                self.may_hold_boost = true;
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
                             }
-                        }
+                            ("commit_wait", MirPrimKind::WaitQueue) => {
+                                self.emit_end_inbox_turn();
+                                let timer = if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var = self.emit_wait_deadline_var("wq_deadline", texpr)?;
+                                    Some(dl_var)
+                                } else {
+                                    None
+                                };
+                                let rty = MirType::Result {
+                                    ok: Box::new(MirType::Void),
+                                    err: None,
+                                };
+                                let dst_res = self.alloc_temp("wq_res", rty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                let wait_timer = timer.map(|dl_var| MirWaitTimer {
+                                    deadline_var: dl_var,
+                                    timeout_bb: resume_bb,
+                                    timeout_err_res: Some(dst_res),
+                                    release_lease_on_timeout: None,
+                                });
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::WaitQueueCommit {
+                                        target,
+                                        dst_res: Some(dst_res),
+                                    },
+                                    wait_timer,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                self.may_hold_boost = true;
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                            }
+                            ("wait_change", MirPrimKind::Watch { elem }) => {
+                                self.emit_end_inbox_turn();
+                                let (last_gen_var, seeded_var) =
+                                    self.prepare_watch_wait_change(&target, &elem);
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var = self.emit_wait_deadline_var("watch_deadline", texpr)?;
+                                    let rty = MirType::Result {
+                                        ok: elem.clone(),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("watch_res", rty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::WatchWaitChange {
+                                            target,
+                                            elem_ty: *elem,
+                                            last_gen_var,
+                                            seeded_var,
+                                            dst_val: None,
+                                            dst_res: Some(dst_res),
+                                        },
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout: None,
+                                        }),
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let dst_val = self.alloc_temp("watch_val", *elem.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::WatchWaitChange {
+                                            target,
+                                            elem_ty: *elem.clone(),
+                                            last_gen_var,
+                                            seeded_var,
+                                            dst_val: Some(dst_val),
+                                            dst_res: None,
+                                        },
+                                        None,
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_val), *elem));
+                                }
+                            }
+                            _ => {}
+                        },
                     }
                 }
                 self.lower_non_yielding_expr(expr, expected)

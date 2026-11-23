@@ -8,7 +8,7 @@ use zev_ast::{
     ArrayLen, Block, CallArg, CatchClause, CatchParam, Expr, ExprKind, FieldInit, FnDecl,
     FormatPart, GenericArg, GenericParamKind, Ident, IsrDecl, Item, ItemKind, MmioDecl,
     MmioDeclKind, OsPrimitiveType, Param, Program, SpawnStmt, Span, Stmt, StmtKind, SwitchArm,
-    SwitchPat, TaskDecl, TypeExpr, TypeKind,
+    SwitchPat, TaskDecl, TypeExpr, TypeKind, WaitArm, WaitTimerArm,
 };
 
 use crate::diag::{Diagnostic, DiagnosticKind};
@@ -1607,6 +1607,7 @@ impl<'a> AstRewriter<'a> {
     fn rewrite_os_primitive(&mut self, op: &OsPrimitiveType) -> OsPrimitiveType {
         match op {
             OsPrimitiveType::Signal => OsPrimitiveType::Signal,
+            OsPrimitiveType::WaitQueue => OsPrimitiveType::WaitQueue,
             OsPrimitiveType::Watch { elem } => OsPrimitiveType::Watch {
                 elem: Box::new(self.rewrite_type(elem)),
             },
@@ -1774,6 +1775,30 @@ impl<'a> AstRewriter<'a> {
                 StmtKind::Switch {
                     scrutinee: new_scrut,
                     arms: new_arms,
+                }
+            }
+            StmtKind::Wait { arms, timer } => {
+                let new_arms = arms
+                    .iter()
+                    .map(|arm| WaitArm {
+                        bind: arm
+                            .bind
+                            .as_ref()
+                            .map(|(ty, id)| (self.rewrite_type(ty), id.clone())),
+                        call: self.rewrite_expr(&arm.call),
+                        body: self.rewrite_block(&arm.body),
+                        span: arm.span,
+                    })
+                    .collect();
+                let new_timer = timer.as_ref().map(|t| WaitTimerArm {
+                    kind: t.kind,
+                    expr: self.rewrite_expr(&t.expr),
+                    body: self.rewrite_block(&t.body),
+                    span: t.span,
+                });
+                StmtKind::Wait {
+                    arms: new_arms,
+                    timer: new_timer,
                 }
             }
             StmtKind::Spawn(sp) => {
@@ -2299,6 +2324,7 @@ fn check_pub_surface_os_primitive(
         | OsPrimitiveType::Pool { elem, .. }
         | OsPrimitiveType::DmaSlot { elem } => Some(elem.as_ref()),
         OsPrimitiveType::Signal
+        | OsPrimitiveType::WaitQueue
         | OsPrimitiveType::ByteRing { .. }
         | OsPrimitiveType::ByteRingUnsized => None,
     };

@@ -13,17 +13,19 @@ bool is_ascii_ws(u8 b) {
 pub []u8 trim_ascii([]u8 s) {
     usize start = 0;
     usize end = s.len;
-    while (start < end) {
-        if (!is_ascii_ws(s[start])) {
-            break;
+    noyield {
+        while (start < end) {
+            if (!is_ascii_ws(s[start])) {
+                break;
+            }
+            start += 1;
         }
-        start += 1;
-    }
-    while (end > start) {
-        if (!is_ascii_ws(s[end - 1])) {
-            break;
+        while (end > start) {
+            if (!is_ascii_ws(s[end - 1])) {
+                break;
+            }
+            end -= 1;
         }
-        end -= 1;
     }
     return s[start..end];
 }

@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Stage-0/1 CLI compiler (`zevc`) for the Zev Language-OS"
+description = "Zev bare-metal compiler and host simulator (`zevc`)"
 
 [[bin]]
 name = "zevc"
@@ -16,5 +16,4 @@ zev-ast = { path = "../zev-ast" }
 zev-parser = { path = "../zev-parser" }
 zev-sema = { path = "../zev-sema" }
 zev-mir = { path = "../zev-mir" }
-zev-codegen-c = { path = "../zev-codegen-c" }
 zev-codegen-llvm = { path = "../zev-codegen-llvm" }

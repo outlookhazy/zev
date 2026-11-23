@@ -1400,6 +1400,18 @@ impl<'a> BodyChecker<'a> {
                             "while (true) (should_share)",
                         );
                     }
+                } else if !manual_yield
+                    && !self.in_noyield()
+                    && !self.in_critical()
+                    && !self.in_isr()
+                    && !self.in_defer()
+                    && self.caller_key != "main"
+                {
+                    self.sema.call_graph.mark_direct_yield(
+                        &self.caller_key,
+                        FnEffect::SoftYielding,
+                        "while (cond) (should_share)",
+                    );
                 }
 
                 if is_while_true && !has_break {
@@ -1867,6 +1879,240 @@ impl<'a> BodyChecker<'a> {
                         top.push(IrqBootNode::BranchGroup {
                             arms: arm_irq_nodes,
                         });
+                    }
+                }
+
+                self.scopes = base_vars.clone();
+                self.merge_branch_vars(&base_vars, &live_var_branches, stmt.span);
+                self.leases = base_leases;
+                self.leases.join_branches(&live_lease_branches);
+                all_arms_diverge
+            }
+
+            StmtKind::Wait { arms, timer } => {
+                self.record_direct_yield(stmt.span, FnEffect::HardBlocking, "'wait { ... }'");
+                if arms.is_empty() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::InvalidOperation,
+                        stmt.span,
+                        "'wait { ... }' requires at least one event arm",
+                    ));
+                }
+
+                let base_vars = self.snapshot_outer_vars();
+                let base_leases = self.leases.clone();
+                let mut live_var_branches = Vec::new();
+                let mut live_lease_branches = Vec::new();
+                let mut all_arms_diverge = !arms.is_empty();
+
+                for arm in arms {
+                    self.scopes = base_vars.clone();
+                    self.leases = base_leases.clone();
+                    self.branch_depth += 1;
+                    self.scopes.push(BTreeMap::new());
+
+                    let mut valid_consumer_call = false;
+                    let mut is_boost_arm = false;
+                    match &arm.call.kind {
+                        ExprKind::MethodCall {
+                            receiver,
+                            method,
+                            args,
+                        } => {
+                            let has_timeout_arg =
+                                args.iter().any(|a| a.name.as_ref().is_some_and(|n| n.name == "timeout"));
+                            if !args.is_empty() {
+                                let mut d = Diagnostic::new(
+                                    DiagnosticKind::InvalidOperation,
+                                    arm.call.span,
+                                    "'wait { ... }' event arms must be direct zero-argument blocking primitive consumer calls",
+                                );
+                                if has_timeout_arg {
+                                    d = d.with_note("move `timeout:` out of the arm into a single `timeout <dur> => { ... }` or `deadline <u32> => { ... }` arm on the `wait` block");
+                                }
+                                self.sema.emit(d);
+                            }
+                            let rv = self.check_expr_infallible(receiver);
+                            let prim_opt = match &rv.ty {
+                                Ty::OsPrimitive(p) => Some(p),
+                                Ty::Ptr(inner) => match inner.as_ref() {
+                                    Ty::OsPrimitive(p) => Some(p),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            if let Some(prim) = prim_opt {
+                                let m = method.name.as_str();
+                                valid_consumer_call = matches!(
+                                    (prim, m),
+                                    (
+                                        ResolvedOsPrimitive::Inbox { .. }
+                                            | ResolvedOsPrimitive::InboxUnsized { .. },
+                                        "recv"
+                                    ) | (ResolvedOsPrimitive::Signal, "wait")
+                                        | (
+                                            ResolvedOsPrimitive::ByteRing { .. }
+                                                | ResolvedOsPrimitive::ByteRingUnsized,
+                                            "wait_read"
+                                        )
+                                        | (ResolvedOsPrimitive::PingPong { .. }, "wait_chunk")
+                                        | (ResolvedOsPrimitive::Watch { .. }, "wait_change")
+                                        | (ResolvedOsPrimitive::Pool { .. }, "alloc")
+                                );
+                                is_boost_arm = matches!(
+                                    (prim, m),
+                                    (
+                                        ResolvedOsPrimitive::Inbox { .. }
+                                            | ResolvedOsPrimitive::InboxUnsized { .. },
+                                        "recv"
+                                    ) | (ResolvedOsPrimitive::Signal, "wait")
+                                        | (
+                                            ResolvedOsPrimitive::ByteRing { .. }
+                                                | ResolvedOsPrimitive::ByteRingUnsized,
+                                            "wait_read"
+                                        )
+                                );
+                            }
+                            if !valid_consumer_call && !rv.ty.is_error() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::InvalidOperation,
+                                    arm.call.span,
+                                    "unsupported 'wait { ... }' arm: arms must be direct blocking consumer calls (`inbox.recv()`, `signal.wait()`, `byte_ring.wait_read()`, `ping_pong.wait_chunk()`, `watch.wait_change()`, `pool.alloc()`)",
+                                ));
+                            }
+                        }
+                        _ => {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                arm.call.span,
+                                "'wait { ... }' arms must be direct zero-argument consumer primitive calls (`inbox.recv()`, `signal.wait()`, `byte_ring.wait_read()`, `ping_pong.wait_chunk()`, `watch.wait_change()`, `pool.alloc()`); arbitrary calls are not cancellation-safe",
+                            ));
+                        }
+                    }
+
+                    let call_val = self.check_expr_infallible(&arm.call);
+                    let _ = is_boost_arm;
+                    if let Some((bind_ty, bind_name)) = &arm.bind {
+                        let resolved_ty = self.sema.resolve_type(bind_ty);
+                        self.sema.check_disallowed_lease_type(
+                            &resolved_ty,
+                            bind_ty.span,
+                            &format!("wait arm binding '{}'", bind_name.name),
+                            true,
+                        );
+                        if call_val.ty.is_void() {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::TypeMismatch,
+                                bind_name.span,
+                                format!(
+                                    "cannot bind variable '{}' to 'void' wait arm '{}'",
+                                    bind_name.name, arm.call.span
+                                ),
+                            ));
+                        } else if !call_val.ty.is_error() && !resolved_ty.is_error() {
+                            if self.sema.check_assignable_or_emit(
+                                &call_val.ty,
+                                &resolved_ty,
+                                arm.call.span,
+                                DiagnosticKind::TypeMismatch,
+                                || {
+                                    format!(
+                                        "wait arm binding '{}' declared as '{}', but arm produces '{}'",
+                                        bind_name.name, resolved_ty, call_val.ty
+                                    )
+                                },
+                            ) {
+                                self.sema.check_f32_coercion_expr(&arm.call, &resolved_ty);
+                            }
+                        }
+                        let decl_depth = self.current_depth();
+                        let (lease_state, lease_gen_key) = if resolved_ty.is_linear_lease() {
+                            (
+                                Some(LinearLeaseState::Live),
+                                Some(self.fresh_lease_gen_key(&bind_name.name)),
+                            )
+                        } else {
+                            (None, None)
+                        };
+                        if let Some(scope) = self.scopes.last_mut() {
+                            scope.insert(
+                                bind_name.name.clone(),
+                                LocalVar {
+                                    name: bind_name.name.clone(),
+                                    ty: resolved_ty,
+                                    decl_depth,
+                                    prov: call_val.prov.clone(),
+                                    field_prov: BTreeMap::new(),
+                                    endpoint_alias: call_val.endpoint_name.clone(),
+                                    field_endpoints: call_val.field_endpoints.clone(),
+                                    is_isr_state: false,
+                                    lease_state,
+                                    lease_gen_key,
+                                },
+                            );
+                        }
+                    } else if call_val.ty.is_linear_lease() {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::LinearLeaseViolation,
+                                arm.call.span,
+                                format!(
+                                    "unused linear '{}' returned by 'wait' arm leaks pool slot",
+                                    call_val.ty
+                                ),
+                            )
+                            .with_note("bind the `Lease<T>` in the arm header (`Lease<T> l = pool.alloc() => { ... }`) and consume it before leaving the arm"),
+                        );
+                    }
+
+                    let arm_div = self.check_block_stmts(&arm.body.stmts);
+                    self.finish_lexical_block(arm_div, arm.body.span);
+                    self.scopes.pop();
+                    self.branch_depth -= 1;
+                    if !arm_div {
+                        all_arms_diverge = false;
+                        live_var_branches.push(self.snapshot_outer_vars());
+                        live_lease_branches.push(self.leases.clone());
+                    }
+                }
+
+                if let Some(t) = timer {
+                    self.scopes = base_vars.clone();
+                    self.leases = base_leases.clone();
+                    let tv = self.check_expr_infallible(&t.expr);
+                    match t.kind {
+                        zev_ast::WaitTimerKind::Timeout => {
+                            if tv.ty != Ty::Duration && !tv.ty.is_error() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    t.expr.span,
+                                    format!(
+                                        "'wait' block `timeout` arm must be a duration literal, found '{}'",
+                                        tv.ty
+                                    ),
+                                ));
+                            }
+                        }
+                        zev_ast::WaitTimerKind::Deadline => {
+                            if !tv.ty.is_assignable_to(&Ty::u32()) && !tv.ty.is_error() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    t.expr.span,
+                                    format!(
+                                        "'wait' block `deadline` arm must be 'u32' (`sys.now_ms()` tick timestamp), found '{}'",
+                                        tv.ty
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    self.branch_depth += 1;
+                    let t_div = self.check_nested_block(&t.body);
+                    self.branch_depth -= 1;
+                    if !t_div {
+                        all_arms_diverge = false;
+                        live_var_branches.push(self.snapshot_outer_vars());
+                        live_lease_branches.push(self.leases.clone());
                     }
                 }
 

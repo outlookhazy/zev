@@ -70,6 +70,7 @@ pub(super) fn emit_host_entry_ir(out: &mut String, ctx: &ModuleCtx<'_>) {
         r#"define i32 @main() nounwind {{
 entry:
   call void @__syn_boot()
+  store i8 0, ptr @__syn_host_in_boot, align 1
   call void @__syn_sched_loop()
   ret i32 0
 }}
@@ -109,7 +110,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 }
             }
             MirType::Primitive(pk) => match pk {
-                MirPrimKind::Signal | MirPrimKind::ByteRing { .. } => {}
+                MirPrimKind::Signal | MirPrimKind::WaitQueue | MirPrimKind::ByteRing { .. } => {}
                 MirPrimKind::Watch { elem }
                 | MirPrimKind::Inbox { elem, .. }
                 | MirPrimKind::PingPong { elem, .. }
@@ -229,6 +230,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
             }
             MirExprKind::PrimRead(prop) => match &**prop {
                 MirPrimReadOp::WatchRead { target, elem_ty }
+                | MirPrimReadOp::WatchGen { target, elem_ty }
                 | MirPrimReadOp::InboxTryRecv { target, elem_ty, .. }
                 | MirPrimReadOp::InboxLen { target, elem_ty, .. }
                 | MirPrimReadOp::InboxIsEmpty { target, elem_ty, .. }
@@ -246,7 +248,9 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                     scan_ty(elem_ty, feat);
                     scan_expr(value, feat);
                 }
-                MirPrimReadOp::SignalIsSet { target } | MirPrimReadOp::SignalTryWait { target } => {
+                MirPrimReadOp::SignalIsSet { target }
+                | MirPrimReadOp::SignalTryWait { target }
+                | MirPrimReadOp::WaitQueueWakeOne { target, .. } => {
                     scan_prim_target(target, feat);
                 }
                 MirPrimReadOp::PingPongDmaBuf {
@@ -431,6 +435,9 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                     }
                     MirPrimNonBlockingOp::SignalNotify { target, .. }
                     | MirPrimNonBlockingOp::SignalClear { target }
+                    | MirPrimNonBlockingOp::WaitQueuePrepare { target }
+                    | MirPrimNonBlockingOp::WaitQueueCancel { target }
+                    | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. }
                     | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
                         scan_prim_target(target, feat);
                     }
@@ -581,32 +588,42 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                             scan_expr(a, feat);
                         }
                     }
-                    MirYieldKind::InboxRecv {
-                        target, elem_ty, ..
-                    }
-                    | MirYieldKind::InboxSend {
-                        target, elem_ty, ..
-                    }
-                    | MirYieldKind::PingPongWaitChunk {
-                        target, elem_ty, ..
-                    }
-                    | MirYieldKind::PoolAlloc {
-                        target, elem_ty, ..
-                    } => {
-                        scan_prim_target(target, feat);
-                        scan_ty(elem_ty, feat);
-                    }
-                    MirYieldKind::SignalWait { target, .. }
-                    | MirYieldKind::ByteRingWaitRead { target, .. } => {
-                        scan_prim_target(target, feat);
-                    }
-                    MirYieldKind::InboxViewRecv { view, elem_ty, .. }
-                    | MirYieldKind::InboxViewSend { view, elem_ty, .. } => {
-                        scan_expr(view, feat);
-                        scan_ty(elem_ty, feat);
-                    }
-                    MirYieldKind::ByteRingViewWaitRead { view, .. } => {
-                        scan_expr(view, feat);
+                    MirYieldKind::Wait { arms, .. } => {
+                        for arm in arms {
+                            match &arm.op {
+                                MirWaitArmOp::InboxRecv {
+                                    target, elem_ty, ..
+                                }
+                                | MirWaitArmOp::InboxSend {
+                                    target, elem_ty, ..
+                                }
+                                | MirWaitArmOp::WatchWaitChange {
+                                    target, elem_ty, ..
+                                }
+                                | MirWaitArmOp::PingPongWaitChunk {
+                                    target, elem_ty, ..
+                                }
+                                | MirWaitArmOp::PoolAlloc {
+                                    target, elem_ty, ..
+                                } => {
+                                    scan_prim_target(target, feat);
+                                    scan_ty(elem_ty, feat);
+                                }
+                                MirWaitArmOp::SignalWait { target, .. }
+                                | MirWaitArmOp::WaitQueueCommit { target, .. }
+                                | MirWaitArmOp::ByteRingWaitRead { target, .. } => {
+                                    scan_prim_target(target, feat);
+                                }
+                                MirWaitArmOp::InboxViewRecv { view, elem_ty, .. }
+                                | MirWaitArmOp::InboxViewSend { view, elem_ty, .. } => {
+                                    scan_expr(view, feat);
+                                    scan_ty(elem_ty, feat);
+                                }
+                                MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                                    scan_expr(view, feat);
+                                }
+                            }
+                        }
                     }
                     MirYieldKind::EveryLatch { .. }
                     | MirYieldKind::DelayPoll { .. }
@@ -1374,13 +1391,18 @@ impl<'a> ModuleCtx<'a> {
             "",
             "i8 %c",
         );
+        let clock_fallback = if self.spec.isa == CpuIsa::HostX86_64Linux {
+            "  %t = call i32 @__syn_host_now_ms()\n  ret i32 %t"
+        } else {
+            "  %t = load volatile i32, ptr @__syn_tick_ms, align 4\n  ret i32 %t"
+        };
         self.emit_hook_wrapper(
             out,
             HookKind::ClockMs,
             "",
             "i32",
             "",
-            "  %t = load volatile i32, ptr @__syn_tick_ms, align 4\n  ret i32 %t",
+            clock_fallback,
             "",
             "",
         );
@@ -1620,7 +1642,7 @@ impl<'a> ModuleCtx<'a> {
             | MirPrimKind::PingPong { elem, .. }
             | MirPrimKind::Pool { elem, .. }
             | MirPrimKind::DmaSlot { elem } => self.scan_mir_type_for_prims(elem),
-            MirPrimKind::Signal | MirPrimKind::ByteRing { .. } => {}
+            MirPrimKind::Signal | MirPrimKind::WaitQueue | MirPrimKind::ByteRing { .. } => {}
         }
         let key = pk.mangle_name();
         if !self.distinct_prims.contains_key(&key) {
@@ -1658,44 +1680,82 @@ impl<'a> ModuleCtx<'a> {
                             self.scan_expr_for_prims(a);
                         }
                     }
-                    MirYieldKind::InboxViewRecv { view, elem_ty, .. }
-                    | MirYieldKind::InboxViewSend { view, elem_ty, .. } => {
-                        self.scan_expr_for_prims(view);
-                        self.register_inbox_view(elem_ty);
-                    }
-                    MirYieldKind::ByteRingViewWaitRead { view, .. } => {
-                        self.scan_expr_for_prims(view);
-                        self.uses_byte_ring_view = true;
-                    }
-                    MirYieldKind::PoolAlloc {
-                        target,
-                        elem_ty,
-                        cap,
-                        ..
-                    } => {
-                        self.scan_prim_target_for_prims(target);
-                        self.register_prim_kind(&MirPrimKind::Pool {
-                            elem: Box::new(elem_ty.clone()),
-                            cap: *cap,
-                        });
-                    }
-                    MirYieldKind::InboxRecv {
-                        target,
-                        elem_ty,
-                        cap,
-                        ..
-                    }
-                    | MirYieldKind::InboxSend {
-                        target,
-                        elem_ty,
-                        cap,
-                        ..
-                    } => {
-                        self.scan_prim_target_for_prims(target);
-                        self.register_prim_kind(&MirPrimKind::Inbox {
-                            elem: Box::new(elem_ty.clone()),
-                            cap: *cap,
-                        });
+                    MirYieldKind::Wait { arms, .. } => {
+                        for arm in arms {
+                            match &arm.op {
+                                MirWaitArmOp::InboxViewRecv { view, elem_ty, .. }
+                                | MirWaitArmOp::InboxViewSend { view, elem_ty, .. } => {
+                                    self.scan_expr_for_prims(view);
+                                    self.register_inbox_view(elem_ty);
+                                }
+                                MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                                    self.scan_expr_for_prims(view);
+                                    self.uses_byte_ring_view = true;
+                                }
+                                MirWaitArmOp::PoolAlloc {
+                                    target,
+                                    elem_ty,
+                                    cap,
+                                    ..
+                                } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::Pool {
+                                        elem: Box::new(elem_ty.clone()),
+                                        cap: *cap,
+                                    });
+                                }
+                                MirWaitArmOp::InboxRecv {
+                                    target,
+                                    elem_ty,
+                                    cap,
+                                    ..
+                                }
+                                | MirWaitArmOp::InboxSend {
+                                    target,
+                                    elem_ty,
+                                    cap,
+                                    ..
+                                } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::Inbox {
+                                        elem: Box::new(elem_ty.clone()),
+                                        cap: *cap,
+                                    });
+                                }
+                                MirWaitArmOp::WatchWaitChange {
+                                    target, elem_ty, ..
+                                } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::Watch {
+                                        elem: Box::new(elem_ty.clone()),
+                                    });
+                                }
+                                MirWaitArmOp::PingPongWaitChunk {
+                                    target,
+                                    elem_ty,
+                                    cap,
+                                    ..
+                                } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::PingPong {
+                                        elem: Box::new(elem_ty.clone()),
+                                        cap: *cap,
+                                    });
+                                }
+                                MirWaitArmOp::SignalWait { target, .. } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::Signal);
+                                }
+                                MirWaitArmOp::WaitQueueCommit { target, .. } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::WaitQueue);
+                                }
+                                MirWaitArmOp::ByteRingWaitRead { target, cap, .. } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 },
@@ -1826,6 +1886,12 @@ impl<'a> ModuleCtx<'a> {
                         cap: *cap,
                     });
                     self.scan_expr_for_prims(half);
+                }
+                MirPrimNonBlockingOp::WaitQueuePrepare { target }
+                | MirPrimNonBlockingOp::WaitQueueCancel { target }
+                | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::WaitQueue);
                 }
                 _ => {}
             },
@@ -2072,6 +2138,10 @@ impl<'a> ModuleCtx<'a> {
                         cap: *cap,
                     });
                 }
+                MirPrimReadOp::WaitQueueWakeOne { target, .. } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::WaitQueue);
+                }
                 _ => {}
             },
             MirExprKind::LeaseGet { lease, elem_ty }
@@ -2230,20 +2300,21 @@ impl<'a> ModuleCtx<'a> {
                 }
             }
             MirType::Primitive(pk) => match pk {
-                MirPrimKind::Signal => (2, 1),
+                MirPrimKind::Signal => (8, 4),
+                MirPrimKind::WaitQueue => (4, 4),
                 MirPrimKind::Watch { elem } => {
                     let (esz, eal) = self.size_align(elem, ptr_bytes);
                     let al = eal.max(4);
-                    (align_up(esz, 4) + 4, al)
+                    (align_up(esz, 4) + 8, al)
                 }
                 MirPrimKind::Inbox { elem, cap } => {
                     let (esz, eal) = self.size_align(elem, ptr_bytes);
                     let al = eal.max(4);
-                    (align_up(13, eal) + esz * (*cap).max(1), al)
+                    (align_up(20 + (*cap).max(1), eal) + esz * (*cap).max(1), al)
                 }
                 MirPrimKind::PingPong { elem, cap } => {
                     let (esz, eal) = self.size_align(elem, ptr_bytes);
-                    (align_up(4, eal) + 2 * esz * (*cap).max(1), eal.max(4))
+                    (align_up(8, eal) + 2 * esz * (*cap).max(1), eal.max(4))
                 }
                 MirPrimKind::Pool { elem, cap } => {
                     let (hdr_sz, hdr_al) = self.pool_hdr_llvm_size();
@@ -2255,7 +2326,7 @@ impl<'a> ModuleCtx<'a> {
                     let al = self.ptr_align();
                     (align_up(2 * ptr_bytes + 2, al.max(1)), al.max(1))
                 }
-                MirPrimKind::ByteRing { cap } => (28 + (*cap).max(1), 4),
+                MirPrimKind::ByteRing { cap } => (align_up(29 + (*cap).max(1), 4), 4),
             },
             MirType::Lease(_) => {
                 let al = self.ptr_align();
@@ -2340,24 +2411,30 @@ impl<'a> ModuleCtx<'a> {
                 }
             }
             MirType::Primitive(pk) => match pk {
-                MirPrimKind::Signal => (2, 1),
+                MirPrimKind::Signal => {
+                    let i32_al = self.llvm_scalar_abi_align(4);
+                    (align_up(2, i32_al) + 4, i32_al)
+                }
+                MirPrimKind::WaitQueue => (4, self.llvm_scalar_abi_align(4)),
                 MirPrimKind::Watch { elem } => {
                     let (esz, eal) = self.llvm_abi_size_align(elem, false);
                     let i32_al = self.llvm_scalar_abi_align(4);
                     let al = eal.max(i32_al);
-                    (align_up(align_up(esz, i32_al) + 4, al), al)
+                    (align_up(align_up(esz, i32_al) + 8, al), al)
                 }
                 MirPrimKind::Inbox { elem, cap } => {
                     let (esz, eal) = self.llvm_abi_size_align(elem, false);
                     let i32_al = self.llvm_scalar_abi_align(4);
                     let c = (*cap).max(1);
                     let al = eal.max(i32_al);
-                    (align_up(align_up(12 + c, eal) + c * esz, al), al)
+                    (align_up(align_up(20 + c, eal) + c * esz, al), al)
                 }
                 MirPrimKind::PingPong { elem, cap } => {
                     let (esz, eal) = self.llvm_abi_size_align(elem, false);
+                    let i32_al = self.llvm_scalar_abi_align(4);
                     let c = (*cap).max(1);
-                    (align_up(4, eal) + 2 * c * esz, eal.max(1))
+                    let al = eal.max(i32_al);
+                    (align_up(align_up(8, eal) + 2 * c * esz, al), al)
                 }
                 MirPrimKind::Pool { elem, cap } => {
                     let (hdr_sz, hdr_al) = self.pool_hdr_llvm_size();
@@ -2375,7 +2452,7 @@ impl<'a> ModuleCtx<'a> {
                 MirPrimKind::DmaSlot { .. } => (align_up(2 * ptr_bytes + 2, ptr_al), ptr_al),
                 MirPrimKind::ByteRing { cap } => {
                     let i32_al = self.llvm_scalar_abi_align(4);
-                    (align_up(25 + (*cap).max(1), i32_al), i32_al)
+                    (align_up(29 + (*cap).max(1), i32_al), i32_al)
                 }
             },
             MirType::Result { ok, .. } => {
@@ -3152,7 +3229,7 @@ impl<'a> ModuleCtx<'a> {
                                 )
                             );
                             format!(
-                                "{{ ptr {pconst}, ptr getelementptr inbounds ({pty}, ptr {pconst}, i32 0, i32 4, i32 0), {usize_ty} {n} }}"
+                                "{{ ptr {pconst}, ptr getelementptr inbounds ({pty}, ptr {pconst}, i32 0, i32 6, i32 0), {usize_ty} {n} }}"
                             )
                         }
                     }
@@ -3234,7 +3311,7 @@ impl<'a> ModuleCtx<'a> {
                     let f = &si.decl.fields[*idx];
                     match &f.ty {
                         MirType::Primitive(MirPrimKind::Signal) => {
-                            format!("{lty} {{ i8 0, i8 127 }}")
+                            format!("{lty} {{ i8 0, i8 127, i32 0 }}")
                         }
                         MirType::Primitive(MirPrimKind::PingPong { elem, cap }) => {
                             let ety = self.llvm_ty(elem);
@@ -3242,7 +3319,7 @@ impl<'a> ModuleCtx<'a> {
                             let lbit = *next_pp_bit;
                             *next_pp_bit = next_pp_bit.saturating_add(1).min(31);
                             format!(
-                                "{lty} {{ i8 0, i8 0, i8 0, i8 {lbit}, [{c} x {ety}] zeroinitializer, [{c} x {ety}] zeroinitializer }}"
+                                "{lty} {{ i8 0, i8 0, i8 0, i8 {lbit}, i32 0, [{c} x {ety}] zeroinitializer, [{c} x {ety}] zeroinitializer }}"
                             )
                         }
                         MirType::Struct(sub) => {
@@ -3277,7 +3354,7 @@ impl<'a> ModuleCtx<'a> {
                     )
                 );
                 Some(format!(
-                    "{{ ptr, ptr, {usize_ty} }} {{ ptr {raw_ptr}, ptr getelementptr inbounds ({pty}, ptr {raw_ptr}, i32 0, i32 4, i32 0), {usize_ty} {n} }}"
+                    "{{ ptr, ptr, {usize_ty} }} {{ ptr {raw_ptr}, ptr getelementptr inbounds ({pty}, ptr {raw_ptr}, i32 0, i32 6, i32 0), {usize_ty} {n} }}"
                 ))
             }
             _ => None,
@@ -3389,18 +3466,21 @@ ok_bb:
             let id = sanitize_ident(mangled);
             match pk {
                 MirPrimKind::Signal => {
-                    let _ = writeln!(out, "%prim.{id} = type {{ i8, i8 }}");
+                    let _ = writeln!(out, "%prim.{id} = type {{ i8, i8, i32 }}");
+                }
+                MirPrimKind::WaitQueue => {
+                    let _ = writeln!(out, "%prim.{id} = type {{ i32 }}");
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
-                    let _ = writeln!(out, "%prim.{id} = type {{ {ety}, i32 }}");
+                    let _ = writeln!(out, "%prim.{id} = type {{ {ety}, i32, i32 }}");
                 }
                 MirPrimKind::Inbox { elem, cap } => {
                     let ety = self.llvm_ty(elem);
                     let c = (*cap).max(1);
                     let _ = writeln!(
                         out,
-                        "%prim.{id} = type {{ i32, i32, i32, [{c} x i8], [{c} x {ety}] }}"
+                        "%prim.{id} = type {{ i32, i32, i32, i32, i32, [{c} x i8], [{c} x {ety}] }}"
                     );
                 }
                 MirPrimKind::PingPong { elem, cap } => {
@@ -3408,7 +3488,7 @@ ok_bb:
                     let c = (*cap).max(1);
                     let _ = writeln!(
                         out,
-                        "%prim.{id} = type {{ i8, i8, i8, i8, [{c} x {ety}], [{c} x {ety}] }}"
+                        "%prim.{id} = type {{ i8, i8, i8, i8, i32, [{c} x {ety}], [{c} x {ety}] }}"
                     );
                 }
                 MirPrimKind::Pool { elem, cap } => {
@@ -3447,7 +3527,7 @@ ok_bb:
                     let c = (*cap).max(1);
                     let _ = writeln!(
                         out,
-                        "%prim.{id} = type {{ i32, i32, i32, i32, i32, i32, i8, [{c} x i8] }}"
+                        "%prim.{id} = type {{ i32, i32, i32, i32, i32, i32, i32, i8, [{c} x i8] }}"
                     );
                 }
             }
@@ -3455,11 +3535,11 @@ ok_bb:
         if self.uses_byte_ring_view {
             let _ = writeln!(
                 out,
-                "%prim.byte_ring_hdr = type {{ i32, i32, i32, i32, i32, i32, i8, [0 x i8] }}"
+                "%prim.byte_ring_hdr = type {{ i32, i32, i32, i32, i32, i32, i32, i8, [0 x i8] }}"
             );
         }
         if !self.distinct_inbox_views.is_empty() {
-            let _ = writeln!(out, "%prim.inbox_hdr = type {{ i32, i32, i32, [0 x i8] }}");
+            let _ = writeln!(out, "%prim.inbox_hdr = type {{ i32, i32, i32, i32, i32, [0 x i8] }}");
         }
         for name in &self.struct_order {
             let si = &self.structs[name];
@@ -3523,7 +3603,7 @@ ok_bb:
             };
             match &p.kind {
                 MirPrimKind::Signal => {
-                    let _ = writeln!(out, "{gsym} = global {pty} {{ i8 0, i8 127 }}, align {align}");
+                    let _ = writeln!(out, "{gsym} = global {pty} {{ i8 0, i8 127, i32 0 }}, align {align}");
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
@@ -3533,7 +3613,7 @@ ok_bb:
                         let iv = self.const_expr_to_llvm(&init_expr, elem);
                         let _ = writeln!(
                             out,
-                            "{gsym} = global {pty} {{ {ety} {iv}, i32 0 }}, align {watch_align}"
+                            "{gsym} = global {pty} {{ {ety} {iv}, i32 0, i32 0 }}, align {watch_align}"
                         );
                     } else {
                         let _ = writeln!(
@@ -3542,7 +3622,9 @@ ok_bb:
                         );
                     }
                 }
-                MirPrimKind::Inbox { .. } | MirPrimKind::ByteRing { .. } => {
+                MirPrimKind::Inbox { .. }
+                | MirPrimKind::ByteRing { .. }
+                | MirPrimKind::WaitQueue => {
                     let _ = writeln!(out, "{gsym} = global {pty} zeroinitializer, align {align}");
                 }
                 MirPrimKind::PingPong { elem, cap } => {
@@ -3551,7 +3633,7 @@ ok_bb:
                     let lbit = p.sleep_lock_bit.unwrap_or(0);
                     let _ = writeln!(
                         out,
-                        "{gsym} = global {pty} {{ i8 0, i8 0, i8 0, i8 {lbit}, [{c} x {ety}] zeroinitializer, [{c} x {ety}] zeroinitializer }}, align {align}"
+                        "{gsym} = global {pty} {{ i8 0, i8 0, i8 0, i8 {lbit}, i32 0, [{c} x {ety}] zeroinitializer, [{c} x {ety}] zeroinitializer }}, align {align}"
                     );
                 }
                 MirPrimKind::Pool { .. } => {
@@ -3608,7 +3690,8 @@ do_dec:
   br label %wake
 wake:
   %b32 = sext i8 %boost to i32
-  {call_kw} void @__syn_wake_one_waiter(ptr %pool_hdr, i32 %b32)
+  %wm_p = getelementptr inbounds %prim.pool_hdr, ptr %pool_hdr, i32 0, i32 1
+  {call_kw} void @__syn_wake_all_mask(ptr %wm_p, i32 %b32)
   br label %unlock_exit
 unlock_exit:
 {crit_exit}  ret void
@@ -3622,7 +3705,57 @@ unlock_exit:
             let id = sanitize_ident(mangled);
             let pty = format!("%prim.{id}");
             let (crit_enter, crit_exit) = crit_pair(vis.is_prim_family_contended(pk), call_kw);
+            let ptr_al = self.ptr_align();
+            let i32_al = self.llvm_scalar_abi_align(4);
             match pk {
+                MirPrimKind::WaitQueue => {
+                    let _ = writeln!(
+                        out,
+                        r#"define void @__syn_wq_prepare(ptr %wq){fn_as} nounwind{fn_sz} {{
+entry:
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  %t = load ptr, ptr @__syn_current_task, align {ptr_al}
+  %isnull = icmp eq ptr %t, null
+  br i1 %isnull, label %done, label %set_bit
+set_bit:
+  %sl_p = getelementptr inbounds %SynTask, ptr %t, i32 0, i32 9
+  %sl8 = load i8, ptr %sl_p, align 1
+  %sl32 = zext i8 %sl8 to i32
+  %sh = and i32 %sl32, 31
+  %bit = shl i32 1, %sh
+  %m = load volatile i32, ptr %wq, align {i32_al}
+  %nm = or i32 %m, %bit
+  store volatile i32 %nm, ptr %wq, align {i32_al}
+  br label %done
+done:
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  ret void
+}}
+
+define void @__syn_wq_cancel(ptr %wq){fn_as} nounwind{fn_sz} {{
+entry:
+  %pm = {call_kw} i32 @__syn_crit_enter()
+  %t = load ptr, ptr @__syn_current_task, align {ptr_al}
+  %isnull = icmp eq ptr %t, null
+  br i1 %isnull, label %done, label %clr_bit
+clr_bit:
+  %sl_p = getelementptr inbounds %SynTask, ptr %t, i32 0, i32 9
+  %sl8 = load i8, ptr %sl_p, align 1
+  %sl32 = zext i8 %sl8 to i32
+  %sh = and i32 %sl32, 31
+  %bit = shl i32 1, %sh
+  %mask = xor i32 %bit, -1
+  %m = load volatile i32, ptr %wq, align {i32_al}
+  %nm = and i32 %m, %mask
+  store volatile i32 %nm, ptr %wq, align {i32_al}
+  br label %done
+done:
+  {call_kw} void @__syn_crit_exit(i32 %pm)
+  ret void
+}}
+"#
+                    );
+                }
                 MirPrimKind::Signal => {
                     let _ = writeln!(
                         out,
@@ -3641,7 +3774,8 @@ upd_b:
   store i8 %min_b, ptr %pb_ptr, align 1
   br label %wake
 wake:
-  {call_kw} void @__syn_wake_waiters(ptr %s, i32 %boost)
+  %wm_p = getelementptr inbounds {pty}, ptr %s, i32 0, i32 2
+  {call_kw} void @__syn_wake_all_mask(ptr %wm_p, i32 %boost)
 {crit_exit}  ret void
 }}
 
@@ -3672,6 +3806,7 @@ empty:
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
+                    let i32_al = self.llvm_scalar_abi_align(4);
                     let _ = writeln!(
                         out,
                         r#"define void @__syn_watch_pub_{id}(ptr %w, {ety} %val){fn_as} nounwind{fn_sz} {{
@@ -3679,9 +3814,11 @@ entry:
 {crit_enter}  %vp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 0
   store {ety} %val, ptr %vp, align 1
   %gp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 1
-  %g = load i32, ptr %gp, align 4
+  %g = load i32, ptr %gp, align {i32_al}
   %g1 = add i32 %g, 1
-  store i32 %g1, ptr %gp, align 4
+  store i32 %g1, ptr %gp, align {i32_al}
+  %wm_p = getelementptr inbounds {pty}, ptr %w, i32 0, i32 2
+  {call_kw} void @__syn_wake_all_mask(ptr %wm_p, i32 -1)
 {crit_exit}  ret void
 }}
 
@@ -3690,6 +3827,13 @@ entry:
 {crit_enter}  %vp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 0
   %v = load {ety}, ptr %vp, align 1
 {crit_exit}  ret {ety} %v
+}}
+
+define i32 @__syn_watch_gen_{id}(ptr %w){fn_as} nounwind{fn_sz} {{
+entry:
+{crit_enter}  %gp = getelementptr inbounds {pty}, ptr %w, i32 0, i32 1
+  %g = load i32, ptr %gp, align {i32_al}
+{crit_exit}  ret i32 %g
 }}"#
                     );
                 }
@@ -3718,9 +3862,9 @@ entry:
 do_push:
   %tail_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 1
   %tail = load i32, ptr %tail_p, align 4
-  %slot_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 4, i32 %tail
+  %slot_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 6, i32 %tail
   store {ety} %val, ptr %slot_p, align 1
-  %bp = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3, i32 %tail
+  %bp = getelementptr inbounds {pty}, ptr %q, i32 0, i32 5, i32 %tail
   %has_b = icmp sge i32 %boost, 0
   %b_p1 = add i32 %boost, 1
   %b8 = trunc i32 %b_p1 to i8
@@ -3733,7 +3877,8 @@ do_push:
   store i32 %tnext, ptr %tail_p, align 4
   %c1 = add i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
-  {call_kw} void @__syn_wake_waiters(ptr %q, i32 %boost)
+  %rx_wm = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3
+  {call_kw} void @__syn_wake_all_mask(ptr %rx_wm, i32 %boost)
 {crit_exit}  ret i8 1
 full:
 {crit_exit}  ret i8 0
@@ -3748,10 +3893,10 @@ entry:
 do_pop:
   %head_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 0
   %head = load i32, ptr %head_p, align 4
-  %slot_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 4, i32 %head
+  %slot_p = getelementptr inbounds {pty}, ptr %q, i32 0, i32 6, i32 %head
   %val = load {ety}, ptr %slot_p, align 1
   store {ety} %val, ptr %out_val, align 1{clear_slot}
-  %bp = getelementptr inbounds {pty}, ptr %q, i32 0, i32 3, i32 %head
+  %bp = getelementptr inbounds {pty}, ptr %q, i32 0, i32 5, i32 %head
   %sb = load i8, ptr %bp, align 1
   store i8 0, ptr %bp, align 1
   %h1 = add i32 %head, 1
@@ -3770,8 +3915,8 @@ apply_pb:
   {call_kw} void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
   br label %wake_senders
 wake_senders:
-  %q_tx = getelementptr inbounds {pty}, ptr %q, i32 0, i32 1
-  {call_kw} void @__syn_wake_waiters(ptr %q_tx, i32 -1)
+  %tx_wm = getelementptr inbounds {pty}, ptr %q, i32 0, i32 4
+  {call_kw} void @__syn_wake_all_mask(ptr %tx_wm, i32 -1)
 {crit_exit}  ret i8 1
 empty:
 {crit_exit}  ret i8 0
@@ -3826,7 +3971,8 @@ entry:
   %next = xor i8 %wh, 1
   store i8 %next, ptr %wh_p, align 1
   store i8 1, ptr %cr_p, align 1
-  {call_kw} void @__syn_wake_waiters(ptr %pp, i32 -1)
+  %wm_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 4
+  {call_kw} void @__syn_wake_all_mask(ptr %wm_p, i32 -1)
 {crit_exit}  ret void
 }}
 
@@ -3840,7 +3986,8 @@ entry:
   %next = xor i8 %c, 1
   store i8 %next, ptr %wh_p, align 1
   store i8 1, ptr %cr_p, align 1
-  {call_kw} void @__syn_wake_waiters(ptr %pp, i32 -1)
+  %wm_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 4
+  {call_kw} void @__syn_wake_all_mask(ptr %wm_p, i32 -1)
 {crit_exit}  ret void
 }}
 
@@ -3855,8 +4002,8 @@ take:
   %rh_p = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 1
   %rh = load i8, ptr %rh_p, align 1
   %is_b0 = icmp eq i8 %rh, 0
-  %b0 = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 4, i32 0
-  %b1 = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 5, i32 0
+  %b0 = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 5, i32 0
+  %b1 = getelementptr inbounds {pty}, ptr %pp, i32 0, i32 6, i32 0
   %buf = select i1 %is_b0, ptr %b0, ptr %b1
 {crit_exit}  ret ptr %buf
 none:
@@ -4236,7 +4383,7 @@ entry:
 chk_b:
   %b_p1 = add i32 %boost, 1
   %enc = trunc i32 %b_p1 to i8
-  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 6
+  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7
   %cur = load i8, ptr %bp, align 1
   %is_z = icmp eq i8 %cur, 0
   %better = icmp ult i8 %enc, %cur
@@ -4246,13 +4393,14 @@ set_b:
   store i8 %enc, ptr %bp, align 1
   br label %do_wake
 do_wake:
-  {call_kw} void @__syn_wake_waiters(ptr %r, i32 %boost)
+  %wm_p = getelementptr inbounds {pty}, ptr %r, i32 0, i32 6
+  {call_kw} void @__syn_wake_all_mask(ptr %wm_p, i32 %boost)
   ret void
 }}
 
 define void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 6
+  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7
   %enc = load i8, ptr %bp, align 1
   %has_b = icmp ne i8 %enc, 0
   %has_t = icmp ne ptr %task, null
@@ -4279,7 +4427,7 @@ entry:
 do_wr:
   %tp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 1
   %t = load i32, ptr %tp, align 4
-  %dp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %t
+  %dp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %t
   store i8 %b, ptr %dp, align 1
   %sp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 3
   %se = load i32, ptr %sp, align 4
@@ -4322,7 +4470,7 @@ loop:
 body:
   %sp_in = getelementptr i8, ptr %src_ptr, i32 %i
   %bv = load i8, ptr %sp_in, align 1
-  %dp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %t_cur
+  %dp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %t_cur
   store i8 %bv, ptr %dp, align 1
   %t1 = add i32 %t_cur, 1
   %wrap = icmp uge i32 %t1, {c}
@@ -4357,7 +4505,7 @@ ret_z:
   %gcp_z = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
   store i32 %tz, ptr %gop_z, align 4
   store i32 0, ptr %gcp_z, align 4
-  %pz = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 0
+  %pz = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 0
 {crit_exit}{ok_z}
 chk_cap:
   %too_big = icmp ugt i32 %req, {c}
@@ -4378,7 +4526,7 @@ empty_ok:
   store i32 0, ptr %sp0, align 4
   store i32 0, ptr %gop0, align 4
   store i32 %req, ptr %gcp0, align 4
-  %pz_ok = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 0
+  %pz_ok = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 0
 {crit_exit}  %sl0_e = insertvalue {slice_ty} poison, ptr %pz_ok, 0
   %sl1_e = insertvalue {slice_ty} %sl0_e, {usize_ty} %req_u, 1
   %ok_e = insertvalue {res_slice_ty} zeroinitializer, {slice_ty} %sl1_e, 0
@@ -4403,7 +4551,7 @@ ok_b:
   %gcp_b = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
   store i32 %t, ptr %gop_b, align 4
   store i32 %req, ptr %gcp_b, align 4
-  %pb = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %t
+  %pb = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %t
 {crit_exit}{ok_back}
 try_wrap:
   %fit_wrap = icmp ule i32 %req, %h
@@ -4413,7 +4561,7 @@ ok_w:
   %gcp_w = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
   store i32 0, ptr %gop_w, align 4
   store i32 %req, ptr %gcp_w, align 4
-  %pw = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 0
+  %pw = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 0
 {crit_exit}{ok_wrap}
 mid_gap:
   %has_se = icmp ugt i32 %se, 0
@@ -4428,7 +4576,7 @@ ok_g:
   %gcp_g = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
   store i32 %t, ptr %gop_g, align 4
   store i32 %req, ptr %gcp_g, align 4
-  %pg = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %t
+  %pg = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %t
 {crit_exit}{ok_gap}
 fail:
 {crit_exit}  %err_r = insertvalue {res_slice_ty} zeroinitializer, i32 1, 1
@@ -4497,7 +4645,7 @@ entry:
   %hp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
   %idx = select i1 %has, i32 %h, i32 0
-  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %idx
+  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %idx
 {crit_exit}{conv_s1_r}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
   %sl1 = insertvalue {slice_ty} %sl0, {usize_ty} %s1_u, 1
@@ -4512,7 +4660,7 @@ entry:
 ready:
   %hp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
-  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %h
+  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %h
   {call_kw} void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
 {crit_exit}{conv_s1_p}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
@@ -4552,7 +4700,7 @@ l1:
   br i1 %d1, label %l2_init, label %b1
 b1:
   %src1_i = add i32 %h, %i1
-  %sp1 = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %src1_i
+  %sp1 = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %src1_i
   %v1 = load i8, ptr %sp1, align 1
   %dp1 = getelementptr i8, ptr %dst_ptr, i32 %i1
   store i8 %v1, ptr %dp1, align 1
@@ -4565,7 +4713,7 @@ l2:
   %d2 = icmp uge i32 %i2, %c2
   br i1 %d2, label %adv, label %b2
 b2:
-  %sp2 = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %i2
+  %sp2 = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %i2
   %v2 = load i8, ptr %sp2, align 1
   %dst2_i = add i32 %c1, %i2
   %dp2 = getelementptr i8, ptr %dst_ptr, i32 %dst2_i
@@ -4589,7 +4737,7 @@ entry:
 ok:
   %hp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
-  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7, i32 %h
+  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 8, i32 %h
   %b = load i8, ptr %bp, align 1
   {call_kw} void @__syn_ring_advance_{id}(ptr %r, i32 1)
   {call_kw} void @__syn_ring_apply_boost_{id}(ptr %r, ptr %task)
@@ -4608,7 +4756,7 @@ entry:
   %sp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 3
   %gop = getelementptr inbounds {pty}, ptr %r, i32 0, i32 4
   %gcp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 5
-  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 6
+  %bp = getelementptr inbounds {pty}, ptr %r, i32 0, i32 7
   store i32 0, ptr %hp, align 4
   store i32 0, ptr %tp, align 4
   store i32 0, ptr %cp, align 4
@@ -4653,7 +4801,7 @@ do_push:
   %tail = load i32, ptr %tail_p, align 4
   %slot_p = getelementptr inbounds {ety}, ptr %items_base, i32 %tail
   store {ety} %val, ptr %slot_p, align 1
-  %bp = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 3, i32 %tail
+  %bp = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 5, i32 %tail
   %has_b = icmp sge i32 %boost, 0
   %b_p1 = add i32 %boost, 1
   %b8 = trunc i32 %b_p1 to i8
@@ -4666,7 +4814,8 @@ do_push:
   store i32 %tnext, ptr %tail_p, align 4
   %c1 = add i32 %cnt, 1
   store i32 %c1, ptr %cnt_p, align 4
-  {call_kw} void @__syn_wake_waiters(ptr %hdr, i32 %boost)
+  %rx_wm = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 3
+  {call_kw} void @__syn_wake_all_mask(ptr %rx_wm, i32 %boost)
 {crit_exit}  ret i8 1
 full:
 {crit_exit}  ret i8 0
@@ -4686,7 +4835,7 @@ do_pop:
   %slot_p = getelementptr inbounds {ety}, ptr %items_base, i32 %head
   %val = load {ety}, ptr %slot_p, align 1
   store {ety} %val, ptr %out_val, align 1{clear_slot}
-  %bp = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 3, i32 %head
+  %bp = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 5, i32 %head
   %sb = load i8, ptr %bp, align 1
   store i8 0, ptr %bp, align 1
   %h1 = add i32 %head, 1
@@ -4705,8 +4854,8 @@ apply_pb:
   {call_kw} void @__syn_boost_task_ptr(ptr %task, i32 %pb32, i32 %now)
   br label %wake_senders
 wake_senders:
-  %q_tx = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 1
-  {call_kw} void @__syn_wake_waiters(ptr %q_tx, i32 -1)
+  %tx_wm = getelementptr inbounds %prim.inbox_hdr, ptr %hdr, i32 0, i32 4
+  {call_kw} void @__syn_wake_all_mask(ptr %tx_wm, i32 -1)
 {crit_exit}  ret i8 1
 empty:
 {crit_exit}  ret i8 0
@@ -4873,7 +5022,7 @@ entry:
 chk_b:
   %b_p1 = add i32 %boost, 1
   %enc = trunc i32 %b_p1 to i8
-  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 6
+  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7
   %cur = load i8, ptr %bp, align 1
   %is_z = icmp eq i8 %cur, 0
   %better = icmp ult i8 %enc, %cur
@@ -4883,7 +5032,8 @@ set_b:
   store i8 %enc, ptr %bp, align 1
   br label %do_wake
 do_wake:
-  {call_kw} void @__syn_wake_waiters(ptr %r, i32 %boost)
+  %wm_p = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 6
+  {call_kw} void @__syn_wake_all_mask(ptr %wm_p, i32 %boost)
   ret void
 }}
 
@@ -4895,7 +5045,7 @@ entry:
 
 define void @__syn_ring_view_apply_boost(ptr %r, ptr %task){fn_as} nounwind{fn_sz} {{
 entry:
-  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 6
+  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7
   %enc = load i8, ptr %bp, align 1
   %has_b = icmp ne i8 %enc, 0
   %has_t = icmp ne ptr %task, null
@@ -4922,7 +5072,7 @@ entry:
 do_wr:
   %tp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 1
   %t = load i32, ptr %tp, align 4
-  %dp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %t
+  %dp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %t
   store i8 %b, ptr %dp, align 1
   %sp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 3
   %se = load i32, ptr %sp, align 4
@@ -4965,7 +5115,7 @@ loop:
 body:
   %sp_in = getelementptr i8, ptr %src_ptr, i32 %i
   %bv = load i8, ptr %sp_in, align 1
-  %dp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %t_cur
+  %dp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %t_cur
   store i8 %bv, ptr %dp, align 1
   %t1 = add i32 %t_cur, 1
   %wrap = icmp uge i32 %t1, %cap
@@ -5000,7 +5150,7 @@ ret_z:
   %gcp_z = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
   store i32 %tz, ptr %gop_z, align 4
   store i32 0, ptr %gcp_z, align 4
-  %pz = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 0
+  %pz = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 0
 {crit_exit}{ok_z}
 chk_cap:
   %too_big = icmp ugt i32 %req, %cap
@@ -5021,7 +5171,7 @@ empty_ok:
   store i32 0, ptr %sp0, align 4
   store i32 0, ptr %gop0, align 4
   store i32 %req, ptr %gcp0, align 4
-  %pz_ok = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 0
+  %pz_ok = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 0
 {crit_exit}  %sl0_e = insertvalue {slice_ty} poison, ptr %pz_ok, 0
   %sl1_e = insertvalue {slice_ty} %sl0_e, {usize_ty} %req_u, 1
   %ok_e = insertvalue {res_slice_ty} zeroinitializer, {slice_ty} %sl1_e, 0
@@ -5046,7 +5196,7 @@ ok_b:
   %gcp_b = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
   store i32 %t, ptr %gop_b, align 4
   store i32 %req, ptr %gcp_b, align 4
-  %pb = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %t
+  %pb = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %t
 {crit_exit}{ok_back}
 try_wrap:
   %fit_wrap = icmp ule i32 %req, %h
@@ -5056,7 +5206,7 @@ ok_w:
   %gcp_w = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
   store i32 0, ptr %gop_w, align 4
   store i32 %req, ptr %gcp_w, align 4
-  %pw = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 0
+  %pw = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 0
 {crit_exit}{ok_wrap}
 mid_gap:
   %has_se = icmp ugt i32 %se, 0
@@ -5071,7 +5221,7 @@ ok_g:
   %gcp_g = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
   store i32 %t, ptr %gop_g, align 4
   store i32 %req, ptr %gcp_g, align 4
-  %pg = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %t
+  %pg = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %t
 {crit_exit}{ok_gap}
 fail:
 {crit_exit}  %err_r = insertvalue {res_slice_ty} zeroinitializer, i32 1, 1
@@ -5140,7 +5290,7 @@ entry:
   %hp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
   %idx = select i1 %has, i32 %h, i32 0
-  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %idx
+  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %idx
 {crit_exit}{conv_s1_r}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
   %sl1 = insertvalue {slice_ty} %sl0, {usize_ty} %s1_u, 1
@@ -5155,7 +5305,7 @@ entry:
 ready:
   %hp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
-  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %h
+  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %h
   {call_kw} void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
 {crit_exit}{conv_s1_p}
   %sl0 = insertvalue {slice_ty} poison, ptr %bp, 0
@@ -5195,7 +5345,7 @@ l1:
   br i1 %d1, label %l2_init, label %b1
 b1:
   %src1_i = add i32 %h, %i1
-  %sp1 = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %src1_i
+  %sp1 = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %src1_i
   %v1 = load i8, ptr %sp1, align 1
   %dp1 = getelementptr i8, ptr %dst_ptr, i32 %i1
   store i8 %v1, ptr %dp1, align 1
@@ -5208,7 +5358,7 @@ l2:
   %d2 = icmp uge i32 %i2, %c2
   br i1 %d2, label %adv, label %b2
 b2:
-  %sp2 = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %i2
+  %sp2 = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %i2
   %v2 = load i8, ptr %sp2, align 1
   %dst2_i = add i32 %c1, %i2
   %dp2 = getelementptr i8, ptr %dst_ptr, i32 %dst2_i
@@ -5232,7 +5382,7 @@ entry:
 ok:
   %hp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %h = load i32, ptr %hp, align 4
-  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7, i32 %h
+  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 8, i32 %h
   %b = load i8, ptr %bp, align 1
   {call_kw} void @__syn_ring_view_advance(ptr %r, i32 %cap, i32 1)
   {call_kw} void @__syn_ring_view_apply_boost(ptr %r, ptr %task)
@@ -5251,7 +5401,7 @@ entry:
   %sp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 3
   %gop = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 4
   %gcp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 5
-  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 6
+  %bp = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 7
   store i32 0, ptr %hp, align 4
   store i32 0, ptr %tp, align 4
   store i32 0, ptr %cp, align 4

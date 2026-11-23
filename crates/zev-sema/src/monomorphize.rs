@@ -19,7 +19,7 @@ use zev_ast::{
     GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal,
     MethodDecl, MmioDecl, MmioDeclKind, MmioRegDecl, OsPrimitiveDecl, OsPrimitiveType, Param,
     PrimType, Program, SelfReceiver, SpawnStmt, Span, Stmt, StmtKind, StructDecl, StructField,
-    SwitchArm, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp,
+    SwitchArm, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp, WaitArm, WaitTimerArm,
 };
 
 use crate::diag::{Diagnostic, DiagnosticKind};
@@ -155,6 +155,7 @@ struct Monomorphizer<'a> {
     raw_consts: BTreeMap<String, (Expr, Option<String>)>,
     eval_consts: BTreeMap<String, usize>,
     const_types: BTreeMap<String, TypeExpr>,
+    global_var_types: BTreeMap<String, TypeExpr>,
     known_structs: BTreeMap<String, StructDecl>,
     known_enums: BTreeMap<String, Vec<String>>,
     enum_prog_idx: BTreeMap<String, Option<usize>>,
@@ -195,6 +196,7 @@ impl<'a> Monomorphizer<'a> {
             raw_consts: BTreeMap::new(),
             eval_consts: BTreeMap::new(),
             const_types: BTreeMap::new(),
+            global_var_types: BTreeMap::new(),
             known_structs: BTreeMap::new(),
             known_enums,
             enum_prog_idx,
@@ -402,6 +404,7 @@ impl<'a> Monomorphizer<'a> {
         // `(prog_idx, item_idx)` so Pass 2 never re-emits duplicate `E0029`s or `<unknown>` files.
         let mut rewritten_structs: BTreeMap<(usize, usize), StructDecl> = BTreeMap::new();
         let mut rewritten_const_tys: BTreeMap<(usize, usize), TypeExpr> = BTreeMap::new();
+        let mut rewritten_global_tys: BTreeMap<(usize, usize), TypeExpr> = BTreeMap::new();
         let mut rewritten_prim_tys: BTreeMap<(usize, usize), OsPrimitiveType> = BTreeMap::new();
         let mut rewritten_fn_rets: BTreeMap<(usize, usize), TypeExpr> = BTreeMap::new();
 
@@ -438,6 +441,12 @@ impl<'a> Monomorphizer<'a> {
                         let rt = self.rewrite_type_expr(&c.ty, &env);
                         self.const_types.insert(c.name.name.clone(), rt.clone());
                         rewritten_const_tys.insert((prog_idx, item_idx), rt);
+                    }
+                    ItemKind::GlobalVar(g) => {
+                        let rt = self.rewrite_type_expr(&g.ty, &env);
+                        self.global_var_types
+                            .insert(g.name.name.clone(), rt.clone());
+                        rewritten_global_tys.insert((prog_idx, item_idx), rt);
                     }
                     ItemKind::OsPrimitive(p) => {
                         let ros = self.rewrite_os_prim_type(&p.ty, &env);
@@ -806,7 +815,9 @@ impl<'a> Monomorphizer<'a> {
                         });
                     }
                     ItemKind::GlobalVar(g) => {
-                        let ty = self.rewrite_type_expr(&g.ty, &env);
+                        let ty = rewritten_global_tys
+                            .remove(&(prog_idx, item_idx))
+                            .unwrap_or_else(|| self.rewrite_type_expr(&g.ty, &env));
                         let mut scopes = vec![BTreeMap::new()];
                         let init = g
                             .init
@@ -1466,6 +1477,7 @@ impl<'a> Monomorphizer<'a> {
     fn rewrite_os_prim_type(&mut self, os: &OsPrimitiveType, env: &SubstEnv) -> OsPrimitiveType {
         match os {
             OsPrimitiveType::Signal => OsPrimitiveType::Signal,
+            OsPrimitiveType::WaitQueue => OsPrimitiveType::WaitQueue,
             OsPrimitiveType::Inbox { elem, cap } => OsPrimitiveType::Inbox {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
                 cap: *cap,
@@ -1529,6 +1541,7 @@ impl<'a> Monomorphizer<'a> {
             }
             TypeKind::OsPrimitive(os) => match os {
                 OsPrimitiveType::Signal => "signal".to_string(),
+                OsPrimitiveType::WaitQueue => "wait_queue".to_string(),
                 OsPrimitiveType::Watch { elem } => {
                     format!("_Gwatch_L_{}_R_", self.format_mangled_type(elem))
                 }
@@ -1605,6 +1618,7 @@ impl<'a> Monomorphizer<'a> {
             TypeKind::Lease(inner) => format!("Lease<{}>", self.format_human_type(inner)),
             TypeKind::OsPrimitive(os) => match os {
                 OsPrimitiveType::Signal => "signal".to_string(),
+                OsPrimitiveType::WaitQueue => "wait_queue".to_string(),
                 OsPrimitiveType::Watch { elem } => {
                     format!("watch<{}>", self.format_human_type(elem))
                 }
@@ -2718,6 +2732,38 @@ impl<'a> Monomorphizer<'a> {
                     arms: r_arms,
                 }
             }
+            StmtKind::Wait { arms, timer } => {
+                let mut r_arms = Vec::with_capacity(arms.len());
+                for a in arms {
+                    let r_bind = a
+                        .bind
+                        .as_ref()
+                        .map(|(ty, id)| (self.rewrite_type_expr(ty, env), id.clone()));
+                    let r_call = self.rewrite_expr(&a.call, env, scopes, None).0;
+                    scopes.push(BTreeMap::new());
+                    if let (Some((rt, id)), Some(sc)) = (&r_bind, scopes.last_mut()) {
+                        sc.insert(id.name.clone(), rt.clone());
+                    }
+                    let body = self.rewrite_block(&a.body, env, scopes);
+                    scopes.pop();
+                    r_arms.push(WaitArm {
+                        bind: r_bind,
+                        call: r_call,
+                        body,
+                        span: a.span,
+                    });
+                }
+                let r_timer = timer.as_ref().map(|t| WaitTimerArm {
+                    kind: t.kind,
+                    expr: self.rewrite_expr(&t.expr, env, scopes, None).0,
+                    body: self.rewrite_block(&t.body, env, scopes),
+                    span: t.span,
+                });
+                StmtKind::Wait {
+                    arms: r_arms,
+                    timer: r_timer,
+                }
+            }
             StmtKind::Spawn(sp) => {
                 let args = sp
                     .args
@@ -2766,6 +2812,9 @@ impl<'a> Monomorphizer<'a> {
         }
         if let Some(ct) = self.const_types.get(name) {
             return InferTy::Concrete(ct.clone());
+        }
+        if let Some(gt) = self.global_var_types.get(name) {
+            return InferTy::Concrete(gt.clone());
         }
         if let Some(os) = self.prim_types.get(name) {
             return InferTy::Concrete(TypeExpr::new(
@@ -4378,6 +4427,7 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
         }
         TypeKind::OsPrimitive(os) => match os {
             OsPrimitiveType::Signal => "signal".to_string(),
+            OsPrimitiveType::WaitQueue => "wait_queue".to_string(),
             OsPrimitiveType::Watch { elem } => format!("_Gwatch_L_{}_R_", mangle_type_expr(elem)),
             OsPrimitiveType::Inbox { elem, cap } => {
                 format!("_Ginbox_L_{}__{}_R_", mangle_type_expr(elem), cap)

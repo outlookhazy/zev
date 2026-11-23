@@ -395,7 +395,7 @@ fn extern_c_callback_safety_direct_and_struct_wrapped() {
         struct BlockOps {
             fn(u32) -> i32 read_block;
         }
-        extern "C" fn mount_fs(BlockOps *ops);
+        extern "C" fn mount_fs(*BlockOps ops);
 
         i32 bad_read(u32 lba) {
             checkpoint();
@@ -488,7 +488,7 @@ fn allow_local_struct_wrapping_and_downward_calls_for_dma_slices() {
         @dma_safe ping_pong<u8, 64> rx_dma;
         @dma_safe pool<[32]u8, 4>   spi_pool;
 
-        u8 peek_first(ByteReader *r) {
+        u8 peek_first(*ByteReader r) {
             if (r.buf.len == 0) {
                 return 0;
             }
@@ -620,7 +620,7 @@ fn reject_returning_local_pointer_slice_or_leased_wrapper() {
     expect_err_kind(
         r#"
         []u8 bad_ret_slice() {
-            u8 tmp[8] = [1, 2, 3, 4, 5, 6, 7, 8];
+            [8]u8 tmp = [1, 2, 3, 4, 5, 6, 7, 8];
             return tmp[0..4];
         }
         fn main() {}
@@ -649,7 +649,7 @@ fn reject_returning_local_pointer_slice_or_leased_wrapper() {
     // Spawning a task with `&local` stack variable
     expect_err_kind(
         r#"
-        task worker(i32 *p) {
+        task worker(*i32 p) {
             loop every 1ms {
                 *p += 1;
             }
@@ -871,7 +871,7 @@ fn dual_exit_error_partial_progress_catch_and_or_validation() {
                 // handled bare error
             };
 
-            u8 buf[8] = [0, 0, 0, 0, 0, 0, 0, 0];
+            [8]u8 buf = [0, 0, 0, 0, 0, 0, 0, 0];
             usize saved_partial = 0;
             usize n1 = read_packet(buf[0..8], true) catch (IoErr err, usize got) {
                 saved_partial = got;
@@ -1044,7 +1044,7 @@ fn qa_adversarial_checklist_suite() {
             error ShortRead, 2;
         }
         fn main() {
-            u8 buf[8] = [0, 1, 2, 3, 4, 5, 6, 7];
+            [8]u8 buf = [0, 1, 2, 3, 4, 5, 6, 7];
             usize n = read_some(buf[0..4]) catch (IoErr e, usize partial) {
                 return;
             };
@@ -1884,12 +1884,12 @@ fn boot_tree_spawn_provenance_unrolling_conditional_and_e0027_e0010() {
     //    + conditional `if` boot branch (`usb_start()`) + `const` slice parameter!
     let model = expect_ok(
         r#"
-        const u8 INIT_SEQ[4] = [1, 2, 3, 4];
+        const [4]u8 INIT_SEQ = [1, 2, 3, 4];
         watch<u16> m1 = 0;
         watch<u16> m2 = 0;
         signal usb_irq_sig;
 
-        task bus_worker(watch<u16> *rpm, []u8 init_bytes, u8 bus_id) {
+        task bus_worker(*watch<u16> rpm, []u8 init_bytes, u8 bus_id) {
             loop every 2ms {
                 u16 cur = rpm.read() + init_bytes[0] + bus_id;
                 rpm.publish(cur);
@@ -1902,7 +1902,7 @@ fn boot_tree_spawn_provenance_unrolling_conditional_and_e0027_e0010() {
             }
         }
 
-        fn setup_bus(watch<u16> *rpm, []u8 seq, u8 id) {
+        fn setup_bus(*watch<u16> rpm, []u8 seq, u8 id) {
             spawn bus_worker(rpm, seq, id) @high;
         }
 
@@ -1956,12 +1956,12 @@ fn boot_tree_spawn_provenance_unrolling_conditional_and_e0027_e0010() {
     // 2. Passing `&local` from `main()` into a boot helper that forwards it to `spawn` -> E0010 (`SpawnNonStaticReference`)!
     expect_err_kind(
         r#"
-        task ptr_task(u16 *p) {
+        task ptr_task(*u16 p) {
             loop every 1ms {
                 *p += 1;
             }
         }
-        fn boot_wire(u16 *p) {
+        fn boot_wire(*u16 p) {
             spawn ptr_task(p) @normal;
         }
         fn main() {
@@ -2295,7 +2295,7 @@ fn defer_and_bounded_for_in_verification() {
         }
 
         isr DMA1_CH5 {
-            u8 lut[4] = [1, 2, 3, 4];
+            [4]u8 lut = [1, 2, 3, 4];
             u32 s = 0;
             for (u8 v in lut) {
                 s += v;
@@ -2476,7 +2476,7 @@ fn wave2_floats_f32_f64_literals_coercion_ops_casts_and_errors() {
             return ((f32)raw) * 3.3 / 4095.0;
         }
 
-        f32 step_pid(PidState *st, f32 target, f32 measured) {
+        f32 step_pid(*PidState st, f32 target, f32 measured) {
             f32 err = target - measured;
             st.integral += err * 0.01;
             st.integral -= 0.0;
@@ -2495,7 +2495,7 @@ fn wave2_floats_f32_f64_literals_coercion_ops_casts_and_errors() {
 
         task control_loop() {
             PidState st = PidState { integral: 0.0, accum64: 0.0 };
-            f32 weights[3] = [0.25, 0.5, 0.25];
+            [3]f32 weights = [0.25, 0.5, 0.25];
             loop every 2ms {
                 f32 v1 = read_adc_volts(2048, true) or 0.0;
                 f32 v2 = read_adc_volts(0, false) catch (SensorErr e) {
@@ -2566,7 +2566,7 @@ fn wave2_monomorphize_generic_structs_fns_inference_mangling_and_attrs() {
             return val;
         }
 
-        bool vec_push<T, usize N>(FixedVec<T, N> *v, T item) {
+        bool vec_push<T, usize N>(*FixedVec<T, N> v, T item) {
             if (v.len >= N) {
                 return false;
             }
@@ -3006,7 +3006,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
             Fault f = Overcurrent;
             Telemetry pkt = Telemetry { id: 7, ok: true };
             EmptyMarker em = EmptyMarker {};
-            u8 arr3[3] = [1, 2, 3];
+            [3]u8 arr3 = [1, 2, 3];
 
             *u8 hdr = "ok";
             print(f"[hdr={hdr}] b={b} sb={sb} wire=0x{wire_v:04X} bits={b:08b} ");
@@ -3014,35 +3014,35 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
 
             // Exact worst-case static fit proofs (NO `or` / `catch` required when `worst <= cap`!):
             // (a) `"rpm="` (4) + `u16` (5) = 9 bytes -> fits `[9]u8` and `*[9]u8`!
-            u8 buf9[9];
+            [9]u8 buf9;
             []u8 s1 = fmt_buf(buf9, f"rpm={rpm}");
             []u8 s2 = fmt_buf(ptr_buf9, f"rpm={rpm}");
             []u8 s3 = fmt_buf(buf9[..], f"rpm={rpm}");
 
             // (b) Constant sub-slice `big[2..16]` has static capacity 14 -> fits `f32` Default (`14` bytes)!
-            u8 big[20];
+            [20]u8 big;
             []u8 s4 = fmt_buf(big[2..16], f"{volts}");
 
             // (c) Float `:.0` (`11`), `:.3` (`15`), `f32` `:e` (`11`), `f64` `:e` (`12`)!
-            u8 b_f0[11];
-            u8 b_f3[15];
-            u8 b_se32[11];
-            u8 b_se64[12];
+            [11]u8 b_f0;
+            [15]u8 b_f3;
+            [11]u8 b_se32;
+            [12]u8 b_se64;
             []u8 sf0 = fmt_buf(b_f0, f"{volts:.0}");
             []u8 sf3 = fmt_buf(b_f3, f"{precise:.3}");
             []u8 sse32 = fmt_buf(b_se32, f"{volts:e}");
             []u8 sse64 = fmt_buf(b_se64, f"{precise:e}");
 
             // (d) Enum `Fault` max variant `"Overcurrent"` = 11 bytes!
-            u8 b_enum[11];
+            [11]u8 b_enum;
             []u8 se = fmt_buf(b_enum, f"{f}");
 
             // (e) Struct `{pkt:?}`: `"Telemetry { id: "` (16) + `u8` (3) + `", ok: "` (6) + `bool` (5) + `" }"` (2) = 32 bytes!
-            u8 b_pkt[32];
+            [32]u8 b_pkt;
             []u8 spkt = fmt_buf(b_pkt, f"{pkt:?}");
 
             // (f) Dynamic `[]u8` hole or dynamic `[]u8` destination handled via `catch (FmtErr err, []u8 clamped)` or `or`!
-            u8 small_dyn[8];
+            [8]u8 small_dyn;
             []u8 dyn_dst = small_dyn[0..8];
             []u8 s_dyn1 = fmt_buf(small_dyn, f"tag={dyn_tag}") catch (FmtErr err, []u8 clamped) {
                 if (err == Truncated) {
@@ -3067,8 +3067,8 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
         }
 
         fn main() {
-            u8 p9[9];
-            u8 tag[2] = [65, 66];
+            [9]u8 p9;
+            [2]u8 tag = [65, 66];
             format_all(tag[0..2], &p9);
         }
         "#,
@@ -3079,7 +3079,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
         r#"
         fn main() {
             u16 rpm = 4200;
-            u8 buf[8];
+            [8]u8 buf;
             []u8 s = fmt_buf(buf, f"rpm={rpm}");
         }
         "#,
@@ -3106,7 +3106,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
             "full slice buf[..] overflow",
             r#"
             fn main() {
-                u8 buf[8];
+                [8]u8 buf;
                 u16 rpm = 1;
                 []u8 s = fmt_buf(buf[..], f"rpm={rpm}");
             }
@@ -3116,7 +3116,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
             "const sub-slice buf[2..9] (cap 7) overflow",
             r#"
             fn main() {
-                u8 buf[16];
+                [16]u8 buf;
                 u16 rpm = 1;
                 []u8 s = fmt_buf(buf[2..9], f"rpm={rpm}");
             }
@@ -3127,7 +3127,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
             r#"
             fn main() {
                 f32 v = 1.5f32;
-                u8 buf[13];
+                [13]u8 buf;
                 []u8 s = fmt_buf(buf, f"{v}");
             }
             "#,
@@ -3137,7 +3137,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
             r#"
             fn main() {
                 f64 v = 1.5;
-                u8 buf[11];
+                [11]u8 buf;
                 []u8 s = fmt_buf(buf, f"{v:e}");
             }
             "#,
@@ -3148,7 +3148,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
             struct Telemetry { u8 id; bool ok; }
             fn main() {
                 Telemetry t = Telemetry { id: 1, ok: false };
-                u8 buf[31];
+                [31]u8 buf;
                 []u8 s = fmt_buf(buf, f"{t:?}");
             }
             "#,
@@ -3174,7 +3174,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
     expect_err_kind(
         r#"
         fn bad([]u8 dyn_hole) {
-            u8 buf[16];
+            [16]u8 buf;
             []u8 s = fmt_buf(buf, f"msg={dyn_hole}");
         }
         fn main() {}
@@ -3186,7 +3186,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
     expect_err_kind(
         r#"
         []u8 bad_return(u16 rpm) {
-            u8 local_buf[16];
+            [16]u8 local_buf;
             return fmt_buf(local_buf, f"rpm={rpm}");
         }
         fn main() {}
@@ -3238,7 +3238,7 @@ fn r2a_h1_static_dst_capacity_soundness_and_m5_fmt_buf_self_aliasing() {
     let d_chained = expect_err_kind(
         r#"
         fn main() {
-            u8 big[16];
+            [16]u8 big;
             []u8 s = fmt_buf(big[0..2][0..10], f"hello");
             println(s);
         }
@@ -3265,14 +3265,14 @@ fn r2a_h1_static_dst_capacity_soundness_and_m5_fmt_buf_self_aliasing() {
     for bad_alias in [
         r#"
         fn main() {
-            u8 buf[16];
+            [16]u8 buf;
             []u8 s = fmt_buf(buf, f"hi");
             s = fmt_buf(buf, f"x{s}") or s;
         }
         "#,
         r#"
         fn main() {
-            u8 buf[16];
+            [16]u8 buf;
             []u8 s = fmt_buf(buf, f"x{buf}") or buf[0..1];
             println(s);
         }
@@ -3294,8 +3294,8 @@ fn r2a_h1_static_dst_capacity_soundness_and_m5_fmt_buf_self_aliasing() {
     expect_ok(
         r#"
         fn main() {
-            u8 buf[32];
-            u8 buf2[32];
+            [32]u8 buf;
+            [32]u8 buf2;
             []u8 s = fmt_buf(buf, f"hi");
             []u8 s_len = fmt_buf(buf, f"len={s.len}");
             []u8 s2 = fmt_buf(buf2, f"x{s}") or buf2[0..1];
@@ -3326,31 +3326,31 @@ fn r2a_h2_m3_h3_h9_low_format_debug_ptrs_slices_enums_hex_escapes_and_precision(
             *Node np = &n;
             *u8 cstr = "hi";
 
-            u8 b_ptr[18];
+            [18]u8 b_ptr;
             []u8 sp1 = fmt_buf(b_ptr, f"{np:?}");
             []u8 sp2 = fmt_buf(b_ptr, f"{cstr:?}");
 
-            u8 b_node[48];
+            [48]u8 b_node;
             []u8 sn = fmt_buf(b_node, f"{n:?}");
 
             Op op = Op.A;
-            u8 b_op[5];
+            [5]u8 b_op;
             []u8 sop = fmt_buf(b_op, f"{op}");
 
-            u8 b_raw1[1];
+            [1]u8 b_raw1;
             []u8 s_hex1 = fmt_buf(b_raw1, f"\xFF");
             []u8 s_hex2 = fmt_buf(b_raw1, f"{"\xAA"}");
 
             Mini m1 = Mini { x: 1 };
             Mini m2 = Mini { x: 2 };
             [2]Mini arr_m = [m1, m2];
-            u8 b_arr_m[34];
+            [34]u8 b_arr_m;
             []u8 sam = fmt_buf(b_arr_m, f"{arr_m:?}");
 
             f64 fv = 1.25;
-            u8 b_p9[21];
+            [21]u8 b_p9;
             []u8 sp9 = fmt_buf(b_p9, f"{fv:.9}");
-            u8 b_e9[19];
+            [19]u8 b_e9;
             []u8 se9 = fmt_buf(b_e9, f"{fv:.9e}");
 
             println(sp1);
@@ -3373,7 +3373,7 @@ fn r2a_h2_m3_h3_h9_low_format_debug_ptrs_slices_enums_hex_escapes_and_precision(
         fn main() {
             Node n = Node { v: 1, next: 0 as *Node };
             *Node np = &n;
-            u8 b[17];
+            [17]u8 b;
             []u8 s = fmt_buf(b, f"{np:?}");
         }
         "#,
@@ -3381,7 +3381,7 @@ fn r2a_h2_m3_h3_h9_low_format_debug_ptrs_slices_enums_hex_escapes_and_precision(
         struct Node { u32 v; *Node next; }
         fn main() {
             Node n = Node { v: 1, next: 0 as *Node };
-            u8 b[47];
+            [47]u8 b;
             []u8 s = fmt_buf(b, f"{n:?}");
         }
         "#,
@@ -3389,7 +3389,7 @@ fn r2a_h2_m3_h3_h9_low_format_debug_ptrs_slices_enums_hex_escapes_and_precision(
         enum Op { A = 1, B = 2 }
         fn main() {
             Op op = Op.A;
-            u8 b[4];
+            [4]u8 b;
             []u8 s = fmt_buf(b, f"{op}");
         }
         "#,
@@ -3398,13 +3398,13 @@ fn r2a_h2_m3_h3_h9_low_format_debug_ptrs_slices_enums_hex_escapes_and_precision(
         struct Wrap { Op op; }
         fn main() {
             Wrap w = Wrap { op: Op.A };
-            u8 b[17]; // "Wrap { op: " (11) + "Op(?)" (5) + " }" (2) = 18 > 17
+            [17]u8 b; // "Wrap { op: " (11) + "Op(?)" (5) + " }" (2) = 18 > 17
             []u8 s = fmt_buf(b, f"{w:?}");
         }
         "#,
         r#"
         fn main() {
-            u8 b[1];
+            [1]u8 b;
             []u8 s = fmt_buf(b, f"\xFF\xAA");
         }
         "#,
@@ -3566,9 +3566,9 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
             i32 v = first_elem([1000, 2000]);
             usize r = switch_and_shadow<7>(7);
 
-            u8 raw[16];
+            [16]u8 raw;
             []u8 fit = fmt_buf(raw[0..TOTAL], f"abcdef");
-            u8 raw9[16];
+            [16]u8 raw9;
             []u8 fit9 = fmt_buf(raw9[0..NINE], f"123456789");
             println(fit);
             println(fit9);
@@ -3615,7 +3615,7 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
         const usize PAYLOAD = 4;
         const usize TOTAL = HDR + PAYLOAD;
         fn main() {
-            u8 raw[16];
+            [16]u8 raw;
             []u8 bad = fmt_buf(raw[0..TOTAL], f"abcdefg");
         }
         "#,
@@ -4048,7 +4048,7 @@ fn wave1_mmio_validation_and_e0031_enforcement() {
             @wo u8 dr @ 0x06;
             @w1c u32 icr @ 0x08;
             @rw [2]u32 brr @ 0x0C;
-            @wo u32 tx[2] @ 0x14;
+            @wo [2]u32 tx @ 0x14;
         }
 
         mmio USART1 : UartRegs @ 0x4001_1000;
@@ -4549,7 +4549,7 @@ task reader(*byte_ring<64> ring) {
     loop {
         []u8 chunk = ring.wait_read();
         ViewWrap w = ViewWrap { s: chunk };
-        u8 tmp[4];
+        [4]u8 tmp;
         usize n = ring.pop(tmp);
         u8 stale_after_pop = w.s[0];
     }
@@ -6097,7 +6097,7 @@ isr dma_isr(*ping_pong<u8, 16> rx) {
 }
 
 task consumer(*ping_pong<u8, 16> rx) {
-    u8 local[16];
+    [16]u8 local;
     loop {
         []u8 chunk = rx.wait_chunk();
         usize n = math.min<usize>(chunk.len, 16);
@@ -6583,6 +6583,212 @@ fn main() {
             res.diagnostics
         );
     }
+}
+
+#[test]
+fn enforces_32_task_static_scheduler_limit_e0027() {
+    fn gen_spawns(count: usize, with_main_supervisor: bool) -> String {
+        let mut s = String::from(
+            "signal sig;\ntask worker(*signal p) { loop { p.wait(); } }\nfn main() {\n",
+        );
+        for _ in 0..count {
+            s.push_str("    spawn worker(&sig);\n");
+        }
+        if with_main_supervisor {
+            s.push_str("    loop {\n        delay(10ms);\n    }\n");
+        }
+        s.push_str("}\n");
+        s
+    }
+
+    // 32 spawned workers (no main supervisor): 32 slots -> valid
+    let ok32 = check_src(&gen_spawns(32, false));
+    assert!(ok32.is_ok(), "32 tasks should fit: {:?}", ok32.err());
+
+    // 31 spawned workers + main supervisor loop: 32 slots -> valid
+    let ok31_sup = check_src(&gen_spawns(31, true));
+    assert!(
+        ok31_sup.is_ok(),
+        "31 tasks + main supervisor should fit: {:?}",
+        ok31_sup.err()
+    );
+
+    // 33 spawned workers -> E0027
+    let bad33 = check_src(&gen_spawns(33, false)).unwrap_err();
+    assert!(
+        bad33
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::InvalidSpawnContext && d.message.contains("32")),
+        "expected E0027 on 33 tasks: {:?}",
+        bad33
+    );
+
+    // 32 spawned workers + main supervisor loop = 33 -> E0027
+    let bad32_sup = check_src(&gen_spawns(32, true)).unwrap_err();
+    assert!(
+        bad32_sup
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::InvalidSpawnContext && d.message.contains("32")),
+        "expected E0027 on 32 tasks + main supervisor: {:?}",
+        bad32_sup
+    );
+}
+
+#[test]
+fn wait_queue_safety_and_std_sync_sema() {
+    let ok = r#"
+import std.sync as sync;
+
+wait_queue raw_wq;
+sync.Semaphore sem;
+sync.EventFlags flags;
+sync.Latch gate;
+sync.Barrier<3> barrier;
+
+irq IRQ_W = 4;
+
+isr w_isr(*wait_queue w, *sync.Semaphore s) {
+    w.wake_one(boost: @high);
+    w.wake_all();
+    s.release();
+}
+
+task waiter(*wait_queue w, *sync.Semaphore s, *sync.EventFlags f, *sync.Latch g, *sync.Barrier<3> b) {
+    loop {
+        critical {
+            w.prepare_wait();
+        }
+        w.cancel_wait();
+        critical {
+            w.prepare_wait();
+        }
+        w.commit_wait(timeout: 20ms) catch {};
+        s.acquire();
+        u32 _bits = f.wait_any(0x1u32);
+        g.wait();
+        bool _leader = b.wait();
+    }
+}
+
+fn main() {
+    sem.init(1u32);
+    IRQ_W.attach(w_isr(&raw_wq, &sem));
+    spawn waiter(&raw_wq, &sem, &flags, &gate, &barrier) @normal;
+    spawn waiter(&raw_wq, &sem, &flags, &gate, &barrier) @normal;
+    spawn waiter(&raw_wq, &sem, &flags, &gate, &barrier) @normal;
+}
+"#;
+    let _ = expect_ok(ok);
+
+    // prepare_wait outside critical -> InvalidOperation (E0024)
+    expect_err_kind(
+        "wait_queue wq; task t() { loop { wq.prepare_wait(); wq.commit_wait(); } } fn main() { spawn t(); }",
+        DiagnosticKind::InvalidOperation,
+    );
+    // prepare_wait / cancel_wait / commit_wait inside ISR -> YieldInIsr (E0005)
+    expect_err_kind(
+        "wait_queue wq; irq Q = 1; isr h() { critical { wq.prepare_wait(); } } fn main() { Q.attach(h); }",
+        DiagnosticKind::YieldInIsr,
+    );
+    expect_err_kind(
+        "wait_queue wq; irq Q = 1; isr h() { wq.cancel_wait(); } fn main() { Q.attach(h); }",
+        DiagnosticKind::YieldInIsr,
+    );
+    expect_err_kind(
+        "wait_queue wq; irq Q = 1; isr h() { wq.commit_wait(); } fn main() { Q.attach(h); }",
+        DiagnosticKind::YieldInIsr,
+    );
+    // commit_wait inside critical -> YieldInCritical (E0004), inside noyield -> YieldInNoYield (E0003)
+    expect_err_kind(
+        "wait_queue wq; task t() { loop { critical { wq.prepare_wait(); wq.commit_wait(); } } } fn main() { spawn t(); }",
+        DiagnosticKind::YieldInCritical,
+    );
+    expect_err_kind(
+        "wait_queue wq; task t() { loop { noyield { wq.commit_wait(); } } } fn main() { spawn t(); }",
+        DiagnosticKind::YieldInNoYield,
+    );
+}
+
+#[test]
+fn while_cond_soft_yielding_vs_noyield_wrapper() {
+    let in_isr = r#"
+watch<u32> reg = 0;
+irq Q = 1;
+fn poll_reg(*watch<u32> w) {
+    while (w.read() == 0) {}
+}
+isr h() {
+    poll_reg(&reg);
+}
+fn main() {
+    Q.attach(h);
+}
+"#;
+    expect_err_kind(in_isr, DiagnosticKind::YieldInIsr);
+
+    let in_critical = r#"
+watch<u32> reg = 0;
+fn poll_reg(*watch<u32> w) {
+    while (w.read() == 0) {}
+}
+task t() {
+    loop {
+        critical {
+            poll_reg(&reg);
+        }
+        sys.delay(1ms);
+    }
+}
+fn main() {
+    spawn t();
+}
+"#;
+    expect_err_kind(in_critical, DiagnosticKind::YieldInCritical);
+
+    let soft_ok = r#"
+watch<u32> reg = 0;
+fn poll_reg(*watch<u32> w) {
+    while (w.read() == 0) {}
+}
+task t() {
+    loop {
+        poll_reg(&reg);
+        sys.delay(1ms);
+    }
+}
+fn main() {
+    spawn t();
+}
+"#;
+    let soft_model = expect_ok(soft_ok);
+    assert_eq!(soft_model.fn_effect("poll_reg"), FnEffect::SoftYielding);
+
+    let ok = r#"
+watch<u32> reg = 0;
+irq Q = 1;
+fn poll_reg(*watch<u32> w) {
+    noyield {
+        while (w.read() == 0) {}
+    }
+}
+isr h() {
+    poll_reg(&reg);
+}
+task t() {
+    loop {
+        critical {
+            poll_reg(&reg);
+        }
+        sys.delay(1ms);
+    }
+}
+fn main() {
+    Q.attach(h);
+    spawn t();
+}
+"#;
+    let model = expect_ok(ok);
+    assert_eq!(model.fn_effect("poll_reg"), FnEffect::NonYielding);
 }
 
 

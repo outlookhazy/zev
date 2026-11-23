@@ -250,6 +250,7 @@ impl MirType {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MirPrimKind {
     Signal,
+    WaitQueue,
     Watch { elem: Box<MirType> },
     Inbox { elem: Box<MirType>, cap: usize },
     PingPong { elem: Box<MirType>, cap: usize },
@@ -262,6 +263,7 @@ impl MirPrimKind {
     pub fn mangle_name(&self) -> String {
         match self {
             MirPrimKind::Signal => "signal".to_string(),
+            MirPrimKind::WaitQueue => "wait_queue".to_string(),
             MirPrimKind::Watch { elem } => format!("watch_{}", elem.mangle_name()),
             MirPrimKind::Inbox { elem, cap } => format!("inbox_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::PingPong { elem, cap } => format!("pp_{}_{}", elem.mangle_name(), cap),
@@ -274,6 +276,7 @@ impl MirPrimKind {
     pub fn display_name(&self) -> String {
         match self {
             MirPrimKind::Signal => "signal".to_string(),
+            MirPrimKind::WaitQueue => "wait_queue".to_string(),
             MirPrimKind::Watch { elem } => format!("watch<{}>", elem.display_name()),
             MirPrimKind::Inbox { elem, cap } => format!("inbox<{}, {cap}>", elem.display_name()),
             MirPrimKind::PingPong { elem, cap } => {
@@ -558,6 +561,10 @@ pub enum MirStmt {
         symbol: String,
         value: u8,
     },
+    /// Semantic marker emitted on bounded `for` loop latches for static run-bound classification.
+    BoundedForLatch,
+    /// Zero non-parameter task locals and child call frames on `restart;` before jumping to `bb_0`.
+    ZeroTaskLocals,
 }
 
 /// Integer radix and zero-padding format mode for [`MirFmtChunk::Int`].
@@ -684,6 +691,16 @@ pub enum MirPrimNonBlockingOp {
     SignalClear {
         target: MirPrimTarget,
     },
+    WaitQueuePrepare {
+        target: MirPrimTarget,
+    },
+    WaitQueueCancel {
+        target: MirPrimTarget,
+    },
+    WaitQueueWakeAll {
+        target: MirPrimTarget,
+        boost: Option<MirPriority>,
+    },
     PingPongFlip {
         target: MirPrimTarget,
         elem_ty: MirType,
@@ -802,93 +819,11 @@ pub enum MirYieldKind {
         resume_bb: BlockId,
     },
     /// Blocking receive on unified `inbox<T, N>`, optionally bounded by `timeout_deadline_var`.
-    InboxRecv {
-        target: MirPrimTarget,
-        elem_ty: MirType,
-        cap: usize,
-        timeout_deadline_var: Option<VarId>,
-        dst_val: Option<VarId>,
-        dst_res: Option<VarId>,
+    /// Single primitive arm inside a unified atomic `MirYieldKind::Wait`.
+    Wait {
+        arms: Vec<MirWaitArm>,
+        timer: Option<MirWaitTimer>,
         poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Blocking backpressure send on unified `inbox<T, N>` when queue is full, optionally bounded by `timeout_deadline_var`.
-    InboxSend {
-        target: MirPrimTarget,
-        elem_ty: MirType,
-        cap: usize,
-        val_var: VarId,
-        timeout_deadline_var: Option<VarId>,
-        dst_res: Option<VarId>,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Blocking wait on `signal`, optionally bounded by `timeout_deadline_var`.
-    SignalWait {
-        target: MirPrimTarget,
-        timeout_deadline_var: Option<VarId>,
-        dst_res: Option<VarId>,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Zero-copy DMA buffer wait on `ping_pong<T, N>`.
-    PingPongWaitChunk {
-        target: MirPrimTarget,
-        elem_ty: MirType,
-        cap: usize,
-        dst_slice: VarId,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Allocate a linear `Lease<T>` from `pool<T, K>` (`pool.alloc([timeout: d])`).
-    PoolAlloc {
-        target: MirPrimTarget,
-        elem_ty: MirType,
-        cap: usize,
-        timeout_deadline_var: Option<VarId>,
-        dst_val: Option<VarId>,
-        dst_res: Option<VarId>,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Blocking receive/view wait on `byte_ring<N>`, optionally bounded by `timeout_deadline_var`.
-    ByteRingWaitRead {
-        target: MirPrimTarget,
-        cap: usize,
-        timeout_deadline_var: Option<VarId>,
-        dst_val: Option<VarId>,
-        dst_res: Option<VarId>,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Blocking receive on unsized `*inbox<T>` view, optionally bounded by `timeout_deadline_var`.
-    InboxViewRecv {
-        view: MirExpr,
-        elem_ty: MirType,
-        timeout_deadline_var: Option<VarId>,
-        dst_val: Option<VarId>,
-        dst_res: Option<VarId>,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Blocking backpressure send on unsized `*inbox<T>` view, optionally bounded by `timeout_deadline_var`.
-    InboxViewSend {
-        view: MirExpr,
-        elem_ty: MirType,
-        val_var: VarId,
-        timeout_deadline_var: Option<VarId>,
-        dst_res: Option<VarId>,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
-    },
-    /// Blocking receive/view wait on unsized `*byte_ring` view, optionally bounded by `timeout_deadline_var`.
-    ByteRingViewWaitRead {
-        view: MirExpr,
-        timeout_deadline_var: Option<VarId>,
-        dst_val: Option<VarId>,
-        dst_res: Option<VarId>,
-        poll_bb: BlockId,
-        resume_bb: BlockId,
     },
     /// Initialize and invoke a yielding child function via `union _child.<slot_name>`.
     CallYielding {
@@ -907,6 +842,93 @@ pub enum MirYieldKind {
         poll_bb: BlockId,
         resume_bb: BlockId,
     },
+}
+
+/// Single primitive wait operation inside [`MirYieldKind::Wait`].
+#[derive(Debug, Clone)]
+pub enum MirWaitArmOp {
+    InboxRecv {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
+    InboxViewRecv {
+        view: MirExpr,
+        elem_ty: MirType,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
+    InboxSend {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+        val_var: VarId,
+        dst_res: Option<VarId>,
+    },
+    InboxViewSend {
+        view: MirExpr,
+        elem_ty: MirType,
+        val_var: VarId,
+        dst_res: Option<VarId>,
+    },
+    SignalWait {
+        target: MirPrimTarget,
+        dst_res: Option<VarId>,
+    },
+    WaitQueueCommit {
+        target: MirPrimTarget,
+        dst_res: Option<VarId>,
+    },
+    WatchWaitChange {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        last_gen_var: VarId,
+        seeded_var: Option<VarId>,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
+    PingPongWaitChunk {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+        dst_slice: VarId,
+    },
+    PoolAlloc {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        cap: usize,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
+    ByteRingWaitRead {
+        target: MirPrimTarget,
+        cap: usize,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
+    ByteRingViewWaitRead {
+        view: MirExpr,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
+}
+
+/// One branch of a [`MirYieldKind::Wait`], polled top-to-bottom under one critical section.
+#[derive(Debug, Clone)]
+pub struct MirWaitArm {
+    pub op: MirWaitArmOp,
+    pub target_bb: BlockId,
+}
+
+/// Optional deadline timer arm of a [`MirYieldKind::Wait`].
+#[derive(Debug, Clone)]
+pub struct MirWaitTimer {
+    pub deadline_var: VarId,
+    pub timeout_bb: BlockId,
+    pub timeout_err_res: Option<VarId>,
+    pub release_lease_on_timeout: Option<(VarId, MirType)>,
 }
 
 /// Basic block terminator in a state-machine task or yielding function.
@@ -953,37 +975,28 @@ impl MirTerminator {
                 MirYieldKind::DelayPoll {
                     poll_bb, resume_bb, ..
                 }
-                | MirYieldKind::InboxRecv {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::InboxSend {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::SignalWait {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::PingPongWaitChunk {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::PoolAlloc {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::ByteRingWaitRead {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::InboxViewRecv {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::InboxViewSend {
-                    poll_bb, resume_bb, ..
-                }
-                | MirYieldKind::ByteRingViewWaitRead {
+                | MirYieldKind::PollChild {
                     poll_bb, resume_bb, ..
                 } => vec![*poll_bb, *resume_bb],
+                MirYieldKind::Wait {
+                    arms,
+                    timer,
+                    poll_bb,
+                } => {
+                    let mut out = vec![*poll_bb];
+                    for arm in arms {
+                        if !out.contains(&arm.target_bb) {
+                            out.push(arm.target_bb);
+                        }
+                    }
+                    if let Some(t) = timer {
+                        if !out.contains(&t.timeout_bb) {
+                            out.push(t.timeout_bb);
+                        }
+                    }
+                    out
+                }
                 MirYieldKind::CallYielding { poll_bb, .. } => vec![*poll_bb],
-                MirYieldKind::PollChild {
-                    poll_bb, resume_bb, ..
-                } => vec![*poll_bb, *resume_bb],
             },
         }
     }
@@ -995,15 +1008,7 @@ impl MirTerminator {
                 MirYieldKind::EveryLatch { resume_bb, .. }
                 | MirYieldKind::ShareCheckpoint { resume_bb } => vec![*resume_bb],
                 MirYieldKind::DelayPoll { poll_bb, .. }
-                | MirYieldKind::InboxRecv { poll_bb, .. }
-                | MirYieldKind::InboxSend { poll_bb, .. }
-                | MirYieldKind::SignalWait { poll_bb, .. }
-                | MirYieldKind::PingPongWaitChunk { poll_bb, .. }
-                | MirYieldKind::PoolAlloc { poll_bb, .. }
-                | MirYieldKind::ByteRingWaitRead { poll_bb, .. }
-                | MirYieldKind::InboxViewRecv { poll_bb, .. }
-                | MirYieldKind::InboxViewSend { poll_bb, .. }
-                | MirYieldKind::ByteRingViewWaitRead { poll_bb, .. }
+                | MirYieldKind::Wait { poll_bb, .. }
                 | MirYieldKind::PollChild { poll_bb, .. } => vec![*poll_bb],
                 MirYieldKind::CallYielding { .. } => vec![],
             },
@@ -1162,6 +1167,10 @@ pub enum MirPrimReadOp {
         target: MirPrimTarget,
         elem_ty: MirType,
     },
+    WatchGen {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+    },
     InboxTryRecv {
         target: MirPrimTarget,
         elem_ty: MirType,
@@ -1194,6 +1203,10 @@ pub enum MirPrimReadOp {
     },
     SignalTryWait {
         target: MirPrimTarget,
+    },
+    WaitQueueWakeOne {
+        target: MirPrimTarget,
+        boost: Option<MirPriority>,
     },
     PingPongDmaBuf {
         target: MirPrimTarget,

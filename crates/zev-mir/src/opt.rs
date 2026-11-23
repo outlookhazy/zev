@@ -20,7 +20,7 @@ use crate::ir::{
     MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootStep, MirCallDst, MirExpr, MirExprKind,
     MirFmtChunk, MirFnBody, MirFunction, MirIntrinsicOp, MirModule, MirPlace, MirPrimKind,
     MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirStmt, MirStruct,
-    MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId, VarRole,
+    MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArmOp, MirYieldKind, VarId, VarRole,
 };
 
 /// Whole-program primitive contention, dead-watch, and singleton folding analysis report.
@@ -276,22 +276,23 @@ fn watch_or_prim_size_align(
     seen_structs: &mut BTreeSet<String>,
 ) -> (usize, usize) {
     let raw = match kind {
-        MirPrimKind::Signal => struct_size_align(&[(ptr_bytes, ptr_bytes), (1, 1), (1, 1)], false),
+        MirPrimKind::Signal => struct_size_align(&[(1, 1), (1, 1), (4, 4)], false),
+        MirPrimKind::WaitQueue => struct_size_align(&[(4, 4)], false),
         MirPrimKind::Watch { elem } => {
             let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
-            struct_size_align(&[el, (4, 4)], false)
+            struct_size_align(&[el, (4, 4), (4, 4)], false)
         }
         MirPrimKind::Inbox { elem, cap } => {
             let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
             struct_size_align(
                 &[
-                    (el.0 * cap, el.1),
+                    (4, 4),
+                    (4, 4),
+                    (4, 4),
+                    (4, 4),
+                    (4, 4),
                     (*cap, 1),
-                    (ptr_bytes, ptr_bytes),
-                    (ptr_bytes, ptr_bytes),
-                    (2, 2),
-                    (2, 2),
-                    (2, 2),
+                    (el.0 * cap, el.1),
                 ],
                 false,
             )
@@ -300,14 +301,12 @@ fn watch_or_prim_size_align(
             let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
             struct_size_align(
                 &[
-                    (el.0 * cap * 2, el.1),
-                    (ptr_bytes, ptr_bytes),
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
+                    (1, 1),
                     (4, 4),
-                    (2, 2),
-                    (1, 1),
-                    (1, 1),
-                    (1, 1),
-                    (1, 1),
+                    (el.0 * cap * 2, el.1),
                 ],
                 false,
             )
@@ -334,8 +333,7 @@ fn watch_or_prim_size_align(
         ),
         MirPrimKind::ByteRing { cap } => struct_size_align(
             &[
-                (*cap, 1),
-                (ptr_bytes, ptr_bytes),
+                (4, 4),
                 (4, 4),
                 (4, 4),
                 (4, 4),
@@ -343,6 +341,7 @@ fn watch_or_prim_size_align(
                 (4, 4),
                 (4, 4),
                 (1, 1),
+                (*cap, 1),
             ],
             false,
         ),
@@ -698,7 +697,8 @@ impl<'a> ScanCtx<'a> {
                 }
             }
             MirExprKind::PrimRead(op) => match op.as_ref() {
-                MirPrimReadOp::WatchRead { target, elem_ty } => {
+                MirPrimReadOp::WatchRead { target, elem_ty }
+                | MirPrimReadOp::WatchGen { target, elem_ty } => {
                     let kind = MirPrimKind::Watch {
                         elem: Box::new(elem_ty.clone()),
                     };
@@ -754,6 +754,9 @@ impl<'a> ScanCtx<'a> {
                 }
                 MirPrimReadOp::SignalIsSet { target } | MirPrimReadOp::SignalTryWait { target } => {
                     self.visit_prim_target(target, &MirPrimKind::Signal, in_isr, callees);
+                }
+                MirPrimReadOp::WaitQueueWakeOne { target, .. } => {
+                    self.visit_prim_target(target, &MirPrimKind::WaitQueue, in_isr, callees);
                 }
                 MirPrimReadOp::PingPongDmaBuf {
                     target,
@@ -974,6 +977,11 @@ impl<'a> ScanCtx<'a> {
             | MirPrimNonBlockingOp::SignalClear { target } => {
                 self.visit_prim_target(target, &MirPrimKind::Signal, in_isr, callees);
             }
+            MirPrimNonBlockingOp::WaitQueuePrepare { target }
+            | MirPrimNonBlockingOp::WaitQueueCancel { target }
+            | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. } => {
+                self.visit_prim_target(target, &MirPrimKind::WaitQueue, in_isr, callees);
+            }
             MirPrimNonBlockingOp::PingPongFlip {
                 target,
                 elem_ty,
@@ -1093,7 +1101,9 @@ impl<'a> ScanCtx<'a> {
             | MirStmt::EndInboxTurn
             | MirStmt::Break
             | MirStmt::Continue
-            | MirStmt::SetIrqSelector { .. } => {}
+            | MirStmt::SetIrqSelector { .. }
+            | MirStmt::BoundedForLatch
+            | MirStmt::ZeroTaskLocals => {}
             MirStmt::If {
                 cond,
                 then_body,
@@ -1203,72 +1213,97 @@ impl<'a> ScanCtx<'a> {
                 | MirYieldKind::DelayPoll { .. }
                 | MirYieldKind::ShareCheckpoint { .. }
                 | MirYieldKind::PollChild { .. } => {}
-                MirYieldKind::InboxRecv {
-                    target,
-                    elem_ty,
-                    cap,
-                    ..
-                }
-                | MirYieldKind::InboxSend {
-                    target,
-                    elem_ty,
-                    cap,
-                    ..
-                } => {
-                    let kind = MirPrimKind::Inbox {
-                        elem: Box::new(elem_ty.clone()),
-                        cap: *cap,
-                    };
-                    self.visit_prim_target(target, &kind, in_isr, callees);
-                }
-                MirYieldKind::SignalWait { target, .. } => {
-                    self.visit_prim_target(target, &MirPrimKind::Signal, in_isr, callees);
-                }
-                MirYieldKind::PingPongWaitChunk {
-                    target,
-                    elem_ty,
-                    cap,
-                    ..
-                } => {
-                    let kind = MirPrimKind::PingPong {
-                        elem: Box::new(elem_ty.clone()),
-                        cap: *cap,
-                    };
-                    self.visit_prim_target(target, &kind, in_isr, callees);
-                }
-                MirYieldKind::PoolAlloc {
-                    target,
-                    elem_ty,
-                    cap,
-                    ..
-                } => {
-                    let kind = MirPrimKind::Pool {
-                        elem: Box::new(elem_ty.clone()),
-                        cap: *cap,
-                    };
-                    self.visit_prim_target(target, &kind, in_isr, callees);
-                }
-                MirYieldKind::ByteRingWaitRead { target, cap, .. } => {
-                    let kind = MirPrimKind::ByteRing { cap: *cap };
-                    self.visit_prim_target(target, &kind, in_isr, callees);
-                }
-                MirYieldKind::InboxViewRecv { view, elem_ty, .. }
-                | MirYieldKind::InboxViewSend { view, elem_ty, .. } => {
-                    if in_isr {
-                        let vk = MirPrimViewKind::Inbox {
-                            elem: Box::new(elem_ty.clone()),
-                        };
-                        self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                MirYieldKind::Wait { arms, .. } => {
+                    for arm in arms {
+                        match &arm.op {
+                            MirWaitArmOp::InboxRecv {
+                                target,
+                                elem_ty,
+                                cap,
+                                ..
+                            }
+                            | MirWaitArmOp::InboxSend {
+                                target,
+                                elem_ty,
+                                cap,
+                                ..
+                            } => {
+                                let kind = MirPrimKind::Inbox {
+                                    elem: Box::new(elem_ty.clone()),
+                                    cap: *cap,
+                                };
+                                self.visit_prim_target(target, &kind, in_isr, callees);
+                            }
+                            MirWaitArmOp::SignalWait { target, .. } => {
+                                self.visit_prim_target(target, &MirPrimKind::Signal, in_isr, callees);
+                            }
+                            MirWaitArmOp::WaitQueueCommit { target, .. } => {
+                                self.visit_prim_target(target, &MirPrimKind::WaitQueue, in_isr, callees);
+                            }
+                            MirWaitArmOp::WatchWaitChange {
+                                target, elem_ty, ..
+                            } => {
+                                let kind = MirPrimKind::Watch {
+                                    elem: Box::new(elem_ty.clone()),
+                                };
+                                match target {
+                                    MirPrimTarget::Global(name) => {
+                                        self.acc.direct_watch_reads.insert(name.clone());
+                                    }
+                                    MirPrimTarget::PtrExpr(_) => {
+                                        self.acc.ptr_watch_read_elems.insert(elem_ty.clone());
+                                    }
+                                }
+                                self.visit_prim_target(target, &kind, in_isr, callees);
+                            }
+                            MirWaitArmOp::PingPongWaitChunk {
+                                target,
+                                elem_ty,
+                                cap,
+                                ..
+                            } => {
+                                let kind = MirPrimKind::PingPong {
+                                    elem: Box::new(elem_ty.clone()),
+                                    cap: *cap,
+                                };
+                                self.visit_prim_target(target, &kind, in_isr, callees);
+                            }
+                            MirWaitArmOp::PoolAlloc {
+                                target,
+                                elem_ty,
+                                cap,
+                                ..
+                            } => {
+                                let kind = MirPrimKind::Pool {
+                                    elem: Box::new(elem_ty.clone()),
+                                    cap: *cap,
+                                };
+                                self.visit_prim_target(target, &kind, in_isr, callees);
+                            }
+                            MirWaitArmOp::ByteRingWaitRead { target, cap, .. } => {
+                                let kind = MirPrimKind::ByteRing { cap: *cap };
+                                self.visit_prim_target(target, &kind, in_isr, callees);
+                            }
+                            MirWaitArmOp::InboxViewRecv { view, elem_ty, .. }
+                            | MirWaitArmOp::InboxViewSend { view, elem_ty, .. } => {
+                                if in_isr {
+                                    let vk = MirPrimViewKind::Inbox {
+                                        elem: Box::new(elem_ty.clone()),
+                                    };
+                                    self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
+                                }
+                                self.visit_expr(view, in_isr, callees);
+                            }
+                            MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                                if in_isr {
+                                    self.acc
+                                        .isr_contended_prim_mangles
+                                        .insert(MirPrimViewKind::ByteRing.mangle_name());
+                                }
+                                self.visit_expr(view, in_isr, callees);
+                            }
+                        }
                     }
-                    self.visit_expr(view, in_isr, callees);
-                }
-                MirYieldKind::ByteRingViewWaitRead { view, .. } => {
-                    if in_isr {
-                        self.acc
-                            .isr_contended_prim_mangles
-                            .insert(MirPrimViewKind::ByteRing.mangle_name());
-                    }
-                    self.visit_expr(view, in_isr, callees);
                 }
                 MirYieldKind::CallYielding { callee, args, .. } => {
                     callees.insert(callee.clone());
@@ -2419,12 +2454,14 @@ impl VarUsageInfo {
             }
             MirExprKind::PrimRead(op) => match op.as_ref() {
                 MirPrimReadOp::WatchRead { target, .. }
+                | MirPrimReadOp::WatchGen { target, .. }
                 | MirPrimReadOp::InboxTryRecv { target, .. }
                 | MirPrimReadOp::InboxLen { target, .. }
                 | MirPrimReadOp::InboxIsEmpty { target, .. }
                 | MirPrimReadOp::InboxIsFull { target, .. }
                 | MirPrimReadOp::SignalIsSet { target }
                 | MirPrimReadOp::SignalTryWait { target }
+                | MirPrimReadOp::WaitQueueWakeOne { target, .. }
                 | MirPrimReadOp::PingPongDmaBuf { target, .. }
                 | MirPrimReadOp::PingPongBaseAddr { target, .. }
                 | MirPrimReadOp::PoolTryAlloc { target, .. }
@@ -2517,6 +2554,9 @@ impl VarUsageInfo {
                 }
                 MirPrimNonBlockingOp::SignalNotify { target, .. }
                 | MirPrimNonBlockingOp::SignalClear { target }
+                | MirPrimNonBlockingOp::WaitQueuePrepare { target }
+                | MirPrimNonBlockingOp::WaitQueueCancel { target }
+                | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. }
                 | MirPrimNonBlockingOp::PingPongFlip { target, .. }
                 | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
                 | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
@@ -2564,7 +2604,9 @@ impl VarUsageInfo {
             | MirStmt::EndInboxTurn
             | MirStmt::Break
             | MirStmt::Continue
-            | MirStmt::SetIrqSelector { .. } => {}
+            | MirStmt::SetIrqSelector { .. }
+            | MirStmt::BoundedForLatch
+            | MirStmt::ZeroTaskLocals => {}
             MirStmt::If {
                 cond,
                 then_body,
@@ -2690,125 +2732,140 @@ impl VarUsageInfo {
                     self.yield_slot_vars.insert(*deadline_var);
                 }
                 MirYieldKind::ShareCheckpoint { .. } => {}
-                MirYieldKind::InboxRecv {
-                    target,
-                    timeout_deadline_var,
-                    dst_val,
-                    dst_res,
-                    ..
-                }
-                | MirYieldKind::ByteRingWaitRead {
-                    target,
-                    timeout_deadline_var,
-                    dst_val,
-                    dst_res,
-                    ..
-                } => {
-                    self.visit_prim_target(target);
-                    for v in [timeout_deadline_var, dst_val, dst_res].into_iter().flatten() {
-                        self.yield_slot_vars.insert(*v);
-                        self.record_write(*v);
+                MirYieldKind::Wait { arms, timer, .. } => {
+                    if let Some(t) = timer {
+                        self.yield_slot_vars.insert(t.deadline_var);
+                        if let Some(r) = t.timeout_err_res {
+                            self.yield_slot_vars.insert(r);
+                            self.record_write(r);
+                            self.result_vars.insert(r);
+                        }
+                        if let Some((lv, _)) = &t.release_lease_on_timeout {
+                            self.yield_slot_vars.insert(*lv);
+                        }
                     }
-                    if let Some(r) = dst_res {
-                        self.result_vars.insert(*r);
-                    }
-                }
-                MirYieldKind::InboxSend {
-                    target,
-                    val_var,
-                    timeout_deadline_var,
-                    dst_res,
-                    ..
-                } => {
-                    self.visit_prim_target(target);
-                    self.yield_slot_vars.insert(*val_var);
-                    if let Some(t) = timeout_deadline_var {
-                        self.yield_slot_vars.insert(*t);
-                    }
-                    if let Some(r) = dst_res {
-                        self.yield_slot_vars.insert(*r);
-                        self.record_write(*r);
-                        self.result_vars.insert(*r);
-                    }
-                }
-                MirYieldKind::SignalWait {
-                    target,
-                    timeout_deadline_var,
-                    dst_res,
-                    ..
-                } => {
-                    self.visit_prim_target(target);
-                    if let Some(t) = timeout_deadline_var {
-                        self.yield_slot_vars.insert(*t);
-                    }
-                    if let Some(r) = dst_res {
-                        self.yield_slot_vars.insert(*r);
-                        self.record_write(*r);
-                        self.result_vars.insert(*r);
-                    }
-                }
-                MirYieldKind::PingPongWaitChunk {
-                    target, dst_slice, ..
-                } => {
-                    self.visit_prim_target(target);
-                    self.yield_slot_vars.insert(*dst_slice);
-                    self.record_write(*dst_slice);
-                }
-                MirYieldKind::PoolAlloc {
-                    target,
-                    timeout_deadline_var,
-                    dst_val,
-                    dst_res,
-                    ..
-                } => {
-                    self.visit_prim_target(target);
-                    for v in [timeout_deadline_var, dst_val, dst_res].into_iter().flatten() {
-                        self.yield_slot_vars.insert(*v);
-                        self.record_write(*v);
-                    }
-                    if let Some(r) = dst_res {
-                        self.result_vars.insert(*r);
-                    }
-                }
-                MirYieldKind::InboxViewRecv {
-                    view,
-                    timeout_deadline_var,
-                    dst_val,
-                    dst_res,
-                    ..
-                }
-                | MirYieldKind::ByteRingViewWaitRead {
-                    view,
-                    timeout_deadline_var,
-                    dst_val,
-                    dst_res,
-                    ..
-                } => {
-                    self.visit_expr(view);
-                    for v in [timeout_deadline_var, dst_val, dst_res].into_iter().flatten() {
-                        self.yield_slot_vars.insert(*v);
-                        self.record_write(*v);
-                    }
-                    if let Some(r) = dst_res {
-                        self.result_vars.insert(*r);
-                    }
-                }
-                MirYieldKind::InboxViewSend {
-                    view,
-                    val_var,
-                    timeout_deadline_var,
-                    dst_res,
-                    ..
-                } => {
-                    self.visit_expr(view);
-                    self.yield_slot_vars.insert(*val_var);
-                    if let Some(t) = timeout_deadline_var {
-                        self.yield_slot_vars.insert(*t);
-                    }
-                    if let Some(r) = dst_res {
-                        self.yield_slot_vars.insert(*r);
-                        self.record_write(*r);
-                        self.result_vars.insert(*r);
+                    for arm in arms {
+                        match &arm.op {
+                            MirWaitArmOp::InboxRecv {
+                                target,
+                                dst_val,
+                                dst_res,
+                                ..
+                            }
+                            | MirWaitArmOp::ByteRingWaitRead {
+                                target,
+                                dst_val,
+                                dst_res,
+                                ..
+                            }
+                            | MirWaitArmOp::PoolAlloc {
+                                target,
+                                dst_val,
+                                dst_res,
+                                ..
+                            } => {
+                                self.visit_prim_target(target);
+                                for v in [dst_val, dst_res].into_iter().flatten() {
+                                    self.yield_slot_vars.insert(*v);
+                                    self.record_write(*v);
+                                }
+                                if let Some(r) = dst_res {
+                                    self.result_vars.insert(*r);
+                                }
+                            }
+                            MirWaitArmOp::WatchWaitChange {
+                                target,
+                                last_gen_var,
+                                seeded_var,
+                                dst_val,
+                                dst_res,
+                                ..
+                            } => {
+                                self.visit_prim_target(target);
+                                self.yield_slot_vars.insert(*last_gen_var);
+                                self.record_write(*last_gen_var);
+                                if let Some(sv) = seeded_var {
+                                    self.yield_slot_vars.insert(*sv);
+                                    self.record_write(*sv);
+                                }
+                                for v in [dst_val, dst_res].into_iter().flatten() {
+                                    self.yield_slot_vars.insert(*v);
+                                    self.record_write(*v);
+                                }
+                                if let Some(r) = dst_res {
+                                    self.result_vars.insert(*r);
+                                }
+                            }
+                            MirWaitArmOp::InboxSend {
+                                target,
+                                val_var,
+                                dst_res,
+                                ..
+                            } => {
+                                self.visit_prim_target(target);
+                                self.yield_slot_vars.insert(*val_var);
+                                if let Some(r) = dst_res {
+                                    self.yield_slot_vars.insert(*r);
+                                    self.record_write(*r);
+                                    self.result_vars.insert(*r);
+                                }
+                            }
+                            MirWaitArmOp::SignalWait {
+                                target, dst_res, ..
+                            }
+                            | MirWaitArmOp::WaitQueueCommit {
+                                target, dst_res, ..
+                            } => {
+                                self.visit_prim_target(target);
+                                if let Some(r) = dst_res {
+                                    self.yield_slot_vars.insert(*r);
+                                    self.record_write(*r);
+                                    self.result_vars.insert(*r);
+                                }
+                            }
+                            MirWaitArmOp::PingPongWaitChunk {
+                                target, dst_slice, ..
+                            } => {
+                                self.visit_prim_target(target);
+                                self.yield_slot_vars.insert(*dst_slice);
+                                self.record_write(*dst_slice);
+                            }
+                            MirWaitArmOp::InboxViewRecv {
+                                view,
+                                dst_val,
+                                dst_res,
+                                ..
+                            }
+                            | MirWaitArmOp::ByteRingViewWaitRead {
+                                view,
+                                dst_val,
+                                dst_res,
+                                ..
+                            } => {
+                                self.visit_expr(view);
+                                for v in [dst_val, dst_res].into_iter().flatten() {
+                                    self.yield_slot_vars.insert(*v);
+                                    self.record_write(*v);
+                                }
+                                if let Some(r) = dst_res {
+                                    self.result_vars.insert(*r);
+                                }
+                            }
+                            MirWaitArmOp::InboxViewSend {
+                                view,
+                                val_var,
+                                dst_res,
+                                ..
+                            } => {
+                                self.visit_expr(view);
+                                self.yield_slot_vars.insert(*val_var);
+                                if let Some(r) = dst_res {
+                                    self.yield_slot_vars.insert(*r);
+                                    self.record_write(*r);
+                                    self.result_vars.insert(*r);
+                                }
+                            }
+                        }
                     }
                 }
                 MirYieldKind::CallYielding { args, dst, .. } => {
@@ -2933,12 +2990,14 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
         }
         MirExprKind::PrimRead(op) => match op.as_ref() {
             MirPrimReadOp::WatchRead { target: t, .. }
+            | MirPrimReadOp::WatchGen { target: t, .. }
             | MirPrimReadOp::InboxTryRecv { target: t, .. }
             | MirPrimReadOp::InboxLen { target: t, .. }
             | MirPrimReadOp::InboxIsEmpty { target: t, .. }
             | MirPrimReadOp::InboxIsFull { target: t, .. }
             | MirPrimReadOp::SignalIsSet { target: t }
             | MirPrimReadOp::SignalTryWait { target: t }
+            | MirPrimReadOp::WaitQueueWakeOne { target: t, .. }
             | MirPrimReadOp::PingPongDmaBuf { target: t, .. }
             | MirPrimReadOp::PingPongBaseAddr { target: t, .. }
             | MirPrimReadOp::PoolTryAlloc { target: t, .. }
@@ -3052,6 +3111,9 @@ fn stmt_reads_var(stmt: &MirStmt, target: VarId) -> bool {
             } => prim_target_reads_var(t, target) || expr_reads_var(value, target),
             MirPrimNonBlockingOp::SignalNotify { target: t, .. }
             | MirPrimNonBlockingOp::SignalClear { target: t }
+            | MirPrimNonBlockingOp::WaitQueuePrepare { target: t }
+            | MirPrimNonBlockingOp::WaitQueueCancel { target: t }
+            | MirPrimNonBlockingOp::WaitQueueWakeAll { target: t, .. }
             | MirPrimNonBlockingOp::PingPongFlip { target: t, .. }
             | MirPrimNonBlockingOp::PingPongSetActive { target: t, .. }
             | MirPrimNonBlockingOp::ByteRingClear { target: t, .. } => {
@@ -3091,7 +3153,9 @@ fn stmt_reads_var(stmt: &MirStmt, target: VarId) -> bool {
         | MirStmt::EndInboxTurn
         | MirStmt::Break
         | MirStmt::Continue
-        | MirStmt::SetIrqSelector { .. } => false,
+        | MirStmt::SetIrqSelector { .. }
+        | MirStmt::BoundedForLatch
+        | MirStmt::ZeroTaskLocals => false,
         MirStmt::If {
             cond,
             then_body,
@@ -3271,12 +3335,14 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
         }
         MirExprKind::PrimRead(op) => match op.as_mut() {
             MirPrimReadOp::WatchRead { target: t, .. }
+            | MirPrimReadOp::WatchGen { target: t, .. }
             | MirPrimReadOp::InboxTryRecv { target: t, .. }
             | MirPrimReadOp::InboxLen { target: t, .. }
             | MirPrimReadOp::InboxIsEmpty { target: t, .. }
             | MirPrimReadOp::InboxIsFull { target: t, .. }
             | MirPrimReadOp::SignalIsSet { target: t }
             | MirPrimReadOp::SignalTryWait { target: t }
+            | MirPrimReadOp::WaitQueueWakeOne { target: t, .. }
             | MirPrimReadOp::PingPongDmaBuf { target: t, .. }
             | MirPrimReadOp::PingPongBaseAddr { target: t, .. }
             | MirPrimReadOp::PoolTryAlloc { target: t, .. }
@@ -3386,6 +3452,9 @@ fn subst_stmt(stmt: &mut MirStmt, target: VarId, repl: &MirExpr) {
             }
             MirPrimNonBlockingOp::SignalNotify { target: t, .. }
             | MirPrimNonBlockingOp::SignalClear { target: t }
+            | MirPrimNonBlockingOp::WaitQueuePrepare { target: t }
+            | MirPrimNonBlockingOp::WaitQueueCancel { target: t }
+            | MirPrimNonBlockingOp::WaitQueueWakeAll { target: t, .. }
             | MirPrimNonBlockingOp::PingPongFlip { target: t, .. }
             | MirPrimNonBlockingOp::PingPongSetActive { target: t, .. }
             | MirPrimNonBlockingOp::ByteRingClear { target: t, .. } => {
@@ -3434,7 +3503,9 @@ fn subst_stmt(stmt: &mut MirStmt, target: VarId, repl: &MirExpr) {
         | MirStmt::EndInboxTurn
         | MirStmt::Break
         | MirStmt::Continue
-        | MirStmt::SetIrqSelector { .. } => {}
+        | MirStmt::SetIrqSelector { .. }
+        | MirStmt::BoundedForLatch
+        | MirStmt::ZeroTaskLocals => {}
         MirStmt::If {
             cond,
             then_body,
@@ -3539,17 +3610,27 @@ fn subst_terminator(term: &mut MirTerminator, target: VarId, repl: &MirExpr) {
             | MirYieldKind::DelayPoll { .. }
             | MirYieldKind::ShareCheckpoint { .. }
             | MirYieldKind::PollChild { .. } => {}
-            MirYieldKind::InboxRecv { target: t, .. }
-            | MirYieldKind::InboxSend { target: t, .. }
-            | MirYieldKind::SignalWait { target: t, .. }
-            | MirYieldKind::PingPongWaitChunk { target: t, .. }
-            | MirYieldKind::PoolAlloc { target: t, .. }
-            | MirYieldKind::ByteRingWaitRead { target: t, .. } => {
-                subst_prim_target(t, target, repl);
+            MirYieldKind::Wait { arms, .. } => {
+                for arm in arms {
+                    match &mut arm.op {
+                        MirWaitArmOp::InboxRecv { target: t, .. }
+                        | MirWaitArmOp::InboxSend { target: t, .. }
+                        | MirWaitArmOp::SignalWait { target: t, .. }
+                        | MirWaitArmOp::WaitQueueCommit { target: t, .. }
+                        | MirWaitArmOp::WatchWaitChange { target: t, .. }
+                        | MirWaitArmOp::PingPongWaitChunk { target: t, .. }
+                        | MirWaitArmOp::PoolAlloc { target: t, .. }
+                        | MirWaitArmOp::ByteRingWaitRead { target: t, .. } => {
+                            subst_prim_target(t, target, repl);
+                        }
+                        MirWaitArmOp::InboxViewRecv { view, .. }
+                        | MirWaitArmOp::InboxViewSend { view, .. }
+                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                            subst_expr(view, target, repl);
+                        }
+                    }
+                }
             }
-            MirYieldKind::InboxViewRecv { view, .. }
-            | MirYieldKind::InboxViewSend { view, .. }
-            | MirYieldKind::ByteRingViewWaitRead { view, .. } => subst_expr(view, target, repl),
             MirYieldKind::CallYielding { args, .. } => {
                 for a in args {
                     subst_expr(a, target, repl);
@@ -3646,12 +3727,14 @@ fn collect_fn_addrs_and_calls_expr<'a>(
         }
         MirExprKind::PrimRead(op) => match op.as_ref() {
             MirPrimReadOp::WatchRead { target, .. }
+            | MirPrimReadOp::WatchGen { target, .. }
             | MirPrimReadOp::InboxTryRecv { target, .. }
             | MirPrimReadOp::InboxLen { target, .. }
             | MirPrimReadOp::InboxIsEmpty { target, .. }
             | MirPrimReadOp::InboxIsFull { target, .. }
             | MirPrimReadOp::SignalIsSet { target }
             | MirPrimReadOp::SignalTryWait { target }
+            | MirPrimReadOp::WaitQueueWakeOne { target, .. }
             | MirPrimReadOp::PingPongDmaBuf { target, .. }
             | MirPrimReadOp::PingPongBaseAddr { target, .. }
             | MirPrimReadOp::PoolTryAlloc { target, .. }
@@ -3819,6 +3902,9 @@ fn collect_fn_addrs_and_calls_stmt(
             }
             MirPrimNonBlockingOp::SignalNotify { target, .. }
             | MirPrimNonBlockingOp::SignalClear { target }
+            | MirPrimNonBlockingOp::WaitQueuePrepare { target }
+            | MirPrimNonBlockingOp::WaitQueueCancel { target }
+            | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. }
             | MirPrimNonBlockingOp::PingPongFlip { target, .. }
             | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
             | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
@@ -3949,7 +4035,9 @@ fn collect_fn_addrs_and_calls_stmt(
         | MirStmt::EndInboxTurn
         | MirStmt::Break
         | MirStmt::Continue
-        | MirStmt::SetIrqSelector { .. } => {}
+        | MirStmt::SetIrqSelector { .. }
+        | MirStmt::BoundedForLatch
+        | MirStmt::ZeroTaskLocals => {}
     }
 }
 
@@ -3984,20 +4072,28 @@ fn collect_fn_addrs_and_calls_term(
             | MirYieldKind::DelayPoll { .. }
             | MirYieldKind::ShareCheckpoint { .. }
             | MirYieldKind::PollChild { .. } => {}
-            MirYieldKind::InboxRecv { target, .. }
-            | MirYieldKind::InboxSend { target, .. }
-            | MirYieldKind::SignalWait { target, .. }
-            | MirYieldKind::PingPongWaitChunk { target, .. }
-            | MirYieldKind::PoolAlloc { target, .. }
-            | MirYieldKind::ByteRingWaitRead { target, .. } => {
-                if let MirPrimTarget::PtrExpr(pe) = target {
-                    collect_fn_addrs_and_calls_expr(pe, addr_taken_fns, call_sites);
+            MirYieldKind::Wait { arms, .. } => {
+                for arm in arms {
+                    match &arm.op {
+                        MirWaitArmOp::InboxRecv { target, .. }
+                        | MirWaitArmOp::InboxSend { target, .. }
+                        | MirWaitArmOp::SignalWait { target, .. }
+                        | MirWaitArmOp::WaitQueueCommit { target, .. }
+                        | MirWaitArmOp::WatchWaitChange { target, .. }
+                        | MirWaitArmOp::PingPongWaitChunk { target, .. }
+                        | MirWaitArmOp::PoolAlloc { target, .. }
+                        | MirWaitArmOp::ByteRingWaitRead { target, .. } => {
+                            if let MirPrimTarget::PtrExpr(pe) = target {
+                                collect_fn_addrs_and_calls_expr(pe, addr_taken_fns, call_sites);
+                            }
+                        }
+                        MirWaitArmOp::InboxViewRecv { view, .. }
+                        | MirWaitArmOp::InboxViewSend { view, .. }
+                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                            collect_fn_addrs_and_calls_expr(view, addr_taken_fns, call_sites);
+                        }
+                    }
                 }
-            }
-            MirYieldKind::InboxViewRecv { view, .. }
-            | MirYieldKind::InboxViewSend { view, .. }
-            | MirYieldKind::ByteRingViewWaitRead { view, .. } => {
-                collect_fn_addrs_and_calls_expr(view, addr_taken_fns, call_sites);
             }
             MirYieldKind::CallYielding { callee, args, .. } => {
                 call_sites
@@ -5403,9 +5499,9 @@ mod tests {
                 "dead_ptr_pub_only".to_string()
             ])
         );
-        // `dead_pub_only` (`watch<u32>`, 8 B) is stripped; `dead_ptr_pub_only` has `&` taken so its 16 B `.bss` stays.
-        assert_eq!(report.dead_watch_bytes_saved_32, 8);
-        assert_eq!(report.dead_watch_bytes_saved_64, 8);
+        // `dead_pub_only` (`watch<u32>`, 12 B) is stripped; `dead_ptr_pub_only` has `&` taken so its `.bss` stays.
+        assert_eq!(report.dead_watch_bytes_saved_32, 12);
+        assert_eq!(report.dead_watch_bytes_saved_64, 12);
         assert!(report.isr_contended_globals.is_empty());
         assert!(report.isr_contended_prim_mangles.is_empty());
         assert_eq!(
@@ -6115,8 +6211,8 @@ mod tests {
             report.elided_globals,
             BTreeSet::from(["fmt_live_w".to_string()])
         );
-        assert_eq!(report.dead_watch_bytes_saved_32, 8);
-        assert_eq!(report.dead_watch_bytes_saved_64, 8);
+        assert_eq!(report.dead_watch_bytes_saved_32, 12);
+        assert_eq!(report.dead_watch_bytes_saved_64, 12);
 
         strip_dead_watch_publishes(&mut mir, &report);
         match &mir.functions[0].body {

@@ -1216,3 +1216,123 @@ fn meta_all_34_e_codes_have_at_least_two_independent_adversarial_tests() {
         under_covered.join("\n")
     );
 }
+
+#[test]
+fn wait_block_arm_validation_scoping_e0011_e0034_and_divergence() {
+    // 1. E0011 stale byte_ring lease inside wait arm
+    expect_err(
+        r#"
+byte_ring<16> rx;
+task t() {
+    loop {
+        wait {
+            []u8 buf = rx.wait_read() => {
+                rx.consume(buf.len);
+                u8 _stale = buf[0];
+            }
+            timeout 10ms => {}
+        }
+    }
+}
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 2. E0011 stale ping_pong DMA slice inside wait arm
+    expect_err(
+        r#"
+@dma_safe ping_pong<u8, 8> pp;
+task t() {
+    loop {
+        wait {
+            []u8 c0 = pp.wait_chunk() => {
+                []u8 c1 = pp.wait_chunk();
+                u8 _stale = c0[0];
+            }
+        }
+    }
+}
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::StaleDmaLease,
+    );
+
+    // 3. E0034 unconsumed linear Lease<T> inside wait arm
+    expect_err(
+        r#"
+pool<u32, 2> p;
+task t() {
+    loop {
+        wait {
+            Lease<u32> l = p.alloc() => {
+                *u32 ptr = l.get();
+                *ptr = 7u32;
+            }
+        }
+    }
+}
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::LinearLeaseViolation,
+    );
+
+    // 4. Reject helper fn calls, per-arm timeout:, empty wait {}, void binding, critical/isr/noyield
+    expect_err(
+        r#"
+signal s;
+fn helper() { s.wait(); }
+task t() { loop { wait { helper() => {} } } }
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::InvalidOperation,
+    );
+    expect_err(
+        r#"
+inbox<u32, 4> q;
+task t() { loop { wait { u32 x = q.recv(timeout: 5ms) => {} } } }
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::InvalidOperation,
+    );
+    expect_err(
+        r#"
+task t() { loop { wait {} } }
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::InvalidOperation,
+    );
+    expect_err(
+        r#"
+signal s;
+task t() { loop { wait { u32 x = s.wait() => {} } } }
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::TypeMismatch,
+    );
+    expect_err(
+        r#"
+signal s;
+task t() { loop { critical { wait { s.wait() => {} } } } }
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::YieldInCritical,
+    );
+    expect_err(
+        r#"
+signal s;
+task t() { loop { noyield { wait { s.wait() => {} } } } }
+fn main() { spawn t(); }
+"#,
+        DiagnosticKind::YieldInNoYield,
+    );
+    expect_err(
+        r#"
+signal s;
+irq Q = 1;
+isr h() { wait { s.wait() => {} } }
+fn main() { Q.attach(h); }
+"#,
+        DiagnosticKind::YieldInIsr,
+    );
+}

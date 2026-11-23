@@ -18,8 +18,8 @@ pub(super) use zev_mir::{
     MirFunction, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
     MirMmioInstance, MirMmioLayout, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
     MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirStmt, MirStruct, MirSwitchPattern,
-    MirSysQuery, MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind, VarId,
-    VarRole,
+    MirSysQuery, MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm,
+    MirWaitArmOp, MirWaitTimer, MirYieldKind, VarId, VarRole,
 };
 
 pub(super) use crate::arm_cortex_m::{NvicMap, build_nvic_map, emit_arm_cortex_m_startup_ir, sanitize_ident};

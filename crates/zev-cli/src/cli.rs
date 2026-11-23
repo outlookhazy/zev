@@ -17,11 +17,6 @@ pub enum Command {
         chip: Option<String>,
         opt_level: Option<String>,
     },
-    EmitC {
-        files: Vec<PathBuf>,
-        include_dirs: Vec<PathBuf>,
-        output: Option<PathBuf>,
-    },
     Run {
         files: Vec<PathBuf>,
         include_dirs: Vec<PathBuf>,
@@ -133,7 +128,7 @@ pub enum Command {
 }
 
 pub const HELP_TEXT: &str = "\
-zevc 0.1.0 — Zev Bare-Metal Cooperative Language-OS Compiler (C99 + LLVM/ARM/RISC-V/AVR/RP2040)
+zevc 0.1.0 — Zev Bare-Metal Cooperative Language-OS Compiler (LLVM/ARM/RISC-V/AVR/RP2040)
 
 USAGE:
     zevc <COMMAND> [OPTIONS] [FILES...]
@@ -149,8 +144,7 @@ COMMANDS:
                                             Build and flash firmware using board TOML `flash_cmd` (`zev.toml` aware)
     ram [--board <b> | --chip <c> | --target <t>] [OPT] [-I <dir>] <files...>
                                             Print static SRAM budget (+ optional HW stack proof)
-    emit-c [-I <dir>] <files...> [-o <out>] Emit freestanding C99 source + synthesized cooperative kernel
-    run [-I <dir>] <files...> [OPTIONS]     Compile emitted C99 via clang and run deterministic host simulation
+    run [-I <dir>] <files...> [OPTIONS]     Compile host LLVM 23 IR via clang and run deterministic host simulation
     emit-llvm [--board <b> | --chip <c> | --target <t>] [OPT] <files...> [-o <out.ll>]
                                             Emit LLVM 23 IR (raw by default, or optimized via opt w/ -O1..-Oz)
     build-elf / run-qemu / build-esp32c6 / flash-esp32c6 / build-avr / flash-avr /
@@ -158,7 +152,7 @@ COMMANDS:
                                             Legacy target-specific aliases for `build --board` / `flash --board`
     help                                    Show this help message
 
-MODULE / INCLUDE OPTIONS (check, ram, emit-c, run, emit-llvm, build, flash, build-*, flash-*, run-qemu):
+MODULE / INCLUDE OPTIONS (check, ram, run, emit-llvm, build, flash, build-*, flash-*, run-qemu):
     -I <dir> | --include <dir>              Add a module search root directory for `import` resolution (repeatable)
 
 CHECK & TARGET OPTIONS:
@@ -174,7 +168,7 @@ LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build, flash, build-*, flash
     --target <cortex-m3|esp32c6|avr|nano-every|rp2040|host> Legacy target alias (`ram`: MCUs; `emit-llvm`: +host)
 
 RUN & RUN-QEMU OPTIONS:
-    --sanitize                              Compile C99 host binary with -fsanitize=address,undefined (`run` only)
+    --sanitize                              Compile host simulation binary with -fsanitize=address,undefined (`run` only)
     --max-ticks <N>                         Bound simulation / QEMU execution to N millisecond ticks
     -- <args...>                            Forward trailing arguments to compiled host binary (`run` only)
 ";
@@ -216,14 +210,6 @@ where
         "ram" => parse_ram(&raw[1..]),
         "build" => parse_build(&raw[1..]),
         "flash" => parse_flash(&raw[1..]),
-        "emit-c" => match parse_files_with_output(&raw[1..], "emit-c")? {
-            Some((files, include_dirs, output)) => Ok(Command::EmitC {
-                files,
-                include_dirs,
-                output,
-            }),
-            None => Ok(Command::Help),
-        },
         "emit-llvm" => parse_emit_llvm(&raw[1..]),
         "build-elf" => match parse_files_with_output_and_opt(&raw[1..], "build-elf")? {
             Some((files, include_dirs, opt_level, output)) => Ok(Command::BuildElf {
@@ -321,7 +307,7 @@ where
         },
         "run" => parse_run(&raw[1..]),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `emit-c`, `run`, `emit-llvm`, `build`, `flash`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, `flash-nano-every`, `build-rp2040`, or `flash-rp2040`; try `zevc --help`)"
+            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `run`, `emit-llvm`, `build`, `flash`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, `flash-nano-every`, `build-rp2040`, or `flash-rp2040`; try `zevc --help`)"
         )),
     }
 }
@@ -588,50 +574,6 @@ fn parse_ram(args: &[String]) -> Result<Command, String> {
         chip,
         opt_level,
     })
-}
-
-fn parse_files_with_output(
-    args: &[String],
-    subcmd: &str,
-) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>, Option<PathBuf>)>, String> {
-    let mut files = Vec::new();
-    let mut include_dirs = Vec::new();
-    let mut output: Option<PathBuf> = None;
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, subcmd)? {
-            i += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(None),
-            "-o" | "--output" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err(format!("`-o` requires an output file path for `zevc {subcmd}`"));
-                }
-                output = Some(PathBuf::from(&args[i]));
-            }
-            _ if arg.starts_with("-o=") => {
-                output = Some(PathBuf::from(&arg[3..]));
-            }
-            _ if arg.starts_with("--output=") => {
-                output = Some(PathBuf::from(&arg[9..]));
-            }
-            _ if arg.starts_with('-') => {
-                return Err(format!("unexpected option `{arg}` for `zevc {subcmd}`"));
-            }
-            _ => files.push(PathBuf::from(arg)),
-        }
-        i += 1;
-    }
-    if files.is_empty() {
-        return Err(format!(
-            "`zevc {subcmd}` requires at least one `.zev` input file"
-        ));
-    }
-    Ok(Some((files, include_dirs, output)))
 }
 
 fn parse_files_with_output_and_opt(
@@ -1270,17 +1212,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_emit_c_and_llvm_and_elf_and_esp32c6() {
-        let cmd_c = parse_args(["emit-c", "a.zev", "b.zev", "-o", "out.c"]).unwrap();
-        assert_eq!(
-            cmd_c,
-            Command::EmitC {
-                files: vec![PathBuf::from("a.zev"), PathBuf::from("b.zev")],
-                include_dirs: vec![],
-                output: Some(PathBuf::from("out.c")),
-            }
-        );
-
+    fn parses_llvm_and_elf_and_esp32c6() {
         let cmd_ll_raw =
             parse_args(["emit-llvm", "examples/esp32c6_demo.zev", "-o", "out.ll"]).unwrap();
         assert_eq!(
@@ -1543,18 +1475,6 @@ mod tests {
                 board: None,
                 chip: None,
                 opt_level: None,
-            }
-        );
-
-        let mut emit_c_args = vec!["emit-c"];
-        emit_c_args.extend_from_slice(&include_flags);
-        emit_c_args.extend_from_slice(&["app.zev", "-o", "app.c"]);
-        assert_eq!(
-            parse_args(emit_c_args).unwrap(),
-            Command::EmitC {
-                files: vec![PathBuf::from("app.zev")],
-                include_dirs: expected_dirs.clone(),
-                output: Some(PathBuf::from("app.c")),
             }
         );
 
@@ -1892,7 +1812,7 @@ mod tests {
         assert!(parse_args(["check"]).is_err());
         assert!(parse_args(["check", "--json"]).is_err());
         assert!(parse_args(["ram"]).is_err());
-        assert!(parse_args(["emit-c", "-o", "foo.c"]).is_err());
+        assert!(parse_args(["emit-c"]).is_err());
         assert!(parse_args(["emit-llvm", "-o", "foo.ll"]).is_err());
         assert!(parse_args(["build-elf", "-o", "foo.elf"]).is_err());
         assert!(parse_args(["run-qemu"]).is_err());

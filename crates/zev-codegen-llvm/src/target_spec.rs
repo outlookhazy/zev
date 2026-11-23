@@ -184,7 +184,7 @@ impl TargetSpec {
             has_vtor: false,
             has_fpu: false,
             iram_in_data: false,
-            allow_sleep_deep: true,
+            allow_sleep_deep: false,
             semihosting: false,
             hal_dir: None,
             board_module: None,
@@ -352,7 +352,7 @@ impl TargetSpec {
         let has_vtor = cdoc.opt_bool("chip", "has_vtor")?.unwrap_or(false);
         let has_fpu = cdoc.opt_bool("chip", "has_fpu")?.unwrap_or(false);
         let iram_in_data = cdoc.opt_bool("chip", "iram_in_data")?.unwrap_or(false);
-        let allow_sleep_deep = cdoc.opt_bool("chip", "allow_sleep_deep")?.unwrap_or(true);
+        let allow_sleep_deep = cdoc.opt_bool("chip", "allow_sleep_deep")?.unwrap_or(false);
         let mut semihosting = cdoc.opt_bool("chip", "semihosting")?.unwrap_or(false);
         let mut hal_dir = cdoc.opt_str("chip", "hal_dir")?;
 

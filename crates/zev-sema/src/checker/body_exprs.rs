@@ -3042,6 +3042,46 @@ impl<'a> BodyChecker<'a> {
                 ExprVal::scalar(Ty::void(), span)
             }
 
+            Some(SysMethod::FuzzIrqs) => {
+                if args.len() != 2 {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "'sys.fuzz_irqs(u32 seed, u32 irq_mask)' expects 2 arguments, found {}",
+                            args.len()
+                        ),
+                    ));
+                    for a in args {
+                        let _ = self.check_expr_infallible(&a.value);
+                    }
+                } else {
+                    let s_val = self.check_expr_infallible(&args[0].value);
+                    if !s_val.ty.is_assignable_to(&Ty::u32()) && !s_val.ty.is_error() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            args[0].span,
+                            format!(
+                                "'sys.fuzz_irqs' seed argument expects `u32`, found '{}'",
+                                s_val.ty
+                            ),
+                        ));
+                    }
+                    let m_val = self.check_expr_infallible(&args[1].value);
+                    if !m_val.ty.is_assignable_to(&Ty::u32()) && !m_val.ty.is_error() {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            args[1].span,
+                            format!(
+                                "'sys.fuzz_irqs' irq_mask argument expects `u32`, found '{}'",
+                                m_val.ty
+                            ),
+                        ));
+                    }
+                }
+                ExprVal::scalar(Ty::void(), span)
+            }
+
             Some(SysMethod::Exit) => {
                 if args.len() != 1 {
                     self.sema.emit(Diagnostic::new(
@@ -3400,6 +3440,112 @@ impl<'a> BodyChecker<'a> {
                 "try_wait" | "is_set" => {
                     self.expect_positional_arity(m, &pos_vals, 0, span);
                     ExprVal::scalar(Ty::bool(), span)
+                }
+                _ => self.unknown_prim_method(prim, method, span),
+            },
+
+            ResolvedOsPrimitive::WaitQueue => match m {
+                "prepare_wait" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout || has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "'wait_queue.prepare_wait()' does not accept 'timeout:' or 'boost:' arguments",
+                        ));
+                    }
+                    if self.in_isr() {
+                        let isr_name = self.display_caller_name().to_string();
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::YieldInIsr,
+                            span,
+                            format!(
+                                "cannot call '{}.prepare_wait()' inside ISR '{}'",
+                                source_key, isr_name
+                            ),
+                        ));
+                    } else if !self.in_critical() {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                span,
+                                "'wait_queue.prepare_wait()' must be called inside a 'critical { ... }' block alongside the condition check",
+                            )
+                            .with_note("arm the waiter bit inside `critical { ... }` while testing the condition so an ISR wake between check and `commit_wait()` cannot be lost"),
+                        );
+                    }
+                    ExprVal::scalar(Ty::void(), span)
+                }
+                "cancel_wait" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout || has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "'wait_queue.cancel_wait()' does not accept 'timeout:' or 'boost:' arguments",
+                        ));
+                    }
+                    if self.in_isr() {
+                        let isr_name = self.display_caller_name().to_string();
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::YieldInIsr,
+                            span,
+                            format!(
+                                "cannot call '{}.cancel_wait()' inside ISR '{}'",
+                                source_key, isr_name
+                            ),
+                        ));
+                    }
+                    ExprVal::scalar(Ty::void(), span)
+                }
+                "commit_wait" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "'wait_queue.commit_wait()' does not accept 'boost:'",
+                        ));
+                    }
+                    self.record_direct_yield(
+                        span,
+                        FnEffect::HardBlocking,
+                        &format!("{}.commit_wait()", source_key),
+                    );
+                    ExprVal {
+                        ty: Ty::void(),
+                        error_spec: if has_timeout {
+                            ResolvedErrorSpec::Untyped
+                        } else {
+                            ResolvedErrorSpec::None
+                        },
+                        prov: Provenance::pure_static(),
+                        endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
+                        span,
+                    }
+                }
+                "wake_one" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "'wait_queue.wake_one()' does not accept 'timeout:'",
+                        ));
+                    }
+                    ExprVal::scalar(Ty::bool(), span)
+                }
+                "wake_all" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "'wait_queue.wake_all()' does not accept 'timeout:'",
+                        ));
+                    }
+                    ExprVal::scalar(Ty::void(), span)
                 }
                 _ => self.unknown_prim_method(prim, method, span),
             },

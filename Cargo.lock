@@ -11,18 +11,7 @@ name = "zev-cli"
 version = "0.1.0"
 dependencies = [
  "zev-ast",
- "zev-codegen-c",
  "zev-codegen-llvm",
- "zev-mir",
- "zev-parser",
- "zev-sema",
-]
-
-[[package]]
-name = "zev-codegen-c"
-version = "0.1.0"
-dependencies = [
- "zev-ast",
  "zev-mir",
  "zev-parser",
  "zev-sema",

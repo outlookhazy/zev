@@ -53,7 +53,7 @@ u16 parse_setpoint([]u8 buf) error ParseErr {
 }
 
 // ── Reusable Task Blueprints (do nothing until spawned; 100% static RAM) ────
-task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
+task motor_control(*watch<u16> target_rpm, u8 pwm_ch) {
     i32 integral = 0;                                  // Persists across yields in static frame
 
     loop every 1ms {                                   // Drift-free periodic deadline
@@ -67,7 +67,7 @@ task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
     }
 }
 
-task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
+task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
     loop {
         []u8 half = rx_dma.wait_chunk();               // Yields; compiler prevents DMA buffer clash
 

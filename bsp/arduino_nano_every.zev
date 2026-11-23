@@ -10,7 +10,9 @@
 import chip.atmega4809 as hw;
 
 pub fn console_putc(u8 c) {
-    while ((hw.USART3.status & hw.BIT_USART_DREIF) == 0) {}
+    noyield {
+        while ((hw.USART3.status & hw.BIT_USART_DREIF) == 0) {}
+    }
     hw.USART3.txd_l = c;
 }
 

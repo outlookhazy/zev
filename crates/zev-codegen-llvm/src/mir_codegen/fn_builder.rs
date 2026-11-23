@@ -164,6 +164,34 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         format!("%v_{}", vid.0)
     }
 
+    pub(super) fn emit_zero_task_locals(&mut self) {
+        let vars_snapshot = self.vars.clone();
+        for v in &vars_snapshot {
+            if v.role == VarRole::Param
+                || v.role == VarRole::IsrState
+                || self.isr_state_ptrs.contains_key(&v.id)
+                || v.ty.is_void()
+            {
+                continue;
+            }
+            let vp = self.var_ptr(v.id);
+            let lty = self.ctx.llvm_ty(&v.ty);
+            self.emit_line(format!("store {lty} zeroinitializer, ptr {vp}, align 1"));
+        }
+        if let Some(coro) = self.coroutine.clone() {
+            for &(gep_idx, _) in coro.union_group_gep.values() {
+                if let Some(fty) = coro.field_llvm_tys.get(gep_idx) {
+                    let up = self.next_tmp();
+                    self.emit_line(format!(
+                        "{up} = getelementptr inbounds {}, ptr %__frame, i32 0, i32 {gep_idx}",
+                        coro.llvm_name
+                    ));
+                    self.emit_line(format!("store {fty} zeroinitializer, ptr {up}, align 1"));
+                }
+            }
+        }
+    }
+
     pub(super) fn coerce(&mut self, val: SsaVal, dst_ty: &str, signed: bool) -> SsaVal {
         if val.ty == dst_ty {
             return val;
@@ -308,16 +336,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let lbl = format!("bb_{}", b.id.0);
             self.start_block(&lbl);
 
-            // On `restart;` back into `bb_0`, zero hoisted non-Param locals while keeping `Param` fields intact!
+            // On `restart;` back into `bb_0`, zero non-Param locals and child frames while keeping `Param` fields intact!
             if b.id.0 == entry_bb && entry_is_restart_target {
-                let vars_snapshot = self.vars.clone();
-                for v in &vars_snapshot {
-                    if v.hoisted && v.role != VarRole::Param {
-                        let vp = self.var_ptr(v.id);
-                        let lty = self.ctx.llvm_ty(&v.ty);
-                        self.emit_line(format!("store {lty} zeroinitializer, ptr {vp}, align 4"));
-                    }
-                }
+                self.emit_zero_task_locals();
             }
 
             // Resync while-sleeping overruns at `loop every` body entry (`wdiff >= eff_p`)
@@ -381,6 +402,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     }
 
     pub(super) fn park_task_deadline(&mut self, wake_tick_val: &SsaVal) {
+        let call_kw = self.call_kw();
         let wt = self.coerce(wake_tick_val.clone(), "i32", false);
         let is_null = self.next_tmp();
         let park_lbl = self.next_label("park_dl");
@@ -388,6 +410,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.emit_line(format!("{is_null} = icmp eq ptr %__task, null"));
         self.emit_term(format!("br i1 {is_null}, label %{after_lbl}, label %{park_lbl}"));
         self.start_block(&park_lbl);
+        let pm = self.next_tmp();
+        self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
         let st_p = self.next_tmp();
         let wt_p = self.next_tmp();
         let ht_p = self.next_tmp();
@@ -400,36 +424,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.emit_line(format!("store i8 0, ptr {ht_p}, align 1"));
         self.emit_line(format!("store i32 {}, ptr {wt_p}, align 4", wt.repr));
         self.emit_line(format!("store ptr null, ptr {wo_p}, align 4"));
-        self.emit_term(format!("br label %{after_lbl}"));
-        self.start_block(&after_lbl);
-    }
-
-    pub(super) fn park_task_prim(&mut self, prim_ptr: &str, timeout_tick: Option<&SsaVal>) {
-        let call_kw = self.call_kw();
-        let is_null = self.next_tmp();
-        let park_lbl = self.next_label("park_prim");
-        let after_lbl = self.next_label("after_prim");
-        self.emit_line(format!("{is_null} = icmp eq ptr %__task, null"));
-        self.emit_term(format!("br i1 {is_null}, label %{after_lbl}, label %{park_lbl}"));
-        self.start_block(&park_lbl);
-        self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
-        let st_p = self.next_tmp();
-        let ht_p = self.next_tmp();
-        let wt_p = self.next_tmp();
-        let wo_p = self.next_tmp();
-        self.emit_line(format!("{st_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 2"));
-        self.emit_line(format!("{ht_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 7"));
-        self.emit_line(format!("{wt_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 11"));
-        self.emit_line(format!("{wo_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 12"));
-        self.emit_line(format!("store i8 3, ptr {st_p}, align 1"));
-        self.emit_line(format!("store ptr {prim_ptr}, ptr {wo_p}, align 4"));
-        if let Some(dl) = timeout_tick {
-            let wt = self.coerce(dl.clone(), "i32", false);
-            self.emit_line(format!("store i8 1, ptr {ht_p}, align 1"));
-            self.emit_line(format!("store i32 {}, ptr {wt_p}, align 4", wt.repr));
-        } else {
-            self.emit_line(format!("store i8 0, ptr {ht_p}, align 1"));
-        }
+        self.emit_line(format!("{call_kw} void @__syn_ready_clear_task(ptr %__task)"));
+        self.emit_line(format!("{call_kw} void @__syn_note_deadline(i32 {})", wt.repr));
+        self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
         self.emit_term(format!("br label %{after_lbl}"));
         self.start_block(&after_lbl);
     }
@@ -604,706 +601,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.store_coro_pc(resume_bb.0 as i32);
                 self.emit_term("ret i32 0");
             }
-            MirYieldKind::InboxRecv {
-                target,
-                elem_ty,
-                cap,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
+            MirYieldKind::Wait {
+                arms,
+                timer,
                 poll_bb,
-                resume_bb,
             } => {
-                let pk = MirPrimKind::Inbox {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                self.emit_queue_recv_yield(
-                    target,
-                    &pk,
-                    elem_ty,
-                    *timeout_deadline_var,
-                    *dst_val,
-                    *dst_res,
-                    *poll_bb,
-                    *resume_bb,
-                )?;
-            }
-            MirYieldKind::InboxSend {
-                target,
-                elem_ty,
-                cap,
-                val_var,
-                timeout_deadline_var,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let pk = MirPrimKind::Inbox {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                let id = sanitize_ident(&pk.mangle_name());
-                let qptr = self.resolve_prim_ptr(target)?;
-                let vp = self.var_ptr(*val_var);
-                let ety = self.ctx.llvm_ty(elem_ty);
-                let is_lease = matches!(elem_ty, MirType::Lease(_));
-                let push_fn = if is_lease {
-                    format!("@__syn_q_push_keep_{id}")
-                } else {
-                    format!("@__syn_q_push_{id}")
-                };
-                let call_kw = self.call_kw();
-                let ptr_al = self.ctx.ptr_align();
-                let v = self.next_tmp();
-                self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
-                let ok = self.next_tmp();
-                self.emit_line(format!(
-                    "{ok} = {call_kw} i8 {push_fn}(ptr {qptr}, {ety} {v}, i32 -1)"
-                ));
-                let ok_b = self.next_tmp();
-                self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
-                let ok_lbl = self.next_label("q_tx_ok");
-                let full_lbl = self.next_label("q_tx_full");
-                self.emit_term(format!("br i1 {ok_b}, label %{ok_lbl}, label %{full_lbl}"));
-
-                self.start_block(&ok_lbl);
-                if is_lease {
-                    let vp_ph = self.next_tmp();
-                    self.emit_line(format!(
-                        "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
-                    ));
-                    self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
-                }
-                if let Some(rvid) = dst_res {
-                    let rp = self.var_ptr(*rvid);
-                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                    self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 4"));
-                }
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&full_lbl);
-                if let Some(dl_var) = timeout_deadline_var {
-                    let dl_ptr = self.var_ptr(*dl_var);
-                    let dl = self.next_tmp();
-                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
-                    let now = self.next_tmp();
-                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
-                    let diff = self.next_tmp();
-                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
-                    let exp = self.next_tmp();
-                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-                    let to_lbl = self.next_label("q_tx_to");
-                    let park_lbl = self.next_label("q_tx_park");
-                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
-
-                    self.start_block(&to_lbl);
-                    if is_lease {
-                        let ph = self.next_tmp();
-                        let sidx = self.next_tmp();
-                        let vp_ph = self.next_tmp();
-                        self.emit_line(format!("{ph} = extractvalue {ety} {v}, 1"));
-                        self.emit_line(format!("{sidx} = extractvalue {ety} {v}, 2"));
-                        self.emit_line(format!(
-                            "{call_kw} void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
-                        ));
-                        self.emit_line(format!(
-                            "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
-                        ));
-                        self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
-                    }
-                    if let Some(rvid) = dst_res {
-                        let rp = self.var_ptr(*rvid);
-                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                        let e0 = self.next_tmp();
-                        self.emit_line(format!(
-                            "{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"
-                        ));
-                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
-                    }
-                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                    self.start_block(&park_lbl);
-                    let pty = format!("%prim.{id}");
-                    let q_tx = self.next_tmp();
-                    self.emit_line(format!(
-                        "{q_tx} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 1"
-                    ));
-                    let dl_ssa = SsaVal::new("i32", dl);
-                    self.park_task_prim(&q_tx, Some(&dl_ssa));
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                } else {
-                    let pty = format!("%prim.{id}");
-                    let q_tx = self.next_tmp();
-                    self.emit_line(format!(
-                        "{q_tx} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 1"
-                    ));
-                    self.park_task_prim(&q_tx, None);
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                }
-            }
-            MirYieldKind::SignalWait {
-                target,
-                timeout_deadline_var,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let call_kw = self.call_kw();
-                let id = sanitize_ident(&MirPrimKind::Signal.mangle_name());
-                let sptr = self.resolve_prim_ptr(target)?;
-                let ok = self.next_tmp();
-                self.emit_line(format!(
-                    "{ok} = {call_kw} i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr %__task)"
-                ));
-                let got = self.next_tmp();
-                self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
-                let ok_lbl = self.next_label("sig_ok");
-                let miss_lbl = self.next_label("sig_miss");
-                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{miss_lbl}"));
-
-                self.start_block(&ok_lbl);
-                if let Some(rvid) = dst_res {
-                    let rp = self.var_ptr(*rvid);
-                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                    self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 4"));
-                }
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&miss_lbl);
-                if let Some(dl_var) = timeout_deadline_var {
-                    let dl_ptr = self.var_ptr(*dl_var);
-                    let dl = self.next_tmp();
-                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
-                    let now = self.next_tmp();
-                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
-                    let diff = self.next_tmp();
-                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
-                    let exp = self.next_tmp();
-                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-                    let to_lbl = self.next_label("sig_to");
-                    let park_lbl = self.next_label("sig_park");
-                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
-
-                    self.start_block(&to_lbl);
-                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
-                    if let Some(rvid) = dst_res {
-                        let rp = self.var_ptr(*rvid);
-                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                        let e0 = self.next_tmp();
-                        self.emit_line(format!("{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"));
-                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
-                    }
-                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                    self.start_block(&park_lbl);
-                    let dl_ssa = SsaVal::new("i32", dl);
-                    self.park_task_prim(&sptr, Some(&dl_ssa));
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                } else {
-                    self.park_task_prim(&sptr, None);
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                }
-            }
-            MirYieldKind::ByteRingWaitRead {
-                target,
-                cap,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let call_kw = self.call_kw();
-                let pk = MirPrimKind::ByteRing { cap: *cap };
-                let id = sanitize_ident(&pk.mangle_name());
-                let rptr = self.resolve_prim_ptr(target)?;
-                let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
-                let slice_ty = format!("{{ ptr, {usize_ty} }}");
-                let sl_val = self.next_tmp();
-                self.emit_line(format!(
-                    "{sl_val} = {call_kw} {slice_ty} @__syn_ring_poll_read_{id}(ptr {rptr}, ptr %__task)"
-                ));
-                let sl_len = self.next_tmp();
-                self.emit_line(format!("{sl_len} = extractvalue {slice_ty} {sl_val}, 1"));
-                let got = self.next_tmp();
-                self.emit_line(format!("{got} = icmp ne {usize_ty} {sl_len}, 0"));
-                let ok_lbl = self.next_label("ring_ok");
-                let miss_lbl = self.next_label("ring_miss");
-                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{miss_lbl}"));
-
-                self.start_block(&ok_lbl);
-                if let Some(vid) = dst_val {
-                    let dp = self.var_ptr(*vid);
-                    self.emit_line(format!("store {slice_ty} {sl_val}, ptr {dp}, align 4"));
-                }
-                if let Some(rvid) = dst_res {
-                    let rp = self.var_ptr(*rvid);
-                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                    let res0 = self.next_tmp();
-                    self.emit_line(format!(
-                        "{res0} = insertvalue {rty} zeroinitializer, {slice_ty} {sl_val}, 0"
-                    ));
-                    self.emit_line(format!("store {rty} {res0}, ptr {rp}, align 4"));
-                }
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&miss_lbl);
-                if let Some(dl_var) = timeout_deadline_var {
-                    let dl_ptr = self.var_ptr(*dl_var);
-                    let dl = self.next_tmp();
-                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
-                    let now = self.next_tmp();
-                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
-                    let diff = self.next_tmp();
-                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
-                    let exp = self.next_tmp();
-                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-                    let to_lbl = self.next_label("ring_to");
-                    let park_lbl = self.next_label("ring_park");
-                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
-
-                    self.start_block(&to_lbl);
-                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
-                    if let Some(rvid) = dst_res {
-                        let rp = self.var_ptr(*rvid);
-                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                        let e0 = self.next_tmp();
-                        self.emit_line(format!("{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"));
-                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
-                    }
-                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                    self.start_block(&park_lbl);
-                    let dl_ssa = SsaVal::new("i32", dl);
-                    self.park_task_prim(&rptr, Some(&dl_ssa));
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                } else {
-                    self.park_task_prim(&rptr, None);
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                }
-            }
-            MirYieldKind::InboxViewRecv {
-                view,
-                elem_ty,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let call_kw = self.call_kw();
-                let (hdr, items_base, cap32) = self.emit_inbox_view_parts(view)?;
-                let key = sanitize_ident(&elem_ty.mangle_name());
-                let ety = self.ctx.llvm_ty(elem_ty);
-                let (tmp_elem, al) = self.emit_temp_alloca(&ety);
-                self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp_elem}, align {al}"));
-
-                let ok = self.next_tmp();
-                self.emit_line(format!(
-                    "{ok} = {call_kw} i8 @__syn_q_view_pop_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, ptr {tmp_elem}, ptr %__task)"
-                ));
-                let got = self.next_tmp();
-                self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
-                let ok_lbl = self.next_label("qv_ok");
-                let miss_lbl = self.next_label("qv_miss");
-                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{miss_lbl}"));
-
-                self.start_block(&ok_lbl);
-                let val = self.next_tmp();
-                self.emit_line(format!("{val} = load {ety}, ptr {tmp_elem}, align {al}"));
-                if let Some(vvid) = dst_val {
-                    let vp = self.var_ptr(*vvid);
-                    self.emit_line(format!("store {ety} {val}, ptr {vp}, align 4"));
-                }
-                if let Some(rvid) = dst_res {
-                    let rp = self.var_ptr(*rvid);
-                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                    let r0 = self.next_tmp();
-                    let r1 = self.next_tmp();
-                    self.emit_line(format!("{r0} = insertvalue {rty} poison, {ety} {val}, 0"));
-                    self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
-                    self.emit_line(format!("store {rty} {r1}, ptr {rp}, align 4"));
-                }
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&miss_lbl);
-                if let Some(dl_var) = timeout_deadline_var {
-                    let dl_ptr = self.var_ptr(*dl_var);
-                    let dl = self.next_tmp();
-                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
-                    let now = self.next_tmp();
-                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
-                    let diff = self.next_tmp();
-                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
-                    let exp = self.next_tmp();
-                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-                    let to_lbl = self.next_label("qv_to");
-                    let park_lbl = self.next_label("qv_park");
-                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
-
-                    self.start_block(&to_lbl);
-                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
-                    if let Some(rvid) = dst_res {
-                        let rp = self.var_ptr(*rvid);
-                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                        let e0 = self.next_tmp();
-                        self.emit_line(format!("{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"));
-                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
-                    }
-                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                    self.start_block(&park_lbl);
-                    let dl_ssa = SsaVal::new("i32", dl);
-                    self.park_task_prim(&hdr, Some(&dl_ssa));
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                } else {
-                    self.park_task_prim(&hdr, None);
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                }
-            }
-            MirYieldKind::InboxViewSend {
-                view,
-                elem_ty,
-                val_var,
-                timeout_deadline_var,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let (hdr, items_base, cap32) = self.emit_inbox_view_parts(view)?;
-                let key = sanitize_ident(&elem_ty.mangle_name());
-                let vp = self.var_ptr(*val_var);
-                let ety = self.ctx.llvm_ty(elem_ty);
-                let is_lease = matches!(elem_ty, MirType::Lease(_));
-                let push_fn = if is_lease {
-                    format!("@__syn_q_view_push_keep_{key}")
-                } else {
-                    format!("@__syn_q_view_push_{key}")
-                };
-                let call_kw = self.call_kw();
-                let ptr_al = self.ctx.ptr_align();
-                let v = self.next_tmp();
-                self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
-                let ok = self.next_tmp();
-                self.emit_line(format!(
-                    "{ok} = {call_kw} i8 {push_fn}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {v}, i32 -1)"
-                ));
-                let ok_b = self.next_tmp();
-                self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
-                let ok_lbl = self.next_label("qv_tx_ok");
-                let full_lbl = self.next_label("qv_tx_full");
-                self.emit_term(format!("br i1 {ok_b}, label %{ok_lbl}, label %{full_lbl}"));
-
-                self.start_block(&ok_lbl);
-                if is_lease {
-                    let vp_ph = self.next_tmp();
-                    self.emit_line(format!(
-                        "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
-                    ));
-                    self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
-                }
-                if let Some(rvid) = dst_res {
-                    let rp = self.var_ptr(*rvid);
-                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                    self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 4"));
-                }
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&full_lbl);
-                if let Some(dl_var) = timeout_deadline_var {
-                    let dl_ptr = self.var_ptr(*dl_var);
-                    let dl = self.next_tmp();
-                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
-                    let now = self.next_tmp();
-                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
-                    let diff = self.next_tmp();
-                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
-                    let exp = self.next_tmp();
-                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-                    let to_lbl = self.next_label("qv_tx_to");
-                    let park_lbl = self.next_label("qv_tx_park");
-                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
-
-                    self.start_block(&to_lbl);
-                    if is_lease {
-                        let ph = self.next_tmp();
-                        let sidx = self.next_tmp();
-                        let vp_ph = self.next_tmp();
-                        self.emit_line(format!("{ph} = extractvalue {ety} {v}, 1"));
-                        self.emit_line(format!("{sidx} = extractvalue {ety} {v}, 2"));
-                        self.emit_line(format!(
-                            "{call_kw} void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
-                        ));
-                        self.emit_line(format!(
-                            "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
-                        ));
-                        self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
-                    }
-                    if let Some(rvid) = dst_res {
-                        let rp = self.var_ptr(*rvid);
-                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                        let e0 = self.next_tmp();
-                        self.emit_line(format!("{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"));
-                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
-                    }
-                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                    self.start_block(&park_lbl);
-                    let q_tx = self.next_tmp();
-                    self.emit_line(format!(
-                        "{q_tx} = getelementptr inbounds %prim.inbox_hdr, ptr {hdr}, i32 0, i32 1"
-                    ));
-                    let dl_ssa = SsaVal::new("i32", dl);
-                    self.park_task_prim(&q_tx, Some(&dl_ssa));
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                } else {
-                    let q_tx = self.next_tmp();
-                    self.emit_line(format!(
-                        "{q_tx} = getelementptr inbounds %prim.inbox_hdr, ptr {hdr}, i32 0, i32 1"
-                    ));
-                    self.park_task_prim(&q_tx, None);
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                }
-            }
-            MirYieldKind::ByteRingViewWaitRead {
-                view,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let call_kw = self.call_kw();
-                let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
-                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
-                let slice_ty = format!("{{ ptr, {usize_ty} }}");
-                let sl_val = self.next_tmp();
-                self.emit_line(format!(
-                    "{sl_val} = {call_kw} {slice_ty} @__syn_ring_view_poll_read(ptr {hdr}, i32 {cap32}, ptr %__task)"
-                ));
-                let sl_len = self.next_tmp();
-                self.emit_line(format!("{sl_len} = extractvalue {slice_ty} {sl_val}, 1"));
-                let got = self.next_tmp();
-                self.emit_line(format!("{got} = icmp ne {usize_ty} {sl_len}, 0"));
-                let ok_lbl = self.next_label("rv_ok");
-                let miss_lbl = self.next_label("rv_miss");
-                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{miss_lbl}"));
-
-                self.start_block(&ok_lbl);
-                if let Some(vid) = dst_val {
-                    let dp = self.var_ptr(*vid);
-                    self.emit_line(format!("store {slice_ty} {sl_val}, ptr {dp}, align 4"));
-                }
-                if let Some(rvid) = dst_res {
-                    let rp = self.var_ptr(*rvid);
-                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                    let res0 = self.next_tmp();
-                    self.emit_line(format!(
-                        "{res0} = insertvalue {rty} zeroinitializer, {slice_ty} {sl_val}, 0"
-                    ));
-                    self.emit_line(format!("store {rty} {res0}, ptr {rp}, align 4"));
-                }
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&miss_lbl);
-                if let Some(dl_var) = timeout_deadline_var {
-                    let dl_ptr = self.var_ptr(*dl_var);
-                    let dl = self.next_tmp();
-                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
-                    let now = self.next_tmp();
-                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
-                    let diff = self.next_tmp();
-                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
-                    let exp = self.next_tmp();
-                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-                    let to_lbl = self.next_label("rv_to");
-                    let park_lbl = self.next_label("rv_park");
-                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
-
-                    self.start_block(&to_lbl);
-                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
-                    if let Some(rvid) = dst_res {
-                        let rp = self.var_ptr(*rvid);
-                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                        let e0 = self.next_tmp();
-                        self.emit_line(format!("{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"));
-                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
-                    }
-                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                    self.start_block(&park_lbl);
-                    let dl_ssa = SsaVal::new("i32", dl);
-                    self.park_task_prim(&hdr, Some(&dl_ssa));
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                } else {
-                    self.park_task_prim(&hdr, None);
-                    self.store_coro_pc(poll_bb.0 as i32);
-                    self.emit_term("ret i32 1");
-                }
-            }
-            MirYieldKind::PingPongWaitChunk {
-                target,
-                elem_ty,
-                cap,
-                dst_slice,
-                poll_bb,
-                resume_bb,
-            } => {
-                let call_kw = self.call_kw();
-                let pk = MirPrimKind::PingPong {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                let id = sanitize_ident(&pk.mangle_name());
-                let pptr = self.resolve_prim_ptr(target)?;
-                let chunk_ptr = self.next_tmp();
-                self.emit_line(format!("{chunk_ptr} = {call_kw} ptr @__syn_pp_poll_{id}(ptr {pptr})"));
-                let got = self.next_tmp();
-                self.emit_line(format!("{got} = icmp ne ptr {chunk_ptr}, null"));
-                let ok_lbl = self.next_label("pp_ok");
-                let wait_lbl = self.next_label("pp_wait");
-                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{wait_lbl}"));
-
-                self.start_block(&ok_lbl);
-                let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
-                let slice_ty = format!("{{ ptr, {usize_ty} }}");
-                let s0 = self.next_tmp();
-                let s1 = self.next_tmp();
-                self.emit_line(format!("{s0} = insertvalue {slice_ty} poison, ptr {chunk_ptr}, 0"));
-                self.emit_line(format!("{s1} = insertvalue {slice_ty} {s0}, {usize_ty} {cap}, 1"));
-                let dp = self.var_ptr(*dst_slice);
-                self.emit_line(format!("store {slice_ty} {s1}, ptr {dp}, align 4"));
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&wait_lbl);
-                self.park_task_prim(&pptr, None);
-                self.store_coro_pc(poll_bb.0 as i32);
-                self.emit_term("ret i32 1");
-            }
-            MirYieldKind::PoolAlloc {
-                target,
-                elem_ty,
-                cap,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                poll_bb,
-                resume_bb,
-            } => {
-                let call_kw = self.call_kw();
-                let pk = MirPrimKind::Pool {
-                    elem: Box::new(elem_ty.clone()),
-                    cap: *cap,
-                };
-                let id = sanitize_ident(&pk.mangle_name());
-                let pptr = self.resolve_prim_ptr(target)?;
-                let (tmp, al) = self.emit_temp_alloca("{ ptr, ptr, i8 }");
-                self.emit_line(format!(
-                    "store {{ ptr, ptr, i8 }} zeroinitializer, ptr {tmp}, align {al}"
-                ));
-                let ok = self.next_tmp();
-                self.emit_line(format!(
-                    "{ok} = {call_kw} i8 @__syn_pool_try_alloc_raw_{id}(ptr {pptr}, ptr {tmp})"
-                ));
-                let got = self.next_tmp();
-                self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
-                let ok_lbl = self.next_label("pool_ok");
-                let empty_lbl = self.next_label("pool_empty");
-                self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{empty_lbl}"));
-
-                self.start_block(&ok_lbl);
-                let ls = self.next_tmp();
-                self.emit_line(format!("{ls} = load {{ ptr, ptr, i8 }}, ptr {tmp}, align {al}"));
-                let ptr_al = self.ctx.ptr_align();
-                if let Some(vid) = dst_val {
-                    let vp = self.var_ptr(*vid);
-                    self.emit_line(format!(
-                        "store {{ ptr, ptr, i8 }} {ls}, ptr {vp}, align {ptr_al}"
-                    ));
-                }
-                if let Some(rvid) = dst_res {
-                    let rp = self.var_ptr(*rvid);
-                    let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                    let r0 = self.next_tmp();
-                    let r1 = self.next_tmp();
-                    self.emit_line(format!(
-                        "{r0} = insertvalue {rty} poison, {{ ptr, ptr, i8 }} {ls}, 0"
-                    ));
-                    self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
-                    self.emit_line(format!("store {rty} {r1}, ptr {rp}, align {ptr_al}"));
-                }
-                self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                self.start_block(&empty_lbl);
-                let dl_ssa = if let Some(dl_var) = timeout_deadline_var {
-                    let dl_ptr = self.var_ptr(*dl_var);
-                    let dl = self.next_tmp();
-                    self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
-                    let now = self.next_tmp();
-                    self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
-                    let diff = self.next_tmp();
-                    self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
-                    let exp = self.next_tmp();
-                    self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-                    let to_lbl = self.next_label("pool_to");
-                    let park_lbl = self.next_label("pool_park");
-                    self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
-
-                    self.start_block(&to_lbl);
-                    self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
-                    if let Some(rvid) = dst_res {
-                        let rp = self.var_ptr(*rvid);
-                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-                        let e0 = self.next_tmp();
-                        self.emit_line(format!(
-                            "{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"
-                        ));
-                        self.emit_line(format!("store {rty} {e0}, ptr {rp}, align {ptr_al}"));
-                    }
-                    self.emit_term(format!("br label %bb_{}", resume_bb.0));
-
-                    self.start_block(&park_lbl);
-                    Some(SsaVal::new("i32", dl))
-                } else {
-                    None
-                };
-                let pm = self.next_tmp();
-                self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
-                let fm_p = self.next_tmp();
-                let fm = self.next_tmp();
-                let has_free = self.next_tmp();
-                self.emit_line(format!(
-                    "{fm_p} = getelementptr inbounds %prim.pool_hdr, ptr {pptr}, i32 0, i32 0"
-                ));
-                self.emit_line(format!("{fm} = load i32, ptr {fm_p}, align 4"));
-                self.emit_line(format!("{has_free} = icmp ne i32 {fm}, 0"));
-                let retry_lbl = self.next_label("pool_retry");
-                let do_park_lbl = self.next_label("pool_do_park");
-                self.emit_term(format!(
-                    "br i1 {has_free}, label %{retry_lbl}, label %{do_park_lbl}"
-                ));
-
-                self.start_block(&retry_lbl);
-                self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
-                self.emit_term(format!("br label %bb_{}", poll_bb.0));
-
-                self.start_block(&do_park_lbl);
-                self.park_task_prim(&pptr, dl_ssa.as_ref());
-                self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
-                self.store_coro_pc(poll_bb.0 as i32);
-                self.emit_term("ret i32 1");
+                self.emit_wait_yield(arms, timer.as_ref(), *poll_bb)?;
             }
             MirYieldKind::CallYielding {
                 callee,
@@ -1452,89 +755,1010 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn emit_queue_recv_yield(
+    pub(super) fn emit_wait_yield(
         &mut self,
-        target: &MirPrimTarget,
-        pk: &MirPrimKind,
-        elem_ty: &MirType,
-        timeout_deadline_var: Option<VarId>,
-        dst_val: Option<VarId>,
-        dst_res: Option<VarId>,
+        arms: &[MirWaitArm],
+        timer: Option<&MirWaitTimer>,
         poll_bb: BlockId,
-        resume_bb: BlockId,
     ) -> Result<(), CodegenError> {
-        let id = sanitize_ident(&pk.mangle_name());
-        let qptr = self.resolve_prim_ptr(target)?;
-        let ety = self.ctx.llvm_ty(elem_ty);
-        let (tmp_elem, al) = self.emit_temp_alloca(&ety);
-        self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp_elem}, align {al}"));
-
         let call_kw = self.call_kw();
-        let ok = self.next_tmp();
-        self.emit_line(format!(
-            "{ok} = {call_kw} i8 @__syn_q_pop_{id}(ptr {qptr}, ptr {tmp_elem}, ptr %__task)"
+        let ptr_al = self.ctx.ptr_align();
+        let i32_al = self.ctx.llvm_scalar_abi_align(4);
+        let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
+
+        enum ResolvedArm {
+            InboxRecv {
+                qptr: String,
+                wm_p: String,
+                id: String,
+                elem_ty: MirType,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            InboxViewRecv {
+                hdr: String,
+                items_base: String,
+                cap32: String,
+                wm_p: String,
+                key: String,
+                elem_ty: MirType,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            InboxSend {
+                qptr: String,
+                wm_p: String,
+                id: String,
+                elem_ty: MirType,
+                val_var: VarId,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            InboxViewSend {
+                hdr: String,
+                items_base: String,
+                cap32: String,
+                wm_p: String,
+                key: String,
+                elem_ty: MirType,
+                val_var: VarId,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            SignalWait {
+                sptr: String,
+                wm_p: String,
+                id: String,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            WaitQueueCommit {
+                wm_p: String,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            WatchWaitChange {
+                wptr: String,
+                wm_p: String,
+                pty: String,
+                elem_ty: MirType,
+                last_gen_var: VarId,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            PingPongWaitChunk {
+                pptr: String,
+                wm_p: String,
+                id: String,
+                cap: usize,
+                dst_slice: VarId,
+                target_bb: BlockId,
+            },
+            PoolAlloc {
+                pptr: String,
+                wm_p: String,
+                id: String,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            ByteRingWaitRead {
+                rptr: String,
+                wm_p: String,
+                id: String,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            ByteRingViewWaitRead {
+                hdr: String,
+                cap32: String,
+                wm_p: String,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+        }
+
+        impl ResolvedArm {
+            fn wm_ptr(&self) -> &str {
+                match self {
+                    ResolvedArm::InboxRecv { wm_p, .. }
+                    | ResolvedArm::InboxViewRecv { wm_p, .. }
+                    | ResolvedArm::InboxSend { wm_p, .. }
+                    | ResolvedArm::InboxViewSend { wm_p, .. }
+                    | ResolvedArm::SignalWait { wm_p, .. }
+                    | ResolvedArm::WaitQueueCommit { wm_p, .. }
+                    | ResolvedArm::WatchWaitChange { wm_p, .. }
+                    | ResolvedArm::PingPongWaitChunk { wm_p, .. }
+                    | ResolvedArm::PoolAlloc { wm_p, .. }
+                    | ResolvedArm::ByteRingWaitRead { wm_p, .. }
+                    | ResolvedArm::ByteRingViewWaitRead { wm_p, .. } => wm_p,
+                }
+            }
+        }
+
+        // Single outer critical section covers poll + timeout check + mask/park atomically.
+        let pm = self.next_tmp();
+        self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
+
+        let is_null = self.next_tmp();
+        self.emit_line(format!("{is_null} = icmp eq ptr %__task, null"));
+        let has_slot_lbl = self.next_label("wait_has_slot");
+        let no_slot_lbl = self.next_label("wait_no_slot");
+        let bit_ready_lbl = self.next_label("wait_bit_ready");
+        self.emit_term(format!(
+            "br i1 {is_null}, label %{no_slot_lbl}, label %{has_slot_lbl}"
         ));
-        let got = self.next_tmp();
-        self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
-        let ok_lbl = self.next_label("q_ok");
-        let miss_lbl = self.next_label("q_miss");
-        self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{miss_lbl}"));
 
-        self.start_block(&ok_lbl);
-        let val = self.next_tmp();
-        self.emit_line(format!("{val} = load {ety}, ptr {tmp_elem}, align {al}"));
-        if let Some(vvid) = dst_val {
-            let vp = self.var_ptr(vvid);
-            self.emit_line(format!("store {ety} {val}, ptr {vp}, align 4"));
-        }
-        if let Some(rvid) = dst_res {
-            let rp = self.var_ptr(rvid);
-            let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
-            let r0 = self.next_tmp();
-            let r1 = self.next_tmp();
-            self.emit_line(format!("{r0} = insertvalue {rty} poison, {ety} {val}, 0"));
-            self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
-            self.emit_line(format!("store {rty} {r1}, ptr {rp}, align 4"));
-        }
-        self.emit_term(format!("br label %bb_{}", resume_bb.0));
+        self.start_block(&has_slot_lbl);
+        let sl_p = self.next_tmp();
+        let sl8 = self.next_tmp();
+        let sl32 = self.next_tmp();
+        let sh = self.next_tmp();
+        let tbit = self.next_tmp();
+        self.emit_line(format!(
+            "{sl_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 9"
+        ));
+        self.emit_line(format!("{sl8} = load i8, ptr {sl_p}, align 1"));
+        self.emit_line(format!("{sl32} = zext i8 {sl8} to i32"));
+        self.emit_line(format!("{sh} = and i32 {sl32}, 31"));
+        self.emit_line(format!("{tbit} = shl i32 1, {sh}"));
+        self.emit_term(format!("br label %{bit_ready_lbl}"));
 
-        self.start_block(&miss_lbl);
-        if let Some(dl_var) = timeout_deadline_var {
-            let dl_ptr = self.var_ptr(dl_var);
+        self.start_block(&no_slot_lbl);
+        self.emit_term(format!("br label %{bit_ready_lbl}"));
+
+        self.start_block(&bit_ready_lbl);
+        let task_bit = self.next_tmp();
+        self.emit_line(format!(
+            "{task_bit} = phi i32 [ {tbit}, %{has_slot_lbl} ], [ 0, %{no_slot_lbl} ]"
+        ));
+        let clr_mask = self.next_tmp();
+        self.emit_line(format!("{clr_mask} = xor i32 {task_bit}, -1"));
+
+        let mut resolved = Vec::with_capacity(arms.len());
+        for arm in arms {
+            let r = match &arm.op {
+                MirWaitArmOp::InboxRecv {
+                    target,
+                    elem_ty,
+                    cap,
+                    dst_val,
+                    dst_res,
+                } => {
+                    let pk = MirPrimKind::Inbox {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    };
+                    let id = sanitize_ident(&pk.mangle_name());
+                    let pty = format!("%prim.{id}");
+                    let qptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 3"
+                    ));
+                    ResolvedArm::InboxRecv {
+                        qptr,
+                        wm_p,
+                        id,
+                        elem_ty: elem_ty.clone(),
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::InboxViewRecv {
+                    view,
+                    elem_ty,
+                    dst_val,
+                    dst_res,
+                } => {
+                    let (hdr, items_base, cap32) = self.emit_inbox_view_parts(view)?;
+                    let key = sanitize_ident(&elem_ty.mangle_name());
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds %prim.inbox_hdr, ptr {hdr}, i32 0, i32 3"
+                    ));
+                    ResolvedArm::InboxViewRecv {
+                        hdr,
+                        items_base,
+                        cap32,
+                        wm_p,
+                        key,
+                        elem_ty: elem_ty.clone(),
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::InboxSend {
+                    target,
+                    elem_ty,
+                    cap,
+                    val_var,
+                    dst_res,
+                } => {
+                    let pk = MirPrimKind::Inbox {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    };
+                    let id = sanitize_ident(&pk.mangle_name());
+                    let pty = format!("%prim.{id}");
+                    let qptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds {pty}, ptr {qptr}, i32 0, i32 4"
+                    ));
+                    ResolvedArm::InboxSend {
+                        qptr,
+                        wm_p,
+                        id,
+                        elem_ty: elem_ty.clone(),
+                        val_var: *val_var,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::InboxViewSend {
+                    view,
+                    elem_ty,
+                    val_var,
+                    dst_res,
+                } => {
+                    let (hdr, items_base, cap32) = self.emit_inbox_view_parts(view)?;
+                    let key = sanitize_ident(&elem_ty.mangle_name());
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds %prim.inbox_hdr, ptr {hdr}, i32 0, i32 4"
+                    ));
+                    ResolvedArm::InboxViewSend {
+                        hdr,
+                        items_base,
+                        cap32,
+                        wm_p,
+                        key,
+                        elem_ty: elem_ty.clone(),
+                        val_var: *val_var,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::SignalWait { target, dst_res } => {
+                    let id = sanitize_ident(&MirPrimKind::Signal.mangle_name());
+                    let sptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds %prim.{id}, ptr {sptr}, i32 0, i32 2"
+                    ));
+                    ResolvedArm::SignalWait {
+                        sptr,
+                        wm_p,
+                        id,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::WaitQueueCommit { target, dst_res } => {
+                    let wptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds %prim.wait_queue, ptr {wptr}, i32 0, i32 0"
+                    ));
+                    ResolvedArm::WaitQueueCommit {
+                        wm_p,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::WatchWaitChange {
+                    target,
+                    elem_ty,
+                    last_gen_var,
+                    dst_val,
+                    dst_res,
+                    ..
+                } => {
+                    let pk = MirPrimKind::Watch {
+                        elem: Box::new(elem_ty.clone()),
+                    };
+                    let id = sanitize_ident(&pk.mangle_name());
+                    let pty = format!("%prim.{id}");
+                    let wptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds {pty}, ptr {wptr}, i32 0, i32 2"
+                    ));
+                    ResolvedArm::WatchWaitChange {
+                        wptr,
+                        wm_p,
+                        pty,
+                        elem_ty: elem_ty.clone(),
+                        last_gen_var: *last_gen_var,
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::PingPongWaitChunk {
+                    target,
+                    elem_ty,
+                    cap,
+                    dst_slice,
+                } => {
+                    let pk = MirPrimKind::PingPong {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    };
+                    let id = sanitize_ident(&pk.mangle_name());
+                    let pty = format!("%prim.{id}");
+                    let pptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds {pty}, ptr {pptr}, i32 0, i32 4"
+                    ));
+                    ResolvedArm::PingPongWaitChunk {
+                        pptr,
+                        wm_p,
+                        id,
+                        cap: *cap,
+                        dst_slice: *dst_slice,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::PoolAlloc {
+                    target,
+                    elem_ty,
+                    cap,
+                    dst_val,
+                    dst_res,
+                } => {
+                    let pk = MirPrimKind::Pool {
+                        elem: Box::new(elem_ty.clone()),
+                        cap: *cap,
+                    };
+                    let id = sanitize_ident(&pk.mangle_name());
+                    let pptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds %prim.pool_hdr, ptr {pptr}, i32 0, i32 1"
+                    ));
+                    ResolvedArm::PoolAlloc {
+                        pptr,
+                        wm_p,
+                        id,
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::ByteRingWaitRead {
+                    target,
+                    cap,
+                    dst_val,
+                    dst_res,
+                } => {
+                    let pk = MirPrimKind::ByteRing { cap: *cap };
+                    let id = sanitize_ident(&pk.mangle_name());
+                    let pty = format!("%prim.{id}");
+                    let rptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds {pty}, ptr {rptr}, i32 0, i32 6"
+                    ));
+                    ResolvedArm::ByteRingWaitRead {
+                        rptr,
+                        wm_p,
+                        id,
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::ByteRingViewWaitRead {
+                    view,
+                    dst_val,
+                    dst_res,
+                } => {
+                    let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds %prim.byte_ring_hdr, ptr {hdr}, i32 0, i32 6"
+                    ));
+                    ResolvedArm::ByteRingViewWaitRead {
+                        hdr,
+                        cap32,
+                        wm_p,
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+            };
+            resolved.push(r);
+        }
+
+        // Clear any leftover task bit before polling so stale bits never accumulate across arms.
+        // (`WaitQueueCommit` already armed its bit inside `prepare_wait()`, so leave it intact!)
+        for r in &resolved {
+            if matches!(r, ResolvedArm::WaitQueueCommit { .. }) {
+                continue;
+            }
+            let wm_p = r.wm_ptr();
+            let old_m = self.next_tmp();
+            let new_m = self.next_tmp();
+            self.emit_line(format!(
+                "{old_m} = load volatile i32, ptr {wm_p}, align {i32_al}"
+            ));
+            self.emit_line(format!("{new_m} = and i32 {old_m}, {clr_mask}"));
+            self.emit_line(format!(
+                "store volatile i32 {new_m}, ptr {wm_p}, align {i32_al}"
+            ));
+        }
+
+        let after_polls_lbl = self.next_label("wait_after_polls");
+        for (idx, arm) in resolved.iter().enumerate() {
+            let next_lbl = if idx + 1 < resolved.len() {
+                self.next_label(&format!("wait_arm_{}", idx + 1))
+            } else {
+                after_polls_lbl.clone()
+            };
+            let ok_lbl = self.next_label(&format!("wait_ok_{idx}"));
+            match arm {
+                ResolvedArm::InboxRecv {
+                    qptr,
+                    id,
+                    elem_ty,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let ety = self.ctx.llvm_ty(elem_ty);
+                    let (tmp_elem, al) = self.emit_temp_alloca(&ety);
+                    self.emit_line(format!(
+                        "store {ety} zeroinitializer, ptr {tmp_elem}, align {al}"
+                    ));
+                    let ok = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ok} = {call_kw} i8 @__syn_q_pop_{id}(ptr {qptr}, ptr {tmp_elem}, ptr %__task)"
+                    ));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    let val = self.next_tmp();
+                    self.emit_line(format!("{val} = load {ety}, ptr {tmp_elem}, align {al}"));
+                    if let Some(vvid) = dst_val {
+                        let vp = self.var_ptr(*vvid);
+                        self.emit_line(format!("store {ety} {val}, ptr {vp}, align 1"));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let r0 = self.next_tmp();
+                        let r1 = self.next_tmp();
+                        self.emit_line(format!("{r0} = insertvalue {rty} poison, {ety} {val}, 0"));
+                        self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
+                        self.emit_line(format!("store {rty} {r1}, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::InboxViewRecv {
+                    hdr,
+                    items_base,
+                    cap32,
+                    key,
+                    elem_ty,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let ety = self.ctx.llvm_ty(elem_ty);
+                    let (tmp_elem, al) = self.emit_temp_alloca(&ety);
+                    self.emit_line(format!(
+                        "store {ety} zeroinitializer, ptr {tmp_elem}, align {al}"
+                    ));
+                    let ok = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ok} = {call_kw} i8 @__syn_q_view_pop_{key}(ptr {hdr}, ptr {items_base}, i32 {cap32}, ptr {tmp_elem}, ptr %__task)"
+                    ));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    let val = self.next_tmp();
+                    self.emit_line(format!("{val} = load {ety}, ptr {tmp_elem}, align {al}"));
+                    if let Some(vvid) = dst_val {
+                        let vp = self.var_ptr(*vvid);
+                        self.emit_line(format!("store {ety} {val}, ptr {vp}, align 1"));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let r0 = self.next_tmp();
+                        let r1 = self.next_tmp();
+                        self.emit_line(format!("{r0} = insertvalue {rty} poison, {ety} {val}, 0"));
+                        self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
+                        self.emit_line(format!("store {rty} {r1}, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::InboxSend {
+                    qptr,
+                    id,
+                    elem_ty,
+                    val_var,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let vp = self.var_ptr(*val_var);
+                    let ety = self.ctx.llvm_ty(elem_ty);
+                    let is_lease = matches!(elem_ty, MirType::Lease(_));
+                    let push_fn = if is_lease {
+                        format!("@__syn_q_push_keep_{id}")
+                    } else {
+                        format!("@__syn_q_push_{id}")
+                    };
+                    let v = self.next_tmp();
+                    self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
+                    let ok = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ok} = {call_kw} i8 {push_fn}(ptr {qptr}, {ety} {v}, i32 -1)"
+                    ));
+                    let ok_b = self.next_tmp();
+                    self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
+                    self.emit_term(format!("br i1 {ok_b}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    if is_lease {
+                        let vp_ph = self.next_tmp();
+                        self.emit_line(format!(
+                            "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
+                        ));
+                        self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::InboxViewSend {
+                    hdr,
+                    items_base,
+                    cap32,
+                    key,
+                    elem_ty,
+                    val_var,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let vp = self.var_ptr(*val_var);
+                    let ety = self.ctx.llvm_ty(elem_ty);
+                    let is_lease = matches!(elem_ty, MirType::Lease(_));
+                    let push_fn = if is_lease {
+                        format!("@__syn_q_view_push_keep_{key}")
+                    } else {
+                        format!("@__syn_q_view_push_{key}")
+                    };
+                    let v = self.next_tmp();
+                    self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
+                    let ok = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ok} = {call_kw} i8 {push_fn}(ptr {hdr}, ptr {items_base}, i32 {cap32}, {ety} {v}, i32 -1)"
+                    ));
+                    let ok_b = self.next_tmp();
+                    self.emit_line(format!("{ok_b} = icmp ne i8 {ok}, 0"));
+                    self.emit_term(format!("br i1 {ok_b}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    if is_lease {
+                        let vp_ph = self.next_tmp();
+                        self.emit_line(format!(
+                            "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
+                        ));
+                        self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::SignalWait {
+                    sptr,
+                    id,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let ok = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ok} = {call_kw} i8 @__syn_sig_poll_{id}(ptr {sptr}, ptr %__task)"
+                    ));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::WaitQueueCommit {
+                    wm_p,
+                    dst_res,
+                    target_bb,
+                } => {
+                    let cur_m = self.next_tmp();
+                    let masked = self.next_tmp();
+                    let cleared = self.next_tmp();
+                    let not_null = self.next_tmp();
+                    let got = self.next_tmp();
+                    self.emit_line(format!(
+                        "{cur_m} = load volatile i32, ptr {wm_p}, align {i32_al}"
+                    ));
+                    self.emit_line(format!("{masked} = and i32 {cur_m}, {task_bit}"));
+                    self.emit_line(format!("{cleared} = icmp eq i32 {masked}, 0"));
+                    self.emit_line(format!("{not_null} = xor i1 {is_null}, true"));
+                    self.emit_line(format!("{got} = and i1 {not_null}, {cleared}"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        self.emit_line(format!("store {rty} zeroinitializer, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::WatchWaitChange {
+                    wptr,
+                    pty,
+                    elem_ty,
+                    last_gen_var,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let gp = self.next_tmp();
+                    let cur_gen = self.next_tmp();
+                    let lgp = self.var_ptr(*last_gen_var);
+                    let last_gen = self.next_tmp();
+                    let chg = self.next_tmp();
+                    self.emit_line(format!(
+                        "{gp} = getelementptr inbounds {pty}, ptr {wptr}, i32 0, i32 1"
+                    ));
+                    self.emit_line(format!("{cur_gen} = load i32, ptr {gp}, align {i32_al}"));
+                    self.emit_line(format!("{last_gen} = load i32, ptr {lgp}, align 1"));
+                    self.emit_line(format!("{chg} = icmp ne i32 {cur_gen}, {last_gen}"));
+                    self.emit_term(format!("br i1 {chg}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    self.emit_line(format!("store i32 {cur_gen}, ptr {lgp}, align 1"));
+                    if dst_val.is_some() || dst_res.is_some() {
+                        let ety = self.ctx.llvm_ty(elem_ty);
+                        let vp_src = self.next_tmp();
+                        let val = self.next_tmp();
+                        self.emit_line(format!(
+                            "{vp_src} = getelementptr inbounds {pty}, ptr {wptr}, i32 0, i32 0"
+                        ));
+                        self.emit_line(format!("{val} = load {ety}, ptr {vp_src}, align 1"));
+                        if let Some(vvid) = dst_val {
+                            let vp = self.var_ptr(*vvid);
+                            self.emit_line(format!("store {ety} {val}, ptr {vp}, align 1"));
+                        }
+                        if let Some(rvid) = dst_res {
+                            let rp = self.var_ptr(*rvid);
+                            let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                            let r0 = self.next_tmp();
+                            let r1 = self.next_tmp();
+                            self.emit_line(format!(
+                                "{r0} = insertvalue {rty} poison, {ety} {val}, 0"
+                            ));
+                            self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
+                            self.emit_line(format!("store {rty} {r1}, ptr {rp}, align 1"));
+                        }
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::PingPongWaitChunk {
+                    pptr,
+                    id,
+                    cap,
+                    dst_slice,
+                    target_bb,
+                    ..
+                } => {
+                    let chunk_ptr = self.next_tmp();
+                    self.emit_line(format!(
+                        "{chunk_ptr} = {call_kw} ptr @__syn_pp_poll_{id}(ptr {pptr})"
+                    ));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ne ptr {chunk_ptr}, null"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    let slice_ty = format!("{{ ptr, {usize_ty} }}");
+                    let s0 = self.next_tmp();
+                    let s1 = self.next_tmp();
+                    self.emit_line(format!(
+                        "{s0} = insertvalue {slice_ty} poison, ptr {chunk_ptr}, 0"
+                    ));
+                    self.emit_line(format!(
+                        "{s1} = insertvalue {slice_ty} {s0}, {usize_ty} {cap}, 1"
+                    ));
+                    let dp = self.var_ptr(*dst_slice);
+                    self.emit_line(format!("store {slice_ty} {s1}, ptr {dp}, align 1"));
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::PoolAlloc {
+                    pptr,
+                    id,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let (tmp, al) = self.emit_temp_alloca("{ ptr, ptr, i8 }");
+                    self.emit_line(format!(
+                        "store {{ ptr, ptr, i8 }} zeroinitializer, ptr {tmp}, align {al}"
+                    ));
+                    let ok = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ok} = {call_kw} i8 @__syn_pool_try_alloc_raw_{id}(ptr {pptr}, ptr {tmp})"
+                    ));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ne i8 {ok}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    let ls = self.next_tmp();
+                    self.emit_line(format!(
+                        "{ls} = load {{ ptr, ptr, i8 }}, ptr {tmp}, align {al}"
+                    ));
+                    if let Some(vid) = dst_val {
+                        let vp = self.var_ptr(*vid);
+                        self.emit_line(format!(
+                            "store {{ ptr, ptr, i8 }} {ls}, ptr {vp}, align 1"
+                        ));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let r0 = self.next_tmp();
+                        let r1 = self.next_tmp();
+                        self.emit_line(format!(
+                            "{r0} = insertvalue {rty} poison, {{ ptr, ptr, i8 }} {ls}, 0"
+                        ));
+                        self.emit_line(format!("{r1} = insertvalue {rty} {r0}, i32 0, 1"));
+                        self.emit_line(format!("store {rty} {r1}, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::ByteRingWaitRead {
+                    rptr,
+                    id,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let slice_ty = format!("{{ ptr, {usize_ty} }}");
+                    let sl_val = self.next_tmp();
+                    self.emit_line(format!(
+                        "{sl_val} = {call_kw} {slice_ty} @__syn_ring_poll_read_{id}(ptr {rptr}, ptr %__task)"
+                    ));
+                    let sl_len = self.next_tmp();
+                    self.emit_line(format!("{sl_len} = extractvalue {slice_ty} {sl_val}, 1"));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ne {usize_ty} {sl_len}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    if let Some(vid) = dst_val {
+                        let dp = self.var_ptr(*vid);
+                        self.emit_line(format!("store {slice_ty} {sl_val}, ptr {dp}, align 1"));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let res0 = self.next_tmp();
+                        self.emit_line(format!(
+                            "{res0} = insertvalue {rty} zeroinitializer, {slice_ty} {sl_val}, 0"
+                        ));
+                        self.emit_line(format!("store {rty} {res0}, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::ByteRingViewWaitRead {
+                    hdr,
+                    cap32,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let slice_ty = format!("{{ ptr, {usize_ty} }}");
+                    let sl_val = self.next_tmp();
+                    self.emit_line(format!(
+                        "{sl_val} = {call_kw} {slice_ty} @__syn_ring_view_poll_read(ptr {hdr}, i32 {cap32}, ptr %__task)"
+                    ));
+                    let sl_len = self.next_tmp();
+                    self.emit_line(format!("{sl_len} = extractvalue {slice_ty} {sl_val}, 1"));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ne {usize_ty} {sl_len}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    if let Some(vid) = dst_val {
+                        let dp = self.var_ptr(*vid);
+                        self.emit_line(format!("store {slice_ty} {sl_val}, ptr {dp}, align 1"));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let res0 = self.next_tmp();
+                        self.emit_line(format!(
+                            "{res0} = insertvalue {rty} zeroinitializer, {slice_ty} {sl_val}, 0"
+                        ));
+                        self.emit_line(format!("store {rty} {res0}, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+            }
+            if idx + 1 < resolved.len() {
+                self.start_block(&next_lbl);
+            }
+        }
+
+        // All arms missed: check optional deadline, then atomically register waiter_masks and park.
+        self.start_block(&after_polls_lbl);
+        let park_lbl = self.next_label("wait_park");
+        let dl_ssa = if let Some(t) = timer {
+            let dl_ptr = self.var_ptr(t.deadline_var);
             let dl = self.next_tmp();
-            self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 4"));
             let now = self.next_tmp();
-            self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
             let diff = self.next_tmp();
-            self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
             let exp = self.next_tmp();
+            self.emit_line(format!("{dl} = load i32, ptr {dl_ptr}, align 1"));
+            self.emit_line(format!("{now} = {call_kw} i32 @__syn_now_ms()"));
+            self.emit_line(format!("{diff} = sub i32 {now}, {dl}"));
             self.emit_line(format!("{exp} = icmp sge i32 {diff}, 0"));
-            let to_lbl = self.next_label("q_to");
-            let park_lbl = self.next_label("q_park");
+            let to_lbl = self.next_label("wait_to");
             self.emit_term(format!("br i1 {exp}, label %{to_lbl}, label %{park_lbl}"));
 
             self.start_block(&to_lbl);
+            for r in &resolved {
+                if let ResolvedArm::WaitQueueCommit { wm_p, .. } = r {
+                    let old_m = self.next_tmp();
+                    let new_m = self.next_tmp();
+                    self.emit_line(format!(
+                        "{old_m} = load volatile i32, ptr {wm_p}, align {i32_al}"
+                    ));
+                    self.emit_line(format!("{new_m} = and i32 {old_m}, {clr_mask}"));
+                    self.emit_line(format!(
+                        "store volatile i32 {new_m}, ptr {wm_p}, align {i32_al}"
+                    ));
+                }
+            }
             self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
-            if let Some(rvid) = dst_res {
+            if let Some(rvid) = t.timeout_err_res {
                 let rp = self.var_ptr(rvid);
                 let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
                 let e0 = self.next_tmp();
                 self.emit_line(format!("{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"));
-                self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 4"));
+                self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 1"));
             }
-            self.emit_term(format!("br label %bb_{}", resume_bb.0));
+            if let Some((lv, lty)) = &t.release_lease_on_timeout {
+                let vp = self.var_ptr(*lv);
+                let ety = self.ctx.llvm_ty(lty);
+                let v = self.next_tmp();
+                let ph = self.next_tmp();
+                let sidx = self.next_tmp();
+                let vp_ph = self.next_tmp();
+                self.emit_line(format!("{v} = load {ety}, ptr {vp}, align 1"));
+                self.emit_line(format!("{ph} = extractvalue {ety} {v}, 1"));
+                self.emit_line(format!("{sidx} = extractvalue {ety} {v}, 2"));
+                self.emit_line(format!(
+                    "{vp_ph} = getelementptr inbounds {ety}, ptr {vp}, i32 0, i32 1"
+                ));
+                self.emit_line(format!("store ptr null, ptr {vp_ph}, align {ptr_al}"));
+                self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_pool_release(ptr {ph}, i8 {sidx}, i8 -1)"
+                ));
+            } else {
+                self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+            }
+            self.emit_term(format!("br label %bb_{}", t.timeout_bb.0));
 
             self.start_block(&park_lbl);
-            let dl_ssa = SsaVal::new("i32", dl);
-            self.park_task_prim(&qptr, Some(&dl_ssa));
-            self.store_coro_pc(poll_bb.0 as i32);
-            self.emit_term("ret i32 1");
+            Some(dl)
         } else {
-            self.park_task_prim(&qptr, None);
-            self.store_coro_pc(poll_bb.0 as i32);
-            self.emit_term("ret i32 1");
+            self.emit_term(format!("br label %{park_lbl}"));
+            self.start_block(&park_lbl);
+            None
+        };
+
+        let do_park_lbl = self.next_label("wait_do_park");
+        let finish_yield_lbl = self.next_label("wait_ret");
+        self.emit_term(format!(
+            "br i1 {is_null}, label %{finish_yield_lbl}, label %{do_park_lbl}"
+        ));
+
+        self.start_block(&do_park_lbl);
+        self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
+        for r in &resolved {
+            let wm_p = r.wm_ptr();
+            let cur_m = self.next_tmp();
+            let next_m = self.next_tmp();
+            self.emit_line(format!(
+                "{cur_m} = load volatile i32, ptr {wm_p}, align {i32_al}"
+            ));
+            self.emit_line(format!("{next_m} = or i32 {cur_m}, {task_bit}"));
+            self.emit_line(format!(
+                "store volatile i32 {next_m}, ptr {wm_p}, align {i32_al}"
+            ));
         }
+        let st_p = self.next_tmp();
+        let ht_p = self.next_tmp();
+        let wo_p = self.next_tmp();
+        self.emit_line(format!(
+            "{st_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 2"
+        ));
+        self.emit_line(format!(
+            "{ht_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 7"
+        ));
+        self.emit_line(format!(
+            "{wo_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 12"
+        ));
+        self.emit_line(format!("store i8 3, ptr {st_p}, align 1"));
+        self.emit_line(format!("store ptr null, ptr {wo_p}, align {ptr_al}"));
+        self.emit_line(format!("{call_kw} void @__syn_ready_clear_task(ptr %__task)"));
+        if let Some(dl) = dl_ssa {
+            let wt_p = self.next_tmp();
+            self.emit_line(format!(
+                "{wt_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 11"
+            ));
+            self.emit_line(format!("store i8 1, ptr {ht_p}, align 1"));
+            self.emit_line(format!("store i32 {dl}, ptr {wt_p}, align 4"));
+            self.emit_line(format!("{call_kw} void @__syn_note_deadline(i32 {dl})"));
+        } else {
+            self.emit_line(format!("store i8 0, ptr {ht_p}, align 1"));
+        }
+        self.emit_term(format!("br label %{finish_yield_lbl}"));
+
+        self.start_block(&finish_yield_lbl);
+        self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+        self.store_coro_pc(poll_bb.0 as i32);
+        self.emit_term("ret i32 1");
         Ok(())
     }
 
@@ -1670,7 +1894,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.emit_line(format!(
             "{f1} = getelementptr inbounds %prim.pool_hdr, ptr {hdr_ptr}, i32 0, i32 1"
         ));
-        self.emit_line(format!("store i32 {mask_i32}, ptr {f1}, align 4"));
+        self.emit_line(format!("store i32 0, ptr {f1}, align 4"));
         self.emit_line(format!(
             "{f2} = getelementptr inbounds %prim.pool_hdr, ptr {hdr_ptr}, i32 0, i32 2"
         ));
@@ -2016,6 +2240,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let call_kw = self.call_kw();
                     self.emit_line(format!("{call_kw} void @__syn_end_inbox_turn(ptr %__task)"));
                 }
+            }
+            MirStmt::BoundedForLatch => {}
+            MirStmt::ZeroTaskLocals => {
+                self.emit_zero_task_locals();
             }
             MirStmt::If {
                 cond,
@@ -2652,18 +2880,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirAssignOp::SubAssign => "sub",
             MirAssignOp::MulAssign => "mul",
             MirAssignOp::DivAssign => {
-                if signed {
-                    "sdiv"
-                } else {
-                    "udiv"
-                }
+                let res = self.emit_checked_int_div_rem(ty, &lhs.repr, &rv.repr, signed, false);
+                return SsaVal::new(ty, res);
             }
             MirAssignOp::RemAssign => {
-                if signed {
-                    "srem"
-                } else {
-                    "urem"
-                }
+                let res = self.emit_checked_int_div_rem(ty, &lhs.repr, &rv.repr, signed, true);
+                return SsaVal::new(ty, res);
             }
             MirAssignOp::BitOrAssign => "or",
             MirAssignOp::BitAndAssign => "and",
@@ -2680,6 +2902,66 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let t = self.next_tmp();
         self.emit_line(format!("{t} = {inst} {ty} {}, {}", lhs.repr, rv.repr));
         SsaVal::new(ty, t)
+    }
+
+    pub(super) fn emit_bounds_check(&mut self, in_bounds_i1: &str, reason: u8) {
+        let ok_lbl = self.next_label("chk_ok");
+        let trap_lbl = self.next_label("chk_trap");
+        let call_kw = self.call_kw();
+        self.emit_term(format!("br i1 {in_bounds_i1}, label %{ok_lbl}, label %{trap_lbl}"));
+        self.start_block(&trap_lbl);
+        self.emit_line(format!("{call_kw} void @__syn_panic(i8 {reason})"));
+        self.emit_term("unreachable");
+        self.start_block(&ok_lbl);
+    }
+
+    pub(super) fn emit_checked_int_div_rem(
+        &mut self,
+        ty: &str,
+        lhs: &str,
+        rhs: &str,
+        signed: bool,
+        is_rem: bool,
+    ) -> String {
+        let nz = self.next_tmp();
+        self.emit_line(format!("{nz} = icmp ne {ty} {rhs}, 0"));
+        self.emit_bounds_check(&nz, 4);
+        let t = self.next_tmp();
+        if !signed {
+            let inst = if is_rem { "urem" } else { "udiv" };
+            self.emit_line(format!("{t} = {inst} {ty} {lhs}, {rhs}"));
+            return t;
+        }
+        let min_lit = match ty {
+            "i8" => Some("-128"),
+            "i16" => Some("-32768"),
+            "i32" => Some("-2147483648"),
+            "i64" => Some("-9223372036854775808"),
+            _ => None,
+        };
+        if let Some(int_min) = min_lit {
+            let is_min = self.next_tmp();
+            let is_neg1 = self.next_tmp();
+            let ovf = self.next_tmp();
+            let safe_rhs = self.next_tmp();
+            self.emit_line(format!("{is_min} = icmp eq {ty} {lhs}, {int_min}"));
+            self.emit_line(format!("{is_neg1} = icmp eq {ty} {rhs}, -1"));
+            self.emit_line(format!("{ovf} = and i1 {is_min}, {is_neg1}"));
+            self.emit_line(format!(
+                "{safe_rhs} = select i1 {ovf}, {ty} 1, {ty} {rhs}"
+            ));
+            if is_rem {
+                let r0 = self.next_tmp();
+                self.emit_line(format!("{r0} = srem {ty} {lhs}, {safe_rhs}"));
+                self.emit_line(format!("{t} = select i1 {ovf}, {ty} 0, {ty} {r0}"));
+            } else {
+                self.emit_line(format!("{t} = sdiv {ty} {lhs}, {safe_rhs}"));
+            }
+        } else {
+            let inst = if is_rem { "srem" } else { "sdiv" };
+            self.emit_line(format!("{t} = {inst} {ty} {lhs}, {rhs}"));
+        }
+        t
     }
 
     pub(super) fn emit_byte_ring_view_parts(&mut self, view: &MirExpr) -> Result<(String, String), CodegenError> {
@@ -2791,6 +3073,19 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{fp} = getelementptr inbounds %prim.signal, ptr {sptr}, i32 0, i32 0"
                 ));
                 self.emit_line(format!("store volatile i8 0, ptr {fp}, align 1"));
+            }
+            MirPrimNonBlockingOp::WaitQueuePrepare { target } => {
+                let wptr = self.resolve_prim_ptr(target)?;
+                self.emit_line(format!("{call_kw} void @__syn_wq_prepare(ptr {wptr})"));
+            }
+            MirPrimNonBlockingOp::WaitQueueCancel { target } => {
+                let wptr = self.resolve_prim_ptr(target)?;
+                self.emit_line(format!("{call_kw} void @__syn_wq_cancel(ptr {wptr})"));
+            }
+            MirPrimNonBlockingOp::WaitQueueWakeAll { target, boost } => {
+                let wptr = self.resolve_prim_ptr(target)?;
+                let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
+                self.emit_line(format!("{call_kw} void @__syn_wake_all_mask(ptr {wptr}, i32 {b})"));
             }
             MirPrimNonBlockingOp::PingPongFlip {
                 target,
@@ -3013,6 +3308,16 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             self.emit_line(format!(
                                 "{call_kw} void @__syn_nvic_pend_irq(i32 {})",
                                 i32v.repr
+                            ));
+                        }
+                    }
+                    "fuzz_irqs" => {
+                        if let (Some((seed, _)), Some((mask, _))) = (ev.first(), ev.get(1)) {
+                            let s32 = self.coerce(seed.clone(), "i32", false);
+                            let m32 = self.coerce(mask.clone(), "i32", false);
+                            self.emit_line(format!(
+                                "{call_kw} void @__syn_fuzz_irqs(i32 {}, i32 {})",
+                                s32.repr, m32.repr
                             ));
                         }
                     }

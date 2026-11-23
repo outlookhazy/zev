@@ -1,7 +1,7 @@
 use std::fs;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use zev_codegen_c::emit_c;
+use zev_codegen_llvm::{CodegenOptions, emit_llvm_ir_with_options};
 use zev_mir::lower_programs;
 use zev_parser::{collect_declared_generic_names, parse_str_named_with_generics};
 use zev_sema::analyze_and_monomorphize_programs;
@@ -62,7 +62,7 @@ fn load_example_sources() -> Vec<(String, String)> {
     out
 }
 
-fn exercise_full_c_pipeline(label: &str, src: &str) -> bool {
+fn exercise_full_llvm_pipeline(label: &str, src: &str) -> bool {
     let opts = AnalyzeOptions::default();
     let res = catch_unwind(AssertUnwindSafe(|| {
         let generics = collect_declared_generic_names(src);
@@ -74,9 +74,11 @@ fn exercise_full_c_pipeline(label: &str, src: &str) -> bool {
             return false;
         };
         if let Ok(mir) = lower_programs(&monos) {
-            let c_src = emit_c(&mir);
-            assert!(!c_src.is_empty(), "emit_c produced empty output");
-            return true;
+            let host_opts = CodegenOptions::host_linux();
+            if let Ok(ll_src) = emit_llvm_ir_with_options(&mir, &host_opts) {
+                assert!(!ll_src.is_empty(), "emit_llvm_ir_with_options produced empty output");
+                return true;
+            }
         }
         false
     }));
@@ -91,7 +93,7 @@ fn exercise_full_c_pipeline(label: &str, src: &str) -> bool {
                 "<non-string panic payload>".to_string()
             };
             let preview: String = src.chars().take(280).collect();
-            panic!("panic in MIR/C99 pipeline ({label}): {msg}\ninput preview: {preview:?}");
+            panic!("panic in MIR/LLVM pipeline ({label}): {msg}\ninput preview: {preview:?}");
         }
     }
 }
@@ -161,10 +163,12 @@ fn synthesize_program(rng: &mut XorShift64, idx: usize) -> String {
     if use_while {
         s.push_str(&format!(
             "    {ty} i = 0 as {ty};\n\
-                 while (i {cmp_op} ((n as {ty}) & (3 as {ty}))) {{\n\
-                     acc = acc + (i as u32);\n\
-                     i = i + (1 as {ty});\n\
-                     if (i >= (4 as {ty})) {{ break; }}\n\
+                 noyield {{\n\
+                     while (i {cmp_op} ((n as {ty}) & (3 as {ty}))) {{\n\
+                         acc = acc + (i as u32);\n\
+                         i = i + (1 as {ty});\n\
+                         if (i >= (4 as {ty})) {{ break; }}\n\
+                     }}\n\
                  }}\n"
         ));
     }
@@ -242,18 +246,18 @@ fn synthesize_program(rng: &mut XorShift64, idx: usize) -> String {
 }
 
 #[test]
-fn fuzz_mir_and_c_codegen_crash_freedom() {
+fn fuzz_mir_and_llvm_codegen_crash_freedom() {
     let mut rng = XorShift64::new(0xC0DE_99C9_1234_5678);
     let examples = load_example_sources();
     assert!(!examples.is_empty(), "expected examples/*.zev to exist");
 
     let mut total_cases = 0usize;
-    let mut reached_emit_c = 0usize;
+    let mut reached_llvm = 0usize;
 
     // 1. Seed directly with clean examples/*.zev and structural line-mutated variants (220 cases)
     for (i, (name, src)) in examples.iter().enumerate() {
-        if exercise_full_c_pipeline(&format!("clean_example_{name}_{i}"), src) {
-            reached_emit_c += 1;
+        if exercise_full_llvm_pipeline(&format!("clean_example_{name}_{i}"), src) {
+            reached_llvm += 1;
         }
         total_cases += 1;
     }
@@ -284,8 +288,8 @@ fn fuzz_mir_and_c_codegen_crash_freedom() {
                 format!("{src}\nfn fuzz_extra_{i}(x: u32) -> u32 {{ return x ^ 1; }}\n")
             }
         };
-        if exercise_full_c_pipeline(&format!("mut_example_{name}_{i}"), &mutated) {
-            reached_emit_c += 1;
+        if exercise_full_llvm_pipeline(&format!("mut_example_{name}_{i}"), &mutated) {
+            reached_llvm += 1;
         }
         total_cases += 1;
     }
@@ -293,15 +297,15 @@ fn fuzz_mir_and_c_codegen_crash_freedom() {
     // 2. Synthesized structured programs exercising structs/enums/generics/tasks/fmt_buf (340 cases)
     for i in 0..340 {
         let synth = synthesize_program(&mut rng, i);
-        if exercise_full_c_pipeline(&format!("synth_{i}"), &synth) {
-            reached_emit_c += 1;
+        if exercise_full_llvm_pipeline(&format!("synth_{i}"), &synth) {
+            reached_llvm += 1;
         }
         total_cases += 1;
     }
 
-    assert!(total_cases >= 550, "ran {total_cases} MIR/C fuzz cases");
+    assert!(total_cases >= 550, "ran {total_cases} MIR/LLVM fuzz cases");
     assert!(
-        reached_emit_c >= 150,
-        "expected many programs to lower all the way to C99, got {reached_emit_c}"
+        reached_llvm >= 150,
+        "expected many programs to lower all the way to LLVM IR, got {reached_llvm}"
     );
 }

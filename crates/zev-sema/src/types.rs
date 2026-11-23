@@ -70,6 +70,7 @@ pub enum PrimitiveKind {
     Pool,
     DmaSlot,
     ByteRing,
+    WaitQueue,
 }
 
 impl PrimitiveKind {
@@ -82,6 +83,7 @@ impl PrimitiveKind {
             Self::Pool => "pool",
             Self::DmaSlot => "dma_slot",
             Self::ByteRing => "byte_ring",
+            Self::WaitQueue => "wait_queue",
         }
     }
 
@@ -110,6 +112,7 @@ pub enum ResolvedOsPrimitive {
     DmaSlot { elem: Box<Ty> },
     ByteRing { cap: usize },
     ByteRingUnsized,
+    WaitQueue,
 }
 
 static BYTE_RING_ELEM_U8: Ty = Ty::Prim(PrimType::U8);
@@ -124,6 +127,7 @@ impl ResolvedOsPrimitive {
             Self::Pool { .. } => PrimitiveKind::Pool,
             Self::DmaSlot { .. } => PrimitiveKind::DmaSlot,
             Self::ByteRing { .. } | Self::ByteRingUnsized => PrimitiveKind::ByteRing,
+            Self::WaitQueue => PrimitiveKind::WaitQueue,
         }
     }
 
@@ -133,7 +137,7 @@ impl ResolvedOsPrimitive {
 
     pub fn elem_ty(&self) -> Option<&Ty> {
         match self {
-            Self::Signal => None,
+            Self::Signal | Self::WaitQueue => None,
             Self::Inbox { elem, .. }
             | Self::InboxUnsized { elem }
             | Self::Watch { elem }
@@ -147,6 +151,7 @@ impl ResolvedOsPrimitive {
     pub const fn capacity(&self) -> Option<usize> {
         match self {
             Self::Signal
+            | Self::WaitQueue
             | Self::Watch { .. }
             | Self::DmaSlot { .. }
             | Self::InboxUnsized { .. }
@@ -163,6 +168,7 @@ impl fmt::Display for ResolvedOsPrimitive {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Signal => write!(f, "signal"),
+            Self::WaitQueue => write!(f, "wait_queue"),
             Self::Inbox { elem, cap } => write!(f, "inbox<{}, {}>", elem, cap),
             Self::InboxUnsized { elem } => write!(f, "inbox<{}>", elem),
             Self::Watch { elem } => write!(f, "watch<{}>", elem),
@@ -521,7 +527,7 @@ impl Ty {
                 }
             }
             Self::OsPrimitive(p) => match p {
-                ResolvedOsPrimitive::Signal => 4,
+                ResolvedOsPrimitive::Signal | ResolvedOsPrimitive::WaitQueue => 4,
                 ResolvedOsPrimitive::Watch { elem } => elem.byte_size(ptr_bytes, structs) + 4,
                 ResolvedOsPrimitive::Inbox { elem, cap } => {
                     elem.byte_size(ptr_bytes, structs) * cap + 16

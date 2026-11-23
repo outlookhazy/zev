@@ -724,13 +724,13 @@ impl<'a> Parser<'a> {
 
     fn trap_p0004(&self, span: Span) -> ParseError {
         self.err_at(
-            "`select` multi-wait is omitted in Zev to keep task wait state O(1) and sequential",
+            "multi-source waiting is spelled `wait { ... }`, not `select` (and arms are polled deterministically top-to-bottom)",
             span,
         )
         .with_code("P0004")
         .with_doc_topic("primitives")
         .with_hint(
-            "pull typed events from an `inbox<Ev, 8>` followed by `switch (ev) { ... }`, or use sequential timeouts: `Ev ev = inbox.recv(timeout: 50ms) or Fallback;`",
+            "replace `select { ... }` with `wait { Cmd c = cmd_q.recv() => { ... } timeout 50ms => { ... } }` (evaluated top-to-bottom in deterministic priority order, unlike Go's random `select`)",
         )
     }
 
@@ -819,6 +819,27 @@ impl<'a> Parser<'a> {
         )
     }
 
+    fn trap_p0014(
+        &self,
+        msg: impl Into<String>,
+        hint: impl Into<String>,
+        span: Span,
+    ) -> ParseError {
+        self.err_at(msg, span)
+            .with_code("P0014")
+            .with_doc_topic("syntax")
+            .with_hint(hint)
+    }
+
+    fn type_snippet(&self, span: Span) -> String {
+        self.source
+            .get(span.start as usize..span.end as usize)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("T")
+            .to_owned()
+    }
+
     fn trap_p0009_lifetime(&self, lt: &str, span: Span) -> ParseError {
         self.err_at(
             format!(
@@ -843,7 +864,7 @@ impl<'a> Parser<'a> {
         .with_code("P0009")
         .with_doc_topic("dma")
         .with_hint(
-            "declare pointer parameters as `T *p` or `*T p`, slices as `[]T`, and pass `&x` at call sites (scope depth and DMA leases are verified automatically)",
+            "declare pointer parameters as `*T p`, slices as `[]T`, and pass `&x` at call sites (scope depth and DMA leases are verified automatically)",
         )
     }
 
@@ -2479,7 +2500,7 @@ impl<'a> Parser<'a> {
         // Optional `const` qualifier on types (e.g. `*const u8` or `const u8*`)
         let _ = self.eat(&TokenKind::KwConst);
 
-        let mut ty = match self.peek_kind() {
+        let ty = match self.peek_kind() {
             TokenKind::Star => {
                 self.bump();
                 if self.at(&TokenKind::KwMut) {
@@ -2553,6 +2574,10 @@ impl<'a> Parser<'a> {
                     "signal" if self.peek_n_kind(1) != TokenKind::Dot => {
                         let tok = self.bump();
                         TypeExpr::new(TypeKind::OsPrimitive(OsPrimitiveType::Signal), tok.span)
+                    }
+                    "wait_queue" if self.peek_n_kind(1) != TokenKind::Dot => {
+                        let tok = self.bump();
+                        TypeExpr::new(TypeKind::OsPrimitive(OsPrimitiveType::WaitQueue), tok.span)
                     }
                     "watch" if self.peek_n_kind(1) == TokenKind::Lt => {
                         self.bump();
@@ -2748,32 +2773,48 @@ impl<'a> Parser<'a> {
             }
         };
 
-        // Postfix type modifiers: `T*`, `T[]`, `T[N]`
-        loop {
-            if self.eat(&TokenKind::Star) {
-                let _ = self.eat(&TokenKind::KwConst);
+        // Reject postfix C-style modifiers (`T*`, `T[]`, `T[N]`) with `P0014` -> canonical `*T`, `[]T`, `[N]T`.
+        if self.at(&TokenKind::Star) {
+            self.bump();
+            let _ = self.eat(&TokenKind::KwConst);
+            let span = ty.span.merge(self.prev_span());
+            let ty_str = self.type_snippet(ty.span);
+            return Err(self.trap_p0014(
+                format!(
+                    "postfix pointer `{ty_str}*` is not valid in Zev; write prefix `*{ty_str}`"
+                ),
+                format!("replace `{ty_str}*` / `{ty_str} *name` with prefix `*{ty_str}` / `*{ty_str} name`"),
+                span,
+            ));
+        }
+        if self.at(&TokenKind::LBracket) {
+            self.bump();
+            if self.eat(&TokenKind::RBracket) {
                 let span = ty.span.merge(self.prev_span());
-                ty = TypeExpr::new(TypeKind::Ptr(Box::new(ty)), span);
-            } else if self.at(&TokenKind::LBracket) {
-                self.bump();
-                if self.eat(&TokenKind::RBracket) {
-                    let span = ty.span.merge(self.prev_span());
-                    ty = TypeExpr::new(TypeKind::Slice(Box::new(ty)), span);
-                } else {
-                    let len = self.parse_array_len()?;
-                    let rb = self.expect(&TokenKind::RBracket)?;
-                    let span = ty.span.merge(rb.span);
-                    ty = TypeExpr::new(
-                        TypeKind::Array {
-                            elem: Box::new(ty),
-                            len,
-                        },
-                        span,
-                    );
-                }
-            } else {
-                break;
+                let ty_str = self.type_snippet(ty.span);
+                return Err(self.trap_p0014(
+                    format!(
+                        "postfix slice `{ty_str}[]` is not valid in Zev; write prefix `[]{ty_str}`"
+                    ),
+                    format!("replace `{ty_str}[]` with prefix slice syntax `[]{ty_str}`"),
+                    span,
+                ));
             }
+            let len = self.parse_array_len()?;
+            let rb = self.expect(&TokenKind::RBracket)?;
+            let span = ty.span.merge(rb.span);
+            let ty_str = self.type_snippet(ty.span);
+            let len_str = match &len {
+                ArrayLen::Fixed(n) => n.to_string(),
+                ArrayLen::Expr(_) => "N".to_string(),
+            };
+            return Err(self.trap_p0014(
+                format!(
+                    "postfix array `{ty_str}[{len_str}]` is not valid in Zev; write prefix `[{len_str}]{ty_str}`"
+                ),
+                format!("replace `{ty_str}[{len_str}]` with prefix array syntax `[{len_str}]{ty_str}`"),
+                span,
+            ));
         }
 
         Ok(ty)
@@ -2806,7 +2847,7 @@ impl<'a> Parser<'a> {
         Ok(params)
     }
 
-    /// Parse `Type name` (including C-style `Type *name`, `Type name[N]`, and `Ret (*cb)(Args...)`).
+    /// Parse canonical `Type name` (rejecting C-style `Type *name`, `Type name[N]`, and `Ret (*cb)(Args...)` with `P0014`).
     fn parse_typed_declarator(&mut self, context: &str) -> Result<(TypeExpr, Ident), ParseError> {
         self.parse_typed_declarator_inner(context, false)
     }
@@ -2821,7 +2862,7 @@ impl<'a> Parser<'a> {
             return Err(self.trap_p0001("mut", start));
         }
 
-        let mut ty = self.parse_type().map_err(|e| {
+        let ty = self.parse_type().map_err(|e| {
             if e.code.is_some() {
                 e
             } else {
@@ -2838,22 +2879,31 @@ impl<'a> Parser<'a> {
             return Err(self.trap_p0001("mut", self.peek_span()));
         }
 
-        // Check C-style function pointer declarator: `RetType (*name)(ParamTypes...)`
+        // Reject C-style function pointer declarator: `RetType (*name)(ParamTypes...)` (`P0014`)
         if self.at(&TokenKind::LParen) && self.peek_n_kind(1) == TokenKind::Star {
             self.bump(); // `(`
             self.bump(); // `*`
             let name = self.parse_ident()?;
             self.expect(&TokenKind::RParen)?;
-            let fn_params = self.parse_fn_ptr_param_types()?;
+            let _fn_params = self.parse_fn_ptr_param_types()?;
             let span = start.merge(self.prev_span());
-            let fn_ty = TypeExpr::new(
-                TypeKind::FnPtr {
-                    params: fn_params,
-                    ret: Box::new(ty),
-                },
+            let ret_str = self.type_snippet(ty.span);
+            let hint = if ret_str == "void" {
+                format!("use Zev function-pointer syntax: `fn(...) {}`", name.name)
+            } else {
+                format!(
+                    "use Zev function-pointer syntax: `fn(...) -> {ret_str} {}`",
+                    name.name
+                )
+            };
+            return Err(self.trap_p0014(
+                format!(
+                    "C-style function pointer declarator `(*{})` is not valid in Zev",
+                    name.name
+                ),
+                hint,
                 span,
-            );
-            return Ok((fn_ty, name));
+            ));
         }
 
         let name = if allow_keyword_name {
@@ -2862,24 +2912,39 @@ impl<'a> Parser<'a> {
             self.parse_ident()?
         };
 
-        // Trailing C-style array declarator on variable/field name: `u8 buf[16]`
-        while self.at(&TokenKind::LBracket) {
+        // Reject trailing C-style array declarator on variable/field name (`u8 buf[16]` / `u8 buf[]`) (`P0014`)
+        if self.at(&TokenKind::LBracket) {
+            let ty_str = self.type_snippet(ty.span);
             self.bump();
             if self.eat(&TokenKind::RBracket) {
-                let span = ty.span.merge(self.prev_span());
-                ty = TypeExpr::new(TypeKind::Slice(Box::new(ty)), span);
-            } else {
-                let len = self.parse_array_len()?;
-                let rb = self.expect(&TokenKind::RBracket)?;
-                let span = ty.span.merge(rb.span);
-                ty = TypeExpr::new(
-                    TypeKind::Array {
-                        elem: Box::new(ty),
-                        len,
-                    },
+                let span = start.merge(self.prev_span());
+                return Err(self.trap_p0014(
+                    format!(
+                        "C-style slice declarator `{ty_str} {}[]` is not valid in Zev; write `[]{ty_str} {}`",
+                        name.name, name.name
+                    ),
+                    format!("rewrite `{ty_str} {}[]` as `[]{ty_str} {}`", name.name, name.name),
                     span,
-                );
+                ));
             }
+            let len = self.parse_array_len()?;
+            let rb = self.expect(&TokenKind::RBracket)?;
+            let span = start.merge(rb.span);
+            let len_str = match &len {
+                ArrayLen::Fixed(n) => n.to_string(),
+                ArrayLen::Expr(_) => "N".to_string(),
+            };
+            return Err(self.trap_p0014(
+                format!(
+                    "C-style array declarator `{ty_str} {}[{len_str}]` is not valid in Zev; write `[{len_str}]{ty_str} {}`",
+                    name.name, name.name
+                ),
+                format!(
+                    "rewrite `{ty_str} {}[{len_str}]` as `[{len_str}]{ty_str} {}`",
+                    name.name, name.name
+                ),
+                span,
+            ));
         }
 
         Ok((ty, name))
@@ -3140,6 +3205,11 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::with_attrs(attrs, StmtKind::Critical { body }, span))
             }
             TokenKind::KwSwitch => self.parse_switch_stmt(attrs, start),
+            TokenKind::Ident(ref s)
+                if s == "wait" && self.peek_n_kind(1) == TokenKind::LBrace =>
+            {
+                self.parse_wait_stmt(attrs, start)
+            }
             TokenKind::KwSpawn => self.parse_spawn_stmt(attrs, start),
             TokenKind::KwContinue => {
                 self.bump();
@@ -3375,30 +3445,64 @@ impl<'a> Parser<'a> {
         ok
     }
 
-    /// Speculatively check whether the upcoming tokens form a C-style local variable declaration
-    /// (`Type name = ...;` or `Type name;`).
+    /// Speculatively check whether the upcoming tokens form a local variable declaration
+    /// (`Type name = ...;` or `Type name;`), including C-style declarators to emit `P0014`.
     fn looks_like_var_decl(&mut self) -> bool {
+        let mut starts_with_known_type = false;
         match self.peek_kind() {
-            TokenKind::KwConst | TokenKind::KwFn | TokenKind::Star | TokenKind::LBracket => {}
+            TokenKind::KwConst | TokenKind::KwFn => {
+                starts_with_known_type = true;
+            }
+            TokenKind::Star | TokenKind::LBracket => {}
             TokenKind::Ident(ref s) => {
-                if PrimType::from_name(s).is_some()
+                if self.is_value_name(s) {
+                    return false;
+                }
+                if (PrimType::from_name(s).is_some()
+                    || matches!(
+                        s.as_str(),
+                        "signal"
+                            | "watch"
+                            | "inbox"
+                            | "byte_ring"
+                            | "ping_pong"
+                            | "pool"
+                            | "dma_slot"
+                            | "wait_queue"
+                            | "Lease"
+                    ))
                     && self.peek_n_kind(1) != TokenKind::Dot
                     && self.peek_n_kind(1) != TokenKind::KwMut
                 {
-                    return true;
+                    starts_with_known_type = true;
                 }
             }
             _ => return false,
         }
 
         let cp = self.save();
-        let ok = match self.parse_typed_declarator("lookahead") {
-            Ok((_, _)) => matches!(self.peek_kind(), TokenKind::Eq | TokenKind::Semi),
-            Err(ref e) if e.code.is_some() => {
-                // If `parse_typed_declarator` hit an explicit foreign-idiom trap (e.g. `u16 mut x = 1;`
-                // or `*mut u8 p = ...;` or `Reader<'a> r = ...;`), let the caller re-run it to report that trap!
-                true
+        let ok = match self.parse_type() {
+            Ok(_) => {
+                if self.at(&TokenKind::KwMut) {
+                    true
+                } else if self.at(&TokenKind::LParen) && self.peek_n_kind(1) == TokenKind::Star {
+                    // C-style `Ret (*cb)(Args...)` -> surface P0014 in `parse_typed_declarator`.
+                    true
+                } else if self.parse_ident().is_ok() {
+                    if self.at(&TokenKind::LBracket) {
+                        // e.g. `u8 buf[16]` / `Foo buf[16]` -> surface P0014.
+                        true
+                    } else {
+                        matches!(self.peek_kind(), TokenKind::Eq | TokenKind::Semi)
+                    }
+                } else {
+                    false
+                }
             }
+            Err(ref e) if e.code == Some("P0014") => {
+                starts_with_known_type || matches!(self.peek_kind(), TokenKind::Ident(_))
+            }
+            Err(ref e) if e.code.is_some() => true,
             Err(_) => false,
         };
         self.restore(cp);
@@ -3557,7 +3661,7 @@ impl<'a> Parser<'a> {
             Err(e) => {
                 // Preserve specific type traps like `chan<...>` (`P0012`), `lease<...>` (`P0013`),
                 // or `&mut`/`'a` (`P0009`); map untyped / C-style `for (i = 0; ...)` or `for (let i ...)` to `P0008`.
-                if matches!(e.code, Some("P0009" | "P0012" | "P0013")) {
+                if matches!(e.code, Some("P0009" | "P0012" | "P0013" | "P0014")) {
                     return Err(e);
                 }
                 return Err(self.trap_p0008(start.merge(self.peek_span())));
@@ -3691,6 +3795,99 @@ impl<'a> Parser<'a> {
             StmtKind::Switch { scrutinee, arms },
             start.merge(rb.span),
         ))
+    }
+
+    fn parse_wait_stmt(&mut self, attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
+        self.bump(); // `wait`
+        self.expect(&TokenKind::LBrace)?;
+        let mut arms = Vec::new();
+        let mut timer: Option<WaitTimerArm> = None;
+
+        while !self.at(&TokenKind::RBrace) && !self.at(&TokenKind::Eof) {
+            let arm_start = self.peek_span();
+            let timer_kind = match self.peek_kind() {
+                TokenKind::Ident(ref s)
+                    if s == "timeout" && self.peek_n_kind(1) != TokenKind::Dot =>
+                {
+                    Some(WaitTimerKind::Timeout)
+                }
+                TokenKind::Ident(ref s)
+                    if s == "deadline" && self.peek_n_kind(1) != TokenKind::Dot =>
+                {
+                    Some(WaitTimerKind::Deadline)
+                }
+                _ => None,
+            };
+
+            if let Some(kind) = timer_kind {
+                self.bump(); // `timeout` or `deadline`
+                let expr = self.parse_expr()?;
+                self.expect(&TokenKind::FatArrow)?;
+                let body = self.parse_wait_arm_body()?;
+                let arm_span = arm_start.merge(body.span);
+                if timer.is_some() {
+                    return Err(self
+                        .err_at(
+                            "`wait { ... }` allows at most one `timeout` or `deadline` timer arm",
+                            arm_span,
+                        )
+                        .with_doc_topic("primitives"));
+                }
+                timer = Some(WaitTimerArm {
+                    kind,
+                    expr,
+                    body,
+                    span: arm_span,
+                });
+                continue;
+            }
+
+            let bind = self.try_parse_wait_arm_bind()?;
+            let call = self.parse_expr()?;
+            self.expect(&TokenKind::FatArrow)?;
+            let body = self.parse_wait_arm_body()?;
+            let arm_span = arm_start.merge(body.span);
+            arms.push(WaitArm {
+                bind,
+                call,
+                body,
+                span: arm_span,
+            });
+        }
+
+        let rb = self.expect(&TokenKind::RBrace)?;
+        Ok(Stmt::with_attrs(
+            attrs,
+            StmtKind::Wait { arms, timer },
+            start.merge(rb.span),
+        ))
+    }
+
+    fn try_parse_wait_arm_bind(&mut self) -> Result<Option<(TypeExpr, Ident)>, ParseError> {
+        let cp = self.save();
+        if let Ok(ty) = self.parse_type() {
+            if matches!(self.peek_kind(), TokenKind::Ident(_))
+                && self.peek_n_kind(1) == TokenKind::Eq
+            {
+                let name = self.parse_ident()?;
+                self.bump(); // `=`
+                return Ok(Some((ty, name)));
+            }
+        }
+        self.restore(cp);
+        Ok(None)
+    }
+
+    fn parse_wait_arm_body(&mut self) -> Result<Block, ParseError> {
+        if self.at(&TokenKind::LBrace) {
+            let b = self.parse_block()?;
+            let _ = self.eat(&TokenKind::Comma);
+            Ok(b)
+        } else {
+            let stmt = self.parse_switch_single_arm_stmt()?;
+            let s_span = stmt.span;
+            Ok(Block::new(vec![stmt], s_span))
+        }
     }
 
     fn parse_switch_pat(&mut self) -> Result<SwitchPat, ParseError> {
@@ -4078,9 +4275,9 @@ impl<'a> Parser<'a> {
             _ => {}
         }
 
-        // Check C-style cast `(PrimType)expr` or `(*PrimType)expr`
+        // Check prefix cast `(PrimType)expr` or `(*Type)expr`
         if self.at(&TokenKind::LParen) {
-            if let Some(ty) = self.try_parse_c_cast_type() {
+            if let Some(ty) = self.try_parse_c_cast_type()? {
                 let inner = self.parse_unary_expr()?;
                 let span = start.merge(inner.span);
                 return Ok(Expr::new(
@@ -4119,22 +4316,30 @@ impl<'a> Parser<'a> {
     }
 
     /// Speculatively check if `(` starts a C-style cast involving a built-in `PrimType`
-    /// or a pointer type (`*T`, `T*`, `(*MyStruct)vp`, `(MyStruct*)vp`, `(*mod.MyStruct)vp`).
-    fn try_parse_c_cast_type(&mut self) -> Option<TypeExpr> {
+    /// or a prefix pointer type `(*MyStruct)vp` (trapping `(MyStruct*)vp` as `P0014`).
+    fn try_parse_c_cast_type(&mut self) -> Result<Option<TypeExpr>, ParseError> {
         let cp = self.save();
         self.bump(); // `(`
         let ty = match self.parse_type() {
             Ok(t) if self.is_valid_c_cast_type(&t) => t,
+            Err(e)
+                if e.code == Some("P0014")
+                    && e.message.contains("pointer")
+                    && self.eat(&TokenKind::RParen)
+                    && self.can_start_unary_expr() =>
+            {
+                return Err(e);
+            }
             _ => {
                 self.restore(cp);
-                return None;
+                return Ok(None);
             }
         };
         if !self.eat(&TokenKind::RParen) || !self.can_start_unary_expr() {
             self.restore(cp);
-            return None;
+            return Ok(None);
         }
-        Some(ty)
+        Ok(Some(ty))
     }
 
     fn is_valid_c_cast_type(&self, ty: &TypeExpr) -> bool {

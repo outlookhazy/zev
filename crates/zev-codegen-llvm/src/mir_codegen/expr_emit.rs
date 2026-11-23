@@ -79,16 +79,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let idx_val = self.coerce(iv, idx_ty, !idx_expr.ty.is_unsigned()).repr;
             let eff_idx = if let Some(alen) = array_len {
                 if alen == 0 {
-                    "0".to_string()
+                    self.emit_bounds_check("false", 3);
                 } else {
                     let inb = self.next_tmp();
-                    let clamped = self.next_tmp();
                     self.emit_line(format!("{inb} = icmp ult {idx_ty} {idx_val}, {alen}"));
-                    self.emit_line(format!(
-                        "{clamped} = select i1 {inb}, {idx_ty} {idx_val}, {idx_ty} 0"
-                    ));
-                    clamped
+                    self.emit_bounds_check(&inb, 3);
                 }
+                idx_val
             } else {
                 idx_val
             };
@@ -177,15 +174,35 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
                     let sl = self.next_tmp();
                     let data_p = self.next_tmp();
+                    let sl_len = self.next_tmp();
+                    let inb = self.next_tmp();
                     let ep = self.next_tmp();
                     self.emit_line(format!("{sl} = load {sl_ty}, ptr {bptr}, align 4"));
                     self.emit_line(format!("{data_p} = extractvalue {sl_ty} {sl}, 0"));
+                    self.emit_line(format!("{sl_len} = extractvalue {sl_ty} {sl}, 1"));
+                    self.emit_line(format!(
+                        "{inb} = icmp ult {usize_ty} {}, {sl_len}",
+                        ic.repr
+                    ));
+                    self.emit_bounds_check(&inb, 1);
                     self.emit_line(format!(
                         "{ep} = getelementptr {ety}, ptr {data_p}, {usize_ty} {}",
                         ic.repr
                     ));
                     Ok((ep, elem_ty.clone(), bpacked))
                 } else {
+                    if let MirType::Array { len, .. } = &bty {
+                        if *len == 0 {
+                            self.emit_bounds_check("false", 1);
+                        } else {
+                            let inb = self.next_tmp();
+                            self.emit_line(format!(
+                                "{inb} = icmp ult {usize_ty} {}, {len}",
+                                ic.repr
+                            ));
+                            self.emit_bounds_check(&inb, 1);
+                        }
+                    }
                     let aty = self.ctx.llvm_ty(&bty);
                     let ep = self.next_tmp();
                     self.emit_line(format!(
@@ -478,7 +495,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         );
                         let items_base = self.next_tmp();
                         self.emit_line(format!(
-                            "{items_base} = getelementptr inbounds {pty}, ptr {}, i32 0, i32 4, i32 0",
+                            "{items_base} = getelementptr inbounds {pty}, ptr {}, i32 0, i32 6, i32 0",
                             pc.repr
                         ));
                         let v0 = self.next_tmp();
@@ -727,14 +744,34 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
                     let bv = self.emit_expr(base)?;
                     let dp = self.next_tmp();
+                    let sl_len = self.next_tmp();
+                    let inb = self.next_tmp();
                     let ep = self.next_tmp();
                     self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", bv.repr));
+                    self.emit_line(format!("{sl_len} = extractvalue {sl_ty} {}, 1", bv.repr));
+                    self.emit_line(format!(
+                        "{inb} = icmp ult {usize_ty} {}, {sl_len}",
+                        ic.repr
+                    ));
+                    self.emit_bounds_check(&inb, 1);
                     self.emit_line(format!(
                         "{ep} = getelementptr {ety}, ptr {dp}, {usize_ty} {}",
                         ic.repr
                     ));
                     Ok(self.load_from_place_ptr(&ep, &expr.ty, false))
                 } else if let Some((bp, bty, packed)) = self.try_emit_rodata_const_ptr(base)? {
+                    if let MirType::Array { len, .. } = &bty {
+                        if *len == 0 {
+                            self.emit_bounds_check("false", 1);
+                        } else {
+                            let inb = self.next_tmp();
+                            self.emit_line(format!(
+                                "{inb} = icmp ult {usize_ty} {}, {len}",
+                                ic.repr
+                            ));
+                            self.emit_bounds_check(&inb, 1);
+                        }
+                    }
                     let blty = self.ctx.llvm_ty(&bty);
                     let ep = self.next_tmp();
                     self.emit_line(format!(
@@ -743,6 +780,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     ));
                     Ok(self.load_from_place_ptr(&ep, &expr.ty, packed))
                 } else {
+                    if let MirType::Array { len, .. } = &base.ty {
+                        if *len == 0 {
+                            self.emit_bounds_check("false", 1);
+                        } else {
+                            let inb = self.next_tmp();
+                            self.emit_line(format!(
+                                "{inb} = icmp ult {usize_ty} {}, {len}",
+                                ic.repr
+                            ));
+                            self.emit_bounds_check(&inb, 1);
+                        }
+                    }
                     let bv = self.emit_expr(base)?;
                     let (tmp, al) = self.emit_temp_alloca(&bv.ty);
                     let ep = self.next_tmp();
@@ -811,48 +860,41 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         (p, bl)
                     };
 
-                // Clamp `start` and `end` to `[0, base_len]` with `end >= start` (matching `syn_subslice_u8`)
-                let st_gt = self.next_tmp();
-                let st_cl = self.next_tmp();
-                let en_gt = self.next_tmp();
-                let en_cl0 = self.next_tmp();
-                let en_lt_st = self.next_tmp();
-                let en_cl = self.next_tmp();
+                // Enforce `start <= end && end <= base_len` via uniform `@__syn_panic(i8 2)` trap.
+                let ok_ord = self.next_tmp();
+                let ok_end = self.next_tmp();
+                let ok_all = self.next_tmp();
+                self.emit_line(format!(
+                    "{ok_ord} = icmp ule {usize_ty} {}, {}",
+                    st_c.repr, en_c.repr
+                ));
+                self.emit_line(format!(
+                    "{ok_end} = icmp ule {usize_ty} {}, {base_len}",
+                    en_c.repr
+                ));
+                self.emit_line(format!("{ok_all} = and i1 {ok_ord}, {ok_end}"));
+                self.emit_bounds_check(&ok_all, 2);
+
                 let is_null = self.next_tmp();
                 let gep_p = self.next_tmp();
                 let sub_p = self.next_tmp();
-                let cl_len = self.next_tmp();
+                let sub_len = self.next_tmp();
                 let r0 = self.next_tmp();
                 let r1 = self.next_tmp();
-
-                self.emit_line(format!(
-                    "{st_gt} = icmp ugt {usize_ty} {}, {base_len}",
-                    st_c.repr
-                ));
-                self.emit_line(format!(
-                    "{st_cl} = select i1 {st_gt}, {usize_ty} {base_len}, {usize_ty} {}",
-                    st_c.repr
-                ));
-                self.emit_line(format!(
-                    "{en_gt} = icmp ugt {usize_ty} {}, {base_len}",
-                    en_c.repr
-                ));
-                self.emit_line(format!(
-                    "{en_cl0} = select i1 {en_gt}, {usize_ty} {base_len}, {usize_ty} {}",
-                    en_c.repr
-                ));
-                self.emit_line(format!("{en_lt_st} = icmp ult {usize_ty} {en_cl0}, {st_cl}"));
-                self.emit_line(format!(
-                    "{en_cl} = select i1 {en_lt_st}, {usize_ty} {st_cl}, {usize_ty} {en_cl0}"
-                ));
                 self.emit_line(format!("{is_null} = icmp eq ptr {base_ptr}, null"));
                 self.emit_line(format!(
-                    "{gep_p} = getelementptr {ety}, ptr {base_ptr}, {usize_ty} {st_cl}"
+                    "{gep_p} = getelementptr {ety}, ptr {base_ptr}, {usize_ty} {}",
+                    st_c.repr
                 ));
                 self.emit_line(format!("{sub_p} = select i1 {is_null}, ptr null, ptr {gep_p}"));
-                self.emit_line(format!("{cl_len} = sub {usize_ty} {en_cl}, {st_cl}"));
+                self.emit_line(format!(
+                    "{sub_len} = sub {usize_ty} {}, {}",
+                    en_c.repr, st_c.repr
+                ));
                 self.emit_line(format!("{r0} = insertvalue {sl_ty} poison, ptr {sub_p}, 0"));
-                self.emit_line(format!("{r1} = insertvalue {sl_ty} {r0}, {usize_ty} {cl_len}, 1"));
+                self.emit_line(format!(
+                    "{r1} = insertvalue {sl_ty} {r0}, {usize_ty} {sub_len}, 1"
+                ));
                 Ok(SsaVal::new(sl_ty, r1))
             }
             MirExprKind::ArrayToSlice {
@@ -1026,6 +1068,16 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{v} = {call_kw} {ety} @__syn_watch_read_{id}(ptr {wptr})"));
                 Ok(SsaVal::new(ety, v))
             }
+            MirPrimReadOp::WatchGen { target, elem_ty } => {
+                let pk = MirPrimKind::Watch {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let id = sanitize_ident(&pk.mangle_name());
+                let wptr = self.resolve_prim_ptr(target)?;
+                let g = self.next_tmp();
+                self.emit_line(format!("{g} = {call_kw} i32 @__syn_watch_gen_{id}(ptr {wptr})"));
+                Ok(SsaVal::new("i32", g))
+            }
             MirPrimReadOp::InboxTryRecv {
                 target,
                 elem_ty,
@@ -1152,6 +1204,15 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 Ok(SsaVal::new("i8", ok))
             }
+            MirPrimReadOp::WaitQueueWakeOne { target, boost } => {
+                let wptr = self.resolve_prim_ptr(target)?;
+                let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
+                let ok = self.next_tmp();
+                self.emit_line(format!(
+                    "{ok} = {call_kw} i8 @__syn_wake_one_mask(ptr {wptr}, i32 {b})"
+                ));
+                Ok(SsaVal::new("i8", ok))
+            }
             MirPrimReadOp::PingPongDmaBuf {
                 target,
                 elem_ty,
@@ -1180,10 +1241,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{wh} = load i8, ptr {wh_p}, align 1"));
                 self.emit_line(format!("{is_b0} = icmp eq i8 {wh}, 0"));
                 self.emit_line(format!(
-                    "{b0} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 4, i32 0"
+                    "{b0} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 5, i32 0"
                 ));
                 self.emit_line(format!(
-                    "{b1} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 5, i32 0"
+                    "{b1} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 6, i32 0"
                 ));
                 self.emit_line(format!("{buf_p} = select i1 {is_b0}, ptr {b0}, ptr {b1}"));
                 self.emit_line(format!("{s0} = insertvalue {sl_ty} poison, ptr {buf_p}, 0"));
@@ -1205,7 +1266,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let b0 = self.next_tmp();
                 let addr = self.next_tmp();
                 self.emit_line(format!(
-                    "{b0} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 4, i32 0"
+                    "{b0} = getelementptr inbounds {pp_ty}, ptr {pptr}, i32 0, i32 5, i32 0"
                 ));
                 self.emit_line(format!("{addr} = ptrtoint ptr {b0} to {usize_ty}"));
                 Ok(SsaVal::new(usize_ty, addr))
@@ -2219,14 +2280,22 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             return Ok(SsaVal::new("i8", b8));
         }
 
+        if matches!(op, MirBinOp::Div | MirBinOp::Rem) {
+            let t = self.emit_checked_int_div_rem(
+                &common_ty,
+                &lc.repr,
+                &rc.repr,
+                signed,
+                matches!(op, MirBinOp::Rem),
+            );
+            let dst_lty = self.ctx.llvm_ty(&res_ty.host_value_type());
+            return Ok(self.coerce(SsaVal::new(common_ty, t), &dst_lty, !res_ty.is_unsigned()));
+        }
+
         let inst = match (op, signed) {
             (MirBinOp::Add, _) => "add",
             (MirBinOp::Sub, _) => "sub",
             (MirBinOp::Mul, _) => "mul",
-            (MirBinOp::Div, true) => "sdiv",
-            (MirBinOp::Div, false) => "udiv",
-            (MirBinOp::Rem, true) => "srem",
-            (MirBinOp::Rem, false) => "urem",
             (MirBinOp::BitOr, _) => "or",
             (MirBinOp::BitAnd, _) => "and",
             (MirBinOp::BitXor, _) => "xor",

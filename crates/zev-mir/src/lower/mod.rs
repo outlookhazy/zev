@@ -19,8 +19,8 @@ pub(super) use crate::ir::{
     MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPlace, MirPrimKind,
     MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirPrimitive, MirPriority,
     MirSpawnInstance, MirStmt, MirStruct, MirSubsystemGlobal, MirSwitchPattern, MirSysQuery,
-    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirYieldKind,
-    MonomorphizedItemKind, MonomorphizedMirItem, VarId, VarRole,
+    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm, MirWaitArmOp,
+    MirWaitTimer, MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem, VarId, VarRole,
 };
 pub(super) use crate::liveness::{analyze_fn_frame, analyze_isr_frame, analyze_task_frame};
 pub(super) use crate::ram::{populate_module_ram_report, RamReport};
@@ -289,6 +289,7 @@ impl ModuleSymbols {
     pub(super) fn resolve_os_prim_type(&self, op: &OsPrimitiveType) -> MirPrimKind {
         match op {
             OsPrimitiveType::Signal => MirPrimKind::Signal,
+            OsPrimitiveType::WaitQueue => MirPrimKind::WaitQueue,
             OsPrimitiveType::Watch { elem } => MirPrimKind::Watch {
                 elem: Box::new(self.resolve_type(elem)),
             },
@@ -1138,6 +1139,7 @@ pub(super) fn lower_coroutine_fn_decl(
         sig.error_spec.clone(),
         manual_yield,
     );
+    cctx.is_yielding_fn = true;
     let mut param_ids = Vec::new();
     for p in &fd.params {
         let pty = syms.resolve_type(&p.ty);

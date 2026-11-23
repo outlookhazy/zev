@@ -354,6 +354,13 @@ pub(super) fn ast_stmts_have_break(stmts: &[Stmt]) -> bool {
                     return true;
                 }
             }
+            StmtKind::Wait { arms, timer } => {
+                if arms.iter().any(|a| ast_block_has_break(&a.body))
+                    || timer.as_ref().is_some_and(|t| ast_block_has_break(&t.body))
+                {
+                    return true;
+                }
+            }
             StmtKind::NoYield { body } | StmtKind::Critical { body } | StmtKind::Block(body) => {
                 if ast_block_has_break(body) {
                     return true;
@@ -451,6 +458,13 @@ pub(super) fn scan_stmts_effect(
                     } else if !stmt_manual {
                         *eff = (*eff).max(MirFnEffect::SoftYielding);
                     }
+                } else if !is_while_true
+                    && !in_noyield
+                    && !in_restricted
+                    && !stmt_manual
+                    && caller != "main"
+                {
+                    *eff = (*eff).max(MirFnEffect::SoftYielding);
                 }
                 scan_stmts_effect(
                     caller,
@@ -563,6 +577,37 @@ pub(super) fn scan_stmts_effect(
                     scan_stmts_effect(
                         caller,
                         &arm.body.stmts,
+                        stmt_manual,
+                        in_noyield,
+                        in_restricted,
+                        eff,
+                        spawns,
+                        edges,
+                    );
+                }
+            }
+            StmtKind::Wait { arms, timer } => {
+                if !in_noyield && !in_restricted {
+                    *eff = (*eff).max(MirFnEffect::HardBlocking);
+                }
+                for arm in arms {
+                    scan_expr_effect(caller, &arm.call, in_noyield, in_restricted, eff, spawns, edges);
+                    scan_stmts_effect(
+                        caller,
+                        &arm.body.stmts,
+                        stmt_manual,
+                        in_noyield,
+                        in_restricted,
+                        eff,
+                        spawns,
+                        edges,
+                    );
+                }
+                if let Some(t) = timer {
+                    scan_expr_effect(caller, &t.expr, in_noyield, in_restricted, eff, spawns, edges);
+                    scan_stmts_effect(
+                        caller,
+                        &t.body.stmts,
                         stmt_manual,
                         in_noyield,
                         in_restricted,
@@ -794,6 +839,19 @@ pub(super) fn stmt_contains_boot_spawn(stmt: &Stmt, syms: &ModuleSymbols) -> boo
                         .iter()
                         .any(|s| stmt_contains_boot_spawn(s, syms))
                 })
+        }
+        StmtKind::Wait { arms, timer } => {
+            arms.iter().any(|a| {
+                a.body
+                    .stmts
+                    .iter()
+                    .any(|s| stmt_contains_boot_spawn(s, syms))
+            }) || timer.as_ref().is_some_and(|t| {
+                t.body
+                    .stmts
+                    .iter()
+                    .any(|s| stmt_contains_boot_spawn(s, syms))
+            })
         }
         StmtKind::Block(b) | StmtKind::NoYield { body: b } | StmtKind::Critical { body: b } => {
             b.stmts.iter().any(|s| stmt_contains_boot_spawn(s, syms))
@@ -1548,6 +1606,13 @@ pub(super) fn lower_main_entry<'a>(
 
         let prio = detect_static_set_priority(tail_slice).unwrap_or(MirPriority::Normal);
         let slot_id = spawned_tasks.len();
+        if slot_id >= 32 {
+            return Err(MirLowerError {
+                message: "program exceeds the 32-task static scheduler limit (`MAX_TASKS = 32` including `main` supervisor)"
+                    .to_string(),
+                span: md.span,
+            });
+        }
         spawned_tasks.push(MirSpawnInstance {
             slot_id,
             instance_name: "main".to_string(),
@@ -1668,6 +1733,16 @@ pub(super) fn collect_ast_idents_stmts(stmts: &[Stmt], out: &mut BTreeSet<String
                 collect_ast_idents_expr(scrutinee, out);
                 for arm in arms {
                     collect_ast_idents_stmts(&arm.body.stmts, out);
+                }
+            }
+            StmtKind::Wait { arms, timer } => {
+                for arm in arms {
+                    collect_ast_idents_expr(&arm.call, out);
+                    collect_ast_idents_stmts(&arm.body.stmts, out);
+                }
+                if let Some(t) = timer {
+                    collect_ast_idents_expr(&t.expr, out);
+                    collect_ast_idents_stmts(&t.body.stmts, out);
                 }
             }
             StmtKind::Spawn(sp) => {

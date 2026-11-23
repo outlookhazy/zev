@@ -111,7 +111,7 @@ u16 adc_read_rpm(u8 pwm_ch) {
     return sample + ch_bias;
 }
 
-u16 pi_step(u16 target, u16 actual, i32 *integral) {
+u16 pi_step(u16 target, u16 actual, *i32 integral) {
     i32 err = (target as i32) - (actual as i32);
     i32 next_int = math.clamp(*integral + err, -10000, 10000);
     *integral = next_int;
@@ -155,14 +155,14 @@ fn log_sim_duty_snapshot(*FixedVec<u16, 4> hist, u16 r1, u16 r2, u16 d1, u16 d2)
     hist.push_ring(r2);
     f32 d1_pct = (d1 as f32) * 0.1f32;
     f32 d2_pct = (d2 as f32) * 0.1f32;
-    u8 summary_buf[64];
+    [64]u8 summary_buf;
     []u8 summary = fmt_buf(summary_buf, f"d1={d1_pct:.1}% d2={d2_pct:.1}% hist_n={hist.len}");
     println(f"[SIM] rpm=({r1}, {r2}) {summary}");
 }
 
 // ── Reusable Parameterized Task Blueprints ──────────────────────────────────
 
-task motor_control(watch<u16> *target_rpm, watch<u16> *out_duty, u8 pwm_ch) {
+task motor_control(*watch<u16> target_rpm, *watch<u16> out_duty, u8 pwm_ch) {
     i32 integral = 0;
 
     loop every 1ms {
@@ -177,7 +177,7 @@ task motor_control(watch<u16> *target_rpm, watch<u16> *out_duty, u8 pwm_ch) {
     }
 }
 
-task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
+task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
     loop {
         []u8 half = rx_dma.wait_chunk();
 

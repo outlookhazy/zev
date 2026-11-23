@@ -503,6 +503,17 @@ pub(super) fn ast_stmts_check_boost_ops(
                     return true;
                 }
             }
+            StmtKind::Wait { arms, timer } => {
+                if arms.iter().any(|arm| {
+                    ast_expr_checks_boost_ops(&arm.call, boost_fns, include_wait_chunk)
+                        || ast_stmts_check_boost_ops(&arm.body.stmts, boost_fns, include_wait_chunk)
+                }) || timer.as_ref().is_some_and(|t| {
+                    ast_expr_checks_boost_ops(&t.expr, boost_fns, include_wait_chunk)
+                        || ast_stmts_check_boost_ops(&t.body.stmts, boost_fns, include_wait_chunk)
+                }) {
+                    return true;
+                }
+            }
             StmtKind::While { cond, body } => {
                 if ast_expr_checks_boost_ops(cond, boost_fns, include_wait_chunk)
                     || ast_stmts_check_boost_ops(&body.stmts, boost_fns, include_wait_chunk)
@@ -2076,6 +2087,15 @@ pub(super) fn ast_stmts_have_return(stmts: &[Stmt]) -> bool {
                     return true;
                 }
             }
+            StmtKind::Wait { arms, timer } => {
+                if arms.iter().any(|a| ast_stmts_have_return(&a.body.stmts))
+                    || timer
+                        .as_ref()
+                        .is_some_and(|t| ast_stmts_have_return(&t.body.stmts))
+                {
+                    return true;
+                }
+            }
             StmtKind::While { body, .. }
             | StmtKind::Loop { body }
             | StmtKind::LoopEvery { body, .. }
@@ -2179,6 +2199,13 @@ pub(super) fn finish_prim_read_method<B: LowerBackend>(
             be.mark_may_hold_boost_be();
             Ok(MirExpr::new(
                 MirExprKind::PrimRead(Box::new(MirPrimReadOp::SignalTryWait { target })),
+                MirType::Bool,
+            ))
+        }
+        ("wake_one", MirPrimKind::WaitQueue) => {
+            let boost = extract_boost_arg(args);
+            Ok(MirExpr::new(
+                MirExprKind::PrimRead(Box::new(MirPrimReadOp::WaitQueueWakeOne { target, boost })),
                 MirType::Bool,
             ))
         }
@@ -2839,6 +2866,7 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             }
                             (Some(SysMethod::LogHex), 1)
                             | (Some(SysMethod::PendIrq), 0)
+                            | (Some(SysMethod::FuzzIrqs), 0 | 1)
                             | (Some(SysMethod::TickBy), 0) => Some(&MirType::U32),
                             _ => None,
                         };
@@ -2956,6 +2984,22 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                         return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::SignalClear {
                             target,
                         })));
+                    }
+                    ("prepare_wait", MirPrimKind::WaitQueue) => {
+                        return Ok(Some(MirStmt::PrimOp(
+                            MirPrimNonBlockingOp::WaitQueuePrepare { target },
+                        )));
+                    }
+                    ("cancel_wait", MirPrimKind::WaitQueue) => {
+                        return Ok(Some(MirStmt::PrimOp(
+                            MirPrimNonBlockingOp::WaitQueueCancel { target },
+                        )));
+                    }
+                    ("wake_all", MirPrimKind::WaitQueue) => {
+                        let boost = extract_boost_arg(args);
+                        return Ok(Some(MirStmt::PrimOp(
+                            MirPrimNonBlockingOp::WaitQueueWakeAll { target, boost },
+                        )));
                     }
                     ("flip", MirPrimKind::PingPong { elem, cap }) => {
                         return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::PingPongFlip {

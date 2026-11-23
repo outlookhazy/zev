@@ -131,7 +131,7 @@ fn print_telemetry_line(
     u32 prio,
     f32 avg_temp
 ) {
-    u8 status_buf[64];
+    [64]u8 status_buf;
     f32 clamped = math.clamp<f32>(avg_temp, -40.0f32, 125.0f32);
     []u8 status = fmt_buf(status_buf, f"avg={clamped:.2}C");
     println(f"[Zev on RP2040 Pico W] uptime={uptime_ms}ms temp={temp_c:.1}C alarms={alarms} triggers={triggers} prio={prio} {status}");

@@ -1,4 +1,4 @@
-//! Complete structured error explainers (`P0001`..`P0013` and `E0001`..`E0034`) for `zevc doc`.
+//! Complete structured error explainers (`P0001`..`P0014` and `E0001`..`E0034`) for `zevc doc`.
 
 pub struct ErrorDoc {
     pub code: &'static str,
@@ -10,7 +10,7 @@ pub struct ErrorDoc {
 }
 
 pub const ERROR_DOCS: &[ErrorDoc] = &[
-    // ── Parser Foreign-Idiom Traps (P0001..P0013) ───────────────────────────
+    // ── Parser Foreign-Idiom Traps (P0001..P0014) ───────────────────────────
     ErrorDoc {
         code: "P0001",
         summary: "Foreign `let` / `var` / `mut` variable binding instead of explicit C-style `Type name`",
@@ -81,9 +81,9 @@ fn main() {
     },
     ErrorDoc {
         code: "P0004",
-        summary: "Go/Rust `select` block used instead of sequential Active-Object `inbox` + `switch`",
+        summary: "Go/Rust `select` block used instead of Zev's deterministic `wait { ... }` block",
         topic: "primitives",
-        why: "Multi-channel `select` requires dynamic wait-list registration across N queues per task turn. Zev keeps per-task scheduler state strictly O(1) (`single wait_obj + single deadline`): funnel events from ISRs and peer tasks into one typed `inbox<Ev, N>`, wait with `recv(timeout: ...) or Fallback`, and branch with `switch (ev)`.",
+        why: "Multi-source waiting in Zev uses contextual `wait { ... }` blocks, which register O(1) static per-primitive waiter bitmasks and evaluate arms in deterministic top-to-bottom priority order (never random selection like Go's `select`). Arms must be direct zero-arg blocking consumer calls (`recv`, `wait`, `wait_read`, `wait_chunk`, `wait_change`, `alloc`) plus an optional `timeout <dur>` or absolute `deadline <u32>` arm.",
         bad_zev: "\
 fn main() {
     select {
@@ -92,22 +92,22 @@ fn main() {
     }
 }",
         good_zev: "\
-enum SupEv { Fault, Heartbeat }
-inbox<SupEv, 8> sup_q;
+signal fault_sig;
+inbox<u32, 8> cmd_q;
 watch<u32> beats = 0;
 
-fn main() {
-    set_priority(@low);
+task sup() {
     loop {
-        SupEv ev = sup_q.recv(timeout: 1s) or Heartbeat;
-        switch (ev) {
-            Fault => { return; }
-            Heartbeat => {
-                beats.publish(beats.read() + 1);
-                return;
-            }
+        wait {
+            fault_sig.wait() => { beats.publish(0u32); }
+            u32 cmd = cmd_q.recv() => { beats.publish(cmd); }
+            timeout 50ms => { beats.publish(beats.read() + 1u32); }
         }
     }
+}
+
+fn main() {
+    spawn sup() @normal;
 }",
     },
     ErrorDoc {
@@ -209,7 +209,7 @@ fn main() {
 }",
         good_zev: "\
 fn main() {
-    u8 data[4] = [10, 20, 30, 40];
+    [4]u8 data = [10, 20, 30, 40];
     u32 sum = 0;
     for (u8 b in data) {
         sum += b as u32;
@@ -238,7 +238,7 @@ struct ByteReader {
     usize pos;
 }
 
-fn step(i32 *acc) {
+fn step(*i32 acc) {
     *acc += 1;
 }
 
@@ -356,6 +356,25 @@ fn main() {
     if (freed) {
         return;
     }
+}",
+    },
+    ErrorDoc {
+        code: "P0014",
+        summary: "Postfix C-style pointer/array/function-pointer syntax used instead of canonical prefix `*T` / `[N]T` / `fn(...)`",
+        topic: "syntax",
+        why: "Zev uses unambiguous left-to-right prefix type modifiers (`*T` for pointers, `[]T` for fat slices, `[N]T` for fixed arrays, and `fn(Args...) -> Ret` for function pointers) rather than C's inside-out postfix declarators (`T *name`, `T name[N]`, `T*`, `Ret (*cb)(Args)`).",
+        bad_zev: "\
+fn main() {
+    u8 buf[16];
+}",
+        good_zev: "\
+fn step(*u32 x) {
+    *x += 1;
+}
+fn main() {
+    [16]u8 buf = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    u32 val = buf[0] as u32;
+    step(&val);
 }",
     },
 
@@ -634,7 +653,7 @@ fn main() {
         topic: "dma",
         why: "Spawned tasks outlive the initial boot setup phase of `main()`. Task endpoint parameters must point to top-level static OS primitives (e.g. `&motor1_rpm`, `&uart1_dma`), never to transient local variables inside `main()` or boot helpers.",
         bad_zev: "\
-task worker(u32 *cfg) {
+task worker(*u32 cfg) {
     loop every 10ms {
         if (*cfg > 0) {}
     }
@@ -646,7 +665,7 @@ fn main() {
         good_zev: "\
 watch<u32> shared_cfg = 10;
 
-task worker(watch<u32> *cfg) {
+task worker(*watch<u32> cfg) {
     loop every 10ms {
         u32 v = cfg.read();
         if (v > 0) {}
@@ -1117,7 +1136,7 @@ fn main() {
 watch<u32> bus1_ticks = 0;
 watch<u32> bus2_ticks = 0;
 
-task bus_worker(watch<u32> *out, u32 step) {
+task bus_worker(*watch<u32> out, u32 step) {
     u32 acc = 0;
     loop every 10ms {
         acc += step;
@@ -1125,7 +1144,7 @@ task bus_worker(watch<u32> *out, u32 step) {
     }
 }
 
-fn start_bus(watch<u32> *out, u32 step) {
+fn start_bus(*watch<u32> out, u32 step) {
     spawn bus_worker(out, step) @normal;
 }
 
@@ -1141,7 +1160,7 @@ fn main() {
         why: "When `dst` in `fmt_buf(dst, f\"...\")` has a statically known byte capacity (`[N]u8`, `*[N]u8`, `dst[..]`, or constant `dst[a..b]`) and every `{...}` hole has a bounded maximum width (e.g. `u32` decimal `10 B`, `i32` `11 B`, `f32` `:.2` `14 B`, `enum` max variant length), `zevc` proves worst-case buffer fit at compile time (`worst <= cap` needs no `or`/`catch`!). Either size `dst` to fit the worst-case bound, or pass a runtime-sized `[]u8` slice and handle `FmtErr::Truncated` with `catch (FmtErr err, []u8 clamped)`.",
         bad_zev: "\
 fn main() {
-    u8 dst[8];
+    [8]u8 dst;
     u32 rpm = 1800;
     []u8 line = fmt_buf(dst, f\"rpm={rpm}\");
     if (line.len > 0) {
@@ -1151,12 +1170,12 @@ fn main() {
         good_zev: "\
 fn write_tagged([]u8 dyn_tag) {
     // 1. Statically proven fit (\"rpm=\" 4 B + u32 max 10 B = 14 B <= 16 B): zero `catch` needed!
-    u8 line_buf[16];
+    [16]u8 line_buf;
     u32 rpm = 1800;
     []u8 ok_line = fmt_buf(line_buf, f\"rpm={rpm}\");
 
     // 2. Runtime `[]u8` slice hole: recovers partial clamped slice on `FmtErr::Truncated`!
-    u8 tag_buf[12];
+    [12]u8 tag_buf;
     []u8 tagged = fmt_buf(tag_buf, f\"tag={dyn_tag}\") catch (FmtErr err, []u8 clamped) {
         clamped
     };
@@ -1166,7 +1185,7 @@ fn write_tagged([]u8 dyn_tag) {
 }
 
 fn main() {
-    u8 raw[4] = [65, 66, 67, 68];
+    [4]u8 raw = [65, 66, 67, 68];
     write_tagged(raw[0..4]);
 }",
     },

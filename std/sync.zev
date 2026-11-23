@@ -1,0 +1,196 @@
+// Standard cooperative synchronization primitives built on `wait_queue` and `critical { ... }`
+
+pub struct Semaphore {
+    watch<u32> count;
+    wait_queue wq;
+}
+
+impl Semaphore {
+    pub fn init(*self, u32 initial) {
+        critical {
+            self.count.publish(initial);
+        }
+    }
+
+    pub u32 count(*self) {
+        return self.count.read();
+    }
+
+    pub bool try_acquire(*self) {
+        bool ok = false;
+        critical {
+            u32 c = self.count.read();
+            if (c > 0u32) {
+                self.count.publish(c - 1u32);
+                ok = true;
+            }
+        }
+        return ok;
+    }
+
+    pub fn acquire(*self) {
+        loop {
+            bool ok = false;
+            critical {
+                u32 c = self.count.read();
+                if (c > 0u32) {
+                    self.count.publish(c - 1u32);
+                    ok = true;
+                } else {
+                    self.wq.prepare_wait();
+                }
+            }
+            if (ok) {
+                return;
+            }
+            self.wq.commit_wait();
+        }
+    }
+
+    pub fn release(*self) {
+        critical {
+            self.count.publish(self.count.read() + 1u32);
+        }
+        self.wq.wake_one();
+    }
+}
+
+pub struct EventFlags {
+    watch<u32> bits;
+    wait_queue wq;
+}
+
+impl EventFlags {
+    pub u32 read(*self) {
+        return self.bits.read();
+    }
+
+    pub fn set(*self, u32 mask) {
+        critical {
+            self.bits.publish(self.bits.read() | mask);
+        }
+        self.wq.wake_all();
+    }
+
+    pub fn clear(*self, u32 mask) {
+        critical {
+            self.bits.publish(self.bits.read() & ~mask);
+        }
+    }
+
+    pub u32 wait_any(*self, u32 mask) {
+        loop {
+            u32 cur = 0u32;
+            bool matched = false;
+            critical {
+                cur = self.bits.read();
+                if ((cur & mask) != 0u32) {
+                    matched = true;
+                } else {
+                    self.wq.prepare_wait();
+                }
+            }
+            if (matched) {
+                return cur & mask;
+            }
+            self.wq.commit_wait();
+        }
+    }
+
+    pub u32 wait_all(*self, u32 mask) {
+        loop {
+            u32 cur = 0u32;
+            bool matched = false;
+            critical {
+                cur = self.bits.read();
+                if ((cur & mask) == mask) {
+                    matched = true;
+                } else {
+                    self.wq.prepare_wait();
+                }
+            }
+            if (matched) {
+                return cur;
+            }
+            self.wq.commit_wait();
+        }
+    }
+}
+
+pub struct Latch {
+    watch<bool> ready;
+    wait_queue wq;
+}
+
+impl Latch {
+    pub bool is_ready(*self) {
+        return self.ready.read();
+    }
+
+    pub fn arrive(*self) {
+        critical {
+            self.ready.publish(true);
+        }
+        self.wq.wake_all();
+    }
+
+    pub fn wait(*self) {
+        loop {
+            bool done = false;
+            critical {
+                done = self.ready.read();
+                if (!done) {
+                    self.wq.prepare_wait();
+                }
+            }
+            if (done) {
+                return;
+            }
+            self.wq.commit_wait();
+        }
+    }
+}
+
+pub struct Barrier<usize N> {
+    watch<usize> count;
+    watch<u32> generation;
+    wait_queue wq;
+}
+
+impl<usize N> Barrier<N> {
+    pub bool wait(*self) {
+        u32 my_gen = 0u32;
+        bool last = false;
+        critical {
+            u32 gen0 = self.generation.read();
+            my_gen = gen0;
+            usize nxt = self.count.read() + 1;
+            if (nxt >= N) {
+                self.count.publish(0);
+                self.generation.publish(gen0 + 1u32);
+                last = true;
+            } else {
+                self.count.publish(nxt);
+                self.wq.prepare_wait();
+            }
+        }
+        if (last) {
+            self.wq.wake_all();
+            return true;
+        }
+        loop {
+            self.wq.commit_wait();
+            bool tripped = false;
+            critical {
+                if (self.generation.read() != my_gen) {
+                    tripped = true;
+                } else {
+                    self.wq.prepare_wait();
+                }
+            }
+            if (tripped) {
+                return false;
+            }
+        }
+    }
+}

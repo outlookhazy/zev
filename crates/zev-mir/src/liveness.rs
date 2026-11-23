@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ir::{
     BlockId, MirAssignOp, MirBlock, MirCallDst, MirChildCallSlot, MirExpr, MirExprKind,
     MirFmtChunk, MirFnBody, MirFunction, MirIsr, MirPlace, MirPrimNonBlockingOp, MirPrimReadOp,
-    MirPrimTarget, MirStmt, MirTaskBlueprint, MirTerminator, MirType, MirVar, MirYieldKind, VarId,
-    VarRole,
+    MirPrimTarget, MirStmt, MirTaskBlueprint, MirTerminator, MirType, MirVar, MirWaitArmOp,
+    MirYieldKind, VarId, VarRole,
 };
 
 /// Record `addr_taken` flags on variables inside an ISR handler.
@@ -217,149 +217,98 @@ fn compute_terminator_live_before(
                 out.insert(*deadline_var);
                 out
             }
-            MirYieldKind::InboxRecv {
-                target,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                resume_bb,
-                ..
-            }
-            | MirYieldKind::ByteRingWaitRead {
-                target,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                resume_bb,
-                ..
-            } => {
-                let mut out = block_live(*resume_bb);
-                // `dst_val` / `dst_res` are written ONLY when the receive completes before `resume_bb`!
-                if let Some(dv) = dst_val {
-                    out.remove(dv);
+            MirYieldKind::Wait { arms, timer, .. } => {
+                let mut out = BTreeSet::new();
+                for arm in arms {
+                    let mut arm_live = block_live(arm.target_bb);
+                    match &arm.op {
+                        MirWaitArmOp::InboxRecv {
+                            dst_val, dst_res, ..
+                        }
+                        | MirWaitArmOp::InboxViewRecv {
+                            dst_val, dst_res, ..
+                        }
+                        | MirWaitArmOp::WatchWaitChange {
+                            dst_val, dst_res, ..
+                        }
+                        | MirWaitArmOp::PoolAlloc {
+                            dst_val, dst_res, ..
+                        }
+                        | MirWaitArmOp::ByteRingWaitRead {
+                            dst_val, dst_res, ..
+                        }
+                        | MirWaitArmOp::ByteRingViewWaitRead {
+                            dst_val, dst_res, ..
+                        } => {
+                            if let Some(dv) = dst_val {
+                                arm_live.remove(dv);
+                            }
+                            if let Some(dr) = dst_res {
+                                arm_live.remove(dr);
+                            }
+                        }
+                        MirWaitArmOp::InboxSend { dst_res, .. }
+                        | MirWaitArmOp::InboxViewSend { dst_res, .. }
+                        | MirWaitArmOp::SignalWait { dst_res, .. }
+                        | MirWaitArmOp::WaitQueueCommit { dst_res, .. } => {
+                            if let Some(dr) = dst_res {
+                                arm_live.remove(dr);
+                            }
+                        }
+                        MirWaitArmOp::PingPongWaitChunk { dst_slice, .. } => {
+                            arm_live.remove(dst_slice);
+                        }
+                    }
+                    out.extend(arm_live);
                 }
-                if let Some(dr) = dst_res {
-                    out.remove(dr);
+                if let Some(t) = timer {
+                    let mut t_live = block_live(t.timeout_bb);
+                    if let Some(dr) = t.timeout_err_res {
+                        t_live.remove(&dr);
+                    }
+                    out.extend(t_live);
+                    out.insert(t.deadline_var);
+                    if let Some((lv, _)) = &t.release_lease_on_timeout {
+                        out.insert(*lv);
+                    }
                 }
-                collect_prim_target_uses(target, &mut out);
-                if let Some(tv) = timeout_deadline_var {
-                    out.insert(*tv);
-                }
-                out
-            }
-            MirYieldKind::InboxViewRecv {
-                view,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                resume_bb,
-                ..
-            }
-            | MirYieldKind::ByteRingViewWaitRead {
-                view,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                resume_bb,
-                ..
-            } => {
-                let mut out = block_live(*resume_bb);
-                if let Some(dv) = dst_val {
-                    out.remove(dv);
-                }
-                if let Some(dr) = dst_res {
-                    out.remove(dr);
-                }
-                collect_expr_uses(view, &mut out);
-                if let Some(tv) = timeout_deadline_var {
-                    out.insert(*tv);
-                }
-                out
-            }
-            MirYieldKind::InboxSend {
-                target,
-                val_var,
-                timeout_deadline_var,
-                dst_res,
-                resume_bb,
-                ..
-            } => {
-                let mut out = block_live(*resume_bb);
-                if let Some(dr) = dst_res {
-                    out.remove(dr);
-                }
-                collect_prim_target_uses(target, &mut out);
-                out.insert(*val_var);
-                if let Some(tv) = timeout_deadline_var {
-                    out.insert(*tv);
-                }
-                out
-            }
-            MirYieldKind::InboxViewSend {
-                view,
-                val_var,
-                timeout_deadline_var,
-                dst_res,
-                resume_bb,
-                ..
-            } => {
-                let mut out = block_live(*resume_bb);
-                if let Some(dr) = dst_res {
-                    out.remove(dr);
-                }
-                collect_expr_uses(view, &mut out);
-                out.insert(*val_var);
-                if let Some(tv) = timeout_deadline_var {
-                    out.insert(*tv);
-                }
-                out
-            }
-            MirYieldKind::SignalWait {
-                target,
-                timeout_deadline_var,
-                dst_res,
-                resume_bb,
-                ..
-            } => {
-                let mut out = block_live(*resume_bb);
-                if let Some(dr) = dst_res {
-                    out.remove(dr);
-                }
-                collect_prim_target_uses(target, &mut out);
-                if let Some(tv) = timeout_deadline_var {
-                    out.insert(*tv);
-                }
-                out
-            }
-            MirYieldKind::PingPongWaitChunk {
-                target,
-                dst_slice,
-                resume_bb,
-                ..
-            } => {
-                let mut out = block_live(*resume_bb);
-                out.remove(dst_slice);
-                collect_prim_target_uses(target, &mut out);
-                out
-            }
-            MirYieldKind::PoolAlloc {
-                target,
-                timeout_deadline_var,
-                dst_val,
-                dst_res,
-                resume_bb,
-                ..
-            } => {
-                let mut out = block_live(*resume_bb);
-                if let Some(dv) = dst_val {
-                    out.remove(dv);
-                }
-                if let Some(dr) = dst_res {
-                    out.remove(dr);
-                }
-                collect_prim_target_uses(target, &mut out);
-                if let Some(tv) = timeout_deadline_var {
-                    out.insert(*tv);
+                for arm in arms {
+                    match &arm.op {
+                        MirWaitArmOp::InboxRecv { target, .. }
+                        | MirWaitArmOp::PoolAlloc { target, .. }
+                        | MirWaitArmOp::ByteRingWaitRead { target, .. }
+                        | MirWaitArmOp::SignalWait { target, .. }
+                        | MirWaitArmOp::WaitQueueCommit { target, .. }
+                        | MirWaitArmOp::PingPongWaitChunk { target, .. } => {
+                            collect_prim_target_uses(target, &mut out);
+                        }
+                        MirWaitArmOp::WatchWaitChange {
+                            target,
+                            last_gen_var,
+                            seeded_var,
+                            ..
+                        } => {
+                            collect_prim_target_uses(target, &mut out);
+                            out.insert(*last_gen_var);
+                            if let Some(sv) = seeded_var {
+                                out.insert(*sv);
+                            }
+                        }
+                        MirWaitArmOp::InboxSend {
+                            target, val_var, ..
+                        } => {
+                            collect_prim_target_uses(target, &mut out);
+                            out.insert(*val_var);
+                        }
+                        MirWaitArmOp::InboxViewRecv { view, .. }
+                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                            collect_expr_uses(view, &mut out);
+                        }
+                        MirWaitArmOp::InboxViewSend { view, val_var, .. } => {
+                            collect_expr_uses(view, &mut out);
+                            out.insert(*val_var);
+                        }
+                    }
                 }
                 out
             }
@@ -428,7 +377,9 @@ fn transfer_stmt(stmt: &MirStmt, live: &mut BTreeSet<VarId>) {
         | MirStmt::ExitCritical
         | MirStmt::EndInboxTurn
         | MirStmt::Break
-        | MirStmt::Continue => {}
+        | MirStmt::Continue
+        | MirStmt::BoundedForLatch
+        | MirStmt::ZeroTaskLocals => {}
         MirStmt::SpawnActivate { args, .. } => {
             for a in args {
                 collect_expr_uses(a, live);
@@ -573,6 +524,9 @@ fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
         }
         MirPrimNonBlockingOp::SignalNotify { target, .. }
         | MirPrimNonBlockingOp::SignalClear { target }
+        | MirPrimNonBlockingOp::WaitQueuePrepare { target }
+        | MirPrimNonBlockingOp::WaitQueueCancel { target }
+        | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. }
         | MirPrimNonBlockingOp::PingPongFlip { target, .. }
         | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
         | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
@@ -697,12 +651,14 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
                 collect_expr_uses(len, uses);
             }
             MirPrimReadOp::WatchRead { target, .. }
+            | MirPrimReadOp::WatchGen { target, .. }
             | MirPrimReadOp::InboxTryRecv { target, .. }
             | MirPrimReadOp::InboxLen { target, .. }
             | MirPrimReadOp::InboxIsEmpty { target, .. }
             | MirPrimReadOp::InboxIsFull { target, .. }
             | MirPrimReadOp::SignalIsSet { target }
             | MirPrimReadOp::SignalTryWait { target }
+            | MirPrimReadOp::WaitQueueWakeOne { target, .. }
             | MirPrimReadOp::PingPongDmaBuf { target, .. }
             | MirPrimReadOp::PingPongBaseAddr { target, .. }
             | MirPrimReadOp::ByteRingReadSlice { target, .. }
@@ -1200,45 +1156,31 @@ fn collect_terminator_forced_hoists(
             MirYieldKind::DelayPoll { deadline_var, .. } => {
                 force_hoist.insert(*deadline_var);
             }
-            MirYieldKind::InboxRecv {
-                timeout_deadline_var: Some(tv),
-                ..
-            }
-            | MirYieldKind::ByteRingWaitRead {
-                timeout_deadline_var: Some(tv),
-                ..
-            }
-            | MirYieldKind::InboxViewRecv {
-                timeout_deadline_var: Some(tv),
-                ..
-            }
-            | MirYieldKind::ByteRingViewWaitRead {
-                timeout_deadline_var: Some(tv),
-                ..
-            }
-            | MirYieldKind::SignalWait {
-                timeout_deadline_var: Some(tv),
-                ..
-            }
-            | MirYieldKind::PoolAlloc {
-                timeout_deadline_var: Some(tv),
-                ..
-            } => {
-                force_hoist.insert(*tv);
-            }
-            MirYieldKind::InboxSend {
-                val_var,
-                timeout_deadline_var,
-                ..
-            }
-            | MirYieldKind::InboxViewSend {
-                val_var,
-                timeout_deadline_var,
-                ..
-            } => {
-                force_hoist.insert(*val_var);
-                if let Some(tv) = timeout_deadline_var {
-                    force_hoist.insert(*tv);
+            MirYieldKind::Wait { arms, timer, .. } => {
+                if let Some(t) = timer {
+                    force_hoist.insert(t.deadline_var);
+                    if let Some((lv, _)) = &t.release_lease_on_timeout {
+                        force_hoist.insert(*lv);
+                    }
+                }
+                for arm in arms {
+                    match &arm.op {
+                        MirWaitArmOp::InboxSend { val_var, .. }
+                        | MirWaitArmOp::InboxViewSend { val_var, .. } => {
+                            force_hoist.insert(*val_var);
+                        }
+                        MirWaitArmOp::WatchWaitChange {
+                            last_gen_var,
+                            seeded_var,
+                            ..
+                        } => {
+                            force_hoist.insert(*last_gen_var);
+                            if let Some(sv) = seeded_var {
+                                force_hoist.insert(*sv);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             MirYieldKind::CallYielding { args, .. } => {

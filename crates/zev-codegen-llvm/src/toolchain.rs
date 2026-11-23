@@ -154,6 +154,11 @@ impl Default for CodegenOptions {
 }
 
 impl CodegenOptions {
+    /// Construct host x86_64 Linux simulation options matching [`TargetSpec::host_linux`].
+    pub fn host_linux() -> Self {
+        Self::from_spec(TargetSpec::host_linux())
+    }
+
     /// Construct codegen options directly from any declarative [`TargetSpec`].
     pub fn from_spec(spec: TargetSpec) -> Self {
         let target = match spec.isa {

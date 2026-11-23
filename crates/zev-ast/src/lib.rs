@@ -329,8 +329,10 @@ pub enum OsPrimitiveType {
     DmaSlot { elem: Box<TypeExpr> },
     /// `byte_ring<N>` — lock-free SPSC circular + BipBuffer byte ring of capacity `cap`.
     ByteRing { cap: usize },
-    /// `*byte_ring` — unsized pointer view over any `byte_ring<N>`.
+    /// `byte_ring` — unsized pointer view over any `byte_ring<N>`.
     ByteRingUnsized,
+    /// `wait_queue` — low-level kernel waiter bitmask primitive for user-defined blocking sync types.
+    WaitQueue,
 }
 
 impl OsPrimitiveType {
@@ -343,6 +345,7 @@ impl OsPrimitiveType {
             Self::Pool { .. } => "pool",
             Self::DmaSlot { .. } => "dma_slot",
             Self::ByteRing { .. } | Self::ByteRingUnsized => "byte_ring",
+            Self::WaitQueue => "wait_queue",
         }
     }
 }
@@ -872,6 +875,11 @@ pub enum StmtKind {
         scrutinee: Expr,
         arms: Vec<SwitchArm>,
     },
+    /// Bounded O(1) deterministic multi-source wait (`wait { ... }`).
+    Wait {
+        arms: Vec<WaitArm>,
+        timer: Option<WaitTimerArm>,
+    },
     /// Static task instantiation (`spawn motor_control(&motor1_rpm, 1) @critical @core(0);`).
     Spawn(SpawnStmt),
     /// `continue;`
@@ -926,6 +934,31 @@ impl AssignOp {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwitchArm {
     pub pat: SwitchPat,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// An event arm in a deterministic `wait { ... }` block (`Cmd c = q.recv() => { ... }`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitArm {
+    pub bind: Option<(TypeExpr, Ident)>,
+    pub call: Expr,
+    pub body: Block,
+    pub span: Span,
+}
+
+/// Kind of optional timer fallback arm in a `wait { ... }` block.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum WaitTimerKind {
+    Timeout,
+    Deadline,
+}
+
+/// Optional timer fallback arm in a `wait { ... }` block (`timeout 50ms => { ... }` or `deadline t => { ... }`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitTimerArm {
+    pub kind: WaitTimerKind,
+    pub expr: Expr,
     pub body: Block,
     pub span: Span,
 }
@@ -1417,6 +1450,7 @@ mod tests {
         };
         assert_eq!(inbox.kind_name(), "inbox");
         assert_eq!(OsPrimitiveType::Signal.kind_name(), "signal");
+        assert_eq!(OsPrimitiveType::WaitQueue.kind_name(), "wait_queue");
         let pool = OsPrimitiveType::Pool {
             elem: Box::new(u8_ty.clone()),
             cap: 4,

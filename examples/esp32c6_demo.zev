@@ -171,7 +171,7 @@ fn print_telemetry_line(
     SupEvent ev,
     LedSample sample
 ) {
-    u8 status_buf[96];
+    [96]u8 status_buf;
     f32 die_c = bsp.read_die_temp_c();
     // Statically proven worst-case fit (`37 B <= 96 B`) — zero `or` / `catch` boilerplate!
     []u8 status = fmt_buf(status_buf, f"avg={avg_mw:.2}mW ev={ev}");
@@ -207,7 +207,7 @@ fn scrub_sram_canary(u32 beat_count) {
 // ── Cooperative Tasks ───────────────────────────────────────────────────────
 
 // Cycles onboard GPIO8 WS2812B RGB LED smoothly every 500ms
-task led_animator(watch<u32> *mode_off, watch<u32> *out_slot, watch<u32> *out_color) {
+task led_animator(*watch<u32> mode_off, *watch<u32> out_slot, *watch<u32> out_color) {
     u32 tick_phase = 0;
 
     loop every 500ms {

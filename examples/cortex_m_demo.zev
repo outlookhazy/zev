@@ -74,7 +74,7 @@ u16 adc_read_rpm(u8 pwm_ch) {
     return base + (ch_off * 100);
 }
 
-u16 pi_step(u16 target, u16 actual, i32 *integral) {
+u16 pi_step(u16 target, u16 actual, *i32 integral) {
     i32 err = (target as i32) - (actual as i32);
     i32 next_i = math.clamp(*integral + err, -8000, 8000);
     *integral = next_i;
@@ -115,7 +115,7 @@ fn scrub_flash_crc() {
 }
 
 // ── Reusable Static Task Blueprints ─────────────────────────────────────────
-task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
+task motor_control(*watch<u16> target_rpm, u8 pwm_ch) {
     i32 integral = 0;
 
     loop every 1ms {
@@ -129,7 +129,7 @@ task motor_control(watch<u16> *target_rpm, u8 pwm_ch) {
     }
 }
 
-task fieldbus_listener(ping_pong<u8, 64> *rx_dma, watch<u16> *out_rpm) {
+task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
     loop {
         []u8 half = rx_dma.wait_chunk();
 
