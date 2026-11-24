@@ -2870,7 +2870,15 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             return SsaVal::new(ty, t);
         }
         let rv = if matches!(op, MirAssignOp::ShlAssign | MirAssignOp::ShrAssign) {
-            self.coerce(rhs.clone(), ty, false)
+            let coerced = self.coerce(rhs.clone(), ty, false);
+            let mask = llvm_int_bits(ty).saturating_sub(1);
+            if let Ok(c) = coerced.repr.parse::<i128>() {
+                SsaVal::new(ty, ((c as u128) & u128::from(mask)).to_string())
+            } else {
+                let m = self.next_tmp();
+                self.emit_line(format!("{m} = and {ty} {}, {mask}", coerced.repr));
+                SsaVal::new(ty, m)
+            }
         } else {
             rhs.clone()
         };

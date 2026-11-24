@@ -1,7 +1,7 @@
 // Bare-Metal Arduino Uno R3 (ATmega328P 16 MHz AVR, Zero-C / Zero-libc)
 //
 // Compiles directly through LLVM 23 (`llc -mtriple=avr -mcpu=atmega328p`) + `ld.lld`
-// into a < 4 KB Flash, < 500 B SRAM Optiboot image with:
+// into an ~18.7 KB Flash, ~1.2 KB static SRAM (~1.4 KB high-water) Optiboot image with:
 //   - Typed `mmio` `u8`/`u16` & `@w1c` register access (`chip.atmega328p` + `bsp.arduino_uno`)
 //   - Hardware `Timer0` 1.000 kHz system tick + `115200 8N1` `USART0` serial telemetry
 //   - Exclusive `hw.IRQ_TIMER1_COMPA` (16-bit hardware timer compare ISR, `boost: @critical`)

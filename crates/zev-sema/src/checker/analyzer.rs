@@ -1128,6 +1128,7 @@ impl Analyzer {
             ));
         } else {
             self.check_f32_coercion_expr(&c.value, &ty);
+            self.check_const_untyped_shift_coercion(&c.value, &ty, true);
         }
 
         self.consts.insert(
@@ -1338,7 +1339,140 @@ impl Analyzer {
                     }
                 }
             }
+            _ => {
+                if target_ty.fixed_int_bit_width().is_some_and(|b| b < 64) {
+                    self.check_const_untyped_shift_coercion(expr, target_ty, false);
+                }
+            }
+        }
+    }
+
+    pub(super) fn check_const_untyped_shift_coercion(
+        &mut self,
+        expr: &Expr,
+        target_ty: &Ty,
+        allow_ident_consts: bool,
+    ) {
+        let Some(bits) = target_ty.fixed_int_bit_width() else {
+            return;
+        };
+        if bits >= 64 {
+            return;
+        }
+        match &expr.kind {
+            ExprKind::Binary {
+                op: op @ (BinaryOp::Shl | BinaryOp::Shr),
+                lhs,
+                rhs,
+            } if Self::expr_is_untyped_int_tree(lhs) => {
+                let sh_opt = if allow_ident_consts {
+                    self.eval_const_expr_i128(rhs, &mut BTreeSet::new())
+                } else {
+                    Self::eval_literal_int_expr(rhs)
+                };
+                if let Some(sh) = sh_opt {
+                    if sh >= i128::from(bits)
+                        && sh < 64
+                        && self
+                            .f32_overflow_reported_spans
+                            .insert((rhs.span.start, rhs.span.end))
+                    {
+                        self.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            rhs.span,
+                            format!(
+                                "shift count {sh} for '{}' is out of range for '{target_ty}' (must be in 0..{bits})",
+                                op.as_str()
+                            ),
+                        ));
+                    }
+                }
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Neg | UnaryOp::BitNot,
+                expr: inner,
+            } => self.check_const_untyped_shift_coercion(inner, target_ty, allow_ident_consts),
+            ExprKind::Binary {
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitXor,
+                lhs,
+                rhs,
+            } if Self::expr_is_untyped_int_tree(expr) => {
+                self.check_const_untyped_shift_coercion(lhs, target_ty, allow_ident_consts);
+                self.check_const_untyped_shift_coercion(rhs, target_ty, allow_ident_consts);
+            }
             _ => {}
+        }
+    }
+
+    fn expr_is_untyped_int_tree(expr: &Expr) -> bool {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Int(_)) => true,
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                expr: inner,
+            } => Self::expr_is_untyped_int_tree(inner),
+            ExprKind::Binary {
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitXor
+                    | BinaryOp::Shl
+                    | BinaryOp::Shr,
+                lhs,
+                rhs,
+            } => {
+                if matches!(expr.kind, ExprKind::Binary { op: BinaryOp::Shl | BinaryOp::Shr, .. }) {
+                    Self::expr_is_untyped_int_tree(lhs)
+                } else {
+                    Self::expr_is_untyped_int_tree(lhs) && Self::expr_is_untyped_int_tree(rhs)
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn eval_literal_int_expr(expr: &Expr) -> Option<i128> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::Int(v)) => Some(i128::from(*v)),
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                expr: inner,
+            } => Self::eval_literal_int_expr(inner)?.checked_neg(),
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                expr: inner,
+            } => Some(!Self::eval_literal_int_expr(inner)?),
+            ExprKind::Binary { op, lhs, rhs } => {
+                let l = Self::eval_literal_int_expr(lhs)?;
+                let r = Self::eval_literal_int_expr(rhs)?;
+                match op {
+                    BinaryOp::Add => l.checked_add(r),
+                    BinaryOp::Sub => l.checked_sub(r),
+                    BinaryOp::Mul => l.checked_mul(r),
+                    BinaryOp::Div if r != 0 => l.checked_div(r),
+                    BinaryOp::Rem if r != 0 => l.checked_rem(r),
+                    BinaryOp::BitOr => Some(l | r),
+                    BinaryOp::BitAnd => Some(l | r).map(|_| l & r),
+                    BinaryOp::BitXor => Some(l ^ r),
+                    BinaryOp::Shl => u32::try_from(r).ok().and_then(|sh| l.checked_shl(sh)),
+                    BinaryOp::Shr => u32::try_from(r).ok().and_then(|sh| l.checked_shr(sh)),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 

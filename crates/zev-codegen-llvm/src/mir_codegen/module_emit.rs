@@ -2600,25 +2600,40 @@ impl<'a> ModuleCtx<'a> {
                     MirBinOp::BitOr => l | r,
                     MirBinOp::BitAnd => l & r,
                     MirBinOp::BitXor => l ^ r,
-                    MirBinOp::Shl => l << (r & 63),
+                    MirBinOp::Shl => {
+                        let ptr_bits = self.spec.isa.ptr_bits();
+                        let width = target_int_signed_and_bits(&lhs.ty, ptr_bits)
+                            .map_or(64, |(_, b)| b);
+                        let sh = (r as u32) & width.saturating_sub(1);
+                        l << sh
+                    }
                     MirBinOp::Shr => {
-                        let sh = (r as u32) & 63;
+                        let ptr_bits = self.spec.isa.ptr_bits();
+                        let width = target_int_signed_and_bits(&lhs.ty, ptr_bits)
+                            .map_or(64, |(_, b)| b);
+                        let sh = (r as u32) & width.saturating_sub(1);
                         if lhs.ty.is_unsigned() {
-                            let ptr_bits = self.spec.isa.ptr_bits();
                             let masked = if lhs.ty == MirType::Bool {
                                 (l as u128) & 1
                             } else {
-                                match target_int_signed_and_bits(&lhs.ty, ptr_bits) {
-                                    Some((_, 8)) => (l as u8) as u128,
-                                    Some((_, 16)) => (l as u16) as u128,
-                                    Some((_, 32)) => (l as u32) as u128,
-                                    Some((_, 64)) => (l as u64) as u128,
+                                match width {
+                                    8 => (l as u8) as u128,
+                                    16 => (l as u16) as u128,
+                                    32 => (l as u32) as u128,
+                                    64 => (l as u64) as u128,
                                     _ => l as u128,
                                 }
                             };
                             (masked >> sh) as i128
                         } else {
-                            l >> sh
+                            let signed_l = match width {
+                                8 => (l as i8) as i128,
+                                16 => (l as i16) as i128,
+                                32 => (l as i32) as i128,
+                                64 => (l as i64) as i128,
+                                _ => l,
+                            };
+                            signed_l >> sh
                         }
                     }
                     MirBinOp::Eq => i128::from(l == r),

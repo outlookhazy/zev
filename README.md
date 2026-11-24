@@ -2,25 +2,59 @@
 
 A compiler (`zevc`) for **Zev**, an experimental bare-metal cooperative language and static runtime targeting microcontrollers and deterministic host LLVM simulation.
 
-Zev builds cooperative tasks, stackless coroutine frames, typed MMIO registers, deterministic multi-source `wait { ... }`, interrupt safety rules, and static DMA buffer ownership checks directly into the compiler, without a heap allocator or per-task stacks.
+Zev compiles tasks, stackless coroutine frames, typed MMIO registers, multi-source `wait { ... }`, interrupt isolation, and DMA buffer ownership directly into one freestanding image—with zero heap allocation and a single shared hardware stack.
 
-See [`DESIGN_V0.md`](DESIGN_V0.md) for the language specification and design rationale.
+See [`DESIGN_V0.md`](DESIGN_V0.md) for the full language and runtime specification.
 
 ---
 
-## Compiler Pipeline
+## Example
 
-- **`zev-ast` / `zev-parser`**: Recursive-descent parser (`f32`/`f64`, `<T, usize N>` generics, canonical prefix types `*T` / `[]T` / `[N]T`, `f"..."` strings, `mmio`, `irq`, `wait { ... }`, `wait_queue`, and `P0001`–`P0014` diagnostics for common C/Rust/Go/Zig syntax habits).
-- **`zev-sema`**: Generic monomorphization, `import`/`pub` module resolution, 3-tier call-graph yield inference (`NonYielding`, `SoftYielding`, `HardBlocking`), Boot-Tree `spawn` (`MAX_TASKS <= 32`) / `irq.attach` checking, ISR isolation (`E0001`/`E0002`/`E0033`), `fmt_buf` bounds checking (`E0028`), per-arm `wait` lease scoping, and linear `Lease<T>` tracking (`E0034`).
-- **`zev-mir`**: Stackless state-machine lowering, liveness hoisting, disjoint child-frame `union` packing, unreachable function pruning, per-task non-yielding run-bound classification (`straight-line`, `bounded-for`, `noyield-spin`), and static SRAM budget reporting.
-- **`zev-codegen-llvm`**: Unified LLVM 23 IR backend driving `opt`, `llc`, and `ld.lld` across host `x86_64` sanitized simulation (`zevc run --sanitize` + `sys.fuzz_irqs`) and bare-metal ARM Cortex-M, RISC-V (`rv32imac`), and AVR targets configured declaratively via `chips/*.toml` and `boards/*.toml`.
-- **`zev-cli` (`zevc`)**: Unified compiler CLI, SVD-to-MMIO importer (`import-svd`), and offline documentation (`zevc doc`).
+```zev
+import board;
+
+irq IRQ_BUTTON = 6;
+signal button_irq;
+
+isr on_button() {
+    button_irq.notify(boost: @high);
+}
+
+task blinker() {
+    bool lit = false;
+    loop {
+        wait {
+            button_irq.wait() => {
+                lit = true;
+                board.set_led(true);
+                println("button pressed");
+            }
+            timeout 250ms => {
+                lit = !lit;
+                board.set_led(lit);
+            }
+        }
+    }
+}
+
+fn main() {
+    board.init();
+    IRQ_BUTTON.attach(on_button);
+    spawn blinker() @normal;
+}
+```
+
+What `zevc` enforces and synthesizes from this file:
+- **Zero heap, single stack:** Every `spawn` in `main()`'s boot tree allocates a fixed `.bss` coroutine frame (`MAX_TASKS <= 32`), union-packing disjoint child frames and reporting worst-case SRAM + stack depth via `zevc ram`.
+- **Call-graph inferred yielding (no `async`/`.await`):** Functions are inferred as `NonYielding`, `SoftYielding` (auto-cloned as zero-`.bss` stack functions inside `noyield`), or `HardBlocking` (statically forbidden in `noyield`, `critical`, `isr`, and `defer`).
+- **Task/ISR & MMIO safety:** Raw mutable globals are rejected (`E0001`/`E0002`); `@ro`, `@wo`, and `@w1c` register rules prevent read-modify-write interrupt-clear bugs (`E0031`); `wait { ... }` polls and parks atomically across multiple primitives with zero lost wakeups.
+- **Defined runtime semantics:** Out-of-bounds array/slice/MMIO indexing and division by zero trap deterministically (`@__syn_panic`), variable bit-shifts mask by `(bit_width - 1)`, float-to-int casts saturate, and host simulation runs the exact same LLVM scheduler IR under Clang ASan+UBSan (`sys.fuzz_irqs`).
 
 ---
 
 ## Targets
 
-Board and chip definitions live in `boards/*.toml` and `chips/*.toml`. A single portable source ([`examples/portable_controller_demo.zev`](examples/portable_controller_demo.zev)) using `import board;` and `hal.*` compiles across five targets:
+Board and chip definitions live declaratively in `boards/*.toml` and `chips/*.toml`. A single portable source ([`examples/portable_controller_demo.zev`](examples/portable_controller_demo.zev)) using `import board;` and `hal.*` compiles across five targets:
 
 | Target (`--board`) | MCU / Architecture | Runtime / Artifact |
 |---|---|---|
@@ -30,7 +64,17 @@ Board and chip definitions live in `boards/*.toml` and `chips/*.toml`. A single 
 | `esp32c6_pico` | ESP32-C6 (`riscv32imac`) | Direct-Boot `.bin` (`esptool` flash) |
 | `rpi_pico_w` | RP2040 (`thumbv6m`) | SRAM `.uf2` (`RPI-RP2` copy + 1200-baud reset) |
 
-Additional standalone hardware demos target `arduino_uno` (ATmega328P `avr`, Optiboot) and `arduino_nano_every` (ATmega4809 `avrxmega3`, `MuxTO` UPDI).
+Additional board-specific hardware demos in `examples/` exercise board peripherals directly on `nucleo_f334r8`, `esp32c6_pico`, `rpi_pico_w`, `arduino_uno` (ATmega328P `avr`, Optiboot), and `arduino_nano_every` (ATmega4809 `avrxmega3`, `MuxTO` UPDI).
+
+---
+
+## Compiler Pipeline
+
+- **`zev-ast` / `zev-parser`**: Recursive-descent parser (`f32`/`f64`, `<T, usize N>` generics, canonical prefix types `*T` / `[]T` / `[N]T`, `f"..."` strings, `mmio`, `irq`, `wait { ... }`, `wait_queue`, and `P0001`–`P0014` diagnostics for common C/Rust/Go/Zig syntax habits).
+- **`zev-sema`**: Generic monomorphization, `import`/`pub` module resolution, 3-tier call-graph yield inference (`NonYielding`, `SoftYielding`, `HardBlocking`), Boot-Tree `spawn` (`MAX_TASKS <= 32`) / `irq.attach` checking, ISR isolation (`E0001`/`E0002`/`E0033`), constant shift range & `fmt_buf` bounds checking (`E0024`/`E0028`), per-arm `wait` lease scoping, and linear `Lease<T>` tracking (`E0034`).
+- **`zev-mir`**: Stackless state-machine lowering, liveness hoisting, disjoint child-frame `union` packing, unreachable function pruning, per-task non-yielding run-bound classification (`straight-line`, `bounded-for`, `noyield-spin`), and static SRAM budget reporting.
+- **`zev-codegen-llvm`**: Unified LLVM 23 IR backend driving `opt`, `llc`, and `ld.lld` across host `x86_64` sanitized simulation (`zevc run --sanitize` + `sys.fuzz_irqs`) and bare-metal ARM Cortex-M, RISC-V (`rv32imac`), and AVR targets configured via `chips/*.toml` and `boards/*.toml`, with defined `@__syn_panic` bounds/div-zero traps and bit-width-masked shifts.
+- **`zev-cli` (`zevc`)**: Unified compiler CLI, SVD-to-MMIO importer (`import-svd`), and offline documentation (`zevc doc`).
 
 ---
 

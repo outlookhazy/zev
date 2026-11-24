@@ -1,14 +1,14 @@
-//! Abstract Syntax Tree (AST) and source location definitions for the Zev Language-OS.
+//! Abstract Syntax Tree (AST) and source location definitions for Zev (`zevc`).
 //!
-//! Covers all v0 constructs from `DESIGN_V0.md` and `examples/motor_controller.zev`:
-//! - Module imports (`import chip.stm32g4 as hw;`)
+//! Covers all v0 constructs from `DESIGN_V0.md` and `examples/`:
+//! - Module imports & re-exports (`import`, `pub import`, `pub`)
 //! - Attributes & priorities (`@dma_safe`, `@manual_yield`, `@critical`, `@high`, `@normal`, `@low`, `@core(N)`)
-//! - Wire-exact `packed struct`, `struct`, and `enum` declarations with endian & float primitives (`u16be`, `u32le`, `f32`, `f64`, etc.)
-//! - Monomorphized `<T>` & `<T, usize N>` bounded generics on `struct`s and `fn`s, plus `[N]T` generic array lengths
-//! - Static OS & DMA primitives (`signal`, `watch<T>`, `inbox<T, N>`, `ping_pong<T, N>`, `lease<T, N>`)
+//! - Wire-exact `packed struct`, `struct`, `mmio`, `irq`, and `enum` declarations with endian & float primitives (`u16be`, `u32le`, `f32`, `f64`, etc.)
+//! - Monomorphized `<T>` & `<T, usize N>` bounded generics on `struct`s, `impl` blocks, and `fn`s, plus `[N]T` generic array lengths
+//! - Static OS & DMA primitives (`signal`, `watch<T>`, `inbox<T, N>`, `byte_ring<N>`, `wait_queue`, `ping_pong<T, N>`, `pool<T, K>`, `Lease<T>`, `dma_slot<T>`)
 //! - Constants (`const`) and raw globals (parsed so `zev-sema` can reject illegal mutable globals cleanly)
-//! - Execution items: `fn` (with dual-exit `error` / `error ErrType` and `extern "C"`), `task` blueprints, and `isr` handlers
-//! - Cooperative & atomic control flow: `loop every <period>`, `loop`, `while`, `for (T x in ...)`, `defer`, `restart;`, `noyield`, `critical`, `checkpoint()`, `spawn`, `switch`
+//! - Execution items: `fn` (with dual-exit `error` / `error ErrType` and `extern "C"`), `task` blueprints, and `isr` handlers (with ISR-private `state`)
+//! - Cooperative & atomic control flow: `wait { ... }`, `loop every <period>`, `loop`, `while`, `for (T x in ...)`, `defer`, `restart;`, `noyield`, `critical`, `checkpoint()`, `spawn`, `switch`
 //! - Zero-heap `f"..."` format strings with compile-time resolved [`FormatSpec`]s
 //! - Dual-exit error handling: `error;`, `error E;`, `error E, partial;`, postfix `or`, and postfix `catch`
 

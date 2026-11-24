@@ -338,6 +338,23 @@ impl Ty {
         }
     }
 
+    /// Returns the target-independent bit-width (`8`, `16`, `32`, `64`) for fixed-width integer primitives.
+    pub const fn fixed_int_bit_width(&self) -> Option<u32> {
+        match self {
+            Self::Prim(PrimType::U8 | PrimType::I8) => Some(8),
+            Self::Prim(
+                PrimType::U16 | PrimType::I16 | PrimType::U16Be | PrimType::U16Le,
+            ) => Some(16),
+            Self::Prim(
+                PrimType::U32 | PrimType::I32 | PrimType::U32Be | PrimType::U32Le,
+            ) => Some(32),
+            Self::Prim(
+                PrimType::U64 | PrimType::I64 | PrimType::U64Be | PrimType::U64Le,
+            ) => Some(64),
+            _ => None,
+        }
+    }
+
     /// Returns `true` if values of this type contain (directly or inside struct/array fields)
     /// any pointer `*T` or slice `[]T` whose lexical scope depth / DMA lease must be tracked.
     pub fn contains_reference(&self, structs: &BTreeMap<String, StructInfo>) -> bool {

@@ -3332,6 +3332,8 @@ impl<'a> BodyChecker<'a> {
             ));
         } else if float_arith_ok {
             self.sema.check_f32_coercion_expr(rhs_expr, lhs);
+        } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+            self.check_const_shift_amount(op.as_str(), lhs, rhs_expr);
         }
     }
 

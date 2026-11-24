@@ -16,7 +16,7 @@ pub struct TopicDoc {
 
 pub const PRIMER_DOC: &str = "\
 ================================================================================
-  ZEV LANGUAGE-OS — QUICK PRIMER & AGENT REFERENCE (`zevc doc`)
+  ZEV — QUICK PRIMER & AGENT REFERENCE (`zevc doc`)
 ================================================================================
 
 CORE MENTAL MODEL (5 RULES):
@@ -32,9 +32,10 @@ CORE MENTAL MODEL (5 RULES):
      static primitives: `watch<T>`, unified `inbox<T, N>` (`.post`, `.send`, `.recv`), `signal`,
      `byte_ring<N>`, `wait_queue` + `std.sync` (`Semaphore`, `EventFlags`, `Latch`, `Barrier<N>`),
      `@dma_safe ping_pong<T, N>`, and `@dma_safe pool<T, K>` + `Lease<T>`.
-  5. Dual-Exit Errors, `defer`, Zero-Heap `f\"...\"` & Runtime Traps: Normal exit `return val;`, failure
+  5. Dual-Exit Errors, `defer`, Zero-Heap `f\"...\"` & Defined Safety: Normal exit `return val;`, failure
      `error [E [, v]];` (`or`/`catch`). Out-of-bounds indices/subslices/MMIO arrays and div/rem by zero
-     trap deterministically (`@__syn_panic`), while `INT_MIN / -1` evaluates safely to `INT_MIN` (`% -1` -> `0`).
+     trap deterministically (`@__syn_panic`), `INT_MIN / -1` evaluates to `INT_MIN` (`% -1` -> `0`), and
+     constant overshifts fail at compile time while variable shifts mask by `(bit_width - 1)`.
 
 ROSETTA STONE (FOREIGN HABIT -> IDIOMATIC ZEV):
   Foreign Habit (Rust / Zig / Go / C)     | Idiomatic Zev (`.zev`)
@@ -83,9 +84,12 @@ pub const TOPIC_DOCS: &[TopicDoc] = &[
 
 ## 1. Scalar, Float, Endian, Pointer, Slice & Array Types
 - Integers & Bool: `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, `isize`, `bool`, `void`
-- IEEE-754 Floats: `f32`, `f64` (`0.25f32`, `2.5e-3`, casts `raw as f32` / `val as i32`)
+- IEEE-754 Floats: `f32`, `f64` (`0.25f32`, `2.5e-3`, casts `raw as f32` / saturating `val as i32`)
 - Wire-Endian (valid in `packed struct`): `u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le`
 - Compound: fat slices `[]u8` (`.len`, `buf[i]`, `buf[0..5]`), pointers `*i32 p` / `*u8`, arrays `[16]u8`
+- Defined Arithmetic & Locals: integer `+`/`-`/`*` wrap in two's complement; constant shifts outside
+  `0..bit_width` fail at compile time (`E0024`) while variable shifts mask by `(bit_width - 1)`; `/`/`%` by `0`
+  and out-of-bounds indexing/subslicing trap via `@__syn_panic`; uninitialized locals zero-initialize.
 
 ## 2. Wire `packed struct`, In-Memory `struct`, `enum` & `.rodata` `const`
 ```zev
@@ -121,11 +125,16 @@ struct FixedVec<T, usize N> {
 }
 
 impl<T, usize N> FixedVec<T, N> {
-    pub fn push(*self, T item) { ... }
+    pub fn push(*self, T item) {
+        if (self.len < N) { self.data[self.len] = item; self.len += 1; }
+    }
 }
 
 impl<usize N> FixedVec<f32, N> {
-    pub f32 avg(*self) { ... }
+    pub f32 first_or_zero(*self) {
+        if (self.len == 0) { return 0.0f32; }
+        return self.data[0];
+    }
 }
 
 T clamp<T>(T val, T lo, T hi) {
@@ -152,10 +161,10 @@ T clamp<T>(T val, T lo, T hi) {
         body: "\
 # Zev Topic Guide: `errors`
 
-## 1. Dual-Exit Register Model (`return` vs `error`)
-Normal completion (`return val;`) and failure (`error ...;`) are distinct exits returned in two CPU
-registers `(r0, r1)` with zero `Result<T, E>` tag-wrapping boilerplate (and `defer` statements execute
-cleanly on both paths after return/error expressions are evaluated):
+## 1. Dual-Exit Model (`return` vs `error`)
+Normal completion (`return val;`) and failure (`error ...;`) are distinct exits with zero `Result<T, E>`
+tag-wrapping boilerplate (`NonYielding` functions return `{ OkTy, i32 }` by value; yielding coroutines write
+`{ OkTy, i32 }` into their static frame's `_ret` slot, and `defer` statements execute cleanly on both paths):
 
 - **Boolean failure (`error` suffix)**:
   ```zev
@@ -285,8 +294,8 @@ fn main() {
 `zev-sema` infers one of three effects for every `fn` across the whole call graph:
 1. **`NonYielding`**: Contains no yields; compiles to a direct stack call (`0 B` `.bss`) and is legal
    everywhere (`noyield`, `critical`, `isr`, `defer`, and `extern \"C\"` callbacks).
-2. **`SoftYielding`**: Terminating compute helpers (e.g. `crc_stream`, `fft`, `sha256`) that yield
-   cooperatively via explicit `checkpoint()` calls OR back-edges of `while (cond)` loops outside
+2. **`SoftYielding`**: Terminating compute or polling helpers (e.g. checksums, parsers, or status loops)
+   that yield cooperatively via explicit `checkpoint()` calls OR back-edges of `while (cond)` loops outside
    `noyield` / `critical` / `isr` / `defer` (whereas bounded `for..in` loops stay in registers with zero
    auto-yielding; wrap tight register-polling `while` loops in `noyield { while (...) {} }`):
    - In normal `task` flow, runs as a union-packed coroutine sharing the CPU smoothly.
@@ -298,10 +307,9 @@ fn main() {
    `wait_queue.commit_wait`, `loop every`, or unbounded `loop`); forbidden inside `noyield`,
    `critical`, `isr`, `defer`, and `extern \"C\"` callbacks (`E0003`–`E0006`).
 - Cycles in the call graph containing any yielding function are rejected (`E0012`).
-
-// Defined Runtime Traps: Array/slice `a[i]`, sub-slice `a[s..e]`, MMIO array `regs.arr[i]`, and integer
-// `x / 0` / `x % 0` trap deterministically via `@__syn_panic` (`sys.set_fault_handler`), while signed
-// `INT_MIN / -1` evaluates cleanly to `INT_MIN` and `INT_MIN % -1` evaluates to `0`.
+- **Defined Runtime Traps**: Out-of-bounds `a[i]`, sub-slice `a[s..e]`, MMIO array `regs.arr[i]`, and integer
+  `x / 0` or `x % 0` trap deterministically via `@__syn_panic` (`sys.set_fault_handler`), while signed
+  `INT_MIN / -1` evaluates to `INT_MIN` and `INT_MIN % -1` evaluates to `0`.
 
 ## 2. Explicit Atomicity Brakes (`noyield`, `critical`, `@manual_yield`)
 ```zev
@@ -314,14 +322,16 @@ u32 hash_block([]u8 data) {           // Inferred `SoftYielding` (`checkpoint()`
     return h;
 }
 
-// 1. `noyield { ... }` — Task-atomic (forbids `HardBlocking`; auto-clones `SoftYielding` `hash_block`!)
-noyield {
-    u32 boot_digest = hash_block(rom_hdr);
-}
+fn boot_init([]u8 rom_hdr) {
+    // 1. `noyield { ... }` — Task-atomic (forbids `HardBlocking`; auto-clones `SoftYielding` `hash_block`!)
+    noyield {
+        u32 boot_digest = hash_block(rom_hdr);
+    }
 
-// 2. `critical { ... }` — Hardware-atomic (masks IRQs; forbids ALL yields & unbounded `loop`)
-critical {
-    hw.RCC.cr |= 0x0100_0000;
+    // 2. `critical { ... }` — Hardware-atomic (masks IRQs; forbids ALL yields & unbounded `loop`)
+    critical {
+        hw.RCC.cr |= 0x0100_0000;
+    }
 }
 
 // 3. Parameterized `isr` + ISR-private `state` (isolated `.bss` per Boot-Tree `.attach(...)`)
@@ -364,7 +374,7 @@ values or static scheduler-aware OS primitives at module scope and pass pointers
 |---|---|---|---|
 | `watch<T> w = init;` | Latest-value cell | `w.read() -> T`, `w.publish(v)` | `w.wait_change([timeout: d]) -> T` |
 | `inbox<T, N> q;` | Unified bounded queue | `q.post(v [, boost: @prio])`, `q.try_send(v) -> bool`, `q.try_recv()` | `q.send(v [, timeout: d])`, `q.recv([timeout: d]) -> T` |
-| `byte_ring<N> r;` | Lock-free SPSC stream / BipBuffer | `r.push(s [, boost:])`, `r.push_byte(b [, boost:])`, `r.grant_write(n)`, `r.commit_write(n [, boost:])`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
+| `byte_ring<N> r;` | Contiguous BipBuffer byte stream | `r.push(s [, boost:])`, `r.push_byte(b [, boost:])`, `r.grant_write(n)`, `r.commit_write(n [, boost:])`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
 | `signal s;` | Lightweight wakeup | `s.notify([boost: @prio])`, `s.try_wait() -> bool`, `s.clear()` | `s.wait([timeout: d])` |
 | `@dma_safe pool<T, K> p;` | Zero-copy `O(1)` slab (`K<=32`) | `p.try_alloc() -> Lease<T> error`, `p.avail()`, `p.in_use()` | `p.alloc([timeout: d]) -> Lease<T>` |
 | `dma_slot<T> s;` | Cross-IRQ `Lease<T>` slot | `s.park(l)`, `s.take() -> Lease<T> error`, `s.release([boost:])`, `s.addr()` | *(park across IRQ/DMA transfer)* |
@@ -425,10 +435,12 @@ fn main() {
 ```
 
 ## 4. Deterministic Multi-Source `wait { ... }` (`P0004` replaces `select`)
-A task can wait atomically across multiple primitives + an idle `timeout <dur> =>` or periodic `deadline <u32_tick> =>`
-using `wait { ... }`. Arms are checked top-to-bottom under a single critical section, park atomically via 32-bit
-primitive waiter bitmasks (zero lost wakeups), allow direct primitive ops only (`recv`, `send`, `wait`,
-`wait_change`, `wait_read`, `wait_chunk`, `alloc`, `commit_wait`), and scope leased slices per arm (`E0011`/`E0034`):
+A task can wait atomically across multiple consumer primitives + an idle `timeout <dur> =>` or periodic
+`deadline <u32_tick> =>` using `wait { ... }`. Arms are checked top-to-bottom under a single critical section,
+park atomically via 32-bit primitive waiter bitmasks (zero lost wakeups), allow the six direct zero-argument
+consumer ops (`inbox.recv()`, `signal.wait()`, `byte_ring.wait_read()`, `ping_pong.wait_chunk()`,
+`watch.wait_change()`, `pool.alloc()`), and scope leased slices per arm (`E0011`/`E0034`; for single-queue
+sends with a timeout, use `q.send(v, timeout: d) catch { ... }`):
 ```zev
 u32 next_beat = sys.now_ms() + 100u32;
 loop {
@@ -463,7 +475,7 @@ loop {
 ## 2. Zero-`'a` Scope-Depth & Lease Provenance Rules (`E0008`..`E0011`, `E0034`)
 Zev requires **zero `'a` lifetime annotations**—`zev-sema` tracks origin depth and lease generation
 (including across `for (u8 b in half)` loops):
-- **ALLOWED**: Bounds-clamped sub-slicing (`half[0..5]`), wrapping in local structs (`ByteReader{ buf: half, pos: 0 }`),
+- **ALLOWED**: Bounds-checked sub-slicing (`half[0..5]`, trapping via `@__syn_panic` if out of range), wrapping in local structs (`ByteReader{ buf: half, pos: 0 }`),
   bounded `for (u8 b in half)` iteration, and passing slices/wrappers **downward** into helper functions.
 - **REJECTED (`E0008`/`E0009`)**: Escaping an inner-scope slice/`b.get()` pointer upward or to an outer scope.
 - **REJECTED (`E0011`)**: Reading `half` (or a `b.get()` pointer) AFTER a second `wait_chunk()` or moving/releasing `b`!
@@ -622,7 +634,7 @@ zevc run --sanitize examples/sim_demo.zev
 zevc run --max-ticks 50 app.zev       # Bounds infinite `loop every` / `checkpoint()` firmware loops!
 ```
 
-## 5. Stage 1A: ARM Cortex-M3 (`lm3s6965_evb`) ELF & QEMU
+## 5. ARM Cortex-M3 (`lm3s6965_evb`) ELF & QEMU
 Synthesizes `.isr_vector`, `Reset_Handler`, `SysTick_Handler`, and linker script with zero C/libc.
 Supports `-O0`, `-O1`, `-O2` (default), `-O3`, `-Os`, and `-Oz` (`--opt-level <level>`):
 ```bash
@@ -632,26 +644,26 @@ zevc run-qemu -Oz examples/cortex_m_demo.zev
 zevc run-qemu --max-ticks 50 app.zev  # Deterministic SysTick cap for non-terminating firmware!
 ```
 
-## 6. Stage 1B: Espressif ESP32-C6 (`esp32c6_pico`, `riscv32imac` Direct-Boot)
+## 6. Espressif ESP32-C6 (`esp32c6_pico`, `riscv32imac` Direct-Boot)
 Synthesizes `0xAEDB041D` x2 ROM Direct-Boot header, `@_start` at `0x42000008`, and `mtvec` dispatch;
-`route_irq`/`ack_irq`, watchdog disarm (`TIMG0`/`TIMG1`/`LP_WDT`/`SWD`), `SYSTIMER` (`sys.set_clock_ms`), and `USB_DEVICE` (`sys.set_putc`) live in pure `.zev`:
+`route_irq`/`ack_irq`, watchdog disarm (`TIMG0`/`TIMG1`/`LP_WDT`/`SWD`), `SYSTIMER` (`sys.set_clock_ms`), and `USB_DEVICE` (`sys.set_putc`) live in `.zev`:
 ```bash
 zevc emit-llvm --board esp32c6_pico examples/esp32c6_demo.zev -o build/esp32c6.ll
 zevc build --board esp32c6_pico -Oz examples/esp32c6_demo.zev -o build/esp32c6_demo.bin
 zevc flash --board esp32c6_pico -Oz examples/esp32c6_demo.zev --port /dev/ttyACM0
 ```
 
-## 7. Stage 1C: Microchip ATmega328P / Arduino Uno R3 (`arduino_uno`, `avr` Optiboot)
+## 7. Microchip ATmega328P / Arduino Uno R3 (`arduino_uno`, `avr` Optiboot)
 Synthesizes Flash vector table, `.data`/`.rodata`/`.bss` startup, `SREG`, and `avr-libgcc` shims;
-WDT disarm, `Timer0` 1 kHz `sys.tick()` ISR, and `115200 8N1` `USART0` (`sys.set_putc`) live in pure `.zev`:
+WDT disarm, `Timer0` 1 kHz `sys.tick()` ISR, and `115200 8N1` `USART0` (`sys.set_putc`) live in `.zev`:
 ```bash
 zevc emit-llvm --board arduino_uno examples/arduino_uno_demo.zev -o build/uno.ll
 zevc build --board arduino_uno examples/arduino_uno_demo.zev -o build/uno_demo.bin
 zevc flash --board arduino_uno examples/arduino_uno_demo.zev --port /dev/ttyACM0
 ```
 
-## 8. Stage 1D: Microchip ATmega4809 / Arduino Nano Every (`arduino_nano_every`, `avrxmega3` UPDI)
-Synthesizes pure-ISA Flash vectors + `.data`/`.bss` startup, while
+## 8. Microchip ATmega4809 / Arduino Nano Every (`arduino_nano_every`, `avrxmega3` UPDI)
+Synthesizes Flash vectors + `.data`/`.bss` startup, while
 `bsp.init_board()` configures `CPU.ccp` WDT/clock unlock, `FUSE.OSCCFG` 16/20 MHz auto-calibration,
 `SLPCTRL`, `isr systick_isr` (`TCB3` 1 kHz `sys.tick()`), and `sys.set_putc` (`115200 8N1` `USART3`) in `.zev`:
 ```bash
@@ -660,9 +672,9 @@ zevc build --board arduino_nano_every examples/arduino_nano_every_demo.zev -o bu
 zevc flash --board arduino_nano_every examples/arduino_nano_every_demo.zev --port /dev/ttyACM0
 ```
 
-## 9. Stage 1E: Raspberry Pi Pico / Pico W (`rpi_pico_w`, `rp2040` SRAM UF2)
+## 9. Raspberry Pi Pico / Pico W (`rpi_pico_w`, `rp2040` SRAM UF2)
 Synthesizes ARMv6-M `.entry` (`0x2000_0000`), `[48 x ptr]` `.isr_vector`, and `SysTick`;
-125 MHz `PLL_SYS`/48 MHz `PLL_USB`, BootROM reset (`sys.rom_call_u32` + `sys.rom_call_noreturn`), `sys.set_exit`, and Full-Speed USB 1.1 CDC-ACM live 100% in `.zev`:
+125 MHz `PLL_SYS`/48 MHz `PLL_USB`, BootROM reset (`sys.rom_call_u32` + `sys.rom_call_noreturn`), `sys.set_exit`, and Full-Speed USB 1.1 CDC-ACM live in `.zev`:
 ```bash
 zevc emit-llvm --board rpi_pico_w examples/pico_w_demo.zev -o build/pico_w.ll
 zevc build --board rpi_pico_w examples/pico_w_demo.zev -o build/pico_w_demo.uf2
@@ -1008,5 +1020,106 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn extract_zev_fences(markdown: &str) -> Vec<(usize, String)> {
+        let mut fences = Vec::new();
+        let mut in_zev = false;
+        let mut start_line = 0usize;
+        let mut cur = String::new();
+        for (idx, line) in markdown.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if !in_zev {
+                if trimmed == "```zev" {
+                    in_zev = true;
+                    start_line = idx + 1;
+                    cur.clear();
+                }
+            } else if trimmed == "```" {
+                in_zev = false;
+                fences.push((start_line, cur.clone()));
+            } else {
+                cur.push_str(line);
+                cur.push('\n');
+            }
+        }
+        assert!(!in_zev, "unclosed ```zev fence starting at line {start_line}");
+        fences
+    }
+
+    #[test]
+    fn all_fenced_zev_snippets_in_docs_and_design_parse_cleanly() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let design = std::fs::read_to_string(root.join("DESIGN_V0.md")).expect("read DESIGN_V0.md");
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+
+        let mut sources: Vec<(String, String)> = vec![
+            ("DESIGN_V0.md".to_string(), design),
+            ("README.md".to_string(), readme),
+        ];
+        for t in TOPIC_DOCS {
+            sources.push((format!("zevc doc {}", t.name), t.body.to_string()));
+        }
+
+        let mut checked = 0usize;
+        for (doc_name, text) in &sources {
+            for (line_no, snippet) in extract_zev_fences(text) {
+                checked += 1;
+                let label = format!("{doc_name}:{line_no}");
+                let parsed_top = zev_parser::parse_str_named(&snippet, &label);
+                match parsed_top {
+                    Ok(prog) => {
+                        if doc_name == "DESIGN_V0.md" || doc_name == "README.md" {
+                            let with_main = if snippet.contains("fn main(") {
+                                prog
+                            } else {
+                                zev_parser::parse_str_named(
+                                    &format!("{snippet}\nfn main() {{}}\n"),
+                                    &label,
+                                )
+                                .expect("parse DESIGN_V0 snippet with main")
+                            };
+                            let opts = zev_sema::AnalyzeOptions {
+                                include_dirs: vec![root.clone()],
+                                hal_dir: Some("hal/sim".to_string()),
+                                board_module: Some("bsp/sim".to_string()),
+                                ..zev_sema::AnalyzeOptions::default()
+                            };
+                            let (mono_progs, _) = zev_sema::analyze_and_monomorphize_programs(
+                                std::slice::from_ref(&with_main),
+                                &opts,
+                            )
+                            .into_result()
+                            .unwrap_or_else(|diags| {
+                                panic!(
+                                    "{doc_name} snippet at {label} failed zev-sema:\n{diags:#?}\n---\n{snippet}"
+                                )
+                            });
+                            if doc_name == "README.md" {
+                                let mir = zev_mir::lower_programs(&mono_progs)
+                                    .expect("README snippet MIR lower");
+                                let ll = zev_codegen_llvm::emit_llvm_ir(&mir)
+                                    .expect("README snippet LLVM codegen");
+                                assert!(!ll.is_empty());
+                            }
+                        }
+                    }
+                    Err(top_err) => {
+                        // Statement-level doc excerpts (e.g. `wait { ... }`, `catch`, `fmt_buf`) must
+                        // parse cleanly inside a `task` body.
+                        let wrapped = format!(
+                            "task __doc_excerpt() {{\n{snippet}\n    loop {{ checkpoint(); }}\n}}\n"
+                        );
+                        if let Err(stmt_err) = zev_parser::parse_str_named(&wrapped, &label) {
+                            panic!(
+                                "fenced ```zev snippet at {label} failed to parse both as items and as statements!\n\
+                                 Item error: {top_err}\nStmt error: {stmt_err}\n---\n{snippet}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked >= 15, "expected at least 15 fenced zev snippets, found {checked}");
     }
 }

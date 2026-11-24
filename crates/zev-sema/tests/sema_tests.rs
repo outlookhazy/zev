@@ -6791,6 +6791,39 @@ fn main() {
     assert_eq!(model.fn_effect("poll_reg"), FnEffect::NonYielding);
 }
 
+#[test]
+fn const_shift_range_validation() {
+    for bad in [
+        "fn main() { u32 x = 1u32 << 32; }",
+        "fn main() { u8 x = 0x80u8 >> 8; }",
+        "fn main() { u32 x = 1 << 32; }",
+        "const u16 BAD = 1 << 16; fn main() {}",
+        "fn main() { u32 x = 1; x <<= 32; }",
+        "fn main() { i32 x = -8; x >>= -1; }",
+        "fn main() { u64 x = 1 << 64; }",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::InvalidOperation);
+    }
+
+    // Valid constant shifts across widths + local variable shadowing a top-level const
+    let valid = r#"
+const u32 N = 32;
+const u64 WIDE = 1 << 40;
+
+fn main() {
+    u8 a = 1 << 7;
+    u32 b = 1 << 31;
+    u64 c = WIDE | (1u64 << 63);
+    u32 N = 4;
+    u32 shadowed_ok = 1u32 << N;
+    u32 shadowed_untyped = 1 << N;
+    u32 _sum = (a as u32) + b + (c as u32) + shadowed_ok + shadowed_untyped;
+}
+"#;
+    expect_ok(valid);
+}
+
+
 
 
 

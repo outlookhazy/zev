@@ -170,7 +170,7 @@ fn main() {
         code: "P0007",
         summary: "Zig/Rust `!Type`, `try`, or `return error.X` / `Err(...)` instead of dual-exit `error`",
         topic: "errors",
-        why: "Zev models normal completion (`return val;` -> `r1 == 0`) and failure (`error [Reason [, partial]];` -> `r1 != 0`) as distinct dual exits returned in two CPU registers `(r0, r1)`. Declare fallibility after the parameter list (`u16 f() error ErrEnum`), fail with `error Variant;`, and handle with `catch` or `or`.",
+        why: "Zev models normal completion (`return val;` -> `status == 0`) and failure (`error [Reason [, partial]];` -> `status != 0`) as distinct exits (`{ OkTy, i32 }` by value for non-yielding functions, or static frame `_ret` + `i32` step status for yielding coroutines). Declare fallibility after the parameter list (`u16 f() error ErrEnum`), fail with `error Variant;`, and handle with `catch` or `or`.",
         bad_zev: "\
 enum IoErr { Timeout }
 !u16 read_reg() {
@@ -383,7 +383,7 @@ fn main() {
         code: "E0001",
         summary: "Illegal raw mutable global variable declared at top level",
         topic: "primitives",
-        why: "Raw mutable globals create data races between hardware ISRs, cooperative tasks, and symmetric multicore targets. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `byte_ring<N>`, `signal`, `ping_pong<T, N>`, `pool<T, K>`, `dma_slot<T>`).",
+        why: "Raw mutable globals allow silent ISR-vs-task preemption races on multi-byte state and bypass scheduler wakeup tracking. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `byte_ring<N>`, `signal`, `wait_queue`, `ping_pong<T, N>`, `pool<T, K>`, `dma_slot<T>`).",
         bad_zev: "\
 u32 latest_rpm = 0;
 
@@ -402,7 +402,7 @@ fn main() {
         code: "E0002",
         summary: "Task, ISR, or function reads/writes a raw mutable global (isolation violation)",
         topic: "primitives",
-        why: "ISRs can preempt any task between instructions unless masked, and tasks run independently across turns/cores. Replacing raw shared globals with `watch<T>` (latest value) or `inbox<Ev, N>` (event queue with optional `boost: @critical`) makes cross-context dataflow atomic and wakeup-aware.",
+        why: "Hardware ISRs can preempt any cooperative task between instructions unless interrupts are masked, and raw shared variables have no wakeup discipline. Replacing raw shared globals with `watch<T>` (latest value) or `inbox<Ev, N>` (event queue with optional `boost: @critical`) makes cross-context dataflow atomic and wakeup-aware.",
         bad_zev: "\
 bool overcurrent_latched = false;
 
@@ -431,7 +431,7 @@ fn main() {
         code: "E0003",
         summary: "`HardBlocking` call, direct `checkpoint()`, `defer` yield, or auto-yield `loop` inside `noyield`",
         topic: "yielding",
-        why: "`noyield { ... }` guarantees task-atomicity: no other cooperative task can interleave mid-update, and transient locals stay in CPU registers. `SoftYielding` helper `fn`s (terminating functions that only call `checkpoint()`) automatically specialize a direct `0 B`-`.bss` stack clone inside `noyield`, whereas `HardBlocking` waits (`delay`, `recv`, `send`, `wait_chunk`), direct `checkpoint()`, and unbounded `loop` are rejected.",
+        why: "`noyield { ... }` guarantees task-atomicity: no other cooperative task can interleave mid-update, and transient locals stay in CPU registers. `SoftYielding` helper `fn`s (terminating functions using `checkpoint()` or unguarded `while (cond)` loops) automatically specialize a direct `0 B`-`.bss` stack clone inside `noyield` (and `noyield { while (cond) {} }` stays non-yielding), whereas `HardBlocking` waits (`delay`, `recv`, `send`, `wait_chunk`), direct `checkpoint()`, and unbounded `loop` / `while (true)` are rejected.",
         bad_zev: "\
 u16 adc_sample() {
     delay(1ms);
@@ -678,9 +678,9 @@ fn main() {
     },
     ErrorDoc {
         code: "E0011",
-        summary: "Stale DMA lease read after a subsequent `wait_chunk()` swap",
+        summary: "Stale leased slice or pointer read after buffer advance, swap, or `Lease` release",
         topic: "dma",
-        why: "`ping_pong<T, N>` double-buffers zero-copy DMA: while the CPU reads half A, DMA hardware overwrites half B. Calling `rx_dma.wait_chunk()` a second time swaps ownership so DMA can overwrite half A—making any slice, sub-slice, or wrapper struct derived from the first `wait_chunk()` stale. Copy out any scalar/struct fields you need before calling `wait_chunk()` again.",
+        why: "Zero-copy slices and pointers leased from `ping_pong.wait_chunk()`, `byte_ring` (`read_slice()`, `wait_read()`, `grant_write()`), or `Lease.get()` remain valid only until the next buffer mutation (`wait_chunk()`, `consume(n)`, `commit_write(n)`, or moving/releasing the `Lease<T>`)—and `wait { ... }` slice bindings are scoped strictly to their arm. Copy out any scalar/struct fields you need before advancing or releasing the buffer.",
         bad_zev: "\
 @dma_safe ping_pong<u8, 64> rx_dma;
 task bad_reader() {
@@ -993,9 +993,9 @@ fn main() {
     },
     ErrorDoc {
         code: "E0023",
-        summary: "Invalid control flow (`break`/`continue` outside loop, `restart` outside `task`, or jump inside `defer`)",
+        summary: "Invalid control flow (`break`/`continue` outside loop, `restart` outside `task`, `set_priority` in `isr`, or jump inside `defer`)",
         topic: "tasks",
-        why: "`break;` and `continue;` must appear inside a loop (`loop`, `loop every`, `while`, or `for`), `restart;` is only valid inside a `task` body, `set_priority` belongs in `fn main()`, and `defer` cleanup blocks cannot jump out of scope via `return`, `error`, `break`, `continue`, or `restart`.",
+        why: "`break;` and `continue;` must appear inside a loop (`loop`, `loop every`, `while`, or `for`), `restart;` is only valid inside a `task` body, `set_priority` is valid in `fn` and `task` bodies (forbidden inside `isr`), and `defer` cleanup blocks cannot jump out of scope via `return`, `error`, `break`, `continue`, or `restart`.",
         bad_zev: "\
 fn helper() {
     restart;
@@ -1024,9 +1024,9 @@ fn main() {
     },
     ErrorDoc {
         code: "E0024",
-        summary: "Invalid type layout or operation (e.g. pointer/slice in `packed struct` or `void` variable)",
+        summary: "Invalid type layout or operation (e.g. pointer/slice in `packed struct`, out-of-range constant shift, or invalid `wait` / `wait_queue` use)",
         topic: "syntax",
-        why: "`packed struct` represents wire-exact protocol frames decoded via `Type.from_bytes(slice)`, so all fields must be fixed-width integer/endian scalars (`u8`, `u16be`, `u32le`, etc.—never pointers or fat slices). Use a normal `struct` for in-memory slice wrappers like `ByteReader`.",
+        why: "`packed struct` represents wire-exact protocol frames decoded via `Type.from_bytes(slice)`, so all fields must be fixed-width integer/endian scalars (`u8`, `u16be`, `u32le`, etc.—never pointers or fat slices). `E0024` also flags out-of-range constant bit-shifts (`outside 0..bit_width`), `void` variables, calling `wait_queue.prepare_wait()` outside `critical { ... }`, and non-consumer or argument-carrying `wait { ... }` arms.",
         bad_zev: "\
 packed struct BadWire {
     u8   op;
@@ -1118,9 +1118,9 @@ fn main() {
     },
     ErrorDoc {
         code: "E0027",
-        summary: "Invalid `spawn` placement (`spawn` inside a `task`, `isr`, loop, recursion, or post-boot supervisor)",
+        summary: "Invalid `spawn` placement or static `MAX_TASKS <= 32` task-slot limit exceeded",
         topic: "tasks",
-        why: "To guarantee 1:1 compile-time `.bss` task slot allocation with zero heap, `spawn` is restricted to **Boot-Tree `spawn`**: `fn main()` (including conditional `if`/`switch` boot branches) and non-loop, non-recursive setup `fn`s called during `main()`'s sequential boot phase before its steady-state supervisor loop (`zevc ram` prints each slot's full provenance path `main -> init_bus -> worker`).",
+        why: "To guarantee 1:1 compile-time `.bss` task slot allocation (`0 B` heap) and `O(1)` 32-bit ready/waiter bitmasks (`MAX_TASKS <= 32`), `spawn` is restricted to **Boot-Tree `spawn`**: `fn main()` (including conditional `if`/`switch` boot branches) and non-loop, non-recursive setup `fn`s called during `main()`'s sequential boot phase before its steady-state supervisor loop (`zevc ram` prints each slot's full provenance path `main -> init_bus -> worker`).",
         bad_zev: "\
 task worker(u8 ch) {
     loop every 10ms {

@@ -7521,4 +7521,58 @@ fn main() {
         std::fs::write(&rv_wfi_path, &ll_rv_wfi).unwrap();
         verify_ll_with_opt(&rv_wfi_path).expect("opt verify rv wfi");
     }
+
+    #[test]
+    fn masked_variable_bit_shifts_across_widths_in_qemu() {
+        let src = r#"
+u8 shift_u8(u8 v, u32 sh) { return v << sh; }
+u32 shift_u32(u32 v, u32 sh) { return v << sh; }
+i32 shift_i32(i32 v, i32 sh) { return v >> sh; }
+u64 shift_u64(u64 v, u32 sh) { return v << sh; }
+u32 const_shift(u32 v) { return v >> 4; }
+
+task verifier() {
+    u32 s32 = 32;
+    u32 s35 = 35;
+    u32 s8 = 8;
+    u32 s9 = 9;
+    i32 neg1 = -1;
+    u32 s65 = 65;
+
+    u8 r8_a = shift_u8(1u8, s8);
+    u8 r8_b = shift_u8(1u8, s9);
+    u32 r32_a = shift_u32(1u32, s32);
+    u32 r32_b = shift_u32(1u32, s35);
+    i32 ri_neg = shift_i32(-16, neg1);
+    u64 r64 = shift_u64(1u64, s65);
+
+    u32 acc = 1u32;
+    acc <<= s35;
+    u8 bacc = 0x80u8;
+    bacc >>= s9;
+    u32 cs = s35 >> 4;
+
+    if (r8_a == 1u8 && r8_b == 2u8 && r32_a == 1u32 && r32_b == 8u32
+        && ri_neg == -1 && r64 == 2u64 && acc == 8u32 && bacc == 0x40u8
+        && cs == 2u32 && const_shift(0x40u32) == 4u32) {
+        println("SHIFT_MASK_OK");
+    }
+    sys.exit(0);
+}
+
+fn main() {
+    spawn verifier() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).unwrap();
+        assert!(zev_sema::analyze_program(&prog).is_ok());
+        let mir = zev_mir::lower_program(&prog).unwrap();
+        let ll = emit_llvm_ir_with_options(&mir, &CodegenOptions::default()).unwrap();
+        // Constant shift (`s35 >> 4`) folds the shift count directly (`lshr i32 ..., 4`) without `and i32 4, 31`.
+        assert!(ll.contains(", 4\n"), "expected direct constant shift `, 4` in IR:\n{ll}");
+        assert!(!ll.contains("and i32 4, 31"), "unexpected mask on constant shift:\n{ll}");
+
+        let (_mir, _ll, qres) = run_zev_cortex_m_qemu("masked_variable_bit_shifts", src);
+        assert!(qres.exec.stdout.contains("SHIFT_MASK_OK"), "unexpected qemu output: {}", qres.exec.stdout);
+    }
 }

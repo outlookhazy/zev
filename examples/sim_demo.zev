@@ -1,6 +1,6 @@
 // Complete Self-Contained Simulation Demo (`zevc run --sanitize examples/sim_demo.zev`)
 //
-// Exercises ALL v0 + Wave 1/Wave 2 + §6.3 Wave 1 invariants deterministically under Clang ASan/UBSan:
+// Exercises core Zev compiler and runtime invariants deterministically under Clang ASan/UBSan:
 //   1. Real `.zev` `chip.*`, `bsp.*`, and `std.*` modules + typed `mmio` (`@rw`, `@ro`, `@wo`, `@w1c`)
 //   2. Parameterized `isr` handlers + ISR-private `state` + Boot-Tree `irq.attach(...)`
 //   3. Boot-Tree `spawn`, `loop every 1ms`, `noyield`, `critical`, `defer`, `for (..)`

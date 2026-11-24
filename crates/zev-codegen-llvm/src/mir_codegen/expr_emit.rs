@@ -2200,19 +2200,23 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let shift_ty = self.ctx.llvm_ty(&lhs_host);
             let lc = self.coerce(lv, &shift_ty, !lhs.ty.is_unsigned());
             let rc = self.coerce(rv, &shift_ty, false);
-            let inst = match op {
-                MirBinOp::Shl => "shl",
-                MirBinOp::Shr => {
-                    if !lhs.ty.is_unsigned() {
-                        "ashr"
-                    } else {
-                        "lshr"
-                    }
-                }
-                _ => unreachable!(),
+            let mask = llvm_int_bits(&shift_ty).saturating_sub(1);
+            let rc_masked = if let Ok(c) = rc.repr.parse::<i128>() {
+                SsaVal::new(shift_ty.clone(), ((c as u128) & u128::from(mask)).to_string())
+            } else {
+                let m = self.next_tmp();
+                self.emit_line(format!("{m} = and {shift_ty} {}, {mask}", rc.repr));
+                SsaVal::new(shift_ty.clone(), m)
+            };
+            let inst = if matches!(op, MirBinOp::Shl) {
+                "shl"
+            } else if !lhs.ty.is_unsigned() {
+                "ashr"
+            } else {
+                "lshr"
             };
             let t = self.next_tmp();
-            self.emit_line(format!("{t} = {inst} {shift_ty} {}, {}", lc.repr, rc.repr));
+            self.emit_line(format!("{t} = {inst} {shift_ty} {}, {}", lc.repr, rc_masked.repr));
             let dst_lty = self.ctx.llvm_ty(&res_ty.host_value_type());
             return Ok(self.coerce(SsaVal::new(shift_ty, t), &dst_lty, !res_ty.is_unsigned()));
         }

@@ -1640,7 +1640,7 @@ pub struct MonomorphizedMirItem {
     pub size_64: usize,
 }
 
-/// Complete lowered MIR module ready for RAM reporting and C99/LLVM backend emission.
+/// Complete lowered MIR module ready for RAM reporting and LLVM backend emission.
 #[derive(Debug, Clone)]
 pub struct MirModule {
     pub tick_period_us: u64,

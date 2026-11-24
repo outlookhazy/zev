@@ -1156,6 +1156,7 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return ExprVal::error(span);
                 }
+                self.check_const_shift_amount(op.as_str(), &lv.ty, rhs);
                 // L-H1: Shift result takes the host integer type of the shifted left operand
                 // rather than promoting to a wider right-hand shift amount (`0x8000_0000u32 >> 4i32` -> `u32`).
                 let res_ty = match &lv.ty {
@@ -1165,6 +1166,31 @@ impl<'a> BodyChecker<'a> {
                 };
                 ExprVal::scalar(res_ty, span)
             }
+        }
+    }
+
+    pub(super) fn check_const_shift_amount(&mut self, op_str: &str, lhs_ty: &Ty, rhs_expr: &Expr) {
+        let shadowed = self.active_local_names();
+        let Some(sh) =
+            self.sema
+                .eval_const_expr_i128_shadowed(rhs_expr, &mut BTreeSet::new(), &shadowed)
+        else {
+            return;
+        };
+        let max_bits = lhs_ty.fixed_int_bit_width().unwrap_or(64);
+        if sh < 0 || sh >= i128::from(max_bits) {
+            let ty_desc = if matches!(lhs_ty, Ty::IntLit) {
+                "integer".to_string()
+            } else {
+                format!("'{lhs_ty}'")
+            };
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::InvalidOperation,
+                rhs_expr.span,
+                format!(
+                    "shift count {sh} for '{op_str}' is out of range for {ty_desc} (must be in 0..{max_bits})"
+                ),
+            ));
         }
     }
 

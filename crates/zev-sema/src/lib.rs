@@ -1,13 +1,13 @@
-//! `zev-sema` — Static Verifier, Monomorphizer & Semantic Analyzer for the Zev Language-OS.
+//! `zev-sema` — Static Verifier, Monomorphizer & Semantic Analyzer for Zev (`zevc`).
 //!
 //! Monomorphizes `<T>` and `<T, usize N>` generics and validates one or more parsed [`zev_ast::Program`]
-//! ASTs against all v0 Language-OS safety and zero-heap scheduling invariants, producing concrete
-//! [`Program`]s and a rich [`SemanticModel`]:
+//! ASTs against Zev's safety and zero-heap scheduling invariants, producing concrete
+//! [`Program`]s and a [`SemanticModel`]:
 //! 1. **Compile-Time `<T>` & `<T, usize N>` Monomorphization** (`<orig>__<arg1>__<arg2>`, `@monomorphized`, `[N]T` bounds)
 //! 2. **Whole-Program 3-Tier Call-Graph Yield Inference** (`NonYielding`, `SoftYielding` dual-spec, `HardBlocking`, `extern "C"`)
 //! 3. **`noyield`, `critical`, `isr`, `defer`, and C-Callback Safety**
-//! 4. **Task & ISR Isolation** (rejects mutable raw globals; enforces communication via `signal`, `inbox`, `watch`, `ping_pong`, `lease`)
-//! 5. **Scope-Depth & DMA Lease Origin Tracking** (zero `'a` lifetimes)
+//! 4. **Task & ISR Isolation** (rejects mutable raw globals; enforces communication via `signal`, `inbox`, `watch`, `byte_ring`, `wait_queue`, `ping_pong`, `pool`/`Lease`/`dma_slot`)
+//! 5. **Scope-Depth, Per-Arm `wait` Slice Lease & Linear `Lease<T>` Ownership Tracking (`E0008`–`E0011`, `E0034`)**
 //! 6. **Zero-Heap `f"..."` Format Verification & `fmt_buf` Worst-Case Buffer Fit Proof (`E0028`)**
 //! 7. **Boot-Tree `spawn` Unrolling, Immortal Tasks & Dual-Exit `return`/`error`/`catch`/`or` Verification**
 
