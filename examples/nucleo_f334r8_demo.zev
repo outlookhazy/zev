@@ -12,7 +12,7 @@ import chip.stm32f334 as hw;
 import chip.stm32f3 as f3;
 import bsp.nucleo_f334r8 as bsp;
 import hal.{time as htime, gpio, pwm, adc, i2c, spi};
-import std.{str, fmt, bus};
+import std.{io, shell, str, fmt, bus};
 
 // Shakedown rig wiring pin descriptor in Flash `.rodata` (kept in app, not in board BSP)
 const gpio.Pin RIG_PB1_PPS = gpio.Pin { port: f3.PORT_B, pin: 1u8, active_low: false };
@@ -130,7 +130,6 @@ watch<GpsSnapshot> gps_watch = GpsSnapshot {
 
 inbox<u32, 8>                  tim2_q;
 inbox<SupEvent, 8>             sup_inbox;
-byte_ring<64>                  console_rx;
 @dma_safe ping_pong<u8, 32>    gps_dma;
 @dma_safe pool<DmaBurst, 2>    dma_pool;
 dma_slot<DmaBurst>             dma_inflight;
@@ -196,19 +195,6 @@ isr tim2_isr(*inbox<u32, 8> q, *watch<PinSnapshot> pw) {
             pb0_level: pb0,
             button_pressed: btn,
         });
-    }
-}
-
-isr usart2_rx_isr(*byte_ring rx, *hw.UsartRegs u) {
-    state u32 vcp_irqs = 0u32;
-    vcp_irqs += 1u32;
-    u.icr = 0x0Fu32;
-    for (u32 spin in 0..8) {
-        if ((u.isr & (1u32 << 5)) == 0u32) {
-            break;
-        }
-        u8 b = (u.rdr & 0xFFu32) as u8;
-        rx.push_byte(b, boost: @high);
     }
 }
 
@@ -434,39 +420,77 @@ task gps_nmea_worker(*ping_pong<u8, 32> rx_pp, *watch<GpsSnapshot> gw) {
     }
 }
 
-task cli_worker(*byte_ring rx, *inbox<SupEvent, 8> sup) {
-    loop {
-        []u8 chunk = rx.wait_read();
-        usize n = chunk.len;
-        []u8 trimmed = str.trim_ascii(chunk);
-        for (u8 ch in trimmed) {
-            if (ch == 'p' || ch == 'P' || ch == '?') {
-                sup.post(CmdStatus, boost: @critical);
-            } else if (ch == 's' || ch == 'S') {
-                sup.post(CmdSystem, boost: @critical);
-            } else if (ch == 'g' || ch == 'G') {
-                sup.post(CmdGps, boost: @critical);
-            } else if (ch == 'l' || ch == 'L') {
-                sup.post(CmdLoopback, boost: @critical);
-            } else if (ch == 'h' || ch == 'H') {
-                sup.post(CmdHrtim, boost: @critical);
-            } else if (ch == 'a' || ch == 'A') {
-                sup.post(CmdAnalog, boost: @critical);
-            } else if (ch == 'd' || ch == 'D') {
-                sup.post(CmdDma, boost: @critical);
-            } else if (ch == 'c' || ch == 'C') {
-                sup.post(CmdCan, boost: @critical);
-            } else if (ch == 'f' || ch == 'F') {
-                sup.post(CmdFlashNvs, boost: @critical);
-            } else if (ch == 'r' || ch == 'R') {
-                sup.post(RunShakedown, boost: @critical);
-            } else if (ch == 'n' || ch == 'N') {
-                sup.post(UserTrigger, boost: @critical);
-            }
-        }
-        rx.consume(n);
-    }
+fn cmd_ping(*shell.Session s, []u8 _args) error shell.Err {
+    PinSnapshot p = pin_watch.read();
+    GpsSnapshot g = gps_watch.read();
+    println(s, f"[CMD F334R8] PONG uptime={sys.now_ms()}ms tim2={p.tim2_ticks} prio={sys.current_prio()} sats={g.sats} fix_q={g.fix_quality}");
 }
+
+fn post_sup(*shell.Session s, SupEvent ev, []u8 msg) error shell.Err {
+    if (!sup_inbox.try_send(ev)) {
+        error Failed;
+    }
+    println(s, msg);
+}
+
+fn cmd_status(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdStatus, "status queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_sys(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdSystem, "sys queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_gps(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdGps, "gps queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_loopback(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdLoopback, "loopback queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_hrtim(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdHrtim, "hrtim queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_analog(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdAnalog, "analog queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_dma(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdDma, "dma queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_can(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdCan, "can queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_nvs(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, CmdFlashNvs, "nvs queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_shakedown(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, RunShakedown, "shakedown queued") catch (shell.Err e) { error e; };
+}
+
+fn cmd_trigger(*shell.Session s, []u8 _args) error shell.Err {
+    post_sup(s, UserTrigger, "trigger queued") catch (shell.Err e) { error e; };
+}
+
+const [12]shell.Cmd COMMANDS = [
+    shell.Cmd { name: "ping",      help: "direct PONG + GPS summary", run: cmd_ping },
+    shell.Cmd { name: "status",    help: "supervisor status line",    run: cmd_status },
+    shell.Cmd { name: "sys",       help: "system/FPU/bus check",      run: cmd_sys },
+    shell.Cmd { name: "gps",       help: "print GPS NMEA snapshot",   run: cmd_gps },
+    shell.Cmd { name: "loopback",  help: "D7->A0 GPIO/PWM test",      run: cmd_loopback },
+    shell.Cmd { name: "hrtim",     help: "HRTIM 100kHz PWM test",     run: cmd_hrtim },
+    shell.Cmd { name: "analog",    help: "ADC/DAC/COMP2 test",        run: cmd_analog },
+    shell.Cmd { name: "dma",       help: "DMA1 CH1 M2M burst",        run: cmd_dma },
+    shell.Cmd { name: "can",       help: "bxCAN loopback test",       run: cmd_can },
+    shell.Cmd { name: "nvs",       help: "Flash NVS page31 test",     run: cmd_nvs },
+    shell.Cmd { name: "shakedown", help: "run full shakedown",        run: cmd_shakedown },
+    shell.Cmd { name: "trigger",   help: "trigger supervisor + GPS",  run: cmd_trigger },
+];
 
 // ── Application-Level Hardware Validation Suites (HAL + Chip Drivers) ───────
 fn sample_a0_window_pct(gpio.Pin pin_a0, u32 window_ms) -> u32 {
@@ -950,6 +974,7 @@ fn run_full_shakedown(bus.ResetReason boot_rr) {
 // ── Boot & Supervisor Loop ───────────────────────────────────────────────────
 fn main() {
     bsp.init_board();
+    io.DuplexStream console = bsp.console_open();
     bus.ResetReason boot_rr = f3.read_reset_reason(true);
     f3.init_adc12();
 
@@ -970,13 +995,9 @@ fn main() {
     hw.IRQ_DMA1_CH1.attach(dma1_ch1_isr(&dma_inflight, &dma_done_q));
     hw.IRQ_DMA1_CH5.attach(usart1_dma_isr(&gps_dma));
     hw.IRQ_TIM2.attach(tim2_isr(&tim2_q, &pin_watch));
-    hw.IRQ_USART2.attach(usart2_rx_isr(&console_rx, hw.USART2));
-    critical {
-        hw.USART2.cr1 = hw.USART2.cr1 | (1u32 << 5) | (1u32 << 2);
-    }
 
     spawn gps_nmea_worker(&gps_dma, &gps_watch) @high;
-    spawn cli_worker(&console_rx, &sup_inbox) @normal;
+    spawn shell.serve(console, COMMANDS) @normal;
 
     set_priority(@low);
     println("");

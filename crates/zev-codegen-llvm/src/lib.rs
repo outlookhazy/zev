@@ -4064,7 +4064,7 @@ fn main() {
             "__syn_vec_irq_0",
             "__syn_vec_irq_5",
             "__syn_vec_irq_11",
-            "__zev_isr_state_1_usb",
+            "__zev_isr_state_0_usb",
             "__syn_fn_bsp_rpi_pico_w__init_clocks",
             "__syn_fn_bsp_rpi_pico_w__usb_cdc_irq_step",
         ] {
@@ -4075,8 +4075,10 @@ fn main() {
             );
         }
         let ll_src = std::fs::read_to_string(&img.elf.ll_path).expect("read pico_w_demo.ll");
-        assert!(ll_src.contains("call void @__syn_isr_usb_cdc_isr("));
-        assert!(ll_src.contains("call void @__syn_fn_console_putc(i8 %c)"));
+        assert!(ll_src.contains("call void @__syn_isr_bsp_rpi_pico_w__usb_console_isr("));
+        assert!(
+            ll_src.contains("call void @__syn_fn_bsp_rpi_pico_w__pico_console_ring_putc(i8 %c)")
+        );
 
         let uf2 = std::fs::read(&img.uf2_path).expect("read generated UF2");
         assert!(
@@ -5727,21 +5729,89 @@ fn main() {
 
         let dir = test_out_dir();
 
-        // 2. ESP32-C6 (`riscv32imac`): `usb_serial` & `usb_cmd_worker` fold cleanly and ELF/.bin build passes
-        let esp_mir = compile_example_mir(&[repo_root().join("examples/esp32c6_demo.zev")]);
-        assert!(esp_mir
-            .visibility
-            .singleton_subsystems
-            .contains("usb_serial"));
-        let esp_usb_folded = esp_mir
+        // 2 & 3. Target-portable singleton subsystem + `*byte_ring` folding on ESP32-C6 & ATmega328P AVR
+        let portable_singleton_src = r#"
+struct SerialPort {
+    byte_ring<16> rx;
+    watch<u32>    seq_num;
+}
+
+SerialPort usb_port;
+watch<u32> out_w = 0;
+
+task usb_worker(*SerialPort p, u32 scale, *watch<u32> out) {
+    *byte_ring rx = &p.rx;
+    loop {
+        []u8 chunk = rx.wait_read(timeout: 30ms) catch { continue; };
+        rx.consume(chunk.len);
+        u32 next = p.seq_num.read() + 1;
+        p.seq_num.publish(next);
+        out.publish(next * scale);
+    }
+}
+
+task feeder(*byte_ring tx) {
+    loop {
+        tx.push("A", boost: @critical);
+        sys.delay(10ms);
+    }
+}
+
+fn main() {
+    spawn usb_worker(&usb_port, 10, &out_w) @normal;
+    spawn feeder(&usb_port.rx) @high;
+}
+"#;
+        let portable_mir = compile_src_mir(portable_singleton_src);
+        assert!(
+            portable_mir
+                .visibility
+                .singleton_subsystems
+                .contains("usb_port"),
+            "usb_port should be marked singleton: {:?}",
+            portable_mir.visibility.singleton_subsystems
+        );
+        let portable_folded = portable_mir
             .visibility
             .folded_task_vars
-            .get("usb_cmd_worker")
-            .expect("usb_cmd_worker should have folded singleton vars");
-        for expected_var in ["port", "slot_w", "color_w", "sup", "rx", "tx"] {
+            .get("usb_worker")
+            .expect("usb_worker should have folded singleton vars");
+        for expected_var in ["p", "out", "rx"] {
             assert!(
-                esp_usb_folded.iter().any(|v| v == expected_var),
-                "expected {expected_var} in esp32c6 usb_cmd_worker folded vars: {esp_usb_folded:?}"
+                portable_folded.iter().any(|v| v == expected_var),
+                "expected {expected_var} in usb_worker folded vars: {portable_folded:?}"
+            );
+        }
+
+        let portable_esp_elf = dir.join("portable_esp32c6_singleton.elf");
+        let portable_esp_bin = dir.join("portable_esp32c6_singleton.bin");
+        let portable_esp_img =
+            build_esp32c6_image(&portable_mir, &portable_esp_elf, &portable_esp_bin)
+                .unwrap_or_else(|e| panic!("portable ESP32-C6 singleton build failed: {e}"));
+        assert!(portable_esp_img.elf.audit.is_zero_heap_freestanding());
+        verify_ll_with_opt(&portable_esp_img.elf.ll_path)
+            .expect("LLVM opt -passes=verify failed on portable ESP32-C6 singleton build");
+
+        let portable_avr_elf = dir.join("portable_avr_singleton.elf");
+        let portable_avr_bin = dir.join("portable_avr_singleton.bin");
+        let portable_avr_img =
+            build_avr_uno_image(&portable_mir, &portable_avr_elf, &portable_avr_bin)
+                .unwrap_or_else(|e| panic!("portable AVR singleton build failed: {e}"));
+        assert!(portable_avr_img.elf.audit.is_zero_heap_freestanding());
+        verify_ll_with_opt(&portable_avr_img.elf.ll_path)
+            .expect("LLVM opt -passes=verify failed on portable AVR singleton build");
+
+        // Also check updated interactive demos (`esp32c6_demo.zev` & `arduino_uno_demo.zev`) fold singletons & verify cleanly
+        let esp_mir = compile_example_mir(&[repo_root().join("examples/esp32c6_demo.zev")]);
+        let esp_folded = esp_mir
+            .visibility
+            .folded_task_vars
+            .get("led_animator")
+            .expect("led_animator should have folded singleton vars");
+        for expected_var in ["mode_off", "out_slot", "out_color"] {
+            assert!(
+                esp_folded.iter().any(|v| v == expected_var),
+                "expected {expected_var} in esp32c6 led_animator folded vars: {esp_folded:?}"
             );
         }
         let esp_elf = dir.join("esp32c6_singleton_check.elf");
@@ -5752,23 +5822,16 @@ fn main() {
         verify_ll_with_opt(&esp_img.elf.ll_path)
             .expect("LLVM opt -passes=verify failed on esp32c6_demo after singleton folding");
 
-        // 3. ATmega328P AVR: `uart_port` & `serial_cmd_worker` fold cleanly and AVR ELF/.bin build passes
         let avr_mir = compile_example_mir(&[repo_root().join("examples/arduino_uno_demo.zev")]);
-        assert!(avr_mir
-            .visibility
-            .singleton_subsystems
-            .contains("uart_port"));
         let avr_folded = avr_mir
             .visibility
             .folded_task_vars
-            .get("serial_cmd_worker")
-            .expect("serial_cmd_worker should have folded singleton vars");
-        for expected_var in ["port", "edges_w", "rx", "tx"] {
-            assert!(
-                avr_folded.iter().any(|v| v == expected_var),
-                "expected {expected_var} in AVR serial_cmd_worker folded vars: {avr_folded:?}"
-            );
-        }
+            .get("led_worker")
+            .expect("led_worker should have folded singleton vars");
+        assert!(
+            avr_folded.iter().any(|v| v == "reqs"),
+            "expected reqs in AVR led_worker folded vars: {avr_folded:?}"
+        );
         let avr_elf = dir.join("avr_singleton_check.elf");
         let avr_bin = dir.join("avr_singleton_check.bin");
         let avr_img = build_avr_uno_image(&avr_mir, &avr_elf, &avr_bin)

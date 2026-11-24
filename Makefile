@@ -43,6 +43,8 @@ check:
 	$(ZEVC) check --board nucleo_f334r8 examples/portable_controller_demo.zev
 	$(ZEVC) check --board esp32c6_pico examples/portable_controller_demo.zev
 	$(ZEVC) check --board rpi_pico_w examples/portable_controller_demo.zev
+	$(ZEVC) check examples/portable_shell_demo.zev
+	$(ZEVC) check --board lm3s6965_evb examples/portable_shell_demo.zev
 	$(ZEVC) check --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
 
 ram:
@@ -50,9 +52,11 @@ ram:
 
 demo:
 	$(ZEVC) run --sanitize examples/sim_demo.zev
+	$(ZEVC) run --sanitize examples/portable_shell_demo.zev --cmd "echo off" --cmd "help" --cmd "led on" --cmd "status" --cmd "led off"
 
 qemu:
 	$(ZEVC) run-qemu examples/cortex_m_demo.zev
+	$(ZEVC) run-qemu examples/portable_shell_demo.zev --cmd "echo off" --cmd "help" --cmd "led on" --cmd "status" --cmd "led off"
 
 esp32c6:
 	$(ZEVC) build --board esp32c6_pico examples/esp32c6_demo.zev -o $(BUILD_DIR)/esp32c6/esp32c6_demo.bin

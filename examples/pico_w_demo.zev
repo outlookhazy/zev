@@ -3,21 +3,22 @@
 // 100% of RP2040 peripheral drivers (125 MHz `PLL_SYS` / 48 MHz `PLL_USB` clocks,
 // Full-Speed USB 1.1 CDC-ACM device stack, 1 MHz `TIMER` `ALARM0`, `PIO0` SM0 inverter,
 // dual-channel `DMA` CH0/CH1, and ADC channel 4 die temp) are written in pure `.zev`:
-//   - `chip.rp2040` + `bsp.rpi_pico_w` + `std.str` + `std.bus` + `std.math`
+//   - `chip.rp2040` + `bsp.rpi_pico_w` + `std.{io, shell, bus, math}`
 //   - Zero-copy `@dma_safe pool<PioDmaBurst, 4>` + linear `Lease<T>` + `dma_slot<T>` + `StatusCell<u32>`
-//   - Interactive USB CDC commands (`p`, `s`, `d`, `n`) + 1200-baud BootROM `RPI-RP2` auto-reset
+//   - Interactive USB CDC `std.shell` commands + 1200-baud BootROM `RPI-RP2` auto-reset
 
 import chip.rp2040 as hw;
 import bsp.rpi_pico_w as bsp;
+import std.io as io;
+import std.shell as shell;
 import std.math as math;
-import std.str as str;
 import std.bus as bus;
 
-enum SupEvent { UserTrigger, BootReset, Heartbeat }
+enum SupCmd { UserTrigger, Heartbeat, RunDma, SetRate }
 
-struct SerialPort {
-    byte_ring<64>  rx;
-    byte_ring<512> tx;
+struct SupMsg {
+    SupCmd cmd;
+    u32    arg;
 }
 
 struct PioDmaBurst {
@@ -33,19 +34,10 @@ struct FixedVec<T, usize N> {
 // ── Static Zero-Heap Language-OS Endpoints (RP2040 SRAM `0x20000000`) ──────
 watch<u32>                 alarm_count  = 0;
 inbox<u32, 8>              alarm_inbox;
-inbox<SupEvent, 8>         sup_inbox;
-SerialPort                 usb_serial;
+inbox<SupMsg, 8>           sup_inbox;
 @dma_safe pool<PioDmaBurst, 4> pio_pool;
 dma_slot<PioDmaBurst>      pio_inflight;
 inbox<Lease<PioDmaBurst>, 4> pio_done_q;
-
-// ── Compiler `println` Console Hook (Pure .zev SPSC USB TX Ring) ─────────────
-fn console_putc(u8 b) {
-    bool _ok = usb_serial.tx.push_byte(b);
-    if (b == '\n') {
-        bsp.usb_kick_tx();
-    }
-}
 
 // ── Synthesized Cortex-M0+ NVIC Interrupt Handlers ───────────────────────────
 isr timer0_isr(*inbox<u32, 8> q) {
@@ -53,33 +45,6 @@ isr timer0_isr(*inbox<u32, 8> q) {
     ticks += 1;
     bsp.rearm_timer_alarm0(250_000);
     q.post(ticks, boost: @critical);
-}
-
-isr usb_cdc_isr(*byte_ring rx, *byte_ring tx, *inbox<SupEvent, 8> sup) {
-    state u32 usb_irqs = 0;
-    state bsp.UsbCdcState usb = bsp.UsbCdcState {
-        ep0_pid: 8192u32,
-        ep1_pid: 0u32,
-        ep2_pid: 0u32,
-        ep0_off: 0u32,
-        ep0_rem: 0u32,
-        baud: 115200u32,
-        ep0_desc_id: 0u8,
-        ep2_busy: false,
-        should_addr: false,
-        pending_addr: 0u8,
-        expect_lc: false,
-        boot_rst: false,
-        was_data_in: false,
-        need_zlp: false,
-        configured: false,
-        dtr: false,
-        line_coding: [0x00u8, 0xC2u8, 0x01u8, 0x00u8, 0u8, 0u8, 8u8]
-    };
-    usb_irqs += 1;
-    if (bsp.usb_cdc_irq_step(&usb, rx, tx)) {
-        sup.post(BootReset, boost: @critical);
-    }
 }
 
 isr pio_dma_isr(*dma_slot<PioDmaBurst> inflight, *inbox<Lease<PioDmaBurst>, 4> done_q) {
@@ -90,10 +55,6 @@ isr pio_dma_isr(*dma_slot<PioDmaBurst> inflight, *inbox<Lease<PioDmaBurst>, 4> d
         return;
     };
     done_q.post(done, boost: @critical);
-}
-
-fn flush_tx_ring() {
-    bsp.usb_kick_tx();
 }
 
 impl<T, usize N> FixedVec<T, N> {
@@ -137,6 +98,39 @@ fn print_telemetry_line(
     println(f"[Zev on RP2040 Pico W] uptime={uptime_ms}ms temp={temp_c:.1}C alarms={alarms} triggers={triggers} prio={prio} {status}");
 }
 
+fn run_pio0_dma_burst(u32 seq) {
+    Lease<PioDmaBurst> job = pio_pool.try_alloc() catch {
+        println("[DMA RP2040] PIO0+DMA err=pool_empty");
+        return;
+    };
+    *PioDmaBurst jp = job.get();
+    usize base = job.addr();
+    for (usize j in 0..8) {
+        u32 w = 0xA5A5_0000u32 ^ (((seq + (j as u32)) * 0x0101_0103u32));
+        jp.tx[j] = w;
+        jp.rx[j] = 0u32;
+    }
+    pio_inflight.park(job) catch {
+        println("[DMA RP2040] PIO0+DMA err=slot_busy");
+        return;
+    };
+    bsp.start_pio0_dma_burst(base, base + 32, 8);
+    Lease<PioDmaBurst> done = pio_done_q.recv(timeout: 100ms) catch {
+        bool dropped = pio_inflight.release();
+        println(f"[DMA RP2040] PIO0+DMA err=timeout dropped={dropped}");
+        return;
+    };
+    bool ok = true;
+    for (usize j in 0..8) {
+        u32 expected = ~(done.get().tx[j]);
+        if (done.get().rx[j] != expected) {
+            ok = false;
+        }
+    }
+    done.release();
+    println(f"[DMA RP2040] PIO0+DMA ok={ok} words=8 pool_avail={pio_pool.avail()}");
+}
+
 // ── Cooperative Tasks ────────────────────────────────────────────────────────
 task alarm_collector(*inbox<u32, 8> q, *watch<u32> alarms_w) {
     loop {
@@ -145,111 +139,70 @@ task alarm_collector(*inbox<u32, 8> q, *watch<u32> alarms_w) {
     }
 }
 
-task usb_cmd_worker(
-    *SerialPort port,
-    *watch<u32> alarms_w,
-    *inbox<SupEvent, 8> sup
-) {
-    *byte_ring rx = &port.rx;
-    *byte_ring tx = &port.tx;
-    u32 cmds = 0;
-    loop {
-        []u8 chunk = rx.wait_read();
-        usize n = chunk.len;
-        []u8 trimmed = str.trim_ascii(chunk);
-        for (u8 ch in trimmed) {
-            if (ch == 'p' || ch == 'P' || ch == '?') {
-                cmds += 1;
-                f32 die_c = bsp.read_die_temp_c();
-                u32 us = bsp.read_timer_us();
-                usize wn = fmt_ring(tx, f"[CMD RP2040] PONG uptime={sys.now_ms()}ms us={us} temp={die_c:.1}C alarms={alarms_w.read()} prio={sys.current_prio()} cmds={cmds}\n") catch { 0 };
-                if (wn > 0) {
-                    flush_tx_ring();
-                }
-            } else if (ch == 's' || ch == 'S' || ch == 't' || ch == 'T') {
-                cmds += 1;
-                u32 raw = bsp.read_die_temp_raw();
-                f32 die_c = bsp.read_die_temp_c();
-                u32 chip_id = bsp.read_chip_id();
-                u32 core = bsp.read_core_id();
-                bus.StatusCell<u32> acell = bus.StatusCell<u32> { state: alarms_w };
-                u32 alarms = bus.read_cell<u32>(&acell);
-                usize wn = fmt_ring(tx, f"[SENS RP2040] die_temp={die_c:.1}C raw={raw} chip_id=0x{chip_id:08x} core={core} alarms={alarms} cmds={cmds}\n") catch { 0 };
-                if (wn > 0) {
-                    flush_tx_ring();
-                }
-            } else if (ch == 'd' || ch == 'D') {
-                cmds += 1;
-                Lease<PioDmaBurst> job = pio_pool.try_alloc() catch {
-                    usize wn = fmt_ring(tx, f"[DMA RP2040] PIO0+DMA err=pool_empty cmds={cmds}\n") catch { 0 };
-                    if (wn > 0) {
-                        flush_tx_ring();
-                    }
-                    continue;
-                };
-                *PioDmaBurst jp = job.get();
-                usize base = job.addr();
-                for (usize j in 0..8) {
-                    u32 w = 0xA5A5_0000u32 ^ (((cmds + (j as u32)) * 0x0101_0103u32));
-                    jp.tx[j] = w;
-                    jp.rx[j] = 0u32;
-                }
-                pio_inflight.park(job) catch {
-                    usize wn = fmt_ring(tx, f"[DMA RP2040] PIO0+DMA err=slot_busy cmds={cmds}\n") catch { 0 };
-                    if (wn > 0) {
-                        flush_tx_ring();
-                    }
-                    continue;
-                };
-                bsp.start_pio0_dma_burst(base, base + 32, 8);
-                Lease<PioDmaBurst> done = pio_done_q.recv(timeout: 100ms) catch {
-                    bool dropped = pio_inflight.release();
-                    usize wn = fmt_ring(tx, f"[DMA RP2040] PIO0+DMA err=timeout dropped={dropped} cmds={cmds}\n") catch { 0 };
-                    if (wn > 0) {
-                        flush_tx_ring();
-                    }
-                    continue;
-                };
-                bool ok = true;
-                for (usize j in 0..8) {
-                    u32 expected = ~(done.get().tx[j]);
-                    if (done.get().rx[j] != expected) {
-                        ok = false;
-                    }
-                }
-                done.release();
-                usize wn = fmt_ring(tx, f"[DMA RP2040] PIO0+DMA ok={ok} words=8 pool_avail={pio_pool.avail()} cmds={cmds}\n") catch { 0 };
-                if (wn > 0) {
-                    flush_tx_ring();
-                }
-            } else if (ch == 'n' || ch == 'N') {
-                cmds += 1;
-                sup.post(UserTrigger, boost: @critical);
-                usize wn = fmt_ring(tx, f"[CMD RP2040] NEXT queued cmds={cmds}\n") catch { 0 };
-                if (wn > 0) {
-                    flush_tx_ring();
-                }
-            }
-        }
-        rx.consume(n);
-    }
+// ── std.shell Command Handlers ───────────────────────────────────────────────
+fn cmd_ping(*shell.Session s, []u8 _args) error shell.Err {
+    f32 die_c = bsp.read_die_temp_c();
+    u32 us = bsp.read_timer_us();
+    println(s, f"[CMD RP2040] PONG uptime={sys.now_ms()}ms us={us} temp={die_c:.1}C alarms={alarm_count.read()} prio={sys.current_prio()}");
 }
+
+fn cmd_sens(*shell.Session s, []u8 _args) error shell.Err {
+    u32 raw = bsp.read_die_temp_raw();
+    f32 die_c = bsp.read_die_temp_c();
+    u32 chip_id = bsp.read_chip_id();
+    u32 core = bsp.read_core_id();
+    bus.StatusCell<u32> acell = bus.StatusCell<u32> { state: &alarm_count };
+    u32 alarms = bus.read_cell<u32>(&acell);
+    println(s, f"[SENS RP2040] die_temp={die_c:.1}C raw={raw} chip_id=0x{chip_id:08x} core={core} alarms={alarms}");
+}
+
+fn cmd_next(*shell.Session s, []u8 _args) error shell.Err {
+    if (!sup_inbox.try_send(SupMsg { cmd: UserTrigger, arg: 0u32 })) {
+        error Failed;
+    }
+    println(s, "[CMD RP2040] NEXT queued");
+}
+
+fn cmd_rate(*shell.Session s, []u8 args) error shell.Err {
+    u32 ms = shell.arg_u32(args, 0) catch { error Usage; };
+    if (ms < 100u32 || ms > 10_000u32) {
+        error Usage;
+    }
+    if (!sup_inbox.try_send(SupMsg { cmd: SetRate, arg: ms })) {
+        error Failed;
+    }
+    println(s, f"rate={ms}ms");
+}
+
+fn cmd_dma(*shell.Session s, []u8 _args) error shell.Err {
+    if (!sup_inbox.try_send(SupMsg { cmd: RunDma, arg: 0u32 })) {
+        error Failed;
+    }
+    println(s, "[DMA RP2040] PIO0+DMA queued");
+}
+
+const [5]shell.Cmd COMMANDS = [
+    shell.Cmd { name: "ping", help: "show uptime, temp & alarms", run: cmd_ping },
+    shell.Cmd { name: "sens", help: "read die temp & chip ID",    run: cmd_sens },
+    shell.Cmd { name: "next", help: "trigger supervisor report",  run: cmd_next },
+    shell.Cmd { name: "rate", help: "rate <100..10000> ms",       run: cmd_rate },
+    shell.Cmd { name: "dma",  help: "trigger PIO0+DMA burst",     run: cmd_dma },
+];
 
 // ── Sequential Boot + Low-Priority Telemetry Supervisor ──────────────────────
 fn main() {
-    sys.set_putc(console_putc);
     bsp.init_clocks();
     sys.use_systick(125_000_000);
     bsp.init_usb_cdc();
     bsp.init_temp_sensor();
     bsp.init_pio0_inverter();
+    io.DuplexStream console = bsp.console_open();
     hw.IRQ_TIMER_0.attach(timer0_isr(&alarm_inbox));
-    hw.IRQ_USBCTRL.attach(usb_cdc_isr(&usb_serial.rx, &usb_serial.tx, &sup_inbox));
     hw.IRQ_DMA_0.attach(pio_dma_isr(&pio_inflight, &pio_done_q));
     bsp.start_timer_alarm0(250_000);
 
     spawn alarm_collector(&alarm_inbox, &alarm_count) @high;
-    spawn usb_cmd_worker(&usb_serial, &alarm_count, &sup_inbox) @normal;
+    spawn shell.serve(console, COMMANDS) @normal;
 
     set_priority(@low);
     delay(250ms);
@@ -261,30 +214,43 @@ fn main() {
     println(f"[BOOT] chip_id=0x{chip_id:08x} timer_1mhz_us={boot_us}");
 
     u32 triggers = 0;
+    u32 dma_seq = 0;
+    u32 rate_ms = 1000u32;
+    u32 next_hb = sys.now_ms() + rate_ms;
     FixedVec<f32, 4> temp_win = FixedVec<f32, 4> {
         data: [0.0f32, 0.0f32, 0.0f32, 0.0f32],
         len: 0
     };
 
     loop {
-        SupEvent ev = sup_inbox.recv(timeout: 1s) or Heartbeat;
-        f32 temp_c = bsp.read_die_temp_c();
-        temp_win.push_ring(temp_c);
-        f32 avg_temp = temp_win.avg();
-        u32 alarms = alarm_count.read();
-
-        switch (ev) {
-            UserTrigger => {
-                u32 boosted = sys.current_prio();
-                triggers += 1;
-                print("[EVENT] RP2040 Supervisor Trigger -> ");
-                print_telemetry_line(sys.now_ms(), temp_c, alarms, triggers, boosted, avg_temp);
+        wait {
+            SupMsg msg = sup_inbox.recv() => {
+                switch (msg.cmd) {
+                    UserTrigger => {
+                        u32 boosted = sys.current_prio();
+                        triggers += 1;
+                        f32 temp_c = bsp.read_die_temp_c();
+                        temp_win.push_ring(temp_c);
+                        print("[EVENT] RP2040 Supervisor Trigger -> ");
+                        print_telemetry_line(sys.now_ms(), temp_c, alarm_count.read(), triggers, boosted, temp_win.avg());
+                    }
+                    SetRate => {
+                        rate_ms = msg.arg;
+                        next_hb = sys.now_ms() + rate_ms;
+                        println(f"[CFG RP2040] heartbeat_ms={rate_ms}");
+                    }
+                    RunDma => {
+                        dma_seq += 1u32;
+                        run_pio0_dma_burst(dma_seq);
+                    }
+                    Heartbeat => {}
+                }
             }
-            BootReset => {
-                sys.exit(0x4255);
-            }
-            Heartbeat => {
-                print_telemetry_line(sys.now_ms(), temp_c, alarms, triggers, sys.current_prio(), avg_temp);
+            deadline next_hb => {
+                next_hb += rate_ms;
+                f32 temp_c = bsp.read_die_temp_c();
+                temp_win.push_ring(temp_c);
+                print_telemetry_line(sys.now_ms(), temp_c, alarm_count.read(), triggers, sys.current_prio(), temp_win.avg());
             }
         }
     }
