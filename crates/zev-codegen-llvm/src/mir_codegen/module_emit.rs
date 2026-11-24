@@ -6187,6 +6187,7 @@ entry:
             &MirType::Void,
             &MirErrorSpec::None,
         );
+        fb.is_task = true;
         fb.emit_coroutine_cfg(&bp.blocks)?;
         let body = fb.finish();
         let _ = writeln!(

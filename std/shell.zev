@@ -11,9 +11,6 @@ pub enum Err {
 }
 
 const [3]u8 BS_ERASE_SEQ = [8u8, 32u8, 8u8];
-const [13]u8 HELP_PAD = [
-    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
-];
 
 pub struct Session {
     io.DuplexStream port;
@@ -229,22 +226,6 @@ impl Session {
         }
     }
 
-    fn write_help(*self, []Cmd cmds) {
-        self.write("  help         show commands\n  echo         echo on|off\n");
-        for (usize i in 0..cmds.len) {
-            []u8 nm = cmds[i].name;
-            self.write(HELP_PAD[0..2]);
-            self.write(nm);
-            usize pad = 1usize;
-            if (nm.len < 12usize) {
-                pad = 13usize - nm.len;
-            }
-            self.write(HELP_PAD[0..pad]);
-            self.write(cmds[i].help);
-            self.write("\n");
-        }
-    }
-
     pub fn poll_once(*self, []Cmd cmds) {
         []u8 chunk = self.port.rx.wait_read();
         usize used = 0;
@@ -311,10 +292,13 @@ impl Session {
                 usize rest_start = line_start + verb_rel + rest_span[0];
                 usize rest_end = line_start + verb_rel + rest_span[1];
                 i32 which = lookup_cmd(self.line_buf[line_start..(line_start + verb_rel)], cmds);
-                []u8 status_out = "ok\n";
 
                 if (which == -1i32) {
-                    self.write_help(cmds);
+                    self.write("  help         show commands\n  echo         echo on|off\n");
+                    for (usize i in 0..cmds.len) {
+                        print(self, f"  {cmds[i].name:<12} {cmds[i].help}\n");
+                    }
+                    self.write("ok\n");
                 } else if (which == -2i32) {
                     bool ok_args = true;
                     bool next_echo = parse_echo_args(self.line_buf[rest_start..rest_end]) catch (Err _e) {
@@ -322,9 +306,10 @@ impl Session {
                         false
                     };
                     if (!ok_args) {
-                        status_out = "usage: echo on|off\nerr Usage\n";
+                        self.write("usage: echo on|off\nerr Usage\n");
                     } else {
                         self.echo = next_echo;
+                        self.write("ok\n");
                     }
                 } else if (which >= 0i32) {
                     usize cmd_idx = which as usize;
@@ -334,19 +319,17 @@ impl Session {
                         ran_ok = false;
                         cmd_err = e;
                     };
-                    if (!ran_ok) {
+                    if (ran_ok) {
+                        self.write("ok\n");
+                    } else {
                         if (cmd_err == Err.Usage) {
-                            self.write("usage: ");
-                            self.write(cmds[cmd_idx].help);
-                            status_out = "\nerr Usage\n";
-                        } else {
-                            status_out = err_status_line(cmd_err);
+                            println(self, f"usage: {cmds[cmd_idx].help}");
                         }
+                        self.write(err_status_line(cmd_err));
                     }
                 } else {
-                    status_out = "err Unknown\n";
+                    self.write("err Unknown\n");
                 }
-                self.write(status_out);
             }
         }
 

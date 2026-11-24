@@ -816,7 +816,7 @@ zevc run app.zev --cmd help           # Scripted mode: stops after final `ok` / 
 
 ## 5. ARM Cortex-M3 (`lm3s6965_evb`) ELF & QEMU
 Synthesizes `.isr_vector`, `Reset_Handler`, `SysTick_Handler`, and linker script with zero C/libc.
-Supports `-O0`, `-O1`, `-O2` (default), `-O3`, `-Os`, and `-Oz` (`--opt-level <level>`):
+Supports `-O0`, `-O1`, `-O2`, `-O3`, `-Os` (MCU default), and `-Oz` (`--opt-level <level>`):
 ```bash
 zevc emit-llvm --board lm3s6965_evb examples/cortex_m_demo.zev -o build/cm3.ll
 zevc build --board lm3s6965_evb -Oz examples/cortex_m_demo.zev -o build/cm3.elf

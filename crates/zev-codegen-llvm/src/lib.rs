@@ -8865,4 +8865,144 @@ fn main() {
             "non-fnptr program should not emit @__syn_panic_fnptr"
         );
     }
+
+    #[test]
+    fn post_item9_code_size_call_site_frame_init_single_print_and_default_os() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+
+        // 1. Default opt_level is `-Os` on all 32-bit chips while `host` stays `-O2`
+        //    and explicit `-O2` override remains selectable.
+        for chip in ["stm32f334r8", "lm3s6965", "esp32c6", "rp2040"] {
+            let spec = TargetSpec::resolve(Some(chip), None).expect(chip);
+            assert_eq!(spec.opt_level, "-Os", "chip {chip} must default to -Os");
+        }
+        assert_eq!(
+            TargetSpec::host_linux().opt_level,
+            "-O2",
+            "host must remain -O2"
+        );
+        assert_eq!(
+            CodegenOptions::host_linux().opt_level,
+            "-O2",
+            "host CodegenOptions must remain -O2"
+        );
+
+        // 2. Yielding call sites initialize `_pc = 0` only (no zeroinitializer frame store at caller),
+        //    callees initialize own hoisted locals on entry, PollChild emits no `@__syn_should_share`,
+        //    and formatted `println(&port, f"value {i} is {n}")` coalesces into ONE yielding write.
+        let src = r#"
+import std.io as io;
+
+byte_ring<64> rx;
+byte_ring<64> tx;
+fn flush(*byte_ring _r) {}
+
+fn leaf_work(u32 a) -> u32 {
+    u32 tmp = a + 1u32;
+    delay(2ms);
+    return tmp * 2u32;
+}
+
+task printer_task() {
+    io.DuplexStream port = io.DuplexStream { rx: &rx, tx: &tx, flush: flush };
+    u32 i = 3u32;
+    u32 n = leaf_work(4u32);
+    println(&port, f"value {i} is {n}");
+    loop {
+        delay(20ms);
+    }
+}
+
+fn main() {
+    spawn printer_task() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str_named(src, "pr29_size.zev").expect("parse");
+        let spec = TargetSpec::resolve(None, Some("nucleo_f334r8")).expect("spec");
+        let aopts = zev_sema::AnalyzeOptions {
+            include_dirs: vec![root.clone()],
+            hal_dir: spec.hal_dir.clone(),
+            board_module: spec.board_module.clone(),
+            target_ptr_bits: spec.isa.ptr_bits(),
+            target_name: spec.chip_name.clone(),
+            ..zev_sema::AnalyzeOptions::default()
+        };
+        let (mono_progs, _) =
+            zev_sema::analyze_and_monomorphize_named_programs(&[(&prog, None)], &aopts)
+                .into_result()
+                .expect("sema");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower");
+
+        for os_or_o2 in [None, Some("-O2")] {
+            let mut opts = CodegenOptions::from_spec(spec.clone());
+            if let Some(ov) = os_or_o2 {
+                opts.opt_level = ov.to_string();
+            }
+            let ll = emit_llvm_ir_with_options(&mir, &opts).expect("emit ll");
+
+            assert!(
+                !ll.contains("store %FnFrame_leaf_work zeroinitializer"),
+                "caller must not zeroinitializer leaf_work frame:\n{ll}"
+            );
+            assert!(
+                !ll.contains("store %FnFrame_std_io__DuplexStream__write zeroinitializer"),
+                "caller must not zeroinitializer write frame:\n{ll}"
+            );
+            assert!(
+                !ll.contains("store %FnFrame_"),
+                "caller must not emit FnFrame zeroinitializer store:\n{ll}"
+            );
+
+            let leaf_body = ll
+                .split("define i32 @__syn_fn_step_leaf_work(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("leaf_work step body");
+            let leaf_bb0 = leaf_body
+                .split("bb_0:")
+                .nth(1)
+                .and_then(|s| s.split("bb_").next())
+                .unwrap_or(leaf_body);
+            assert!(
+                leaf_bb0.contains("zeroinitializer, ptr") || leaf_bb0.contains("store i32 0, ptr"),
+                "leaf_work bb_0 must initialize its own hoisted local on entry:\n{leaf_bb0}"
+            );
+
+            let step_body = ll
+                .split("define i32 @__syn_task_step_printer_task(")
+                .nth(1)
+                .and_then(|s| s.split("\n}\n").next())
+                .expect("task step body");
+            for poll_bb in ["bb_1:", "bb_3:"] {
+                let poll_slice = step_body
+                    .split(poll_bb)
+                    .nth(1)
+                    .and_then(|s| s.split("poll_child_done_").next())
+                    .unwrap_or_else(|| panic!("missing {poll_bb} in:\n{step_body}"));
+                assert!(
+                    !poll_slice.contains("@__syn_should_share"),
+                    "PollChild {poll_bb} must not call @__syn_should_share:\n{poll_slice}"
+                );
+            }
+            let write_calls = step_body
+                .matches("@__syn_fn_step_std_io__DuplexStream__write(")
+                .count();
+            assert_eq!(
+                write_calls, 1,
+                "expected 1 yielding write for println(&port, f\"value {{i}} is {{n}}\"), found {write_calls}:\n{step_body}"
+            );
+
+            // Verify explicit `-O2` vs default `-Os` both compile through opt+llc into ELF.
+            let elf_name = if os_or_o2.is_some() {
+                "pr29_o2.elf"
+            } else {
+                "pr29_os.elf"
+            };
+            let built = build_elf(&mir, &test_out_dir().join(elf_name), &opts).expect("build elf");
+            assert!(built.sizes.text > 0);
+        }
+    }
 }
