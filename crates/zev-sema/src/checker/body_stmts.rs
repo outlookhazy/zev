@@ -1814,8 +1814,29 @@ impl<'a> BodyChecker<'a> {
             }
 
             StmtKind::Switch { scrutinee, arms } => {
-                let sv = self.check_expr_infallible(scrutinee);
+                let mut sv = self.check_expr_infallible(scrutinee);
                 self.validate_int_expr_at_type(scrutinee, None);
+                if !sv.ty.is_error()
+                    && !sv.ty.is_integer()
+                    && !sv.ty.is_bool()
+                    && !matches!(sv.ty, Ty::Enum(_))
+                {
+                    let mut diag = Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        scrutinee.span,
+                        format!(
+                            "'switch' scrutinee must be an integer, 'bool', or 'enum', found '{}'",
+                            sv.ty
+                        ),
+                    );
+                    if matches!(sv.ty, Ty::Str)
+                        || matches!(&sv.ty, Ty::Slice(elem) if **elem == Ty::u8())
+                    {
+                        diag = diag.with_note("compare strings using `if (s == \"...\")` instead");
+                    }
+                    self.sema.emit(diag);
+                    sv.ty = Ty::Error;
+                }
                 let base_vars = self.snapshot_outer_vars();
                 let base_leases = self.leases.clone();
                 let mut live_var_branches = Vec::new();
@@ -3198,6 +3219,14 @@ impl<'a> BodyChecker<'a> {
                     }
                     return;
                 };
+                if pointee_ty.is_void() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        target.span,
+                        "cannot dereference opaque '*void' pointer; cast it to a concrete pointer type first",
+                    ));
+                    return;
+                }
                 if let Some(ln) = ty_contains_byval_mmio(pointee_ty) {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::MmioViolation,

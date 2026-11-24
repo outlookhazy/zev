@@ -140,7 +140,12 @@ pub(super) fn is_valid_cast(src: &Ty, dst: &Ty) -> bool {
         };
     }
     if src == dst {
-        return true;
+        return src.is_numeric()
+            || src.is_bool()
+            || matches!(
+                src,
+                Ty::Enum(_) | Ty::Ptr(_) | Ty::FnPtr { .. } | Ty::IrqToken
+            );
     }
     match (src, dst) {
         // Any numeric <-> numeric (`int <-> int`, `int <-> float`, `f32 <-> f64`).

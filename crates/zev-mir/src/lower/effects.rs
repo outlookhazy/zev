@@ -1319,7 +1319,9 @@ pub(super) fn is_const_mir_expr(expr: &MirExpr) -> bool {
         MirExprKind::MakePrimView { ptr, .. } => is_const_mir_expr(ptr),
         MirExprKind::AddrOfPlace(place) => is_const_mir_place(place),
         MirExprKind::Unary { expr, .. } | MirExprKind::Cast { expr, .. } => is_const_mir_expr(expr),
-        MirExprKind::Binary { lhs, rhs, .. } => is_const_mir_expr(lhs) && is_const_mir_expr(rhs),
+        MirExprKind::Binary { lhs, rhs, .. } | MirExprKind::SeqEq { lhs, rhs, .. } => {
+            is_const_mir_expr(lhs) && is_const_mir_expr(rhs)
+        }
         MirExprKind::StructLit { fields, .. } => {
             fields.iter().all(|(_, e, _)| is_const_mir_expr(e))
         }
@@ -1391,6 +1393,20 @@ pub(super) fn resolve_boot_const_expr(expr: &MirExpr, env: &BTreeMap<VarId, MirE
                 op: *op,
                 lhs: Box::new(resolve_boot_const_expr(lhs, env)),
                 rhs: Box::new(resolve_boot_const_expr(rhs, env)),
+            },
+            expr.ty.clone(),
+        ),
+        MirExprKind::SeqEq {
+            eq,
+            lhs,
+            rhs,
+            elem_ty,
+        } => MirExpr::new(
+            MirExprKind::SeqEq {
+                eq: *eq,
+                lhs: Box::new(resolve_boot_const_expr(lhs, env)),
+                rhs: Box::new(resolve_boot_const_expr(rhs, env)),
+                elem_ty: elem_ty.clone(),
             },
             expr.ty.clone(),
         ),

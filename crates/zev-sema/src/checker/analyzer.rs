@@ -4822,6 +4822,16 @@ impl Analyzer {
                             a != b
                         });
                     }
+                    if let (Some(a), Some(b)) = (
+                        self.eval_const_bytes_shadowed(lhs, visiting, shadowed),
+                        self.eval_const_bytes_shadowed(rhs, visiting, shadowed),
+                    ) {
+                        return Some(if matches!(op, BinaryOp::Eq) {
+                            a == b
+                        } else {
+                            a != b
+                        });
+                    }
                     let a = self.eval_const_expr_i128_shadowed(lhs, visiting, shadowed)?;
                     let b = self.eval_const_expr_i128_shadowed(rhs, visiting, shadowed)?;
                     Some(if matches!(op, BinaryOp::Eq) {
@@ -4843,6 +4853,28 @@ impl Analyzer {
                 }
                 _ => None,
             },
+            _ => None,
+        }
+    }
+
+    pub(super) fn eval_const_bytes_shadowed(
+        &self,
+        expr: &Expr,
+        visiting: &mut BTreeSet<String>,
+        shadowed: &BTreeSet<String>,
+    ) -> Option<Vec<u8>> {
+        match &expr.kind {
+            ExprKind::Literal(Literal::String(s)) => Some(zev_ast::decoded_string_bytes(s)),
+            ExprKind::Ident(id) => {
+                if shadowed.contains(&id.name) || !visiting.insert(id.name.clone()) {
+                    return None;
+                }
+                let res = self.raw_const_exprs.get(&id.name).and_then(|(raw, _, _)| {
+                    self.eval_const_bytes_shadowed(raw, visiting, &BTreeSet::new())
+                });
+                visiting.remove(&id.name);
+                res
+            }
             _ => None,
         }
     }

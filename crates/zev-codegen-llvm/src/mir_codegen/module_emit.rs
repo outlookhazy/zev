@@ -173,6 +173,13 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 scan_expr(lhs, feat);
                 scan_expr(rhs, feat);
             }
+            MirExprKind::SeqEq {
+                lhs, rhs, elem_ty, ..
+            } => {
+                scan_ty(elem_ty, feat);
+                scan_expr(lhs, feat);
+                scan_expr(rhs, feat);
+            }
             MirExprKind::Cast {
                 expr: sub,
                 target_ty,
@@ -2034,6 +2041,7 @@ impl<'a> ModuleCtx<'a> {
             | MirExprKind::SliceLen(e)
             | MirExprKind::FromBytes { slice: e, .. } => self.scan_expr_for_prims(e),
             MirExprKind::Binary { lhs, rhs, .. }
+            | MirExprKind::SeqEq { lhs, rhs, .. }
             | MirExprKind::Index {
                 base: lhs,
                 index: rhs,
@@ -2734,6 +2742,16 @@ impl<'a> ModuleCtx<'a> {
                     MirBinOp::LogicalOr => i128::from(l != 0 || r != 0),
                 }
             }
+            MirExprKind::SeqEq { eq, lhs, rhs, .. } => {
+                if let (Some(lv), Some(rv)) =
+                    (self.eval_const_seq_vals(lhs), self.eval_const_seq_vals(rhs))
+                {
+                    let same = lv == rv;
+                    i128::from(if *eq { same } else { !same })
+                } else {
+                    0
+                }
+            }
             MirExprKind::Cast {
                 expr: sub,
                 target_ty,
@@ -2801,6 +2819,40 @@ impl<'a> ModuleCtx<'a> {
             ((raw_f as f32) as f64).to_bits()
         } else {
             raw_f.to_bits()
+        }
+    }
+
+    pub(super) fn eval_const_seq_vals(&self, expr: &MirExpr) -> Option<Vec<i128>> {
+        match &expr.kind {
+            MirExprKind::StringLit(s) => {
+                let bytes = zev_ast::decoded_string_bytes(s);
+                Some(bytes.into_iter().map(i128::from).collect())
+            }
+            MirExprKind::ArrayLit { elems, .. } => Some(
+                elems
+                    .iter()
+                    .map(|e| self.eval_const_int(e))
+                    .collect::<Vec<_>>(),
+            ),
+            MirExprKind::ConstRef(name) => {
+                let c = self.module.consts.iter().find(|c| c.name == *name)?;
+                self.eval_const_seq_vals(&c.init)
+            }
+            MirExprKind::SubSlice {
+                base, start, end, ..
+            } => {
+                let all = self.eval_const_seq_vals(base)?;
+                let st = usize::try_from(self.eval_const_int(start))
+                    .ok()?
+                    .min(all.len());
+                let en = usize::try_from(self.eval_const_int(end))
+                    .ok()?
+                    .min(all.len())
+                    .max(st);
+                Some(all[st..en].to_vec())
+            }
+            MirExprKind::Cast { expr: sub, .. } => self.eval_const_seq_vals(sub),
+            _ => None,
         }
     }
 

@@ -257,6 +257,19 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             ));
             return SsaVal::new(dst_ty, tf);
         }
+        if (val.ty == "ptr addrspace(1)" && dst_ty == "ptr")
+            || (val.ty == "ptr" && dst_ty == "ptr addrspace(1)")
+        {
+            let usize_ty = self.ctx.spec.isa.usize_llvm_ty();
+            let it = self.next_tmp();
+            let pt = self.next_tmp();
+            self.emit_line(format!(
+                "{it} = ptrtoint {} {} to {usize_ty}",
+                val.ty, val.repr
+            ));
+            self.emit_line(format!("{pt} = inttoptr {usize_ty} {it} to {dst_ty}"));
+            return SsaVal::new(dst_ty, pt);
+        }
         if (dst_ty == "ptr" || dst_ty == "ptr addrspace(1)") && val.ty.starts_with('i') {
             let t = self.next_tmp();
             self.emit_line(format!(

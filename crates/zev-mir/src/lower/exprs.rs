@@ -996,6 +996,14 @@ fn is_pure_untyped_float_ast(expr: &Expr) -> bool {
     }
 }
 
+fn is_pure_untyped_int_array_ast(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::ArrayLit(elems) if !elems.is_empty() && elems.iter().all(is_pure_untyped_int_ast))
+}
+
+fn is_seq_mir_ty(ty: &MirType) -> bool {
+    matches!(ty, MirType::Slice(_) | MirType::Array { .. } | MirType::Str)
+}
+
 fn unify_array_mir_types(lhs: &MirType, rhs: &MirType) -> MirType {
     if is_scalar_int_mir_type(lhs) && is_scalar_int_mir_type(rhs) {
         unify_mir_int_types(lhs, rhs)
@@ -1120,6 +1128,12 @@ pub(super) fn lower_leaf_expr(
                     MirType::MmioPtr(inst.layout.clone()),
                 ));
             }
+            if let Some(&num) = syms.irqs.get(&id.name) {
+                return Ok(MirExpr::new(
+                    MirExprKind::IntLit(i128::from(num)),
+                    MirType::U32,
+                ));
+            }
             if let Some(sig) = syms.fns.get(&id.name) {
                 let target = if sig.effect == MirFnEffect::SoftYielding {
                     format!("{}__noyield", id.name)
@@ -1226,6 +1240,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             finish_unary(*op, sub)
         }
         ExprKind::Binary { op, lhs, rhs } => {
+            let is_eq_ne = matches!(op, BinaryOp::Eq | BinaryOp::Ne);
             let is_cmp_or_logic = matches!(
                 op,
                 BinaryOp::Eq
@@ -1239,15 +1254,39 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             );
             let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
             let op_expected = if is_cmp_or_logic { None } else { expected };
-            let (l, r) = if !is_shift && ast_is_untyped_int_lit(lhs) && !ast_is_untyped_int_lit(rhs)
+            let lhs_untyped_int_arr = is_eq_ne && is_pure_untyped_int_array_ast(lhs);
+            let rhs_untyped_int_arr = is_eq_ne && is_pure_untyped_int_array_ast(rhs);
+            let (l, r) = if !is_shift
+                && ((ast_is_untyped_int_lit(lhs) && !ast_is_untyped_int_lit(rhs))
+                    || (lhs_untyped_int_arr && !rhs_untyped_int_arr))
             {
                 let r = be.lower_sub(rhs, op_expected)?;
-                let l = be.lower_sub(lhs, Some(&r.ty.host_value_type()))?;
+                let lhs_exp = match &r.ty {
+                    MirType::Str if lhs_untyped_int_arr => MirType::Slice(Box::new(MirType::U8)),
+                    MirType::Slice(elem) | MirType::Array { elem, .. } if lhs_untyped_int_arr => {
+                        MirType::Slice(Box::new(elem.host_value_type()))
+                    }
+                    other => other.host_value_type(),
+                };
+                let l = be.lower_sub(lhs, Some(&lhs_exp))?;
+                (l, r)
+            } else if lhs_untyped_int_arr && rhs_untyped_int_arr {
+                let seq_i32 = MirType::Slice(Box::new(MirType::I32));
+                let l = be.lower_sub(lhs, Some(&seq_i32))?;
+                let r = be.lower_sub(rhs, Some(&seq_i32))?;
                 (l, r)
             } else {
                 let l = be.lower_sub(lhs, op_expected)?;
                 let rhs_exp = if is_shift {
                     None
+                } else if rhs_untyped_int_arr {
+                    match &l.ty {
+                        MirType::Str => Some(MirType::Slice(Box::new(MirType::U8))),
+                        MirType::Slice(elem) | MirType::Array { elem, .. } => {
+                            Some(MirType::Slice(Box::new(elem.host_value_type())))
+                        }
+                        other => Some(other.host_value_type()),
+                    }
                 } else {
                     Some(l.ty.host_value_type())
                 };
@@ -1259,6 +1298,9 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
         ExprKind::Cast { expr: inner, ty } => {
             let target_ty = be.syms().resolve_type(ty);
             let sub = be.lower_sub(inner, None)?;
+            if matches!(target_ty, MirType::PrimView(_)) {
+                return Ok(coerce_expr_if_needed(sub, &target_ty));
+            }
             if matches!(&target_ty, MirType::Slice(elem) if **elem == MirType::U8)
                 && matches!(&sub.kind, MirExprKind::StringLit(_))
             {
@@ -1273,6 +1315,12 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             ))
         }
         ExprKind::Field { target, field } => {
+            if let Some((_, num)) = be.syms().resolve_irq_field_be(expr, be.scopes()) {
+                return Ok(MirExpr::new(
+                    MirExprKind::IntLit(i128::from(num)),
+                    MirType::U32,
+                ));
+            }
             if let Some(inst_name) = be.syms().resolve_mmio_instance_field_be(expr, be.scopes()) {
                 let layout = be.syms().mmio_instances[&inst_name].layout.clone();
                 return Ok(MirExpr::new(
@@ -1906,7 +1954,7 @@ pub(super) fn finish_unary(op: UnaryOp, sub: MirExpr) -> Result<MirExpr, MirLowe
             MirType::Bool,
         )),
         UnaryOp::BitNot => {
-            let ty = sub.ty.clone();
+            let ty = sub.ty.host_value_type();
             Ok(MirExpr::new(
                 MirExprKind::Unary {
                     op: MirUnaryOp::BitNot,
@@ -2124,6 +2172,29 @@ pub(super) fn widen_arith_mir_expr(expr: MirExpr, target_ty: &MirType) -> MirExp
 }
 
 pub(super) fn finish_binary(op: BinaryOp, mut lhs: MirExpr, mut rhs: MirExpr) -> MirExpr {
+    if matches!(op, BinaryOp::Eq | BinaryOp::Ne) && is_seq_mir_ty(&lhs.ty) && is_seq_mir_ty(&rhs.ty)
+    {
+        let elem_ty = match (&lhs.ty, &rhs.ty) {
+            (MirType::Slice(e) | MirType::Array { elem: e, .. }, _) => e.host_value_type(),
+            (_, MirType::Slice(e) | MirType::Array { elem: e, .. }) => e.host_value_type(),
+            _ => MirType::U8,
+        };
+        if matches!(&lhs.kind, MirExprKind::StringLit(_)) && lhs.ty == MirType::Str {
+            lhs.ty = MirType::Slice(Box::new(MirType::U8));
+        }
+        if matches!(&rhs.kind, MirExprKind::StringLit(_)) && rhs.ty == MirType::Str {
+            rhs.ty = MirType::Slice(Box::new(MirType::U8));
+        }
+        return MirExpr::new(
+            MirExprKind::SeqEq {
+                eq: op == BinaryOp::Eq,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                elem_ty,
+            },
+            MirType::Bool,
+        );
+    }
     let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
     // Unify float literal precision if one side is `f32` and the other is a `FloatLit`
     if lhs.ty == MirType::F32 && matches!(rhs.kind, MirExprKind::FloatLit(_)) {

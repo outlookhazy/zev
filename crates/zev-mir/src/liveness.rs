@@ -616,6 +616,7 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             collect_place_uses_for_partial_write(place, uses);
         }
         MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::SeqEq { lhs, rhs, .. }
         | MirExprKind::Index {
             base: lhs,
             index: rhs,
@@ -793,6 +794,7 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
             }
         }
         MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::SeqEq { lhs, rhs, .. }
         | MirExprKind::Index {
             base: lhs,
             index: rhs,
