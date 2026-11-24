@@ -11,7 +11,7 @@ pub struct Channel {
     u16 duty_permil;
 }
 
-pub Channel make_channel(u8 kind, u8 unit, u8 ch, u32 period, u16 duty_permil) {
+pub fn make_channel(u8 kind, u8 unit, u8 ch, u32 period, u16 duty_permil) -> Channel {
     u16 d = math.clamp<u16>(duty_permil, 0u16, 1000u16);
     return Channel {
         kind: kind,

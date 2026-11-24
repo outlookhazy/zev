@@ -32,7 +32,7 @@ pub fn tim2_clear_irq() {
     hw.TIM2.sr = 0u32;
 }
 
-pub pwm.Channel tim1_pwm_ch1_pa8_start(u32 freq_hz, u16 initial_permil) {
+pub fn tim1_pwm_ch1_pa8_start(u32 freq_hz, u16 initial_permil) -> pwm.Channel {
     u32 eff_freq = freq_hz;
     if (eff_freq == 0u32) {
         eff_freq = 1000u32;

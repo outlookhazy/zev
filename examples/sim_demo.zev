@@ -81,7 +81,7 @@ fn run_power_on_self_test() {
     diag_telemetry.publish(vbus_mv + gate_ok);
 }
 
-u16 crc16([]u8 buf) {
+fn crc16([]u8 buf) -> u16 {
     u16 s1 = 85;
     u16 s2 = 170;
     for (u8 b in buf) {
@@ -91,7 +91,7 @@ u16 crc16([]u8 buf) {
     return (s2 * 256) | s1;
 }
 
-u16 parse_setpoint([]u8 buf) error ParseErr {
+fn parse_setpoint([]u8 buf) -> u16 error ParseErr {
     if (buf.len < 5) {
         error TooShort;
     }
@@ -104,14 +104,14 @@ u16 parse_setpoint([]u8 buf) error ParseErr {
     return frame.setpoint;
 }
 
-u16 adc_read_rpm(u8 pwm_ch) {
+fn adc_read_rpm(u8 pwm_ch) -> u16 {
     u16 ch_bias = pwm_ch;
     u16 sample = 600 + (ch_bias * 100);
     checkpoint();
     return sample + ch_bias;
 }
 
-u16 pi_step(u16 target, u16 actual, *i32 integral) {
+fn pi_step(u16 target, u16 actual, *i32 integral) -> u16 {
     i32 err = (target as i32) - (actual as i32);
     i32 next_int = math.clamp(*integral + err, -10000, 10000);
     *integral = next_int;

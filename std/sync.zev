@@ -12,7 +12,7 @@ impl Semaphore {
         }
     }
 
-    pub u32 count(*self) {
+    pub fn count(*self) -> u32 {
         u32 v = 0u32;
         critical {
             v = self.count.get();
@@ -20,7 +20,7 @@ impl Semaphore {
         return v;
     }
 
-    pub bool try_acquire(*self) {
+    pub fn try_acquire(*self) -> bool {
         bool ok = false;
         critical {
             u32 c = self.count.get();
@@ -65,7 +65,7 @@ pub struct EventFlags {
 }
 
 impl EventFlags {
-    pub u32 read(*self) {
+    pub fn read(*self) -> u32 {
         u32 v = 0u32;
         critical {
             v = self.bits.get();
@@ -86,7 +86,7 @@ impl EventFlags {
         }
     }
 
-    pub u32 wait_any(*self, u32 mask) {
+    pub fn wait_any(*self, u32 mask) -> u32 {
         loop {
             u32 cur = 0u32;
             bool matched = false;
@@ -105,7 +105,7 @@ impl EventFlags {
         }
     }
 
-    pub u32 wait_all(*self, u32 mask) {
+    pub fn wait_all(*self, u32 mask) -> u32 {
         loop {
             u32 cur = 0u32;
             bool matched = false;
@@ -131,7 +131,7 @@ pub struct Latch {
 }
 
 impl Latch {
-    pub bool is_ready(*self) {
+    pub fn is_ready(*self) -> bool {
         bool v = false;
         critical {
             v = self.ready.get();
@@ -170,7 +170,7 @@ pub struct Barrier<usize N> {
 }
 
 impl<usize N> Barrier<N> {
-    pub bool wait(*self) {
+    pub fn wait(*self) -> bool {
         u32 my_gen = 0u32;
         bool last = false;
         critical {

@@ -51,7 +51,7 @@ pub fn on_fault() {
     }
 }
 
-pub u32 init_board() {
+pub fn init_board() -> u32 {
     sys.set_fault_handler(on_fault);
 
     u32 clk = f3.configure_pll_hse_bypass_72mhz();
@@ -73,11 +73,11 @@ pub u32 init_board() {
     return clk;
 }
 
-pub gpio.Pin led_pin() {
+pub fn led_pin() -> gpio.Pin {
     return PIN_LD2;
 }
 
-pub gpio.Pin button_pin() {
+pub fn button_pin() -> gpio.Pin {
     return PIN_B1;
 }
 
@@ -89,7 +89,7 @@ pub fn toggle_led() {
     PIN_LD2.toggle();
 }
 
-pub bool read_button() {
+pub fn read_button() -> bool {
     return PIN_B1.read();
 }
 
@@ -98,18 +98,18 @@ pub fn init() {
     f3.init_adc12();
 }
 
-pub adc.Channel default_adc() {
+pub fn default_adc() -> adc.Channel {
     return adc.make_channel(1u8, 18u8, 3300u16);
 }
 
-pub pwm.Channel default_pwm() {
+pub fn default_pwm() -> pwm.Channel {
     return f3.tim1_pwm_ch1_pa8_start(1000u32, 0u16);
 }
 
-pub spi.Bus default_spi() {
+pub fn default_spi() -> spi.Bus {
     return f3.spi1_init(bus.SpiMode.Mode0, 3u8, f3.SPI1_PINS_PB3_5, 10u32);
 }
 
-pub i2c.Bus default_i2c() {
+pub fn default_i2c() -> i2c.Bus {
     return f3.i2c1_init_pb6_pb7_100k(10u32);
 }

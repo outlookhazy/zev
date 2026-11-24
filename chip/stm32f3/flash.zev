@@ -14,7 +14,7 @@ fn flash_lock() {
     hw.FLASH.cr = hw.FLASH.cr | (1u32 << 7);
 }
 
-bool flash_wait_idle() {
+fn flash_wait_idle() -> bool {
     for (u32 spin in 0..2_000_000) {
         if ((hw.FLASH.sr & 1u32) == 0u32) {
             return true;
@@ -23,7 +23,7 @@ bool flash_wait_idle() {
     return false;
 }
 
-pub bool flash_nvs_erase() {
+pub fn flash_nvs_erase() -> bool {
     flash_unlock();
     if (!flash_wait_idle()) {
         flash_lock();
@@ -40,7 +40,7 @@ pub bool flash_nvs_erase() {
     return idle_ok && ((sr & 0x14u32) == 0u32);
 }
 
-pub bool flash_nvs_write_u16(usize halfword_idx, u16 val) {
+pub fn flash_nvs_write_u16(usize halfword_idx, u16 val) -> bool {
     if (halfword_idx >= 1024) {
         return false;
     }
@@ -62,7 +62,7 @@ pub bool flash_nvs_write_u16(usize halfword_idx, u16 val) {
     return hw.FLASH_NVS.halfwords[halfword_idx] == val;
 }
 
-pub bool flash_nvs_write_words(usize word_idx, []u32 words) {
+pub fn flash_nvs_write_words(usize word_idx, []u32 words) -> bool {
     if (word_idx > 512 || words.len > (512 - word_idx)) {
         return false;
     }
@@ -81,7 +81,7 @@ pub bool flash_nvs_write_words(usize word_idx, []u32 words) {
     return true;
 }
 
-pub u32 flash_nvs_read_u32(usize word_idx) {
+pub fn flash_nvs_read_u32(usize word_idx) -> u32 {
     if (word_idx >= 512) {
         return 0xFFFF_FFFFu32;
     }

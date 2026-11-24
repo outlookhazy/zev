@@ -9,7 +9,7 @@ pub const u8 SPI1_PINS_NONE  = 0u8;
 pub const u8 SPI1_PINS_PA5_7 = 1u8;
 pub const u8 SPI1_PINS_PB3_5 = 2u8;
 
-u32 mode_bits(bus.SpiMode mode) {
+fn mode_bits(bus.SpiMode mode) -> u32 {
     switch (mode) {
         bus.SpiMode.Mode0 => { return 0u32; }
         bus.SpiMode.Mode1 => { return 1u32; }
@@ -18,7 +18,7 @@ u32 mode_bits(bus.SpiMode mode) {
     }
 }
 
-pub hspi.Bus spi1_init(bus.SpiMode mode, u8 br_div, u8 pinset, u32 timeout_ms) {
+pub fn spi1_init(bus.SpiMode mode, u8 br_div, u8 pinset, u32 timeout_ms) -> hspi.Bus {
     hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOA | hw.RCC_AHB_GPIOB;
     hw.RCC.apb2enr = hw.RCC.apb2enr | hw.RCC_APB2_SPI1;
     u32 _stab = hw.RCC.apb2enr;

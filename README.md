@@ -70,7 +70,7 @@ Additional board-specific hardware demos in `examples/` exercise board periphera
 
 ## Compiler Pipeline
 
-- **`zev-ast` / `zev-parser`**: Recursive-descent parser (`f32`/`f64`, `<T, usize N>` generics, canonical prefix types `*T` / `[]T` / `[N]T`, `f"..."` strings, `mmio`, `irq`, `wait { ... }`, `wait_queue`, and `P0001`–`P0017` diagnostics for common C/Rust/Go/Zig syntax habits).
+- **`zev-ast` / `zev-parser`**: Recursive-descent parser (`f32`/`f64`, `<T, usize N>` generics, canonical prefix types `*T` / `[]T` / `[N]T`, `f"..."` strings, `mmio`, `irq`, `wait { ... }`, `wait_queue`, and `P0001`–`P0018` diagnostics for common C/Rust/Go/Zig syntax habits).
 - **`zev-sema`**: Generic monomorphization, `import`/`pub` module resolution, 3-tier call-graph yield inference (`NonYielding`, `SoftYielding`, `HardBlocking`), Boot-Tree `spawn` (`MAX_TASKS <= 32`) / `irq.attach` checking, ISR isolation (`E0001`/`E0002`/`E0033`), constant shift range & `fmt_buf` bounds checking (`E0024`/`E0028`), per-arm `wait` lease scoping, and linear `Lease<T>` tracking (`E0034`).
 - **`zev-mir`**: Stackless state-machine lowering, liveness hoisting, disjoint child-frame `union` packing, unreachable function pruning, per-task non-yielding run-bound classification (`straight-line`, `bounded-for`, `noyield-spin`), and static SRAM budget reporting.
 - **`zev-codegen-llvm`**: Unified LLVM 23 IR backend driving `opt`, `llc`, and `ld.lld` across host `x86_64` sanitized simulation (`zevc run --sanitize` + `sys.fuzz_irqs`) and bare-metal ARM Cortex-M, RISC-V (`rv32imac`), and AVR targets configured via `chips/*.toml` and `boards/*.toml`, with defined `@__syn_panic` bounds/div-zero traps and bit-width-masked shifts.

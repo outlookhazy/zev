@@ -349,10 +349,10 @@ impl<'a> Parser<'a> {
     fn trap_p0002_colon_binding(&self, name: &str, ty_hint: Option<&str>, span: Span) -> ParseError {
         let rewrite = match ty_hint {
             Some(t) => format!(
-                "write C-style `{t} {name}` instead of `{name}: {t}`; for value-returning functions put the return type before the name: `{t} foo({t} {name}) {{ ... }}` (`fn name(...)` is only for `void` functions)"
+                "write C-style `{t} {name}` instead of `{name}: {t}`; functions use `fn foo({t} {name}) -> {t} {{ ... }}`"
             ),
             None => format!(
-                "write C-style `Type {name}` instead of `{name}: Type`; for value-returning functions put the return type before the name: `u16 foo(u16 {name}) {{ ... }}` (`fn name(...)` is only for `void` functions)"
+                "write C-style `Type {name}` instead of `{name}: Type`; functions use `fn foo(u16 {name}) -> u16 {{ ... }}`"
             ),
         };
         self.err_at(
@@ -362,27 +362,6 @@ impl<'a> Parser<'a> {
         .with_code("P0002")
         .with_doc_topic("syntax")
         .with_hint(rewrite)
-    }
-
-    fn trap_p0002_fn_arrow(&self, fn_name: &str, ret_hint: Option<&str>, span: Span) -> ParseError {
-        let hint = match ret_hint {
-            Some("void") => format!(
-                "remove `-> void`; `fn {fn_name}(...) {{ ... }}` already returns `void`"
-            ),
-            Some(rt) => format!(
-                "put the return type before the function name without `fn`: `{rt} {fn_name}(...) {{ ... }}` (`fn name(...)` is only for `void`-returning functions with C-style `Type name` parameters)"
-            ),
-            None => format!(
-                "put the return type before the function name without `fn`: `u16 {fn_name}(u16 x) {{ ... }}` (`fn name(...)` is only for `void`-returning functions with C-style `Type name` parameters)"
-            ),
-        };
-        self.err_at(
-            format!("`-> RetType` after `fn {fn_name}(...)` is not valid in Zev"),
-            span,
-        )
-        .with_code("P0002")
-        .with_doc_topic("syntax")
-        .with_hint(hint)
     }
 
     fn trap_p0002_postfix_return(
@@ -396,14 +375,14 @@ impl<'a> Parser<'a> {
                 "remove `void`; `fn {fn_name}(...) {{ ... }}` already returns `void`"
             ),
             Some(rt) => format!(
-                "put the return type before the function name without `fn`: `{rt} {fn_name}(...) {{ ... }}` (`fn name(...)` is only for `void`-returning functions with C-style `Type name` parameters)"
+                "write `->` before the return type: `fn {fn_name}(...) -> {rt} {{ ... }}`"
             ),
             None => format!(
-                "put the return type before the function name without `fn`: `u16 {fn_name}(u16 x) {{ ... }}` (`fn name(...)` is only for `void`-returning functions with C-style `Type name` parameters)"
+                "write `->` before the return type: `fn {fn_name}(u16 x) -> u16 {{ ... }}`"
             ),
         };
         self.err_at(
-            format!("postfix return type after `fn {fn_name}(...)` is not valid in Zev"),
+            format!("postfix return type without `->` after `fn {fn_name}(...)` is not valid in Zev"),
             span,
         )
         .with_code("P0002")
@@ -586,6 +565,30 @@ impl<'a> Parser<'a> {
         .with_hint(format!(
             "rewrite `({ty_str})expr` as `expr as {ty_str}`"
         ))
+    }
+
+    fn trap_p0018(&self, ret_type: &TypeExpr, fn_name: &str, span: Span) -> ParseError {
+        let ret_str = self.type_snippet(ret_type.span);
+        let (msg, hint) =
+            if ret_str == "void" || matches!(ret_type.kind, TypeKind::Prim(PrimType::Void)) {
+                (
+                    format!(
+                        "retired return-first declaration `void {fn_name}(...)`; write `fn {fn_name}(...)` instead"
+                    ),
+                    format!("rewrite `void {fn_name}(...)` as `fn {fn_name}(...)` (omit `void`)"),
+                )
+            } else {
+                (
+                    format!(
+                        "retired return-first declaration `{ret_str} {fn_name}(...)`; write `fn {fn_name}(...) -> {ret_str}` instead"
+                    ),
+                    format!("rewrite `{ret_str} {fn_name}(...)` as `fn {fn_name}(...) -> {ret_str}`"),
+                )
+            };
+        self.err_at(msg, span)
+            .with_code("P0018")
+            .with_doc_topic("syntax")
+            .with_hint(hint)
     }
 
     fn type_snippet(&self, span: Span) -> String {
@@ -883,9 +886,7 @@ impl<'a> Parser<'a> {
                 self.check_generic_lifetime_after_decl_name()?;
 
                 if self.at(&TokenKind::LParen) || self.at(&TokenKind::Lt) {
-                    let f = self.finish_fn_after_name(attrs.clone(), false, ty, name, first_span)?;
-                    let span = f.span;
-                    out.push(Item::with_pub(attrs, is_pub, ItemKind::Fn(f), span));
+                    return Err(self.trap_p0018(&ty, &name.name, first_span.merge(name.span)));
                 } else {
                     let init = if self.eat(&TokenKind::Eq) {
                         Some(self.parse_expr()?)
@@ -1160,27 +1161,32 @@ impl<'a> Parser<'a> {
                 .with_doc_topic("syntax"));
         }
 
-        let (ret_type, name, fn_span) = if self.at(&TokenKind::KwFn) {
-            let fn_tok = self.expect(&TokenKind::KwFn)?;
-            let is_standard_fn = matches!(self.peek_kind(), TokenKind::Ident(_))
-                && matches!(self.peek_n_kind(1), TokenKind::LParen | TokenKind::Lt);
-            if !is_standard_fn {
-                if self.at(&TokenKind::Bang) {
-                    return Err(self.trap_p0007(
-                        "Zig-style `!Type` error-union return type",
-                        self.peek_span(),
-                    ));
-                }
-                let (rt, nm) = self.parse_typed_declarator("method declaration")?;
-                (rt, nm, fn_tok.span)
-            } else {
-                let nm = self.parse_ident()?;
-                (TypeExpr::void(fn_tok.span), nm, fn_tok.span)
-            }
+        let fn_tok = if self.at(&TokenKind::KwFn) {
+            self.expect(&TokenKind::KwFn)?
         } else {
+            if self.at(&TokenKind::Bang) {
+                return Err(self.trap_p0007(
+                    "Zig-style `!Type` error-union return type",
+                    self.peek_span(),
+                ));
+            }
             let (rt, nm) = self.parse_typed_declarator("method declaration")?;
-            (rt, nm, cur_span)
+            return Err(self.trap_p0018(&rt, &nm.name, first_span.merge(nm.span)));
         };
+        let is_standard_fn = matches!(self.peek_kind(), TokenKind::Ident(_))
+            && matches!(self.peek_n_kind(1), TokenKind::LParen | TokenKind::Lt);
+        if !is_standard_fn {
+            if self.at(&TokenKind::Bang) {
+                return Err(self.trap_p0007(
+                    "Zig-style `!Type` error-union return type",
+                    self.peek_span(),
+                ));
+            }
+            let (rt, nm) = self.parse_typed_declarator("method declaration")?;
+            return Err(self.trap_p0018(&rt, &nm.name, first_span.merge(nm.span)));
+        }
+        let fn_span = fn_tok.span;
+        let name = self.parse_ident()?;
 
         if self.at(&TokenKind::Lt) {
             return Err(self
@@ -1196,15 +1202,41 @@ impl<'a> Parser<'a> {
 
         let (receiver, params) = self.parse_method_param_list()?;
 
-        if self.at(&TokenKind::Arrow) {
-            let arrow = self.bump();
-            let (ret_hint, end_span) = self.sniff_type_display_and_span(arrow.span);
-            return Err(self.trap_p0002_fn_arrow(
-                &name.name,
-                ret_hint.as_deref(),
-                arrow.span.merge(end_span),
-            ));
-        }
+        let ret_type = if self.eat(&TokenKind::Arrow) {
+            if self.at(&TokenKind::Bang) {
+                let bang = self.bump();
+                return Err(self.trap_p0007(
+                    "Zig/Rust `-> !Type` error-union return type",
+                    self.prev_span().merge(bang.span),
+                ));
+            }
+            self.parse_type()?
+        } else {
+            if self.at(&TokenKind::Bang) {
+                let bang = self.bump();
+                return Err(self.trap_p0007(
+                    "Zig-style `!Type` error-union return type",
+                    bang.span,
+                ));
+            }
+            if !self.at(&TokenKind::LBrace)
+                && !self.at(&TokenKind::KwError)
+                && !self.at(&TokenKind::Eof)
+                && matches!(
+                    self.peek_kind(),
+                    TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::Star
+                )
+            {
+                let start = self.peek_span();
+                let (ret_hint, end_span) = self.sniff_type_display_and_span(start);
+                return Err(self.trap_p0002_postfix_return(
+                    &name.name,
+                    ret_hint.as_deref(),
+                    start.merge(end_span),
+                ));
+            }
+            TypeExpr::void(fn_tok.span)
+        };
 
         let error_spec = self.parse_optional_error_spec()?;
         let (body, end_span) = self.parse_fn_body(false, &name)?;
@@ -1475,8 +1507,14 @@ impl<'a> Parser<'a> {
                 let decl = if self.at(&TokenKind::KwFn) {
                     self.parse_kw_fn(item_attrs.clone(), true, item_start)?
                 } else {
+                    if self.at(&TokenKind::Bang) {
+                        return Err(self.trap_p0007(
+                            "Zig-style `!Type` error-union return type",
+                            self.peek_span(),
+                        ));
+                    }
                     let (ty, name) = self.parse_typed_declarator("extern \"C\" function")?;
-                    self.finish_fn_after_name(item_attrs.clone(), true, ty, name, item_start)?
+                    return Err(self.trap_p0018(&ty, &name.name, item_start.merge(name.span)));
                 };
                 let span = item_start.merge(decl.span);
                 out.push(Item::with_pub(item_attrs, item_is_pub, ItemKind::Fn(decl), span));
@@ -1487,10 +1525,14 @@ impl<'a> Parser<'a> {
             let span = decl.span;
             out.push(Item::with_pub(attrs, is_pub, ItemKind::Fn(decl), span));
         } else {
+            if self.at(&TokenKind::Bang) {
+                return Err(self.trap_p0007(
+                    "Zig-style `!Type` error-union return type",
+                    self.peek_span(),
+                ));
+            }
             let (ty, name) = self.parse_typed_declarator("extern \"C\" function")?;
-            let decl = self.finish_fn_after_name(attrs.clone(), true, ty, name, first_span)?;
-            let span = decl.span;
-            out.push(Item::with_pub(attrs, is_pub, ItemKind::Fn(decl), span));
+            return Err(self.trap_p0018(&ty, &name.name, first_span.merge(name.span)));
         }
 
         Ok(())
@@ -1633,8 +1675,7 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Parse `fn name(params...) [error ...] ({ ... } | ;)`.
-    /// Traps Rust-style `-> RetType` after `fn name(...)` with `P0002` (or `P0007` if `-> !Type`).
+    /// Parse `fn name[<generics>](params...) [-> RetType] [error ...] ({ ... } | ;)`.
     fn parse_kw_fn(
         &mut self,
         attrs: Vec<Attr>,
@@ -1654,103 +1695,60 @@ impl<'a> Parser<'a> {
                 ));
             }
             let (ret_type, name) = self.parse_typed_declarator("function declaration")?;
-            return self.finish_fn_after_name(attrs, is_extern_c, ret_type, name, first_span);
+            return Err(self.trap_p0018(&ret_type, &name.name, first_span.merge(name.span)));
         }
 
         let name = self.parse_ident()?;
         let generic_params = self.parse_optional_generic_params()?;
         let (params, is_variadic) = self.parse_param_list()?;
 
-        if self.at(&TokenKind::Arrow) {
-            let arrow = self.bump();
+        let ret_type = if self.eat(&TokenKind::Arrow) {
             if self.at(&TokenKind::Bang) {
                 let bang = self.bump();
                 return Err(self.trap_p0007(
                     "Zig/Rust `-> !Type` error-union return type",
-                    arrow.span.merge(bang.span),
+                    self.prev_span().merge(bang.span),
                 ));
             }
-            let (ret_hint, end_span) = self.sniff_type_display_and_span(arrow.span);
-            return Err(self.trap_p0002_fn_arrow(
-                &name.name,
-                ret_hint.as_deref(),
-                arrow.span.merge(end_span),
-            ));
-        }
-
-        if self.at(&TokenKind::Bang) {
-            let bang = self.bump();
-            return Err(self.trap_p0007(
-                "Zig-style `!Type` error-union return type",
-                bang.span,
-            ));
-        }
-
-        if !self.at(&TokenKind::LBrace)
-            && !self.at(&TokenKind::Semi)
-            && !self.at(&TokenKind::KwError)
-            && !self.at(&TokenKind::Eof)
-            && matches!(
-                self.peek_kind(),
-                TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::Star
-            )
-        {
-            if matches!(self.peek_kind(), TokenKind::Ident(_))
-                && self.peek_n_kind(1) == TokenKind::Bang
-            {
-                let start = self.peek_span();
+            self.parse_type()?
+        } else {
+            if self.at(&TokenKind::Bang) {
+                let bang = self.bump();
                 return Err(self.trap_p0007(
-                    "Zig-style `ErrType!Type` error-union return type",
-                    start.merge(self.peek_n_span(1)),
+                    "Zig-style `!Type` error-union return type",
+                    bang.span,
                 ));
             }
-            let start = self.peek_span();
-            let (ret_hint, end_span) = self.sniff_type_display_and_span(start);
-            return Err(self.trap_p0002_postfix_return(
-                &name.name,
-                ret_hint.as_deref(),
-                start.merge(end_span),
-            ));
-        }
 
-        let ret_type = TypeExpr::void(fn_tok.span);
-        let error_spec = self.parse_optional_error_spec()?;
-        let (body, end_span) = self.parse_fn_body(is_extern_c, &name)?;
+            if !self.at(&TokenKind::LBrace)
+                && !self.at(&TokenKind::Semi)
+                && !self.at(&TokenKind::KwError)
+                && !self.at(&TokenKind::Eof)
+                && matches!(
+                    self.peek_kind(),
+                    TokenKind::Ident(_) | TokenKind::LBracket | TokenKind::Star
+                )
+            {
+                if matches!(self.peek_kind(), TokenKind::Ident(_))
+                    && self.peek_n_kind(1) == TokenKind::Bang
+                {
+                    let start = self.peek_span();
+                    return Err(self.trap_p0007(
+                        "Zig-style `ErrType!Type` error-union return type",
+                        start.merge(self.peek_n_span(1)),
+                    ));
+                }
+                let start = self.peek_span();
+                let (ret_hint, end_span) = self.sniff_type_display_and_span(start);
+                return Err(self.trap_p0002_postfix_return(
+                    &name.name,
+                    ret_hint.as_deref(),
+                    start.merge(end_span),
+                ));
+            }
 
-        Ok(FnDecl {
-            attrs,
-            is_extern_c,
-            name,
-            generic_params,
-            params,
-            is_variadic,
-            ret_type,
-            error_spec,
-            body,
-            span: first_span.merge(end_span),
-        })
-    }
-
-    fn finish_fn_after_name(
-        &mut self,
-        attrs: Vec<Attr>,
-        is_extern_c: bool,
-        ret_type: TypeExpr,
-        name: Ident,
-        first_span: Span,
-    ) -> Result<FnDecl, ParseError> {
-        let generic_params = self.parse_optional_generic_params()?;
-        let (params, is_variadic) = self.parse_param_list()?;
-
-        if self.at(&TokenKind::Arrow) {
-            let arrow = self.bump();
-            let (ret_hint, end_span) = self.sniff_type_display_and_span(arrow.span);
-            return Err(self.trap_p0002_fn_arrow(
-                &name.name,
-                ret_hint.as_deref(),
-                arrow.span.merge(end_span),
-            ));
-        }
+            TypeExpr::void(fn_tok.span)
+        };
 
         let error_spec = self.parse_optional_error_spec()?;
         let (body, end_span) = self.parse_fn_body(is_extern_c, &name)?;

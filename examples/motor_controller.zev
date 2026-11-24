@@ -39,7 +39,7 @@ isr dma_rx_isr(*ping_pong<u8, 64> rx_dma, *hw.DmaRegs dma, u32 clear_mask) {
 }
 
 // ── Pure / Yield-Capable Helper Functions ───────────────────────────────────
-u16 parse_setpoint([]u8 buf) error ParseErr {
+fn parse_setpoint([]u8 buf) -> u16 error ParseErr {
     if (buf.len < 5) {
         error TooShort;
     }

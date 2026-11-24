@@ -111,7 +111,7 @@ impl<T, usize N> FixedVec<T, N> {
 }
 
 impl<usize N> FixedVec<f32, N> {
-    f32 avg(*self) {
+    fn avg(*self) -> f32 {
         if (self.len == 0) {
             return 0.0f32;
         }

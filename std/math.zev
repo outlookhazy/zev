@@ -1,6 +1,6 @@
 // Standard zero-heap integer & floating-point clamping, bounds, and magnitude utilities
 
-pub T clamp<T>(T val, T lo, T hi) {
+pub fn clamp<T>(T val, T lo, T hi) -> T {
     if (val < lo) {
         return lo;
     }
@@ -10,28 +10,28 @@ pub T clamp<T>(T val, T lo, T hi) {
     return val;
 }
 
-pub T min<T>(T a, T b) {
+pub fn min<T>(T a, T b) -> T {
     if (a < b) {
         return a;
     }
     return b;
 }
 
-pub T max<T>(T a, T b) {
+pub fn max<T>(T a, T b) -> T {
     if (a > b) {
         return a;
     }
     return b;
 }
 
-pub u32 abs_i32(i32 v) {
+pub fn abs_i32(i32 v) -> u32 {
     if (v < 0i32) {
         return ((-(v + 1i32)) as u32) + 1u32;
     }
     return v as u32;
 }
 
-pub u64 abs_i64(i64 v) {
+pub fn abs_i64(i64 v) -> u64 {
     if (v < 0i64) {
         return ((-(v + 1i64)) as u64) + 1u64;
     }

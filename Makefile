@@ -13,7 +13,7 @@ build:
 doc:
 	$(ZEVC) doc >/dev/null
 	$(ZEVC) doc --list >/dev/null
-	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 P0013 P0014 P0015 P0016 P0017 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029 E0030 E0031 E0032 E0033 E0034; do \
+	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 P0013 P0014 P0015 P0016 P0017 P0018 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029 E0030 E0031 E0032 E0033 E0034; do \
 		$(ZEVC) doc $$q >/dev/null || exit 1; \
 	done
 	@echo "OK (zevc doc primer, 8 topics, and error explainers verified)"

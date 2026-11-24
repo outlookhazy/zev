@@ -97,11 +97,11 @@ pub fn toggle_led() {
     hw.PORTE.outtgl = hw.BIT_PE2_LED;
 }
 
-pub u8 read_led() {
+pub fn read_led() -> u8 {
     return (hw.PORTE.out >> 2) & 1;
 }
 
-pub u8 read_d2_pin() {
+pub fn read_d2_pin() -> u8 {
     return hw.PORTA.in_reg & 1;
 }
 
@@ -147,7 +147,7 @@ pub fn disable_uart_dre_irq() {
     }
 }
 
-u16 adc_convert_once() {
+fn adc_convert_once() -> u16 {
     hw.ADC0.intflags = hw.BIT_ADC_RESRDY;
     hw.ADC0.command = hw.BIT_ADC_STCONV;
     for (u32 i in 0..8192) {
@@ -177,7 +177,7 @@ pub fn init_adc() {
     u16 _discard = adc_convert_once();
 }
 
-pub u16 read_a0() {
+pub fn read_a0() -> u16 {
     hw.ADC0.ctrlc = hw.BIT_ADC_SAMPCAP | hw.ADC_REFSEL_VDDREF | hw.ADC_PRESC_DIV16;
     hw.ADC0.sampctrl = 16;
     hw.ADC0.muxpos = hw.ADC_MUX_AIN3;
@@ -185,7 +185,7 @@ pub u16 read_a0() {
     return adc_convert_once();
 }
 
-pub u16 read_mcu_temp_c_x10() {
+pub fn read_mcu_temp_c_x10() -> u16 {
     // ATmega4809 Datasheet Section 30.3.2.6 calibrated on-die temperature in tenths of deg C:
     //   Temp_K     = ((ADC0.RES - (i8)SIGROW.TEMPSENSE1) * SIGROW.TEMPSENSE0) / 256
     //   Temp_C_x10 = (((raw - offset) * gain * 10) - 699264 + 128) >> 8   (273.15 * 10 * 256 = 699264)
@@ -237,7 +237,7 @@ pub fn spi_master_start_byte(u8 first_byte) {
     }
 }
 
-pub u8 spi_transfer_read() {
+pub fn spi_transfer_read() -> u8 {
     u8 st = hw.SPI0.intflags;
     u8 b = hw.SPI0.data;
     hw.SPI0.intflags = hw.BIT_SPI_IF;

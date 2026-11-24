@@ -32,16 +32,16 @@ fn main() {
     },
     ErrorDoc {
         code: "P0002",
-        summary: "Rust/Zig/Go `name: Type` parameter or `-> RetType` function return syntax",
+        summary: "Rust/Zig/Go `name: Type` binding or missing `->` before return type",
         topic: "syntax",
-        why: "Zev uses C-style return-first signatures (`RetType name(Type param)`) for value-returning functions and `fn name(Type param)` strictly for `void`-returning functions. Function pointer types still write `fn(T1) -> Ret`, but function definitions never use `:` or `->`.",
+        why: "Zev declarations put the type before the variable or parameter name (`Type name`), while all functions use `fn name(params) [-> Ret]` (omitting `-> Ret` for `void`). Tasks (`task`) and interrupt handlers (`isr`) return `void` and reject `-> Ret`.",
         bad_zev: "\
 fn clamp_duty(val: u16, limit: u16) -> u16 {
     if (val > limit) { return limit; }
     return val;
 }",
         good_zev: "\
-u16 clamp_duty(u16 val, u16 limit) {
+fn clamp_duty(u16 val, u16 limit) -> u16 {
     if (val > limit) {
         return limit;
     }
@@ -66,7 +66,7 @@ async fn read_sensor() -> u16 {
     return 400;
 }",
         good_zev: "\
-u16 read_sensor() {
+fn read_sensor() -> u16 {
     u16 base = 400;
     checkpoint();
     return base + 12;
@@ -142,7 +142,7 @@ fn main() {
         why: "Zev keeps variable declarations uniform everywhere—including `catch` clauses—using explicit parenthesized `(ErrType err)` or `(ErrType err, ValType partial)` bindings.",
         bad_zev: "\
 enum ParseErr { BadCrc }
-u16 decode([]u8 b) error ParseErr { error BadCrc; }
+fn decode([]u8 b) -> u16 error ParseErr { error BadCrc; }
 fn main() {
     []u8 empty;
     u16 v = decode(empty) catch |err| { return; };
@@ -150,7 +150,7 @@ fn main() {
         good_zev: "\
 enum ParseErr { BadCrc }
 
-u16 decode(u8 b) error ParseErr {
+fn decode(u8 b) -> u16 error ParseErr {
     if (b == 0) {
         error BadCrc;
     }
@@ -170,7 +170,7 @@ fn main() {
         code: "P0007",
         summary: "Zig/Rust `!Type`, `try`, or `return error.X` / `Err(...)` instead of dual-exit `error`",
         topic: "errors",
-        why: "Zev models normal completion (`return val;` -> `status == 0`) and failure (`error [Reason [, partial]];` -> `status != 0`) as distinct exits (`{ OkTy, i32 }` by value for non-yielding functions, or static frame `_ret` + `i32` step status for yielding coroutines). Declare fallibility after the parameter list (`u16 f() error ErrEnum`), fail with `error Variant;`, and handle with `catch` or `or`.",
+        why: "Zev models normal completion (`return val;` -> `status == 0`) and failure (`error [Reason [, partial]];` -> `status != 0`) as distinct exits (`{ OkTy, i32 }` by value for non-yielding functions, or static frame `_ret` + `i32` step status for yielding coroutines). Declare fallibility after the parameter list (`fn f() -> u16 error ErrEnum`), fail with `error Variant;`, and handle with `catch` or `or`.",
         bad_zev: "\
 enum IoErr { Timeout }
 !u16 read_reg() {
@@ -182,7 +182,7 @@ fn main() {
         good_zev: "\
 enum IoErr { Timeout }
 
-u16 read_reg(bool ok) error IoErr {
+fn read_reg(bool ok) -> u16 error IoErr {
     if (!ok) {
         error Timeout;
     }
@@ -436,6 +436,26 @@ fn main() {
     }
 }",
     },
+    ErrorDoc {
+        code: "P0018",
+        summary: "Retired return-first function or method declaration (`RetType name(...)`)",
+        topic: "syntax",
+        why: "All functions, methods, and `extern \"C\"` prototypes in Zev use one uniform `fn` form: `[pub] [extern \"C\"] fn name<generics>(params) [-> RetType] [error ErrType]`, omitting `-> RetType` for `void` functions. Put `fn` before the name and write non-void return types after `->`.",
+        bad_zev: "\
+u16 add(u16 a, u16 b) {
+    return a + b;
+}",
+        good_zev: "\
+fn add(u16 a, u16 b) -> u16 {
+    return a + b;
+}
+fn main() {
+    u16 s = add(1u16, 2u16);
+    if (s == 3u16) {
+        return;
+    }
+}",
+    },
 
     // ── Semantic & Static-Verifier Diagnostics (E0001..E0034) ───────────────
     ErrorDoc {
@@ -492,7 +512,7 @@ fn main() {
         topic: "yielding",
         why: "`noyield { ... }` guarantees task-atomicity: no other cooperative task can interleave mid-update, and transient locals stay in CPU registers. `SoftYielding` helper `fn`s (terminating functions using `checkpoint()` or unguarded `while (cond)` loops) automatically specialize a direct `0 B`-`.bss` stack clone inside `noyield` (and `noyield { while (cond) {} }` stays non-yielding), whereas `HardBlocking` waits (`delay`, `recv`, `send`, `wait_chunk`), direct `checkpoint()`, and unbounded `loop` / `while (true)` are rejected.",
         bad_zev: "\
-u16 adc_sample() {
+fn adc_sample() -> u16 {
     delay(1ms);
     return 900;
 }
@@ -502,12 +522,12 @@ fn main() {
     }
 }",
         good_zev: "\
-u16 adc_sample() {
+fn adc_sample() -> u16 {
     delay(1ms);
     return 900;
 }
 
-u16 compute_duty(u16 sample) {
+fn compute_duty(u16 sample) -> u16 {
     return sample / 2;
 }
 
@@ -650,7 +670,7 @@ struct ByteReader {
     usize pos;
 }
 
-u8 peek_first(ByteReader r) {
+fn peek_first(ByteReader r) -> u8 {
     if (r.buf.len == 0) {
         return 0;
     }
@@ -678,13 +698,13 @@ fn main() {
         topic: "dma",
         why: "Returning `&local` or a local-leased `wait_chunk()` slice upward out of a function would leave the caller holding a dangling pointer to a destroyed stack frame or unguarded DMA buffer. Return value types (scalars/structs) upward, or pass slices downward into helpers.",
         bad_zev: "\
-*u32 bad_ptr() {
+fn bad_ptr() -> *u32 {
     u32 tmp = 42;
     return &tmp;
 }
 fn main() {}",
         good_zev: "\
-[]u8 trim_header([]u8 packet) {
+fn trim_header([]u8 packet) -> []u8 {
     if (packet.len < 2) {
         return packet;
     }
@@ -828,12 +848,12 @@ fn main() {
         topic: "errors",
         why: "Value-returning functions (`u16 foo()`) must return an expression assignable to their declared return type on normal exit paths, whereas `fn name()` (`void`) and `isr` items use bare `return;` without a value (and `task` items are immortal actors that use `restart;` instead of `return;`).",
         bad_zev: "\
-u16 get_rpm() {
+fn get_rpm() -> u16 {
     return;
 }
 fn main() {}",
         good_zev: "\
-u16 get_rpm() {
+fn get_rpm() -> u16 {
     return 1500;
 }
 
@@ -851,14 +871,14 @@ fn main() {
         why: "Zev supports three exact `error` exit forms matched to the function header:\n  1. Untyped `u16 f() error` -> exit with bare `error;` (or `error, partial_val;`).\n  2. Typed `u16 f() error MyErr` -> exit with `error Variant;`.\n  3. Typed + partial progress `usize f() error MyErr` -> exit with `error Variant, partial_val;`.\nFunctions without `error` in their signature cannot use the `error` statement.",
         bad_zev: "\
 enum ParseErr { BadCrc }
-u16 check_frame() {
+fn check_frame() -> u16 {
     error BadCrc;
 }
 fn main() {}",
         good_zev: "\
 enum ParseErr { TooShort, BadCrc }
 
-u16 check_frame(u8 len, bool crc_ok) error ParseErr {
+fn check_frame(u8 len, bool crc_ok) -> u16 error ParseErr {
     if (len < 5) {
         error TooShort;
     }
@@ -882,7 +902,7 @@ fn main() {
         why: "Ignoring hardware or protocol errors silently is a classic source of embedded field failures. Every call to an `error`-returning function—or primitive wait with `timeout: ...`—must explicitly handle failure with postfix `or <fallback>` or `catch (...) { ... }`.",
         bad_zev: "\
 enum BusErr { Nack }
-u8 i2c_read() error BusErr {
+fn i2c_read() -> u8 error BusErr {
     error Nack;
 }
 fn main() {
@@ -891,7 +911,7 @@ fn main() {
         good_zev: "\
 enum BusErr { Nack }
 
-u8 i2c_read(bool present) error BusErr {
+fn i2c_read(bool present) -> u8 error BusErr {
     if (!present) {
         error Nack;
     }
@@ -915,7 +935,7 @@ fn main() {
         why: "A `catch` clause binds `(ErrType err)` (or `(ErrType err, RetType partial)` when inspecting partial progress) for typed errors, and takes no typed error binding for untyped `error` functions. When assigning the result (`u16 x = f() catch ...;`), the `catch` block must either diverge (`return;`, `continue;`, `break;`, `error ...;`) or evaluate to a replacement value.",
         bad_zev: "\
 enum ParseErr { BadCrc }
-u16 parse(u8 b) error ParseErr {
+fn parse(u8 b) -> u16 error ParseErr {
     if (b == 0) { error BadCrc; }
     return b;
 }
@@ -931,7 +951,7 @@ struct DecodedPacket {
 
 enum IoErr { Timeout }
 
-DecodedPacket read_pkt(u32 limit) error IoErr {
+fn read_pkt(u32 limit) -> DecodedPacket error IoErr {
     if (limit > 4) {
         error Timeout, DecodedPacket{ cmd: 9, val: 4 };
     }
@@ -1271,7 +1291,7 @@ struct FixedVec<T, usize N> {
     usize len;
 }
 
-T clamp<T>(T val, T lo, T hi) {
+fn clamp<T>(T val, T lo, T hi) -> T {
     if (val < lo) {
         return lo;
     }
@@ -1370,7 +1390,7 @@ fn main() {
         topic: "yielding",
         why: "Persistent per-attachment ISR storage uses `state Type x = init;` directly inside an `isr` body: every `state` variable must have an explicit initializer, cannot appear outside an `isr`, and cannot escape `&state_var` out of its declaring block (each Boot-Tree `vec.attach(...)` gets its own isolated `.bss`/`.data` instance automatically).",
         bad_zev: "\
-u32 helper() {
+fn helper() -> u32 {
     state u32 count = 0;
     count += 1;
     return count;

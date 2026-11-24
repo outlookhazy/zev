@@ -15,18 +15,18 @@ pub struct ByteWriter {
     usize pos;
 }
 
-pub ByteReader reader_new([]u8 src) {
+pub fn reader_new([]u8 src) -> ByteReader {
     return ByteReader { buf: src, pos: 0 };
 }
 
-pub usize reader_remaining(*ByteReader r) {
+pub fn reader_remaining(*ByteReader r) -> usize {
     if (r.pos >= r.buf.len) {
         return 0;
     }
     return r.buf.len - r.pos;
 }
 
-pub u8 reader_u8(*ByteReader r) error IoErr {
+pub fn reader_u8(*ByteReader r) -> u8 error IoErr {
     if (r.pos >= r.buf.len) {
         error Eof;
     }
@@ -35,7 +35,7 @@ pub u8 reader_u8(*ByteReader r) error IoErr {
     return b;
 }
 
-pub []u8 reader_slice(*ByteReader r, usize len) error IoErr {
+pub fn reader_slice(*ByteReader r, usize len) -> []u8 error IoErr {
     if (reader_remaining(r) < len) {
         error Eof;
     }
@@ -45,7 +45,7 @@ pub []u8 reader_slice(*ByteReader r, usize len) error IoErr {
     return r.buf[start..end];
 }
 
-pub []u8 reader_until(*ByteReader r, u8 delim) error IoErr {
+pub fn reader_until(*ByteReader r, u8 delim) -> []u8 error IoErr {
     usize start = r.pos;
     if (start >= r.buf.len) {
         error Eof;
@@ -59,7 +59,7 @@ pub []u8 reader_until(*ByteReader r, u8 delim) error IoErr {
     error Eof;
 }
 
-pub ByteWriter writer_new([]u8 dst) {
+pub fn writer_new([]u8 dst) -> ByteWriter {
     return ByteWriter { buf: dst, pos: 0 };
 }
 
@@ -83,7 +83,7 @@ pub fn writer_bytes(*ByteWriter w, []u8 src) error IoErr {
     return;
 }
 
-pub []u8 writer_slice(*ByteWriter w) {
+pub fn writer_slice(*ByteWriter w) -> []u8 {
     if (w.pos >= w.buf.len) {
         return w.buf[0..w.buf.len];
     }
@@ -95,6 +95,6 @@ pub struct DuplexStream {
     *byte_ring tx;
 }
 
-pub usize stream_write(*DuplexStream s, []u8 data) {
+pub fn stream_write(*DuplexStream s, []u8 data) -> usize {
     return s.tx.push(data);
 }

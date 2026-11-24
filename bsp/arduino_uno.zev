@@ -71,11 +71,11 @@ pub fn toggle_led() {
     }
 }
 
-pub u8 read_led() {
+pub fn read_led() -> u8 {
     return (hw.PORTB.port >> 5) & 1;
 }
 
-pub u8 read_d2_pin() {
+pub fn read_d2_pin() -> u8 {
     return (hw.PORTD.pin >> 2) & 1;
 }
 
@@ -126,7 +126,7 @@ pub fn disable_uart_udre_irq() {
     }
 }
 
-u16 adc_convert_once() {
+fn adc_convert_once() -> u16 {
     hw.ADC_REGS.adcsra = 0xC7;
     for (u32 i in 0..4096) {
         if ((hw.ADC_REGS.adcsra & 0x40) == 0) {
@@ -145,17 +145,17 @@ pub fn init_adc() {
     u16 discard = adc_convert_once();
 }
 
-pub u16 read_adc_mux(u8 admux_val) {
+pub fn read_adc_mux(u8 admux_val) -> u16 {
     hw.ADC_REGS.admux = admux_val;
     u16 settle = adc_convert_once();
     return adc_convert_once();
 }
 
-pub u16 read_a0() {
+pub fn read_a0() -> u16 {
     return read_adc_mux(0x40);
 }
 
-pub u16 read_mcu_vcc_mv() {
+pub fn read_mcu_vcc_mv() -> u16 {
     hw.ADC_REGS.admux = 0x4E;
     for (u8 k in 0..24) {
         u16 d = adc_convert_once();
@@ -185,7 +185,7 @@ pub fn spi_master_start_byte(u8 first_byte) {
     }
 }
 
-pub u8 spi_transfer_read() {
+pub fn spi_transfer_read() -> u8 {
     u8 st = hw.SPI_REGS.spsr;
     u8 b = hw.SPI_REGS.spdr;
     if ((st & 0x80) == 0) {

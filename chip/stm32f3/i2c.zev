@@ -5,7 +5,7 @@ import chip.stm32f3.gpio as cgpio;
 import hal.time as htime;
 import hal.i2c as hi2c;
 
-pub hi2c.Bus i2c1_init_pb6_pb7_100k(u32 timeout_ms) {
+pub fn i2c1_init_pb6_pb7_100k(u32 timeout_ms) -> hi2c.Bus {
     hw.RCC.ahbenr = hw.RCC.ahbenr | hw.RCC_AHB_GPIOB;
     hw.RCC.apb1enr = hw.RCC.apb1enr | hw.RCC_APB1_I2C1;
     u32 _stab = hw.RCC.apb1enr;
@@ -27,7 +27,7 @@ pub hi2c.Bus i2c1_init_pb6_pb7_100k(u32 timeout_ms) {
     return hi2c.make_bus(1u8, timeout_ms);
 }
 
-pub bool i2c1_bus_idle() {
+pub fn i2c1_bus_idle() -> bool {
     return (hw.I2C1.isr & (1u32 << 15)) == 0u32;
 }
 

@@ -68,11 +68,11 @@ pub fn init_adc12() {
     adc_set_sample_time(2u8, 1u32, 7u32);
 }
 
-pub u16 read_vrefint_cal() {
+pub fn read_vrefint_cal() -> u16 {
     return hw.VREFINT_CAL.vrefint;
 }
 
-pub u16 read_vrefint_counts() error bus.BusStatus {
+pub fn read_vrefint_counts() -> u16 error bus.BusStatus {
     hadc.Channel ch18 = hadc.make_channel(1u8, 18u8, 3300u16);
     u16 raw = ch18.read_u16() catch (bus.BusStatus err) {
         error err;
@@ -80,7 +80,7 @@ pub u16 read_vrefint_counts() error bus.BusStatus {
     return raw;
 }
 
-pub u32 read_vdda_mv() error bus.BusStatus {
+pub fn read_vdda_mv() -> u32 error bus.BusStatus {
     u16 raw = read_vrefint_counts() catch (bus.BusStatus err) {
         error err;
     };
@@ -91,7 +91,7 @@ pub u32 read_vdda_mv() error bus.BusStatus {
     return (3300u32 * (cal as u32)) / (raw as u32);
 }
 
-pub f32 read_vdda_volts() error bus.BusStatus {
+pub fn read_vdda_volts() -> f32 error bus.BusStatus {
     u16 raw = read_vrefint_counts() catch (bus.BusStatus err) {
         error err;
     };
@@ -102,6 +102,6 @@ pub f32 read_vdda_volts() error bus.BusStatus {
     return (3.30f32 * (cal as f32)) / (raw as f32);
 }
 
-pub hadc.Channel adc_channel(u8 unit, u8 ch, u16 vdda_mv) {
+pub fn adc_channel(u8 unit, u8 ch, u16 vdda_mv) -> hadc.Channel {
     return hadc.make_channel(unit, ch, vdda_mv);
 }

@@ -93,12 +93,12 @@ pub fn gpio_set_af(gpio.Pin pin, u8 af, u32 pupd, bool open_drain) {
     gpio_config_af(pin.port, pin.pin as u32, pupd, open_drain, af as u32);
 }
 
-pub gpio.Pin gpio_pin_in(u8 port, u32 pin, u32 pupd, bool active_low) {
+pub fn gpio_pin_in(u8 port, u32 pin, u32 pupd, bool active_low) -> gpio.Pin {
     gpio_config(port, pin, MODE_IN, pupd);
     return gpio.make_pin(port, pin as u8, active_low);
 }
 
-pub gpio.Pin gpio_pin_out(u8 port, u32 pin, bool initial_high, bool active_low) {
+pub fn gpio_pin_out(u8 port, u32 pin, bool initial_high, bool active_low) -> gpio.Pin {
     gpio_config(port, pin, MODE_OUT, PUPD_NONE);
     gpio.Pin p = gpio.make_pin(port, pin as u8, active_low);
     p.write(initial_high);

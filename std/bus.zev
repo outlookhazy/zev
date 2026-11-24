@@ -39,7 +39,7 @@ pub struct BusStats {
     u32 errors;
 }
 
-pub BusStats stats_zero() {
+pub fn stats_zero() -> BusStats {
     return BusStats {
         tx_frames: 0,
         rx_frames: 0,
@@ -67,7 +67,7 @@ pub fn publish_cell<T>(*StatusCell<T> c, T val) {
     c.state.publish(val);
 }
 
-pub T read_cell<T>(*StatusCell<T> c) {
+pub fn read_cell<T>(*StatusCell<T> c) -> T {
     return c.state.read();
 }
 
@@ -75,6 +75,6 @@ pub fn publish_stats(*watch<BusStats> w, BusStats st) {
     w.publish(st);
 }
 
-pub BusStats read_stats(*watch<BusStats> w) {
+pub fn read_stats(*watch<BusStats> w) -> BusStats {
     return w.read();
 }

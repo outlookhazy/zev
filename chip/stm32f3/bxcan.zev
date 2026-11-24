@@ -82,7 +82,7 @@ pub fn can1_init(u32 bitrate, u8 mode) {
     }
 }
 
-pub bool can1_send(*bus.CanFrame tx) {
+pub fn can1_send(*bus.CanFrame tx) -> bool {
     if ((hw.CAN1.tsr & (1u32 << 26)) == 0u32) {
         return false;
     }
@@ -116,7 +116,7 @@ pub bool can1_send(*bus.CanFrame tx) {
     return true;
 }
 
-pub bool can1_recv(*bus.CanFrame rx) {
+pub fn can1_recv(*bus.CanFrame rx) -> bool {
     if ((hw.CAN1.rf0r & 3u32) == 0u32) {
         return false;
     }

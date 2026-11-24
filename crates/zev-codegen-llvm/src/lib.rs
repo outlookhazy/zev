@@ -441,7 +441,7 @@ mod tests {
         let src = r#"
             enum IoErr { Timeout, BusFault }
 
-            u32 read_burst(u32 count) error IoErr {
+            fn read_burst(u32 count) -> u32 error IoErr {
                 if (count > 4) {
                     error Timeout, 4;
                 }
@@ -496,14 +496,14 @@ mod tests {
 
             enum PacketErr { Corrupt }
 
-            DecodedPacket decode_pkt(bool bad) error PacketErr {
+            fn decode_pkt(bool bad) -> DecodedPacket error PacketErr {
                 if (bad) {
                     error Corrupt;
                 }
                 return DecodedPacket{ cmd: CMD_SPECIAL, temp: 25 };
             }
 
-            DecodedPacket decode_yielding(bool bad) error PacketErr {
+            fn decode_yielding(bool bad) -> DecodedPacket error PacketErr {
                 checkpoint();
                 if (bad) {
                     error Corrupt;
@@ -511,7 +511,7 @@ mod tests {
                 return DecodedPacket{ cmd: 2, temp: 200 };
             }
 
-            i32 match_cmd(u8 cmd) {
+            fn match_cmd(u8 cmd) -> i32 {
                 switch (cmd) {
                     CMD_PING => {
                         return 11;
@@ -661,14 +661,14 @@ mod tests {
                 u16 temp;
             }
 
-            DecodedPacket decode_direct(bool fail) error PacketErr {
+            fn decode_direct(bool fail) -> DecodedPacket error PacketErr {
                 if (fail) {
                     error BadCrc;
                 }
                 return DecodedPacket{ cmd: 1, temp: 100 };
             }
 
-            DecodedPacket decode_yielding(bool fail) error PacketErr {
+            fn decode_yielding(bool fail) -> DecodedPacket error PacketErr {
                 checkpoint();
                 if (fail) {
                     error BadCrc;
@@ -1195,7 +1195,7 @@ mod tests {
             watch<u32> inbody_runs = 0;
             watch<u32> sleep_runs = 0;
 
-            u32 compute_period_ms(u32 mult) {
+            fn compute_period_ms(u32 mult) -> u32 {
                 return mult * 5;
             }
 
@@ -1417,7 +1417,7 @@ mod tests {
                 trace_log.publish(trace_log.read() * 10 + digit);
             }
 
-            u32 direct_op(bool should_fail) error OpErr {
+            fn direct_op(bool should_fail) -> u32 error OpErr {
                 u32 ret_val = 42;
                 defer {
                     append_trace(1);
@@ -1448,7 +1448,7 @@ mod tests {
                 return ret_val + 8;
             }
 
-            u32 coro_op(bool should_fail) error OpErr {
+            fn coro_op(bool should_fail) -> u32 error OpErr {
                 u32 ret_val = 100;
                 defer {
                     append_trace(7);
@@ -1544,7 +1544,7 @@ mod tests {
     #[test]
     fn wave1_bounded_for_range_inclusive_and_foreach_slice_in_qemu() {
         let src = r#"
-            u32 sum_direct([]u8 sl) {
+            fn sum_direct([]u8 sl) -> u32 {
                 u32 total = 0;
                 for (u8 i in 0..=4) {
                     if (i == 2) {
@@ -1756,7 +1756,7 @@ mod tests {
     #[test]
     fn wave1_dual_specialized_soft_yielding_fn_o2_and_oz_in_qemu() {
         let src = r#"
-            u32 mix_byte(u32 acc, u8 b) {
+            fn mix_byte(u32 acc, u8 b) -> u32 {
                 checkpoint();
                 u32 v = acc ^ (b as u32);
                 u8 step = 0;
@@ -1775,7 +1775,7 @@ mod tests {
                 return v;
             }
 
-            u32 compute_crc_soft([]u8 buf) {
+            fn compute_crc_soft([]u8 buf) -> u32 {
                 u32 acc = 0x1234;
                 for (u8 b in buf) {
                     checkpoint();
@@ -1958,7 +1958,7 @@ mod tests {
             watch<f64> rem_out_f64 = 0.0;
             watch<i32> cast_out_i32 = 0;
 
-            f32 clamp_f32(f32 x, f32 lo, f32 hi) {
+            fn clamp_f32(f32 x, f32 lo, f32 hi) -> f32 {
                 if (x < lo) { return lo; }
                 if (x > hi) { return hi; }
                 return x;
@@ -2285,7 +2285,7 @@ mod tests {
                 usize len;
             }
 
-            T clamp<T>(T x, T lo, T hi) {
+            fn clamp<T>(T x, T lo, T hi) -> T {
                 if (x < lo) { return lo; }
                 if (x > hi) { return hi; }
                 return x;
@@ -2536,11 +2536,11 @@ mod tests {
                 F cb;
             }
 
-            u32 add10(u32 x) {
+            fn add10(u32 x) -> u32 {
                 return x + 10;
             }
 
-            f32 scale2(f32 x) {
+            fn scale2(f32 x) -> f32 {
                 return x * 2.0f32;
             }
 
@@ -2548,7 +2548,7 @@ mod tests {
                 hook_acc.publish(hook_acc.read() + delta);
             }
 
-            f32 apply_f32(fn(f32) -> f32 op, f32 v) {
+            fn apply_f32(fn(f32) -> f32 op, f32 v) -> f32 {
                 return op(v);
             }
 
@@ -3668,7 +3668,7 @@ isr step_1() { log_q.post(1); }
 isr step_2() { log_q.post(2); }
 isr step_3() { log_q.post(3); }
 
-bool get_cond() { return true; }
+fn get_cond() -> bool { return true; }
 
 fn main() {
     IRQ_10.attach_shared(step_1);
@@ -3714,7 +3714,7 @@ mmio ArrRegs {
 }
 mmio DEV : ArrRegs @ 0x4000_0000;
 
-usize make_idx(u64 hi, u64 lo) {
+fn make_idx(u64 hi, u64 lo) -> usize {
     u64 full = (hi << 32) | lo;
     return full as usize;
 }
@@ -4631,7 +4631,7 @@ byte_ring<24> ring_b;
 inbox<u32, 3> q_a;
 inbox<u32, 6> q_b;
 
-usize exercise_ring(*byte_ring r, u8 seed) {
+fn exercise_ring(*byte_ring r, u8 seed) -> usize {
     usize cap = r.cap();
     assert(r.is_empty());
     assert(!r.is_full());
@@ -4668,7 +4668,7 @@ usize exercise_ring(*byte_ring r, u8 seed) {
     return cap;
 }
 
-usize exercise_inbox(*inbox<u32> q) {
+fn exercise_inbox(*inbox<u32> q) -> usize {
     usize cap = q.cap();
     assert(q.is_empty());
     assert(!q.is_full());
@@ -4864,7 +4864,7 @@ byte_ring<16> tx;
 byte_ring<16> tx2;
 signal sync;
 
-usize write_fmt_view(*byte_ring r, u16 v) error FmtErr {
+fn write_fmt_view(*byte_ring r, u16 v) -> usize error FmtErr {
     return fmt_ring(r, f"V={v:04X}", boost: @high) catch (FmtErr e, usize pw) {
         error e, pw;
     };
@@ -5151,11 +5151,11 @@ isr on_dma_irq(*dma_slot<[17]u8> slot) {
     slot.release(boost: @critical);
 }
 
-bool try_enqueue_view(*inbox<Lease<[17]u8>> q, Lease<[17]u8> item) {
+fn try_enqueue_view(*inbox<Lease<[17]u8>> q, Lease<[17]u8> item) -> bool {
     return q.try_send(item);
 }
 
-u8 helper_with_defer(*pool<[17]u8, 4> p) {
+fn helper_with_defer(*pool<[17]u8, 4> p) -> u8 {
     Lease<[17]u8> b = p.try_alloc() catch {
         return 0;
     };
@@ -5348,11 +5348,11 @@ byte_ring<16> uart_tx;
 dma_slot<[64]u8> tx_slot;
 inbox<Lease<[64]u8>, 2> tx_q;
 
-void update_status(*StatusCell<u32> cell, u32 next_val) {
+fn update_status(*StatusCell<u32> cell, u32 next_val) {
     cell.state.publish(next_val);
 }
 
-void forward_stream(*DuplexStream io) {
+fn forward_stream(*DuplexStream io) {
     assert(io.rx.push("PING") == 4);
     [4]u8 buf;
     assert(io.rx.pop(buf) == 4);
@@ -5653,7 +5653,7 @@ isr on_timer_irq(*inbox<u8, 4> q, *byte_ring<16> r) {
     r.push_byte(2u8, boost: @critical);
 }
 
-usize inspect_q_view(*inbox<u8> q) {
+fn inspect_q_view(*inbox<u8> q) -> usize {
     usize n = q.len();
     if (q.is_empty() || q.is_full()) {
         return n + 1;
@@ -5661,7 +5661,7 @@ usize inspect_q_view(*inbox<u8> q) {
     return n;
 }
 
-usize inspect_r_view(*byte_ring r) {
+fn inspect_r_view(*byte_ring r) -> usize {
     usize n = r.len();
     if (r.is_empty()) {
         return n + 1;
@@ -5861,7 +5861,7 @@ fn main() {
     #[test]
     fn l_m1_indirect_fnptr_conservative_stack_bound_end_to_end() {
         let src = r#"
-u32 heavy_leaf(u32 x) {
+fn heavy_leaf(u32 x) -> u32 {
     [64]u8 buf;
     u32 i = 0;
     noyield {
@@ -5873,7 +5873,7 @@ u32 heavy_leaf(u32 x) {
     return (buf[x & 63u32] as u32) + (buf[(x + 17u32) & 63u32] as u32);
 }
 
-u32 alt_leaf(u32 x) {
+fn alt_leaf(u32 x) -> u32 {
     return x + 1u32;
 }
 
@@ -6195,11 +6195,11 @@ struct PacketSlice {
     []u8 bytes;
 }
 
-[]u8 ret_lit_slice() {
+fn ret_lit_slice() -> []u8 {
     return "RET\x00!";
 }
 
-u8 read_slice_byte([]u8 s, usize expected_len, usize idx) {
+fn read_slice_byte([]u8 s, usize expected_len, usize idx) -> u8 {
     assert(s.len == expected_len);
     return s[idx];
 }
@@ -6627,7 +6627,7 @@ fn uart_putc(u8 c) {
     UART0.dr = c as u32;
 }
 
-u32 hw_ms() {
+fn hw_ms() -> u32 {
     return 42u32 + sys.now_ticks();
 }
 
@@ -6713,7 +6713,7 @@ fn putc_upper(u8 c) {
     UART0.dr = ch as u32;
 }
 
-u32 custom_clock_ms() {
+fn custom_clock_ms() -> u32 {
     return 777_000u32 + STUB.idle_hits;
 }
 
@@ -6806,7 +6806,7 @@ isr fpu_tick_isr() {
     sys.tick();
 }
 
-f32 biquad_step(f32 x, f32 b0, f32 z1) {
+fn biquad_step(f32 x, f32 b0, f32 z1) -> f32 {
     return (x * b0) + z1;
 }
 
@@ -6938,7 +6938,7 @@ impl<T, usize N> Acc<T, N> {
 }
 
 impl<usize N> Acc<f32, N> {
-    pub f32 avg(*self) {
+    pub fn avg(*self) -> f32 {
         if (self.count == 0) {
             return 0.0f32;
         }
@@ -6952,7 +6952,7 @@ impl<usize N> Acc<f32, N> {
 
 watch<u32> out_w = 0u32;
 
-u16 sum_slice([]u16 xs) {
+fn sum_slice([]u16 xs) -> u16 {
     u16 total = 0u16;
     for (u16 x in xs) {
         total += x;
@@ -7121,7 +7121,7 @@ fn main() {
 watch<u32> in_w = 5;
 watch<u32> out_w = 0;
 
-u32 fib(u32 n) {
+fn fib(u32 n) -> u32 {
     if (n <= 1u32) {
         return n;
     }
@@ -7520,11 +7520,11 @@ fn main() {
     #[test]
     fn masked_variable_bit_shifts_across_widths_in_qemu() {
         let src = r#"
-u8 shift_u8(u8 v, u32 sh) { return v << sh; }
-u32 shift_u32(u32 v, u32 sh) { return v << sh; }
-i32 shift_i32(i32 v, i32 sh) { return v >> sh; }
-u64 shift_u64(u64 v, u32 sh) { return v << sh; }
-u32 const_shift(u32 v) { return v >> 4; }
+fn shift_u8(u8 v, u32 sh) -> u8 { return v << sh; }
+fn shift_u32(u32 v, u32 sh) -> u32 { return v << sh; }
+fn shift_i32(i32 v, i32 sh) -> i32 { return v >> sh; }
+fn shift_u64(u64 v, u32 sh) -> u64 { return v << sh; }
+fn const_shift(u32 v) -> u32 { return v >> 4; }
 
 task verifier() {
     u32 s32 = 32;
@@ -7574,7 +7574,7 @@ fn main() {
     #[test]
     fn destination_typed_arithmetic_and_integer_table_in_qemu() {
         let src = r#"
-u16 calc_sum(u8 x, u8 y) {
+fn calc_sum(u8 x, u8 y) -> u16 {
     return x + y;
 }
 
