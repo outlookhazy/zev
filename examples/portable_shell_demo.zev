@@ -1,0 +1,45 @@
+// Portable Interactive `std.shell` Showcase (`board` + `std.io` + `std.shell`)
+//
+// Runs unmodified across host simulation (`zevc run --sanitize --cmd ...`),
+// Cortex-M3 QEMU (`zevc run-qemu --cmd ...`), STM32F334R8, ESP32-C6, and RP2040.
+
+import board;
+import std.io as io;
+import std.shell as shell;
+
+inbox<bool, 4> led_inbox;
+watch<bool>    led_state = false;
+
+task led_worker(*inbox<bool, 4> reqs, *watch<bool> state_w) {
+    loop {
+        bool on = reqs.recv();
+        noyield {
+            board.set_led(on);
+        }
+        state_w.publish(on);
+    }
+}
+
+fn cmd_led(*shell.Session s, []u8 args) error shell.Err {
+    bool on = shell.arg_bool(args, 0) catch { error Usage; };
+    if (!led_inbox.try_send(on)) {
+        error Failed;
+    }
+    println(s, f"led={on}");
+}
+
+fn cmd_status(*shell.Session s, []u8 _args) error shell.Err {
+    println(s, f"board={board.BOARD_NAME} uptime={sys.now_ms()}ms led={led_state.read()}");
+}
+
+const [2]shell.Cmd COMMANDS = [
+    shell.Cmd { name: "led",    help: "led on|off",         run: cmd_led },
+    shell.Cmd { name: "status", help: "show board & LED",   run: cmd_status },
+];
+
+fn main() {
+    board.init();
+    io.DuplexStream console = board.console_open();
+    spawn led_worker(&led_inbox, &led_state) @high;
+    spawn shell.serve(console, COMMANDS) @normal;
+}

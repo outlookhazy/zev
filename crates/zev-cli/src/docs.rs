@@ -161,6 +161,41 @@ Use `import board;` and `hal.*` for portable firmware, then target hardware boar
 - `zevc ram --board nucleo_f334r8 app.zev` — verify exact flash/RAM `.bss` + static call-stack bounds.
 - `zevc build --board nucleo_f334r8 app.zev -o app.bin` — emit `.bin` / `.uf2` / `.elf` with zero heap symbols.
 - Put `[project]` defaults (`entry`, `board`, `port`, `opt_level`) in `zev.toml` to run `zevc build` / `zevc flash` directly.
+
+## Step 5 — Optional On-Device Command Shell (`std.shell`)
+When a firmware needs an interactive serial/USB shell, opt in from `fn main()` via `board.console_open()` and spawn `shell.serve` (apps that never import `std.shell` or open the console pay 0 bytes):
+```zev
+import board;
+import std.io as io;
+import std.shell as shell;
+
+inbox<bool, 4> led_q;
+
+task led_ctrl(*inbox<bool, 4> q) {
+    loop {
+        bool on = q.recv();
+        board.set_led(on);
+    }
+}
+
+fn cmd_led(*shell.Session s, []u8 args) error shell.Err {
+    bool on = shell.arg_bool(args, 0) catch { error Usage; };
+    if (!led_q.try_send(on)) { error Failed; }
+    println(s, f\"led={on}\");
+}
+
+const [1]shell.Cmd COMMANDS = [
+    shell.Cmd { name: \"led\", help: \"led on|off\", run: cmd_led },
+];
+
+fn main() {
+    board.init();
+    io.DuplexStream console = board.console_open();
+    spawn led_ctrl(&led_q) @high;
+    spawn shell.serve(console, COMMANDS) @low;
+}
+```
+Test the same commands deterministically across host (`zevc run --sanitize app.zev --cmd help --cmd \"led on\"`), QEMU (`zevc run-qemu app.zev --cmd \"led on\"`), and hardware (`zevc monitor --board nucleo_f334r8 --cmd \"led on\"`).
 ",
     },
     TopicDoc {
@@ -626,10 +661,10 @@ task net_worker() {
     TopicDoc {
         name: "runtime",
         aliases: &[
-            "io", "std", "sys", "hw", "chip", "bsp", "mmio", "irq", "attach", "nvic", "print",
+            "io", "std", "shell", "sys", "hw", "chip", "bsp", "mmio", "irq", "attach", "nvic", "print",
             "println", "uart", "fmt", "format", "fstring", "fmt_ring",
         ],
-        summary: "Zero-heap `f\"...\"` (`fmt_buf`/`fmt_ring`), typed `mmio`, `irq.attach`, and `sys.*`",
+        summary: "Zero-heap `f\"...\"` (`fmt_buf`/`fmt_ring`), optional `std.shell`, typed `mmio`, `irq.attach`, and `sys.*`",
         body: "\
 # Zev Topic Guide: `runtime`
 
@@ -656,6 +691,10 @@ format-string parser, zero global handler registry):
   - `{t:.2}` — Compact (~150 B Arduino-style) fixed-decimal `f32`/`f64` (`\"nan\"`, `\"inf\"`, `\"ovf\"`).
   - `{t:e}` / `{t:.3e}` — Scientific float (linked via `--gc-sections` *only* if `:e` appears in program!).
   - `{pkt:?}` — Compile-time struct field debug expansion (`\"CmdFrame { op: 1, ... }\"`).
+
+## 1b. Optional Console Input & On-Device Shell (`std.io` / `std.shell`)
+- `board.console_open() -> io.DuplexStream` is optional per board: calling it allocates the board's RX/TX `byte_ring`s, attaches UART/USB interrupts, and routes `println(...)` through the shared TX ring so task output stays line-intact. Programs that do not call `console_open()` pay 0 bytes.
+- `std.shell` provides `Err` (`Usage`, `Unknown`, `LineTooLong`, `Failed`), `Cmd { []u8 name; []u8 help; fn(*Session, []u8) error Err run; }`, `Session` (a `println(s, f\"...\")` sink with `Session.make(port, custom_buf)` / `.begin()` / `.poll_once(cmds)`), `pub task serve(io.DuplexStream port, []Cmd cmds)` (64-byte line buffer, `help`, `echo on|off`, CR/LF/CRLF, BS/DEL), and `arg_u32` / `arg_i32` / `arg_hex` / `arg_bool` / `arg_str`.
 
 ## 2. Portable Built-Ins, `.zev` BSP Hooks & `sys.*` Namespace
 - `assert(cond);` / `delay(10ms);` / `checkpoint();` / `set_priority(@low);`

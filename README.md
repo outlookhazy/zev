@@ -46,6 +46,7 @@ fn main() {
 
 What `zevc` enforces and synthesizes from this file:
 - **Zero heap, single stack:** Every `spawn` in `main()`'s boot tree allocates a fixed `.bss` coroutine frame (`MAX_TASKS <= 32`), union-packing disjoint child frames and reporting worst-case SRAM + stack depth via `zevc ram`.
+- **Optional zero-heap command shell (`std.shell`):** Boards that support interactive input expose `board.console_open() -> io.DuplexStream` on demand (zero flash/RAM cost when uncalled), powering reusable `.rodata` `shell.Cmd` tables (`shell.serve`) tested identically with `zevc run --cmd`, `zevc run-qemu --cmd`, and `zevc monitor`.
 - **Call-graph inferred yielding (no `async`/`.await`):** Functions are inferred as `NonYielding`, `SoftYielding` (auto-cloned as zero-`.bss` stack functions inside `noyield`), or `HardBlocking` (statically forbidden in `noyield`, `critical`, `isr`, and `defer`).
 - **Task/ISR & MMIO safety:** Raw mutable globals are rejected (`E0001`/`E0002`); `@ro`, `@wo`, and `@w1c` register rules prevent read-modify-write interrupt-clear bugs (`E0031`); `wait { ... }` polls and parks atomically across multiple primitives with zero lost wakeups.
 - **Defined runtime semantics:** Out-of-bounds array/slice/MMIO indexing and division by zero trap deterministically (invoking any registered `sys.set_fault_handler` callback before halting), variable bit-shifts mask by `(bit_width - 1)`, float-to-int casts saturate, `sys.trace_sleep(bool)` accepts sleep-tracing hooks alongside `sys.sleep_depth()` / `sys.wfi_count()` / `sys.set_idle`, and host simulation runs the exact same LLVM scheduler IR under Clang ASan+UBSan (`sys.fuzz_irqs`).
@@ -114,7 +115,11 @@ make demo
 
 # Bare-metal Cortex-M3 build + QEMU run
 cargo run --quiet --bin zevc -- run-qemu examples/portable_controller_demo.zev
+cargo run --quiet --bin zevc -- run-qemu examples/portable_shell_demo.zev --cmd "led on" --cmd status
 make qemu
+
+# Live serial monitor & scripted verification against physical boards
+cargo run --quiet --bin zevc -- monitor --board nucleo_f334r8 --cmd help --cmd ping
 
 # Compile-time SRAM & run-bound report (task frames, child unions, ELF .bss, max non-yield run, stack)
 cargo run --quiet --bin zevc -- ram --board nucleo_f334r8 examples/portable_controller_demo.zev

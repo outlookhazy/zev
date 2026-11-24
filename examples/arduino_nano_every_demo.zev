@@ -3,7 +3,7 @@
 // Compiles directly through LLVM 23 (`llc -mtriple=avr -mcpu=atmega4809`) + `ld.lld`
 // into a compact UPDI Flash image with:
 //   - Typed `mmio` `u8`/`u16`, `@wo`, & `@w1c` register access (`chip.atmega4809` + `bsp.arduino_nano_every`)
-//   - Hardware `TCB3` 1.000 kHz system tick + `115200 8N1` `USART3` (`PB4`/`PB5` SAMD11 USB-CDC) telemetry
+//   - Hardware `TCB3` 1.000 kHz system tick + `115200 8N1` `USART3` console (`std.shell`)
 //   - Exclusive `hw.IRQ_TCB0_INT` (16-bit `TCB0` periodic interrupt ISR, `boost: @critical`)
 //   - Shared `hw.IRQ_PORTE_PORT` handlers tracking physical `PE2` (Pin 13 L LED) pin transitions
 //     across isolated ISR-private `state` counters
@@ -12,11 +12,14 @@
 
 import chip.atmega4809 as hw;
 import bsp.arduino_nano_every as bsp;
-import std.str as str;
+import std.io as io;
+import std.shell as shell;
 
-struct SerialPort {
-    byte_ring<64> rx;
-    byte_ring<96> tx;
+enum LedAction {
+    Auto,
+    On,
+    Off,
+    SpiTest,
 }
 
 struct SpiBurst {
@@ -26,8 +29,8 @@ struct SpiBurst {
 }
 
 inbox<u32, 8>             tcb0_inbox;
+inbox<LedAction, 4>       led_inbox;
 watch<u32>                pad_edges = 0;
-SerialPort                uart_port;
 @dma_safe pool<SpiBurst, 2> spi_pool;
 dma_slot<SpiBurst>        spi_inflight;
 inbox<Lease<SpiBurst>, 2> spi_done_q;
@@ -37,24 +40,6 @@ isr tcb0_isr(*inbox<u32, 8> q, *hw.TcbRegs tcb) {
     seq += 1;
     tcb.intflags = hw.BIT_TCB_CAPT;
     q.post(seq, boost: @critical);
-}
-
-isr uart_rx_isr(*byte_ring rx, *hw.UsartRegs uart) {
-    state u32 rx_bytes = 0;
-    rx_bytes += 1;
-    u8 b = uart.rxd_l;
-    rx.push_byte(b, boost: @high);
-}
-
-isr uart_tx_isr(*byte_ring tx, *hw.UsartRegs uart) {
-    state u32 tx_bytes = 0;
-    u8 b = tx.try_pop_byte() catch {
-        u8 ctrl = uart.ctrla;
-        uart.ctrla = ctrl & (~hw.BIT_USART_DREIE);
-        return;
-    };
-    tx_bytes += 1;
-    uart.txd_l = b;
 }
 
 isr porte_isr_a(*hw.PortRegs porte) {
@@ -94,16 +79,62 @@ isr spi0_isr(*dma_slot<SpiBurst> inflight, *inbox<Lease<SpiBurst>, 2> done_q) {
     }
 }
 
-fn kick_uart_tx(*byte_ring tx) {
-    if (!tx.is_empty()) {
-        bsp.enable_uart_dre_irq();
-    }
+fn run_spi_burst(u8 seed) {
+    u8 prev_led = bsp.read_led();
+    Lease<SpiBurst> job = spi_pool.try_alloc() catch {
+        println("[DMA NANO] SPI err=pool_empty");
+        return;
+    };
+    *SpiBurst jp = job.get();
+    jp.tx[0] = 0xA5u8;
+    jp.tx[1] = 0x5Au8;
+    jp.tx[2] = seed;
+    jp.tx[3] = 0x3Cu8;
+    jp.idx = 0u8;
+    spi_inflight.park(job) catch {
+        println("[DMA NANO] SPI err=slot_busy");
+        return;
+    };
+    bsp.spi_master_start_byte(0xA5u8);
+    Lease<SpiBurst> done = spi_done_q.recv(timeout: 50ms) catch {
+        bsp.spi_master_finish();
+        bool dropped = spi_inflight.release();
+        bsp.set_led(prev_led != 0);
+        println(f"[DMA NANO] SPI err=timeout dropped={dropped}");
+        return;
+    };
+    bool ok = done.get().idx == 4u8;
+    done.release();
+    bsp.set_led(prev_led != 0);
+    println(f"[DMA NANO] SPI ok={ok} bytes=4 pool_avail={spi_pool.avail()}");
 }
 
-task led_blinker() {
-    loop every 350ms {
-        noyield {
-            bsp.toggle_led();
+task led_worker(*inbox<LedAction, 4> reqs) {
+    bool auto_blink = true;
+    u8 spi_seq = 0u8;
+    loop {
+        LedAction act = reqs.recv(timeout: 350ms) catch {
+            if (auto_blink) {
+                noyield {
+                    bsp.toggle_led();
+                }
+            }
+            continue;
+        };
+        switch (act) {
+            Auto => { auto_blink = true; }
+            On => {
+                auto_blink = false;
+                noyield { bsp.set_led(true); }
+            }
+            Off => {
+                auto_blink = false;
+                noyield { bsp.set_led(false); }
+            }
+            SpiTest => {
+                spi_seq += 1u8;
+                run_spi_burst(spi_seq);
+            }
         }
     }
 }
@@ -126,103 +157,62 @@ task nano_telemetry() {
     }
 }
 
-task serial_cmd_worker(*SerialPort port, *watch<u32> edges_w) {
-    *byte_ring rx = &port.rx;
-    *byte_ring tx = &port.tx;
-    u32 cmds = 0;
-    loop {
-        []u8 chunk = rx.wait_read();
-        usize n = chunk.len;
-        []u8 trimmed = str.trim_ascii(chunk);
-        for (u8 ch in trimmed) {
-            if (ch == 'p' || ch == 'P' || ch == '?') {
-                cmds += 1;
-                usize wn = fmt_ring(tx, f"[CMD NANO] PONG uptime={sys.now_ms()}ms led={bsp.read_led()} edges={edges_w.read()} cmds={cmds}\r\n") catch { 0 };
-                if (wn > 0) {
-                    kick_uart_tx(tx);
-                }
-            } else if (ch == 's' || ch == 'S' || ch == 'v' || ch == 'V') {
-                cmds += 1;
-                u16 temp_x10 = bsp.read_mcu_temp_c_x10();
-                u16 a0 = bsp.read_a0();
-                u8 d2 = bsp.read_d2_pin();
-                usize wn = fmt_ring(tx, f"[SENS NANO] temp_c={temp_x10 / 10}.{temp_x10 % 10} a0={a0} d2={d2} led={bsp.read_led()} cmds={cmds}\r\n") catch { 0 };
-                if (wn > 0) {
-                    kick_uart_tx(tx);
-                }
-            } else if (ch == 't' || ch == 'T') {
-                cmds += 1;
-                noyield {
-                    bsp.toggle_led();
-                }
-                usize wn = fmt_ring(tx, f"[CMD NANO] TOGGLE led={bsp.read_led()} cmds={cmds}\r\n") catch { 0 };
-                if (wn > 0) {
-                    kick_uart_tx(tx);
-                }
-            } else if (ch == 'd' || ch == 'D') {
-                cmds += 1;
-                u8 prev_led = bsp.read_led();
-                Lease<SpiBurst> job = spi_pool.try_alloc() catch {
-                    usize wn = fmt_ring(tx, f"[DMA NANO] SPI err=pool_empty cmds={cmds}\r\n") catch { 0 };
-                    if (wn > 0) {
-                        kick_uart_tx(tx);
-                    }
-                    continue;
-                };
-                *SpiBurst jp = job.get();
-                jp.tx[0] = 0xA5u8;
-                jp.tx[1] = 0x5Au8;
-                jp.tx[2] = (cmds & 0xFF) as u8;
-                jp.tx[3] = 0x3Cu8;
-                jp.idx = 0u8;
-                spi_inflight.park(job) catch {
-                    usize wn = fmt_ring(tx, f"[DMA NANO] SPI err=slot_busy cmds={cmds}\r\n") catch { 0 };
-                    if (wn > 0) {
-                        kick_uart_tx(tx);
-                    }
-                    continue;
-                };
-                bsp.spi_master_start_byte(0xA5u8);
-                Lease<SpiBurst> done = spi_done_q.recv(timeout: 50ms) catch {
-                    bsp.spi_master_finish();
-                    bool dropped = spi_inflight.release();
-                    bsp.set_led(prev_led != 0);
-                    usize wn = fmt_ring(tx, f"[DMA NANO] SPI err=timeout dropped={dropped} cmds={cmds}\r\n") catch { 0 };
-                    if (wn > 0) {
-                        kick_uart_tx(tx);
-                    }
-                    continue;
-                };
-                bool ok = done.get().idx == 4u8;
-                done.release();
-                bsp.set_led(prev_led != 0);
-                usize wn = fmt_ring(tx, f"[DMA NANO] SPI ok={ok} bytes=4 pool_avail={spi_pool.avail()} cmds={cmds}\r\n") catch { 0 };
-                if (wn > 0) {
-                    kick_uart_tx(tx);
-                }
-            }
-        }
-        rx.consume(n);
-    }
+fn cmd_ping(*shell.Session s, []u8 _args) error shell.Err {
+    println(s, f"[CMD NANO] PONG uptime={sys.now_ms()}ms led={bsp.read_led()} edges={pad_edges.read()}");
 }
+
+fn cmd_sens(*shell.Session s, []u8 _args) error shell.Err {
+    u16 temp_x10 = bsp.read_mcu_temp_c_x10();
+    u16 a0 = bsp.read_a0();
+    u8 d2 = bsp.read_d2_pin();
+    println(s, f"[SENS NANO] temp_c={temp_x10 / 10}.{temp_x10 % 10} a0={a0} d2={d2} led={bsp.read_led()}");
+}
+
+fn cmd_led(*shell.Session s, []u8 args) error shell.Err {
+    []u8 mode = shell.arg_str(args, 0) catch { error Usage; };
+    if (mode == "auto") {
+        bool _ok = led_inbox.try_send(Auto);
+        println(s, "led=auto");
+        return;
+    }
+    bool on = shell.arg_bool(args, 0) catch { error Usage; };
+    if (on) {
+        bool _ok = led_inbox.try_send(On);
+    } else {
+        bool _ok = led_inbox.try_send(Off);
+    }
+    println(s, f"led={on}");
+}
+
+fn cmd_spi(*shell.Session s, []u8 _args) error shell.Err {
+    if (!led_inbox.try_send(SpiTest)) {
+        error Failed;
+    }
+    println(s, "[DMA NANO] SPI queued");
+}
+
+const [4]shell.Cmd COMMANDS = [
+    shell.Cmd { name: "ping", help: "show uptime & edges",    run: cmd_ping },
+    shell.Cmd { name: "sens", help: "read temp, A0 & D2",     run: cmd_sens },
+    shell.Cmd { name: "led",  help: "led on|off|auto",        run: cmd_led },
+    shell.Cmd { name: "spi",  help: "trigger SPI DMA burst",  run: cmd_spi },
+];
 
 fn main() {
     bsp.init_board();
     bsp.init_adc();
+    io.DuplexStream console = bsp.console_open();
     hw.IRQ_TCB0_INT.attach(tcb0_isr(&tcb0_inbox, hw.TCB0));
     hw.IRQ_PORTE_PORT.attach_shared(porte_isr_a(hw.PORTE));
     hw.IRQ_PORTE_PORT.attach_shared(porte_isr_b(&pad_edges));
-    hw.IRQ_USART3_RXC.attach(uart_rx_isr(&uart_port.rx, hw.USART3));
-    hw.IRQ_USART3_DRE.attach(uart_tx_isr(&uart_port.tx, hw.USART3));
     hw.IRQ_SPI0_INT.attach(spi0_isr(&spi_inflight, &spi_done_q));
     bsp.enable_led_port_irq();
     bsp.start_tcb0_periodic(39999);
-    bsp.enable_uart_rx_irq();
 
     println("");
     println("[BOOT] Zev Language-OS on Arduino Nano Every (ATmega4809 avrxmega3, zero C)");
 
-    spawn led_blinker() @high;
+    spawn led_worker(&led_inbox) @high;
     spawn nano_telemetry() @normal;
-    spawn serial_cmd_worker(&uart_port, &pad_edges) @normal;
+    spawn shell.serve(console, COMMANDS) @normal;
 }
