@@ -134,12 +134,7 @@ impl<'a> Lexer<'a> {
                             return Err(self
                                 .err_at(
                                     "unterminated `/* ... */` block comment",
-                                    Span::new(
-                                        start as u32,
-                                        self.pos as u32,
-                                        start_line,
-                                        start_col,
-                                    ),
+                                    Span::new(start as u32, self.pos as u32, start_line, start_col),
                                 )
                                 .with_doc_topic("syntax"));
                         }
@@ -172,7 +167,10 @@ impl<'a> Lexer<'a> {
                 let text = &self.source[start..self.pos];
                 let kind = TokenKind::keyword_from_str(text)
                     .unwrap_or_else(|| TokenKind::Ident(text.to_owned()));
-                tokens.push(Token::new(kind, self.span_from(start, start_line, start_col)));
+                tokens.push(Token::new(
+                    kind,
+                    self.span_from(start, start_line, start_col),
+                ));
                 continue;
             }
 
@@ -374,7 +372,10 @@ impl<'a> Lexer<'a> {
                 }
             };
 
-            tokens.push(Token::new(kind, self.span_from(start, start_line, start_col)));
+            tokens.push(Token::new(
+                kind,
+                self.span_from(start, start_line, start_col),
+            ));
         }
 
         Ok(())
@@ -449,26 +450,27 @@ impl<'a> Lexer<'a> {
         let mut float_str = String::new();
 
         // Reject non-decimal float literals (`0x1.5`, `0b1.0`, `0o7.5`) while leaving ranges (`0x00..0x10`) intact.
-        if radix != 10 && self.peek() == Some('.') && self.peek_second() != Some('.') {
-            if self
+        if radix != 10
+            && self.peek() == Some('.')
+            && self.peek_second() != Some('.')
+            && self
                 .peek_second()
                 .is_some_and(|nc| nc.is_digit(radix) || nc.is_ascii_digit() || nc == '_')
+        {
+            self.bump(); // `.`
+            while self
+                .peek()
+                .is_some_and(|c| is_ident_continue(c) || matches!(c, '+' | '-'))
             {
-                self.bump(); // `.`
-                while self
-                    .peek()
-                    .is_some_and(|c| is_ident_continue(c) || matches!(c, '+' | '-'))
-                {
-                    self.bump();
-                }
-                let span = self.span_from(start, start_line, start_col);
-                return Err(self
-                    .err_at(
-                        "non-decimal float literals (e.g. `0x1.5`) are not supported; write decimal floating-point literals (e.g. `1.3125`)",
-                        span,
-                    )
-                    .with_doc_topic("syntax"));
+                self.bump();
             }
+            let span = self.span_from(start, start_line, start_col);
+            return Err(self
+                .err_at(
+                    "non-decimal float literals (e.g. `0x1.5`) are not supported; write decimal floating-point literals (e.g. `1.3125`)",
+                    span,
+                )
+                .with_doc_topic("syntax"));
         }
 
         // Decimal fractional part `.digits` — ONLY when `radix == 10 && c == '.' && next.is_ascii_digit()`!
@@ -525,8 +527,8 @@ impl<'a> Lexer<'a> {
                 }
                 None
                 | Some(
-                    ';' | ',' | ')' | ']' | '}' | ' ' | '\t' | '\r' | '\n' | '+' | '-' | '*'
-                    | '/' | '%' | '<' | '>' | '=' | '!' | '&' | '|' | '^' | ':',
+                    ';' | ',' | ')' | ']' | '}' | ' ' | '\t' | '\r' | '\n' | '+' | '-' | '*' | '/'
+                    | '%' | '<' | '>' | '=' | '!' | '&' | '|' | '^' | ':',
                 ) => {
                     self.bump(); // `.`
                     let span = self.span_from(start, start_line, start_col);
@@ -632,7 +634,9 @@ impl<'a> Lexer<'a> {
                 bad => {
                     return Err(self
                         .err_at(
-                            format!("invalid float literal suffix `{bad}` (expected `f32` or `f64`)"),
+                            format!(
+                                "invalid float literal suffix `{bad}` (expected `f32` or `f64`)"
+                            ),
                             span,
                         )
                         .with_doc_topic("syntax"));
@@ -1067,8 +1071,11 @@ impl<'a> Lexer<'a> {
             if let Some(digits) = rest.strip_suffix('e').or_else(|| rest.strip_suffix('E')) {
                 if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
                     let p = digits.parse::<u8>().map_err(|_| {
-                        self.err_at(format!("format precision `{digits}` out of `u8` range"), span)
-                            .with_doc_topic("syntax")
+                        self.err_at(
+                            format!("format precision `{digits}` out of `u8` range"),
+                            span,
+                        )
+                        .with_doc_topic("syntax")
                     })?;
                     return Ok(FormatSpec::Sci { precision: Some(p) });
                 }
@@ -1076,8 +1083,11 @@ impl<'a> Lexer<'a> {
                 let digits = rest.strip_suffix('f').unwrap_or(rest);
                 if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
                     let p = digits.parse::<u8>().map_err(|_| {
-                        self.err_at(format!("format precision `{digits}` out of `u8` range"), span)
-                            .with_doc_topic("syntax")
+                        self.err_at(
+                            format!("format precision `{digits}` out of `u8` range"),
+                            span,
+                        )
+                        .with_doc_topic("syntax")
                     })?;
                     return Ok(FormatSpec::Fixed { precision: p });
                 }
@@ -1143,7 +1153,9 @@ impl<'a> Lexer<'a> {
                 if prefix.len() < 2 || w == 0 {
                     return Err(self
                         .err_at(
-                            format!("invalid format specifier `:{s}` (zero-pad width must be >= 1)"),
+                            format!(
+                                "invalid format specifier `:{s}` (zero-pad width must be >= 1)"
+                            ),
                             span,
                         )
                         .with_doc_topic("syntax")
@@ -1211,7 +1223,10 @@ impl<'a> Lexer<'a> {
         if self.bump() != Some('\'') {
             let span = self.span_from(start, start_line, start_col);
             return Err(self
-                .err_at("unterminated character literal (expected closing `'`)", span)
+                .err_at(
+                    "unterminated character literal (expected closing `'`)",
+                    span,
+                )
                 .with_doc_topic("syntax"));
         }
         let span = self.span_from(start, start_line, start_col);

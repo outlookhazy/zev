@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use zev_sema::{
-    AnalyzeOptions, Diagnostic, DiagnosticKind, SemanticModel, analyze_and_monomorphize_programs,
-    analyze_program,
+    analyze_and_monomorphize_programs, analyze_program, AnalyzeOptions, Diagnostic, DiagnosticKind,
+    SemanticModel,
 };
 
 fn check_src(src: &str) -> Result<SemanticModel, Vec<Diagnostic>> {
@@ -21,14 +21,22 @@ fn check_mono_src(src: &str) -> Result<SemanticModel, Vec<Diagnostic>> {
 fn expect_ok(src: &str) {
     if let Err(diags) = check_src(src) {
         let msgs: Vec<String> = diags.iter().map(ToString::to_string).collect();
-        panic!("expected clean check, got:\n{}\n---\n{}", msgs.join("\n"), src);
+        panic!(
+            "expected clean check, got:\n{}\n---\n{}",
+            msgs.join("\n"),
+            src
+        );
     }
 }
 
 fn expect_mono_ok(src: &str) {
     if let Err(diags) = check_mono_src(src) {
         let msgs: Vec<String> = diags.iter().map(ToString::to_string).collect();
-        panic!("expected clean mono check, got:\n{}\n---\n{}", msgs.join("\n"), src);
+        panic!(
+            "expected clean mono check, got:\n{}\n---\n{}",
+            msgs.join("\n"),
+            src
+        );
     }
 }
 

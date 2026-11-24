@@ -10,11 +10,11 @@ pub struct ParseError {
     /// Offending token/character span (`line` and `col` are 1-indexed).
     pub span: Span,
     /// Optional filename or logical source label.
-    pub file: Option<String>,
+    pub file: Option<Box<str>>,
     /// Optional offending single line of source text for rich diagnostic formatting.
-    pub source_line: Option<String>,
+    pub source_line: Option<Box<str>>,
     /// Optional 1-shot Zev rewrite suggestion/hint.
-    pub hint: Option<String>,
+    pub hint: Option<Box<str>>,
     /// Optional stable parser error code (e.g. `"P0001"`..`"P0010"`).
     pub code: Option<&'static str>,
     /// Optional `zevc doc <topic>` guide topic (e.g. `"syntax"`, `"yielding"`, `"errors"`, `"primitives"`, `"dma"`).
@@ -23,18 +23,13 @@ pub struct ParseError {
 
 impl ParseError {
     /// Create a new `ParseError` and extract the offending source line from `source`.
-    pub fn new(
-        message: impl Into<String>,
-        span: Span,
-        source: &str,
-        file: Option<&str>,
-    ) -> Self {
+    pub fn new(message: impl Into<String>, span: Span, source: &str, file: Option<&str>) -> Self {
         let line_idx = span.line.saturating_sub(1) as usize;
-        let source_line = source.lines().nth(line_idx).map(str::to_owned);
+        let source_line = source.lines().nth(line_idx).map(Box::from);
         Self {
             message: message.into(),
             span,
-            file: file.map(str::to_owned),
+            file: file.map(Box::from),
             source_line,
             hint: None,
             code: None,
@@ -44,7 +39,7 @@ impl ParseError {
 
     /// Attach a helpful Zev rewrite hint to this error.
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
-        self.hint = Some(hint.into());
+        self.hint = Some(hint.into().into_boxed_str());
         self
     }
 
@@ -76,7 +71,7 @@ impl ParseError {
         let mut clone = self.clone();
         if clone.source_line.is_none() {
             let line_idx = clone.span.line.saturating_sub(1) as usize;
-            clone.source_line = source.lines().nth(line_idx).map(str::to_owned);
+            clone.source_line = source.lines().nth(line_idx).map(Box::from);
         }
         clone.to_string()
     }

@@ -34,6 +34,13 @@ jobs:
           llc --version | grep -i 'llvm version'
           ld.lld --version
 
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Cap test parallelism at 4 to bound concurrent clang/ld.lld/qemu subprocesses and peak RAM.
       - name: Run workspace test suite
         run: cargo test --workspace -- --test-threads=4
 

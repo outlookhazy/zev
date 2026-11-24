@@ -102,7 +102,10 @@ impl SourceFile {
         let width_digits = line.to_string().len();
 
         let span_chars = if end_byte > start_byte && end_byte <= self.src.len() {
-            let line_end_col = line_str.chars().count().saturating_sub(col.saturating_sub(1));
+            let line_end_col = line_str
+                .chars()
+                .count()
+                .saturating_sub(col.saturating_sub(1));
             let raw_len = self
                 .src
                 .get(start_byte..end_byte)
@@ -148,7 +151,12 @@ impl SourceFile {
         }
 
         let docs_line = format_docs_directive(code, doc_topic);
-        let _ = writeln!(out, "{:>width$} = docs: {docs_line}", "", width = width_digits);
+        let _ = writeln!(
+            out,
+            "{:>width$} = docs: {docs_line}",
+            "",
+            width = width_digits
+        );
         out
     }
 }
@@ -270,7 +278,11 @@ pub fn render_check_json_ok_with_tasks(
             )
         })
         .collect();
-    sorted_mono.sort_unstable_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)).then_with(|| a.2.cmp(b.2)));
+    sorted_mono.sort_unstable_by(|a, b| {
+        a.1.cmp(b.1)
+            .then_with(|| a.0.cmp(b.0))
+            .then_with(|| a.2.cmp(b.2))
+    });
     sorted_mono.dedup();
 
     let mut mono_json = String::from("[");

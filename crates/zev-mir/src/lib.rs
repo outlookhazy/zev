@@ -192,7 +192,8 @@ mod tests {
             is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false, generic_params: vec![],
+                is_extern_c: false,
+                generic_params: vec![],
                 name: id("adc_read_rpm"),
                 params: vec![Param {
                     ty: ty_prim(PrimType::U8),
@@ -206,7 +207,8 @@ mod tests {
                     vec![
                         Stmt::new(
                             StmtKind::Expr(Expr::new(
-                                ExprKind::Call { generic_args: vec![],
+                                ExprKind::Call {
+                                    generic_args: vec![],
                                     callee: Box::new(expr_id("delay")),
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Literal(Literal::Duration(dur_ms(1))),
@@ -232,7 +234,8 @@ mod tests {
             is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false, generic_params: vec![],
+                is_extern_c: false,
+                generic_params: vec![],
                 name: id("pi_step"),
                 params: vec![
                     Param {
@@ -269,7 +272,8 @@ mod tests {
             is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false, generic_params: vec![],
+                is_extern_c: false,
+                generic_params: vec![],
                 name: id("save_fault_record"),
                 params: vec![Param {
                     ty: ty_prim(PrimType::U32),
@@ -299,7 +303,8 @@ mod tests {
                         ),
                         Stmt::new(
                             StmtKind::Expr(Expr::new(
-                                ExprKind::Call { generic_args: vec![],
+                                ExprKind::Call {
+                                    generic_args: vec![],
                                     callee: Box::new(expr_id("delay")),
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Literal(Literal::Duration(dur_ms(2))),
@@ -332,7 +337,8 @@ mod tests {
             is_pub: false,
             kind: ItemKind::Fn(FnDecl {
                 attrs: vec![],
-                is_extern_c: false, generic_params: vec![],
+                is_extern_c: false,
+                generic_params: vec![],
                 name: id("scrub_flash_crc"),
                 params: vec![],
                 is_variadic: false,
@@ -903,10 +909,22 @@ mod tests {
         fn var_by_name<'a>(bp: &'a MirTaskBlueprint, n: &str) -> &'a MirVar {
             bp.vars.iter().find(|v| v.name == n).unwrap()
         }
-        assert!(var_by_name(mc, "integral").hoisted, "`integral` must be hoisted");
-        assert!(var_by_name(mc, "target").hoisted, "`target` crosses adc_read_rpm yield");
-        assert!(!var_by_name(mc, "actual").hoisted, "`actual` must stay on stack");
-        assert!(!var_by_name(mc, "duty").hoisted, "`duty` inside noyield must stay on stack");
+        assert!(
+            var_by_name(mc, "integral").hoisted,
+            "`integral` must be hoisted"
+        );
+        assert!(
+            var_by_name(mc, "target").hoisted,
+            "`target` crosses adc_read_rpm yield"
+        );
+        assert!(
+            !var_by_name(mc, "actual").hoisted,
+            "`actual` must stay on stack"
+        );
+        assert!(
+            !var_by_name(mc, "duty").hoisted,
+            "`duty` inside noyield must stay on stack"
+        );
         assert!(var_by_name(mc, "duty").in_noyield_scope);
 
         // 3. Check fieldbus_listener: `half` stays on stack!
@@ -915,7 +933,10 @@ mod tests {
             .iter()
             .find(|b| b.name == "fieldbus_listener")
             .unwrap();
-        assert!(!var_by_name(fb, "half").hoisted, "`half` must stay on stack");
+        assert!(
+            !var_by_name(fb, "half").hoisted,
+            "`half` must stay on stack"
+        );
 
         // 4. Check main supervisor: `bad_packets` hoisted, `ev` on stack, child frames union-aliased!
         let main_bp = mir
@@ -927,7 +948,10 @@ mod tests {
             var_by_name(main_bp, "bad_packets").hoisted,
             "`bad_packets` must be hoisted"
         );
-        assert!(!var_by_name(main_bp, "ev").hoisted, "`ev` must stay on stack");
+        assert!(
+            !var_by_name(main_bp, "ev").hoisted,
+            "`ev` must stay on stack"
+        );
         assert_eq!(main_bp.child_slots.len(), 2);
         assert_eq!(main_bp.child_slots[0].union_group, 0);
         assert_eq!(main_bp.child_slots[1].union_group, 0);
@@ -1039,7 +1063,8 @@ mod tests {
                     is_pub: false,
                     kind: ItemKind::Fn(FnDecl {
                         attrs: vec![],
-                        is_extern_c: false, generic_params: vec![],
+                        is_extern_c: false,
+                        generic_params: vec![],
                         name: id("decode"),
                         params: vec![Param {
                             ty: ty_prim(PrimType::U8),
@@ -1126,7 +1151,8 @@ mod tests {
                     is_pub: false,
                     kind: ItemKind::Fn(FnDecl {
                         attrs: vec![],
-                        is_extern_c: false, generic_params: vec![],
+                        is_extern_c: false,
+                        generic_params: vec![],
                         name: id("caller"),
                         params: vec![],
                         is_variadic: false,
@@ -1149,7 +1175,8 @@ mod tests {
                                         init: Some(Expr::new(
                                             ExprKind::Catch {
                                                 expr: Box::new(Expr::new(
-                                                    ExprKind::Call { generic_args: vec![],
+                                                    ExprKind::Call {
+                                                        generic_args: vec![],
                                                         callee: Box::new(expr_id("decode")),
                                                         args: vec![CallArg::positional(expr_int(
                                                             99,
@@ -1157,7 +1184,7 @@ mod tests {
                                                     },
                                                     sp,
                                                 )),
-                                                clause: CatchClause {
+                                                clause: Box::new(CatchClause {
                                                     err_param: Some(CatchParam {
                                                         ty: ty_named("PktErr"),
                                                         name: id("e"),
@@ -1197,7 +1224,7 @@ mod tests {
                                                         sp,
                                                     ),
                                                     span: sp,
-                                                },
+                                                }),
                                             },
                                             sp,
                                         )),
@@ -1224,7 +1251,11 @@ mod tests {
                 assert!(matches!(arms[0].0, MirSwitchPattern::Int(0x11)));
                 assert!(matches!(arms[1].0, MirSwitchPattern::Int(0x16)));
                 if let MirStmt::Return(Some(ret_e)) = &arms[1].1[0] {
-                    assert_eq!(ret_e.ty, MirType::I32, "`300 - (500 as i32)` must have MirType::I32");
+                    assert_eq!(
+                        ret_e.ty,
+                        MirType::I32,
+                        "`300 - (500 as i32)` must have MirType::I32"
+                    );
                 } else {
                     panic!("expected Return in CMD_B arm");
                 }
@@ -1255,7 +1286,10 @@ mod tests {
                 sp,
             )
         };
-        let dur5 = Box::new(Expr::new(ExprKind::Literal(Literal::Duration(dur_ms(5))), sp));
+        let dur5 = Box::new(Expr::new(
+            ExprKind::Literal(Literal::Duration(dur_ms(5))),
+            sp,
+        ));
 
         let items = vec![
             Item {
@@ -1361,7 +1395,8 @@ mod tests {
                 is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false, generic_params: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
                     name: id("init_pair"),
                     params: vec![
                         Param {
@@ -1420,7 +1455,8 @@ mod tests {
                 is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false, generic_params: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
                     name: id("setup_bus"),
                     params: vec![Param {
                         ty: ty_prim(PrimType::Bool),
@@ -1434,7 +1470,8 @@ mod tests {
                         vec![
                             Stmt::new(
                                 StmtKind::Expr(Expr::new(
-                                    ExprKind::Call { generic_args: vec![],
+                                    ExprKind::Call {
+                                        generic_args: vec![],
                                         callee: Box::new(expr_id("init_pair")),
                                         args: vec![
                                             CallArg::positional(addr_of("w0")),
@@ -1478,7 +1515,8 @@ mod tests {
                 is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false, generic_params: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
                     name: id("main"),
                     params: vec![],
                     is_variadic: false,
@@ -1487,7 +1525,8 @@ mod tests {
                     body: Some(Block::new(
                         vec![Stmt::new(
                             StmtKind::Expr(Expr::new(
-                                ExprKind::Call { generic_args: vec![],
+                                ExprKind::Call {
+                                    generic_args: vec![],
                                     callee: Box::new(expr_id("setup_bus")),
                                     args: vec![CallArg::positional(Expr::new(
                                         ExprKind::Literal(Literal::Bool(true)),
@@ -1527,9 +1566,13 @@ mod tests {
         assert!(mir.spawned_tasks[2].conditional);
 
         let has_nested_cond_spawn = mir.boot.steps.iter().any(|step| match step {
-            MirBootStep::Stmt(MirStmt::If { then_body, .. }) => then_body
-                .iter()
-                .any(|s| matches!(s, MirStmt::SpawnActivate { slot_id: 2, .. })),
+            MirBootStep::Stmt(stmt) => matches!(
+                stmt.as_ref(),
+                MirStmt::If { then_body, .. }
+                    if then_body
+                        .iter()
+                        .any(|s| matches!(s, MirStmt::SpawnActivate { slot_id: 2, .. }))
+            ),
             _ => false,
         });
         assert!(
@@ -1551,7 +1594,10 @@ mod tests {
     #[test]
     fn wave1_soft_yielding_dual_specialization_and_ram_report_in_mir() {
         let sp = Span::dummy();
-        let dur5 = Box::new(Expr::new(ExprKind::Literal(Literal::Duration(dur_ms(5))), sp));
+        let dur5 = Box::new(Expr::new(
+            ExprKind::Literal(Literal::Duration(dur_ms(5))),
+            sp,
+        ));
         let items = vec![
             // u32 leaf_soft(u32 x) { checkpoint(); return x + 1; }
             Item {
@@ -1807,11 +1853,19 @@ mod tests {
         let prog = Program::new(items, sp);
         let mir = lower_program(&prog).expect("lower soft-yielding specialization test");
 
-        assert!(mir.dual_specialized_fns.contains(&"shared_soft".to_string()));
+        assert!(mir
+            .dual_specialized_fns
+            .contains(&"shared_soft".to_string()));
         assert!(mir.dual_specialized_fns.contains(&"leaf_soft".to_string()));
-        assert!(!mir.dual_specialized_fns.contains(&"noyield_only_soft".to_string()));
+        assert!(!mir
+            .dual_specialized_fns
+            .contains(&"noyield_only_soft".to_string()));
 
-        let shared_coro = mir.functions.iter().find(|f| f.name == "shared_soft").unwrap();
+        let shared_coro = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "shared_soft")
+            .unwrap();
         assert!(shared_coro.is_yielding);
         let shared_ny = mir
             .functions
@@ -1961,7 +2015,8 @@ mod tests {
                 is_pub: false,
                 kind: ItemKind::Fn(FnDecl {
                     attrs: vec![],
-                    is_extern_c: false, generic_params: vec![],
+                    is_extern_c: false,
+                    generic_params: vec![],
                     name: id("main"),
                     params: vec![],
                     is_variadic: false,
@@ -1990,7 +2045,11 @@ mod tests {
         let prog = Program::new(items, sp);
         let mir = lower_program(&prog).expect("lower unified inbox + restart test");
 
-        let bp = mir.task_blueprints.iter().find(|b| b.name == "actor").unwrap();
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|b| b.name == "actor")
+            .unwrap();
         assert!(
             bp.blocks[0].is_resume_entry,
             "restart target BlockId(0) must have is_resume_entry = true"
@@ -2376,7 +2435,11 @@ mod tests {
         assert_eq!(mir.formatted_enums, vec!["BusErr".to_string()]);
 
         // 4. `acc32` (4 B) and `acc64` (8 B) hoisted into `telem` coroutine frame
-        let bp = mir.task_blueprints.iter().find(|b| b.name == "telem").unwrap();
+        let bp = mir
+            .task_blueprints
+            .iter()
+            .find(|b| b.name == "telem")
+            .unwrap();
         let acc32 = bp.vars.iter().find(|v| v.name == "acc32").unwrap();
         let acc64 = bp.vars.iter().find(|v| v.name == "acc64").unwrap();
         assert!(acc32.hoisted && acc32.ty == MirType::F32);
@@ -2385,13 +2448,19 @@ mod tests {
         // 5. `{pkt:?}` expanded into literal `"SensorPkt { id: "` + field chunks + `" }"`!
         let has_expanded_debug = bp.blocks.iter().any(|blk| {
             blk.stmts.iter().any(|s| match s {
-                MirStmt::PrintFmt { chunks, newline: true } => chunks.iter().any(|c| {
-                    matches!(c, MirFmtChunk::Literal(lit) if lit.contains("SensorPkt { id: "))
-                }),
+                MirStmt::PrintFmt {
+                    chunks,
+                    newline: true,
+                } => chunks.iter().any(
+                    |c| matches!(c, MirFmtChunk::Literal(lit) if lit.contains("SensorPkt { id: ")),
+                ),
                 _ => false,
             })
         });
-        assert!(has_expanded_debug, "expected compile-time struct debug expansion");
+        assert!(
+            has_expanded_debug,
+            "expected compile-time struct debug expansion"
+        );
 
         // 6. Monomorphized instances populated & rendered in Section 7 of `RamReport`
         assert_eq!(mir.monomorphized_instances.len(), 2);
@@ -2552,12 +2621,19 @@ mod tests {
 
         // H2: `Node { val: ..., next: 0x... }` formats `next` as `"0x"` + hex integer without auto-dereferencing `Node *`!
         let has_ptr_hex = mir.boot.steps.iter().any(|st| match st {
-            MirBootStep::Stmt(MirStmt::PrintFmt { chunks, .. }) => chunks.iter().any(|c| {
-                matches!(c, MirFmtChunk::Literal(s) if s.contains("next: 0x"))
-            }),
+            MirBootStep::Stmt(stmt) => matches!(
+                stmt.as_ref(),
+                MirStmt::PrintFmt { chunks, .. }
+                    if chunks
+                        .iter()
+                        .any(|c| matches!(c, MirFmtChunk::Literal(s) if s.contains("next: 0x")))
+            ),
             _ => false,
         });
-        assert!(has_ptr_hex, "expected `next: 0x` hex pointer formatting on self-referential Node");
+        assert!(
+            has_ptr_hex,
+            "expected `next: 0x` hex pointer formatting on self-referential Node"
+        );
     }
 
     fn ty_ptr(inner: TypeExpr) -> TypeExpr {
@@ -2875,15 +2951,23 @@ mod tests {
                 )
             })
             .count();
-        assert_eq!(next_slot_calls, 1, "index side-effect must be evaluated strictly once");
+        assert_eq!(
+            next_slot_calls, 1,
+            "index side-effect must be evaluated strictly once"
+        );
         assert!(matches!(
-            stmts.iter().find(|s| matches!(s, MirStmt::MmioWrite { elem_bits: 16, .. })),
+            stmts
+                .iter()
+                .find(|s| matches!(s, MirStmt::MmioWrite { elem_bits: 16, .. })),
             Some(MirStmt::MmioWrite {
                 offset: 0x10,
                 elem_bits: 16,
                 array_len: Some(4),
                 value: MirExpr {
-                    kind: MirExprKind::Binary { op: MirBinOp::BitOr, .. },
+                    kind: MirExprKind::Binary {
+                        op: MirBinOp::BitOr,
+                        ..
+                    },
                     ..
                 },
                 ..
@@ -3158,7 +3242,11 @@ mod tests {
                             Stmt::new(
                                 StmtKind::Expr(expr_call(
                                     "setup_uart",
-                                    vec![expr_addrof(expr_id("UART1")), expr_id("UART1_IRQ"), expr_int(3)],
+                                    vec![
+                                        expr_addrof(expr_id("UART1")),
+                                        expr_id("UART1_IRQ"),
+                                        expr_int(3),
+                                    ],
                                 )),
                                 sp,
                             ),
@@ -3253,10 +3341,16 @@ mod tests {
                 MirBakedArg::Const(MirExpr { kind: MirExprKind::IntLit(3), .. }),
             ] if u == "UART1" && q == "rx_q"
         ));
-        assert_eq!(uart_vec.bindings[0].state_vars[0].storage_symbol, "__zev_isr_state_0_count");
+        assert_eq!(
+            uart_vec.bindings[0].state_vars[0].storage_symbol,
+            "__zev_isr_state_0_count"
+        );
 
         let mode_vec = mir.irq_vectors.iter().find(|v| v.irq_num == 42).unwrap();
-        assert_eq!(mode_vec.selector_symbol.as_deref(), Some("__zev_irq_sel_42"));
+        assert_eq!(
+            mode_vec.selector_symbol.as_deref(),
+            Some("__zev_irq_sel_42")
+        );
         assert_eq!(
             mode_vec.bindings[0].cond_selector,
             Some(("__zev_irq_sel_42".to_string(), 1))
@@ -3268,8 +3362,13 @@ mod tests {
 
         assert!(mir.boot.steps.iter().any(|st| matches!(
             st,
-            MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, args }))
-            if method == "pend_irq" && matches!(&args[..], [MirExpr { kind: MirExprKind::IntLit(37), .. }])
+            MirBootStep::Stmt(stmt)
+                if matches!(
+                    stmt.as_ref(),
+                    MirStmt::Intrinsic(MirIntrinsicOp::SysOp { method, args })
+                        if method == "pend_irq"
+                            && matches!(&args[..], [MirExpr { kind: MirExprKind::IntLit(37), .. }])
+                )
         )));
 
         // uart_isr state: u32(4) + u8(1) = 5; 4x shared_isr instances (4 * u16 = 8); 1x selector = 1; total = 14 B!
@@ -3715,7 +3814,11 @@ mod tests {
         let mir = lower_program(&prog).expect(
             "MIR lowering must handle (*ptr).reg, (*ptr).arr[i], (*ptr).arr.len, and arr.ptr",
         );
-        let poke_fn = mir.functions.iter().find(|f| f.name == "poke").expect("poke fn");
+        let poke_fn = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "poke")
+            .expect("poke fn");
         let MirFnBody::Direct(stmts) = &poke_fn.body else {
             panic!("expected Direct body");
         };
@@ -3726,9 +3829,14 @@ mod tests {
             "expected MmioWrite to (*ptr).cr at offset 0x00: {stmts:?}"
         );
         assert!(
-            stmts
-                .iter()
-                .any(|s| matches!(s, MirStmt::MmioWrite { offset: 0x10, index: Some(_), .. })),
+            stmts.iter().any(|s| matches!(
+                s,
+                MirStmt::MmioWrite {
+                    offset: 0x10,
+                    index: Some(_),
+                    ..
+                }
+            )),
             "expected indexed MmioWrite to (*ptr).arr[i] at offset 0x10: {stmts:?}"
         );
         assert!(
@@ -3924,7 +4032,7 @@ mod tests {
                                                 },
                                                 sp,
                                             )),
-                                            clause: CatchClause {
+                                            clause: Box::new(CatchClause {
                                                 err_param: None,
                                                 partial_param: None,
                                                 body: Block::new(
@@ -3932,7 +4040,7 @@ mod tests {
                                                     sp,
                                                 ),
                                                 span: sp,
-                                            },
+                                            }),
                                         },
                                         sp,
                                     )),
@@ -3952,7 +4060,7 @@ mod tests {
                                                     },
                                                     sp,
                                                 )),
-                                                clause: CatchClause {
+                                                clause: Box::new(CatchClause {
                                                     err_param: None,
                                                     partial_param: None,
                                                     body: Block::new(
@@ -3960,7 +4068,7 @@ mod tests {
                                                         sp,
                                                     ),
                                                     span: sp,
-                                                },
+                                                }),
                                             },
                                             sp,
                                         )),
@@ -4091,7 +4199,10 @@ mod tests {
             }
         }
         assert!(saw_alloc && saw_get && saw_park && saw_take && saw_release);
-        assert!(nullify_count >= 3, "expected nullify on moves into call, park, release: {nullify_count}");
+        assert!(
+            nullify_count >= 3,
+            "expected nullify on moves into call, park, release: {nullify_count}"
+        );
     }
 
     #[test]
@@ -4321,8 +4432,16 @@ mod tests {
         );
 
         let mir = lower_program(&prog).expect("lower B-M3");
-        let dma_prim = mir.primitives.iter().find(|p| p.name == "dma_pool").unwrap();
-        let task_prim = mir.primitives.iter().find(|p| p.name == "task_pool").unwrap();
+        let dma_prim = mir
+            .primitives
+            .iter()
+            .find(|p| p.name == "dma_pool")
+            .unwrap();
+        let task_prim = mir
+            .primitives
+            .iter()
+            .find(|p| p.name == "task_pool")
+            .unwrap();
         assert!(
             !dma_prim.irq_mask_elided,
             "dma_pool contended via dma_slot.release must NOT mark irq_mask_elided"
@@ -4463,10 +4582,7 @@ mod tests {
                             vec![
                                 Stmt::new(
                                     StmtKind::VarDecl {
-                                        ty: TypeExpr::new(
-                                            TypeKind::Slice(Box::new(ty_u8())),
-                                            sp,
-                                        ),
+                                        ty: TypeExpr::new(TypeKind::Slice(Box::new(ty_u8())), sp),
                                         name: id("ch"),
                                         init: Some(Expr::new(
                                             ExprKind::MethodCall {
@@ -4604,10 +4720,7 @@ mod tests {
                                 ),
                                 Stmt::new(
                                     StmtKind::VarDecl {
-                                        ty: TypeExpr::new(
-                                            TypeKind::Slice(Box::new(ty_u8())),
-                                            sp,
-                                        ),
+                                        ty: TypeExpr::new(TypeKind::Slice(Box::new(ty_u8())), sp),
                                         name: id("tail_ch"),
                                         init: Some(Expr::new(
                                             ExprKind::MethodCall {
@@ -4633,7 +4746,11 @@ mod tests {
 
         let mir = lower_program(&prog).expect("lower B-H3/L-H1/B-H2");
 
-        let wb = mir.functions.iter().find(|f| f.name == "wait_bytes").unwrap();
+        let wb = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "wait_bytes")
+            .unwrap();
         assert!(wb.is_yielding);
         assert!(mir.task_blueprints.iter().any(|b| b.is_main_supervisor));
 
@@ -4936,11 +5053,14 @@ mod tests {
         let mut saw_noreturn = false;
         for step in &mir.boot.steps {
             if let MirBootStep::Stmt(s) = step {
-                match s {
+                match s.as_ref() {
                     MirStmt::Assign {
                         value:
                             MirExpr {
-                                kind: MirExprKind::RomCallU32 { stack_bound: 48, .. },
+                                kind:
+                                    MirExprKind::RomCallU32 {
+                                        stack_bound: 48, ..
+                                    },
                                 ..
                             },
                         ..

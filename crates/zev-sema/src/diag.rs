@@ -175,9 +175,7 @@ impl DiagnosticKind {
             | Self::InvalidControlFlow
             | Self::NonDivergingTask
             | Self::InvalidSpawnContext => "tasks",
-            Self::IrqAttachmentError
-            | Self::ModuleError
-            | Self::MmioViolation => "runtime",
+            Self::IrqAttachmentError | Self::ModuleError | Self::MmioViolation => "runtime",
             Self::InvalidIsrState => "yielding",
             Self::ReturnMismatch
             | Self::ErrorSpecMismatch
@@ -361,9 +359,7 @@ impl Diagnostic {
 
     /// Specific fix-it note if set, or the category's default idiomatic hint.
     pub fn help_text(&self) -> &str {
-        self.note
-            .as_deref()
-            .unwrap_or_else(|| self.kind.doc_hint())
+        self.note.as_deref().unwrap_or_else(|| self.kind.doc_hint())
     }
 }
 

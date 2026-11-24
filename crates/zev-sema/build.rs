@@ -11,7 +11,9 @@ fn collect_zev_files(dir: &Path, dirs_out: &mut Vec<PathBuf>, files_out: &mut Ve
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
-    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|ent| ent.path())).collect();
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|ent| ent.path()))
+        .collect();
     paths.sort();
     for path in paths {
         if path.is_dir() {

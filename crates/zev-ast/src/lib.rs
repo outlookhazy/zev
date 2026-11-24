@@ -15,7 +15,7 @@
 use std::fmt;
 
 pub mod builtins;
-pub use builtins::{BuiltinFn, SYS_NAMESPACE, SysMethod};
+pub use builtins::{BuiltinFn, SysMethod, SYS_NAMESPACE};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Source Spans & Identifiers
@@ -270,13 +270,7 @@ impl PrimType {
     pub const fn is_signed(self) -> bool {
         matches!(
             self,
-            Self::I8
-                | Self::I16
-                | Self::I32
-                | Self::I64
-                | Self::Isize
-                | Self::F32
-                | Self::F64
+            Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::Isize | Self::F32 | Self::F64
         )
     }
 
@@ -415,7 +409,7 @@ pub struct GenericParam {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GenericArg {
     Type(TypeExpr),
-    Const(Expr),
+    Const(Box<Expr>),
 }
 
 /// Fixed-size array bound (`[16]u8` or generic/const `[N]T`).
@@ -446,10 +440,7 @@ pub enum TypeKind {
     /// Module-qualified type path (`hw.Usart`, `chip.stm32g4.DmaChannel`).
     Path(Vec<Ident>),
     /// Generic type instantiation (`FixedVec<u32, 16>`, `FixedVec<T, N>`).
-    Generic {
-        base: Ident,
-        args: Vec<GenericArg>,
-    },
+    Generic { base: Ident, args: Vec<GenericArg> },
     /// Module-qualified generic type instantiation (`col.FixedVec<u32, 16>`).
     GenericPath {
         path: Vec<Ident>,
@@ -851,10 +842,7 @@ pub enum StmtKind {
         else_block: Option<Block>,
     },
     /// Bounded conditional loop (`while (cond) { ... }`).
-    While {
-        cond: Expr,
-        body: Block,
-    },
+    While { cond: Expr, body: Block },
     /// Bounded integer range loop (`for (usize i in 0..8) { ... }` or `for (u32 i in 0..=n) { ... }`).
     ForRange {
         var_ty: TypeExpr,
@@ -872,24 +860,15 @@ pub enum StmtKind {
         body: Block,
     },
     /// Unbounded loop (`loop { ... }`).
-    Loop {
-        body: Block,
-    },
+    Loop { body: Block },
     /// Drift-free periodic loop (`loop every 20ms { ... }` or `loop every period_expr { ... }`).
-    LoopEvery {
-        period: Box<Expr>,
-        body: Block,
-    },
+    LoopEvery { period: Box<Expr>, body: Block },
     /// Deterministic scope-exit cleanup (`defer expr;` or `defer { ... }`).
     Defer(Box<Stmt>),
     /// Task-atomic non-yielding scope (`noyield { ... }`).
-    NoYield {
-        body: Block,
-    },
+    NoYield { body: Block },
     /// Hardware-IRQ-masked atomic scope (`critical { ... }`).
-    Critical {
-        body: Block,
-    },
+    Critical { body: Block },
     /// Sequential pattern dispatch (`switch (ev) { Variant => { ... } }`).
     Switch {
         scrutinee: Expr,
@@ -1038,10 +1017,7 @@ pub enum ExprKind {
     /// Priority literal in expression position (`set_priority(@low)`, `boost: @critical`).
     Priority(Priority),
     /// Prefix unary operation (`&x`, `*p`, `!flag`, `~mask`, `-val`).
-    Unary {
-        op: UnaryOp,
-        expr: Box<Expr>,
-    },
+    Unary { op: UnaryOp, expr: Box<Expr> },
     /// Infix binary operation (`a + b`, `HALF | FULL`, `crc != frame.crc`, ...).
     Binary {
         op: BinaryOp,
@@ -1049,15 +1025,9 @@ pub enum ExprKind {
         rhs: Box<Expr>,
     },
     /// Explicit scalar cast (`x as u16` or `(u16)x`).
-    Cast {
-        expr: Box<Expr>,
-        ty: TypeExpr,
-    },
+    Cast { expr: Box<Expr>, ty: TypeExpr },
     /// Field or peripheral property access (`frame.crc`, `buf.len`, `hw.DMA1.CH5`).
-    Field {
-        target: Box<Expr>,
-        field: Ident,
-    },
+    Field { target: Box<Expr>, field: Ident },
     /// Direct function call (`parse_setpoint(half)`, `clamp<f32>(v, 0.0, 1.0)`).
     Call {
         callee: Box<Expr>,
@@ -1072,10 +1042,7 @@ pub enum ExprKind {
         args: Vec<CallArg>,
     },
     /// Element indexing (`buf[i]`).
-    Index {
-        target: Box<Expr>,
-        index: Box<Expr>,
-    },
+    Index { target: Box<Expr>, index: Box<Expr> },
     /// Sub-slice range (`buf[0..5]`, `buf[..5]`, `buf[3..]`).
     Slice {
         target: Box<Expr>,
@@ -1101,7 +1068,7 @@ pub enum ExprKind {
     /// Block error handler (`parse_setpoint(half) catch (ParseErr err) { ... }`).
     Catch {
         expr: Box<Expr>,
-        clause: CatchClause,
+        clause: Box<CatchClause>,
     },
 }
 
@@ -1542,7 +1509,13 @@ mod tests {
             sp,
         );
         assert!(matches!(loop_every.kind, StmtKind::LoopEvery { .. }));
-        assert!(matches!(for_range.kind, StmtKind::ForRange { inclusive: true, .. }));
+        assert!(matches!(
+            for_range.kind,
+            StmtKind::ForRange {
+                inclusive: true,
+                ..
+            }
+        ));
         assert!(matches!(for_each.kind, StmtKind::ForEach { .. }));
     }
 

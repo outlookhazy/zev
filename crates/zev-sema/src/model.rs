@@ -184,7 +184,7 @@ pub enum IrqBindingArg {
     /// Compile-time constant boolean.
     ConstBool(bool),
     /// Other compile-time constant expression (e.g. `const` float or resolved enum literal).
-    ConstExpr { ty: Ty, expr: Expr },
+    ConstExpr { ty: Ty, expr: Box<Expr> },
 }
 
 /// Resolved boot-time `irq.attach(...)` or `irq.attach_shared(...)` binding.

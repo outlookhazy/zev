@@ -86,13 +86,11 @@ pub(super) fn ty_contains_os_prim_view(
             if !visiting.insert(name.clone()) {
                 return false;
             }
-            let has = structs
-                .get(name)
-                .is_some_and(|st| {
-                    st.fields
-                        .iter()
-                        .any(|f| ty_contains_os_prim_view(&f.ty, structs, visiting))
-                });
+            let has = structs.get(name).is_some_and(|st| {
+                st.fields
+                    .iter()
+                    .any(|f| ty_contains_os_prim_view(&f.ty, structs, visiting))
+            });
             visiting.remove(name);
             has
         }
@@ -273,9 +271,7 @@ pub(super) fn stmts_have_break(stmts: &[Stmt]) -> bool {
                 else_block,
                 ..
             } => {
-                if block_has_break(then_block)
-                    || else_block.as_ref().is_some_and(block_has_break)
-                {
+                if block_has_break(then_block) || else_block.as_ref().is_some_and(block_has_break) {
                     return true;
                 }
             }
@@ -296,7 +292,10 @@ pub(super) fn stmts_have_break(stmts: &[Stmt]) -> bool {
                     return true;
                 }
             }
-            StmtKind::Expr(expr) | StmtKind::VarDecl { init: Some(expr), .. } => {
+            StmtKind::Expr(expr)
+            | StmtKind::VarDecl {
+                init: Some(expr), ..
+            } => {
                 if expr_has_break(expr) {
                     return true;
                 }
@@ -315,10 +314,14 @@ pub(super) fn stmts_have_break(stmts: &[Stmt]) -> bool {
 
 pub(super) fn expr_has_break(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Catch { expr: inner, clause } => {
-            expr_has_break(inner) || block_has_break(&clause.body)
-        }
-        ExprKind::Or { expr: a, fallback: b } => expr_has_break(a) || expr_has_break(b),
+        ExprKind::Catch {
+            expr: inner,
+            clause,
+        } => expr_has_break(inner) || block_has_break(&clause.body),
+        ExprKind::Or {
+            expr: a,
+            fallback: b,
+        } => expr_has_break(a) || expr_has_break(b),
         _ => false,
     }
 }

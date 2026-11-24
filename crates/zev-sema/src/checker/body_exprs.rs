@@ -1,5 +1,12 @@
 use super::*;
 
+type AddrOfPlaceResult = (
+    ExprVal,
+    Provenance,
+    Option<String>,
+    Option<(String, String, usize)>,
+);
+
 impl<'a> BodyChecker<'a> {
     pub(super) fn take_mmio_array_tag(&mut self, span: Span) -> Option<(String, String, usize)> {
         self.mmio_array_expr_spans.remove(&(span.start, span.end))
@@ -326,7 +333,8 @@ impl<'a> BodyChecker<'a> {
                     ));
                 }
                 let Some(st_info) = self.sema.structs.get(&name.name).cloned() else {
-                    let struct_names: Vec<&str> = self.sema.structs.keys().map(String::as_str).collect();
+                    let struct_names: Vec<&str> =
+                        self.sema.structs.keys().map(String::as_str).collect();
                     let mut diag = Diagnostic::new(
                         DiagnosticKind::UndefinedSymbol,
                         name.span,
@@ -480,7 +488,10 @@ impl<'a> BodyChecker<'a> {
                                 self.sema.emit(Diagnostic::new(
                                     DiagnosticKind::TypeMismatch,
                                     e.span,
-                                    format!("array element has type '{}', expected '{}'", ev.ty, cur),
+                                    format!(
+                                        "array element has type '{}', expected '{}'",
+                                        ev.ty, cur
+                                    ),
                                 ));
                             }
                         }
@@ -490,7 +501,12 @@ impl<'a> BodyChecker<'a> {
                                 cur,
                                 e.span,
                                 DiagnosticKind::TypeMismatch,
-                                || format!("array element has type '{}', expected '{}'", ev.ty, cur),
+                                || {
+                                    format!(
+                                        "array element has type '{}', expected '{}'",
+                                        ev.ty, cur
+                                    )
+                                },
                             );
                         }
                     }
@@ -580,10 +596,7 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidOrFallback,
                         fallback.span,
-                        format!(
-                            "'or' fallback has type '{}', expected '{}'",
-                            fv.ty, iv.ty
-                        ),
+                        format!("'or' fallback has type '{}', expected '{}'", fv.ty, iv.ty),
                     ));
                 }
                 let res_ty = if let Some(u) = int_unified {
@@ -828,7 +841,9 @@ impl<'a> BodyChecker<'a> {
 
         // 5. Unqualified enum variant (`Overcurrent`, `BadPacket`, `TooShort`, `BadCrc`, ...),
         //    scoped to enums visible in the current module.
-        let visible_enums = self.sema.visible_enums_for_variant(self.prog_idx, &ident.name);
+        let visible_enums = self
+            .sema
+            .visible_enums_for_variant(self.prog_idx, &ident.name);
         if !visible_enums.is_empty() {
             if visible_enums.len() == 1 {
                 return ExprVal::scalar(Ty::Enum(visible_enums[0].clone()), ident.span);
@@ -960,7 +975,10 @@ impl<'a> BodyChecker<'a> {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::ImmutableAssignment,
                             span,
-                            format!("cannot take mutable pointer '&{}' to immutable 'const'", id.name),
+                            format!(
+                                "cannot take mutable pointer '&{}' to immutable 'const'",
+                                id.name
+                            ),
                         ));
                         return ExprVal::error(span);
                     }
@@ -1085,7 +1103,13 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    pub(super) fn check_binary_expr(&mut self, op: BinaryOp, lhs: &Expr, rhs: &Expr, span: Span) -> ExprVal {
+    pub(super) fn check_binary_expr(
+        &mut self,
+        op: BinaryOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        span: Span,
+    ) -> ExprVal {
         // S-H2: Short-circuit `&&` and `||` conditionally evaluate `rhs` only when `lhs` does not
         // short-circuit, so snapshot/fork variable move states & lease generations around `rhs`!
         if matches!(op, BinaryOp::And | BinaryOp::Or) {
@@ -1099,9 +1123,14 @@ impl<'a> BodyChecker<'a> {
             let after_rhs_leases = self.leases.clone();
 
             self.scopes = after_lhs_vars.clone();
-            self.merge_branch_vars(&after_lhs_vars, &[after_lhs_vars.clone(), after_rhs_vars], span);
+            self.merge_branch_vars(
+                &after_lhs_vars,
+                &[after_lhs_vars.clone(), after_rhs_vars],
+                span,
+            );
             self.leases = after_lhs_leases.clone();
-            self.leases.join_branches(&[after_lhs_leases, after_rhs_leases]);
+            self.leases
+                .join_branches(&[after_lhs_leases, after_rhs_leases]);
 
             if lv.ty.is_error() || rv.ty.is_error() {
                 return ExprVal::error(span);
@@ -1353,7 +1382,12 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    pub(super) fn finish_deref_expr(&mut self, iv: ExprVal, span: Span, reject_byval: bool) -> ExprVal {
+    pub(super) fn finish_deref_expr(
+        &mut self,
+        iv: ExprVal,
+        span: Span,
+        reject_byval: bool,
+    ) -> ExprVal {
         match iv.ty {
             Ty::Ptr(pointee) => {
                 if reject_byval {
@@ -1552,12 +1586,7 @@ impl<'a> BodyChecker<'a> {
         place: &Expr,
         addr_span: Span,
         allow_mmio_array: bool,
-    ) -> (
-        ExprVal,
-        Provenance,
-        Option<String>,
-        Option<(String, String, usize)>,
-    ) {
+    ) -> AddrOfPlaceResult {
         match &place.kind {
             ExprKind::Ident(id) => {
                 let iv = self.check_expr_infallible(place);
@@ -1619,11 +1648,21 @@ impl<'a> BodyChecker<'a> {
                                 field.name, layout_name, reg_name
                             ),
                         ));
-                        return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                        return (
+                            ExprVal::error(place.span),
+                            Provenance::pure_static(),
+                            None,
+                            None,
+                        );
                     }
                 }
                 if bv.ty.is_error() {
-                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                    return (
+                        ExprVal::error(place.span),
+                        Provenance::pure_static(),
+                        None,
+                        None,
+                    );
                 }
                 if is_mmio_ty(&bv.ty) {
                     let layout_name = match &bv.ty {
@@ -1668,7 +1707,12 @@ impl<'a> BodyChecker<'a> {
                             field.name
                         ),
                     ));
-                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                    return (
+                        ExprVal::error(place.span),
+                        Provenance::pure_static(),
+                        None,
+                        None,
+                    );
                 }
                 let fv = self.check_resolved_field_val_with_place(
                     bv.clone(),
@@ -1710,10 +1754,20 @@ impl<'a> BodyChecker<'a> {
                             reg_name
                         ),
                     ));
-                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                    return (
+                        ExprVal::error(place.span),
+                        Provenance::pure_static(),
+                        None,
+                        None,
+                    );
                 }
                 if seq_v.ty.is_error() {
-                    return (ExprVal::error(place.span), Provenance::pure_static(), None, None);
+                    return (
+                        ExprVal::error(place.span),
+                        Provenance::pure_static(),
+                        None,
+                        None,
+                    );
                 }
                 let elem_v =
                     self.check_resolved_index_val(seq_v.clone(), seq, index.span, place.span);
@@ -1809,7 +1863,8 @@ impl<'a> BodyChecker<'a> {
                         unreachable!()
                     }
                 } else {
-                    let note = if matches!(field.name.as_str(), "length" | "size" | "count" | "cap") {
+                    let note = if matches!(field.name.as_str(), "length" | "size" | "count" | "cap")
+                    {
                         "did you mean `.len`? (slices provide `.len` of type `usize` and `.ptr` of type `*T`)".to_string()
                     } else if let Some(best) = closest_match(&field.name, ["len", "ptr"], 2) {
                         format!("did you mean `.{}`?", best)
@@ -1820,7 +1875,10 @@ impl<'a> BodyChecker<'a> {
                         Diagnostic::new(
                             DiagnosticKind::UndefinedSymbol,
                             field.span,
-                            format!("slice has no property '{}' (supported: 'len', 'ptr')", field.name),
+                            format!(
+                                "slice has no property '{}' (supported: 'len', 'ptr')",
+                                field.name
+                            ),
                         )
                         .with_note(note),
                     );
@@ -1886,7 +1944,11 @@ impl<'a> BodyChecker<'a> {
                         Ty::Ptr(inner) if matches!(&**inner, Ty::Struct(s) if self.sema.structs.get(s).is_some_and(|st| st.is_subsystem))
                     );
                 let is_view_field = is_subsys_field
-                    || ty_contains_os_prim_view(&f_info.ty, &self.sema.structs, &mut BTreeSet::new());
+                    || ty_contains_os_prim_view(
+                        &f_info.ty,
+                        &self.sema.structs,
+                        &mut BTreeSet::new(),
+                    );
                 let prov = if is_view_field
                     || f_info.ty.contains_reference(&self.sema.structs)
                     || f_info.ty.contains_fn_ptr(&self.sema.structs)
@@ -1941,7 +2003,11 @@ impl<'a> BodyChecker<'a> {
                 }
             }
 
-            Ty::MmioLayout(layout_name) | Ty::MmioInstance { layout: layout_name, .. } => {
+            Ty::MmioLayout(layout_name)
+            | Ty::MmioInstance {
+                layout: layout_name,
+                ..
+            } => {
                 let Some(layout_info) = self.sema.mmio_layouts.get(&layout_name).cloned() else {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::UndefinedSymbol,
@@ -1950,7 +2016,11 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return ExprVal::error(span);
                 };
-                let Some(reg) = layout_info.regs.iter().find(|r| r.name == field.name).cloned()
+                let Some(reg) = layout_info
+                    .regs
+                    .iter()
+                    .find(|r| r.name == field.name)
+                    .cloned()
                 else {
                     let candidates = layout_info.regs.iter().map(|r| r.name.as_str());
                     let mut diag = Diagnostic::new(
@@ -1978,10 +2048,8 @@ impl<'a> BodyChecker<'a> {
                     ));
                 }
                 let reg_ty = if let Some(len) = reg.array_len {
-                    self.mmio_array_expr_spans.insert(
-                        (span.start, span.end),
-                        (layout_name, reg.name, len),
-                    );
+                    self.mmio_array_expr_spans
+                        .insert((span.start, span.end), (layout_name, reg.name, len));
                     Ty::Array {
                         elem: Box::new(Ty::Prim(reg.elem_ty)),
                         len,
@@ -2025,7 +2093,12 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    pub(super) fn check_call_expr(&mut self, callee: &Expr, args: &[CallArg], span: Span) -> ExprVal {
+    pub(super) fn check_call_expr(
+        &mut self,
+        callee: &Expr,
+        args: &[CallArg],
+        span: Span,
+    ) -> ExprVal {
         // Normalize `a.b(args)` if parser represented it as `Call { callee: Field { target, field }, args }`.
         if let ExprKind::Field { target, field } = &callee.kind {
             // Unless `target` is a struct whose `field` is a `FnPtr`! Check if `target` has a `FnPtr` field first.
@@ -2101,7 +2174,12 @@ impl<'a> BodyChecker<'a> {
                 for (i, arg) in args.iter().enumerate() {
                     let av = self.check_expr_infallible(&arg.value);
                     if av.ty.is_linear_lease() {
-                        self.consume_lease_value(&arg.value, &av, "function pointer argument", arg.span);
+                        self.consume_lease_value(
+                            &arg.value,
+                            &av,
+                            "function pointer argument",
+                            arg.span,
+                        );
                     }
                     if let Some(expected) = params.get(i) {
                         if self.sema.check_assignable_or_emit(
@@ -2109,7 +2187,14 @@ impl<'a> BodyChecker<'a> {
                             expected,
                             arg.span,
                             DiagnosticKind::TypeMismatch,
-                            || format!("argument {} has type '{}', expected '{}'", i + 1, av.ty, expected),
+                            || {
+                                format!(
+                                    "argument {} has type '{}', expected '{}'",
+                                    i + 1,
+                                    av.ty,
+                                    expected
+                                )
+                            },
                         ) {
                             self.check_coerced_expr(&arg.value, expected);
                         }
@@ -2204,22 +2289,19 @@ impl<'a> BodyChecker<'a> {
                 ) {
                     self.check_coerced_expr(&arg.value, &param.ty);
                 }
-                av.prov = self.coerce_array_to_slice_prov(
-                    &arg.value,
-                    &av.ty,
-                    &param.ty,
-                    &av.prov,
-                );
+                av.prov = self.coerce_array_to_slice_prov(&arg.value, &av.ty, &param.ty, &av.prov);
             }
 
             // If calling an `extern "C"` function, record any user `fn` callbacks passed in `arg`!
             if fn_info.is_extern_c {
                 for cb_fn in &av.prov.fn_callbacks {
-                    self.sema.call_graph.add_extern_callback(ExternCallbackSite {
-                        extern_fn: fn_info.name.clone(),
-                        callback_fn: cb_fn.clone(),
-                        span: arg.span,
-                    });
+                    self.sema
+                        .call_graph
+                        .add_extern_callback(ExternCallbackSite {
+                            extern_fn: fn_info.name.clone(),
+                            callback_fn: cb_fn.clone(),
+                            span: arg.span,
+                        });
                 }
             }
 
@@ -2339,7 +2421,10 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("'set_priority' expects 1 priority argument, found {}", args.len()),
+                        format!(
+                            "'set_priority' expects 1 priority argument, found {}",
+                            args.len()
+                        ),
                     ));
                 }
                 for a in args {
@@ -2380,7 +2465,11 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("'{}' expects 1 duration argument, found {}", name, args.len()),
+                        format!(
+                            "'{}' expects 1 duration argument, found {}",
+                            name,
+                            args.len()
+                        ),
                     ));
                 }
                 for a in args {
@@ -2389,7 +2478,10 @@ impl<'a> BodyChecker<'a> {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
                             a.span,
-                            format!("'{}' expects a duration literal (e.g. 10ms), found '{}'", name, av.ty),
+                            format!(
+                                "'{}' expects a duration literal (e.g. 10ms), found '{}'",
+                                name, av.ty
+                            ),
                         ));
                     }
                 }
@@ -2470,7 +2562,10 @@ impl<'a> BodyChecker<'a> {
                         Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
                             span,
-                            format!("'assert' expects 1 'bool' condition argument, found {}", args.len()),
+                            format!(
+                                "'assert' expects 1 'bool' condition argument, found {}",
+                                args.len()
+                            ),
                         )
                         .with_note("pass a boolean comparison such as `assert(count > 0);`"),
                     );
@@ -2486,7 +2581,9 @@ impl<'a> BodyChecker<'a> {
                                 args[0].span,
                                 format!("'assert' expects a 'bool' condition, found '{}'", av.ty),
                             )
-                            .with_note("pass a boolean comparison such as `assert(val == expected);`"),
+                            .with_note(
+                                "pass a boolean comparison such as `assert(val == expected);`",
+                            ),
                         );
                     }
                 }
@@ -2695,12 +2792,8 @@ impl<'a> BodyChecker<'a> {
                             if let Some(var) = self.lookup_local(&id.name).cloned() {
                                 if let Some(key) = var.lease_gen_key {
                                     let gen = self.leases.acquire_next(&key, span);
-                                    let prov = Provenance::dma_lease_get(
-                                        key,
-                                        gen,
-                                        var.decl_depth,
-                                        span,
-                                    );
+                                    let prov =
+                                        Provenance::dma_lease_get(key, gen, var.decl_depth, span);
                                     return ExprVal {
                                         ty: Ty::Ptr(elem),
                                         error_spec: ResolvedErrorSpec::None,
@@ -2798,7 +2891,12 @@ impl<'a> BodyChecker<'a> {
                     for (i, arg) in args.iter().enumerate() {
                         let av = self.check_expr_infallible(&arg.value);
                         if av.ty.is_linear_lease() {
-                            self.consume_lease_value(&arg.value, &av, "function pointer field argument", arg.span);
+                            self.consume_lease_value(
+                                &arg.value,
+                                &av,
+                                "function pointer field argument",
+                                arg.span,
+                            );
                         }
                         if let Some(expected) = params.get(i) {
                             if !av.ty.is_assignable_to(expected) {
@@ -2858,7 +2956,12 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    pub(super) fn check_sys_method(&mut self, method: &Ident, args: &[CallArg], span: Span) -> ExprVal {
+    pub(super) fn check_sys_method(
+        &mut self,
+        method: &Ident,
+        args: &[CallArg],
+        span: Span,
+    ) -> ExprVal {
         let m = method.name.as_str();
         match SysMethod::from_name(m) {
             Some(SysMethod::UseSystick) => {
@@ -2947,7 +3050,10 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("'sys.delay' expects 1 duration argument, found {}", args.len()),
+                        format!(
+                            "'sys.delay' expects 1 duration argument, found {}",
+                            args.len()
+                        ),
                     ));
                 }
                 for a in args {
@@ -2983,7 +3089,10 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("'sys.tick_by(u32 ms)' expects 1 argument, found {}", args.len()),
+                        format!(
+                            "'sys.tick_by(u32 ms)' expects 1 argument, found {}",
+                            args.len()
+                        ),
                     ));
                     for a in args {
                         let _ = self.check_expr_infallible(&a.value);
@@ -2994,7 +3103,10 @@ impl<'a> BodyChecker<'a> {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
                             args[0].span,
-                            format!("'sys.tick_by' expects `u32` milliseconds, found '{}'", av.ty),
+                            format!(
+                                "'sys.tick_by' expects `u32` milliseconds, found '{}'",
+                                av.ty
+                            ),
                         ));
                     } else {
                         self.check_coerced_expr(&args[0].value, &Ty::u32());
@@ -3174,7 +3286,10 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("'sys.trace_sleep(bool on)' expects 1 argument, found {}", args.len()),
+                        format!(
+                            "'sys.trace_sleep(bool on)' expects 1 argument, found {}",
+                            args.len()
+                        ),
                     ));
                     for a in args {
                         let _ = self.check_expr_infallible(&a.value);
@@ -3211,7 +3326,10 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("'sys.pend_irq(u32 irq)' expects 1 argument, found {}", args.len()),
+                        format!(
+                            "'sys.pend_irq(u32 irq)' expects 1 argument, found {}",
+                            args.len()
+                        ),
                     ));
                     for a in args {
                         let _ = self.check_expr_infallible(&a.value);
@@ -3286,7 +3404,10 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
-                        format!("'sys.exit(i32 code)' expects 1 argument, found {}", args.len()),
+                        format!(
+                            "'sys.exit(i32 code)' expects 1 argument, found {}",
+                            args.len()
+                        ),
                     ));
                     for a in args {
                         let _ = self.check_expr_infallible(&a.value);
@@ -3393,8 +3514,7 @@ impl<'a> BodyChecker<'a> {
                         "unknown runtime method 'sys.{}' — did you mean top-level `println(\"...\")` or `sys.log(\"...\")`?",
                         m
                     )
-                } else if let Some(best) =
-                    closest_match(m, SysMethod::ALL_NAMES.iter().copied(), 2)
+                } else if let Some(best) = closest_match(m, SysMethod::ALL_NAMES.iter().copied(), 2)
                 {
                     format!(
                         "unknown runtime method 'sys.{}' — did you mean `sys.{}(...)`?",
@@ -3432,11 +3552,8 @@ impl<'a> BodyChecker<'a> {
                     method_name, role_desc, expected_ty, av.ty
                 )
             };
-            self.sema.emit(Diagnostic::new(
-                DiagnosticKind::TypeMismatch,
-                arg.span,
-                msg,
-            ));
+            self.sema
+                .emit(Diagnostic::new(DiagnosticKind::TypeMismatch, arg.span, msg));
         }
         for cb_fn in &av.prov.fn_callbacks {
             if let Some(fn_info) = self.sema.functions.get(cb_fn) {
@@ -3473,7 +3590,10 @@ impl<'a> BodyChecker<'a> {
         let max_args = fixed + 4;
         if args.len() < fixed || args.len() > max_args {
             let sig = if has_stack_bound {
-                format!("'sys.{}(usize fn_addr, usize stack_bound, ...args)'", method_name)
+                format!(
+                    "'sys.{}(usize fn_addr, usize stack_bound, ...args)'",
+                    method_name
+                )
             } else {
                 format!("'sys.{}(usize fn_addr, ...args)'", method_name)
             };
@@ -3842,7 +3962,8 @@ impl<'a> BodyChecker<'a> {
                 _ => self.unknown_prim_method(prim, method, span),
             },
 
-            ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => match m {
+            ResolvedOsPrimitive::Inbox { elem, .. }
+            | ResolvedOsPrimitive::InboxUnsized { elem } => match m {
                 "post" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
                     if elem.is_linear_lease() {
@@ -3945,8 +4066,12 @@ impl<'a> BodyChecker<'a> {
                         &format!("{}.wait_chunk()", source_key),
                     );
                     let gen = self.leases.acquire_next(source_key, span);
-                    let prov =
-                        Provenance::dma_lease(source_key.to_string(), gen, self.current_depth(), span);
+                    let prov = Provenance::dma_lease(
+                        source_key.to_string(),
+                        gen,
+                        self.current_depth(),
+                        span,
+                    );
                     ExprVal {
                         ty: Ty::Slice(elem.clone()),
                         error_spec: if has_timeout {
@@ -4658,7 +4783,6 @@ impl<'a> BodyChecker<'a> {
             span,
         }
     }
-
 }
 
 impl<'a> BodyChecker<'a> {
@@ -4729,7 +4853,12 @@ impl<'a> BodyChecker<'a> {
             ));
             return;
         };
-        let Some(reg) = layout_info.regs.iter().find(|r| r.name == field.name).cloned() else {
+        let Some(reg) = layout_info
+            .regs
+            .iter()
+            .find(|r| r.name == field.name)
+            .cloned()
+        else {
             let candidates = layout_info.regs.iter().map(|r| r.name.as_str());
             let mut diag = Diagnostic::new(
                 DiagnosticKind::UndefinedSymbol,
@@ -4759,11 +4888,10 @@ impl<'a> BodyChecker<'a> {
                 return;
             };
             let shadowed = self.active_local_names();
-            if let Some(idx) = self.sema.eval_const_expr_i128_shadowed(
-                idx_expr,
-                &mut BTreeSet::new(),
-                &shadowed,
-            ) {
+            if let Some(idx) =
+                self.sema
+                    .eval_const_expr_i128_shadowed(idx_expr, &mut BTreeSet::new(), &shadowed)
+            {
                 if idx < 0 || idx as u128 >= len as u128 {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::MmioViolation,
@@ -4870,7 +4998,11 @@ impl<'a> BodyChecker<'a> {
         Some(chain)
     }
 
-    pub(super) fn classify_irq_attach_arg(&self, expr: &Expr, val: &ExprVal) -> Option<BootAttachArgSpec> {
+    pub(super) fn classify_irq_attach_arg(
+        &self,
+        expr: &Expr,
+        val: &ExprVal,
+    ) -> Option<BootAttachArgSpec> {
         match &expr.kind {
             ExprKind::Unary {
                 op: UnaryOp::AddrOf,
@@ -4901,13 +5033,11 @@ impl<'a> BodyChecker<'a> {
                         if let Some(field_chain) =
                             self.build_subsystem_field_chain(base_ty, &rev_fields)
                         {
-                            return Some(BootAttachArgSpec::Static(
-                                IrqBindingArg::SubsystemPath {
-                                    root: id.name.clone(),
-                                    root_struct: sub.struct_name.clone(),
-                                    field_chain,
-                                },
-                            ));
+                            return Some(BootAttachArgSpec::Static(IrqBindingArg::SubsystemPath {
+                                root: id.name.clone(),
+                                root_struct: sub.struct_name.clone(),
+                                field_chain,
+                            }));
                         }
                     }
                     if !rev_fields.is_empty() {
@@ -5136,10 +5266,7 @@ impl<'a> BodyChecker<'a> {
                 self.sema.emit(Diagnostic::new(
                     DiagnosticKind::IrqAttachmentError,
                     isr_ident.span,
-                    format!(
-                        "'{}' is a `task`, not an `isr` handler",
-                        isr_ident.name
-                    ),
+                    format!("'{}' is a `task`, not an `isr` handler", isr_ident.name),
                 ));
             } else {
                 self.sema.emit(Diagnostic::new(
@@ -5209,11 +5336,9 @@ impl<'a> BodyChecker<'a> {
                 ));
             }
             let forwarded_pname = match &spec {
-                Some(BootAttachArgSpec::Param { index, .. }) => self
-                    .param_names
-                    .get(*index)
-                    .cloned()
-                    .unwrap_or(param_name),
+                Some(BootAttachArgSpec::Param { index, .. }) => {
+                    self.param_names.get(*index).cloned().unwrap_or(param_name)
+                }
                 _ => param_name,
             };
             arg_specs.push((spec, a.span, forwarded_pname));
@@ -5343,25 +5468,18 @@ impl<'a> BodyChecker<'a> {
                     | BinaryOp::BitXor,
                 lhs,
                 rhs,
-            } => {
-                if nat_ty
-                    .as_ref()
-                    .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit))
-                {
-                    self.validate_int_expr_at_type(lhs, eff_prim);
-                    self.validate_int_expr_at_type(rhs, eff_prim);
-                }
+            } if nat_ty
+                .as_ref()
+                .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit)) =>
+            {
+                self.validate_int_expr_at_type(lhs, eff_prim);
+                self.validate_int_expr_at_type(rhs, eff_prim);
             }
             _ => {}
         }
     }
 
-    pub(super) fn check_int_lit_range_or_emit(
-        &mut self,
-        val: i128,
-        prim: PrimType,
-        span: Span,
-    ) {
+    pub(super) fn check_int_lit_range_or_emit(&mut self, val: i128, prim: PrimType, span: Span) {
         let Some((min_v, max_v)) = Ty::int_prim_range(prim) else {
             return;
         };
@@ -5378,10 +5496,7 @@ impl<'a> BodyChecker<'a> {
                     prim.as_str()
                 )
             } else {
-                format!(
-                    "valid range for `{}` is {min_v}..={max_v}",
-                    prim.as_str()
-                )
+                format!("valid range for `{}` is {min_v}..={max_v}", prim.as_str())
             };
             self.sema.emit(
                 Diagnostic::new(

@@ -97,7 +97,10 @@ impl<'a> DirectLowerCtx<'a> {
             .any(|frame| !frame.is_empty())
     }
 
-    pub(super) fn lower_single_deferred_stmt(&mut self, deferred: &Stmt) -> Result<Vec<MirStmt>, MirLowerError> {
+    pub(super) fn lower_single_deferred_stmt(
+        &mut self,
+        deferred: &Stmt,
+    ) -> Result<Vec<MirStmt>, MirLowerError> {
         let prev_ny = self.in_noyield;
         self.in_noyield = true;
         self.scopes.push();
@@ -122,7 +125,10 @@ impl<'a> DirectLowerCtx<'a> {
 
     /// Emit active `defer` statements from innermost scope down to `min_depth` (inclusive) WITHOUT
     /// popping `self.defer_stack` (used for `return`, `error`, `break`, `continue`, `sys.exit`).
-    pub(super) fn emit_defers_down_to(&mut self, min_depth: usize) -> Result<Vec<MirStmt>, MirLowerError> {
+    pub(super) fn emit_defers_down_to(
+        &mut self,
+        min_depth: usize,
+    ) -> Result<Vec<MirStmt>, MirLowerError> {
         let top = self.defer_stack.len();
         if min_depth >= top {
             return Ok(Vec::new());
@@ -150,13 +156,19 @@ impl<'a> DirectLowerCtx<'a> {
         Ok(out)
     }
 
-    pub(super) fn lower_top_level_stmts(&mut self, stmts: &[Stmt]) -> Result<Vec<MirStmt>, MirLowerError> {
+    pub(super) fn lower_top_level_stmts(
+        &mut self,
+        stmts: &[Stmt],
+    ) -> Result<Vec<MirStmt>, MirLowerError> {
         let mut out = self.lower_stmt_seq(stmts)?;
         out.extend(self.pop_and_lower_top_defer_scope()?);
         Ok(out)
     }
 
-    pub(super) fn lower_block_stmts(&mut self, stmts: &[Stmt]) -> Result<Vec<MirStmt>, MirLowerError> {
+    pub(super) fn lower_block_stmts(
+        &mut self,
+        stmts: &[Stmt],
+    ) -> Result<Vec<MirStmt>, MirLowerError> {
         self.scopes.push();
         self.defer_stack.push(Vec::new());
         let mut out = self.lower_stmt_seq(stmts)?;
@@ -214,8 +226,7 @@ impl<'a> DirectLowerCtx<'a> {
                         ctx: self,
                         stmts: &mut out,
                     };
-                    let coerced =
-                        consume_moved_lease_be(coerce_expr_if_needed(val, &vty), &mut be);
+                    let coerced = consume_moved_lease_be(coerce_expr_if_needed(val, &vty), &mut be);
                     if self.boot_state.is_some() {
                         let resolved = resolve_boot_const_expr(&coerced, &self.boot_const_env);
                         if is_const_mir_expr(&resolved) {
@@ -517,7 +528,10 @@ impl<'a> DirectLowerCtx<'a> {
                             cond: MirExpr::new(
                                 MirExprKind::Binary {
                                     op: MirBinOp::Ge,
-                                    lhs: Box::new(MirExpr::new(MirExprKind::Var(ivar), vty.clone())),
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(ivar),
+                                        vty.clone(),
+                                    )),
                                     rhs: Box::new(MirExpr::new(
                                         MirExprKind::Var(e_tmp),
                                         vty.clone(),
@@ -545,7 +559,10 @@ impl<'a> DirectLowerCtx<'a> {
                             cond: MirExpr::new(
                                 MirExprKind::Binary {
                                     op: MirBinOp::Ge,
-                                    lhs: Box::new(MirExpr::new(MirExprKind::Var(ivar), vty.clone())),
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(ivar),
+                                        vty.clone(),
+                                    )),
                                     rhs: Box::new(MirExpr::new(
                                         MirExprKind::Var(e_tmp),
                                         vty.clone(),
@@ -614,7 +631,8 @@ impl<'a> DirectLowerCtx<'a> {
                 body,
             } => {
                 let ety = self.syms.resolve_type(elem_ty);
-                let (slice_tmp, seq_elem_ty) = self.lower_iter_into_slice_temp(iter, &ety, &mut out)?;
+                let (slice_tmp, seq_elem_ty) =
+                    self.lower_iter_into_slice_temp(iter, &ety, &mut out)?;
                 let len_tmp = self.alloc_temp("for_len", MirType::Usize);
                 let slice_ty = MirType::Slice(Box::new(seq_elem_ty.clone()));
                 out.push(MirStmt::Assign {
@@ -819,7 +837,8 @@ impl<'a> DirectLowerCtx<'a> {
                     return Ok(out);
                 }
                 if let Some(code_arg_opt) = extract_sys_exit_arg(e) {
-                    let code_expr = self.lower_sys_exit_code_before_defers(code_arg_opt, &mut out)?;
+                    let code_expr =
+                        self.lower_sys_exit_code_before_defers(code_arg_opt, &mut out)?;
                     out.extend(self.emit_defers_down_to(0)?);
                     out.push(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
                         method: "exit".to_string(),
@@ -846,8 +865,9 @@ impl<'a> DirectLowerCtx<'a> {
             }
             StmtKind::LoopEvery { .. } | StmtKind::Restart => {
                 return Err(MirLowerError {
-                    message: "yielding `loop every` or `restart` encountered inside non-yielding context"
-                        .to_string(),
+                    message:
+                        "yielding `loop every` or `restart` encountered inside non-yielding context"
+                            .to_string(),
                     span: stmt.span,
                 });
             }
@@ -1109,25 +1129,26 @@ impl<'a> DirectLowerCtx<'a> {
             if let Some(p) = fd.params.get(idx) {
                 if let Some((iname, inum)) = self.try_resolve_irq_token(&a.value)? {
                     irq_arg_bindings.push((p.name.name.clone(), (iname, inum)));
-                    lowered_args.push(MirExpr::new(MirExprKind::IntLit(inum as i128), MirType::U32));
+                    lowered_args.push(MirExpr::new(
+                        MirExprKind::IntLit(inum as i128),
+                        MirType::U32,
+                    ));
                     continue;
                 }
             }
             let expected = sig.params.get(idx);
             let me = self.lower_expr_with_stmts(&a.value, expected, out)?;
             let coerced = match (&me.ty, expected, &me.kind) {
-                (
-                    MirType::Array { elem, len },
-                    Some(MirType::Slice(_)),
-                    MirExprKind::Var(vid),
-                ) => MirExpr::new(
-                    MirExprKind::ArrayToSlice {
-                        array_place: Box::new(MirPlace::Var(*vid)),
-                        len: *len,
-                        elem_ty: *elem.clone(),
-                    },
-                    sig.params[idx].clone(),
-                ),
+                (MirType::Array { elem, len }, Some(MirType::Slice(_)), MirExprKind::Var(vid)) => {
+                    MirExpr::new(
+                        MirExprKind::ArrayToSlice {
+                            array_place: Box::new(MirPlace::Var(*vid)),
+                            len: *len,
+                            elem_ty: *elem.clone(),
+                        },
+                        sig.params[idx].clone(),
+                    )
+                }
                 (MirType::Array { elem, len }, Some(MirType::Slice(_)), _)
                     if is_rodata_const_mir_expr(&me) =>
                 {
@@ -1301,24 +1322,19 @@ impl<'a> DirectLowerCtx<'a> {
             }
             ExprKind::Call { callee, args, .. } if self.boot_state.is_some() => {
                 if let ExprKind::Ident(id) = &callee.kind {
-                    if let Some(unrolled) = self.try_unroll_boot_helper_call(&id.name, args, stmts)?
+                    if let Some(unrolled) =
+                        self.try_unroll_boot_helper_call(&id.name, args, stmts)?
                     {
                         return Ok(unrolled);
                     }
                 }
                 let _ = &self.pending_stmts;
-                let mut be = DirectBackend {
-                    ctx: self,
-                    stmts,
-                };
+                let mut be = DirectBackend { ctx: self, stmts };
                 lower_common_expr(expr, expected, &mut be)
             }
             _ => {
                 let _ = &self.pending_stmts;
-                let mut be = DirectBackend {
-                    ctx: self,
-                    stmts,
-                };
+                let mut be = DirectBackend { ctx: self, stmts };
                 lower_common_expr(expr, expected, &mut be)
             }
         }
@@ -1340,7 +1356,8 @@ impl<'a> DirectLowerCtx<'a> {
                     ctx: self,
                     stmts: &mut fb_stmts,
                 };
-                let fb_val = consume_moved_lease_be(coerce_expr_if_needed(fb_val, ok_ty), &mut fb_be);
+                let fb_val =
+                    consume_moved_lease_be(coerce_expr_if_needed(fb_val, ok_ty), &mut fb_be);
                 fb_stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(out_vid),
                     op: MirAssignOp::Assign,
@@ -1500,9 +1517,7 @@ impl<'a> DirectLowerCtx<'a> {
                 }
                 if extract_sys_exit_arg(tail_expr).is_some() {
                     err_stmts.extend(self.lower_stmt(last_stmt)?);
-                } else if let Some(stmt_op) =
-                    self.try_lower_stmt_call(tail_expr, &mut err_stmts)?
-                {
+                } else if let Some(stmt_op) = self.try_lower_stmt_call(tail_expr, &mut err_stmts)? {
                     err_stmts.push(stmt_op);
                 } else {
                     let tail_val =
@@ -1514,8 +1529,10 @@ impl<'a> DirectLowerCtx<'a> {
                             ctx: self,
                             stmts: &mut err_stmts,
                         };
-                        let tail_val =
-                            consume_moved_lease_be(coerce_expr_if_needed(tail_val, &ok_ty), &mut err_be);
+                        let tail_val = consume_moved_lease_be(
+                            coerce_expr_if_needed(tail_val, &ok_ty),
+                            &mut err_be,
+                        );
                         err_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(out_vid),
                             op: MirAssignOp::Assign,
@@ -1575,10 +1592,7 @@ impl<'a> DirectLowerCtx<'a> {
         expr: &Expr,
         stmts: &mut Vec<MirStmt>,
     ) -> Result<(MirPlace, MirType), MirLowerError> {
-        let mut be = DirectBackend {
-            ctx: self,
-            stmts,
-        };
+        let mut be = DirectBackend { ctx: self, stmts };
         lower_place_common(expr, &mut be)
     }
 
@@ -1587,14 +1601,14 @@ impl<'a> DirectLowerCtx<'a> {
         expr: &Expr,
         stmts: &mut Vec<MirStmt>,
     ) -> Result<Option<MirStmt>, MirLowerError> {
-        let mut be = DirectBackend {
-            ctx: self,
-            stmts,
-        };
+        let mut be = DirectBackend { ctx: self, stmts };
         try_lower_nonblocking_call_or_method(expr, &mut be)
     }
 
-    pub(super) fn try_resolve_irq_token(&self, expr: &Expr) -> Result<Option<(String, u32)>, MirLowerError> {
+    pub(super) fn try_resolve_irq_token(
+        &self,
+        expr: &Expr,
+    ) -> Result<Option<(String, u32)>, MirLowerError> {
         match &expr.kind {
             ExprKind::Ident(id) => {
                 if let Some(bound) = self
@@ -1631,8 +1645,9 @@ impl<'a> DirectLowerCtx<'a> {
         let raw = self.lower_expr_with_stmts(arg_expr, Some(param_ty), &mut arg_stmts)?;
         if !arg_stmts.is_empty() {
             return Err(MirLowerError {
-                message: "ISR attachment argument must be statically known (no runtime side effects)"
-                    .to_string(),
+                message:
+                    "ISR attachment argument must be statically known (no runtime side effects)"
+                        .to_string(),
                 span: arg_expr.span,
             });
         }
@@ -1775,18 +1790,18 @@ impl<'a> DirectLowerCtx<'a> {
             }
         };
 
-        let isr_param_tys = self
-            .syms
-            .isrs
-            .get(&handler_name)
-            .cloned()
-            .ok_or_else(|| MirLowerError {
-                message: format!(
-                    "unknown ISR handler `{handler_name}` in IRQ `.{}`",
-                    method.name
-                ),
-                span: args[0].value.span,
-            })?;
+        let isr_param_tys =
+            self.syms
+                .isrs
+                .get(&handler_name)
+                .cloned()
+                .ok_or_else(|| MirLowerError {
+                    message: format!(
+                        "unknown ISR handler `{handler_name}` in IRQ `.{}`",
+                        method.name
+                    ),
+                    span: args[0].value.span,
+                })?;
 
         if call_args.len() != isr_param_tys.len() {
             return Err(MirLowerError {
@@ -1806,12 +1821,18 @@ impl<'a> DirectLowerCtx<'a> {
         }
 
         let bs = self.boot_state.as_mut().ok_or_else(|| MirLowerError {
-            message: "`irq.attach` encountered outside sequential `main()` boot context".to_string(),
+            message: "`irq.attach` encountered outside sequential `main()` boot context"
+                .to_string(),
             span: expr.span,
         })?;
-        if let Some(sel_stmt) =
-            bs.attach_irq(&irq_name, irq_num, is_shared, &handler_name, baked_args, expr.span)?
-        {
+        if let Some(sel_stmt) = bs.attach_irq(
+            &irq_name,
+            irq_num,
+            is_shared,
+            &handler_name,
+            baked_args,
+            expr.span,
+        )? {
             out.push(sel_stmt);
         }
         Ok(true)

@@ -58,7 +58,8 @@ impl<'a> BodyChecker<'a> {
         if matches!(dv.ty, Ty::Array { .. }) {
             if let Some(root) = root_ident_of(dst_expr) {
                 if let Some(var) = self.lookup_local(&root) {
-                    ret_prov = ret_prov.merge(&Provenance::addr_of_local(&var.name, var.decl_depth));
+                    ret_prov =
+                        ret_prov.merge(&Provenance::addr_of_local(&var.name, var.decl_depth));
                 }
             }
         }
@@ -68,8 +69,8 @@ impl<'a> BodyChecker<'a> {
                 if var.ty.contains_reference(&self.sema.structs)
                     || matches!(var.ty, Ty::Array { .. })
                 {
-                    dst_alias_prov = dst_alias_prov
-                        .merge(&Provenance::addr_of_local(&var.name, var.decl_depth));
+                    dst_alias_prov =
+                        dst_alias_prov.merge(&Provenance::addr_of_local(&var.name, var.decl_depth));
                 }
             }
         }
@@ -146,10 +147,7 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         arg_name.span,
-                        format!(
-                            "unknown named argument '{}:' in 'fmt_ring'",
-                            arg_name.name
-                        ),
+                        format!("unknown named argument '{}:' in 'fmt_ring'", arg_name.name),
                     ));
                 }
             } else {
@@ -213,10 +211,7 @@ impl<'a> BodyChecker<'a> {
                         rv.ty
                     ),
                 );
-                if matches!(
-                    rv.ty,
-                    Ty::OsPrimitive(ResolvedOsPrimitive::ByteRing { .. })
-                ) {
+                if matches!(rv.ty, Ty::OsPrimitive(ResolvedOsPrimitive::ByteRing { .. })) {
                     diag = diag.with_note("pass `&ring` or a `*byte_ring` view pointer");
                 }
                 self.sema.emit(diag);
@@ -295,7 +290,9 @@ impl<'a> BodyChecker<'a> {
                 FormatPart::Hole { expr, spec, .. } => {
                     let Some(ty) = self.structural_expr_ty(expr).or_else(|| match &expr.kind {
                         ExprKind::Literal(Literal::String(_)) => Some(Ty::Str),
-                        ExprKind::Literal(Literal::Int { suffix: Some(p), .. }) => Some(Ty::Prim(*p)),
+                        ExprKind::Literal(Literal::Int {
+                            suffix: Some(p), ..
+                        }) => Some(Ty::Prim(*p)),
                         ExprKind::Literal(Literal::Int { suffix: None, .. }) => Some(Ty::IntLit),
                         ExprKind::Literal(Literal::Float { .. }) => Some(Ty::FloatLit),
                         ExprKind::Literal(Literal::Bool(_)) => Some(Ty::bool()),
@@ -317,7 +314,11 @@ impl<'a> BodyChecker<'a> {
         }
         if ty.is_bool() {
             return if let ExprKind::Literal(Literal::Bool(b)) = &expr.kind {
-                if *b { 4 } else { 5 }
+                if *b {
+                    4
+                } else {
+                    5
+                }
             } else {
                 4
             };
@@ -792,9 +793,9 @@ impl<'a> BodyChecker<'a> {
                             st_name
                         ),
                     )
-                    .with_note(format!(
-                        "use `{{val:?}}` for compile-time struct debug expansion or format fields explicitly (`f\"{{val.field}}\"`)"
-                    )),
+                    .with_note(
+                        "use `{val:?}` for compile-time struct debug expansion or format fields explicitly (`f\"{val.field}\"`)".to_string(),
+                    ),
                 );
                 None
             }
@@ -897,7 +898,10 @@ impl<'a> BodyChecker<'a> {
                 self.sema.emit(Diagnostic::new(
                     DiagnosticKind::TypeMismatch,
                     span,
-                    format!("field/element of type '{}' cannot be formatted with ':?'", other),
+                    format!(
+                        "field/element of type '{}' cannot be formatted with ':?'",
+                        other
+                    ),
                 ));
                 None
             }

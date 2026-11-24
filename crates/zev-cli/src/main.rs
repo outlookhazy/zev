@@ -7,8 +7,8 @@ mod svd;
 
 use cli::{parse_args, Command, HELP_TEXT};
 use diag::{
-    format_check_human_ok, primary_doc_cmd, render_check_json_err,
-    render_check_json_ok_with_tasks, JsonDiag, SourceFile, TaskRunSummary,
+    format_check_human_ok, primary_doc_cmd, render_check_json_err, render_check_json_ok_with_tasks,
+    JsonDiag, SourceFile, TaskRunSummary,
 };
 use runner::TempWorkDir;
 use std::collections::{HashMap, HashSet};
@@ -103,7 +103,7 @@ fn load_and_check_detailed_with_includes_and_targets(
                     line,
                     col,
                     message: pe.message,
-                    help: pe.hint,
+                    help: pe.hint.map(String::from),
                     doc_cmd,
                 });
             }
@@ -121,10 +121,12 @@ fn load_and_check_detailed_with_includes_and_targets(
         .map(|(name, _, prog)| (prog, Some(name.as_str())))
         .collect();
 
-    let mut opts = AnalyzeOptions::default();
-    opts.include_dirs = include_dirs.to_vec();
-    opts.hal_dir = hal_dir.map(str::to_string);
-    opts.board_module = board_module.map(str::to_string);
+    let opts = AnalyzeOptions {
+        include_dirs: include_dirs.to_vec(),
+        hal_dir: hal_dir.map(str::to_string),
+        board_module: board_module.map(str::to_string),
+        ..Default::default()
+    };
     let out = analyze_and_monomorphize_named_programs(&named_refs, &opts);
     if !out.diagnostics.is_empty() {
         let mut rendered = String::new();
@@ -258,9 +260,7 @@ fn default_output_with_ext(files: &[PathBuf], ext: &str) -> PathBuf {
     PathBuf::from(format!("{stem}.{ext}"))
 }
 
-fn resolve_llvm_options(
-    target: Option<&str>,
-) -> Result<zev_codegen_llvm::CodegenOptions, String> {
+fn resolve_llvm_options(target: Option<&str>) -> Result<zev_codegen_llvm::CodegenOptions, String> {
     match target {
         None | Some("cortex-m3") | Some("thumbv7m") | Some("thumbv7m-none-eabi") => {
             Ok(zev_codegen_llvm::CodegenOptions::default())
@@ -283,9 +283,10 @@ fn resolve_llvm_options(
         | Some("thumbv6m")
         | Some("thumbv6m-none-eabi") => Ok(zev_codegen_llvm::CodegenOptions::rp2040()),
         Some("host") | Some("x86_64") | Some("x86_64-unknown-linux-gnu") => {
-            let mut opts = zev_codegen_llvm::CodegenOptions::default();
-            opts.target = zev_codegen_llvm::TargetArch::HostX86_64Linux;
-            Ok(opts)
+            Ok(zev_codegen_llvm::CodegenOptions {
+                target: zev_codegen_llvm::TargetArch::HostX86_64Linux,
+                ..Default::default()
+            })
         }
         Some(other) => Err(format!(
             "unsupported `--target {other}` (expected `cortex-m3`, `esp32c6`, `avr`, `nano-every`, `rp2040`, or `host`)"
@@ -518,8 +519,8 @@ fn discover_manifest_for_inputs(
             cwd.join(first)
         };
         if let Some(parent) = abs.parent().filter(|p| !p.as_os_str().is_empty()) {
-            if let Some(found) = zev_codegen_llvm::ProjectManifest::discover(parent)
-                .map_err(|e| e.to_string())?
+            if let Some(found) =
+                zev_codegen_llvm::ProjectManifest::discover(parent).map_err(|e| e.to_string())?
             {
                 return Ok(Some(found));
             }
@@ -628,51 +629,50 @@ fn resolve_project_build_inputs(
     opt_level: Option<&str>,
 ) -> Result<ResolvedProjectBuild, String> {
     let manifest = discover_manifest_for_inputs(files)?;
-    let (manifest_dir, resolved_files, eff_board, eff_chip, eff_port, eff_opt) =
-        match manifest {
-            Some((mdir, m)) => {
-                let rfiles = if files.is_empty() {
-                    let Some(ref entry) = m.entry else {
-                        return Err(format!(
-                            "no input `.zev` files given and `{}` has no `entry` field",
-                            mdir.join("zev.toml").display()
-                        ));
-                    };
-                    let resolved = if entry.is_absolute() {
-                        entry.clone()
-                    } else {
-                        mdir.join(entry)
-                    };
-                    vec![resolved]
-                } else {
-                    files.to_vec()
+    let (manifest_dir, resolved_files, eff_board, eff_chip, eff_port, eff_opt) = match manifest {
+        Some((mdir, m)) => {
+            let rfiles = if files.is_empty() {
+                let Some(ref entry) = m.entry else {
+                    return Err(format!(
+                        "no input `.zev` files given and `{}` has no `entry` field",
+                        mdir.join("zev.toml").display()
+                    ));
                 };
-                (
-                    Some(mdir),
-                    rfiles,
-                    board.map(str::to_string).or(m.board),
-                    chip.map(str::to_string).or(m.chip),
-                    port.map(str::to_string).or(m.port),
-                    opt_level.map(str::to_string).or(m.opt_level),
-                )
-            }
-            None => {
-                if files.is_empty() {
-                    return Err(
+                let resolved = if entry.is_absolute() {
+                    entry.clone()
+                } else {
+                    mdir.join(entry)
+                };
+                vec![resolved]
+            } else {
+                files.to_vec()
+            };
+            (
+                Some(mdir),
+                rfiles,
+                board.map(str::to_string).or(m.board),
+                chip.map(str::to_string).or(m.chip),
+                port.map(str::to_string).or(m.port),
+                opt_level.map(str::to_string).or(m.opt_level),
+            )
+        }
+        None => {
+            if files.is_empty() {
+                return Err(
                         "no input `.zev` files given and no `zev.toml` found in current or parent directories"
                             .to_string(),
                     );
-                }
-                (
-                    None,
-                    files.to_vec(),
-                    board.map(str::to_string),
-                    chip.map(str::to_string),
-                    port.map(str::to_string),
-                    opt_level.map(str::to_string),
-                )
             }
-        };
+            (
+                None,
+                files.to_vec(),
+                board.map(str::to_string),
+                chip.map(str::to_string),
+                port.map(str::to_string),
+                opt_level.map(str::to_string),
+            )
+        }
+    };
 
     if eff_board.is_none() && eff_chip.is_none() {
         return Err(
@@ -780,15 +780,12 @@ fn run_ram_analysis(
     }
     let hal_dir = llvm_opts.as_ref().and_then(|o| o.hal_dir.as_deref());
     let board_module = llvm_opts.as_ref().and_then(|o| o.board_module.as_deref());
-    let (_, mir) = match compile_to_mir_with_includes_and_targets(
-        files,
-        &eff_includes,
-        hal_dir,
-        board_module,
-    ) {
-        Ok(res) => res,
-        Err(err) => return RamExecOutcome::CompileErr(err),
-    };
+    let (_, mir) =
+        match compile_to_mir_with_includes_and_targets(files, &eff_includes, hal_dir, board_module)
+        {
+            Ok(res) => res,
+            Err(err) => return RamExecOutcome::CompileErr(err),
+        };
     let mut text = mir.ram_report.format_table();
     if let Some(opts) = llvm_opts {
         match zev_codegen_llvm::analyze_hardware_stack_high_water(&mir, &opts) {
@@ -878,7 +875,9 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::ImportSvd { svd_path, output } => svd::run_import_svd(&svd_path, output.as_deref()),
+        Command::ImportSvd { svd_path, output } => {
+            svd::run_import_svd(&svd_path, output.as_deref())
+        }
         Command::Check {
             files,
             include_dirs,
@@ -1005,9 +1004,9 @@ fn main() -> ExitCode {
                 opts.opt_level = lvl.clone();
             }
             let mut eff_includes = include_dirs.clone();
-            if let Some(ref root) = opts.spec.as_ref().and_then(|s| s.root_dir.as_ref()) {
+            if let Some(root) = opts.spec.as_ref().and_then(|s| s.root_dir.as_ref()) {
                 if !eff_includes.contains(root) {
-                    eff_includes.push((*root).clone());
+                    eff_includes.push(root.clone());
                 }
             }
             match compile_to_mir_with_includes_and_targets(
@@ -1184,14 +1183,14 @@ fn main() -> ExitCode {
                             p
                         }
                     };
-                    let res = match zev_codegen_llvm::build_target_image(&mir, &built.opts, &out_path)
-                    {
-                        Ok(r) => r,
-                        Err(err) => {
-                            eprintln!("error: {err}");
-                            return ExitCode::FAILURE;
-                        }
-                    };
+                    let res =
+                        match zev_codegen_llvm::build_target_image(&mir, &built.opts, &out_path) {
+                            Ok(r) => r,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
                     print_target_build_summary(&built.spec, &res);
                     let target_label = built
                         .spec
@@ -1231,12 +1230,13 @@ fn main() -> ExitCode {
             include_dirs,
             opt_level,
             output,
-        } => {
-            match compile_to_mir_with_includes(&files, &include_dirs) {
+        } => match compile_to_mir_with_includes(&files, &include_dirs) {
             Ok((_, mir)) => {
                 let out_elf = output.unwrap_or_else(|| default_output_with_ext(&files, "elf"));
-                let mut opts = zev_codegen_llvm::CodegenOptions::default();
-                opts.opt_level = opt_level;
+                let opts = zev_codegen_llvm::CodegenOptions {
+                    opt_level,
+                    ..Default::default()
+                };
                 match zev_codegen_llvm::build_elf(&mir, &out_elf, &opts) {
                     Ok(res) => {
                         println!(
@@ -1262,8 +1262,7 @@ fn main() -> ExitCode {
                 eprintln!("{err}");
                 ExitCode::FAILURE
             }
-            }
-        }
+        },
         Command::RunQemu {
             files,
             include_dirs,
@@ -1281,40 +1280,40 @@ fn main() -> ExitCode {
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
             ) {
-            Ok((_, mir)) => {
-                let temp = match TempWorkDir::create("zevc-qemu") {
-                    Ok(t) => t,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                let elf_path = temp.dir.join("firmware.elf");
-                let qemu_opts = zev_codegen_llvm::QemuRunOptions::default();
-                match zev_codegen_llvm::run_qemu_cortex_m(&mir, &elf_path, &opts, &qemu_opts) {
-                    Ok(res) => {
-                        if !res.exec.stdout.is_empty() {
-                            print!("{}", res.exec.stdout);
+                Ok((_, mir)) => {
+                    let temp = match TempWorkDir::create("zevc-qemu") {
+                        Ok(t) => t,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::FAILURE;
                         }
-                        if !res.exec.stderr.is_empty() {
-                            eprint!("{}", res.exec.stderr);
+                    };
+                    let elf_path = temp.dir.join("firmware.elf");
+                    let qemu_opts = zev_codegen_llvm::QemuRunOptions::default();
+                    match zev_codegen_llvm::run_qemu_cortex_m(&mir, &elf_path, &opts, &qemu_opts) {
+                        Ok(res) => {
+                            if !res.exec.stdout.is_empty() {
+                                print!("{}", res.exec.stdout);
+                            }
+                            if !res.exec.stderr.is_empty() {
+                                eprint!("{}", res.exec.stderr);
+                            }
+                            if res.exec.exit_code == 0 {
+                                ExitCode::SUCCESS
+                            } else {
+                                ExitCode::from((res.exec.exit_code.clamp(1, 255)) as u8)
+                            }
                         }
-                        if res.exec.exit_code == 0 {
-                            ExitCode::SUCCESS
-                        } else {
-                            ExitCode::from((res.exec.exit_code.clamp(1, 255)) as u8)
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
                         }
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
         }
         Command::BuildEsp32C6 {
@@ -1331,26 +1330,26 @@ fn main() -> ExitCode {
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
             ) {
-            Ok((_, mir)) => {
-                let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
-                let out_elf = out_bin.with_extension("elf");
-                match zev_codegen_llvm::build_esp32c6_image_with_options(
-                    &mir, &out_elf, &out_bin, &opts,
-                ) {
-                    Ok(res) => {
-                        print_esp32c6_summary(&res);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+                Ok((_, mir)) => {
+                    let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
+                    let out_elf = out_bin.with_extension("elf");
+                    match zev_codegen_llvm::build_esp32c6_image_with_options(
+                        &mir, &out_elf, &out_bin, &opts,
+                    ) {
+                        Ok(res) => {
+                            print_esp32c6_summary(&res);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
         }
         Command::FlashEsp32C6 {
@@ -1368,51 +1367,51 @@ fn main() -> ExitCode {
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
             ) {
-            Ok((_, mir)) => {
-                let mut temp_holder: Option<TempWorkDir> = None;
-                let out_bin = match output {
-                    Some(p) => p,
-                    None => {
-                        let temp = match TempWorkDir::create("zevc-esp32c6") {
-                            Ok(t) => t,
-                            Err(err) => {
-                                eprintln!("error: {err}");
-                                return ExitCode::FAILURE;
-                            }
-                        };
-                        let p = temp.dir.join("firmware.bin");
-                        temp_holder = Some(temp);
-                        p
-                    }
-                };
-                let out_elf = out_bin.with_extension("elf");
-                let res = match zev_codegen_llvm::build_esp32c6_image_with_options(
-                    &mir, &out_elf, &out_bin, &opts,
-                ) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                print_esp32c6_summary(&res);
-                println!("Flashing ESP32-C6 on `{port}` at offset 0x0...");
-                match zev_codegen_llvm::flash_esp32c6_bin(&res.bin_path, &port) {
-                    Ok(esptool_out) => {
-                        print!("{esptool_out}");
-                        drop(temp_holder);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+                Ok((_, mir)) => {
+                    let mut temp_holder: Option<TempWorkDir> = None;
+                    let out_bin = match output {
+                        Some(p) => p,
+                        None => {
+                            let temp = match TempWorkDir::create("zevc-esp32c6") {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                            let p = temp.dir.join("firmware.bin");
+                            temp_holder = Some(temp);
+                            p
+                        }
+                    };
+                    let out_elf = out_bin.with_extension("elf");
+                    let res = match zev_codegen_llvm::build_esp32c6_image_with_options(
+                        &mir, &out_elf, &out_bin, &opts,
+                    ) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    print_esp32c6_summary(&res);
+                    println!("Flashing ESP32-C6 on `{port}` at offset 0x0...");
+                    match zev_codegen_llvm::flash_esp32c6_bin(&res.bin_path, &port) {
+                        Ok(esptool_out) => {
+                            print!("{esptool_out}");
+                            drop(temp_holder);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
         }
         Command::BuildAvr {
@@ -1565,9 +1564,7 @@ fn main() -> ExitCode {
                     }
                 };
                 print_avr_nano_every_summary(&res);
-                println!(
-                    "Flashing Arduino Nano Every (ATmega4809) on `{port}` via MuxTO UPDI..."
-                );
+                println!("Flashing Arduino Nano Every (ATmega4809) on `{port}` via MuxTO UPDI...");
                 match zev_codegen_llvm::flash_avr_nano_every_bin(&res.bin_path, &port) {
                     Ok(flash_out) => {
                         print!("{flash_out}");
@@ -1599,28 +1596,28 @@ fn main() -> ExitCode {
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
             ) {
-            Ok((_, mir)) => {
-                let out_uf2 = output.unwrap_or_else(|| default_output_with_ext(&files, "uf2"));
-                let out_elf = out_uf2.with_extension("elf");
-                match zev_codegen_llvm::build_rp2040_image_with_options(
-                    &mir, &out_elf, &out_uf2, &opts,
-                ) {
-                    Ok(res) => {
-                        print_rp2040_summary(&res);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+                Ok((_, mir)) => {
+                    let out_uf2 = output.unwrap_or_else(|| default_output_with_ext(&files, "uf2"));
+                    let out_elf = out_uf2.with_extension("elf");
+                    match zev_codegen_llvm::build_rp2040_image_with_options(
+                        &mir, &out_elf, &out_uf2, &opts,
+                    ) {
+                        Ok(res) => {
+                            print_rp2040_summary(&res);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
-            }
-        },
+        }
         Command::FlashRp2040 {
             files,
             include_dirs,
@@ -1636,51 +1633,51 @@ fn main() -> ExitCode {
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
             ) {
-            Ok((_, mir)) => {
-                let mut temp_holder: Option<TempWorkDir> = None;
-                let out_uf2 = match output {
-                    Some(p) => p,
-                    None => {
-                        let temp = match TempWorkDir::create("zevc-rp2040") {
-                            Ok(t) => t,
-                            Err(err) => {
-                                eprintln!("error: {err}");
-                                return ExitCode::FAILURE;
-                            }
-                        };
-                        let p = temp.dir.join("firmware.uf2");
-                        temp_holder = Some(temp);
-                        p
-                    }
-                };
-                let out_elf = out_uf2.with_extension("elf");
-                let res = match zev_codegen_llvm::build_rp2040_image_with_options(
-                    &mir, &out_elf, &out_uf2, &opts,
-                ) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                print_rp2040_summary(&res);
-                println!("Flashing Raspberry Pi RP2040 (`{port}` -> `RPI-RP2`)...");
-                match zev_codegen_llvm::flash_rp2040_uf2(&res.uf2_path, &port) {
-                    Ok(flash_out) => {
-                        print!("{flash_out}");
-                        drop(temp_holder);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+                Ok((_, mir)) => {
+                    let mut temp_holder: Option<TempWorkDir> = None;
+                    let out_uf2 = match output {
+                        Some(p) => p,
+                        None => {
+                            let temp = match TempWorkDir::create("zevc-rp2040") {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                            let p = temp.dir.join("firmware.uf2");
+                            temp_holder = Some(temp);
+                            p
+                        }
+                    };
+                    let out_elf = out_uf2.with_extension("elf");
+                    let res = match zev_codegen_llvm::build_rp2040_image_with_options(
+                        &mir, &out_elf, &out_uf2, &opts,
+                    ) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    print_rp2040_summary(&res);
+                    println!("Flashing Raspberry Pi RP2040 (`{port}` -> `RPI-RP2`)...");
+                    match zev_codegen_llvm::flash_rp2040_uf2(&res.uf2_path, &port) {
+                        Ok(flash_out) => {
+                            print!("{flash_out}");
+                            drop(temp_holder);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
         }
     }
@@ -1806,7 +1803,10 @@ mod tests {
                 fail.human
             );
             let json = render_check_json_err(&fail.json_diags);
-            assert!(json.contains(&format!("\"code\": \"{expected_code}\"")), "json={json}");
+            assert!(
+                json.contains(&format!("\"code\": \"{expected_code}\"")),
+                "json={json}"
+            );
             assert!(
                 json.contains(&format!("\"doc_cmd\": \"zevc doc {expected_code}\"")),
                 "json={json}"
@@ -1823,10 +1823,18 @@ mod tests {
         ) else {
             panic!("expected 3-hop yield chain in ISR to fail");
         };
-        assert!(f_chain.human.contains("error[E0005]"), "human=\n{}", f_chain.human);
+        assert!(
+            f_chain.human.contains("error[E0005]"),
+            "human=\n{}",
+            f_chain.human
+        );
         assert!(f_chain.human.contains("f1"), "human=\n{}", f_chain.human);
         assert!(f_chain.human.contains("f2"), "human=\n{}", f_chain.human);
-        assert!(f_chain.human.contains("zevc doc E0005"), "human=\n{}", f_chain.human);
+        assert!(
+            f_chain.human.contains("zevc doc E0005"),
+            "human=\n{}",
+            f_chain.human
+        );
 
         let Err(f_meth) = check_temp_file(
             "bad_meth.zev",
@@ -1834,11 +1842,18 @@ mod tests {
         ) else {
             panic!("expected invalid inbox method to fail");
         };
-        assert!(f_meth.human.contains("error[E0020]"), "human=\n{}", f_meth.human);
+        assert!(
+            f_meth.human.contains("error[E0020]"),
+            "human=\n{}",
+            f_meth.human
+        );
         assert!(f_meth.human.contains("post"), "human=\n{}", f_meth.human);
         let json = render_check_json_err(&f_meth.json_diags);
         assert!(json.contains("\"code\": \"E0020\""), "json={json}");
-        assert!(json.contains("\"doc_cmd\": \"zevc doc E0020\""), "json={json}");
+        assert!(
+            json.contains("\"doc_cmd\": \"zevc doc E0020\""),
+            "json={json}"
+        );
 
         let ok = check_temp_file(
             "partial_ok.zev",
@@ -1855,8 +1870,14 @@ mod tests {
             &ok.sema.monomorphized_instances,
         );
         assert!(ok_json.starts_with("{\"ok\": true"));
-        assert!(ok_json.contains("\"dual_specialized_functions\": []"), "json={ok_json}");
-        assert!(ok_json.contains("\"monomorphized_instances\": []"), "json={ok_json}");
+        assert!(
+            ok_json.contains("\"dual_specialized_functions\": []"),
+            "json={ok_json}"
+        );
+        assert!(
+            ok_json.contains("\"monomorphized_instances\": []"),
+            "json={ok_json}"
+        );
     }
 
     #[test]
@@ -1944,8 +1965,16 @@ fn main() {
             let Err(fail) = check_temp_file(fname, src) else {
                 panic!("expected `{fname}` to fail with `{code}`");
             };
-            assert!(fail.human.contains(&format!("error[{code}]")), "human=\n{}", fail.human);
-            assert!(fail.human.contains(&format!("zevc doc {code}")), "human=\n{}", fail.human);
+            assert!(
+                fail.human.contains(&format!("error[{code}]")),
+                "human=\n{}",
+                fail.human
+            );
+            assert!(
+                fail.human.contains(&format!("zevc doc {code}")),
+                "human=\n{}",
+                fail.human
+            );
             assert!(docs::lookup_doc(Some(code), false).is_ok());
         }
     }
@@ -2040,7 +2069,10 @@ fn main() {
             ram_table.contains("7. Monomorphized Generic Instantiations"),
             "ram_table=\n{ram_table}"
         );
-        assert!(ram_table.contains("FixedVec<u32, 8>"), "ram_table=\n{ram_table}");
+        assert!(
+            ram_table.contains("FixedVec<u32, 8>"),
+            "ram_table=\n{ram_table}"
+        );
         assert!(ram_table.contains("clamp<f32>"), "ram_table=\n{ram_table}");
 
         // 3. Verify emitted host LLVM IR runs cleanly under ASan/UBSan (`fit_line` + `trunc_line` + `println(f"...")`)
@@ -2070,8 +2102,16 @@ fn main() {
             let Err(fail) = check_temp_file(fname, src) else {
                 panic!("expected `{fname}` to fail with `{code}`");
             };
-            assert!(fail.human.contains(&format!("error[{code}]")), "human=\n{}", fail.human);
-            assert!(fail.human.contains(&format!("zevc doc {code}")), "human=\n{}", fail.human);
+            assert!(
+                fail.human.contains(&format!("error[{code}]")),
+                "human=\n{}",
+                fail.human
+            );
+            assert!(
+                fail.human.contains(&format!("zevc doc {code}")),
+                "human=\n{}",
+                fail.human
+            );
             assert!(docs::lookup_doc(Some(code), false).is_ok());
         }
     }
@@ -2122,7 +2162,11 @@ fn main() {
         let Err(unparen_err) = load_and_check_detailed(&[lib_path.clone(), unparen_path]) else {
             panic!("expected unparenthesized check_window(A < B, C > (D + 1)) to fail sema");
         };
-        assert!(unparen_err.human.contains("error[E0029]"), "human=\n{}", unparen_err.human);
+        assert!(
+            unparen_err.human.contains("error[E0029]"),
+            "human=\n{}",
+            unparen_err.human
+        );
         assert!(
             unparen_err.human.contains("parenthesize"),
             "expected parenthesization note, got:\n{}",
@@ -2131,7 +2175,9 @@ fn main() {
 
         // Pass `app_path` twice to also verify canonical input path deduplication (no E0021!)
         let bundle = load_and_check_detailed(&[lib_path, app_path.clone(), app_path])
-            .unwrap_or_else(|e| panic!("multi-file generic + comparison check failed:\n{}", e.human));
+            .unwrap_or_else(|e| {
+                panic!("multi-file generic + comparison check failed:\n{}", e.human)
+            });
         assert_eq!(bundle.programs.len(), 2);
 
         let dual_vec: Vec<String> = bundle.sema.dual_specialized_fns.iter().cloned().collect();
@@ -2159,12 +2205,20 @@ fn main() {
         let Err(f_print) = check_temp_file("bad_print.zev", "fn main() { print(123); }\n") else {
             panic!("print(123) must be rejected by zev-sema");
         };
-        assert!(f_print.human.contains("error[E0019]"), "human=\n{}", f_print.human);
+        assert!(
+            f_print.human.contains("error[E0019]"),
+            "human=\n{}",
+            f_print.human
+        );
 
         let Err(f_sim) = check_temp_file("bad_sim.zev", "fn main() { sim.log(1, 2, 3); }\n") else {
             panic!("sim.log must be rejected by zev-sema");
         };
-        assert!(f_sim.human.contains("error[E0020]"), "human=\n{}", f_sim.human);
+        assert!(
+            f_sim.human.contains("error[E0020]"),
+            "human=\n{}",
+            f_sim.human
+        );
 
         let parity_src = "\
 const u8 CMD_HEAT = 7;
@@ -2224,8 +2278,10 @@ fn main() {
         assert_eq!(host_exit, 0);
 
         // 2. Verify Cortex-M3 QEMU with --max-ticks 15
-        let mut q_opts = zev_codegen_llvm::CodegenOptions::default();
-        q_opts.max_ticks = 15;
+        let q_opts = zev_codegen_llvm::CodegenOptions {
+            max_ticks: 15,
+            ..Default::default()
+        };
         let elf_path = temp.dir.join("parity.elf");
         let qres = zev_codegen_llvm::run_qemu_cortex_m(
             &mir,
@@ -2235,10 +2291,26 @@ fn main() {
         )
         .expect("QEMU parity run must succeed");
         assert_eq!(qres.exec.exit_code, 0);
-        assert!(qres.exec.stdout.contains("arm=2"), "out={}", qres.exec.stdout);
-        assert!(qres.exec.stdout.contains("diff=-200"), "out={}", qres.exec.stdout);
-        assert!(qres.exec.stdout.contains("temp=42"), "out={}", qres.exec.stdout);
-        assert!(qres.exec.stdout.contains("tick"), "out={}", qres.exec.stdout);
+        assert!(
+            qres.exec.stdout.contains("arm=2"),
+            "out={}",
+            qres.exec.stdout
+        );
+        assert!(
+            qres.exec.stdout.contains("diff=-200"),
+            "out={}",
+            qres.exec.stdout
+        );
+        assert!(
+            qres.exec.stdout.contains("temp=42"),
+            "out={}",
+            qres.exec.stdout
+        );
+        assert!(
+            qres.exec.stdout.contains("tick"),
+            "out={}",
+            qres.exec.stdout
+        );
     }
 
     #[test]
@@ -2289,8 +2361,8 @@ fn main() {
             assert_eq!(opts.target, zev_codegen_llvm::TargetArch::AvrAtmega328p);
         }
 
-        let demo_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../examples/arduino_uno_demo.zev");
+        let demo_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/arduino_uno_demo.zev");
         assert!(
             load_and_check_detailed(std::slice::from_ref(&demo_path)).is_ok(),
             "examples/arduino_uno_demo.zev must check cleanly"
@@ -2341,7 +2413,10 @@ fn main() {
                 text,
                 within_budget,
             } => {
-                assert!(within_budget, "expected within_budget for nano-every:\n{text}");
+                assert!(
+                    within_budget,
+                    "expected within_budget for nano-every:\n{text}"
+                );
                 assert!(text.contains("STATIC ZERO-HEAP SRAM REPORT"));
                 assert!(text.contains("HARDWARE SINGLE-STACK + .BSS HIGH-WATER PROOF"));
                 assert!(text.contains("6144 B"), "missing 6144 B in:\n{text}");
@@ -2414,7 +2489,10 @@ fn main() {
                     assert!(within_budget, "expected within_budget for {tgt}:\n{text}");
                     assert!(text.contains("STATIC ZERO-HEAP SRAM REPORT"));
                     assert!(text.contains("HARDWARE SINGLE-STACK + .BSS HIGH-WATER PROOF"));
-                    assert!(text.contains(budget_str), "missing {budget_str} in:\n{text}");
+                    assert!(
+                        text.contains(budget_str),
+                        "missing {budget_str} in:\n{text}"
+                    );
                     assert!(text.contains("PASS"));
                 }
                 _ => panic!("expected targeted ram output for {tgt}"),
@@ -2423,7 +2501,12 @@ fn main() {
 
         // 3. `zevc ram --target host` is rejected as usage error
         assert!(matches!(
-            execute_ram_command(&[root.join("examples/sim_demo.zev")], &[], Some("host"), None),
+            execute_ram_command(
+                &[root.join("examples/sim_demo.zev")],
+                &[],
+                Some("host"),
+                None
+            ),
             RamExecOutcome::UsageErr(_)
         ));
     }
@@ -2534,16 +2617,14 @@ fn main() {
         )
         .unwrap();
 
-        let (mdir, manifest) =
-            zev_codegen_llvm::ProjectManifest::discover(&temp.dir.join("src"))
-                .expect("manifest parse")
-                .expect("manifest found");
+        let (mdir, manifest) = zev_codegen_llvm::ProjectManifest::discover(&temp.dir.join("src"))
+            .expect("manifest parse")
+            .expect("manifest found");
         assert_eq!(mdir, temp.dir);
         assert_eq!(manifest.entry.as_deref(), Some(Path::new("src/app.zev")));
 
-        let resolved =
-            resolve_project_build_inputs(&[entry_path], &[], None, None, None, None)
-                .expect("resolve custom project");
+        let resolved = resolve_project_build_inputs(&[entry_path], &[], None, None, None, None)
+            .expect("resolve custom project");
         assert_eq!(resolved.spec.chip_name, "my_cm3");
         assert_eq!(resolved.spec.board_name.as_deref(), Some("my_board"));
         assert_eq!(resolved.spec.ram_size, 32768);
@@ -2553,8 +2634,7 @@ fn main() {
         let (_, mir) =
             compile_to_mir_with_includes(&resolved.files, &resolved.include_dirs).unwrap();
         let out_elf = temp.dir.join("custom.elf");
-        let built =
-            zev_codegen_llvm::build_target_image(&mir, &resolved.opts, &out_elf).unwrap();
+        let built = zev_codegen_llvm::build_target_image(&mir, &resolved.opts, &out_elf).unwrap();
         assert!(built.image_path.is_file());
         assert_eq!(built.elf.audit.undefined_symbols.len(), 0);
     }
@@ -3112,9 +3192,18 @@ fn main() {
         .unwrap();
         let (bundle, mir) = compile_to_mir_with_includes(&[src_path], &[]).unwrap();
         let table = mir.ram_report.format_table();
-        assert!(table.contains("max non-yield run: straight-line"), "table=\n{table}");
-        assert!(table.contains("max non-yield run: bounded-for"), "table=\n{table}");
-        assert!(table.contains("max non-yield run: noyield-spin"), "table=\n{table}");
+        assert!(
+            table.contains("max non-yield run: straight-line"),
+            "table=\n{table}"
+        );
+        assert!(
+            table.contains("max non-yield run: bounded-for"),
+            "table=\n{table}"
+        );
+        assert!(
+            table.contains("max non-yield run: noyield-spin"),
+            "table=\n{table}"
+        );
 
         let task_runs: Vec<TaskRunSummary> = mir
             .ram_report
@@ -3139,12 +3228,24 @@ fn main() {
             &bundle.sema.monomorphized_instances,
             &task_runs,
         );
-        assert!(json.contains("\"blueprint\": \"t_straight\""), "json={json}");
-        assert!(json.contains("\"max_run_kind\": \"straight-line\""), "json={json}");
+        assert!(
+            json.contains("\"blueprint\": \"t_straight\""),
+            "json={json}"
+        );
+        assert!(
+            json.contains("\"max_run_kind\": \"straight-line\""),
+            "json={json}"
+        );
         assert!(json.contains("\"blueprint\": \"t_for\""), "json={json}");
-        assert!(json.contains("\"max_run_kind\": \"bounded-for\""), "json={json}");
+        assert!(
+            json.contains("\"max_run_kind\": \"bounded-for\""),
+            "json={json}"
+        );
         assert!(json.contains("\"blueprint\": \"t_spin\""), "json={json}");
-        assert!(json.contains("\"max_run_kind\": \"noyield-spin\""), "json={json}");
+        assert!(
+            json.contains("\"max_run_kind\": \"noyield-spin\""),
+            "json={json}"
+        );
     }
 
     #[test]
@@ -3169,7 +3270,8 @@ fn main() {
         let src_path = temp.dir.join("pick.zev");
         std::fs::write(&src_path, src).unwrap();
 
-        let (_, mir) = compile_to_mir(&[src_path]).expect("fn pick() -> fn(u32) -> u32 must check & lower");
+        let (_, mir) =
+            compile_to_mir(&[src_path]).expect("fn pick() -> fn(u32) -> u32 must check & lower");
         let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(
             &mir,
             &zev_codegen_llvm::CodegenOptions::host_linux(),
@@ -3490,7 +3592,10 @@ fn main() {
             &zev_codegen_llvm::CodegenOptions::host_linux(),
         )
         .unwrap();
-        assert_eq!(runner::compile_and_run_host_llvm(&ll_timers, true, &[]).unwrap(), 0);
+        assert_eq!(
+            runner::compile_and_run_host_llvm(&ll_timers, true, &[]).unwrap(),
+            0
+        );
 
         // 2. Priority starvation preemption windows across `i32::MAX` and `u32::MAX` wraparound.
         let src_starve = "\
@@ -3527,7 +3632,10 @@ fn main() {
             &zev_codegen_llvm::CodegenOptions::host_linux(),
         )
         .unwrap();
-        assert_eq!(runner::compile_and_run_host_llvm(&ll_starve, true, &[]).unwrap(), 0);
+        assert_eq!(
+            runner::compile_and_run_host_llvm(&ll_starve, true, &[]).unwrap(),
+            0
+        );
 
         // Also test starvation window crossing `u32::MAX -> 0` (`0xFFFF_FFFD -> 0x0000_0002`).
         let src_starve_u32 = "\

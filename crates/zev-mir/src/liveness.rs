@@ -50,11 +50,7 @@ pub fn analyze_fn_frame(func: &mut MirFunction) {
     }
 }
 
-fn compute_hoisting(
-    param_set: &BTreeSet<VarId>,
-    vars: &mut [MirVar],
-    blocks: &[MirBlock],
-) {
+fn compute_hoisting(param_set: &BTreeSet<VarId>, vars: &mut [MirVar], blocks: &[MirBlock]) {
     let block_index: BTreeMap<BlockId, usize> =
         blocks.iter().enumerate().map(|(i, b)| (b.id, i)).collect();
 
@@ -519,7 +515,9 @@ fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
         }
         MirPrimNonBlockingOp::ByteRingConsume { target, len, .. }
         | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. }
-        | MirPrimNonBlockingOp::PingPongCompleteHalf { target, half: len, .. } => {
+        | MirPrimNonBlockingOp::PingPongCompleteHalf {
+            target, half: len, ..
+        } => {
             collect_prim_target_uses(target, uses);
             collect_expr_uses(len, uses);
         }
@@ -603,10 +601,18 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
                 collect_expr_uses(idx, uses);
             }
         }
-        MirExprKind::AddrOfPlace(place) | MirExprKind::ArrayToSlice { array_place: place, .. } => {
+        MirExprKind::AddrOfPlace(place)
+        | MirExprKind::ArrayToSlice {
+            array_place: place, ..
+        } => {
             collect_place_uses_for_partial_write(place, uses);
         }
-        MirExprKind::Binary { lhs, rhs, .. } | MirExprKind::Index { base: lhs, index: rhs, .. } => {
+        MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::Index {
+            base: lhs,
+            index: rhs,
+            ..
+        } => {
             collect_expr_uses(lhs, uses);
             collect_expr_uses(rhs, uses);
         }
@@ -639,7 +645,9 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
                 collect_expr_uses(value, uses);
             }
             MirPrimReadOp::ByteRingPush { target, src, .. }
-            | MirPrimReadOp::ByteRingPop { target, dst: src, .. } => {
+            | MirPrimReadOp::ByteRingPop {
+                target, dst: src, ..
+            } => {
                 collect_prim_target_uses(target, uses);
                 collect_expr_uses(src, uses);
             }
@@ -776,7 +784,12 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
                 collect_addr_of_vars(idx, out);
             }
         }
-        MirExprKind::Binary { lhs, rhs, .. } | MirExprKind::Index { base: lhs, index: rhs, .. } => {
+        MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::Index {
+            base: lhs,
+            index: rhs,
+            ..
+        } => {
             collect_addr_of_vars(lhs, out);
             collect_addr_of_vars(rhs, out);
         }
@@ -818,12 +831,12 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
                 collect_addr_of_vars(view, out);
                 collect_addr_of_vars(value, out);
             }
-            MirPrimReadOp::ByteRingViewPush { view, src: value, .. }
+            MirPrimReadOp::ByteRingViewPush {
+                view, src: value, ..
+            }
             | MirPrimReadOp::ByteRingViewPop { view, dst: value }
             | MirPrimReadOp::ByteRingViewPushByte {
-                view,
-                byte: value,
-                ..
+                view, byte: value, ..
             }
             | MirPrimReadOp::ByteRingViewGrantWrite { view, len: value } => {
                 collect_addr_of_vars(view, out);
@@ -918,12 +931,10 @@ fn collect_alias_sources_expr(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
                 }
             }
         }
-        MirExprKind::RomCallU32 { addr, args, .. } => {
-            if type_may_carry_alias(&expr.ty) {
-                collect_alias_sources_expr(addr, out);
-                for a in args {
-                    collect_alias_sources_expr(a, out);
-                }
+        MirExprKind::RomCallU32 { addr, args, .. } if type_may_carry_alias(&expr.ty) => {
+            collect_alias_sources_expr(addr, out);
+            for a in args {
+                collect_alias_sources_expr(a, out);
             }
         }
         _ => {}

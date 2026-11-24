@@ -7,18 +7,20 @@ pub(super) use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, BuiltinFn, CallArg, CatchClause,
     ConstDecl, DurationLit, EnumDecl, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec,
     GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal, MmioAccess, MmioDecl,
-    MmioDeclKind, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType, Priority, Program, SYS_NAMESPACE,
-    SpawnStmt, Span, Stmt, StmtKind, StructDecl, SwitchPat, SysMethod, TaskDecl, TypeExpr,
-    TypeKind, UnaryOp,
+    MmioDeclKind, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType, Priority, Program, Span,
+    SpawnStmt, Stmt, StmtKind, StructDecl, SwitchPat, SysMethod, TaskDecl, TypeExpr, TypeKind,
+    UnaryOp, SYS_NAMESPACE,
 };
 
-pub(super) use crate::call_graph::{CallContext, CallEdge, CallGraph, CallableKind, ExternCallbackSite};
+pub(super) use crate::call_graph::{
+    CallContext, CallEdge, CallGraph, CallableKind, ExternCallbackSite,
+};
 pub(super) use crate::diag::{Diagnostic, DiagnosticKind};
 pub(super) use crate::model::{
-    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo,
-    IrqInfo, IsrInfo, IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo,
-    MonomorphizedInstance, MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite,
-    SemanticModel, SpawnedTaskInstance, SubsystemInfo, TaskInfo,
+    ConstInfo, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo, IrqInfo, IsrInfo,
+    IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo, MonomorphizedInstance,
+    MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite, SemanticModel,
+    SpawnedTaskInstance, SubsystemInfo, TaskInfo, DEFAULT_TICK_PERIOD_US,
 };
 pub(super) use crate::modules::LinkedModulesOutput;
 pub(super) use crate::provenance::{LeaseEnv, Provenance};
@@ -84,8 +86,14 @@ pub(super) struct IllegalGlobalInfo {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum LinearLeaseState {
     Live,
-    DeferredRelease { span: Span, scope_depth: u32 },
-    Moved { moved_at: Span, reason: &'static str },
+    DeferredRelease {
+        span: Span,
+        scope_depth: u32,
+    },
+    Moved {
+        moved_at: Span,
+        reason: &'static str,
+    },
     Uninit,
 }
 
@@ -318,7 +326,6 @@ pub(crate) struct Analyzer {
     pub(super) diagnostics: Vec<Diagnostic>,
 }
 
-
 mod analyzer;
 mod body_exprs;
 mod body_stmts;
@@ -365,4 +372,3 @@ pub(super) struct BodyChecker<'a> {
     pub(super) next_lease_var_id: u64,
     pub(super) expr_tys: std::collections::HashMap<usize, Ty>,
 }
-

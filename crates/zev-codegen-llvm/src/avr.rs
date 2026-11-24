@@ -66,7 +66,10 @@ pub fn emit_avr_startup_ir(
         "; ── AVR ({}) {vector_slots}-Slot Flash Vector Table (@ 0x{:04X}) ──",
         spec.cpu, spec.flash_base
     );
-    let _ = writeln!(out, "module asm \".section .vectors, \\22ax\\22, @progbits\"");
+    let _ = writeln!(
+        out,
+        "module asm \".section .vectors, \\22ax\\22, @progbits\""
+    );
     let _ = writeln!(out, "module asm \".global _start\"");
     let _ = writeln!(out, "module asm \"_start:\"");
     let _ = writeln!(out, "module asm \"  {br_inst} __syn_avr_reset\"");

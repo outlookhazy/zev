@@ -94,10 +94,7 @@ impl<'a> Parser<'a> {
         let expr = match self.peek_kind() {
             TokenKind::Int { value, suffix } => {
                 let tok = self.bump();
-                Expr::new(
-                    ExprKind::Literal(Literal::Int { value, suffix }),
-                    tok.span,
-                )
+                Expr::new(ExprKind::Literal(Literal::Int { value, suffix }), tok.span)
             }
             TokenKind::KwTrue => {
                 let tok = self.bump();
@@ -144,7 +141,7 @@ impl<'a> Parser<'a> {
         };
 
         if self.at(&TokenKind::Comma) || self.at(&TokenKind::Gt) || self.at(&TokenKind::Shr) {
-            Some(GenericArg::Const(expr))
+            Some(GenericArg::Const(Box::new(expr)))
         } else {
             None
         }
@@ -347,7 +344,12 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn trap_p0002_colon_binding(&self, name: &str, ty_hint: Option<&str>, span: Span) -> ParseError {
+    fn trap_p0002_colon_binding(
+        &self,
+        name: &str,
+        ty_hint: Option<&str>,
+        span: Span,
+    ) -> ParseError {
         let rewrite = match ty_hint {
             Some(t) => format!(
                 "write C-style `{t} {name}` instead of `{name}: {t}`; functions use `fn foo({t} {name}) -> {t} {{ ... }}`"
@@ -372,18 +374,20 @@ impl<'a> Parser<'a> {
         span: Span,
     ) -> ParseError {
         let hint = match ret_hint {
-            Some("void") => format!(
-                "remove `void`; `fn {fn_name}(...) {{ ... }}` already returns `void`"
-            ),
-            Some(rt) => format!(
-                "write `->` before the return type: `fn {fn_name}(...) -> {rt} {{ ... }}`"
-            ),
-            None => format!(
-                "write `->` before the return type: `fn {fn_name}(u16 x) -> u16 {{ ... }}`"
-            ),
+            Some("void") => {
+                format!("remove `void`; `fn {fn_name}(...) {{ ... }}` already returns `void`")
+            }
+            Some(rt) => {
+                format!("write `->` before the return type: `fn {fn_name}(...) -> {rt} {{ ... }}`")
+            }
+            None => {
+                format!("write `->` before the return type: `fn {fn_name}(u16 x) -> u16 {{ ... }}`")
+            }
         };
         self.err_at(
-            format!("postfix return type without `->` after `fn {fn_name}(...)` is not valid in Zev"),
+            format!(
+                "postfix return type without `->` after `fn {fn_name}(...)` is not valid in Zev"
+            ),
             span,
         )
         .with_code("P0002")
@@ -537,13 +541,10 @@ impl<'a> Parser<'a> {
             None => "replace `::` with `.`; Zev uses `.` for module paths, enum variants, and member access"
                 .to_string(),
         };
-        self.err_at(
-            "retired `::` path separator; use `.` instead",
-            span,
-        )
-        .with_code("P0016")
-        .with_doc_topic("syntax")
-        .with_hint(hint)
+        self.err_at("retired `::` path separator; use `.` instead", span)
+            .with_code("P0016")
+            .with_doc_topic("syntax")
+            .with_hint(hint)
     }
 
     fn trap_p0016_turbofish(&self, span: Span) -> ParseError {
@@ -558,34 +559,35 @@ impl<'a> Parser<'a> {
 
     fn trap_p0017(&self, ty_str: &str, span: Span) -> ParseError {
         self.err_at(
-            format!("retired C-style cast `({ty_str})expr`; use postfix `expr as {ty_str}` instead"),
+            format!(
+                "retired C-style cast `({ty_str})expr`; use postfix `expr as {ty_str}` instead"
+            ),
             span,
         )
         .with_code("P0017")
         .with_doc_topic("syntax")
-        .with_hint(format!(
-            "rewrite `({ty_str})expr` as `expr as {ty_str}`"
-        ))
+        .with_hint(format!("rewrite `({ty_str})expr` as `expr as {ty_str}`"))
     }
 
     fn trap_p0018(&self, ret_type: &TypeExpr, fn_name: &str, span: Span) -> ParseError {
         let ret_str = self.type_snippet(ret_type.span);
-        let (msg, hint) =
-            if ret_str == "void" || matches!(ret_type.kind, TypeKind::Prim(PrimType::Void)) {
-                (
+        let (msg, hint) = if ret_str == "void"
+            || matches!(ret_type.kind, TypeKind::Prim(PrimType::Void))
+        {
+            (
                     format!(
                         "retired return-first declaration `void {fn_name}(...)`; write `fn {fn_name}(...)` instead"
                     ),
                     format!("rewrite `void {fn_name}(...)` as `fn {fn_name}(...)` (omit `void`)"),
                 )
-            } else {
-                (
+        } else {
+            (
                     format!(
                         "retired return-first declaration `{ret_str} {fn_name}(...)`; write `fn {fn_name}(...) -> {ret_str}` instead"
                     ),
                     format!("rewrite `{ret_str} {fn_name}(...)` as `fn {fn_name}(...) -> {ret_str}`"),
                 )
-            };
+        };
         self.err_at(msg, span)
             .with_code("P0018")
             .with_doc_topic("syntax")
@@ -678,10 +680,7 @@ impl<'a> Parser<'a> {
                     return Err(trap_err);
                 }
                 Err(self
-                    .err_at(
-                        format!("expected identifier, found {}", tok.kind),
-                        tok.span,
-                    )
+                    .err_at(format!("expected identifier, found {}", tok.kind), tok.span)
                     .with_doc_topic("syntax"))
             }
         }
@@ -889,7 +888,9 @@ impl<'a> Parser<'a> {
                 return Err(self.trap_p0007("Zig-style `!Type` error-union return type", cur_span));
             }
             TokenKind::Question => {
-                return Err(self.trap_p0007("Zig-style `?Type` optional/error return type", cur_span));
+                return Err(
+                    self.trap_p0007("Zig-style `?Type` optional/error return type", cur_span)
+                );
             }
             TokenKind::Lifetime(ref lt) => {
                 return Err(self.trap_p0009_lifetime(lt, cur_span));
@@ -908,7 +909,12 @@ impl<'a> Parser<'a> {
                 let imps = self.parse_imports()?;
                 for imp in imps {
                     let span = first_span.merge(imp.span);
-                    out.push(Item::with_pub(attrs.clone(), is_pub, ItemKind::Import(imp), span));
+                    out.push(Item::with_pub(
+                        attrs.clone(),
+                        is_pub,
+                        ItemKind::Import(imp),
+                        span,
+                    ));
                 }
             }
             TokenKind::KwPacked | TokenKind::KwStruct => {
@@ -1101,7 +1107,10 @@ impl<'a> Parser<'a> {
                         TokenKind::Int { value: n, .. } => n.to_string(),
                         other => {
                             return Err(self
-                                .err_at(format!("unexpected attribute argument {other}"), arg_tok.span)
+                                .err_at(
+                                    format!("unexpected attribute argument {other}"),
+                                    arg_tok.span,
+                                )
                                 .with_doc_topic("tasks"));
                         }
                     };
@@ -1268,7 +1277,10 @@ impl<'a> Parser<'a> {
         let cur_span = self.peek_span();
         if self.at(&TokenKind::KwExtern) {
             return Err(self
-                .err_at("`extern \"C\"` declarations are not allowed inside `impl` blocks", cur_span)
+                .err_at(
+                    "`extern \"C\"` declarations are not allowed inside `impl` blocks",
+                    cur_span,
+                )
                 .with_doc_topic("syntax"));
         }
 
@@ -1325,10 +1337,7 @@ impl<'a> Parser<'a> {
         } else {
             if self.at(&TokenKind::Bang) {
                 let bang = self.bump();
-                return Err(self.trap_p0007(
-                    "Zig-style `!Type` error-union return type",
-                    bang.span,
-                ));
+                return Err(self.trap_p0007("Zig-style `!Type` error-union return type", bang.span));
             }
             if !self.at(&TokenKind::LBrace)
                 && !self.at(&TokenKind::KwError)
@@ -1373,7 +1382,9 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_method_param_list(&mut self) -> Result<(Option<SelfReceiver>, Vec<Param>), ParseError> {
+    fn parse_method_param_list(
+        &mut self,
+    ) -> Result<(Option<SelfReceiver>, Vec<Param>), ParseError> {
         self.expect(&TokenKind::LParen)?;
         let mut receiver = None;
         let mut params = Vec::new();
@@ -1404,7 +1415,10 @@ impl<'a> Parser<'a> {
         while !self.at(&TokenKind::RParen) && !self.at(&TokenKind::Eof) {
             if self.at(&TokenKind::DotDotDot) {
                 return Err(self
-                    .err_at("methods inside `impl` cannot be variadic (`...`)", self.peek_span())
+                    .err_at(
+                        "methods inside `impl` cannot be variadic (`...`)",
+                        self.peek_span(),
+                    )
                     .with_doc_topic("syntax"));
             }
             if self.at(&TokenKind::KwSelf)
@@ -1628,7 +1642,12 @@ impl<'a> Parser<'a> {
                     return Err(self.trap_p0018(&ty, &name.name, item_start.merge(name.span)));
                 };
                 let span = item_start.merge(decl.span);
-                out.push(Item::with_pub(item_attrs, item_is_pub, ItemKind::Fn(decl), span));
+                out.push(Item::with_pub(
+                    item_attrs,
+                    item_is_pub,
+                    ItemKind::Fn(decl),
+                    span,
+                ));
             }
             self.expect(&TokenKind::RBrace)?;
         } else if self.at(&TokenKind::KwFn) {
@@ -1825,10 +1844,7 @@ impl<'a> Parser<'a> {
         } else {
             if self.at(&TokenKind::Bang) {
                 let bang = self.bump();
-                return Err(self.trap_p0007(
-                    "Zig-style `!Type` error-union return type",
-                    bang.span,
-                ));
+                return Err(self.trap_p0007("Zig-style `!Type` error-union return type", bang.span));
             }
 
             if !self.at(&TokenKind::LBrace)
@@ -1889,7 +1905,10 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::Gt) || self.at(&TokenKind::Shr) {
             let gt_span = self.expect_type_gt()?;
             return Err(self
-                .err_at("empty generic parameter list `<>`", lt_tok.span.merge(gt_span))
+                .err_at(
+                    "empty generic parameter list `<>`",
+                    lt_tok.span.merge(gt_span),
+                )
                 .with_doc_topic("syntax"));
         }
 
@@ -1976,7 +1995,10 @@ impl<'a> Parser<'a> {
         if self.at(&TokenKind::Gt) || self.at(&TokenKind::Shr) {
             let gt_span = self.expect_type_gt()?;
             return Err(self
-                .err_at("empty generic argument list `<>`", lt_tok.span.merge(gt_span))
+                .err_at(
+                    "empty generic argument list `<>`",
+                    lt_tok.span.merge(gt_span),
+                )
                 .with_doc_topic("syntax"));
         }
 
@@ -2015,7 +2037,7 @@ impl<'a> Parser<'a> {
         }
 
         let expr = self.parse_generic_const_expr()?;
-        Ok(GenericArg::Const(expr))
+        Ok(GenericArg::Const(Box::new(expr)))
     }
 
     /// Parse a constant expression inside `<...>` generic arguments, supporting `|`, `^`, `&`,
@@ -2416,9 +2438,8 @@ impl<'a> Parser<'a> {
                     "byte_ring" if self.peek_n_kind(1) == TokenKind::Lt => {
                         self.bump();
                         self.expect(&TokenKind::Lt)?;
-                        let cap = self.parse_usize_literal(
-                            "byte_ring capacity (e.g. `byte_ring<256>`)",
-                        )?;
+                        let cap =
+                            self.parse_usize_literal("byte_ring capacity (e.g. `byte_ring<256>`)")?;
                         let gt_span = self.expect_type_gt()?;
                         TypeExpr::new(
                             TypeKind::OsPrimitive(OsPrimitiveType::ByteRing { cap }),
@@ -2511,9 +2532,7 @@ impl<'a> Parser<'a> {
                         let gt_span = self.expect_type_gt()?;
                         TypeExpr::new(TypeKind::Lease(Box::new(elem)), start.merge(gt_span))
                     }
-                    "ping_pong" | "pool"
-                        if self.peek_n_kind(1) == TokenKind::Lt =>
-                    {
+                    "ping_pong" | "pool" if self.peek_n_kind(1) == TokenKind::Lt => {
                         self.bump();
                         self.expect(&TokenKind::Lt)?;
                         let elem = self.parse_type()?;
@@ -2810,10 +2829,9 @@ impl<'a> Parser<'a> {
                     return Err(self.trap_p0009_lifetime(lt, self.peek_span()));
                 }
                 TokenKind::Bang => {
-                    return Err(self.trap_p0007(
-                        "Zig-style `!Type` error-union type",
-                        self.peek_span(),
-                    ));
+                    return Err(
+                        self.trap_p0007("Zig-style `!Type` error-union type", self.peek_span())
+                    );
                 }
                 _ => {}
             }
@@ -2941,9 +2959,7 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::with_attrs(attrs, StmtKind::Critical { body }, span))
             }
             TokenKind::KwSwitch => self.parse_switch_stmt(attrs, start),
-            TokenKind::Ident(ref s)
-                if s == "wait" && self.peek_n_kind(1) == TokenKind::LBrace =>
-            {
+            TokenKind::Ident(ref s) if s == "wait" && self.peek_n_kind(1) == TokenKind::LBrace => {
                 self.parse_wait_stmt(attrs, start)
             }
             _ => self.parse_non_block_stmt(attrs, start, cur_span, allow_tail_expr),
@@ -3446,7 +3462,11 @@ impl<'a> Parser<'a> {
         let cond = self.parse_condition_expr()?;
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(Stmt::with_attrs(attrs, StmtKind::While { cond, body }, span))
+        Ok(Stmt::with_attrs(
+            attrs,
+            StmtKind::While { cond, body },
+            span,
+        ))
     }
 
     /// Parse `loop { ... }` or `loop every <period_expr> { ... }`.
@@ -3527,7 +3547,10 @@ impl<'a> Parser<'a> {
             Err(e) => {
                 // Preserve specific type traps like `chan<...>` (`P0012`), `lease<...>` (`P0013`),
                 // or `&mut`/`'a` (`P0009`); map untyped / C-style `for (i = 0; ...)` or `for (let i ...)` to `P0008`.
-                if matches!(e.code, Some("P0009" | "P0012" | "P0013" | "P0014" | "P0015" | "P0016" | "P0017")) {
+                if matches!(
+                    e.code,
+                    Some("P0009" | "P0012" | "P0013" | "P0014" | "P0015" | "P0016" | "P0017")
+                ) {
                     return Err(e);
                 }
                 return Err(self.trap_p0008(start.merge(self.peek_span())));
@@ -3804,10 +3827,7 @@ impl<'a> Parser<'a> {
             }
             TokenKind::Int { value, suffix } => {
                 self.bump();
-                Ok(SwitchPat::Literal(
-                    Literal::Int { value, suffix },
-                    tok.span,
-                ))
+                Ok(SwitchPat::Literal(Literal::Int { value, suffix }, tok.span))
             }
             TokenKind::KwTrue => {
                 self.bump();
@@ -3834,19 +3854,17 @@ impl<'a> Parser<'a> {
                 let ret_tok = self.bump();
                 if self.at(&TokenKind::KwError) {
                     let err_kw = self.bump();
-                    return Err(self.trap_p0007(
-                        "`return error...`",
-                        ret_tok.span.merge(err_kw.span),
-                    ));
+                    return Err(
+                        self.trap_p0007("`return error...`", ret_tok.span.merge(err_kw.span))
+                    );
                 }
                 if matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "Err")
                     && self.peek_n_kind(1) == TokenKind::LParen
                 {
                     let err_id = self.bump();
-                    return Err(self.trap_p0007(
-                        "`return Err(...)`",
-                        ret_tok.span.merge(err_id.span),
-                    ));
+                    return Err(
+                        self.trap_p0007("`return Err(...)`", ret_tok.span.merge(err_id.span))
+                    );
                 }
                 let val = if self.at(&TokenKind::Comma)
                     || self.at(&TokenKind::Semi)
@@ -4131,7 +4149,8 @@ impl<'a> Parser<'a> {
                 | TokenKind::Bang
                 | TokenKind::Tilde
                 | TokenKind::Minus
-        ) || (self.at(&TokenKind::LParen) && self.peek_n_kind(1) != TokenKind::LParen);
+        ) || (self.at(&TokenKind::LParen)
+            && self.peek_n_kind(1) != TokenKind::LParen);
 
         if can_prefix {
             self.parse_prefix_unary_or_trap()
@@ -4323,7 +4342,6 @@ impl<'a> Parser<'a> {
 
     #[inline(never)]
     fn parse_postfix_tail(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
-
         loop {
             if self.at(&TokenKind::Arrow) {
                 let arrow_span = self.bump().span;
@@ -4447,7 +4465,7 @@ impl<'a> Parser<'a> {
                     expr = self.parse_index_or_slice(expr)?;
                 }
                 TokenKind::KwCatch => {
-                    let clause = self.parse_catch_clause()?;
+                    let clause = Box::new(self.parse_catch_clause()?);
                     let span = expr.span.merge(clause.span);
                     expr = Expr::new(
                         ExprKind::Catch {
@@ -4765,7 +4783,10 @@ impl<'a> Parser<'a> {
                 // Zig `error.Variant` used in an expression (`P0007`)
                 let e_tok = self.bump();
                 let dot_tok = self.bump();
-                Err(self.trap_p0007("Zig-style `error.Variant` value", e_tok.span.merge(dot_tok.span)))
+                Err(self.trap_p0007(
+                    "Zig-style `error.Variant` value",
+                    e_tok.span.merge(dot_tok.span),
+                ))
             }
             _ => {
                 if let Some(trap_err) = self.check_unexpected_token_trap(&tok) {
@@ -4800,10 +4821,7 @@ impl<'a> Parser<'a> {
                         let extra = sub_parser.peek_token();
                         return Err(self
                             .err_at(
-                                format!(
-                                    "unexpected {} inside format string hole",
-                                    extra.kind
-                                ),
+                                format!("unexpected {} inside format string hole", extra.kind),
                                 extra.span,
                             )
                             .with_doc_topic("syntax"));

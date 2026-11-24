@@ -347,7 +347,10 @@ impl LeaseEnv {
 
     /// Return the name of the method that last invalidated `source` (defaults to `"wait_chunk"`).
     pub fn last_invalidator(&self, source: &str) -> &'static str {
-        self.last_inv_method.get(source).copied().unwrap_or("wait_chunk")
+        self.last_inv_method
+            .get(source)
+            .copied()
+            .unwrap_or("wait_chunk")
     }
 
     /// Check if `token` is still valid in the current state.

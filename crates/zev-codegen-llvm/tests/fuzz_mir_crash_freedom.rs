@@ -1,7 +1,7 @@
 use std::fs;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use zev_codegen_llvm::{CodegenOptions, emit_llvm_ir_with_options};
+use zev_codegen_llvm::{emit_llvm_ir_with_options, CodegenOptions};
 use zev_mir::lower_programs;
 use zev_parser::parse_str_named;
 use zev_sema::analyze_and_monomorphize_programs;
@@ -75,7 +75,10 @@ fn exercise_full_llvm_pipeline(label: &str, src: &str) -> bool {
         if let Ok(mir) = lower_programs(&monos) {
             let host_opts = CodegenOptions::host_linux();
             if let Ok(ll_src) = emit_llvm_ir_with_options(&mir, &host_opts) {
-                assert!(!ll_src.is_empty(), "emit_llvm_ir_with_options produced empty output");
+                assert!(
+                    !ll_src.is_empty(),
+                    "emit_llvm_ir_with_options produced empty output"
+                );
                 return true;
             }
         }
@@ -111,10 +114,10 @@ fn synthesize_program(rng: &mut XorShift64, idx: usize) -> String {
     let op = *rng.pick(&["+", "-", "*", "&", "|", "^"]);
     let cmp_op = *rng.pick(&["==", "!=", "<", "<=", ">", ">="]);
 
-    let use_shared = idx % 2 == 0;
-    let use_generics = idx % 3 == 0;
-    let use_switch = idx % 4 == 0;
-    let use_while = idx % 5 == 0;
+    let use_shared = idx.is_multiple_of(2);
+    let use_generics = idx.is_multiple_of(3);
+    let use_switch = idx.is_multiple_of(4);
+    let use_while = idx.is_multiple_of(5);
     let use_fmt = idx % 3 == 1;
     let use_yield_task = idx % 2 == 1;
 
@@ -236,9 +239,9 @@ return x;\
     s.push_str("}\n");
 
     // Introduce small structured mutations on a fraction of generated programs
-    if idx % 9 == 0 {
+    if idx.is_multiple_of(9) {
         s.replacen("sys.exit(0);", "loop { }", 1)
-    } else if idx % 13 == 0 {
+    } else if idx.is_multiple_of(13) {
         s.replacen("return acc;", "", 1)
     } else {
         s

@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn target_int_signed_and_bits(target_ty: &MirType, ptr_bits: u32) -> Option<(bool, u32)> {
+pub(super) fn target_int_signed_and_bits(
+    target_ty: &MirType,
+    ptr_bits: u32,
+) -> Option<(bool, u32)> {
     match target_ty.host_value_type() {
         MirType::U8 => Some((false, 8)),
         MirType::I8 => Some((true, 8)),
@@ -130,7 +133,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok((ptr_tmp, lty, align))
     }
 
-    pub(super) fn emit_place_ptr(&mut self, place: &MirPlace) -> Result<(String, MirType, bool), CodegenError> {
+    pub(super) fn emit_place_ptr(
+        &mut self,
+        place: &MirPlace,
+    ) -> Result<(String, MirType, bool), CodegenError> {
         match place {
             MirPlace::Var(vid) => {
                 let p = self.var_ptr(*vid);
@@ -180,10 +186,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     self.emit_line(format!("{sl} = load {sl_ty}, ptr {bptr}, align 4"));
                     self.emit_line(format!("{data_p} = extractvalue {sl_ty} {sl}, 0"));
                     self.emit_line(format!("{sl_len} = extractvalue {sl_ty} {sl}, 1"));
-                    self.emit_line(format!(
-                        "{inb} = icmp ult {usize_ty} {}, {sl_len}",
-                        ic.repr
-                    ));
+                    self.emit_line(format!("{inb} = icmp ult {usize_ty} {}, {sl_len}", ic.repr));
                     self.emit_bounds_check(&inb, 1);
                     self.emit_line(format!(
                         "{ep} = getelementptr {ety}, ptr {data_p}, {usize_ty} {}",
@@ -274,7 +277,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
     }
 
-    pub(super) fn load_from_place_ptr(&mut self, ptr: &str, raw_ty: &MirType, _packed: bool) -> SsaVal {
+    pub(super) fn load_from_place_ptr(
+        &mut self,
+        ptr: &str,
+        raw_ty: &MirType,
+        _packed: bool,
+    ) -> SsaVal {
         let lty = self.ctx.llvm_ty(raw_ty);
         // `align 1` keeps unaligned `packed struct` / wire-cast pointer loads fault-safe while
         // `llc` folds known-aligned stack/frame accesses to natural load instructions.
@@ -287,7 +295,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         } = raw_ty
         {
             let swapped = self.next_tmp();
-            self.emit_line(format!("{swapped} = call i{bits} @llvm.bswap.i{bits}(i{bits} {raw})"));
+            self.emit_line(format!(
+                "{swapped} = call i{bits} @llvm.bswap.i{bits}(i{bits} {raw})"
+            ));
             SsaVal::new(lty, swapped)
         } else {
             SsaVal::new(lty, raw)
@@ -323,10 +333,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
     pub(super) fn pattern_int(&self, pat: &MirSwitchPattern) -> i64 {
         match pat {
-            MirSwitchPattern::EnumVariant {
-                enum_name,
-                variant,
-            } => self
+            MirSwitchPattern::EnumVariant { enum_name, variant } => self
                 .ctx
                 .enum_variants
                 .get(&(enum_name.clone(), variant.clone()))
@@ -415,10 +422,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     Ok(SsaVal::new("ptr", format!("@.str.{idx}")))
                 }
             }
-            MirExprKind::EnumVariant {
-                enum_name,
-                variant,
-            } => {
+            MirExprKind::EnumVariant { enum_name, variant } => {
                 let disc = self
                     .ctx
                     .enum_variants
@@ -437,7 +441,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         .float_consts
                         .get(name)
                         .copied()
-                        .or_else(|| self.ctx.consts.get(name).copied().map(|v| (v as f64).to_bits()))
+                        .or_else(|| {
+                            self.ctx
+                                .consts
+                                .get(name)
+                                .copied()
+                                .map(|v| (v as f64).to_bits())
+                        })
                         .unwrap_or(0);
                     let target_fty = if dst_lty == "float" || expr.ty == MirType::F32 {
                         "float"
@@ -460,12 +470,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     Ok(SsaVal::new(dst_lty, format!("{v}")))
                 }
             }
-            MirExprKind::GlobalPrimAddr(name) => {
-                Ok(SsaVal::new("ptr", format!("@__syn_prim_{}", sanitize_ident(name))))
-            }
-            MirExprKind::SubsystemAddr(name) => {
-                Ok(SsaVal::new("ptr", format!("@__zev_subsys_{}", sanitize_ident(name))))
-            }
+            MirExprKind::GlobalPrimAddr(name) => Ok(SsaVal::new(
+                "ptr",
+                format!("@__syn_prim_{}", sanitize_ident(name)),
+            )),
+            MirExprKind::SubsystemAddr(name) => Ok(SsaVal::new(
+                "ptr",
+                format!("@__zev_subsys_{}", sanitize_ident(name)),
+            )),
             MirExprKind::MakePrimView { ptr, cap, kind } => {
                 let pv = self.emit_expr(ptr)?;
                 let pc = self.coerce(pv, "ptr", false);
@@ -480,9 +492,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             "{v0} = insertvalue {vty} poison, ptr {}, 0",
                             pc.repr
                         ));
-                        self.emit_line(format!(
-                            "{v1} = insertvalue {vty} {v0}, {usize_ty} {n}, 1"
-                        ));
+                        self.emit_line(format!("{v1} = insertvalue {vty} {v0}, {usize_ty} {n}, 1"));
                         Ok(SsaVal::new(vty, v1))
                     }
                     MirPrimViewKind::Inbox { elem } => {
@@ -512,9 +522,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         self.emit_line(format!(
                             "{v1} = insertvalue {vty} {v0}, ptr {items_base}, 1"
                         ));
-                        self.emit_line(format!(
-                            "{v2} = insertvalue {vty} {v1}, {usize_ty} {n}, 2"
-                        ));
+                        self.emit_line(format!("{v2} = insertvalue {vty} {v1}, {usize_ty} {n}, 2"));
                         Ok(SsaVal::new(vty, v2))
                     }
                 }
@@ -551,7 +559,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     *array_len,
                 )?;
                 let val = self.next_tmp();
-                self.emit_line(format!("{val} = load volatile {lty}, ptr {p}, align {align}"));
+                self.emit_line(format!(
+                    "{val} = load volatile {lty}, ptr {p}, align {align}"
+                ));
                 Ok(self.coerce(SsaVal::new(lty, val), &dst_lty, !expr.ty.is_unsigned()))
             }
             MirExprKind::FnAddr(fname) => {
@@ -559,7 +569,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 if let Some(sig) = self.ctx.fn_sigs.get(fname) {
                     Ok(SsaVal::new(fn_ptr_ty, sig.symbol.clone()))
                 } else {
-                    Ok(SsaVal::new(fn_ptr_ty, format!("@{}", sanitize_ident(fname))))
+                    Ok(SsaVal::new(
+                        fn_ptr_ty,
+                        format!("@{}", sanitize_ident(fname)),
+                    ))
                 }
             }
             MirExprKind::Var(vid) => {
@@ -585,7 +598,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         Ok(SsaVal::new(dst_lty, t))
                     }
                     MirUnaryOp::Not => {
-                        let i1v = self.to_i1(sv);
+                        let i1v = self.coerce_to_i1(sv);
                         let inv = self.next_tmp();
                         let b8 = self.next_tmp();
                         self.emit_line(format!("{inv} = xor i1 {i1v}, true"));
@@ -611,7 +624,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             } => {
                 let sv = self.emit_expr(sub)?;
                 if *target_ty == MirType::Bool {
-                    let i1v = self.to_i1(sv);
+                    let i1v = self.coerce_to_i1(sv);
                     let b8 = self.next_tmp();
                     self.emit_line(format!("{b8} = zext i1 {i1v} to i8"));
                     return Ok(SsaVal::new("i8", b8));
@@ -753,10 +766,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let ep = self.next_tmp();
                     self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", bv.repr));
                     self.emit_line(format!("{sl_len} = extractvalue {sl_ty} {}, 1", bv.repr));
-                    self.emit_line(format!(
-                        "{inb} = icmp ult {usize_ty} {}, {sl_len}",
-                        ic.repr
-                    ));
+                    self.emit_line(format!("{inb} = icmp ult {usize_ty} {}, {sl_len}", ic.repr));
                     self.emit_bounds_check(&inb, 1);
                     self.emit_line(format!(
                         "{ep} = getelementptr {ety}, ptr {dp}, {usize_ty} {}",
@@ -799,7 +809,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let bv = self.emit_expr(base)?;
                     let (tmp, al) = self.emit_temp_alloca(&bv.ty);
                     let ep = self.next_tmp();
-                    self.emit_line(format!("store {} {}, ptr {tmp}, align {al}", bv.ty, bv.repr));
+                    self.emit_line(format!(
+                        "store {} {}, ptr {tmp}, align {al}",
+                        bv.ty, bv.repr
+                    ));
                     self.emit_line(format!(
                         "{ep} = getelementptr inbounds {}, ptr {tmp}, {usize_ty} 0, {usize_ty} {}",
                         bv.ty, ic.repr
@@ -822,47 +835,46 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let st_c = self.coerce(st_v, &usize_ty, false);
                 let en_c = self.coerce(en_v, &usize_ty, false);
 
-                let (base_ptr, base_len) =
-                    if *base_is_array || matches!(base.ty, MirType::Array { .. }) {
-                        let arr_len = match &base.ty {
-                            MirType::Array { len, .. } => *len,
-                            _ => 0,
-                        };
-                        let p = if let MirExprKind::Var(vid) = &base.kind {
-                            let ap = self.var_ptr(*vid);
-                            let aty = self.ctx.llvm_ty(&base.ty);
-                            let gp = self.next_tmp();
-                            self.emit_line(format!(
+                let (base_ptr, base_len) = if *base_is_array
+                    || matches!(base.ty, MirType::Array { .. })
+                {
+                    let arr_len = match &base.ty {
+                        MirType::Array { len, .. } => *len,
+                        _ => 0,
+                    };
+                    let p = if let MirExprKind::Var(vid) = &base.kind {
+                        let ap = self.var_ptr(*vid);
+                        let aty = self.ctx.llvm_ty(&base.ty);
+                        let gp = self.next_tmp();
+                        self.emit_line(format!(
                                 "{gp} = getelementptr inbounds {aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
                             ));
-                            gp
-                        } else if let Some((ap, aty_mir, _)) =
-                            self.try_emit_rodata_const_ptr(base)?
-                        {
-                            let aty = self.ctx.llvm_ty(&aty_mir);
-                            let gp = self.next_tmp();
-                            self.emit_line(format!(
+                        gp
+                    } else if let Some((ap, aty_mir, _)) = self.try_emit_rodata_const_ptr(base)? {
+                        let aty = self.ctx.llvm_ty(&aty_mir);
+                        let gp = self.next_tmp();
+                        self.emit_line(format!(
                                 "{gp} = getelementptr inbounds {aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
                             ));
-                            gp
-                        } else {
-                            let bv = self.emit_expr(base)?;
-                            let (tmp, al) = self.emit_temp_alloca(&bv.ty);
-                            self.emit_line(format!(
-                                "store {} {}, ptr {tmp}, align {al}",
-                                bv.ty, bv.repr
-                            ));
-                            tmp
-                        };
-                        (p, format!("{arr_len}"))
+                        gp
                     } else {
                         let bv = self.emit_expr(base)?;
-                        let p = self.next_tmp();
-                        let bl = self.next_tmp();
-                        self.emit_line(format!("{p} = extractvalue {sl_ty} {}, 0", bv.repr));
-                        self.emit_line(format!("{bl} = extractvalue {sl_ty} {}, 1", bv.repr));
-                        (p, bl)
+                        let (tmp, al) = self.emit_temp_alloca(&bv.ty);
+                        self.emit_line(format!(
+                            "store {} {}, ptr {tmp}, align {al}",
+                            bv.ty, bv.repr
+                        ));
+                        tmp
                     };
+                    (p, format!("{arr_len}"))
+                } else {
+                    let bv = self.emit_expr(base)?;
+                    let p = self.next_tmp();
+                    let bl = self.next_tmp();
+                    self.emit_line(format!("{p} = extractvalue {sl_ty} {}, 0", bv.repr));
+                    self.emit_line(format!("{bl} = extractvalue {sl_ty} {}, 1", bv.repr));
+                    (p, bl)
+                };
 
                 // Enforce `start <= end && end <= base_len` via uniform `@__syn_panic(i8 2)` trap.
                 let ok_ord = self.next_tmp();
@@ -890,7 +902,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{gep_p} = getelementptr {ety}, ptr {base_ptr}, {usize_ty} {}",
                     st_c.repr
                 ));
-                self.emit_line(format!("{sub_p} = select i1 {is_null}, ptr null, ptr {gep_p}"));
+                self.emit_line(format!(
+                    "{sub_p} = select i1 {is_null}, ptr null, ptr {gep_p}"
+                ));
                 self.emit_line(format!(
                     "{sub_len} = sub {usize_ty} {}, {}",
                     en_c.repr, st_c.repr
@@ -902,9 +916,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(SsaVal::new(sl_ty, r1))
             }
             MirExprKind::ArrayToSlice {
-                array_place,
-                len,
-                ..
+                array_place, len, ..
             } => {
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
@@ -917,7 +929,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{ep} = getelementptr inbounds {aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
                 ));
                 self.emit_line(format!("{r0} = insertvalue {sl_ty} poison, ptr {ep}, 0"));
-                self.emit_line(format!("{r1} = insertvalue {sl_ty} {r0}, {usize_ty} {len}, 1"));
+                self.emit_line(format!(
+                    "{r1} = insertvalue {sl_ty} {r0}, {usize_ty} {len}, 1"
+                ));
                 Ok(SsaVal::new(sl_ty, r1))
             }
             MirExprKind::FromBytes { struct_name, slice } => {
@@ -1031,7 +1045,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirExprKind::LeaseGet { lease, .. } => {
                 let lv = self.emit_expr(lease)?;
                 let p = self.next_tmp();
-                self.emit_line(format!("{p} = extractvalue {{ ptr, ptr, i8 }} {}, 0", lv.repr));
+                self.emit_line(format!(
+                    "{p} = extractvalue {{ ptr, ptr, i8 }} {}, 0",
+                    lv.repr
+                ));
                 Ok(SsaVal::new("ptr", p))
             }
             MirExprKind::LeaseAddr { lease, .. } => {
@@ -1039,7 +1056,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let lv = self.emit_expr(lease)?;
                 let p = self.next_tmp();
                 let a = self.next_tmp();
-                self.emit_line(format!("{p} = extractvalue {{ ptr, ptr, i8 }} {}, 0", lv.repr));
+                self.emit_line(format!(
+                    "{p} = extractvalue {{ ptr, ptr, i8 }} {}, 0",
+                    lv.repr
+                ));
                 self.emit_line(format!("{a} = ptrtoint ptr {p} to {usize_ty}"));
                 Ok(SsaVal::new(usize_ty, a))
             }
@@ -1069,7 +1089,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let wptr = self.resolve_prim_ptr(target)?;
                 let ety = self.ctx.llvm_ty(elem_ty);
                 let v = self.next_tmp();
-                self.emit_line(format!("{v} = {call_kw} {ety} @__syn_watch_read_{id}(ptr {wptr})"));
+                self.emit_line(format!(
+                    "{v} = {call_kw} {ety} @__syn_watch_read_{id}(ptr {wptr})"
+                ));
                 Ok(SsaVal::new(ety, v))
             }
             MirPrimReadOp::GuardedGet { target, elem_ty } => {
@@ -1094,7 +1116,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let id = sanitize_ident(&pk.mangle_name());
                 let wptr = self.resolve_prim_ptr(target)?;
                 let g = self.next_tmp();
-                self.emit_line(format!("{g} = {call_kw} i32 @__syn_watch_gen_{id}(ptr {wptr})"));
+                self.emit_line(format!(
+                    "{g} = {call_kw} i32 @__syn_watch_gen_{id}(ptr {wptr})"
+                ));
                 Ok(SsaVal::new("i32", g))
             }
             MirPrimReadOp::InboxTryRecv {
@@ -1267,7 +1291,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 self.emit_line(format!("{buf_p} = select i1 {is_b0}, ptr {b0}, ptr {b1}"));
                 self.emit_line(format!("{s0} = insertvalue {sl_ty} poison, ptr {buf_p}, 0"));
-                self.emit_line(format!("{s1} = insertvalue {sl_ty} {s0}, {usize_ty} {n}, 1"));
+                self.emit_line(format!(
+                    "{s1} = insertvalue {sl_ty} {s0}, {usize_ty} {n}, 1"
+                ));
                 Ok(SsaVal::new(sl_ty, s1))
             }
             MirPrimReadOp::PingPongBaseAddr {
@@ -1636,7 +1662,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let ety = self.ctx.llvm_ty(elem_ty);
                 let rty = format!("{{ {ety}, i32 }}");
                 let (tmp, al) = self.emit_temp_alloca(&ety);
-                self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp}, align {al}"));
+                self.emit_line(format!(
+                    "store {ety} zeroinitializer, ptr {tmp}, align {al}"
+                ));
                 let task_arg = if self.coroutine.is_some() {
                     "%__task"
                 } else {
@@ -1882,7 +1910,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let ety = self.ctx.llvm_ty(elem_ty);
         let rty = format!("{{ {ety}, i32 }}");
         let (tmp, al) = self.emit_temp_alloca(&ety);
-        self.emit_line(format!("store {ety} zeroinitializer, ptr {tmp}, align {al}"));
+        self.emit_line(format!(
+            "store {ety} zeroinitializer, ptr {tmp}, align {al}"
+        ));
         let task_arg = if self.coroutine.is_some() {
             "%__task"
         } else {
@@ -1918,7 +1948,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
     pub(super) fn emit_runtime_assert(&mut self, cond_val: SsaVal) {
         let call_kw = self.call_kw();
-        let c1 = self.to_i1(cond_val);
+        let c1 = self.coerce_to_i1(cond_val);
         let ok_lbl = self.next_label("assert_ok");
         let fail_lbl = self.next_label("assert_fail");
         self.emit_term(format!("br i1 {c1}, label %{ok_lbl}, label %{fail_lbl}"));
@@ -1940,14 +1970,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let call_kw = self.call_kw();
         // Indirect call through a local/parameter/temp `MirVar` of `MirType::FnPtr`
         if callee != "assert" {
-            if let Some((vid, params, ret)) =
-                self.vars.iter().rev().find_map(|v| match &v.ty {
-                    MirType::FnPtr { params, ret } if v.name == callee => {
-                        Some((v.id, params.clone(), (**ret).clone()))
-                    }
-                    _ => None,
-                })
-            {
+            if let Some((vid, params, ret)) = self.vars.iter().rev().find_map(|v| match &v.ty {
+                MirType::FnPtr { params, ret } if v.name == callee => {
+                    Some((v.id, params.clone(), (**ret).clone()))
+                }
+                _ => None,
+            }) {
                 let fp_ty = MirType::FnPtr {
                     params: params.clone(),
                     ret: Box::new(ret.clone()),
@@ -1974,7 +2002,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     return Ok(SsaVal::new("void", "0"));
                 } else {
                     let r = self.next_tmp();
-                    self.emit_line(format!("{r} = {call_kw} {ret_lty} {}({joined})", fp_ptr.repr));
+                    self.emit_line(format!(
+                        "{r} = {call_kw} {ret_lty} {}({joined})",
+                        fp_ptr.repr
+                    ));
                     return Ok(SsaVal::new(ret_lty, r));
                 }
             }
@@ -2024,8 +2055,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
             }
             let sig_prefix = if esig.variadic {
-                let fixed: Vec<String> =
-                    esig.params.iter().map(|t| self.ctx.llvm_ty(t)).collect();
+                let fixed: Vec<String> = esig.params.iter().map(|t| self.ctx.llvm_ty(t)).collect();
                 let mut fp = fixed;
                 fp.push("...".to_string());
                 format!("{ret_lty} ({})", fp.join(", "))
@@ -2057,7 +2087,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 if let Some(a0) = args.first() {
                     let sv = self.emit_expr(a0)?;
                     let p = self.coerce_str_ptr(sv);
-                    self.emit_line(format!("{call_kw} void @__syn_uart_println(ptr {})", p.repr));
+                    self.emit_line(format!(
+                        "{call_kw} void @__syn_uart_println(ptr {})",
+                        p.repr
+                    ));
                 } else {
                     self.emit_line(format!("{call_kw} void @__syn_uart_putc(i8 10)"));
                 }
@@ -2101,7 +2134,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         match op {
             MirBinOp::LogicalAnd => {
                 let lv = self.emit_expr(lhs)?;
-                let l1 = self.to_i1(lv);
+                let l1 = self.coerce_to_i1(lv);
                 let lhs_lbl = self.cur_label.clone();
                 let rhs_lbl = self.next_label("and_rhs");
                 let end_lbl = self.next_label("and_end");
@@ -2109,7 +2142,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
                 self.start_block(&rhs_lbl);
                 let rv = self.emit_expr(rhs)?;
-                let r1 = self.to_i1(rv);
+                let r1 = self.coerce_to_i1(rv);
                 let r8 = self.next_tmp();
                 self.emit_line(format!("{r8} = zext i1 {r1} to i8"));
                 let rhs_done_lbl = self.cur_label.clone();
@@ -2124,7 +2157,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirBinOp::LogicalOr => {
                 let lv = self.emit_expr(lhs)?;
-                let l1 = self.to_i1(lv);
+                let l1 = self.coerce_to_i1(lv);
                 let lhs_lbl = self.cur_label.clone();
                 let rhs_lbl = self.next_label("or_rhs");
                 let end_lbl = self.next_label("or_end");
@@ -2132,7 +2165,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
                 self.start_block(&rhs_lbl);
                 let rv = self.emit_expr(rhs)?;
-                let r1 = self.to_i1(rv);
+                let r1 = self.coerce_to_i1(rv);
                 let r8 = self.next_tmp();
                 self.emit_line(format!("{r8} = zext i1 {r1} to i8"));
                 let rhs_done_lbl = self.cur_label.clone();
@@ -2210,7 +2243,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 _ => "fadd",
             };
             let t = self.next_tmp();
-            self.emit_line(format!("{t} = {finst} {common_fty} {}, {}", lc.repr, rc.repr));
+            self.emit_line(format!(
+                "{t} = {finst} {common_fty} {}, {}",
+                lc.repr, rc.repr
+            ));
             return Ok(self.coerce(SsaVal::new(common_fty, t), &res_lty, true));
         }
 
@@ -2221,7 +2257,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let rc = self.coerce(rv, &shift_ty, false);
             let mask = llvm_int_bits(&shift_ty).saturating_sub(1);
             let rc_masked = if let Ok(c) = rc.repr.parse::<i128>() {
-                SsaVal::new(shift_ty.clone(), ((c as u128) & u128::from(mask)).to_string())
+                SsaVal::new(
+                    shift_ty.clone(),
+                    ((c as u128) & u128::from(mask)).to_string(),
+                )
             } else {
                 let m = self.next_tmp();
                 self.emit_line(format!("{m} = and {shift_ty} {}, {mask}", rc.repr));
@@ -2235,7 +2274,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 "lshr"
             };
             let t = self.next_tmp();
-            self.emit_line(format!("{t} = {inst} {shift_ty} {}, {}", lc.repr, rc_masked.repr));
+            self.emit_line(format!(
+                "{t} = {inst} {shift_ty} {}, {}",
+                lc.repr, rc_masked.repr
+            ));
             let dst_lty = self.ctx.llvm_ty(&res_ty.host_value_type());
             return Ok(self.coerce(SsaVal::new(shift_ty, t), &dst_lty, !res_ty.is_unsigned()));
         }
@@ -2272,12 +2314,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
         let is_cmp = matches!(
             op,
-            MirBinOp::Eq
-                | MirBinOp::Ne
-                | MirBinOp::Lt
-                | MirBinOp::Le
-                | MirBinOp::Gt
-                | MirBinOp::Ge
+            MirBinOp::Eq | MirBinOp::Ne | MirBinOp::Lt | MirBinOp::Le | MirBinOp::Gt | MirBinOp::Ge
         );
         if is_cmp {
             let pred = match (op, signed) {
@@ -2333,7 +2370,6 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok(self.coerce(SsaVal::new(common_ty, t), &dst_lty, !res_ty.is_unsigned()))
     }
 }
-
 
 pub(super) fn crit_pair(contended: bool, call_kw: &str) -> (String, String) {
     if contended {

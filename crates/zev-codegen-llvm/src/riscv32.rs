@@ -121,8 +121,7 @@ module asm "  .option pop"
 @__sbss = external global i8
 @__ebss = external global i8
 "#,
-        spec.cpu,
-        spec.flash_base
+        spec.cpu, spec.flash_base
     );
 
     // Build single module-level @llvm.used list keeping inline-asm-referenced hooks & trampolines alive.
@@ -245,7 +244,10 @@ fn emit_riscv32_irq_vectors_ir(
         out,
         "; ── RISC-V Vectored Trap Table (@__syn_rv_vector_table: section \"{tramp_sec}\", align 256) ──"
     );
-    let _ = writeln!(out, "module asm \".section {tramp_sec}, \\22ax\\22, @progbits\"");
+    let _ = writeln!(
+        out,
+        "module asm \".section {tramp_sec}, \\22ax\\22, @progbits\""
+    );
     let _ = writeln!(out, "module asm \".balign 256\"");
     let _ = writeln!(out, "module asm \".global __syn_rv_vector_table\"");
     let _ = writeln!(out, "module asm \".type __syn_rv_vector_table, @function\"");
@@ -464,7 +466,10 @@ restore:
 }}"#
         .to_string()
     };
-    let idle_sleep_ir = idle_sleep_ir.replace("{sz}", sz).replace("{{", "{").replace("}}", "}");
+    let idle_sleep_ir = idle_sleep_ir
+        .replace("{sz}", sz)
+        .replace("{{", "{")
+        .replace("}}", "}");
 
     let _ = writeln!(
         out,

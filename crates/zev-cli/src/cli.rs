@@ -370,21 +370,29 @@ fn parse_import_svd(args: &[String]) -> Result<Command, String> {
             "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() || args[i].is_empty() {
-                    return Err("`-o` requires an output `.zev` path for `zevc import-svd`".to_string());
+                    return Err(
+                        "`-o` requires an output `.zev` path for `zevc import-svd`".to_string()
+                    );
                 }
                 output = Some(PathBuf::from(&args[i]));
             }
             _ if arg.starts_with("-o=") => {
                 let val = &arg[3..];
                 if val.is_empty() {
-                    return Err("`-o=` requires a non-empty output `.zev` path for `zevc import-svd`".to_string());
+                    return Err(
+                        "`-o=` requires a non-empty output `.zev` path for `zevc import-svd`"
+                            .to_string(),
+                    );
                 }
                 output = Some(PathBuf::from(val));
             }
             _ if arg.starts_with("--output=") => {
                 let val = &arg[9..];
                 if val.is_empty() {
-                    return Err("`--output=` requires a non-empty output `.zev` path for `zevc import-svd`".to_string());
+                    return Err(
+                        "`--output=` requires a non-empty output `.zev` path for `zevc import-svd`"
+                            .to_string(),
+                    );
                 }
                 output = Some(PathBuf::from(val));
             }
@@ -393,7 +401,9 @@ fn parse_import_svd(args: &[String]) -> Result<Command, String> {
             }
             _ => {
                 if svd_path.is_some() {
-                    return Err("`zevc import-svd` accepts exactly one `.svd` input file".to_string());
+                    return Err(
+                        "`zevc import-svd` accepts exactly one `.svd` input file".to_string()
+                    );
                 }
                 svd_path = Some(PathBuf::from(arg));
             }
@@ -421,7 +431,7 @@ fn parse_doc(args: &[String]) -> Result<Command, String> {
             _ => {
                 if query.is_some() {
                     return Err(
-                        "`zevc doc` accepts at most one topic or error code query".to_string(),
+                        "`zevc doc` accepts at most one topic or error code query".to_string()
                     );
                 }
                 query = Some(arg.clone());
@@ -479,14 +489,18 @@ fn try_parse_board_or_chip_arg(
     if arg == "--board" {
         *i += 1;
         if *i >= args.len() || args[*i].is_empty() {
-            return Err(format!("`--board` requires a board name or `.toml` path for `zevc {subcmd}`"));
+            return Err(format!(
+                "`--board` requires a board name or `.toml` path for `zevc {subcmd}`"
+            ));
         }
         *board = Some(args[*i].clone());
         return Ok(true);
     }
     if let Some(val) = arg.strip_prefix("--board=") {
         if val.is_empty() {
-            return Err(format!("`--board=` requires a board name or `.toml` path for `zevc {subcmd}`"));
+            return Err(format!(
+                "`--board=` requires a board name or `.toml` path for `zevc {subcmd}`"
+            ));
         }
         *board = Some(val.to_string());
         return Ok(true);
@@ -494,14 +508,18 @@ fn try_parse_board_or_chip_arg(
     if arg == "--chip" {
         *i += 1;
         if *i >= args.len() || args[*i].is_empty() {
-            return Err(format!("`--chip` requires a chip name or `.toml` path for `zevc {subcmd}`"));
+            return Err(format!(
+                "`--chip` requires a chip name or `.toml` path for `zevc {subcmd}`"
+            ));
         }
         *chip = Some(args[*i].clone());
         return Ok(true);
     }
     if let Some(val) = arg.strip_prefix("--chip=") {
         if val.is_empty() {
-            return Err(format!("`--chip=` requires a chip name or `.toml` path for `zevc {subcmd}`"));
+            return Err(format!(
+                "`--chip=` requires a chip name or `.toml` path for `zevc {subcmd}`"
+            ));
         }
         *chip = Some(val.to_string());
         return Ok(true);
@@ -576,10 +594,12 @@ fn parse_ram(args: &[String]) -> Result<Command, String> {
     })
 }
 
+type FilesWithOutputAndOpt = (Vec<PathBuf>, Vec<PathBuf>, String, Option<PathBuf>);
+
 fn parse_files_with_output_and_opt(
     args: &[String],
     subcmd: &str,
-) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>, String, Option<PathBuf>)>, String> {
+) -> Result<Option<FilesWithOutputAndOpt>, String> {
     parse_files_with_output_and_opt_default(args, subcmd, "-O2")
 }
 
@@ -587,7 +607,7 @@ fn parse_files_with_output_and_opt_default(
     args: &[String],
     subcmd: &str,
     default_opt: &str,
-) -> Result<Option<(Vec<PathBuf>, Vec<PathBuf>, String, Option<PathBuf>)>, String> {
+) -> Result<Option<FilesWithOutputAndOpt>, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
     let mut opt_level = default_opt.to_string();
@@ -604,7 +624,9 @@ fn parse_files_with_output_and_opt_default(
             "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err(format!("`-o` requires an output file path for `zevc {subcmd}`"));
+                    return Err(format!(
+                        "`-o` requires an output file path for `zevc {subcmd}`"
+                    ));
                 }
                 output = Some(PathBuf::from(&args[i]));
             }
@@ -666,7 +688,9 @@ fn parse_emit_llvm(args: &[String]) -> Result<Command, String> {
             "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("`-o` requires an output file path for `zevc emit-llvm`".to_string());
+                    return Err(
+                        "`-o` requires an output file path for `zevc emit-llvm`".to_string()
+                    );
                 }
                 output = Some(PathBuf::from(&args[i]));
             }
@@ -809,7 +833,10 @@ fn parse_flash(args: &[String]) -> Result<Command, String> {
             "-p" | "--port" => {
                 i += 1;
                 if i >= args.len() || args[i].is_empty() {
-                    return Err("`--port` requires a serial device or mount path for `zevc flash`".to_string());
+                    return Err(
+                        "`--port` requires a serial device or mount path for `zevc flash`"
+                            .to_string(),
+                    );
                 }
                 port = Some(args[i].clone());
             }
@@ -951,14 +978,18 @@ fn parse_flash_serial(
             "-p" | "--port" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("`--port` requires a serial device path (e.g. `/dev/ttyACM0`)".to_string());
+                    return Err(
+                        "`--port` requires a serial device path (e.g. `/dev/ttyACM0`)".to_string(),
+                    );
                 }
                 port = args[i].clone();
             }
             "-o" | "--output" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err(format!("`-o` requires an output `.bin` path for `zevc {subcmd}`"));
+                    return Err(format!(
+                        "`-o` requires an output `.bin` path for `zevc {subcmd}`"
+                    ));
                 }
                 output = Some(PathBuf::from(&args[i]));
             }
@@ -1118,9 +1149,12 @@ mod tests {
 
     #[test]
     fn parses_ram_multiple_files() {
-        let cmd =
-            parse_args(["ram", "examples/motor_controller.zev", "examples/motor_support.zev"])
-                .unwrap();
+        let cmd = parse_args([
+            "ram",
+            "examples/motor_controller.zev",
+            "examples/motor_support.zev",
+        ])
+        .unwrap();
         assert_eq!(
             cmd,
             Command::Ram {
@@ -1176,7 +1210,14 @@ mod tests {
         );
 
         assert_eq!(
-            parse_args(["ram", "--target", "avr", "-Os", "examples/arduino_uno_demo.zev"]).unwrap(),
+            parse_args([
+                "ram",
+                "--target",
+                "avr",
+                "-Os",
+                "examples/arduino_uno_demo.zev"
+            ])
+            .unwrap(),
             Command::Ram {
                 files: vec![PathBuf::from("examples/arduino_uno_demo.zev")],
                 include_dirs: vec![],
@@ -1251,8 +1292,14 @@ mod tests {
             }
         );
 
-        let cmd_elf =
-            parse_args(["build-elf", "-Os", "-o", "fw.elf", "examples/cortex_m_demo.zev"]).unwrap();
+        let cmd_elf = parse_args([
+            "build-elf",
+            "-Os",
+            "-o",
+            "fw.elf",
+            "examples/cortex_m_demo.zev",
+        ])
+        .unwrap();
         assert_eq!(
             cmd_elf,
             Command::BuildElf {
@@ -1343,23 +1390,74 @@ mod tests {
         }
 
         for bad in ["-O", "-O4", "-Ofast", "-Og"] {
-            assert!(parse_args(["build-elf", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["run-qemu", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["emit-llvm", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["build-esp32c6", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["flash-esp32c6", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["build-avr", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["build-uno", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["flash-avr", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["flash-uno", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["build-nano-every", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["build-atmega4809", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["flash-nano-every", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["flash-atmega4809", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["build-rp2040", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["build-pico", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["flash-rp2040", bad, "a.zev"]).is_err(), "expected err on {bad}");
-            assert!(parse_args(["flash-pico", bad, "a.zev"]).is_err(), "expected err on {bad}");
+            assert!(
+                parse_args(["build-elf", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["run-qemu", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["emit-llvm", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["build-esp32c6", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["flash-esp32c6", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["build-avr", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["build-uno", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["flash-avr", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["flash-uno", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["build-nano-every", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["build-atmega4809", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["flash-nano-every", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["flash-atmega4809", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["build-rp2040", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["build-pico", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["flash-rp2040", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
+            assert!(
+                parse_args(["flash-pico", bad, "a.zev"]).is_err(),
+                "expected err on {bad}"
+            );
         }
         assert!(parse_args(["build-elf", "--opt-level", "O9", "a.zev"]).is_err());
         assert!(parse_args(["build-elf", "--opt-level=fast", "a.zev"]).is_err());
@@ -1608,7 +1706,8 @@ mod tests {
         }
 
         for alias in ["flash-nano-every", "flash-atmega4809"] {
-            let mut nano_flash_args = vec![alias, "--port", "/dev/ttyACM0", "-Oz", "-o", "nano.bin"];
+            let mut nano_flash_args =
+                vec![alias, "--port", "/dev/ttyACM0", "-Oz", "-o", "nano.bin"];
             nano_flash_args.extend_from_slice(&include_flags);
             nano_flash_args.push("app.zev");
             assert_eq!(
@@ -1639,7 +1738,8 @@ mod tests {
         }
 
         for alias in ["flash-rp2040", "flash-pico"] {
-            let mut pico_flash_args = vec![alias, "--port", "/dev/ttyACM2", "-Oz", "-o", "pico.uf2"];
+            let mut pico_flash_args =
+                vec![alias, "--port", "/dev/ttyACM2", "-Oz", "-o", "pico.uf2"];
             pico_flash_args.extend_from_slice(&include_flags);
             pico_flash_args.push("app.zev");
             assert_eq!(
@@ -1694,7 +1794,14 @@ mod tests {
         );
 
         assert_eq!(
-            parse_args(["ram", "--target", "rp2040", "-O2", "examples/pico_w_demo.zev"]).unwrap(),
+            parse_args([
+                "ram",
+                "--target",
+                "rp2040",
+                "-O2",
+                "examples/pico_w_demo.zev"
+            ])
+            .unwrap(),
             Command::Ram {
                 files: vec![PathBuf::from("examples/pico_w_demo.zev")],
                 include_dirs: Vec::new(),
@@ -1740,12 +1847,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_args([
-                "build",
-                "--chip=esp32c6",
-                "--opt-level=O2",
-            ])
-            .unwrap(),
+            parse_args(["build", "--chip=esp32c6", "--opt-level=O2",]).unwrap(),
             Command::Build {
                 files: Vec::new(),
                 include_dirs: Vec::new(),

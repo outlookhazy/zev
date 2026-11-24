@@ -2,11 +2,11 @@ use std::path::Path;
 
 use zev_ast::{ArrayLen, AttrKind, ItemKind, Priority, TypeKind};
 use zev_sema::{
-    AnalyzeOptions, Diagnostic, DiagnosticKind, FnEffect, MAX_MONOMORPHIZED_INSTANCES,
-    MonomorphizedInstance, MonomorphizedKind, PrimitiveKind, SemanticModel, analyze,
-    analyze_and_monomorphize_named_programs, analyze_and_monomorphize_programs,
+    analyze, analyze_and_monomorphize_named_programs, analyze_and_monomorphize_programs,
     analyze_named_programs, analyze_program, mangle_type_expr, monomorphize_named_programs,
-    monomorphize_programs,
+    monomorphize_programs, AnalyzeOptions, Diagnostic, DiagnosticKind, FnEffect,
+    MonomorphizedInstance, MonomorphizedKind, PrimitiveKind, SemanticModel,
+    MAX_MONOMORPHIZED_INSTANCES,
 };
 
 fn load_example_prog(path: &Path) -> zev_ast::Program {
@@ -443,7 +443,10 @@ fn reject_mutable_raw_global_and_isolation_violation_in_isr_and_task() {
         .iter()
         .filter(|d| d.kind == DiagnosticKind::GlobalIsolationViolation)
         .count();
-    assert_eq!(isolation_count, 2, "expected isolation errors in both EXTI0 and worker");
+    assert_eq!(
+        isolation_count, 2,
+        "expected isolation errors in both EXTI0 and worker"
+    );
 }
 
 #[test]
@@ -1003,7 +1006,9 @@ fn qa_adversarial_checklist_suite() {
         DiagnosticKind::ScopeDepthEscape,
     );
     assert!(
-        dma_diags.iter().any(|d| d.kind == DiagnosticKind::StaleDmaLease),
+        dma_diags
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::StaleDmaLease),
         "expected StaleDmaLease alongside ScopeDepthEscape"
     );
 
@@ -1258,7 +1263,11 @@ fn primitive_method_suggestions_for_foreign_idioms() {
         DiagnosticKind::UndefinedSymbol,
     );
     assert!(d_inbox[0].message.contains(".post("), "got: {}", d_inbox[0]);
-    assert!(d_inbox[0].note.as_deref().unwrap().contains("valid methods on `inbox<Ev, 8>`"));
+    assert!(d_inbox[0]
+        .note
+        .as_deref()
+        .unwrap()
+        .contains("valid methods on `inbox<Ev, 8>`"));
 
     // 2. `watch.get` & `watch.set` -> suggests `.read()` and `.publish(...)`
     let d_watch_get = expect_err_kind(
@@ -1270,7 +1279,11 @@ fn primitive_method_suggestions_for_foreign_idioms() {
         "#,
         DiagnosticKind::UndefinedSymbol,
     );
-    assert!(d_watch_get[0].message.contains(".read()"), "got: {}", d_watch_get[0]);
+    assert!(
+        d_watch_get[0].message.contains(".read()"),
+        "got: {}",
+        d_watch_get[0]
+    );
 
     let d_watch_set = expect_err_kind(
         r#"
@@ -1281,7 +1294,11 @@ fn primitive_method_suggestions_for_foreign_idioms() {
         "#,
         DiagnosticKind::UndefinedSymbol,
     );
-    assert!(d_watch_set[0].message.contains(".publish("), "got: {}", d_watch_set[0]);
+    assert!(
+        d_watch_set[0].message.contains(".publish("),
+        "got: {}",
+        d_watch_set[0]
+    );
 
     // 3. `ping_pong.recv` -> suggests `.wait_chunk()`
     let d_pp = expect_err_kind(
@@ -1296,7 +1313,11 @@ fn primitive_method_suggestions_for_foreign_idioms() {
         "#,
         DiagnosticKind::UndefinedSymbol,
     );
-    assert!(d_pp[0].message.contains(".wait_chunk()"), "got: {}", d_pp[0]);
+    assert!(
+        d_pp[0].message.contains(".wait_chunk()"),
+        "got: {}",
+        d_pp[0]
+    );
 
     // 4. `signal.set` -> suggests `.notify()`
     let d_sig = expect_err_kind(
@@ -1363,8 +1384,12 @@ fn fuzzy_identifier_type_field_and_fixit_notes() {
         "#,
         DiagnosticKind::UndefinedSymbol,
     );
-    assert!(d_field.iter().any(|d| d.note.as_deref().unwrap().contains(".len")));
-    assert!(d_field.iter().any(|d| d.note.as_deref().unwrap().contains("CmdFrame.setpoint")));
+    assert!(d_field
+        .iter()
+        .any(|d| d.note.as_deref().unwrap().contains(".len")));
+    assert!(d_field
+        .iter()
+        .any(|d| d.note.as_deref().unwrap().contains("CmdFrame.setpoint")));
 
     // Raw global actionable `watch<u32>` / `inbox<u32, 8>` note
     let d_glob = expect_err_kind(
@@ -1377,8 +1402,16 @@ fn fuzzy_identifier_type_field_and_fixit_notes() {
         "#,
         DiagnosticKind::IllegalMutableGlobal,
     );
-    assert!(d_glob[0].note.as_deref().unwrap().contains("watch<u32> fault_flags"));
-    assert!(d_glob[0].note.as_deref().unwrap().contains("inbox<u32, 8> fault_flags"));
+    assert!(d_glob[0]
+        .note
+        .as_deref()
+        .unwrap()
+        .contains("watch<u32> fault_flags"));
+    assert!(d_glob[0]
+        .note
+        .as_deref()
+        .unwrap()
+        .contains("inbox<u32, 8> fault_flags"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1612,8 +1645,6 @@ fn validate_value_producing_catch_blocks_e0017() {
     assert_eq!(d_void_tail[0].code(), "E0017");
 }
 
-
-
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. Section 6.2 Wave 1 — Stage 2 Semantic Invariants
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1638,7 +1669,10 @@ fn unreachable_code_e0025_all_diverging_forms_and_single_warning_per_tail() {
         .iter()
         .filter(|d| d.kind == DiagnosticKind::UnreachableCode)
         .count();
-    assert_eq!(e0025_count, 1, "expected exactly 1 E0025 for dead tail, got: {diags:?}");
+    assert_eq!(
+        e0025_count, 1,
+        "expected exactly 1 E0025 for dead tail, got: {diags:?}"
+    );
     assert_eq!(diags[0].code(), "E0025");
 
     // 2. Unreachable after `error`, `break`, `continue`, `restart`, and `sys.exit(...)`.
@@ -1793,7 +1827,11 @@ fn immortal_tasks_e0026_restart_and_sys_exit() {
         "#,
         DiagnosticKind::NonDivergingTask,
     );
-    assert_eq!(d_ret.len(), 1, "expected single E0026 on `return;`, got: {d_ret:?}");
+    assert_eq!(
+        d_ret.len(),
+        1,
+        "expected single E0026 on `return;`, got: {d_ret:?}"
+    );
 
     // 3. Valid immortal tasks: `restart;` recovery, `sys.exit(0)` sim driver, `loop` / `loop every`,
     //    plus `fn main()` exiting `}` cleanly after `spawn`s!
@@ -2555,10 +2593,15 @@ fn wave2_floats_f32_f64_literals_coercion_ops_casts_and_errors() {
     assert!(model.primitives.contains_key("sample_q"));
 
     // 2. Foreign C float type names (`float` -> `f32`, `double` -> `f64`) produce actionable notes!
-    let d_float = expect_err_kind("fn main() { float x = 1.0; }", DiagnosticKind::UndefinedSymbol);
+    let d_float = expect_err_kind(
+        "fn main() { float x = 1.0; }",
+        DiagnosticKind::UndefinedSymbol,
+    );
     assert!(d_float[0].note.as_deref().unwrap().contains("`f32`"));
-    let d_double =
-        expect_err_kind("fn main() { double x = 1.0; }", DiagnosticKind::UndefinedSymbol);
+    let d_double = expect_err_kind(
+        "fn main() { double x = 1.0; }",
+        DiagnosticKind::UndefinedSymbol,
+    );
     assert!(d_double[0].note.as_deref().unwrap().contains("`f64`"));
 
     // 3. Reject implicit mixed `f32` + `f64`, implicit `f64 -> f32` narrowing, implicit `int -> float`,
@@ -2720,16 +2763,16 @@ fn wave2_monomorphize_generic_structs_fns_inference_mangling_and_attrs() {
     assert_eq!(mono2.len(), 2);
 
     let named_out = analyze_and_monomorphize_named_programs(
-        &[
-            (&lib_prog, Some("lib.zev")),
-            (&app_prog, Some("app.zev")),
-        ],
+        &[(&lib_prog, Some("lib.zev")), (&app_prog, Some("app.zev"))],
         &AnalyzeOptions::default(),
     );
     let (_, model) = named_out
         .into_result()
         .expect("named monomorphized sema should pass");
-    assert_eq!(model.monomorphized_instances, model2.monomorphized_instances);
+    assert_eq!(
+        model.monomorphized_instances,
+        model2.monomorphized_instances
+    );
 
     let expected_instances = vec![
         MonomorphizedInstance {
@@ -3039,7 +3082,10 @@ fn local_bindings_shadow_same_named_generic_fn_templates() {
         "#,
     );
     assert!(
-        model.monomorphized_instances.iter().any(|i| i.signature == "lim<4>"),
+        model
+            .monomorphized_instances
+            .iter()
+            .any(|i| i.signature == "lim<4>"),
         "template call before the shadowing local must still instantiate: {:?}",
         model.monomorphized_instances
     );
@@ -3726,7 +3772,8 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
 
     // 3. M14: Multi-file `E0029` carries exact `file` (`Some("app.zev")`) with zero duplicate parameter-type errors!
     let lib_p = zev_parser::parse_str("struct FixedVec<T, usize N> { [N]T data; }").unwrap();
-    let app_p = zev_parser::parse_str("fn use_vec(FixedVec<u32> bad_param) {} fn main() {}").unwrap();
+    let app_p =
+        zev_parser::parse_str("fn use_vec(FixedVec<u32> bad_param) {} fn main() {}").unwrap();
     let mf_out = analyze_and_monomorphize_named_programs(
         &[(&lib_p, Some("lib.zev")), (&app_p, Some("app.zev"))],
         &AnalyzeOptions::default(),
@@ -3744,7 +3791,10 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
     let rec_types = zev_parser::parse_str("struct Cycle { Cycle self_val; }").unwrap();
     let rec_main = zev_parser::parse_str("fn main() {}").unwrap();
     let rec_out = analyze_named_programs(
-        &[(&rec_types, Some("types.zev")), (&rec_main, Some("main.zev"))],
+        &[
+            (&rec_types, Some("types.zev")),
+            (&rec_main, Some("main.zev")),
+        ],
         &AnalyzeOptions::default(),
     );
     assert!(
@@ -3957,10 +4007,7 @@ fn wave1_module_resolution_diamond_pub_extern_c_and_generics() {
     let mut opts = AnalyzeOptions::default();
     opts.include_dirs.push(ws.root.join("libs"));
 
-    let out = analyze_and_monomorphize_named_programs(
-        &[(&main_prog, main_path.to_str())],
-        &opts,
-    );
+    let out = analyze_and_monomorphize_named_programs(&[(&main_prog, main_path.to_str())], &opts);
     assert!(
         out.diagnostics.is_empty(),
         "unexpected module diagnostics: {:?}",
@@ -3968,8 +4015,14 @@ fn wave1_module_resolution_diamond_pub_extern_c_and_generics() {
     );
 
     // 1. Canonicalized symbols and `display_names`.
-    assert!(out.model.mmio_layouts.contains_key("drivers_uart__UartRegs"));
-    assert!(out.model.mmio_instances.contains_key("drivers_uart__USART1"));
+    assert!(out
+        .model
+        .mmio_layouts
+        .contains_key("drivers_uart__UartRegs"));
+    assert!(out
+        .model
+        .mmio_instances
+        .contains_key("drivers_uart__USART1"));
     assert!(out.model.irqs.contains_key("drivers_uart__IRQ_UART1"));
     assert_eq!(
         out.model
@@ -4000,7 +4053,10 @@ fn wave1_module_resolution_diamond_pub_extern_c_and_generics() {
     assert_eq!(out.model.isr_states.len(), 1);
     assert_eq!(out.model.isr_states[0].name, "hits");
     assert_eq!(out.model.spawned_tasks.len(), 1);
-    assert_eq!(out.model.spawned_tasks[0].task_name, "drivers_uart__uart_worker");
+    assert_eq!(
+        out.model.spawned_tasks[0].task_name,
+        "drivers_uart__uart_worker"
+    );
 }
 
 #[test]
@@ -4537,8 +4593,8 @@ fn main() {
 "#;
     let main_path = tmp.join("main.zev");
     std::fs::write(&main_path, main_ok).expect("write main.zev");
-    let parsed_ok = zev_parser::parse_str_named(main_ok, main_path.to_str().unwrap())
-        .expect("parse main_ok");
+    let parsed_ok =
+        zev_parser::parse_str_named(main_ok, main_path.to_str().unwrap()).expect("parse main_ok");
     let out_ok = analyze_and_monomorphize_named_programs(
         &[(&parsed_ok, main_path.to_str())],
         &AnalyzeOptions::default(),
@@ -4762,7 +4818,10 @@ fn main() { spawn t(&ring) @normal; }
         .iter()
         .filter(|d| d.kind == DiagnosticKind::StaleDmaLease)
         .count();
-    assert_eq!(stale_count, 3, "expected 3 StaleDmaLease errors on *byte_ring");
+    assert_eq!(
+        stale_count, 3,
+        "expected 3 StaleDmaLease errors on *byte_ring"
+    );
 }
 
 #[test]
@@ -5877,10 +5936,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
         let ws = TempWorkspace::new("s_m2_err");
         ws.write("Zev.toml", "[package]\nname = \"app\"\n");
         ws.write("badmod.zev", priv_pub_mod);
-        let main_path = ws.write(
-            "main.zev",
-            "import badmod as b;\nfn main() {}\n",
-        );
+        let main_path = ws.write("main.zev", "import badmod as b;\nfn main() {}\n");
         let prog = zev_parser::parse_str_named(
             &std::fs::read_to_string(&main_path).unwrap(),
             main_path.to_str().unwrap(),
@@ -6143,10 +6199,22 @@ fn main() {
     zev_sema::analyze_program(&prog).expect("sys.nop() should verify in tasks and ISRs");
 
     expect_err_kind("fn main() { sys.nop(1); }", DiagnosticKind::TypeMismatch);
-    expect_err_kind("fn main() { sys.lock_sleep(); }", DiagnosticKind::UndefinedSymbol);
-    expect_err_kind("fn main() { sys.unlock_sleep(); }", DiagnosticKind::UndefinedSymbol);
-    expect_err_kind("fn main() { sys.delay_us(5u32); }", DiagnosticKind::UndefinedSymbol);
-    expect_err_kind("fn f(u32 us) { u32 _x = us; } fn main() { sys.set_delay_us(f); }", DiagnosticKind::UndefinedSymbol);
+    expect_err_kind(
+        "fn main() { sys.lock_sleep(); }",
+        DiagnosticKind::UndefinedSymbol,
+    );
+    expect_err_kind(
+        "fn main() { sys.unlock_sleep(); }",
+        DiagnosticKind::UndefinedSymbol,
+    );
+    expect_err_kind(
+        "fn main() { sys.delay_us(5u32); }",
+        DiagnosticKind::UndefinedSymbol,
+    );
+    expect_err_kind(
+        "fn f(u32 us) { u32 _x = us; } fn main() { sys.set_delay_us(f); }",
+        DiagnosticKind::UndefinedSymbol,
+    );
 }
 
 #[test]
@@ -6228,20 +6296,24 @@ fn main() {
 "#;
     let prog = zev_parser::parse_str(src).expect("parse hal test");
 
-    let sim_out = zev_sema::analyze_with_options(
-        std::slice::from_ref(&prog),
-        &AnalyzeOptions::default(),
-    );
+    let sim_out =
+        zev_sema::analyze_with_options(std::slice::from_ref(&prog), &AnalyzeOptions::default());
     assert!(
         sim_out.diagnostics.is_empty(),
         "hal/sim diagnostics: {:?}",
         sim_out.diagnostics
     );
     assert!(sim_out.model.functions.contains_key("hal_gpio__make_pin"));
-    assert!(sim_out.model.functions.contains_key("hal_gpio__Pin__set_mode"));
+    assert!(sim_out
+        .model
+        .functions
+        .contains_key("hal_gpio__Pin__set_mode"));
     assert!(sim_out.model.functions.contains_key("hal_gpio__Pin__write"));
     assert!(sim_out.model.functions.contains_key("hal_gpio__Pin__read"));
-    assert!(!sim_out.model.mmio_instances.contains_key("chip_stm32f334__GPIOA"));
+    assert!(!sim_out
+        .model
+        .mmio_instances
+        .contains_key("chip_stm32f334__GPIOA"));
 
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let f3_opts = AnalyzeOptions {
@@ -6256,10 +6328,16 @@ fn main() {
         f3_out.diagnostics
     );
     assert!(f3_out.model.functions.contains_key("hal_gpio__make_pin"));
-    assert!(f3_out.model.functions.contains_key("hal_gpio__Pin__set_mode"));
+    assert!(f3_out
+        .model
+        .functions
+        .contains_key("hal_gpio__Pin__set_mode"));
     assert!(f3_out.model.functions.contains_key("hal_gpio__Pin__write"));
     assert!(f3_out.model.functions.contains_key("hal_gpio__Pin__read"));
-    assert!(f3_out.model.mmio_instances.contains_key("chip_stm32f334__GPIOA"));
+    assert!(f3_out
+        .model
+        .mmio_instances
+        .contains_key("chip_stm32f334__GPIOA"));
 }
 
 #[test]
@@ -6324,7 +6402,11 @@ fn main() {
         ..AnalyzeOptions::default()
     };
     let ok_out = zev_sema::analyze_with_options(&[ok_prog], &opts);
-    assert!(ok_out.diagnostics.is_empty(), "diags: {:?}", ok_out.diagnostics);
+    assert!(
+        ok_out.diagnostics.is_empty(),
+        "diags: {:?}",
+        ok_out.diagnostics
+    );
 
     // Ambiguous pub import must report ModuleError
     let ambig_src = r#"
@@ -6337,7 +6419,10 @@ fn main() {
     let ambig_prog = zev_parser::parse_str(ambig_src).expect("parse ambig_prog");
     let ambig_out = zev_sema::analyze_with_options(&[ambig_prog], &opts);
     assert!(
-        ambig_out.diagnostics.iter().any(|d| d.kind == DiagnosticKind::ModuleError),
+        ambig_out
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::ModuleError),
         "expected ambiguous re-export ModuleError, got: {:?}",
         ambig_out.diagnostics
     );
@@ -6412,7 +6497,9 @@ fn main() {}
     let p1 = zev_parser::parse_str(foreign_impl_src).unwrap();
     let o1 = zev_sema::analyze_with_options(&[p1], &opts);
     assert!(
-        o1.diagnostics.iter().any(|d| d.kind == DiagnosticKind::ModuleError),
+        o1.diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::ModuleError),
         "expected foreign-type impl rejection, got: {:?}",
         o1.diagnostics
     );
@@ -6429,7 +6516,9 @@ fn main() {
     let p2 = zev_parser::parse_str(priv_call_src).unwrap();
     let o2 = zev_sema::analyze_with_options(&[p2], &opts);
     assert!(
-        o2.diagnostics.iter().any(|d| d.kind == DiagnosticKind::ModuleError),
+        o2.diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::ModuleError),
         "expected private method ModuleError, got: {:?}",
         o2.diagnostics
     );
@@ -6548,10 +6637,26 @@ fn board_module_and_hal_target_binding_across_four_targets() {
 
     let targets: [(&str, Option<&str>, Option<&str>); 5] = [
         ("host_sim", None, None),
-        ("lm3s6965_evb", Some("hal/lm3s6965"), Some("bsp/lm3s6965_evb")),
-        ("nucleo_f334r8", Some("hal/stm32f3"), Some("bsp/nucleo_f334r8")),
-        ("esp32c6_pico", Some("hal/esp32c6"), Some("bsp/esp32c6_pico")),
-        ("rpi_pico_w", Some("hal/rp2040"), Some("bsp/rpi_pico_w_board")),
+        (
+            "lm3s6965_evb",
+            Some("hal/lm3s6965"),
+            Some("bsp/lm3s6965_evb"),
+        ),
+        (
+            "nucleo_f334r8",
+            Some("hal/stm32f3"),
+            Some("bsp/nucleo_f334r8"),
+        ),
+        (
+            "esp32c6_pico",
+            Some("hal/esp32c6"),
+            Some("bsp/esp32c6_pico"),
+        ),
+        (
+            "rpi_pico_w",
+            Some("hal/rp2040"),
+            Some("bsp/rpi_pico_w_board"),
+        ),
     ];
 
     for (label, hal_dir, board_module) in targets {
@@ -6586,8 +6691,7 @@ fn main() {
 }
 "#;
     let diamond_prog =
-        zev_parser::parse_str_named(diamond_src, "diamond.zev")
-            .expect("parse diamond import");
+        zev_parser::parse_str_named(diamond_src, "diamond.zev").expect("parse diamond import");
     let diamond_opts = AnalyzeOptions {
         include_dirs: vec![root],
         hal_dir: Some("hal/stm32f3".to_string()),
@@ -6615,7 +6719,11 @@ fn main() {
     for (label, hal_dir, board_module) in [
         ("emb_sim", None, None),
         ("emb_esp32c6", Some("hal/esp32c6"), Some("bsp/esp32c6_pico")),
-        ("emb_rp2040", Some("hal/rp2040"), Some("bsp/rpi_pico_w_board")),
+        (
+            "emb_rp2040",
+            Some("hal/rp2040"),
+            Some("bsp/rpi_pico_w_board"),
+        ),
     ] {
         let p = zev_parser::parse_str_named(emb_src, "embedded.zev")
             .unwrap_or_else(|e| panic!("parse embedded {label}: {e:#?}"));
@@ -7248,9 +7356,3 @@ fn retired_inbox_try_post_is_rejected_with_post_suggestion() {
         "expected try_post removal diagnostic recommending .post(...) or .try_send(...), got: {diags:?}"
     );
 }
-
-
-
-
-
-

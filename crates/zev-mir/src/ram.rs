@@ -203,17 +203,31 @@ impl RamReport {
     /// Human-readable static SRAM budget table suitable for `zevc ram`.
     pub fn format_table(&self) -> String {
         let mut out = String::new();
-        out.push_str("================================================================================\n");
+        out.push_str(
+            "================================================================================\n",
+        );
         out.push_str("  STATIC ZERO-HEAP SRAM REPORT (32-bit MCU Target / 64-bit Host Sim)\n");
-        out.push_str("================================================================================\n\n");
+        out.push_str(
+            "================================================================================\n\n",
+        );
 
         out.push_str("1. Spawned Task Instances (Static Coroutine Frames + TCBs)\n");
-        out.push_str("--------------------------------------------------------------------------------\n");
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
         out.push_str(&format!(
             "  {:<4} {:<24} {:<10} {:>10} {:>10} {:>11} {:>9}\n",
-            "Slot", "Instance (Blueprint)", "Priority", "Frame(32b)", "TCB(32b)", "UnionSaved", "Frame(64b)"
+            "Slot",
+            "Instance (Blueprint)",
+            "Priority",
+            "Frame(32b)",
+            "TCB(32b)",
+            "UnionSaved",
+            "Frame(64b)"
         ));
-        out.push_str("  ------------------------------------------------------------------------------\n");
+        out.push_str(
+            "  ------------------------------------------------------------------------------\n",
+        );
         if self.spawned_tasks.is_empty() {
             out.push_str("  (no spawned tasks)\n");
         } else {
@@ -369,7 +383,9 @@ impl RamReport {
         }
 
         out.push_str("3. Static OS & DMA Endpoints\n");
-        out.push_str("--------------------------------------------------------------------------------\n");
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
         if self.primitives.is_empty() {
             out.push_str("  (none)\n");
         } else {
@@ -403,12 +419,16 @@ impl RamReport {
         out.push('\n');
 
         out.push_str("4. Total Static SRAM Summary\n");
-        out.push_str("--------------------------------------------------------------------------------\n");
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
         out.push_str(&format!(
             "  {:<34} {:>12} {:>14}\n",
             "Component", "32-bit MCU", "64-bit Host"
         ));
-        out.push_str("  ------------------------------------------------------------------------------\n");
+        out.push_str(
+            "  ------------------------------------------------------------------------------\n",
+        );
         out.push_str(&format!(
             "  {:<34} {:>10} B {:>12} B\n",
             "Task Coroutine Frames (packed)",
@@ -437,22 +457,16 @@ impl RamReport {
         }
         out.push_str(&format!(
             "  {:<34} {:>10} B {:>12} B\n",
-            "Scheduler Task Table (TCBs)",
-            self.mcu32.tcb_table_bytes,
-            self.host64.tcb_table_bytes
+            "Scheduler Task Table (TCBs)", self.mcu32.tcb_table_bytes, self.host64.tcb_table_bytes
         ));
         out.push_str(&format!(
             "  {:<34} {:>10} B {:>12} B\n",
-            "OS & DMA Primitives",
-            self.mcu32.primitives_bytes,
-            self.host64.primitives_bytes
+            "OS & DMA Primitives", self.mcu32.primitives_bytes, self.host64.primitives_bytes
         ));
         if self.mcu32.isr_state_bytes > 0 || self.host64.isr_state_bytes > 0 {
             out.push_str(&format!(
                 "  {:<34} {:>10} B {:>12} B\n",
-                "ISR Static State",
-                self.mcu32.isr_state_bytes,
-                self.host64.isr_state_bytes
+                "ISR Static State", self.mcu32.isr_state_bytes, self.host64.isr_state_bytes
             ));
         }
         out.push_str(&format!(
@@ -461,12 +475,12 @@ impl RamReport {
             self.mcu32.scheduler_bytes,
             self.host64.scheduler_bytes
         ));
-        out.push_str("  ------------------------------------------------------------------------------\n");
+        out.push_str(
+            "  ------------------------------------------------------------------------------\n",
+        );
         out.push_str(&format!(
             "  {:<34} {:>10} B {:>12} B\n",
-            "TOTAL STATIC SRAM (Packed)",
-            self.mcu32.total_sram_bytes,
-            self.host64.total_sram_bytes
+            "TOTAL STATIC SRAM (Packed)", self.mcu32.total_sram_bytes, self.host64.total_sram_bytes
         ));
         out.push_str(&format!(
             "  {:<34} {:>10} B {:>12} B\n",
@@ -529,7 +543,9 @@ impl RamReport {
             }
         }
 
-        out.push_str("================================================================================\n");
+        out.push_str(
+            "================================================================================\n",
+        );
         out
     }
 }
@@ -660,18 +676,14 @@ impl<'a> LayoutCtx<'a> {
             MirType::Void => SizeAlign::new(0, 1),
             MirType::Bool | MirType::U8 | MirType::I8 => SizeAlign::new(1, 1),
             MirType::U16 | MirType::I16 => SizeAlign::new(2, 2),
-            MirType::U32 | MirType::I32 | MirType::F32 => {
-                SizeAlign::new(4, 4)
-            }
+            MirType::U32 | MirType::I32 | MirType::F32 => SizeAlign::new(4, 4),
             MirType::U64 | MirType::I64 | MirType::F64 => SizeAlign::new(8, 8),
             MirType::Usize
             | MirType::Isize
             | MirType::Str
             | MirType::Ptr(_)
             | MirType::MmioPtr(_)
-            | MirType::FnPtr { .. } => {
-                SizeAlign::new(ptr, ptr)
-            }
+            | MirType::FnPtr { .. } => SizeAlign::new(ptr, ptr),
             MirType::Lease(_) => SizeAlign::new(ptr * 3, ptr),
             MirType::EndianInt { bits, .. } => {
                 let bytes = (*bits as usize) / 8;
@@ -915,6 +927,7 @@ pub fn compute_ram_report(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compute_ram_report_with_subsystems(
     structs: &[MirStruct],
     functions: &[MirFunction],
@@ -1094,7 +1107,11 @@ pub fn compute_ram_report_with_subsystems(
             name: sub.name.clone(),
             kind_display: sub.struct_name.clone(),
             dma_safe: sub.dma_safe,
-            holds_sleep_lock: struct_holds_dma_sleep_lock(&sub.struct_name, sub.dma_safe, &ctx.structs),
+            holds_sleep_lock: struct_holds_dma_sleep_lock(
+                &sub.struct_name,
+                sub.dma_safe,
+                &ctx.structs,
+            ),
             dead_stripped: false,
             irq_mask_elided: false,
             singleton_folded: false,
@@ -1255,7 +1272,11 @@ fn resolve_fn_metrics<'a>(
                     resolve_fn_metrics(&slot.callee, fn_map, ctx, cache, visiting);
                 }
                 let ret_ty = func.envelope_return_type();
-                let ret_opt = if ret_ty.is_void() { None } else { Some(&ret_ty) };
+                let ret_opt = if ret_ty.is_void() {
+                    None
+                } else {
+                    Some(&ret_ty)
+                };
                 compute_frame_metrics(&func.vars, child_slots, ret_opt, cache, ctx)
             }
         }
@@ -1334,7 +1355,10 @@ fn compute_single_abi_frame(
                 TargetAbi::Mcu32 => cm.naive_32,
                 TargetAbi::Host64 => cm.naive_64,
             };
-            groups.entry(slot.union_group).or_default().push(packed_child);
+            groups
+                .entry(slot.union_group)
+                .or_default()
+                .push(packed_child);
             naive_fields.push(naive_child);
             child_naive_bytes += naive_child.size;
         }
@@ -1635,7 +1659,10 @@ fn fold_expr_run(
         | MirExprKind::LeaseAddr { lease: inner, .. } => {
             fold_expr_run(inner, fn_map, cache, visiting, kind, extra_blocks);
         }
-        MirExprKind::AddrOfPlace(place) | MirExprKind::ArrayToSlice { array_place: place, .. } => {
+        MirExprKind::AddrOfPlace(place)
+        | MirExprKind::ArrayToSlice {
+            array_place: place, ..
+        } => {
             fold_place_run(place, fn_map, cache, visiting, kind, extra_blocks);
         }
         MirExprKind::Binary { lhs, rhs, .. }
@@ -1696,11 +1723,25 @@ fn fold_expr_run(
                 fold_prim_target_run(target, fn_map, cache, visiting, kind, extra_blocks);
             }
             MirPrimReadOp::InboxTrySend { target, value, .. }
-            | MirPrimReadOp::DmaSlotPark { target, lease: value, .. }
-            | MirPrimReadOp::ByteRingPush { target, src: value, .. }
-            | MirPrimReadOp::ByteRingPushByte { target, byte: value, .. }
-            | MirPrimReadOp::ByteRingGrantWrite { target, len: value, .. }
-            | MirPrimReadOp::ByteRingPop { target, dst: value, .. } => {
+            | MirPrimReadOp::DmaSlotPark {
+                target,
+                lease: value,
+                ..
+            }
+            | MirPrimReadOp::ByteRingPush {
+                target, src: value, ..
+            }
+            | MirPrimReadOp::ByteRingPushByte {
+                target,
+                byte: value,
+                ..
+            }
+            | MirPrimReadOp::ByteRingGrantWrite {
+                target, len: value, ..
+            }
+            | MirPrimReadOp::ByteRingPop {
+                target, dst: value, ..
+            } => {
                 fold_prim_target_run(target, fn_map, cache, visiting, kind, extra_blocks);
                 fold_expr_run(value, fn_map, cache, visiting, kind, extra_blocks);
             }
@@ -1719,8 +1760,12 @@ fn fold_expr_run(
                 fold_expr_run(view, fn_map, cache, visiting, kind, extra_blocks);
             }
             MirPrimReadOp::InboxViewTrySend { view, value, .. }
-            | MirPrimReadOp::ByteRingViewPush { view, src: value, .. }
-            | MirPrimReadOp::ByteRingViewPushByte { view, byte: value, .. }
+            | MirPrimReadOp::ByteRingViewPush {
+                view, src: value, ..
+            }
+            | MirPrimReadOp::ByteRingViewPushByte {
+                view, byte: value, ..
+            }
             | MirPrimReadOp::ByteRingViewGrantWrite { view, len: value }
             | MirPrimReadOp::ByteRingViewPop { view, dst: value } => {
                 fold_expr_run(view, fn_map, cache, visiting, kind, extra_blocks);
@@ -1759,8 +1804,7 @@ fn analyze_direct_stmts(
                 fold_place_run(target, fn_map, cache, visiting, &mut kind, &mut blocks);
                 fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
             }
-            MirStmt::Expr(expr)
-            | MirStmt::Intrinsic(MirIntrinsicOp::UseSystick { hz: expr }) => {
+            MirStmt::Expr(expr) | MirStmt::Intrinsic(MirIntrinsicOp::UseSystick { hz: expr }) => {
                 fold_expr_run(expr, fn_map, cache, visiting, &mut kind, &mut blocks);
             }
             MirStmt::PrimOp(op) => match op {
@@ -1777,9 +1821,17 @@ fn analyze_direct_stmts(
                 MirPrimNonBlockingOp::WatchPublish { target, value, .. }
                 | MirPrimNonBlockingOp::GuardedSet { target, value, .. }
                 | MirPrimNonBlockingOp::InboxPost { target, value, .. }
-                | MirPrimNonBlockingOp::PingPongCompleteHalf { target, half: value, .. }
-                | MirPrimNonBlockingOp::ByteRingConsume { target, len: value, .. }
-                | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len: value, .. } => {
+                | MirPrimNonBlockingOp::PingPongCompleteHalf {
+                    target,
+                    half: value,
+                    ..
+                }
+                | MirPrimNonBlockingOp::ByteRingConsume {
+                    target, len: value, ..
+                }
+                | MirPrimNonBlockingOp::ByteRingCommitWrite {
+                    target, len: value, ..
+                } => {
                     fold_prim_target_run(target, fn_map, cache, visiting, &mut kind, &mut blocks);
                     fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
                 }
@@ -1791,7 +1843,9 @@ fn analyze_direct_stmts(
                 }
                 MirPrimNonBlockingOp::InboxViewPost { view, value, .. }
                 | MirPrimNonBlockingOp::ByteRingViewConsume { view, len: value }
-                | MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len: value, .. } => {
+                | MirPrimNonBlockingOp::ByteRingViewCommitWrite {
+                    view, len: value, ..
+                } => {
                     fold_expr_run(view, fn_map, cache, visiting, &mut kind, &mut blocks);
                     fold_expr_run(value, fn_map, cache, visiting, &mut kind, &mut blocks);
                 }
@@ -1885,10 +1939,7 @@ fn analyze_direct_stmts(
                 fold_fmt_chunks_run(chunks, fn_map, cache, visiting, &mut kind, &mut blocks);
             }
             MirStmt::MmioWrite {
-                base,
-                index,
-                value,
-                ..
+                base, index, value, ..
             } => {
                 fold_expr_run(base, fn_map, cache, visiting, &mut kind, &mut blocks);
                 if let Some(idx) = index {
@@ -1961,9 +2012,8 @@ fn tarjan_sccs(adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
 }
 
 fn sccs_have_cycle(sccs: &[Vec<usize>], adj: &[Vec<usize>]) -> bool {
-    sccs.iter().any(|scc| {
-        scc.len() > 1 || scc.first().is_some_and(|&u| adj[u].contains(&u))
-    })
+    sccs.iter()
+        .any(|scc| scc.len() > 1 || scc.first().is_some_and(|&u| adj[u].contains(&u)))
 }
 
 fn analyze_coro_blocks(
@@ -2050,7 +2100,9 @@ fn analyze_coro_blocks(
                             | crate::ir::MirWaitArmOp::PingPongWaitChunk { target, .. }
                             | crate::ir::MirWaitArmOp::PoolAlloc { target, .. }
                             | crate::ir::MirWaitArmOp::ByteRingWaitRead { target, .. } => {
-                                fold_prim_target_run(target, fn_map, cache, visiting, &mut k, &mut w);
+                                fold_prim_target_run(
+                                    target, fn_map, cache, visiting, &mut k, &mut w,
+                                );
                             }
                             crate::ir::MirWaitArmOp::InboxViewRecv { view, .. }
                             | crate::ir::MirWaitArmOp::InboxViewSend { view, .. }
@@ -2075,7 +2127,10 @@ fn analyze_coro_blocks(
                 }
             },
         }
-        let has_for_latch = b.stmts.iter().any(|st| matches!(st, MirStmt::BoundedForLatch));
+        let has_for_latch = b
+            .stmts
+            .iter()
+            .any(|st| matches!(st, MirStmt::BoundedForLatch));
         if !has_for_latch {
             adj_free[idx] = adj[idx].clone();
         }

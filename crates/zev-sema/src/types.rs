@@ -34,10 +34,7 @@ pub enum Ty {
     /// Linear, move-only buffer lease `Lease<T>` allocated from a `pool<T, K>`.
     Lease(Box<Ty>),
     /// Function pointer or function reference (`fn(T1, T2) -> Ret`).
-    FnPtr {
-        params: Vec<Ty>,
-        ret: Box<Ty>,
-    },
+    FnPtr { params: Vec<Ty>, ret: Box<Ty> },
     /// Typed MMIO register block layout (`UartRegs`), usable behind pointer `*UartRegs` (`mmio` values cannot be copied by value).
     MmioLayout(String),
     /// Typed physical MMIO peripheral instance (`USART1 : UartRegs @ 0x4001_1000`), coercing implicitly to `*UartRegs`.
@@ -349,15 +346,15 @@ impl Ty {
     pub const fn fixed_int_bit_width(&self) -> Option<u32> {
         match self {
             Self::Prim(PrimType::U8 | PrimType::I8) => Some(8),
-            Self::Prim(
-                PrimType::U16 | PrimType::I16 | PrimType::U16Be | PrimType::U16Le,
-            ) => Some(16),
-            Self::Prim(
-                PrimType::U32 | PrimType::I32 | PrimType::U32Be | PrimType::U32Le,
-            ) => Some(32),
-            Self::Prim(
-                PrimType::U64 | PrimType::I64 | PrimType::U64Be | PrimType::U64Le,
-            ) => Some(64),
+            Self::Prim(PrimType::U16 | PrimType::I16 | PrimType::U16Be | PrimType::U16Le) => {
+                Some(16)
+            }
+            Self::Prim(PrimType::U32 | PrimType::I32 | PrimType::U32Be | PrimType::U32Le) => {
+                Some(32)
+            }
+            Self::Prim(PrimType::U64 | PrimType::I64 | PrimType::U64Be | PrimType::U64Le) => {
+                Some(64)
+            }
             _ => None,
         }
     }
@@ -553,17 +550,14 @@ impl Ty {
                 true
             }
             (Ty::Str, Ty::Ptr(inner))
-                if inner.is_void()
-                    || matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>
+                if inner.is_void() || matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>
             {
                 true
             }
             (Ty::Str, Ty::Slice(inner)) if matches!(**inner, Ty::Prim(PrimType::U8)) => true,
 
             // Typed physical MMIO peripheral instance coerces implicitly to `*Layout`.
-            (Ty::MmioInstance { layout: a, .. }, Ty::Ptr(inner))
-                if matches!(&**inner, Ty::MmioLayout(b) if a == b) =>
-            {
+            (Ty::MmioInstance { layout: a, .. }, Ty::Ptr(inner)) if matches!(&**inner, Ty::MmioLayout(b) if a == b) => {
                 true
             }
 

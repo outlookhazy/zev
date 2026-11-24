@@ -93,9 +93,9 @@ impl VisibilityReport {
             MirPrimKind::ByteRing { .. } => {
                 self.isr_contended_prim_mangles.contains("view_byte_ring")
             }
-            MirPrimKind::Inbox { elem, .. } => self.isr_contended_prim_mangles.contains(
-                &MirPrimViewKind::Inbox { elem: elem.clone() }.mangle_name(),
-            ),
+            MirPrimKind::Inbox { elem, .. } => self
+                .isr_contended_prim_mangles
+                .contains(&MirPrimViewKind::Inbox { elem: elem.clone() }.mangle_name()),
             MirPrimKind::Pool { elem, .. } => self
                 .isr_contended_prim_mangles
                 .contains(&format!("lease_release_{}", elem.mangle_name())),
@@ -279,15 +279,36 @@ fn watch_or_prim_size_align(
         MirPrimKind::Signal => struct_size_align(&[(1, 1), (1, 1), (4, 4)], false),
         MirPrimKind::WaitQueue => struct_size_align(&[(4, 4)], false),
         MirPrimKind::Watch { elem } => {
-            let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
+            let el = type_size_align(
+                elem,
+                false,
+                ptr_bytes,
+                structs,
+                dma_layout_structs,
+                seen_structs,
+            );
             struct_size_align(&[el, (4, 4), (4, 4)], false)
         }
         MirPrimKind::Guarded { elem } => {
-            let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
+            let el = type_size_align(
+                elem,
+                false,
+                ptr_bytes,
+                structs,
+                dma_layout_structs,
+                seen_structs,
+            );
             struct_size_align(&[el], false)
         }
         MirPrimKind::Inbox { elem, cap } => {
-            let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
+            let el = type_size_align(
+                elem,
+                false,
+                ptr_bytes,
+                structs,
+                dma_layout_structs,
+                seen_structs,
+            );
             struct_size_align(
                 &[
                     (4, 4),
@@ -302,7 +323,14 @@ fn watch_or_prim_size_align(
             )
         }
         MirPrimKind::PingPong { elem, cap } => {
-            let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
+            let el = type_size_align(
+                elem,
+                false,
+                ptr_bytes,
+                structs,
+                dma_layout_structs,
+                seen_structs,
+            );
             struct_size_align(
                 &[
                     (1, 1),
@@ -320,7 +348,14 @@ fn watch_or_prim_size_align(
                 &[(4, 4), (4, 4), (ptr_bytes, ptr_bytes), (1, 1), (1, 1)],
                 false,
             );
-            let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
+            let el = type_size_align(
+                elem,
+                false,
+                ptr_bytes,
+                structs,
+                dma_layout_structs,
+                seen_structs,
+            );
             let elem_sz = el.0.max(1);
             let elem_al = el.1.max(1);
             if dma_safe {
@@ -332,7 +367,12 @@ fn watch_or_prim_size_align(
             struct_size_align(&[hdr, (elem_sz * *cap, elem_al)], false)
         }
         MirPrimKind::DmaSlot { .. } => struct_size_align(
-            &[(ptr_bytes, ptr_bytes), (ptr_bytes, ptr_bytes), (1, 1), (1, 1)],
+            &[
+                (ptr_bytes, ptr_bytes),
+                (ptr_bytes, ptr_bytes),
+                (1, 1),
+                (1, 1),
+            ],
             false,
         ),
         MirPrimKind::ByteRing { cap } => struct_size_align(
@@ -369,7 +409,15 @@ fn watch_byte_size(
     let kind = MirPrimKind::Watch {
         elem: Box::new(elem.clone()),
     };
-    watch_or_prim_size_align(&kind, dma_safe, ptr_bytes, structs, dma_layout_structs, &mut seen).0
+    watch_or_prim_size_align(
+        &kind,
+        dma_safe,
+        ptr_bytes,
+        structs,
+        dma_layout_structs,
+        &mut seen,
+    )
+    .0
 }
 
 fn is_benign_c_builtin(name: &str) -> bool {
@@ -427,7 +475,12 @@ impl<'a> ScanCtx<'a> {
         }
     }
 
-    fn record_sys_isr_callback(&mut self, arg: Option<&MirExpr>, params: &[MirType], ret: &MirType) {
+    fn record_sys_isr_callback(
+        &mut self,
+        arg: Option<&MirExpr>,
+        params: &[MirType],
+        ret: &MirType,
+    ) {
         let Some(mut expr) = arg else {
             return;
         };
@@ -452,9 +505,7 @@ impl<'a> ScanCtx<'a> {
             MirType::PrimView(vk) => {
                 self.acc.isr_contended_prim_mangles.insert(vk.mangle_name());
             }
-            MirType::Ptr(inner)
-            | MirType::Slice(inner)
-            | MirType::Array { elem: inner, .. } => {
+            MirType::Ptr(inner) | MirType::Slice(inner) | MirType::Array { elem: inner, .. } => {
                 self.record_prim_types_in_ty(inner, seen_structs);
             }
             MirType::Lease(inner) => {
@@ -538,7 +589,9 @@ impl<'a> ScanCtx<'a> {
             }
             MirPrimTarget::PtrExpr(expr) => {
                 if in_isr {
-                    self.acc.isr_contended_prim_mangles.insert(kind.mangle_name());
+                    self.acc
+                        .isr_contended_prim_mangles
+                        .insert(kind.mangle_name());
                 }
                 self.visit_expr(expr, in_isr, callees);
             }
@@ -607,7 +660,9 @@ impl<'a> ScanCtx<'a> {
             }
             MirExprKind::MakePrimView { ptr, cap, kind } => {
                 if in_isr {
-                    self.acc.isr_contended_prim_mangles.insert(kind.mangle_name());
+                    self.acc
+                        .isr_contended_prim_mangles
+                        .insert(kind.mangle_name());
                     let concrete = match kind {
                         MirPrimViewKind::ByteRing => MirPrimKind::ByteRing { cap: *cap },
                         MirPrimViewKind::Inbox { elem } => MirPrimKind::Inbox {
@@ -633,10 +688,18 @@ impl<'a> ScanCtx<'a> {
             | MirExprKind::LeaseAddr { lease: inner, .. } => {
                 self.visit_expr(inner, in_isr, callees);
             }
-            MirExprKind::AddrOfPlace(place) | MirExprKind::ArrayToSlice { array_place: place, .. } => {
+            MirExprKind::AddrOfPlace(place)
+            | MirExprKind::ArrayToSlice {
+                array_place: place, ..
+            } => {
                 self.visit_place(place, in_isr, callees);
             }
-            MirExprKind::Binary { lhs, rhs, .. } | MirExprKind::Index { base: lhs, index: rhs, .. } => {
+            MirExprKind::Binary { lhs, rhs, .. }
+            | MirExprKind::Index {
+                base: lhs,
+                index: rhs,
+                ..
+            } => {
                 self.visit_expr(lhs, in_isr, callees);
                 self.visit_expr(rhs, in_isr, callees);
             }
@@ -784,9 +847,13 @@ impl<'a> ScanCtx<'a> {
                     };
                     self.visit_prim_target(target, &kind, in_isr, callees);
                 }
-                MirPrimReadOp::ByteRingPush { target, cap, src, .. }
+                MirPrimReadOp::ByteRingPush {
+                    target, cap, src, ..
+                }
                 | MirPrimReadOp::ByteRingPop {
-                    target, cap, dst: src,
+                    target,
+                    cap,
+                    dst: src,
                 } => {
                     let kind = MirPrimKind::ByteRing { cap: *cap };
                     self.visit_prim_target(target, &kind, in_isr, callees);
@@ -1256,10 +1323,20 @@ impl<'a> ScanCtx<'a> {
                                 self.visit_prim_target(target, &kind, in_isr, callees);
                             }
                             MirWaitArmOp::SignalWait { target, .. } => {
-                                self.visit_prim_target(target, &MirPrimKind::Signal, in_isr, callees);
+                                self.visit_prim_target(
+                                    target,
+                                    &MirPrimKind::Signal,
+                                    in_isr,
+                                    callees,
+                                );
                             }
                             MirWaitArmOp::WaitQueueCommit { target, .. } => {
-                                self.visit_prim_target(target, &MirPrimKind::WaitQueue, in_isr, callees);
+                                self.visit_prim_target(
+                                    target,
+                                    &MirPrimKind::WaitQueue,
+                                    in_isr,
+                                    callees,
+                                );
                             }
                             MirWaitArmOp::WatchWaitChange {
                                 target, elem_ty, ..
@@ -1336,12 +1413,7 @@ impl<'a> ScanCtx<'a> {
         }
     }
 
-    fn visit_blocks(
-        &mut self,
-        blocks: &[MirBlock],
-        in_isr: bool,
-        callees: &mut BTreeSet<String>,
-    ) {
+    fn visit_blocks(&mut self, blocks: &[MirBlock], in_isr: bool, callees: &mut BTreeSet<String>) {
         for blk in blocks {
             for s in &blk.stmts {
                 self.visit_stmt(s, in_isr, callees);
@@ -1533,35 +1605,36 @@ pub fn analyze_visibility(module: &MirModule) -> VisibilityReport {
     let mut visited_isr_fns: BTreeSet<String> = BTreeSet::new();
     let mut processed_fnptr_sigs = 0usize;
     let mut seeded_real_extern_c = false;
-    let seed_indirect_isr_callees = |ctx: &ScanCtx<'_>,
-                                     visited_isr_fns: &BTreeSet<String>,
-                                     isr_queue: &mut VecDeque<String>,
-                                     processed_fnptr_sigs: &mut usize,
-                                     seeded_real_extern_c: &mut bool| {
-        while *processed_fnptr_sigs < ctx.acc.isr_fnptr_sigs.len() {
-            let (params, ret) = &ctx.acc.isr_fnptr_sigs[*processed_fnptr_sigs];
-            *processed_fnptr_sigs += 1;
-            for fname in &addr_taken_fns {
-                if !visited_isr_fns.contains(fname)
-                    && fn_map
-                        .get(fname.as_str())
-                        .is_some_and(|f| fnptr_sig_matches(f, params, ret))
-                {
-                    isr_queue.push_back(fname.clone());
+    let seed_indirect_isr_callees =
+        |ctx: &ScanCtx<'_>,
+         visited_isr_fns: &BTreeSet<String>,
+         isr_queue: &mut VecDeque<String>,
+         processed_fnptr_sigs: &mut usize,
+         seeded_real_extern_c: &mut bool| {
+            while *processed_fnptr_sigs < ctx.acc.isr_fnptr_sigs.len() {
+                let (params, ret) = &ctx.acc.isr_fnptr_sigs[*processed_fnptr_sigs];
+                *processed_fnptr_sigs += 1;
+                for fname in &addr_taken_fns {
+                    if !visited_isr_fns.contains(fname)
+                        && fn_map
+                            .get(fname.as_str())
+                            .is_some_and(|f| fnptr_sig_matches(f, params, ret))
+                    {
+                        isr_queue.push_back(fname.clone());
+                    }
                 }
             }
-        }
-        if ctx.acc.isr_calls_real_extern_c && !*seeded_real_extern_c {
-            *seeded_real_extern_c = true;
-            for fname in &addr_taken_fns {
-                if !visited_isr_fns.contains(fname)
-                    && fn_map.get(fname.as_str()).is_some_and(|f| !f.is_yielding)
-                {
-                    isr_queue.push_back(fname.clone());
+            if ctx.acc.isr_calls_real_extern_c && !*seeded_real_extern_c {
+                *seeded_real_extern_c = true;
+                for fname in &addr_taken_fns {
+                    if !visited_isr_fns.contains(fname)
+                        && fn_map.get(fname.as_str()).is_some_and(|f| !f.is_yielding)
+                    {
+                        isr_queue.push_back(fname.clone());
+                    }
                 }
             }
-        }
-    };
+        };
 
     seed_indirect_isr_callees(
         &ctx,
@@ -1740,14 +1813,14 @@ struct SubsysInstancePath {
     display_path: String,
 }
 
-fn collect_subsystem_instance_counts(
-    module: &MirModule,
-) -> (
+type SubsystemInstanceCounts = (
     BTreeMap<String, usize>,
     BTreeSet<String>,
     BTreeMap<String, String>,
     BTreeSet<String>,
-) {
+);
+
+fn collect_subsystem_instance_counts(module: &MirModule) -> SubsystemInstanceCounts {
     let structs: BTreeMap<&str, &MirStruct> = module
         .structs
         .iter()
@@ -2130,10 +2203,9 @@ fn mir_expr_eq(a: &MirExpr, b: &MirExpr) -> bool {
         (MirExprKind::ResultIsErr(x), MirExprKind::ResultIsErr(y))
         | (MirExprKind::ResultErr(x), MirExprKind::ResultErr(y))
         | (MirExprKind::ResultVal(x), MirExprKind::ResultVal(y)) => x == y,
-        (
-            MirExprKind::Unary { op: oa, expr: ea },
-            MirExprKind::Unary { op: ob, expr: eb },
-        ) => oa == ob && mir_expr_eq(ea, eb),
+        (MirExprKind::Unary { op: oa, expr: ea }, MirExprKind::Unary { op: ob, expr: eb }) => {
+            oa == ob && mir_expr_eq(ea, eb)
+        }
         (MirExprKind::AddrOfPlace(pa), MirExprKind::AddrOfPlace(pb)) => mir_place_eq(pa, pb),
         (
             MirExprKind::Binary {
@@ -2174,14 +2246,7 @@ fn mir_expr_eq(a: &MirExpr, b: &MirExpr) -> bool {
                 field: fb,
                 raw_field_ty: rtb,
             },
-        ) => {
-            sa == sb
-                && pa == pb
-                && ipa == ipb
-                && fa == fb
-                && rta == rtb
-                && mir_expr_eq(ba, bb)
-        }
+        ) => sa == sb && pa == pb && ipa == ipb && fa == fb && rta == rtb && mir_expr_eq(ba, bb),
         (
             MirExprKind::StructLit {
                 struct_name: sa,
@@ -3080,9 +3145,9 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
             MirPrimReadOp::ByteRingPushByte {
                 target: t, byte, ..
             } => prim_target_reads_var(t, target) || expr_reads_var(byte, target),
-            MirPrimReadOp::ByteRingGrantWrite {
-                target: t, len, ..
-            } => prim_target_reads_var(t, target) || expr_reads_var(len, target),
+            MirPrimReadOp::ByteRingGrantWrite { target: t, len, .. } => {
+                prim_target_reads_var(t, target) || expr_reads_var(len, target)
+            }
             MirPrimReadOp::InboxViewTryRecv { view, .. }
             | MirPrimReadOp::InboxViewLen { view, .. }
             | MirPrimReadOp::InboxViewCap { view, .. }
@@ -3175,12 +3240,8 @@ fn stmt_reads_var(stmt: &MirStmt, target: VarId) -> bool {
             MirPrimNonBlockingOp::LeaseNullify { target: place, .. } => {
                 place_reads_var(place, target, false)
             }
-            MirPrimNonBlockingOp::ByteRingConsume {
-                target: t, len, ..
-            }
-            | MirPrimNonBlockingOp::ByteRingCommitWrite {
-                target: t, len, ..
-            }
+            MirPrimNonBlockingOp::ByteRingConsume { target: t, len, .. }
+            | MirPrimNonBlockingOp::ByteRingCommitWrite { target: t, len, .. }
             | MirPrimNonBlockingOp::PingPongCompleteHalf {
                 target: t,
                 half: len,
@@ -3443,9 +3504,7 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
                 subst_prim_target(t, target, repl);
                 subst_expr(byte, target, repl);
             }
-            MirPrimReadOp::ByteRingGrantWrite {
-                target: t, len, ..
-            } => {
+            MirPrimReadOp::ByteRingGrantWrite { target: t, len, .. } => {
                 subst_prim_target(t, target, repl);
                 subst_expr(len, target, repl);
             }
@@ -3520,12 +3579,8 @@ fn subst_stmt(stmt: &mut MirStmt, target: VarId, repl: &MirExpr) {
             MirPrimNonBlockingOp::LeaseNullify { target: place, .. } => {
                 subst_place(place, target, repl, false);
             }
-            MirPrimNonBlockingOp::ByteRingConsume {
-                target: t, len, ..
-            }
-            | MirPrimNonBlockingOp::ByteRingCommitWrite {
-                target: t, len, ..
-            }
+            MirPrimNonBlockingOp::ByteRingConsume { target: t, len, .. }
+            | MirPrimNonBlockingOp::ByteRingCommitWrite { target: t, len, .. }
             | MirPrimNonBlockingOp::PingPongCompleteHalf {
                 target: t,
                 half: len,
@@ -3705,8 +3760,8 @@ fn subst_blocks(blocks: &mut [MirBlock], target: VarId, repl: &MirExpr) {
     }
 }
 
-fn collect_fn_addrs_and_calls_expr<'a>(
-    expr: &'a MirExpr,
+fn collect_fn_addrs_and_calls_expr(
+    expr: &MirExpr,
     addr_taken_fns: &mut BTreeSet<String>,
     call_sites: &mut BTreeMap<String, Vec<Vec<MirExpr>>>,
 ) {
@@ -3751,8 +3806,7 @@ fn collect_fn_addrs_and_calls_expr<'a>(
                 collect_fn_addrs_and_calls_expr(i, addr_taken_fns, call_sites);
             }
         }
-        MirExprKind::AddrOfPlace(p)
-        | MirExprKind::ArrayToSlice { array_place: p, .. } => {
+        MirExprKind::AddrOfPlace(p) | MirExprKind::ArrayToSlice { array_place: p, .. } => {
             collect_fn_addrs_and_calls_place(p, addr_taken_fns, call_sites);
         }
         MirExprKind::Binary { lhs, rhs, .. }
@@ -4391,10 +4445,19 @@ fn is_single_boot_called_fn(
     if call_sites.get(fn_name).map_or(0, Vec::len) != 1 {
         return false;
     }
-    fn stmt_has_direct_call_outside_loop(stmt: &MirStmt, target: &str, in_loop: bool) -> Option<bool> {
+    fn stmt_has_direct_call_outside_loop(
+        stmt: &MirStmt,
+        target: &str,
+        in_loop: bool,
+    ) -> Option<bool> {
         match stmt {
             MirStmt::Expr(MirExpr {
-                kind: MirExprKind::CallDirect { callee, is_extern_c: false, .. },
+                kind:
+                    MirExprKind::CallDirect {
+                        callee,
+                        is_extern_c: false,
+                        ..
+                    },
                 ..
             }) if callee == target => Some(!in_loop),
             MirStmt::If {
@@ -4499,11 +4562,14 @@ fn propagate_boot_consts(
 
         let mut candidate: Option<(usize, VarId, MirExpr)> = None;
         for (idx, step) in module.boot.steps.iter().enumerate() {
-            if let MirBootStep::Stmt(MirStmt::Assign {
+            let MirBootStep::Stmt(stmt) = step else {
+                continue;
+            };
+            if let MirStmt::Assign {
                 target: MirPlace::Var(vid),
                 op: MirAssignOp::Assign,
                 value,
-            }) = step
+            } = stmt.as_ref()
             {
                 let Some(v) = var_by_id(&module.boot.vars, *vid) else {
                     continue;
@@ -5140,7 +5206,11 @@ pub fn prune_unreachable_functions(module: &mut MirModule) {
                     for s in &blk.stmts {
                         collect_fn_addrs_and_calls_stmt(s, &mut sub_addrs, &mut sub_calls);
                     }
-                    collect_fn_addrs_and_calls_term(&blk.terminator, &mut sub_addrs, &mut sub_calls);
+                    collect_fn_addrs_and_calls_term(
+                        &blk.terminator,
+                        &mut sub_addrs,
+                        &mut sub_calls,
+                    );
                 }
             }
         }
@@ -5379,7 +5449,11 @@ mod tests {
                     error_spec: None,
                     body: Some(Block::new(
                         vec![Stmt::new(
-                            StmtKind::Expr(expr_method(expr_id("w"), "publish", vec![expr_id("v")])),
+                            StmtKind::Expr(expr_method(
+                                expr_id("w"),
+                                "publish",
+                                vec![expr_id("v")],
+                            )),
                             sp,
                         )],
                         sp,
@@ -5439,7 +5513,10 @@ mod tests {
                                             StmtKind::Expr(expr_method(
                                                 expr_id("dead_pub_only"),
                                                 "publish",
-                                                vec![expr_call("side_effect_val", vec![expr_int(1)])],
+                                                vec![expr_call(
+                                                    "side_effect_val",
+                                                    vec![expr_int(1)],
+                                                )],
                                             )),
                                             sp,
                                         ),
@@ -5508,7 +5585,10 @@ mod tests {
                                             StmtKind::Expr(expr_method(
                                                 expr_id("dead_pub_only"),
                                                 "publish",
-                                                vec![expr_call("side_effect_val", vec![expr_int(2)])],
+                                                vec![expr_call(
+                                                    "side_effect_val",
+                                                    vec![expr_int(2)],
+                                                )],
                                             )),
                                             sp,
                                         )],
@@ -5533,7 +5613,11 @@ mod tests {
                                 StmtKind::VarDecl {
                                     ty: ty_prim(PrimType::U16),
                                     name: id("a"),
-                                    init: Some(expr_method(expr_id("live_read_task"), "read", vec![])),
+                                    init: Some(expr_method(
+                                        expr_id("live_read_task"),
+                                        "read",
+                                        vec![],
+                                    )),
                                 },
                                 sp,
                             ),
@@ -5560,10 +5644,7 @@ mod tests {
 
         assert_eq!(
             report.dead_watches,
-            BTreeSet::from([
-                "dead_pub_only".to_string(),
-                "dead_ptr_pub_only".to_string()
-            ])
+            BTreeSet::from(["dead_pub_only".to_string(), "dead_ptr_pub_only".to_string()])
         );
         // `dead_pub_only` (`watch<u32>`, 12 B) is stripped; `dead_ptr_pub_only` has `&` taken so its `.bss` stays.
         assert_eq!(report.dead_watch_bytes_saved_32, 12);
@@ -5729,7 +5810,7 @@ mod tests {
             elem: Box::new(MirType::U16),
         })));
         mir.boot.steps = vec![
-            MirBootStep::Stmt(MirStmt::Expr(MirExpr::new(
+            MirBootStep::Stmt(Box::new(MirStmt::Expr(MirExpr::new(
                 MirExprKind::CallDirect {
                     callee: "read_any".to_string(),
                     is_extern_c: false,
@@ -5739,20 +5820,24 @@ mod tests {
                     )],
                 },
                 MirType::U16,
+            )))),
+            MirBootStep::Stmt(Box::new(MirStmt::PrimOp(
+                MirPrimNonBlockingOp::WatchPublish {
+                    target: MirPrimTarget::PtrExpr(MirExpr::new(
+                        MirExprKind::GlobalPrimAddr("w_b".to_string()),
+                        ptr_u16_watch,
+                    )),
+                    elem_ty: MirType::U16,
+                    value: MirExpr::new(MirExprKind::IntLit(20), MirType::U16),
+                },
             ))),
-            MirBootStep::Stmt(MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
-                target: MirPrimTarget::PtrExpr(MirExpr::new(
-                    MirExprKind::GlobalPrimAddr("w_b".to_string()),
-                    ptr_u16_watch,
-                )),
-                elem_ty: MirType::U16,
-                value: MirExpr::new(MirExprKind::IntLit(20), MirType::U16),
-            })),
-            MirBootStep::Stmt(MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
-                target: MirPrimTarget::Global("w_other_ty".to_string()),
-                elem_ty: MirType::U32,
-                value: MirExpr::new(MirExprKind::IntLit(30), MirType::U32),
-            })),
+            MirBootStep::Stmt(Box::new(MirStmt::PrimOp(
+                MirPrimNonBlockingOp::WatchPublish {
+                    target: MirPrimTarget::Global("w_other_ty".to_string()),
+                    elem_ty: MirType::U32,
+                    value: MirExpr::new(MirExprKind::IntLit(30), MirType::U32),
+                },
+            ))),
         ];
 
         let report = analyze_visibility(&mir);
@@ -6151,7 +6236,10 @@ mod tests {
                 MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
                     target: MirPrimTarget::Global("dead_pair_w".to_string()),
                     elem_ty: MirType::Struct("Pair".to_string()),
-                    value: MirExpr::new(MirExprKind::IntLit(0), MirType::Struct("Pair".to_string())),
+                    value: MirExpr::new(
+                        MirExprKind::IntLit(0),
+                        MirType::Struct("Pair".to_string()),
+                    ),
                 }),
             ]),
         });
@@ -6378,7 +6466,10 @@ mod tests {
                 target: MirPrimTarget::PtrExpr(MirExpr::new(
                     MirExprKind::AddrOfPlace(Box::new(MirPlace::Field {
                         base: Box::new(MirPlace::Deref(
-                            Box::new(MirExpr::new(MirExprKind::Var(VarId(0)), port_ptr_ty.clone())),
+                            Box::new(MirExpr::new(
+                                MirExprKind::Var(VarId(0)),
+                                port_ptr_ty.clone(),
+                            )),
                             MirType::Struct("SerialPort".to_string()),
                         )),
                         struct_name: "SerialPort".to_string(),
@@ -6511,7 +6602,10 @@ mod tests {
                         MirStmt::Assign {
                             target: MirPlace::Var(VarId(4)),
                             op: MirAssignOp::Assign,
-                            value: MirExpr::new(MirExprKind::FloatLit(2.5_f64.to_bits()), MirType::F64),
+                            value: MirExpr::new(
+                                MirExprKind::FloatLit(2.5_f64.to_bits()),
+                                MirType::F64,
+                            ),
                         },
                     ],
                     terminator: MirTerminator::Yield(MirYieldKind::ShareCheckpoint {
@@ -6530,10 +6624,7 @@ mod tests {
                             elem_ty: MirType::U32,
                             value: MirExpr::new(
                                 MirExprKind::PrimRead(Box::new(MirPrimReadOp::ByteRingViewLen {
-                                    view: MirExpr::new(
-                                        MirExprKind::Var(VarId(3)),
-                                        view_ty.clone(),
-                                    ),
+                                    view: MirExpr::new(MirExprKind::Var(VarId(3)), view_ty.clone()),
                                 })),
                                 MirType::U32,
                             ),
@@ -6830,11 +6921,17 @@ mod tests {
         });
 
         let a1 = vec![
-            MirExpr::new(MirExprKind::SubsystemAddr("bus1".to_string()), bus_ptr.clone()),
+            MirExpr::new(
+                MirExprKind::SubsystemAddr("bus1".to_string()),
+                bus_ptr.clone(),
+            ),
             MirExpr::new(MirExprKind::IntLit(1), MirType::U32),
         ];
         let a2 = vec![
-            MirExpr::new(MirExprKind::SubsystemAddr("bus2".to_string()), bus_ptr.clone()),
+            MirExpr::new(
+                MirExprKind::SubsystemAddr("bus2".to_string()),
+                bus_ptr.clone(),
+            ),
             MirExpr::new(MirExprKind::IntLit(2), MirType::U32),
         ];
         mir.boot.steps.push(MirBootStep::SpawnActivate {
@@ -7193,7 +7290,10 @@ mod tests {
         assert!(bp.vars[0].hoisted, "mut_p must stay hoisted");
         assert!(bp.vars[1].hoisted, "addr_p must stay hoisted");
         assert!(bp.vars[2].hoisted, "p_reassigned must stay hoisted");
-        assert!(bp.vars[3].hoisted, "p_cond in non-entry bb must stay hoisted");
+        assert!(
+            bp.vars[3].hoisted,
+            "p_cond in non-entry bb must stay hoisted"
+        );
         assert!(
             bp.vars[4].hoisted,
             "indirect fnptr_call_0 slot must NOT be eliminated"
@@ -7277,19 +7377,23 @@ mod tests {
             addr_taken: false,
             hoisted: false,
         });
-        mir.boot.steps.push(MirBootStep::Stmt(MirStmt::Assign {
-            target: MirPlace::Var(VarId(0)),
-            op: MirAssignOp::Assign,
-            value: subsys_expr.clone(),
-        }));
-        mir.boot.steps.push(MirBootStep::Stmt(MirStmt::Expr(MirExpr::new(
-            MirExprKind::CallDirect {
-                callee: "init_subsystems".to_string(),
-                is_extern_c: false,
-                args: vec![],
-            },
-            MirType::Void,
-        ))));
+        mir.boot
+            .steps
+            .push(MirBootStep::Stmt(Box::new(MirStmt::Assign {
+                target: MirPlace::Var(VarId(0)),
+                op: MirAssignOp::Assign,
+                value: subsys_expr.clone(),
+            })));
+        mir.boot
+            .steps
+            .push(MirBootStep::Stmt(Box::new(MirStmt::Expr(MirExpr::new(
+                MirExprKind::CallDirect {
+                    callee: "init_subsystems".to_string(),
+                    is_extern_c: false,
+                    args: vec![],
+                },
+                MirType::Void,
+            )))));
 
         mir.functions.push(MirFunction {
             name: "init_subsystems".to_string(),
@@ -7314,7 +7418,10 @@ mod tests {
             blueprint_name: "restart_worker".to_string(),
             priority: MirPriority::Normal,
             core_pin: None,
-            init_args: vec![subsys_expr, MirExpr::new(MirExprKind::IntLit(42), MirType::U32)],
+            init_args: vec![
+                subsys_expr,
+                MirExpr::new(MirExprKind::IntLit(42), MirType::U32),
+            ],
             is_main_supervisor: false,
             provenance_path: vec![
                 "main".to_string(),
@@ -7438,9 +7545,15 @@ mod tests {
 
         let bp = &mir.task_blueprints[0];
         assert!(!bp.vars[0].hoisted, "param `c` must fold via boot helper");
-        assert!(!bp.vars[1].hoisted, "param `rate` must fold via boot helper");
+        assert!(
+            !bp.vars[1].hoisted,
+            "param `rate` must fold via boot helper"
+        );
         assert!(!bp.vars[2].hoisted, "local `*byte_ring rx` must fold");
-        assert!(bp.vars[3].hoisted, "mutated local `retries` must remain hoisted");
+        assert!(
+            bp.vars[3].hoisted,
+            "mutated local `retries` must remain hoisted"
+        );
         assert!(matches!(
             bp.blocks[1].terminator,
             MirTerminator::Yield(MirYieldKind::ShareCheckpoint {
@@ -7544,12 +7657,17 @@ mod tests {
         mir.consts.push(MirConst {
             name: "CB_CONST".to_string(),
             ty: fn_void_ty.clone(),
-            init: MirExpr::new(MirExprKind::FnAddr("cb_from_const".to_string()), fn_void_ty.clone()),
+            init: MirExpr::new(
+                MirExprKind::FnAddr("cb_from_const".to_string()),
+                fn_void_ty.clone(),
+            ),
         });
-        mir.boot.steps.push(MirBootStep::Stmt(MirStmt::Expr(MirExpr::new(
-            MirExprKind::FnAddr("cb_level2".to_string()),
-            fn_other_ty.clone(),
-        ))));
+        mir.boot
+            .steps
+            .push(MirBootStep::Stmt(Box::new(MirStmt::Expr(MirExpr::new(
+                MirExprKind::FnAddr("cb_level2".to_string()),
+                fn_other_ty.clone(),
+            )))));
 
         mir.functions = vec![
             // `cb_from_const(u32 v)`: touches `w_cb_contended` and invokes `fn(u8, u8) -> void` fnptr!
@@ -7792,7 +7910,9 @@ mod tests {
                 child_slots: vec![],
             },
         });
-        mir.boot.boot_yielding_callees.push("coro_helper".to_string());
+        mir.boot
+            .boot_yielding_callees
+            .push("coro_helper".to_string());
         mir.boot.steps.push(MirBootStep::RunYieldingFn {
             callee: "coro_helper".to_string(),
             args: vec![MirExpr::new(MirExprKind::IntLit(7), MirType::U32)],
@@ -7809,7 +7929,8 @@ mod tests {
     #[test]
     fn prune_unreachable_functions_drops_dead_helpers_and_keeps_transitive_and_fnaddr() {
         let mut mir = empty_module();
-        let ret_u32 = |v: i128| MirStmt::Return(Some(MirExpr::new(MirExprKind::IntLit(v), MirType::U32)));
+        let ret_u32 =
+            |v: i128| MirStmt::Return(Some(MirExpr::new(MirExprKind::IntLit(v), MirType::U32)));
 
         mir.functions.push(MirFunction {
             name: "used_direct".to_string(),
@@ -7877,30 +7998,35 @@ mod tests {
             },
         });
         mir.dual_specialized_fns.push("dead_yielding".to_string());
-        mir.monomorphized_instances.push(crate::ir::MonomorphizedMirItem {
-            kind: crate::ir::MonomorphizedItemKind::Fn,
-            signature: "dead_pure".to_string(),
-            mangled_name: "dead_pure".to_string(),
-            size_32: 0,
-            size_64: 0,
-        });
-        mir.boot.steps.push(MirBootStep::Stmt(MirStmt::Intrinsic(
-            MirIntrinsicOp::SysOp {
-                method: "set_putc".to_string(),
-                args: vec![MirExpr::new(
-                    MirExprKind::FnAddr("putc_hook".to_string()),
-                    MirType::Usize,
-                )],
-            },
-        )));
-        mir.boot.steps.push(MirBootStep::Stmt(MirStmt::Expr(MirExpr::new(
-            MirExprKind::CallDirect {
-                callee: "used_direct".to_string(),
-                is_extern_c: false,
-                args: vec![],
-            },
-            MirType::U32,
-        ))));
+        mir.monomorphized_instances
+            .push(crate::ir::MonomorphizedMirItem {
+                kind: crate::ir::MonomorphizedItemKind::Fn,
+                signature: "dead_pure".to_string(),
+                mangled_name: "dead_pure".to_string(),
+                size_32: 0,
+                size_64: 0,
+            });
+        mir.boot
+            .steps
+            .push(MirBootStep::Stmt(Box::new(MirStmt::Intrinsic(
+                MirIntrinsicOp::SysOp {
+                    method: "set_putc".to_string(),
+                    args: vec![MirExpr::new(
+                        MirExprKind::FnAddr("putc_hook".to_string()),
+                        MirType::Usize,
+                    )],
+                },
+            ))));
+        mir.boot
+            .steps
+            .push(MirBootStep::Stmt(Box::new(MirStmt::Expr(MirExpr::new(
+                MirExprKind::CallDirect {
+                    callee: "used_direct".to_string(),
+                    is_extern_c: false,
+                    args: vec![],
+                },
+                MirType::U32,
+            )))));
 
         prune_unreachable_functions(&mut mir);
         crate::ram::populate_module_ram_report(&mut mir);
@@ -7911,7 +8037,11 @@ mod tests {
         assert!(kept.contains("putc_hook"));
         assert!(!kept.contains("dead_pure"));
         assert!(!kept.contains("dead_yielding"));
-        assert!(mir.ram_report.fn_frames.is_empty(), "fn_frames={:?}", mir.ram_report.fn_frames);
+        assert!(
+            mir.ram_report.fn_frames.is_empty(),
+            "fn_frames={:?}",
+            mir.ram_report.fn_frames
+        );
         assert!(mir.dual_specialized_fns.is_empty());
         assert!(mir.monomorphized_instances.is_empty());
     }

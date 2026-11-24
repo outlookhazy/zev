@@ -25,18 +25,18 @@ pub use call_graph::{CallContext, CallEdge, CallGraph, CallableKind, ExternCallb
 pub use checker::{AnalysisOutput, AnalyzeOptions};
 pub use diag::{Diagnostic, DiagnosticKind};
 pub use model::{
-    ConstInfo, DEFAULT_TICK_PERIOD_US, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo,
-    IrqInfo, IsrInfo, IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo,
-    MonomorphizedInstance, MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite,
-    SemanticModel, SpawnedTaskInstance, SubsystemInfo, TaskInfo,
+    ConstInfo, FnEffect, FunctionInfo, IrqBindingArg, IrqBindingInfo, IrqInfo, IsrInfo,
+    IsrStateInfo, MmioInstanceInfo, MmioLayoutInfo, MmioRegInfo, MonomorphizedInstance,
+    MonomorphizedKind, ParamInfo, PrimitiveInfo, PriorityBoostSite, SemanticModel,
+    SpawnedTaskInstance, SubsystemInfo, TaskInfo, DEFAULT_TICK_PERIOD_US,
 };
 pub use modules::{
-    LinkedModulesOutput, load_and_link_modules, load_and_link_modules_with_hal,
-    load_and_link_modules_with_targets,
+    load_and_link_modules, load_and_link_modules_with_hal, load_and_link_modules_with_targets,
+    LinkedModulesOutput,
 };
 pub use monomorphize::{
-    MAX_GENERIC_DEPTH, MAX_MONOMORPHIZED_INSTANCES, MonomorphizeOutput, mangle_type_expr,
-    monomorphize_named_programs, monomorphize_programs,
+    mangle_type_expr, monomorphize_named_programs, monomorphize_programs, MonomorphizeOutput,
+    MAX_GENERIC_DEPTH, MAX_MONOMORPHIZED_INSTANCES,
 };
 pub use provenance::{LeaseEnv, LeaseToken, Provenance};
 pub use types::{

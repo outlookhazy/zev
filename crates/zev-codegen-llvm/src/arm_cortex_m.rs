@@ -50,7 +50,11 @@ impl NvicMap {
             }
         }
         let min_slots = (min_vector_irqs as usize).max(CORTEX_M_MIN_NVIC_IRQS);
-        let max_irq = vectors.iter().map(|v| v.irq_num as usize).max().unwrap_or(0);
+        let max_irq = vectors
+            .iter()
+            .map(|v| v.irq_num as usize)
+            .max()
+            .unwrap_or(0);
         let num_slots = (max_irq + 1).max(min_slots);
         let mut map = NvicMap {
             by_name: BTreeMap::new(),
@@ -121,17 +125,16 @@ pub fn sanitize_ident(s: &str) -> String {
 
 /// Emit pure-ISA Cortex-M startup (`.entry` if `code_in_ram`, `.isr_vector`, `@Reset_Handler`,
 /// `@SysTick_Handler`, `@HardFault_Handler`, `@Default_Handler`).
-pub fn emit_arm_cortex_m_startup_ir(
-    out: &mut String,
-    spec: &TargetSpec,
-    sz: &str,
-    nvic: &NvicMap,
-) {
+pub fn emit_arm_cortex_m_startup_ir(out: &mut String, spec: &TargetSpec, sz: &str, nvic: &NvicMap) {
     let initial_sp = spec.initial_sp();
     let sp_i32 = initial_sp as i32;
     let ext_irqs = nvic.vector_slots.len().max(CORTEX_M_MIN_NVIC_IRQS);
     let total_vector_len = 16 + ext_irqs;
-    let vec_align = if spec.code_in_ram || spec.has_vtor { 256 } else { 4 };
+    let vec_align = if spec.code_in_ram || spec.has_vtor {
+        256
+    } else {
+        4
+    };
 
     let mut iser_words = nvic.iser_masks;
     if iser_words[0] == 0 && nvic.iser0_mask != 0 {
@@ -205,10 +208,7 @@ module asm ".balign 4"
         "@.hf_msg = private unnamed_addr constant [11 x i8] c\"HARDFAULT\\0A\\00\", align 1\n"
     );
 
-    let _ = writeln!(
-        out,
-        "@__isr_vector = constant [{total_vector_len} x ptr] ["
-    );
+    let _ = writeln!(out, "@__isr_vector = constant [{total_vector_len} x ptr] [");
     let _ = writeln!(
         out,
         "  ptr inttoptr (i32 {sp_i32} to ptr), ; 0: Initial Main Stack Pointer (0x{initial_sp:08X})"
@@ -218,7 +218,10 @@ module asm ".balign 4"
     let _ = writeln!(out, "  ptr @HardFault_Handler,              ; 3: HardFault");
     let _ = writeln!(out, "  ptr @Default_Handler,                ; 4: MemManage");
     let _ = writeln!(out, "  ptr @Default_Handler,                ; 5: BusFault");
-    let _ = writeln!(out, "  ptr @Default_Handler,                ; 6: UsageFault");
+    let _ = writeln!(
+        out,
+        "  ptr @Default_Handler,                ; 6: UsageFault"
+    );
     let _ = writeln!(out, "  ptr null,                            ; 7: Reserved");
     let _ = writeln!(out, "  ptr null,                            ; 8: Reserved");
     let _ = writeln!(out, "  ptr null,                            ; 9: Reserved");

@@ -20,39 +20,40 @@ pub(super) fn discover_systick_config(
                 if let ExprKind::Ident(id) = &receiver.kind {
                     if id.name == SYS_NAMESPACE {
                         match SysMethod::from_name(&method.name) {
-                                Some(SysMethod::UseSystick) => {
-                                    if let Some(first) = args.first() {
-                                        if let ExprKind::Literal(Literal::Int { value: hz, .. }) =
-                                            &first.value.kind
-                                        {
-                                            syms.systick_hz = Some(*hz);
-                                        }
+                            Some(SysMethod::UseSystick) => {
+                                if let Some(first) = args.first() {
+                                    if let ExprKind::Literal(Literal::Int { value: hz, .. }) =
+                                        &first.value.kind
+                                    {
+                                        syms.systick_hz = Some(*hz);
                                     }
-                                    if let Some(second) = args.get(1) {
-                                        if let ExprKind::Literal(Literal::Duration(d)) =
-                                            &second.value.kind
-                                        {
-                                            let us = d.as_micros();
-                                            if us > 0 {
-                                                syms.tick_period_us = us;
-                                            }
+                                }
+                                if let Some(second) = args.get(1) {
+                                    if let ExprKind::Literal(Literal::Duration(d)) =
+                                        &second.value.kind
+                                    {
+                                        let us = d.as_micros();
+                                        if us > 0 {
+                                            syms.tick_period_us = us;
                                         }
                                     }
                                 }
-                                Some(SysMethod::SetTickUs) => {
-                                    if let Some(first) = args.first() {
-                                        if let ExprKind::Literal(Literal::Int { value: us, .. }) =
-                                            &first.value.kind
-                                        {
-                                            if *us > 0 {
-                                                syms.tick_period_us = *us;
-                                            }
+                            }
+                            Some(SysMethod::SetTickUs) => {
+                                if let Some(first) = args.first() {
+                                    if let ExprKind::Literal(Literal::Int { value: us, .. }) =
+                                        &first.value.kind
+                                    {
+                                        if *us > 0 {
+                                            syms.tick_period_us = *us;
                                         }
                                     }
                                 }
+                            }
                             Some(SysMethod::SetTick | SysMethod::SetTickPeriod) => {
                                 if let Some(first) = args.first() {
-                                    if let ExprKind::Literal(Literal::Duration(d)) = &first.value.kind
+                                    if let ExprKind::Literal(Literal::Duration(d)) =
+                                        &first.value.kind
                                     {
                                         let us = d.as_micros();
                                         if us > 0 {
@@ -263,8 +264,7 @@ pub(super) fn infer_effects_and_specializations(
         }
     }
     for fname in &fn_names {
-        if !has_incoming.contains(fname.as_str())
-            && visited.insert((fname.clone(), ExecMode::Coro))
+        if !has_incoming.contains(fname.as_str()) && visited.insert((fname.clone(), ExecMode::Coro))
         {
             queue.push_back((fname.clone(), ExecMode::Coro));
         }
@@ -389,10 +389,14 @@ pub(super) fn ast_stmts_have_break(stmts: &[Stmt]) -> bool {
 
 pub(super) fn ast_expr_has_break(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Catch { expr: inner, clause } => {
-            ast_expr_has_break(inner) || ast_block_has_break(&clause.body)
-        }
-        ExprKind::Or { expr: a, fallback: b } => ast_expr_has_break(a) || ast_expr_has_break(b),
+        ExprKind::Catch {
+            expr: inner,
+            clause,
+        } => ast_expr_has_break(inner) || ast_block_has_break(&clause.body),
+        ExprKind::Or {
+            expr: a,
+            fallback: b,
+        } => ast_expr_has_break(a) || ast_expr_has_break(b),
         _ => false,
     }
 }
@@ -416,7 +420,15 @@ pub(super) fn scan_stmts_effect(
                 if !in_noyield && !in_restricted {
                     *eff = (*eff).max(MirFnEffect::HardBlocking);
                 }
-                scan_expr_effect(caller, period, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(
+                    caller,
+                    period,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
                 scan_stmts_effect(
                     caller,
                     &body.stmts,
@@ -577,7 +589,15 @@ pub(super) fn scan_stmts_effect(
                 }
             }
             StmtKind::Switch { scrutinee, arms } => {
-                scan_expr_effect(caller, scrutinee, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(
+                    caller,
+                    scrutinee,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
                 for arm in arms {
                     scan_stmts_effect(
                         caller,
@@ -596,7 +616,15 @@ pub(super) fn scan_stmts_effect(
                     *eff = (*eff).max(MirFnEffect::HardBlocking);
                 }
                 for arm in arms {
-                    scan_expr_effect(caller, &arm.call, in_noyield, in_restricted, eff, spawns, edges);
+                    scan_expr_effect(
+                        caller,
+                        &arm.call,
+                        in_noyield,
+                        in_restricted,
+                        eff,
+                        spawns,
+                        edges,
+                    );
                     scan_stmts_effect(
                         caller,
                         &arm.body.stmts,
@@ -609,7 +637,15 @@ pub(super) fn scan_stmts_effect(
                     );
                 }
                 if let Some(t) = timer {
-                    scan_expr_effect(caller, &t.expr, in_noyield, in_restricted, eff, spawns, edges);
+                    scan_expr_effect(
+                        caller,
+                        &t.expr,
+                        in_noyield,
+                        in_restricted,
+                        eff,
+                        spawns,
+                        edges,
+                    );
                     scan_stmts_effect(
                         caller,
                         &t.body.stmts,
@@ -640,7 +676,15 @@ pub(super) fn scan_stmts_effect(
                 scan_expr_effect(caller, e, in_noyield, in_restricted, eff, spawns, edges);
             }
             StmtKind::Assign { target, value, .. } => {
-                scan_expr_effect(caller, target, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(
+                    caller,
+                    target,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
                 scan_expr_effect(caller, value, in_noyield, in_restricted, eff, spawns, edges);
             }
             StmtKind::Error { reason, partial } => {
@@ -654,7 +698,15 @@ pub(super) fn scan_stmts_effect(
             StmtKind::Spawn(sp) => {
                 *spawns = true;
                 for a in &sp.args {
-                    scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, spawns, edges);
+                    scan_expr_effect(
+                        caller,
+                        &a.value,
+                        in_noyield,
+                        in_restricted,
+                        eff,
+                        spawns,
+                        edges,
+                    );
                 }
             }
             StmtKind::VarDecl { init: None, .. }
@@ -698,9 +750,25 @@ pub(super) fn scan_expr_effect(
                     }
                 }
             }
-            scan_expr_effect(caller, callee, in_noyield, in_restricted, eff, spawns, edges);
+            scan_expr_effect(
+                caller,
+                callee,
+                in_noyield,
+                in_restricted,
+                eff,
+                spawns,
+                edges,
+            );
             for a in args {
-                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(
+                    caller,
+                    &a.value,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
         }
         ExprKind::MethodCall {
@@ -727,9 +795,25 @@ pub(super) fn scan_expr_effect(
             {
                 *eff = (*eff).max(MirFnEffect::HardBlocking);
             }
-            scan_expr_effect(caller, receiver, in_noyield, in_restricted, eff, spawns, edges);
+            scan_expr_effect(
+                caller,
+                receiver,
+                in_noyield,
+                in_restricted,
+                eff,
+                spawns,
+                edges,
+            );
             for a in args {
-                scan_expr_effect(caller, &a.value, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(
+                    caller,
+                    &a.value,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
         }
         ExprKind::Unary { expr: inner, .. }
@@ -750,7 +834,15 @@ pub(super) fn scan_expr_effect(
             scan_expr_effect(caller, rhs, in_noyield, in_restricted, eff, spawns, edges);
         }
         ExprKind::Slice { target, start, end } => {
-            scan_expr_effect(caller, target, in_noyield, in_restricted, eff, spawns, edges);
+            scan_expr_effect(
+                caller,
+                target,
+                in_noyield,
+                in_restricted,
+                eff,
+                spawns,
+                edges,
+            );
             if let Some(s) = start {
                 scan_expr_effect(caller, s, in_noyield, in_restricted, eff, spawns, edges);
             }
@@ -760,7 +852,15 @@ pub(super) fn scan_expr_effect(
         }
         ExprKind::StructLit { fields, .. } => {
             for f in fields {
-                scan_expr_effect(caller, &f.value, in_noyield, in_restricted, eff, spawns, edges);
+                scan_expr_effect(
+                    caller,
+                    &f.value,
+                    in_noyield,
+                    in_restricted,
+                    eff,
+                    spawns,
+                    edges,
+                );
             }
         }
         ExprKind::ArrayLit(elems) => {
@@ -775,7 +875,10 @@ pub(super) fn scan_expr_effect(
                 }
             }
         }
-        ExprKind::Catch { expr: inner, clause } => {
+        ExprKind::Catch {
+            expr: inner,
+            clause,
+        } => {
             scan_expr_effect(caller, inner, in_noyield, in_restricted, eff, spawns, edges);
             scan_stmts_effect(
                 caller,
@@ -792,7 +895,11 @@ pub(super) fn scan_expr_effect(
     }
 }
 
-pub(super) fn stmt_slice_can_yield(stmts: &[Stmt], manual_yield: bool, syms: &ModuleSymbols) -> bool {
+pub(super) fn stmt_slice_can_yield(
+    stmts: &[Stmt],
+    manual_yield: bool,
+    syms: &ModuleSymbols,
+) -> bool {
     let mut eff = MirFnEffect::NonYielding;
     let mut dummy_sp = false;
     let mut edges = Vec::new();
@@ -810,7 +917,7 @@ pub(super) fn stmt_slice_can_yield(stmts: &[Stmt], manual_yield: bool, syms: &Mo
         return true;
     }
     edges.iter().any(|e| {
-        syms.fns.get(&e.callee).map_or(false, |f| {
+        syms.fns.get(&e.callee).is_some_and(|f| {
             f.effect == MirFnEffect::HardBlocking
                 || (f.effect == MirFnEffect::SoftYielding && !e.in_noyield)
         })
@@ -830,11 +937,9 @@ pub(super) fn stmt_contains_boot_spawn(stmt: &Stmt, syms: &ModuleSymbols) -> boo
                     .stmts
                     .iter()
                     .any(|s| stmt_contains_boot_spawn(s, syms))
-                || else_block.as_ref().is_some_and(|eb| {
-                    eb.stmts
-                        .iter()
-                        .any(|s| stmt_contains_boot_spawn(s, syms))
-                })
+                || else_block
+                    .as_ref()
+                    .is_some_and(|eb| eb.stmts.iter().any(|s| stmt_contains_boot_spawn(s, syms)))
         }
         StmtKind::Switch { scrutinee, arms } => {
             expr_contains_boot_spawn(scrutinee, syms)
@@ -873,16 +978,14 @@ pub(super) fn expr_contains_boot_spawn(expr: &Expr, syms: &ModuleSymbols) -> boo
     match &expr.kind {
         ExprKind::Call { callee, args, .. } => {
             if let ExprKind::Ident(id) = &callee.kind {
-                if syms
-                    .fns
-                    .get(&id.name)
-                    .is_some_and(|sig| sig.spawns_in_boot)
-                {
+                if syms.fns.get(&id.name).is_some_and(|sig| sig.spawns_in_boot) {
                     return true;
                 }
             }
             expr_contains_boot_spawn(callee, syms)
-                || args.iter().any(|a| expr_contains_boot_spawn(&a.value, syms))
+                || args
+                    .iter()
+                    .any(|a| expr_contains_boot_spawn(&a.value, syms))
         }
         ExprKind::MethodCall {
             receiver,
@@ -893,7 +996,9 @@ pub(super) fn expr_contains_boot_spawn(expr: &Expr, syms: &ModuleSymbols) -> boo
                 return true;
             }
             expr_contains_boot_spawn(receiver, syms)
-                || args.iter().any(|a| expr_contains_boot_spawn(&a.value, syms))
+                || args
+                    .iter()
+                    .any(|a| expr_contains_boot_spawn(&a.value, syms))
         }
         ExprKind::Unary { expr: inner, .. }
         | ExprKind::Cast { expr: inner, .. }
@@ -907,7 +1012,10 @@ pub(super) fn expr_contains_boot_spawn(expr: &Expr, syms: &ModuleSymbols) -> boo
             expr: lhs,
             fallback: rhs,
         } => expr_contains_boot_spawn(lhs, syms) || expr_contains_boot_spawn(rhs, syms),
-        ExprKind::Catch { expr: inner, clause } => {
+        ExprKind::Catch {
+            expr: inner,
+            clause,
+        } => {
             expr_contains_boot_spawn(inner, syms)
                 || clause
                     .body
@@ -997,12 +1105,8 @@ pub(super) fn is_const_mir_expr(expr: &MirExpr) -> bool {
         | MirExprKind::ConstRef(_) => true,
         MirExprKind::MakePrimView { ptr, .. } => is_const_mir_expr(ptr),
         MirExprKind::AddrOfPlace(place) => is_const_mir_place(place),
-        MirExprKind::Unary { expr, .. } | MirExprKind::Cast { expr, .. } => {
-            is_const_mir_expr(expr)
-        }
-        MirExprKind::Binary { lhs, rhs, .. } => {
-            is_const_mir_expr(lhs) && is_const_mir_expr(rhs)
-        }
+        MirExprKind::Unary { expr, .. } | MirExprKind::Cast { expr, .. } => is_const_mir_expr(expr),
+        MirExprKind::Binary { lhs, rhs, .. } => is_const_mir_expr(lhs) && is_const_mir_expr(rhs),
         MirExprKind::StructLit { fields, .. } => {
             fields.iter().all(|(_, e, _)| is_const_mir_expr(e))
         }
@@ -1011,7 +1115,10 @@ pub(super) fn is_const_mir_expr(expr: &MirExpr) -> bool {
     }
 }
 
-pub(super) fn resolve_boot_const_place(place: &MirPlace, env: &BTreeMap<VarId, MirExpr>) -> MirPlace {
+pub(super) fn resolve_boot_const_place(
+    place: &MirPlace,
+    env: &BTreeMap<VarId, MirExpr>,
+) -> MirPlace {
     match place {
         MirPlace::Var(_) => place.clone(),
         MirPlace::Deref(inner, ty) => {
@@ -1127,9 +1234,7 @@ pub(super) fn zero_init_expr(ty: &MirType, syms: &ModuleSymbols) -> MirExpr {
         | MirType::I32
         | MirType::I64
         | MirType::Isize => MirExpr::new(MirExprKind::IntLit(0), ty.clone()),
-        MirType::EndianInt { .. } => {
-            MirExpr::new(MirExprKind::IntLit(0), ty.host_value_type())
-        }
+        MirType::EndianInt { .. } => MirExpr::new(MirExprKind::IntLit(0), ty.host_value_type()),
         MirType::Enum(name) => {
             if let Some(en) = syms.enums.get(name) {
                 if let Some((first_name, _)) = en.first() {
@@ -1148,7 +1253,7 @@ pub(super) fn zero_init_expr(ty: &MirType, syms: &ModuleSymbols) -> MirExpr {
             let z = zero_init_expr(elem, syms);
             MirExpr::new(
                 MirExprKind::ArrayLit {
-                    elems: std::iter::repeat(z).take(*len).collect(),
+                    elems: std::iter::repeat_n(z, *len).collect(),
                     elem_ty: (**elem).clone(),
                 },
                 ty.clone(),
@@ -1437,12 +1542,8 @@ pub(super) fn lower_main_entry<'a>(
             next_binding_id: 0,
             irq_param_bindings: BTreeMap::new(),
         };
-        let mut dctx = DirectLowerCtx::new_with_boot(
-            syms,
-            MirType::Void,
-            MirErrorSpec::None,
-            boot_state,
-        );
+        let mut dctx =
+            DirectLowerCtx::new_with_boot(syms, MirType::Void, MirErrorSpec::None, boot_state);
 
         for stmt in &combined_boot_iter {
             match &stmt.kind {
@@ -1455,14 +1556,10 @@ pub(super) fn lower_main_entry<'a>(
                         ExprKind::Ident(id) => id.name.clone(),
                         _ => unreachable!(),
                     };
-                    let fn_sig = syms
-                        .fns
-                        .get(&cname)
-                        .cloned()
-                        .ok_or_else(|| MirLowerError {
-                            message: format!("internal error: missing fn signature '{cname}'"),
-                            span: stmt.span,
-                        })?;
+                    let fn_sig = syms.fns.get(&cname).cloned().ok_or_else(|| MirLowerError {
+                        message: format!("internal error: missing fn signature '{cname}'"),
+                        span: stmt.span,
+                    })?;
                     let mut pre_stmts = Vec::new();
                     let mut largs = Vec::new();
                     for (i, a) in args.iter().enumerate() {
@@ -1473,7 +1570,7 @@ pub(super) fn lower_main_entry<'a>(
                         )?);
                     }
                     for ps in pre_stmts {
-                        boot_steps.push(MirBootStep::Stmt(ps));
+                        boot_steps.push(MirBootStep::Stmt(Box::new(ps)));
                     }
                     boot_yielding_callees.insert(cname.clone());
                     boot_steps.push(MirBootStep::RunYieldingFn {
@@ -1495,14 +1592,10 @@ pub(super) fn lower_main_entry<'a>(
                         ExprKind::Ident(id) => id.name.clone(),
                         _ => unreachable!(),
                     };
-                    let fn_sig = syms
-                        .fns
-                        .get(&cname)
-                        .cloned()
-                        .ok_or_else(|| MirLowerError {
-                            message: format!("internal error: missing fn signature '{cname}'"),
-                            span: stmt.span,
-                        })?;
+                    let fn_sig = syms.fns.get(&cname).cloned().ok_or_else(|| MirLowerError {
+                        message: format!("internal error: missing fn signature '{cname}'"),
+                        span: stmt.span,
+                    })?;
                     let vty = syms.resolve_type(ty);
                     let vid = dctx.declare_var(&name.name, vty, VarRole::UserLocal);
                     let mut pre_stmts = Vec::new();
@@ -1515,7 +1608,7 @@ pub(super) fn lower_main_entry<'a>(
                         )?);
                     }
                     for ps in pre_stmts {
-                        boot_steps.push(MirBootStep::Stmt(ps));
+                        boot_steps.push(MirBootStep::Stmt(Box::new(ps)));
                     }
                     boot_yielding_callees.insert(cname.clone());
                     let dst = if fn_sig.error_spec.has_error() {
@@ -1536,7 +1629,7 @@ pub(super) fn lower_main_entry<'a>(
                             MirStmt::SpawnActivate { slot_id, args } => {
                                 boot_steps.push(MirBootStep::SpawnActivate { slot_id, args });
                             }
-                            other => boot_steps.push(MirBootStep::Stmt(other)),
+                            other => boot_steps.push(MirBootStep::Stmt(Box::new(other))),
                         }
                     }
                 }
@@ -1546,7 +1639,7 @@ pub(super) fn lower_main_entry<'a>(
         if !tail_becomes_task {
             let root_defers = dctx.pop_and_lower_top_defer_scope()?;
             for ls in root_defers {
-                boot_steps.push(MirBootStep::Stmt(ls));
+                boot_steps.push(MirBootStep::Stmt(Box::new(ls)));
             }
         }
 
@@ -1647,7 +1740,7 @@ pub(super) fn is_yielding_fn_callee(callee: &Expr, syms: &ModuleSymbols) -> bool
     if let ExprKind::Ident(id) = &callee.kind {
         syms.fns
             .get(&id.name)
-            .map_or(false, |f| f.is_yielding && !f.spawns_in_boot)
+            .is_some_and(|f| f.is_yielding && !f.spawns_in_boot)
     } else {
         false
     }
@@ -1677,10 +1770,8 @@ pub(super) fn is_pure_boot_setup_stmt(stmt: &Stmt) -> bool {
 pub(super) fn collect_ast_idents_stmts(stmts: &[Stmt], out: &mut BTreeSet<String>) {
     for stmt in stmts {
         match &stmt.kind {
-            StmtKind::VarDecl { init, .. } => {
-                if let Some(e) = init {
-                    collect_ast_idents_expr(e, out);
-                }
+            StmtKind::VarDecl { init: Some(e), .. } => {
+                collect_ast_idents_expr(e, out);
             }
             StmtKind::Assign { target, value, .. } => {
                 collect_ast_idents_expr(target, out);
@@ -1818,7 +1909,10 @@ pub(super) fn collect_ast_idents_expr(expr: &Expr, out: &mut BTreeSet<String>) {
                 }
             }
         }
-        ExprKind::Catch { expr: inner, clause } => {
+        ExprKind::Catch {
+            expr: inner,
+            clause,
+        } => {
             collect_ast_idents_expr(inner, out);
             collect_ast_idents_stmts(&clause.body.stmts, out);
         }
@@ -1829,4 +1923,3 @@ pub(super) fn collect_ast_idents_expr(expr: &Expr, out: &mut BTreeSet<String>) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared Scope & Expression Helpers
 // ─────────────────────────────────────────────────────────────────────────────
-

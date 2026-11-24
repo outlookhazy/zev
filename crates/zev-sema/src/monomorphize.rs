@@ -16,10 +16,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use zev_ast::{
     ArrayLen, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, CatchParam, ConstDecl,
     ErrorSpec, Expr, ExprKind, FieldInit, FnDecl, FormatPart, GenericArg, GenericParam,
-    GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal,
-    MethodDecl, MmioDecl, MmioDeclKind, MmioRegDecl, OsPrimitiveDecl, OsPrimitiveType, Param,
-    PrimType, Program, SelfReceiver, SpawnStmt, Span, Stmt, StmtKind, StructDecl, StructField,
-    SwitchArm, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp, WaitArm, WaitTimerArm,
+    GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal, MethodDecl,
+    MmioDecl, MmioDeclKind, MmioRegDecl, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType,
+    Program, SelfReceiver, Span, SpawnStmt, Stmt, StmtKind, StructDecl, StructField, SwitchArm,
+    SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp, WaitArm, WaitTimerArm,
 };
 
 use crate::diag::{Diagnostic, DiagnosticKind};
@@ -183,6 +183,14 @@ struct Monomorphizer<'a> {
     instances: BTreeMap<(MonomorphizedKind, String), MonomorphizedInstance>,
     diagnostics: Vec<Diagnostic>,
 }
+
+type ImplMethodMatch = (
+    usize,
+    GenericImplMethodEntry,
+    BTreeMap<String, TypeExpr>,
+    BTreeMap<String, usize>,
+);
+type ResolvedImplMethod = (String, Option<SelfReceiver>, TypeExpr, bool, Option<usize>);
 
 impl<'a> Monomorphizer<'a> {
     fn new(inputs: &'a [(&'a Program, Option<&'a str>)], non_root_prog_count: usize) -> Self {
@@ -591,14 +599,18 @@ impl<'a> Monomorphizer<'a> {
                     }
                 } else {
                     self.validate_generic_params(&imp.target_name.name, &imp.generic_params, &file);
-                    let Some(tmpl) = self.struct_templates.get(&imp.target_name.name).cloned() else {
+                    let Some(tmpl) = self.struct_templates.get(&imp.target_name.name).cloned()
+                    else {
                         let msg = if self.known_structs.contains_key(&imp.target_name.name) {
                             format!(
                                 "struct '{}' is not generic (expected 0 target generic arguments)",
                                 imp.target_name.name
                             )
                         } else {
-                            format!("unknown generic struct '{}' in `impl`", imp.target_name.name)
+                            format!(
+                                "unknown generic struct '{}' in `impl`",
+                                imp.target_name.name
+                            )
                         };
                         self.emit(
                             &file,
@@ -978,7 +990,10 @@ impl<'a> Monomorphizer<'a> {
             for it in base_items {
                 let is_early = matches!(
                     it.kind,
-                    ItemKind::Import(_) | ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Const(_)
+                    ItemKind::Import(_)
+                        | ItemKind::Struct(_)
+                        | ItemKind::Enum(_)
+                        | ItemKind::Const(_)
                 );
                 if !is_early && !inserted_structs {
                     inserted_structs = true;
@@ -1473,7 +1488,10 @@ impl<'a> Monomorphizer<'a> {
             TypeKind::OsPrimitive(os) => TypeKind::OsPrimitive(self.rewrite_os_prim_type(os, env)),
             TypeKind::Lease(inner) => TypeKind::Lease(Box::new(self.rewrite_type_expr(inner, env))),
             TypeKind::FnPtr { params, ret } => TypeKind::FnPtr {
-                params: params.iter().map(|p| self.rewrite_type_expr(p, env)).collect(),
+                params: params
+                    .iter()
+                    .map(|p| self.rewrite_type_expr(p, env))
+                    .collect(),
                 ret: Box::new(self.rewrite_type_expr(ret, env)),
             },
         };
@@ -1670,11 +1688,7 @@ impl<'a> Monomorphizer<'a> {
         }
     }
 
-    fn build_names(
-        &self,
-        orig_name: &str,
-        args: &[ResolvedGenArg],
-    ) -> (String, String) {
+    fn build_names(&self, orig_name: &str, args: &[ResolvedGenArg]) -> (String, String) {
         let mangled_parts: Vec<String> = args.iter().map(|a| self.format_mangled_arg(a)).collect();
         let human_parts: Vec<String> = args.iter().map(|a| self.format_human_arg(a)).collect();
         let mangled = format!("{}__{}", orig_name, mangled_parts.join("__"));
@@ -1956,18 +1970,18 @@ impl<'a> Monomorphizer<'a> {
                     GenericArg::Type(TypeExpr {
                         kind: TypeKind::Named(id),
                         ..
-                    })
-                    | GenericArg::Const(Expr {
-                        kind: ExprKind::Ident(id),
-                        ..
                     }) => c_idx.get(id.name.as_str()).copied(),
+                    GenericArg::Const(e) => match &e.kind {
+                        ExprKind::Ident(id) => c_idx.get(id.name.as_str()).copied(),
+                        _ => None,
+                    },
                     _ => None,
                 };
                 if let Some(ci) = bound_name {
                     parts.push(format!("#C{ci}"));
                 } else {
                     let expr = match arg {
-                        GenericArg::Const(e) => Some(e.clone()),
+                        GenericArg::Const(e) => Some((**e).clone()),
                         GenericArg::Type(TypeExpr {
                             kind: TypeKind::Named(id),
                             span,
@@ -2063,11 +2077,11 @@ impl<'a> Monomorphizer<'a> {
             GenericArg::Type(TypeExpr {
                 kind: TypeKind::Named(id),
                 ..
-            })
-            | GenericArg::Const(Expr {
-                kind: ExprKind::Ident(id),
-                ..
             }) => Some(id.clone()),
+            GenericArg::Const(e) => match &e.kind {
+                ExprKind::Ident(id) => Some(id.clone()),
+                _ => None,
+            },
             _ => None,
         };
         if let Some(id) = &ident_name {
@@ -2081,7 +2095,7 @@ impl<'a> Monomorphizer<'a> {
         }
         *score += 10;
         let eval_expr = match pat_arg {
-            GenericArg::Const(e) => Some(e.clone()),
+            GenericArg::Const(e) => Some((**e).clone()),
             GenericArg::Type(TypeExpr {
                 kind: TypeKind::Named(id),
                 span,
@@ -2093,6 +2107,7 @@ impl<'a> Monomorphizer<'a> {
             .is_some_and(|v| v == conc_n)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn unify_type_pattern(
         &self,
         pat: &TypeExpr,
@@ -2129,10 +2144,7 @@ impl<'a> Monomorphizer<'a> {
                 score,
                 tmpl_env,
             ),
-            (
-                TypeKind::Array { elem: ea, len: la },
-                TypeKind::Array { elem: eb, len: lb },
-            ) => {
+            (TypeKind::Array { elem: ea, len: la }, TypeKind::Array { elem: eb, len: lb }) => {
                 if !self.unify_type_pattern(
                     ea,
                     eb,
@@ -2154,7 +2166,7 @@ impl<'a> Monomorphizer<'a> {
                         *n == conc_n
                     }
                     ArrayLen::Expr(e) => self.unify_const_arg_pattern(
-                        &GenericArg::Const((**e).clone()),
+                        &GenericArg::Const(e.clone()),
                         conc_n,
                         impl_consts,
                         bound_consts,
@@ -2225,13 +2237,10 @@ impl<'a> Monomorphizer<'a> {
             }
             (TypeKind::Ptr(x), TypeKind::Ptr(y))
             | (TypeKind::Slice(x), TypeKind::Slice(y))
-            | (TypeKind::Lease(x), TypeKind::Lease(y)) => {
-                self.types_structurally_equal_mono(x, y)
+            | (TypeKind::Lease(x), TypeKind::Lease(y)) => self.types_structurally_equal_mono(x, y),
+            (TypeKind::Array { elem: ex, len: lx }, TypeKind::Array { elem: ey, len: ly }) => {
+                lx == ly && self.types_structurally_equal_mono(ex, ey)
             }
-            (
-                TypeKind::Array { elem: ex, len: lx },
-                TypeKind::Array { elem: ey, len: ly },
-            ) => lx == ly && self.types_structurally_equal_mono(ex, ey),
             _ => false,
         }
     }
@@ -2246,16 +2255,11 @@ impl<'a> Monomorphizer<'a> {
         call_span: Span,
         caller_scope: Option<usize>,
         caller_env: &SubstEnv,
-    ) -> Option<(String, Option<SelfReceiver>, TypeExpr, bool, Option<usize>)> {
+    ) -> Option<ResolvedImplMethod> {
         let candidates = self.generic_impl_methods.get(base_struct)?.clone();
         let st_tmpl = self.struct_templates.get(base_struct)?.clone();
 
-        let mut matches: Vec<(
-            usize,
-            GenericImplMethodEntry,
-            BTreeMap<String, TypeExpr>,
-            BTreeMap<String, usize>,
-        )> = Vec::new();
+        let mut matches: Vec<ImplMethodMatch> = Vec::new();
 
         for entry in candidates {
             if entry.method.func.name.name != method_name {
@@ -2346,12 +2350,10 @@ impl<'a> Monomorphizer<'a> {
         if matches.is_empty() {
             return None;
         }
-        matches.sort_by(|a, b| b.0.cmp(&a.0));
+        matches.sort_by_key(|m| std::cmp::Reverse(m.0));
         let top_score = matches[0].0;
         let tied = matches.iter().take_while(|m| m.0 == top_score).count();
-        let Some((_, entry, bound_types, bound_consts)) = matches.into_iter().next() else {
-            return None;
-        };
+        let (_, entry, bound_types, bound_consts) = matches.into_iter().next()?;
 
         if tied > 1 {
             let human_st = self
@@ -2511,12 +2513,7 @@ impl<'a> Monomorphizer<'a> {
         ))
     }
 
-    fn rewrite_fn_decl(
-        &mut self,
-        f: &FnDecl,
-        pre_ret: Option<TypeExpr>,
-        env: &SubstEnv,
-    ) -> FnDecl {
+    fn rewrite_fn_decl(&mut self, f: &FnDecl, pre_ret: Option<TypeExpr>, env: &SubstEnv) -> FnDecl {
         let params: Vec<Param> = f
             .params
             .iter()
@@ -2874,13 +2871,13 @@ impl<'a> Monomorphizer<'a> {
         match &expr.kind {
             ExprKind::Literal(lit) => {
                 let ity = match lit {
-                    Literal::Int { suffix: Some(p), .. } => {
-                        InferTy::Concrete(TypeExpr::new(TypeKind::Prim(*p), expr.span))
-                    }
+                    Literal::Int {
+                        suffix: Some(p), ..
+                    } => InferTy::Concrete(TypeExpr::new(TypeKind::Prim(*p), expr.span)),
                     Literal::Int { suffix: None, .. } => InferTy::IntLit,
-                    Literal::Float { suffix: Some(p), .. } => {
-                        InferTy::Concrete(TypeExpr::new(TypeKind::Prim(*p), expr.span))
-                    }
+                    Literal::Float {
+                        suffix: Some(p), ..
+                    } => InferTy::Concrete(TypeExpr::new(TypeKind::Prim(*p), expr.span)),
                     Literal::Float { suffix: None, .. } => InferTy::FloatLit,
                     Literal::Bool(_) => {
                         InferTy::Concrete(TypeExpr::new(TypeKind::Prim(PrimType::Bool), expr.span))
@@ -2940,10 +2937,9 @@ impl<'a> Monomorphizer<'a> {
                 let (ri, inner_ty) = self.rewrite_expr(inner, env, scopes, None);
                 let out_ty = match op {
                     UnaryOp::AddrOf => match inner_ty {
-                        InferTy::Concrete(ct) => InferTy::Concrete(TypeExpr::new(
-                            TypeKind::Ptr(Box::new(ct)),
-                            expr.span,
-                        )),
+                        InferTy::Concrete(ct) => {
+                            InferTy::Concrete(TypeExpr::new(TypeKind::Ptr(Box::new(ct)), expr.span))
+                        }
                         _ => InferTy::Unknown,
                     },
                     UnaryOp::Deref => match inner_ty {
@@ -3032,7 +3028,8 @@ impl<'a> Monomorphizer<'a> {
                     match &deref.kind {
                         TypeKind::Named(sname) => {
                             if let Some(st) = self.known_structs.get(&sname.name) {
-                                if let Some(sf) = st.fields.iter().find(|f| f.name.name == field.name)
+                                if let Some(sf) =
+                                    st.fields.iter().find(|f| f.name.name == field.name)
                                 {
                                     out_ty = InferTy::Concrete(sf.ty.clone());
                                 }
@@ -3199,8 +3196,10 @@ impl<'a> Monomorphizer<'a> {
                     }
 
                     let out_ident = Ident::new(resolved_struct_name, eff_name.span);
-                    let out_ty =
-                        InferTy::Concrete(TypeExpr::new(TypeKind::Named(out_ident.clone()), expr.span));
+                    let out_ty = InferTy::Concrete(TypeExpr::new(
+                        TypeKind::Named(out_ident.clone()),
+                        expr.span,
+                    ));
                     return (
                         Expr::new(
                             ExprKind::StructLit {
@@ -3471,9 +3470,8 @@ impl<'a> Monomorphizer<'a> {
                                 }
                                 Some(recv_kind) => {
                                     let recv_arg = match (recv_kind, recv_is_ptr) {
-                                        (SelfReceiver::Value, false) | (SelfReceiver::Ptr, true) => {
-                                            rr.clone()
-                                        }
+                                        (SelfReceiver::Value, false)
+                                        | (SelfReceiver::Ptr, true) => rr.clone(),
                                         (SelfReceiver::Value, true) => Expr::new(
                                             ExprKind::Unary {
                                                 op: UnaryOp::Deref,
@@ -3520,8 +3518,10 @@ impl<'a> Monomorphizer<'a> {
                 let mut out_ty = InferTy::Unknown;
                 if let ExprKind::Ident(id) = &rr.kind {
                     if method.name == "from_bytes" && self.known_structs.contains_key(&id.name) {
-                        out_ty =
-                            InferTy::Concrete(TypeExpr::new(TypeKind::Named(id.clone()), expr.span));
+                        out_ty = InferTy::Concrete(TypeExpr::new(
+                            TypeKind::Named(id.clone()),
+                            expr.span,
+                        ));
                     }
                 }
                 if let InferTy::Concrete(ct) = &r_ty {
@@ -3531,10 +3531,7 @@ impl<'a> Monomorphizer<'a> {
                     };
                     if let TypeKind::OsPrimitive(os) = &deref.kind {
                         match (os, method.name.as_str()) {
-                            (
-                                OsPrimitiveType::Watch { elem },
-                                "read" | "wait_change",
-                            )
+                            (OsPrimitiveType::Watch { elem }, "read" | "wait_change")
                             | (OsPrimitiveType::Guarded { elem }, "get")
                             | (
                                 OsPrimitiveType::Inbox { elem, .. }
@@ -3572,20 +3569,14 @@ impl<'a> Monomorphizer<'a> {
                                     expr.span,
                                 ));
                             }
-                            (
-                                OsPrimitiveType::Pool { elem, .. },
-                                "try_alloc" | "alloc",
-                            )
+                            (OsPrimitiveType::Pool { elem, .. }, "try_alloc" | "alloc")
                             | (OsPrimitiveType::DmaSlot { elem }, "take") => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
                                     TypeKind::Lease(elem.clone()),
                                     expr.span,
                                 ));
                             }
-                            (
-                                OsPrimitiveType::Pool { .. },
-                                "avail" | "in_use" | "cap",
-                            )
+                            (OsPrimitiveType::Pool { .. }, "avail" | "in_use" | "cap")
                             | (OsPrimitiveType::DmaSlot { .. }, "addr") => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
                                     TypeKind::Prim(PrimType::Usize),
@@ -3603,8 +3594,7 @@ impl<'a> Monomorphizer<'a> {
                                 ));
                             }
                             (
-                                OsPrimitiveType::ByteRing { .. }
-                                | OsPrimitiveType::ByteRingUnsized,
+                                OsPrimitiveType::ByteRing { .. } | OsPrimitiveType::ByteRingUnsized,
                                 "read_slice" | "wait_read" | "grant_write",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
@@ -3616,8 +3606,7 @@ impl<'a> Monomorphizer<'a> {
                                 ));
                             }
                             (
-                                OsPrimitiveType::ByteRing { .. }
-                                | OsPrimitiveType::ByteRingUnsized,
+                                OsPrimitiveType::ByteRing { .. } | OsPrimitiveType::ByteRingUnsized,
                                 "try_pop_byte",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
@@ -3626,8 +3615,7 @@ impl<'a> Monomorphizer<'a> {
                                 ));
                             }
                             (
-                                OsPrimitiveType::ByteRing { .. }
-                                | OsPrimitiveType::ByteRingUnsized,
+                                OsPrimitiveType::ByteRing { .. } | OsPrimitiveType::ByteRingUnsized,
                                 "push" | "pop" | "len" | "cap" | "free_space",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
@@ -3636,8 +3624,7 @@ impl<'a> Monomorphizer<'a> {
                                 ));
                             }
                             (
-                                OsPrimitiveType::ByteRing { .. }
-                                | OsPrimitiveType::ByteRingUnsized,
+                                OsPrimitiveType::ByteRing { .. } | OsPrimitiveType::ByteRingUnsized,
                                 "push_byte" | "is_empty" | "is_full",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
@@ -3698,7 +3685,10 @@ impl<'a> Monomorphizer<'a> {
                         }
                     }
                 }
-                (Expr::new(ExprKind::FormatString(r_parts), expr.span), InferTy::Unknown)
+                (
+                    Expr::new(ExprKind::FormatString(r_parts), expr.span),
+                    InferTy::Unknown,
+                )
             }
 
             ExprKind::Or {
@@ -3758,12 +3748,12 @@ impl<'a> Monomorphizer<'a> {
                     Expr::new(
                         ExprKind::Catch {
                             expr: Box::new(ri),
-                            clause: CatchClause {
+                            clause: Box::new(CatchClause {
                                 err_param,
                                 partial_param,
                                 body,
                                 span: clause.span,
-                            },
+                            }),
                         },
                         expr.span,
                     ),
@@ -3804,8 +3794,10 @@ impl<'a> Monomorphizer<'a> {
             ExprKind::Ident(id) if !scopes_contain(scopes, &id.name) => Some(id.clone()),
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(base_id) = &target.kind {
-                    if matches!(self.lookup_scope_ty(&base_id.name, env, scopes), InferTy::Unknown)
-                        && self.fn_templates.contains_key(&field.name)
+                    if matches!(
+                        self.lookup_scope_ty(&base_id.name, env, scopes),
+                        InferTy::Unknown
+                    ) && self.fn_templates.contains_key(&field.name)
                     {
                         Some(field.clone())
                     } else {
@@ -3836,8 +3828,10 @@ impl<'a> Monomorphizer<'a> {
                     if let Some((mangled, ret_ty)) =
                         self.instantiate_fn(&fn_id.name, &r_gargs, span, env)
                     {
-                        let new_callee =
-                            Expr::new(ExprKind::Ident(Ident::new(mangled, fn_id.span)), callee.span);
+                        let new_callee = Expr::new(
+                            ExprKind::Ident(Ident::new(mangled, fn_id.span)),
+                            callee.span,
+                        );
                         return (
                             Expr::new(
                                 ExprKind::Call {
@@ -3853,8 +3847,7 @@ impl<'a> Monomorphizer<'a> {
                 }
 
                 // Error recovery: emit dummy concrete call so sema doesn't cascade an undefined symbol.
-                let fallback_callee =
-                    Expr::new(ExprKind::Ident(fn_id), callee.span);
+                let fallback_callee = Expr::new(ExprKind::Ident(fn_id), callee.span);
                 return (
                     Expr::new(
                         ExprKind::Call {
@@ -3901,10 +3894,7 @@ impl<'a> Monomorphizer<'a> {
 
             if fn_id.name == "fmt_buf" {
                 let slice_u8 = TypeExpr::new(
-                    TypeKind::Slice(Box::new(TypeExpr::new(
-                        TypeKind::Prim(PrimType::U8),
-                        span,
-                    ))),
+                    TypeKind::Slice(Box::new(TypeExpr::new(TypeKind::Prim(PrimType::U8), span))),
                     span,
                 );
                 return (
@@ -4011,12 +4001,23 @@ impl<'a> Monomorphizer<'a> {
         if let Some(err_msg) = conflict {
             self.emit(
                 &env.file,
-                Diagnostic::new(DiagnosticKind::GenericInstantiationError, call_span, err_msg),
+                Diagnostic::new(
+                    DiagnosticKind::GenericInstantiationError,
+                    call_span,
+                    err_msg,
+                ),
             );
             return None;
         }
 
-        self.materialize_inferred_args(&f.name.name, &f.generic_params, &inferred_types, &inferred_consts, env, call_span)
+        self.materialize_inferred_args(
+            &f.name.name,
+            &f.generic_params,
+            &inferred_types,
+            &inferred_consts,
+            env,
+            call_span,
+        )
     }
 
     fn infer_struct_lit_args(
@@ -4056,7 +4057,14 @@ impl<'a> Monomorphizer<'a> {
             return None;
         }
 
-        self.materialize_inferred_args(&st.name.name, &st.generic_params, &inferred_types, &inferred_consts, env, lit_span)
+        self.materialize_inferred_args(
+            &st.name.name,
+            &st.generic_params,
+            &inferred_types,
+            &inferred_consts,
+            env,
+            lit_span,
+        )
     }
 
     fn materialize_inferred_args(
@@ -4161,7 +4169,8 @@ impl<'a> Monomorphizer<'a> {
                         (Some(InferTy::IntLit), InferTy::Concrete(ct)) if is_int_type_expr(ct) => {
                             inferred_types.insert(id.name.clone(), InferTy::Concrete(ct.clone()));
                         }
-                        (Some(InferTy::Concrete(ct)), InferTy::IntLit) if is_int_type_expr(&ct) => {}
+                        (Some(InferTy::Concrete(ct)), InferTy::IntLit) if is_int_type_expr(&ct) => {
+                        }
                         (Some(InferTy::IntLit), InferTy::IntLit) => {}
                         (Some(InferTy::FloatLit), InferTy::Concrete(ct))
                             if is_float_type_expr(ct) =>
@@ -4296,20 +4305,19 @@ impl<'a> Monomorphizer<'a> {
             }
 
             TypeKind::Slice(p_elem) => {
-                if let InferTy::Concrete(TypeExpr { kind, .. }) = actual {
-                    match kind {
-                        TypeKind::Slice(a_elem) | TypeKind::Array { elem: a_elem, .. } => {
-                            self.unify_pattern(
-                                p_elem,
-                                &InferTy::Concrete((**a_elem).clone()),
-                                param_kinds,
-                                inferred_types,
-                                inferred_consts,
-                                conflict,
-                            );
-                        }
-                        _ => {}
-                    }
+                if let InferTy::Concrete(TypeExpr {
+                    kind: TypeKind::Slice(a_elem) | TypeKind::Array { elem: a_elem, .. },
+                    ..
+                }) = actual
+                {
+                    self.unify_pattern(
+                        p_elem,
+                        &InferTy::Concrete((**a_elem).clone()),
+                        param_kinds,
+                        inferred_types,
+                        inferred_consts,
+                        conflict,
+                    );
                 }
             }
 
@@ -4398,22 +4406,23 @@ impl<'a> Monomorphizer<'a> {
                                             }
                                         }
                                     }
-                                    (GenericArg::Const(Expr {
-                                        kind: ExprKind::Ident(cid),
-                                        ..
-                                    }), ResolvedGenArg::Const(i_n)) => {
-                                        if param_kinds.get(&cid.name)
-                                            == Some(&GenericParamKind::ConstUsize)
-                                        {
-                                            if let Some(&prev_n) = inferred_consts.get(&cid.name) {
-                                                if prev_n != *i_n {
-                                                    *conflict = Some(format!(
-                                                        "conflicting bounds {} and {} inferred for generic parameter 'usize {}'",
-                                                        prev_n, i_n, cid.name
-                                                    ));
+                                    (GenericArg::Const(e), ResolvedGenArg::Const(i_n)) => {
+                                        if let ExprKind::Ident(cid) = &e.kind {
+                                            if param_kinds.get(&cid.name)
+                                                == Some(&GenericParamKind::ConstUsize)
+                                            {
+                                                if let Some(&prev_n) =
+                                                    inferred_consts.get(&cid.name)
+                                                {
+                                                    if prev_n != *i_n {
+                                                        *conflict = Some(format!(
+                                                            "conflicting bounds {} and {} inferred for generic parameter 'usize {}'",
+                                                            prev_n, i_n, cid.name
+                                                        ));
+                                                    }
+                                                } else {
+                                                    inferred_consts.insert(cid.name.clone(), *i_n);
                                                 }
-                                            } else {
-                                                inferred_consts.insert(cid.name.clone(), *i_n);
                                             }
                                         }
                                     }
@@ -4438,15 +4447,11 @@ fn escape_mangle_ident(s: &str) -> String {
 fn mangle_generic_arg_ast(arg: &GenericArg) -> String {
     match arg {
         GenericArg::Type(te) => mangle_type_expr(te),
-        GenericArg::Const(Expr {
-            kind: ExprKind::Literal(Literal::Int { value: v, .. }),
-            ..
-        }) => v.to_string(),
-        GenericArg::Const(Expr {
-            kind: ExprKind::Ident(id),
-            ..
-        }) => escape_mangle_ident(&id.name),
-        GenericArg::Const(_) => "expr".to_string(),
+        GenericArg::Const(e) => match &e.kind {
+            ExprKind::Literal(Literal::Int { value: v, .. }) => v.to_string(),
+            ExprKind::Ident(id) => escape_mangle_ident(&id.name),
+            _ => "expr".to_string(),
+        },
     }
 }
 

@@ -100,10 +100,7 @@ impl<'a> BodyChecker<'a> {
                 None => (rest, None),
             };
             if let Some(idx) = self.param_names.iter().position(|n| n == pname) {
-                return EndpointSpec::Param {
-                    index: idx,
-                    suffix,
-                };
+                return EndpointSpec::Param { index: idx, suffix };
             }
         }
         EndpointSpec::Static(ep.to_string())
@@ -216,16 +213,16 @@ impl<'a> BodyChecker<'a> {
         self.param_names = params.iter().map(|p| p.name.clone()).collect();
         for (idx, p) in params.iter().enumerate() {
             let is_ptr = matches!(p.ty, Ty::Ptr(_));
-            let endpoint_alias = if ty_contains_os_prim_view(&p.ty, &self.sema.structs, &mut BTreeSet::new()) {
-                Some(format!("param:{}", p.name))
-            } else {
-                None
-            };
+            let endpoint_alias =
+                if ty_contains_os_prim_view(&p.ty, &self.sema.structs, &mut BTreeSet::new()) {
+                    Some(format!("param:{}", p.name))
+                } else {
+                    None
+                };
             let prov = if p.ty.contains_reference(&self.sema.structs) {
                 Provenance::for_param(idx, is_ptr, endpoint_alias.clone())
-            } else if matches!(p.ty, Ty::FnPtr { .. }) {
-                Provenance::pure_static()
             } else {
+                // Non-reference scalars and function pointers both carry pure_static provenance.
                 Provenance::pure_static()
             };
             let (lease_state, lease_gen_key) = if p.ty.is_linear_lease() {
@@ -306,7 +303,12 @@ impl<'a> BodyChecker<'a> {
             self.sema
                 .variant_to_enums
                 .keys()
-                .filter(|v| !self.sema.visible_enums_for_variant(self.prog_idx, v).is_empty())
+                .filter(|v| {
+                    !self
+                        .sema
+                        .visible_enums_for_variant(self.prog_idx, v)
+                        .is_empty()
+                })
                 .map(String::as_str),
         );
         pool.extend(self.sema.functions.keys().map(String::as_str));
@@ -350,7 +352,10 @@ impl<'a> BodyChecker<'a> {
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::YieldInIsr,
                 span,
-                format!("cannot yield via {} inside ISR '{}'", construct_desc, isr_name),
+                format!(
+                    "cannot yield via {} inside ISR '{}'",
+                    construct_desc, isr_name
+                ),
             ));
         } else if self.in_critical() {
             self.sema.emit(Diagnostic::new(
@@ -438,7 +443,12 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
-    pub(super) fn check_unconsumed_leases_on_exit(&mut self, exit_span: Span, exit_kind: &str, min_depth_exclusive: u32) {
+    pub(super) fn check_unconsumed_leases_on_exit(
+        &mut self,
+        exit_span: Span,
+        exit_kind: &str,
+        min_depth_exclusive: u32,
+    ) {
         let mut offenders = Vec::new();
         for scope in &self.scopes {
             for var in scope.values() {
@@ -723,7 +733,11 @@ impl<'a> BodyChecker<'a> {
                         ),
                     ));
                 }
-                if self.scopes.last().is_some_and(|s| s.contains_key(&name.name)) {
+                if self
+                    .scopes
+                    .last()
+                    .is_some_and(|s| s.contains_key(&name.name))
+                {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::DuplicateDefinition,
                         name.span,
@@ -857,7 +871,9 @@ impl<'a> BodyChecker<'a> {
                 let dup_in_isr = if matches!(self.body_kind, ActiveBodyKind::Isr) {
                     !self.isr_state_names.insert(name.name.clone())
                 } else {
-                    self.scopes.last().is_some_and(|s| s.contains_key(&name.name))
+                    self.scopes
+                        .last()
+                        .is_some_and(|s| s.contains_key(&name.name))
                 };
                 if dup_in_isr {
                     self.sema.emit(Diagnostic::new(
@@ -904,10 +920,7 @@ impl<'a> BodyChecker<'a> {
                 );
                 if resolved_ty.contains_reference(&self.sema.structs)
                     || resolved_ty.contains_fn_ptr(&self.sema.structs)
-                    || matches!(
-                        resolved_ty,
-                        Ty::OsPrimitive(_) | Ty::MmioInstance { .. }
-                    )
+                    || matches!(resolved_ty, Ty::OsPrimitive(_) | Ty::MmioInstance { .. })
                 {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidIsrState,
@@ -1080,12 +1093,8 @@ impl<'a> BodyChecker<'a> {
                                     self.check_coerced_expr(e, ret_ty);
                                 }
                                 if ret_ty.contains_reference(&self.sema.structs) {
-                                    let ret_prov = self.coerce_array_to_slice_prov(
-                                        e,
-                                        &val.ty,
-                                        ret_ty,
-                                        &val.prov,
-                                    );
+                                    let ret_prov = self
+                                        .coerce_array_to_slice_prov(e, &val.ty, ret_ty, &val.prov);
                                     if ret_prov.has_non_returning_origin() {
                                         self.sema.emit(
                                             Diagnostic::new(
@@ -1254,10 +1263,7 @@ impl<'a> BodyChecker<'a> {
                                 if let Some(p_expr) = partial {
                                     self.check_coerced_expr(p_expr, ret_ty);
                                     let partial_prov = self.coerce_array_to_slice_prov(
-                                        p_expr,
-                                        &pv.ty,
-                                        ret_ty,
-                                        &pv.prov,
+                                        p_expr, &pv.ty, ret_ty, &pv.prov,
                                     );
                                     if ret_ty.contains_reference(&self.sema.structs)
                                         && partial_prov.has_non_returning_origin()
@@ -1329,10 +1335,7 @@ impl<'a> BodyChecker<'a> {
                     {
                         if let Some(top) = self.boot_block_stack.last_mut() {
                             top.push(IrqBootNode::BranchGroup {
-                                arms: vec![
-                                    (then_div, then_irq_nodes),
-                                    (else_div, else_irq_nodes),
-                                ],
+                                arms: vec![(then_div, then_irq_nodes), (else_div, else_irq_nodes)],
                             });
                         }
                     }
@@ -1558,9 +1561,7 @@ impl<'a> BodyChecker<'a> {
                             period.span,
                             "periodic 'loop every' interval must be greater than 0",
                         ));
-                    } else if const_ticks
-                        .is_some_and(|t| t > zev_ast::MAX_DURATION_TICKS as i128)
-                    {
+                    } else if const_ticks.is_some_and(|t| t > zev_ast::MAX_DURATION_TICKS as i128) {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::InvalidDurationResolution,
                             period.span,
@@ -1588,11 +1589,7 @@ impl<'a> BodyChecker<'a> {
                 );
                 let has_break = block_has_break(body);
                 if !has_break {
-                    self.check_unconsumed_leases_on_exit(
-                        stmt.span,
-                        "enter infinite loop every",
-                        0,
-                    );
+                    self.check_unconsumed_leases_on_exit(stmt.span, "enter infinite loop every", 0);
                 }
                 let prev_sup_loop = self.in_main_supervisor_loop;
                 if !has_break && self.caller_key == "main" {
@@ -1813,7 +1810,9 @@ impl<'a> BodyChecker<'a> {
                                     suffix: Some(p), ..
                                 } => Ty::Prim(*p),
                                 Literal::Int { suffix: None, .. } => Ty::IntLit,
-                                Literal::Float { suffix: Some(p), .. } => Ty::Prim(*p),
+                                Literal::Float {
+                                    suffix: Some(p), ..
+                                } => Ty::Prim(*p),
                                 Literal::Float { suffix: None, .. } => Ty::FloatLit,
                                 Literal::Bool(_) => Ty::bool(),
                                 Literal::Duration(d) => {
@@ -1839,21 +1838,13 @@ impl<'a> BodyChecker<'a> {
                                 Ty::Prim(p),
                             ) = (lit, &sv.ty)
                             {
-                                self.check_int_lit_range_or_emit(
-                                    i128::from(*value),
-                                    *p,
-                                    *pat_span,
-                                );
+                                self.check_int_lit_range_or_emit(i128::from(*value), *p, *pat_span);
                             } else if let Literal::Int {
                                 value,
                                 suffix: Some(p),
                             } = lit
                             {
-                                self.check_int_lit_range_or_emit(
-                                    i128::from(*value),
-                                    *p,
-                                    *pat_span,
-                                );
+                                self.check_int_lit_range_or_emit(i128::from(*value), *p, *pat_span);
                             }
                         }
                         SwitchPat::Ident {
@@ -1882,7 +1873,8 @@ impl<'a> BodyChecker<'a> {
                                 {
                                     covered_variants.insert(name.name.clone());
                                 } else {
-                                    let hint = self.suggest_enum_variant_hint(enum_name, &name.name);
+                                    let hint =
+                                        self.suggest_enum_variant_hint(enum_name, &name.name);
                                     self.sema.emit(
                                         Diagnostic::new(
                                             DiagnosticKind::UndefinedSymbol,
@@ -1900,7 +1892,10 @@ impl<'a> BodyChecker<'a> {
                                     self.sema.emit(Diagnostic::new(
                                         DiagnosticKind::UndefinedSymbol,
                                         *pat_span,
-                                        format!("unknown switch pattern '{}.{}'", pref.name, name.name),
+                                        format!(
+                                            "unknown switch pattern '{}.{}'",
+                                            pref.name, name.name
+                                        ),
                                     ));
                                 }
                             } else if let Some(c) = self.sema.consts.get(&name.name) {
@@ -1922,7 +1917,10 @@ impl<'a> BodyChecker<'a> {
                                 ));
                             }
                         }
-                        SwitchPat::Qualified { path, span: pat_span } => {
+                        SwitchPat::Qualified {
+                            path,
+                            span: pat_span,
+                        } => {
                             if !sv.ty.is_error() {
                                 let rendered = path
                                     .iter()
@@ -1963,9 +1961,7 @@ impl<'a> BodyChecker<'a> {
                     arm_irq_nodes.push((false, Vec::new()));
                 }
 
-                if self.can_record_boot_step()
-                    && arm_irq_nodes.iter().any(|(_, n)| !n.is_empty())
-                {
+                if self.can_record_boot_step() && arm_irq_nodes.iter().any(|(_, n)| !n.is_empty()) {
                     if let Some(top) = self.boot_block_stack.last_mut() {
                         top.push(IrqBootNode::BranchGroup {
                             arms: arm_irq_nodes,
@@ -2010,8 +2006,9 @@ impl<'a> BodyChecker<'a> {
                             method,
                             args,
                         } => {
-                            let has_timeout_arg =
-                                args.iter().any(|a| a.name.as_ref().is_some_and(|n| n.name == "timeout"));
+                            let has_timeout_arg = args
+                                .iter()
+                                .any(|a| a.name.as_ref().is_some_and(|n| n.name == "timeout"));
                             if !args.is_empty() {
                                 let mut d = Diagnostic::new(
                                     DiagnosticKind::InvalidOperation,
@@ -2104,8 +2101,9 @@ impl<'a> BodyChecker<'a> {
                                     bind_name.name, arm.call.span
                                 ),
                             ));
-                        } else if !call_val.ty.is_error() && !resolved_ty.is_error() {
-                            if self.sema.check_assignable_or_emit(
+                        } else if !call_val.ty.is_error()
+                            && !resolved_ty.is_error()
+                            && self.sema.check_assignable_or_emit(
                                 &call_val.ty,
                                 &resolved_ty,
                                 arm.call.span,
@@ -2116,9 +2114,9 @@ impl<'a> BodyChecker<'a> {
                                         bind_name.name, resolved_ty, call_val.ty
                                     )
                                 },
-                            ) {
-                                self.check_coerced_expr(&arm.call, &resolved_ty);
-                            }
+                            )
+                        {
+                            self.check_coerced_expr(&arm.call, &resolved_ty);
                         }
                         let decl_depth = self.current_depth();
                         let (lease_state, lease_gen_key) = if resolved_ty.is_linear_lease() {
@@ -2326,18 +2324,19 @@ impl<'a> BodyChecker<'a> {
                 if var.decl_depth <= entry_depth
                     && matches!(var.lease_state, Some(LinearLeaseState::Live))
                 {
-                    let was_live = entry_vars
-                        .get(idx)
-                        .and_then(|s| s.get(name))
-                        .is_some_and(|ev| {
-                            matches!(
-                                ev.lease_state,
-                                Some(
-                                    LinearLeaseState::Live
-                                        | LinearLeaseState::DeferredRelease { .. }
+                    let was_live =
+                        entry_vars
+                            .get(idx)
+                            .and_then(|s| s.get(name))
+                            .is_some_and(|ev| {
+                                matches!(
+                                    ev.lease_state,
+                                    Some(
+                                        LinearLeaseState::Live
+                                            | LinearLeaseState::DeferredRelease { .. }
+                                    )
                                 )
-                            )
-                        });
+                            });
                     if !was_live {
                         offenders.push(name.clone());
                     }
@@ -2376,7 +2375,8 @@ impl<'a> BodyChecker<'a> {
         self.loop_depth += 1;
         self.loop_entry_depths.push(entry_depth);
         self.loop_outer_reads.push(Vec::new());
-        self.loop_lease_frames.push((entry_depth, loop_entry_vars.clone()));
+        self.loop_lease_frames
+            .push((entry_depth, loop_entry_vars.clone()));
 
         let body_div = self.with_nested_scope(|this| {
             let bind_depth = this.current_depth();
@@ -2422,7 +2422,8 @@ impl<'a> BodyChecker<'a> {
                     if let Some(inv_span) = modified.get(&tok.source) {
                         if leases_before.check_valid(tok).is_ok() {
                             let inv_method = self.leases.last_invalidator(&tok.source);
-                            let display_src = tok.source.strip_suffix("#write").unwrap_or(&tok.source);
+                            let display_src =
+                                tok.source.strip_suffix("#write").unwrap_or(&tok.source);
                             let (msg, note_msg) = if tok.acq_method == "wait_chunk" {
                                 (
                                     format!(
@@ -2465,7 +2466,8 @@ impl<'a> BodyChecker<'a> {
                     if let Some(inv_span) = modified.get(&tok.source) {
                         if read_env.check_valid(tok).is_ok() {
                             let inv_method = self.leases.last_invalidator(&tok.source);
-                            let display_src = tok.source.strip_suffix("#write").unwrap_or(&tok.source);
+                            let display_src =
+                                tok.source.strip_suffix("#write").unwrap_or(&tok.source);
                             let (msg, note_msg) = if tok.acq_method == "wait_chunk" {
                                 (
                                     format!(
@@ -2513,7 +2515,8 @@ impl<'a> BodyChecker<'a> {
         self.loop_depth += 1;
         self.loop_entry_depths.push(entry_depth);
         self.loop_outer_reads.push(Vec::new());
-        self.loop_lease_frames.push((entry_depth, loop_entry_vars.clone()));
+        self.loop_lease_frames
+            .push((entry_depth, loop_entry_vars.clone()));
 
         let body_div = self.check_nested_block(body);
         if !body_div {
@@ -2540,7 +2543,8 @@ impl<'a> BodyChecker<'a> {
                         // Only report if `read_env` hadn't already reported it stale on iteration 1.
                         if read_env.check_valid(tok).is_ok() {
                             let inv_method = self.leases.last_invalidator(&tok.source);
-                            let display_src = tok.source.strip_suffix("#write").unwrap_or(&tok.source);
+                            let display_src =
+                                tok.source.strip_suffix("#write").unwrap_or(&tok.source);
                             let (msg, note_msg) = if tok.acq_method == "wait_chunk" {
                                 (
                                     format!(
@@ -2702,12 +2706,8 @@ impl<'a> BodyChecker<'a> {
                     self.check_coerced_expr(&arg.value, &param.ty);
                 }
                 if param.ty.contains_reference(&self.sema.structs) {
-                    let arg_prov = self.coerce_array_to_slice_prov(
-                        &arg.value,
-                        &val.ty,
-                        &param.ty,
-                        &val.prov,
-                    );
+                    let arg_prov =
+                        self.coerce_array_to_slice_prov(&arg.value, &val.ty, &param.ty, &val.prov);
                     if arg_prov.has_non_returning_origin() {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::SpawnNonStaticReference,
@@ -2725,9 +2725,7 @@ impl<'a> BodyChecker<'a> {
             }
             let field_endpoints = self.extract_field_endpoint_specs(&val);
             let endpoint_from_param = self.resolve_param_endpoint_index(&val.endpoint_name);
-            let static_endpoint = val
-                .endpoint_name
-                .filter(|ep| !ep.starts_with("param:"));
+            let static_endpoint = val.endpoint_name.filter(|ep| !ep.starts_with("param:"));
             arg_bindings.push(BootArgBinding {
                 static_endpoint,
                 endpoint_from_param,
@@ -2801,10 +2799,7 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::ImmutableAssignment,
                         target.span,
-                        format!(
-                            "cannot reassign hardware handle '{}' directly",
-                            ident.name
-                        ),
+                        format!("cannot reassign hardware handle '{}' directly", ident.name),
                     ));
                     return;
                 }
@@ -2970,10 +2965,7 @@ impl<'a> BodyChecker<'a> {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::ImmutableAssignment,
                         target.span,
-                        format!(
-                            "cannot assign to field of immutable const '{}'",
-                            const_name
-                        ),
+                        format!("cannot assign to field of immutable const '{}'", const_name),
                     ));
                     return;
                 }
@@ -2981,16 +2973,14 @@ impl<'a> BodyChecker<'a> {
                 let base_val = self.check_projection_base(base);
                 let (struct_name, via_ptr) = match &base_val.ty {
                     Ty::Struct(s) => (s.clone(), false),
-                    Ty::MmioLayout(layout_name) | Ty::MmioInstance { layout: layout_name, .. } => {
+                    Ty::MmioLayout(layout_name)
+                    | Ty::MmioInstance {
+                        layout: layout_name,
+                        ..
+                    } => {
                         let ln = layout_name.clone();
                         self.check_mmio_reg_write_access(
-                            &ln,
-                            field,
-                            None,
-                            op,
-                            value_expr,
-                            &rhs,
-                            stmt_span,
+                            &ln, field, None, op, value_expr, &rhs, stmt_span,
                         );
                         return;
                     }
@@ -2999,33 +2989,30 @@ impl<'a> BodyChecker<'a> {
                         Ty::MmioLayout(layout_name) => {
                             let ln = layout_name.clone();
                             self.check_mmio_reg_write_access(
-                                &ln,
-                                field,
-                                None,
-                                op,
-                                value_expr,
-                                &rhs,
-                                stmt_span,
+                                &ln, field, None, op, value_expr, &rhs, stmt_span,
                             );
                             return;
                         }
                         _ => {
-                        if !base_val.ty.is_error() {
-                            self.sema.emit(Diagnostic::new(
-                                DiagnosticKind::TypeMismatch,
-                                base.span,
-                                format!("type '{}' has no field '{}'", base_val.ty, field.name),
-                            ));
+                            if !base_val.ty.is_error() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    base.span,
+                                    format!("type '{}' has no field '{}'", base_val.ty, field.name),
+                                ));
+                            }
+                            return;
                         }
-                        return;
-                    }
-                },
-                _ => {
+                    },
+                    _ => {
                         if !base_val.ty.is_error() {
                             self.sema.emit(Diagnostic::new(
                                 DiagnosticKind::TypeMismatch,
                                 base.span,
-                                format!("type '{}' has no assignable field '{}'", base_val.ty, field.name),
+                                format!(
+                                    "type '{}' has no assignable field '{}'",
+                                    base_val.ty, field.name
+                                ),
                             ));
                         }
                         return;
@@ -3090,12 +3077,8 @@ impl<'a> BodyChecker<'a> {
                 if field_ty.contains_reference(&self.sema.structs)
                     || field_ty.contains_fn_ptr(&self.sema.structs)
                 {
-                    let rhs_prov = self.coerce_array_to_slice_prov(
-                        value_expr,
-                        &rhs.ty,
-                        &field_ty,
-                        &rhs.prov,
-                    );
+                    let rhs_prov =
+                        self.coerce_array_to_slice_prov(value_expr, &rhs.ty, &field_ty, &rhs.prov);
                     if via_ptr {
                         let dest_depth = base_val.prov.pointee_depth.unwrap_or(0);
                         if (base_val.prov.pointee_is_caller_or_static
@@ -3161,8 +3144,10 @@ impl<'a> BodyChecker<'a> {
                                     let prefix = format!("{}.", field.name);
                                     v.field_endpoints.retain(|k, _| !k.starts_with(&prefix));
                                     for (sub_k, sub_ep) in &rhs.field_endpoints {
-                                        v.field_endpoints
-                                            .insert(format!("{}.{}", field.name, sub_k), sub_ep.clone());
+                                        v.field_endpoints.insert(
+                                            format!("{}.{}", field.name, sub_k),
+                                            sub_ep.clone(),
+                                        );
                                     }
                                 }
                             }
@@ -3240,12 +3225,8 @@ impl<'a> BodyChecker<'a> {
                     self.check_compound_op_types(op, pointee_ty, value_expr, &rhs.ty, stmt_span);
                 }
                 if pointee_ty.contains_reference(&self.sema.structs) {
-                    let rhs_prov = self.coerce_array_to_slice_prov(
-                        value_expr,
-                        &rhs.ty,
-                        pointee_ty,
-                        &rhs.prov,
-                    );
+                    let rhs_prov =
+                        self.coerce_array_to_slice_prov(value_expr, &rhs.ty, pointee_ty, &rhs.prov);
                     let dest_depth = pv.prov.pointee_depth.unwrap_or(0);
                     if (pv.prov.pointee_is_caller_or_static && rhs_prov.has_non_returning_origin())
                         || dest_depth < rhs_prov.origin_depth
@@ -3451,5 +3432,4 @@ impl<'a> BodyChecker<'a> {
             self.check_coerced_expr(rhs_expr, lhs);
         }
     }
-
 }
