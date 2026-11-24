@@ -3256,4 +3256,274 @@ fn main() {
         let exit_scaled = runner::compile_and_run_host_llvm(&ll_scaled, true, &[]).unwrap();
         assert_eq!(exit_scaled, 0);
     }
+
+    #[test]
+    fn host_sanitize_verifies_scheduler_across_tick_wraparound() {
+        let temp = TempWorkDir::create("zevc-tick-wraparound").unwrap();
+
+        // 1. Timers (`delay`, `wait timeout`/`deadline`, `loop every` cadence & overrun resync)
+        //    crossing both `i32::MAX` (`0x7FFF_FFFF -> 0x8000_0000`) and `u32::MAX` (`0xFFFF_FFFF -> 0`).
+        let src_timers = "\
+signal never_sig;
+watch<bool> i32_delay_done = false;
+watch<bool> i32_wait_done = false;
+watch<bool> i32_every_done = false;
+
+signal u32_delay_sig;
+signal u32_wait_sig;
+signal u32_every_sig;
+watch<bool> u32_delay_done = false;
+watch<bool> u32_wait_done = false;
+watch<bool> u32_every_done = false;
+
+task delay_worker() {
+    u32 s1 = now_ticks();
+    assert(s1 == 0x7FFF_FFF8u32);
+    delay(15ms);
+    assert(now_ticks() == 0x8000_0007u32);
+    assert(now_ticks() - s1 == 15u32);
+    i32_delay_done.publish(true);
+
+    u32_delay_sig.wait();
+    u32 s2 = now_ticks();
+    assert(s2 == 0xFFFF_FFF0u32);
+    delay(25ms);
+    assert(now_ticks() == 0x0000_0009u32);
+    assert(now_ticks() - s2 == 25u32);
+    u32_delay_done.publish(true);
+
+    never_sig.wait();
+    loop { checkpoint(); }
+}
+
+task wait_worker() {
+    u32 s1 = now_ticks();
+    bool timed_out = false;
+    wait {
+        never_sig.wait() => { assert(false); }
+        timeout 12ms => { timed_out = true; }
+    }
+    assert(timed_out);
+    assert(now_ticks() == 0x8000_0004u32);
+    assert(now_ticks() - s1 == 12u32);
+    i32_wait_done.publish(true);
+
+    u32_wait_sig.wait();
+    u32 s2 = now_ticks();
+    u32 dl2 = s2 + 20u32;
+    bool dl_fired = false;
+    wait {
+        never_sig.wait() => { assert(false); }
+        deadline dl2 => { dl_fired = true; }
+    }
+    assert(dl_fired);
+    assert(now_ticks() == 0x0000_0004u32);
+    assert(now_ticks() - s2 == 20u32);
+    u32_wait_done.publish(true);
+
+    never_sig.wait();
+    loop { checkpoint(); }
+}
+
+task every_worker() {
+    u32 step = 0u32;
+    u32 prev = 0u32;
+    loop every 5ms {
+        step += 1u32;
+        u32 t = now_ticks();
+        if (step == 1u32) {
+            assert(t == 0x7FFF_FFF8u32);
+        } else if (step <= 4u32) {
+            // Wakes cleanly across `0x7FFF_FFFF -> 0x8000_0000`: +5, +5, +5 => 0x8000_0007
+            assert(t - prev == 5u32);
+            if (step == 4u32) {
+                // Both delay_worker and wait_worker finish by 0x8000_0007; stall 12ms -> 0x8000_0013.
+                sys.tick_by(12u32);
+            }
+        } else if (step == 5u32) {
+            // EveryLatch coalesces missed deadlines (0x8000_000C & 0x8000_0011 -> resync_dl = 0x8000_0011)
+            // and runs one immediate recovery step at 0x8000_0013 without burst-catching up both skipped ticks.
+            assert(t == 0x8000_0013u32);
+        } else {
+            // Next wake locks cleanly onto the original 5ms phase grid: 0x8000_0011 + 5 = 0x8000_0016.
+            assert(t == 0x8000_0016u32);
+            break;
+        }
+        prev = t;
+    }
+    i32_every_done.publish(true);
+
+    u32_every_sig.wait();
+    u32 step2 = 0u32;
+    u32 prev2 = 0u32;
+    loop every 10ms {
+        step2 += 1u32;
+        u32 t = now_ticks();
+        if (step2 == 1u32) {
+            assert(t == 0xFFFF_FFF0u32);
+        } else if (step2 == 2u32) {
+            assert(t == 0xFFFF_FFFAu32);
+        } else if (step2 == 3u32) {
+            // Crossed u32 wrap (`0xFFFF_FFFF -> 0`) on normal cadence:
+            assert(t == 0x0000_0004u32);
+            assert(t - prev2 == 10u32);
+        } else if (step2 == 4u32) {
+            assert(t == 0x0000_000Eu32);
+            // Overrun stall 23ms -> 0x0000_0025; skips 0x0000_0018, resync_dl = 0x0000_0022.
+            sys.tick_by(23u32);
+        } else if (step2 == 5u32) {
+            assert(t == 0x0000_0025u32);
+        } else {
+            assert(t == 0x0000_002Cu32);
+            break;
+        }
+        prev2 = t;
+    }
+    u32_every_done.publish(true);
+    never_sig.wait();
+    loop { checkpoint(); }
+}
+
+task coordinator() {
+    while (!(i32_delay_done.read() && i32_wait_done.read() && i32_every_done.read())) {
+        delay(1ms);
+    }
+    // Jump near u32 wraparound (`0xFFFF_FFF0`).
+    u32 jump = 0xFFFF_FFF0u32 - now_ticks();
+    sys.tick_by(jump);
+    assert(now_ticks() == 0xFFFF_FFF0u32);
+    u32_delay_sig.notify();
+    u32_wait_sig.notify();
+    u32_every_sig.notify();
+
+    while (!(u32_delay_done.read() && u32_wait_done.read() && u32_every_done.read())) {
+        delay(1ms);
+    }
+    println(\"tick_wrap_timers_ok\");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.tick_by(0x7FFF_FFF8u32);
+    spawn delay_worker() @high;
+    spawn wait_worker() @high;
+    spawn every_worker() @normal;
+    spawn coordinator() @low;
+}
+";
+        let timers_path = temp.dir.join("wrap_timers.zev");
+        std::fs::write(&timers_path, src_timers).unwrap();
+        let (_, mir_timers) = compile_to_mir(&[timers_path]).unwrap();
+        let ll_timers = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir_timers,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        assert_eq!(runner::compile_and_run_host_llvm(&ll_timers, true, &[]).unwrap(), 0);
+
+        // 2. Priority starvation preemption windows across `i32::MAX` and `u32::MAX` wraparound.
+        let src_starve = "\
+watch<u32> starver_hits = 0u32;
+
+task starver() {
+    // At t0 = 0x7FFF_FFFD, @normal starvation window is 15ms => due = 0x8000_000C.
+    assert(now_ticks() == 0x8000_000Cu32);
+    starver_hits.publish(1u32);
+    loop { checkpoint(); }
+}
+
+task hog() {
+    // @high hogs CPU via soft-yielding while loop until @normal `starver` hits its 15ms starvation window across `i32::MAX`.
+    while (starver_hits.read() == 0u32) {
+        sys.tick_by(1u32);
+        checkpoint();
+    }
+    println(\"tick_wrap_starve_i32_ok\");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.tick_by(0x7FFF_FFFDu32);
+    spawn hog() @high;
+    spawn starver() @normal;
+}
+";
+        let starve_path = temp.dir.join("wrap_starve_i32.zev");
+        std::fs::write(&starve_path, src_starve).unwrap();
+        let (_, mir_starve) = compile_to_mir(&[starve_path]).unwrap();
+        let ll_starve = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir_starve,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        assert_eq!(runner::compile_and_run_host_llvm(&ll_starve, true, &[]).unwrap(), 0);
+
+        // Also test starvation window crossing `u32::MAX -> 0` (`0xFFFF_FFFD -> 0x0000_0002`).
+        let src_starve_u32 = "\
+watch<u32> starver_hits = 0u32;
+
+task starver() {
+    assert(now_ticks() == 0x0000_000Cu32);
+    starver_hits.publish(1u32);
+    loop { checkpoint(); }
+}
+
+task hog() {
+    while (starver_hits.read() == 0u32) {
+        sys.tick_by(1u32);
+        checkpoint();
+    }
+    println(\"tick_wrap_starve_u32_ok\");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.tick_by(0xFFFF_FFFDu32);
+    spawn hog() @high;
+    spawn starver() @normal;
+}
+";
+        let starve_u32_path = temp.dir.join("wrap_starve_u32.zev");
+        std::fs::write(&starve_u32_path, src_starve_u32).unwrap();
+        let (_, mir_starve_u32) = compile_to_mir(&[starve_u32_path]).unwrap();
+        let ll_starve_u32 = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir_starve_u32,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        assert_eq!(
+            runner::compile_and_run_host_llvm(&ll_starve_u32, true, &[]).unwrap(),
+            0
+        );
+
+        // 3. `--max-ticks` wraparound: must run 16 ticks across `0x7FFF_FFFC -> 0x8000_000C` without stopping early.
+        let src_max_ticks = "\
+task pulse() {
+    loop every 4ms {
+        println(f\"pulse t={now_ticks():08x}\");
+    }
+}
+
+fn main() {
+    sys.tick_by(0x7FFF_FFFCu32);
+    spawn pulse() @normal;
+}
+";
+        let max_ticks_path = temp.dir.join("wrap_max_ticks.zev");
+        std::fs::write(&max_ticks_path, src_max_ticks).unwrap();
+        let (_, mir_mt) = compile_to_mir(&[max_ticks_path]).unwrap();
+        let mut opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        opts.max_ticks = 16;
+        let ll_mt = zev_codegen_llvm::emit_llvm_ir_with_options(&mir_mt, &opts).unwrap();
+        let (exit_mt, stdout_mt) =
+            runner::compile_and_run_host_llvm_output(&ll_mt, true, &[]).unwrap();
+        assert_eq!(exit_mt, 0);
+        assert!(stdout_mt.contains("pulse t=7ffffffc"), "stdout={stdout_mt}");
+        assert!(stdout_mt.contains("pulse t=80000000"), "stdout={stdout_mt}");
+        assert!(stdout_mt.contains("pulse t=80000008"), "stdout={stdout_mt}");
+        assert!(
+            !stdout_mt.contains("pulse t=8000000c"),
+            "max_ticks=16 from 0x7ffffffc must stop before 0x8000000c, got stdout={stdout_mt}"
+        );
+    }
 }

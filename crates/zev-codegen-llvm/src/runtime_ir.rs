@@ -172,6 +172,7 @@ pub fn emit_kernel_runtime_ir_with_features(
 @__syn_current_task = global ptr null, align 4{cm_boot_global}
 @__syn_ready_mask = internal global [4 x i32] zeroinitializer, align 4
 @__syn_earliest_deadline = internal global i32 0, align 4
+@__syn_sched_start_tick = internal global i32 0, align 4
 @__syn_has_deadline_waiter = internal global i8 0, align 1
 "#
     );
@@ -1572,7 +1573,9 @@ entry:
   br i1 %has_cap, label %chk_cap, label %chk_null
 chk_cap:
   %now_cap = {call_kw} i32 @__syn_now_ms()
-  %hit_cap = icmp sge i32 %now_cap, %cap
+  %start_cap = load i32, ptr @__syn_sched_start_tick, align 4
+  %elapsed_cap = sub i32 %now_cap, %start_cap
+  %hit_cap = icmp sge i32 %elapsed_cap, %cap
   br i1 %hit_cap, label %ret_true, label %chk_null
 chk_null:
   %isnull = icmp eq ptr %task, null
@@ -1852,13 +1855,17 @@ entry:
         out,
         r#"define void @__syn_sched_loop(){fn_as} noreturn nounwind{sz} {{
 entry:
-{mie_enable_ir}{auto_systick_check}tick_loop:
+{mie_enable_ir}  %init_tick = {call_kw} i32 @__syn_now_ms()
+  store i32 %init_tick, ptr @__syn_sched_start_tick, align 4
+{auto_systick_check}tick_loop:
   %now = {call_kw} i32 @__syn_now_ms()
   %cap = load i32, ptr @__syn_max_ticks, align 4
   %has_cap = icmp sgt i32 %cap, 0
   br i1 %has_cap, label %chk_cap, label %wake_phase
 chk_cap:
-  %reached = icmp sge i32 %now, %cap
+  %start_tick = load i32, ptr @__syn_sched_start_tick, align 4
+  %elapsed = sub i32 %now, %start_tick
+  %reached = icmp sge i32 %elapsed, %cap
   br i1 %reached, label %clean_exit, label %wake_phase
 
 wake_phase:
