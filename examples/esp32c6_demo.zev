@@ -44,8 +44,8 @@ struct LedSample {
 
 // ── Static Zero-Heap Language-OS Endpoints (HP-SRAM `0x40800000`) ───────────
 watch<u32>               palette_offset = 0;
-guarded<u32>             active_slot    = 0;
-guarded<u32>             active_color   = 0;
+watch<u32>               active_slot    = 0;
+watch<u32>               active_color   = 0;
 watch<u32>               diag_signature = 0;
 inbox<SupEvent, 8>       sup_inbox;
 SerialPort               usb_serial;
@@ -127,6 +127,17 @@ impl<usize N> FixedVec<f32, N> {
 }
 
 // ── Pure Saturated Color Wheel: Red -> Green -> Blue -> Cyan -> Magenta (0% White!) ──
+fn palette_color(u32 slot) -> u32 {
+    u32 idx = slot % PALETTE_LEN;
+    switch (idx) {
+        0 => { return 0x400000; }
+        1 => { return 0x004000; }
+        2 => { return 0x000040; }
+        3 => { return 0x003838; }
+        _ => { return 0x380038; }
+    }
+}
+
 fn drive_palette_slot(u32 slot) -> u32 {
     u32 idx = slot % PALETTE_LEN;
     switch (idx) {
@@ -206,23 +217,26 @@ fn scrub_sram_canary(u32 beat_count) {
 
 // ── Cooperative Tasks ───────────────────────────────────────────────────────
 
-// Cycles onboard GPIO8 WS2812B RGB LED smoothly every 500ms
-task led_animator(*watch<u32> mode_off, *guarded<u32> out_slot, *guarded<u32> out_color) {
+// Cycles onboard GPIO8 WS2812B RGB LED smoothly every 500ms (and immediately on palette shift)
+task led_animator(*watch<u32> mode_off, *watch<u32> out_slot, *watch<u32> out_color) {
     u32 tick_phase = 0;
 
-    loop every 500ms {
+    loop {
         u32 user_off = mode_off.read();
         u32 slot = (tick_phase + user_off) % PALETTE_LEN;
 
         noyield {
             u32 rgb = drive_palette_slot(slot);
-            critical {
-                out_slot.set(slot);
-                out_color.set(rgb);
-            }
+            out_slot.publish(slot);
+            out_color.publish(rgb);
         }
 
-        tick_phase += 1;
+        wait {
+            u32 _new_off = mode_off.wait_change() => {}
+            timeout 500ms => {
+                tick_phase += 1;
+            }
+        }
     }
 }
 
@@ -250,9 +264,8 @@ task button_monitor() {
 
 task usb_cmd_worker(
     *SerialPort port,
-    *guarded<u32> slot_w,
-    *guarded<u32> color_w,
-    *watch<u32> off_w,
+    *watch<u32> slot_w,
+    *watch<u32> color_w,
     *inbox<SupEvent, 8> sup
 ) {
     *byte_ring rx = &port.rx;
@@ -265,12 +278,8 @@ task usb_cmd_worker(
         for (u8 ch in trimmed) {
             if (ch == 'p' || ch == 'P' || ch == '?') {
                 cmds += 1;
-                u32 slot = 0;
-                u32 rgb = 0;
-                critical {
-                    slot = slot_w.get();
-                    rgb = color_w.get();
-                }
+                u32 slot = slot_w.read();
+                u32 rgb = color_w.read();
                 f32 die_c = bsp.read_die_temp_c();
                 usize wn = fmt_ring(tx, f"[CMD ESP32-C6] PONG uptime={sys.now_ms()}ms slot={slot} color=0x{rgb:06x} temp={die_c:.1}C prio={sys.current_prio()} cmds={cmds}\n") catch { 0 };
                 if (wn > 0) {
@@ -282,13 +291,9 @@ task usb_cmd_worker(
                 i32 cal = bsp.read_temp_calib_tenths_c();
                 u8 dac = bsp.read_tsens_dac();
                 f32 die_c = bsp.read_die_temp_c();
-                bus.StatusCell<u32> off_cell = bus.StatusCell<u32> { state: off_w };
-                u32 off = bus.read_cell<u32>(&off_cell);
-                u32 slot = 0;
-                critical {
-                    slot = slot_w.get();
-                }
-                usize wn = fmt_ring(tx, f"[SENS ESP32-C6] die_temp={die_c:.1}C raw={raw} cal={cal} dac={dac} slot={slot} off={off} cmds={cmds}\n") catch { 0 };
+                bus.StatusCell<u32> slot_cell = bus.StatusCell<u32> { state: slot_w };
+                u32 slot = bus.read_cell<u32>(&slot_cell);
+                usize wn = fmt_ring(tx, f"[SENS ESP32-C6] die_temp={die_c:.1}C raw={raw} cal={cal} dac={dac} slot={slot} cmds={cmds}\n") catch { 0 };
                 if (wn > 0) {
                     flush_tx_ring(tx);
                 }
@@ -372,10 +377,8 @@ fn main() {
 
     // Immediate visual boot confirmation on GPIO8 WS2812B RGB LED
     u32 boot_rgb = drive_palette_slot(0);
-    critical {
-        active_slot.set(0);
-        active_color.set(boot_rgb);
-    }
+    active_slot.publish(0);
+    active_color.publish(boot_rgb);
 
     run_soc_self_test();
 
@@ -386,7 +389,7 @@ fn main() {
 
     spawn led_animator(&palette_offset, &active_slot, &active_color) @normal;
     spawn button_monitor() @high;
-    spawn usb_cmd_worker(&usb_serial, &active_slot, &active_color, &palette_offset, &sup_inbox) @normal;
+    spawn usb_cmd_worker(&usb_serial, &active_slot, &active_color, &sup_inbox) @normal;
 
     set_priority(@low);
     u32 presses = 0;
@@ -406,16 +409,7 @@ fn main() {
                 u32 next_off = (palette_offset.read() + 1) % PALETTE_LEN;
                 palette_offset.publish(next_off);
 
-                u32 cur_rgb = 0;
-                noyield {
-                    u32 instant_rgb = drive_palette_slot(next_off);
-                    critical {
-                        active_slot.set(next_off);
-                        active_color.set(instant_rgb);
-                    }
-                    cur_rgb = instant_rgb;
-                }
-
+                u32 cur_rgb = palette_color(next_off);
                 LedSample sample = sample_led_power(next_off, cur_rgb);
                 mw_window.push_ring(sample.mwatts);
                 f32 avg_mw = mw_window.avg();
@@ -428,12 +422,8 @@ fn main() {
                 heartbeats += 1;
                 scrub_sram_canary(heartbeats);
 
-                u32 cur_slot = 0;
-                u32 cur_rgb = 0;
-                critical {
-                    cur_slot = active_slot.get();
-                    cur_rgb = active_color.get();
-                }
+                u32 cur_slot = active_slot.read();
+                u32 cur_rgb = active_color.read();
                 LedSample sample = sample_led_power(cur_slot, cur_rgb);
                 mw_window.push_ring(sample.mwatts);
                 f32 avg_mw = mw_window.avg();

@@ -106,8 +106,8 @@ mod tests {
         let path = repo_root().join("examples/motor_controller.zev");
         let program = parse_workspace_example(&path);
 
-        // 2 imports + 1 packed struct + 2 enums + 5 OS primitives + 2 ISRs + 1 helper fn + 2 tasks + 1 main fn = 16 items
-        assert_eq!(program.items.len(), 16, "unexpected item count");
+        // 2 imports + 1 packed struct + 2 enums + 6 OS primitives + 2 ISRs + 1 helper fn + 2 tasks + 1 main fn = 17 items
+        assert_eq!(program.items.len(), 17, "unexpected item count");
 
         match &program.items[0].kind {
             ItemKind::Import(imp) => {
@@ -166,12 +166,22 @@ mod tests {
         match &program.items[7].kind {
             ItemKind::OsPrimitive(os) => {
                 assert_eq!(os.name.as_str(), "motor1_rpm");
+                assert!(matches!(os.ty, OsPrimitiveType::Watch { .. }));
                 assert!(os.init.is_some());
             }
             other => panic!("expected Watch OsPrimitive, got {other:?}"),
         }
 
-        match &program.items[10].kind {
+        match &program.items[9].kind {
+            ItemKind::OsPrimitive(os) => {
+                assert_eq!(os.name.as_str(), "fault_latched");
+                assert!(matches!(os.ty, OsPrimitiveType::Watch { .. }));
+                assert!(os.init.is_some());
+            }
+            other => panic!("expected Watch OsPrimitive, got {other:?}"),
+        }
+
+        match &program.items[11].kind {
             ItemKind::Isr(isr) => {
                 assert_eq!(isr.vector.as_str(), "overcurrent_isr");
                 assert_eq!(isr.params.len(), 2);
@@ -192,7 +202,7 @@ mod tests {
             other => panic!("expected Isr, got {other:?}"),
         }
 
-        match &program.items[12].kind {
+        match &program.items[13].kind {
             ItemKind::Fn(f) => {
                 assert_eq!(f.name.as_str(), "parse_setpoint");
                 assert_eq!(f.ret_type.kind, TypeKind::Prim(PrimType::U16));
@@ -203,24 +213,24 @@ mod tests {
             other => panic!("expected Fn, got {other:?}"),
         }
 
-        match &program.items[13].kind {
+        match &program.items[14].kind {
             ItemKind::Task(t) => {
                 assert_eq!(t.name.as_str(), "motor_control");
-                assert_eq!(t.params.len(), 2);
+                assert_eq!(t.params.len(), 3);
                 match &t.params[0].ty.kind {
                     TypeKind::Ptr(inner) => {
                         assert!(matches!(
                             inner.kind,
-                            TypeKind::OsPrimitive(OsPrimitiveType::Guarded { .. })
+                            TypeKind::OsPrimitive(OsPrimitiveType::Watch { .. })
                         ));
                     }
-                    other => panic!("expected Ptr(Guarded), got {other:?}"),
+                    other => panic!("expected Ptr(Watch), got {other:?}"),
                 }
             }
             other => panic!("expected Task, got {other:?}"),
         }
 
-        match &program.items[15].kind {
+        match &program.items[16].kind {
             ItemKind::Fn(f) => {
                 assert_eq!(f.name.as_str(), "main");
                 assert!(f.ret_type.is_void());

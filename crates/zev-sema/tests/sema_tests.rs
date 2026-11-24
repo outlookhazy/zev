@@ -7033,9 +7033,6 @@ fn integer_conversion_portability_ranges_and_widening_sema() {
         "fn main() { u16 a = 1; isize b = a; }",
         "fn main() { i32 a = 1; isize b = a; }",
         "fn main() { isize a = 1; usize b = a; }",
-        "fn main() { usize a = 65536; }",
-        "fn main() { isize a = 32768; }",
-        "fn main() { isize a = -32769; }",
         "packed struct P { u16be x; } fn main() { P p = P { x: 1 }; u16le q = 2; bool _b = p.x == q; }",
         "fn main() { u8 a = 200; u32 w = 0; w = (a + 300) as u32; }",
     ] {
@@ -7047,6 +7044,90 @@ fn integer_conversion_portability_ranges_and_widening_sema() {
         "fn main() { u8 a = 200; u8 x = a << 8; }",
     ] {
         expect_err_kind(bad_shift, DiagnosticKind::InvalidOperation);
+    }
+
+    // 3. Target pointer-width range checks on `usize`/`isize` literals and constant expressions
+    //    (locals, `const` declarations, and `<usize N>` generic arguments), while typed conversions
+    //    remain target-portable (`u8`/`u16` -> `usize` -> `u64`, checked above).
+    let check_with_target = |src: &str, ptr_bits: u32, target_name: &str| {
+        let prog = zev_parser::parse_str(src)
+            .unwrap_or_else(|e| panic!("test source failed to parse:\n{e}\n---\n{src}"));
+        let opts = AnalyzeOptions {
+            target_ptr_bits: ptr_bits,
+            target_name: target_name.to_string(),
+            ..Default::default()
+        };
+        analyze_and_monomorphize_named_programs(&[(&prog, None)], &opts)
+    };
+
+    // Host (default 64-bit): accepts 100_000 and 5_000_000_000 across locals, consts, and generics.
+    for ok_host in [
+        "const usize CAP = 100000; fn take<usize N>() -> usize { return N; } fn main() { usize n = 100000; usize c = CAP; usize g = take<100000>(); usize _sum = n + c + g; }",
+        "const usize BIG = 5_000_000_000; const isize S = -5_000_000_000; fn take<usize N>() -> usize { return N; } fn main() { usize n = 5_000_000_000; usize g = take<5_000_000_000>(); usize gc = take<BIG>(); isize sn = S; usize _u = n + g + gc; isize _si = sn; }",
+    ] {
+        let out = check_with_target(ok_host, 64, "host");
+        assert!(
+            out.diagnostics.is_empty(),
+            "expected 64-bit host program to succeed, got:\n{:?}",
+            out.diagnostics
+        );
+    }
+
+    // 32-bit board: accepts 100_000 across locals, consts, generics; rejects 5_000_000_000 naming target & 32-bit.
+    let ok_32 = "const usize CAP = 100000; fn take<usize N>() -> usize { return N; } fn main() { usize n = 100000; usize g = take<CAP>(); usize _x = n + g; }";
+    let out_32_ok = check_with_target(ok_32, 32, "nucleo_f334r8");
+    assert!(
+        out_32_ok.diagnostics.is_empty(),
+        "expected 32-bit board to accept 100000, got:\n{:?}",
+        out_32_ok.diagnostics
+    );
+    for bad_32 in [
+        "fn main() { usize n = 5_000_000_000; }",
+        "const usize CAP = 5_000_000_000; fn main() {}",
+        "fn main() { isize s = -2_147_483_649; }",
+        "fn take<usize N>() -> usize { return N; } fn main() { usize g = take<5_000_000_000>(); }",
+        "const usize CAP = 5_000_000_000; fn take<usize N>() -> usize { return N; } fn main() { usize g = take<CAP>(); }",
+    ] {
+        let out = check_with_target(bad_32, 32, "nucleo_f334r8");
+        assert!(
+            !out.diagnostics.is_empty(),
+            "expected 32-bit target error for:\n{bad_32}"
+        );
+        let msg = out.diagnostics[0].to_string();
+        assert!(
+            msg.contains("32-bit") && msg.contains("nucleo_f334r8"),
+            "error must name target & 32-bit pointer width:\n{msg}"
+        );
+    }
+
+    // AVR board (16-bit): accepts 65535; rejects 70000, 65536, 32768, -32769 naming target & 16-bit.
+    let ok_16 = "const usize CAP = 65535; const isize S = -32768; fn take<usize N>() -> usize { return N; } fn main() { usize n = 65535; usize g = take<CAP>(); isize s = S; usize _x = n + g; isize _y = s; }";
+    let out_16_ok = check_with_target(ok_16, 16, "arduino_uno");
+    assert!(
+        out_16_ok.diagnostics.is_empty(),
+        "expected 16-bit AVR board to accept 65535, got:\n{:?}",
+        out_16_ok.diagnostics
+    );
+    for bad_16 in [
+        "fn main() { usize a = 65536; }",
+        "fn main() { usize a = 70000; }",
+        "fn main() { isize a = 32768; }",
+        "fn main() { isize a = -32769; }",
+        "const usize CAP = 70000; fn main() {}",
+        "const isize S = 32768; fn main() {}",
+        "fn take<usize N>() -> usize { return N; } fn main() { usize g = take<70000>(); }",
+        "const usize CAP = 70000; fn take<usize N>() -> usize { return N; } fn main() { usize g = take<CAP>(); }",
+    ] {
+        let out = check_with_target(bad_16, 16, "arduino_uno");
+        assert!(
+            !out.diagnostics.is_empty(),
+            "expected 16-bit AVR error for:\n{bad_16}"
+        );
+        let msg = out.diagnostics[0].to_string();
+        assert!(
+            msg.contains("16-bit") && msg.contains("arduino_uno"),
+            "error must name target & 16-bit pointer width:\n{msg}"
+        );
     }
 }
 
@@ -7354,5 +7435,73 @@ fn retired_inbox_try_post_is_rejected_with_post_suggestion() {
                 && d.message.contains(".post(")
                 && d.message.contains(".try_send(")),
         "expected try_post removal diagnostic recommending .post(...) or .try_send(...), got: {diags:?}"
+    );
+}
+
+#[test]
+fn bare_const_expr_generic_args_and_defaulted_literal_calls_diagnostics() {
+    // 1. Bare const expr in generic call args (`lim<K + 1>(1)`) advises parenthesizing to `lim<(K + 1)>(1)`,
+    //    and non-generic comparisons (`f(a < b + 1, c > (d))`) still succeed.
+    let bad_c = "\
+const usize K = 3;
+fn lim<usize N>(u32 x) -> u32 { return x + (N as u32); }
+fn main() { u32 _y = lim<K + 1>(1); }
+";
+    let p_c = zev_parser::parse_str(bad_c).unwrap();
+    let out_c = analyze_and_monomorphize_programs(&[p_c], &AnalyzeOptions::default());
+    assert!(
+        out_c.diagnostics.iter().any(|d| {
+            d.kind == DiagnosticKind::GenericInstantiationError
+                && d.message.contains("lim<(K + 1)>(1)")
+                && d.message.contains("parenthes")
+        }),
+        "expected Fix C diagnostic, got: {:?}",
+        out_c.diagnostics
+    );
+    assert!(
+        out_c.diagnostics.iter().all(|d| !d
+            .message
+            .contains("cannot be referenced without concrete call arguments")),
+        "unexpected bare-ref cascade: {:?}",
+        out_c.diagnostics
+    );
+
+    // Multi-arg syntax recovery error case `lim<K + 1>(1, 2)` / `lim<K + 1, K + 2>(1)` also shows rewrite.
+    let (_p_multi, errs_multi) = zev_parser::parse_str_named_recovering(
+        "fn lim<usize A, usize B>(u32 x) -> u32 { return x; }\nfn main() { lim<1 + 2, 3 + 4>(5); }\n",
+        "c_multi.zev",
+    );
+    assert!(
+        errs_multi
+            .iter()
+            .any(|e| e.message.contains("lim<(1 + 2), (3 + 4)>(5)")),
+        "expected multi-arg Fix C rewrite message, got: {errs_multi:?}"
+    );
+
+    // 2. Fix D: wrapper generic struct destination infers inner T from all-literal call,
+    //    and literal overflow inside defaulted generic call suggests explicit type arguments.
+    let box_ok = "\
+struct Box<T> { T v; }
+fn make_box<T>(T a, T b) -> Box<T> { return Box { v: a }; }
+fn main() { Box<u32> _bx = make_box(3, 4); }
+";
+    let p_box = zev_parser::parse_str(box_ok).unwrap();
+    let out_box = analyze_and_monomorphize_programs(&[p_box], &AnalyzeOptions::default());
+    assert!(out_box.diagnostics.is_empty(), "{:?}", out_box.diagnostics);
+
+    let ovf = "\
+fn pick<T>(T a, T b) -> T { return a; }
+fn main() { pick(5_000_000_000, 4); }
+";
+    let p_ovf = zev_parser::parse_str(ovf).unwrap();
+    let out_ovf = analyze_and_monomorphize_programs(&[p_ovf], &AnalyzeOptions::default());
+    assert!(
+        out_ovf.diagnostics.iter().any(|d| {
+            d.kind == DiagnosticKind::TypeMismatch
+                && d.message.contains("defaulted to 'i32'")
+                && d.message.contains("pick<i64>(5000000000, 4)")
+        }),
+        "expected Fix D overflow suggestion, got: {:?}",
+        out_ovf.diagnostics
     );
 }

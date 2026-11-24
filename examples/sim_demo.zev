@@ -30,8 +30,9 @@ enum SupEvent { Overcurrent, BadPacket, IdleCheck }
 @dma_safe ping_pong<u8, 64> uart1_dma;
 @dma_safe ping_pong<u8, 64> uart2_dma;
 
-guarded<u16>       motor1_rpm = 0;
-guarded<u16>       motor2_rpm = 0;
+watch<u16>         motor1_rpm = 0;
+watch<u16>         motor2_rpm = 0;
+watch<bool>        fault_latched = false;
 watch<u16>         motor1_duty = 0;
 watch<u16>         motor2_duty = 0;
 watch<u32>         diag_telemetry = 0;
@@ -162,13 +163,13 @@ fn log_sim_duty_snapshot(*FixedVec<u16, 4> hist, u16 r1, u16 r2, u16 d1, u16 d2)
 
 // ── Reusable Parameterized Task Blueprints ──────────────────────────────────
 
-task motor_control(*guarded<u16> target_rpm, *watch<u16> out_duty, u8 pwm_ch) {
+task motor_control(*watch<u16> target_rpm, *watch<bool> fault, *watch<u16> out_duty, u8 pwm_ch) {
     i32 integral = 0;
 
     loop every 1ms {
         u16 target = 0;
-        critical {
-            target = target_rpm.get();
+        if (!fault.read()) {
+            target = target_rpm.read();
         }
         u16 actual = adc_read_rpm(pwm_ch);
 
@@ -180,7 +181,7 @@ task motor_control(*guarded<u16> target_rpm, *watch<u16> out_duty, u8 pwm_ch) {
     }
 }
 
-task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *guarded<u16> out_rpm) {
+task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
     loop {
         []u8 half = rx_dma.wait_chunk();
 
@@ -190,9 +191,7 @@ task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *guarded<u16> out_rpm) {
             continue;
         };
 
-        critical {
-            out_rpm.set(rpm);
-        }
+        out_rpm.publish(rpm);
     }
 }
 
@@ -241,12 +240,8 @@ task sim_stimulus() {
 
         if (tick == 4) {
             // Milestone 2: Verify u16be decoded RPMs & 1ms PI duties
-            u16 r1 = 0;
-            u16 r2 = 0;
-            critical {
-                r1 = motor1_rpm.get();
-                r2 = motor2_rpm.get();
-            }
+            u16 r1 = motor1_rpm.read();
+            u16 r2 = motor2_rpm.read();
             sim_milestone(2, r1 as u32, r2 as u32);
             u16 d1 = motor1_duty.read();
             u16 d2 = motor2_duty.read();
@@ -269,12 +264,12 @@ task sim_stimulus() {
         }
 
         if (tick == 11) {
-            // Milestone 6: Verify motors safely zeroed, fault record committed, and release DMA wake-lock
-            u32 r1_after = 0;
-            u32 r2_after = 0;
-            critical {
-                r1_after = motor1_rpm.get();
-                r2_after = motor2_rpm.get();
+            // Milestone 6: Verify fault latch zeroes effective motor targets, fault record committed, and release DMA wake-lock
+            u32 r1_after = motor1_rpm.read() as u32;
+            u32 r2_after = motor2_rpm.read() as u32;
+            if (fault_latched.read()) {
+                r1_after = 0;
+                r2_after = 0;
             }
             sim_milestone(4, r1_after, r2_after);
 
@@ -311,8 +306,8 @@ fn main() {
 
     run_power_on_self_test();
 
-    spawn motor_control(&motor1_rpm, &motor1_duty, 1) @critical;
-    spawn motor_control(&motor2_rpm, &motor2_duty, 2) @critical;
+    spawn motor_control(&motor1_rpm, &fault_latched, &motor1_duty, 1) @critical;
+    spawn motor_control(&motor2_rpm, &fault_latched, &motor2_duty, 2) @critical;
     spawn fieldbus_listener(&uart1_dma, &motor1_rpm) @normal;
     spawn fieldbus_listener(&uart2_dma, &motor2_rpm) @normal;
     spawn sim_stimulus() @high;
@@ -325,10 +320,7 @@ fn main() {
 
         switch (ev) {
             Overcurrent => {
-                critical {
-                    motor1_rpm.set(0);
-                    motor2_rpm.set(0);
-                }
+                fault_latched.publish(true);
                 save_fault_record(bad_packets);
             }
             BadPacket => {

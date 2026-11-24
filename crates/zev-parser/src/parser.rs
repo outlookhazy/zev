@@ -10,6 +10,7 @@ struct Checkpoint {
     pos: usize,
     pending_gt: Option<Span>,
     allow_struct_lit: bool,
+    bare_cand_len: usize,
 }
 
 pub struct Parser<'a> {
@@ -24,6 +25,10 @@ pub struct Parser<'a> {
     allow_struct_lit: bool,
     /// Current nesting depth across recursive expression, statement, block, and type parsers.
     recursion_depth: usize,
+    /// First span where `MAX_PARSER_RECURSION_DEPTH` was hit within the current top-level item.
+    depth_limit_hit: Option<Span>,
+    /// Purely syntactic `<...>(...)` candidates where speculative `<...>` failed to parse.
+    bare_generic_call_candidates: Vec<BareGenericCallCandidate>,
 }
 
 impl<'a> Parser<'a> {
@@ -36,6 +41,8 @@ impl<'a> Parser<'a> {
             pending_gt: None,
             allow_struct_lit: true,
             recursion_depth: 0,
+            depth_limit_hit: None,
+            bare_generic_call_candidates: Vec::new(),
         }
     }
 
@@ -48,6 +55,8 @@ impl<'a> Parser<'a> {
             pending_gt: None,
             allow_struct_lit: true,
             recursion_depth: self.recursion_depth,
+            depth_limit_hit: self.depth_limit_hit,
+            bare_generic_call_candidates: Vec::new(),
         }
     }
 
@@ -55,8 +64,206 @@ impl<'a> Parser<'a> {
     /// Each constant-generic argument is restricted to literals (`123`, `true`, `false`, `-1`),
     /// identifiers (`N`), or parenthesized expressions (`(N + 1)`), while type arguments reuse
     /// `parse_type()`. Never inspects declared names; caller commits only on `(` or allowed `{`.
+    fn try_record_bare_generic_call(
+        &mut self,
+        callee_name: &str,
+        display_callee: &str,
+        callee_span: Span,
+    ) {
+        if self.depth_limit_hit.is_some() || self.pending_gt.is_some() || !self.at(&TokenKind::Lt) {
+            return;
+        }
+        let cp = self.save();
+        self.bump(); // `<`
+        let mut angle_depth: usize = 1;
+        let mut paren_depth: usize = 0;
+        let mut bracket_depth: usize = 0;
+        let mut brace_depth: usize = 0;
+        let mut segs: Vec<(usize, usize, usize, usize, bool)> = Vec::new();
+        let mut cur_tok_start = self.pos;
+        let mut cur_byte_start = self.peek_span().start as usize;
+
+        while angle_depth > 0 {
+            let tok = self.peek_token();
+            let at_top = paren_depth == 0 && bracket_depth == 0 && brace_depth == 0;
+            match tok.kind {
+                TokenKind::Eof | TokenKind::Semi => {
+                    self.restore(cp);
+                    return;
+                }
+                TokenKind::LBrace if at_top => {
+                    self.restore(cp);
+                    return;
+                }
+                TokenKind::LParen => {
+                    paren_depth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen => {
+                    if paren_depth == 0 {
+                        self.restore(cp);
+                        return;
+                    }
+                    paren_depth -= 1;
+                    self.bump();
+                }
+                TokenKind::LBracket => {
+                    bracket_depth += 1;
+                    self.bump();
+                }
+                TokenKind::RBracket => {
+                    if bracket_depth == 0 {
+                        self.restore(cp);
+                        return;
+                    }
+                    bracket_depth -= 1;
+                    self.bump();
+                }
+                TokenKind::LBrace => {
+                    brace_depth += 1;
+                    self.bump();
+                }
+                TokenKind::RBrace => {
+                    if brace_depth == 0 {
+                        self.restore(cp);
+                        return;
+                    }
+                    brace_depth -= 1;
+                    self.bump();
+                }
+                TokenKind::Lt if at_top => {
+                    angle_depth += 1;
+                    self.bump();
+                }
+                TokenKind::Comma if at_top && angle_depth == 1 => {
+                    segs.push((
+                        cur_tok_start,
+                        self.pos,
+                        cur_byte_start,
+                        tok.span.start as usize,
+                        false,
+                    ));
+                    self.bump();
+                    cur_tok_start = self.pos;
+                    cur_byte_start = self.peek_span().start as usize;
+                }
+                TokenKind::Gt if at_top => {
+                    angle_depth -= 1;
+                    if angle_depth == 0 {
+                        segs.push((
+                            cur_tok_start,
+                            self.pos,
+                            cur_byte_start,
+                            tok.span.start as usize,
+                            false,
+                        ));
+                        self.bump();
+                        break;
+                    }
+                    self.bump();
+                }
+                TokenKind::Shr if at_top && angle_depth >= 2 => {
+                    angle_depth -= 2;
+                    if angle_depth == 0 {
+                        segs.push((
+                            cur_tok_start,
+                            self.pos,
+                            cur_byte_start,
+                            tok.span.start as usize + 1,
+                            true,
+                        ));
+                        self.bump();
+                        break;
+                    }
+                    self.bump();
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+
+        if segs.is_empty()
+            || segs.iter().any(|(_, _, bs, be, _)| {
+                self.source
+                    .get(*bs..*be)
+                    .is_none_or(|s| s.trim().is_empty())
+            })
+            || !self.at(&TokenKind::LParen)
+        {
+            self.restore(cp);
+            return;
+        }
+
+        let lparen = self.bump();
+        let mut pdepth: usize = 1;
+        let mut end_span = lparen.span;
+        let mut closed = false;
+        while pdepth > 0 {
+            let tok = self.peek_token();
+            match tok.kind {
+                TokenKind::Eof | TokenKind::Semi => break,
+                TokenKind::LParen => {
+                    pdepth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen => {
+                    pdepth -= 1;
+                    end_span = tok.span;
+                    self.bump();
+                    if pdepth == 0 {
+                        closed = true;
+                        break;
+                    }
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        let call_args_str = if closed {
+            self.source
+                .get(lparen.span.start as usize..end_span.end as usize)
+                .unwrap_or("(...)")
+                .to_string()
+        } else {
+            "(...)".to_string()
+        };
+
+        let mut parts = Vec::with_capacity(segs.len());
+        for (tok_start, tok_end, bs, be, ends_with_split_shr) in segs {
+            let raw = self.source.get(bs..be).map_or("", str::trim);
+            let test_cp = self.save();
+            self.pos = tok_start;
+            self.pending_gt = None;
+            let parsed_cleanly = self.parse_speculative_expr_generic_arg().is_some()
+                && if ends_with_split_shr {
+                    self.pos == tok_end && self.pending_gt.is_some()
+                } else {
+                    self.pos == tok_end && self.pending_gt.is_none()
+                };
+            self.restore(test_cp);
+            if parsed_cleanly {
+                parts.push(raw.to_string());
+            } else {
+                parts.push(format!("({raw})"));
+            }
+        }
+        self.restore(cp);
+
+        let rewrite = format!("{display_callee}<{}>{call_args_str}", parts.join(", "));
+        self.bare_generic_call_candidates
+            .push(BareGenericCallCandidate {
+                callee_name: callee_name.to_string(),
+                display_callee: display_callee.to_string(),
+                callee_span,
+                full_span: callee_span.merge(end_span),
+                rewrite,
+            });
+    }
+
     fn parse_speculative_expr_generic_args(&mut self) -> Option<Vec<GenericArg>> {
-        if !self.at(&TokenKind::Lt) {
+        if self.depth_limit_hit.is_some() || !self.at(&TokenKind::Lt) {
             return None;
         }
         self.bump(); // `<`
@@ -79,6 +286,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_speculative_expr_generic_arg(&mut self) -> Option<GenericArg> {
+        if self.depth_limit_hit.is_some() {
+            return None;
+        }
         if let TokenKind::Lifetime(_) = self.peek_kind() {
             return None;
         }
@@ -90,6 +300,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.restore(cp);
+        if self.depth_limit_hit.is_some() {
+            return None;
+        }
 
         let expr = match self.peek_kind() {
             TokenKind::Int { value, suffix } => {
@@ -156,6 +369,7 @@ impl<'a> Parser<'a> {
             pos: self.pos,
             pending_gt: self.pending_gt,
             allow_struct_lit: self.allow_struct_lit,
+            bare_cand_len: self.bare_generic_call_candidates.len(),
         }
     }
 
@@ -163,6 +377,7 @@ impl<'a> Parser<'a> {
         self.pos = cp.pos;
         self.pending_gt = cp.pending_gt;
         self.allow_struct_lit = cp.allow_struct_lit;
+        self.bare_generic_call_candidates.truncate(cp.bare_cand_len);
     }
 
     fn peek_token(&self) -> Token {
@@ -317,11 +532,18 @@ impl<'a> Parser<'a> {
         ParseError::new(message, span, self.source, self.filename)
     }
 
-    fn check_recursion_depth(&self, span: Span) -> Result<(), ParseError> {
+    fn depth_limit_err(&self, span: Span) -> ParseError {
+        self.err_at("maximum parser nesting depth exceeded", span)
+            .with_doc_topic("syntax")
+    }
+
+    fn check_recursion_depth(&mut self, span: Span) -> Result<(), ParseError> {
+        if let Some(prev_span) = self.depth_limit_hit {
+            return Err(self.depth_limit_err(prev_span));
+        }
         if self.recursion_depth >= MAX_PARSER_RECURSION_DEPTH {
-            return Err(self
-                .err_at("maximum parser nesting depth exceeded", span)
-                .with_doc_topic("syntax"));
+            self.depth_limit_hit = Some(span);
+            return Err(self.depth_limit_err(span));
         }
         Ok(())
     }
@@ -720,7 +942,11 @@ impl<'a> Parser<'a> {
         } else {
             start_span.merge(self.prev_span())
         };
-        Ok(Program::new(items, end_span))
+        Ok(
+            Program::new(items, end_span).with_bare_generic_call_candidates(std::mem::take(
+                &mut self.bare_generic_call_candidates,
+            )),
+        )
     }
 
     /// Parse a top-level program while synchronizing at item boundaries after syntax errors so
@@ -739,12 +965,40 @@ impl<'a> Parser<'a> {
                         break;
                     }
                 }
-                Err(err) => {
+                Err(mut err) => {
+                    if let Some(cand) = self.bare_generic_call_candidates.iter().rev().find(|c| {
+                        err.span.start >= c.full_span.start && err.span.end <= c.full_span.end
+                    }) {
+                        let is_known_generic_fn = items.iter().any(|it| {
+                            matches!(
+                                &it.kind,
+                                ItemKind::Fn(f)
+                                    if f.name.name == cand.callee_name && !f.generic_params.is_empty()
+                            )
+                        });
+                        if is_known_generic_fn {
+                            err.span = cand.full_span;
+                            err.message = format!(
+                                "constant expressions in generic arguments for '{}' must be parenthesized; write `{}`",
+                                cand.display_callee, cand.rewrite
+                            );
+                            err.doc_topic = Some("generics");
+                        } else if err.hint.is_none() {
+                            err.hint = Some(
+                                format!(
+                                    "if '{}' is a generic function, parenthesize constant expressions in its generic arguments: `{}`",
+                                    cand.display_callee, cand.rewrite
+                                )
+                                .into_boxed_str(),
+                            );
+                        }
+                    }
                     errors.push(err);
                     if errors.len() >= MAX_RECOVERED_PARSE_ERRORS {
                         break;
                     }
                     self.recursion_depth = 0;
+                    self.depth_limit_hit = None;
                     self.pending_gt = None;
                     self.allow_struct_lit = true;
                     self.synchronize_to_next_item(pos_before);
@@ -757,7 +1011,12 @@ impl<'a> Parser<'a> {
         } else {
             start_span.merge(self.prev_span())
         };
-        (Program::new(items, end_span), errors)
+        (
+            Program::new(items, end_span).with_bare_generic_call_candidates(std::mem::take(
+                &mut self.bare_generic_call_candidates,
+            )),
+            errors,
+        )
     }
 
     fn is_top_level_sync_starter(&self) -> bool {
@@ -2028,7 +2287,7 @@ impl<'a> Parser<'a> {
             {
                 return Ok(GenericArg::Type(ty));
             }
-            Err(e) if e.code.is_some() => {
+            Err(e) if e.code.is_some() || self.depth_limit_hit.is_some() => {
                 return Err(e);
             }
             _ => {
@@ -3385,7 +3644,7 @@ impl<'a> Parser<'a> {
                 }
             }
             Err(ref e) if e.code.is_some() => true,
-            Err(_) => false,
+            Err(_) => self.depth_limit_hit.is_some(),
         };
         self.restore(cp);
         ok
@@ -3756,6 +4015,9 @@ impl<'a> Parser<'a> {
             }
         }
         self.restore(cp);
+        if let Some(dspan) = self.depth_limit_hit {
+            return Err(self.depth_limit_err(dspan));
+        }
         Ok(None)
     }
 
@@ -4236,6 +4498,7 @@ impl<'a> Parser<'a> {
         let lp = self.bump(); // `(`
         let ty = match self.parse_type() {
             Ok(t) if self.is_valid_c_cast_type(&t) => t,
+            Err(e) if self.depth_limit_hit.is_some() => return Err(e),
             Err(e)
                 if e.code == Some("P0014")
                     && e.message.contains("pointer")
@@ -4246,6 +4509,9 @@ impl<'a> Parser<'a> {
             }
             _ => {
                 self.restore(cp);
+                if let Some(dspan) = self.depth_limit_hit {
+                    return Err(self.depth_limit_err(dspan));
+                }
                 return Ok(None);
             }
         };
@@ -4414,6 +4680,18 @@ impl<'a> Parser<'a> {
                             }
                         }
                         self.restore(cp);
+                        if let Some(dspan) = self.depth_limit_hit {
+                            return Err(self.depth_limit_err(dspan));
+                        }
+                        if let ExprKind::Ident(module_ident) = &expr.kind {
+                            let callee_span = expr.span.merge(field.span);
+                            let display_callee = format!("{}.{}", module_ident.name, field.name);
+                            self.try_record_bare_generic_call(
+                                &field.name,
+                                &display_callee,
+                                callee_span,
+                            );
+                        }
                     }
 
                     if is_mod_ident && self.allow_struct_lit && self.looks_like_struct_lit_body() {
@@ -4756,6 +5034,10 @@ impl<'a> Parser<'a> {
                         }
                     }
                     self.restore(cp);
+                    if let Some(dspan) = self.depth_limit_hit {
+                        return Err(self.depth_limit_err(dspan));
+                    }
+                    self.try_record_bare_generic_call(&ident.name, &ident.name, start);
                 }
 
                 if self.allow_struct_lit && self.looks_like_struct_lit_body() {

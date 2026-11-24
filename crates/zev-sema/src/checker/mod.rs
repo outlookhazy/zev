@@ -43,6 +43,10 @@ pub struct AnalyzeOptions {
     pub hal_dir: Option<String>,
     /// Target-bound board module override (e.g. `"bsp/nucleo_f334r8"`), defaulting to `"bsp/sim"`.
     pub board_module: Option<String>,
+    /// Pointer bit-width of the selected target (`16` on AVR, `32` on Cortex-M/RISC-V, `64` on host).
+    pub target_ptr_bits: u32,
+    /// Human-readable target name reported in `usize`/`isize` range diagnostics.
+    pub target_name: String,
 }
 
 impl Default for AnalyzeOptions {
@@ -52,6 +56,8 @@ impl Default for AnalyzeOptions {
             include_dirs: Vec::new(),
             hal_dir: None,
             board_module: None,
+            target_ptr_bits: 64,
+            target_name: "host".to_string(),
         }
     }
 }
@@ -278,6 +284,8 @@ pub(crate) struct Analyzer {
     pub(super) tick_period_us: u64,
     pub(super) tick_configured_explicitly: bool,
     pub(super) systick_hz: Option<u64>,
+    pub(super) target_ptr_bits: u32,
+    pub(super) target_name: String,
     pub(super) display_names: BTreeMap<String, String>,
     pub(super) program_extern_c_scopes: Vec<BTreeSet<String>>,
     pub(super) rewritten_pub_extern_sites: BTreeSet<(usize, u32, u32)>,
@@ -321,6 +329,7 @@ pub(crate) struct Analyzer {
     pub(super) current_prog_idx: usize,
     pub(super) current_instantiation_note: Option<String>,
     pub(super) mono_instantiation_notes: BTreeMap<String, String>,
+    pub(super) defaulted_generic_calls: Vec<crate::monomorphize::DefaultedGenericCall>,
     pub(super) f32_overflow_reported_spans: BTreeSet<(u32, u32)>,
     pub(super) node_files: BTreeMap<String, String>,
     pub(super) diagnostics: Vec<Diagnostic>,

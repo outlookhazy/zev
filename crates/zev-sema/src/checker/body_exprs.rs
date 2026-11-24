@@ -188,7 +188,7 @@ impl<'a> BodyChecker<'a> {
             ExprKind::Index { target, index } => {
                 let (tv, mmio_arr) = self.check_expr_infallible_allow_mmio_array(target);
                 let iv = self.check_expr_infallible(index);
-                self.validate_int_expr_at_type(index, None);
+                self.validate_int_expr_at_type(index, Some(PrimType::Usize));
                 if !iv.ty.is_integer() && !iv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -248,7 +248,7 @@ impl<'a> BodyChecker<'a> {
             ExprKind::Slice { target, start, end } => {
                 if let Some(s) = start {
                     let sv = self.check_expr_infallible(s);
-                    self.validate_int_expr_at_type(s, None);
+                    self.validate_int_expr_at_type(s, Some(PrimType::Usize));
                     if !sv.ty.is_integer() && !sv.ty.is_error() {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
@@ -259,7 +259,7 @@ impl<'a> BodyChecker<'a> {
                 }
                 if let Some(e) = end {
                     let ev = self.check_expr_infallible(e);
-                    self.validate_int_expr_at_type(e, None);
+                    self.validate_int_expr_at_type(e, Some(PrimType::Usize));
                     if !ev.ty.is_integer() && !ev.ty.is_error() {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
@@ -1738,6 +1738,7 @@ impl<'a> BodyChecker<'a> {
                 let (seq_v, seq_place_prov, seq_ep, mmio_arr) =
                     self.check_addr_of_place_impl(seq, addr_span, true);
                 let idx_v = self.check_expr_infallible(index);
+                self.validate_int_expr_at_type(index, Some(PrimType::Usize));
                 if !idx_v.ty.is_integer() && !idx_v.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -2986,6 +2987,8 @@ impl<'a> BodyChecker<'a> {
                                 hv.ty
                             ),
                         ));
+                    } else {
+                        self.validate_int_expr_at_type(&hz_arg.value, Some(PrimType::U32));
                     }
                 }
                 // Optional second argument configures custom tick period (`sys.use_systick(hz, 500us)`).
@@ -4836,6 +4839,7 @@ impl<'a> BodyChecker<'a> {
     ) {
         if let Some(idx_expr) = elem_index {
             let iv = self.check_expr_infallible(idx_expr);
+            self.validate_int_expr_at_type(idx_expr, Some(PrimType::Usize));
             if !iv.ty.is_integer() && !iv.ty.is_error() {
                 self.sema.emit(Diagnostic::new(
                     DiagnosticKind::TypeMismatch,
@@ -5395,11 +5399,24 @@ impl<'a> BodyChecker<'a> {
     }
 
     pub(super) fn validate_int_expr_at_type(&mut self, expr: &Expr, dest: Option<PrimType>) {
+        self.validate_int_expr_at_type_inner(expr, dest, dest.is_some());
+    }
+
+    fn validate_int_expr_at_type_inner(
+        &mut self,
+        expr: &Expr,
+        dest: Option<PrimType>,
+        check_const_target_range: bool,
+    ) {
         let nat_ty = self.expr_tys.get(&(expr as *const Expr as usize)).cloned();
-        let eff_prim = dest.map(Ty::host_prim).or_else(|| match &nat_ty {
-            Some(Ty::Prim(p)) if p.is_integer() => Some(Ty::host_prim(*p)),
-            _ => None,
-        });
+        let eff_prim = match (dest, &nat_ty) {
+            (Some(dp), Some(Ty::IntLit)) | (Some(dp), None) => Some(Ty::host_prim(dp)),
+            (Some(dp), Some(nt)) if nt.is_assignable_to(&Ty::Prim(dp)) => Some(Ty::host_prim(dp)),
+            _ => match &nat_ty {
+                Some(Ty::Prim(p)) if p.is_integer() => Some(Ty::host_prim(*p)),
+                _ => None,
+            },
+        };
         match &expr.kind {
             ExprKind::Literal(Literal::Int {
                 value,
@@ -5425,7 +5442,7 @@ impl<'a> BodyChecker<'a> {
                     .as_ref()
                     .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit))
                 {
-                    self.validate_int_expr_at_type(inner, eff_prim);
+                    self.validate_int_expr_at_type_inner(inner, eff_prim, false);
                 }
             }
             ExprKind::Unary {
@@ -5436,7 +5453,7 @@ impl<'a> BodyChecker<'a> {
                     .as_ref()
                     .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit))
                 {
-                    self.validate_int_expr_at_type(inner, eff_prim);
+                    self.validate_int_expr_at_type_inner(inner, eff_prim, false);
                 }
             }
             ExprKind::Binary {
@@ -5453,7 +5470,7 @@ impl<'a> BodyChecker<'a> {
                         .or_else(|| nat_ty.clone())
                         .unwrap_or(Ty::IntLit);
                     self.check_const_shift_amount(op.as_str(), &check_ty, rhs);
-                    self.validate_int_expr_at_type(lhs, eff_prim);
+                    self.validate_int_expr_at_type_inner(lhs, eff_prim, false);
                 }
             }
             ExprKind::Binary {
@@ -5472,15 +5489,69 @@ impl<'a> BodyChecker<'a> {
                 .as_ref()
                 .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit)) =>
             {
-                self.validate_int_expr_at_type(lhs, eff_prim);
-                self.validate_int_expr_at_type(rhs, eff_prim);
+                self.validate_int_expr_at_type_inner(lhs, eff_prim, false);
+                self.validate_int_expr_at_type_inner(rhs, eff_prim, false);
             }
             _ => {}
+        }
+
+        if check_const_target_range {
+            if let Some(dp @ (PrimType::Usize | PrimType::Isize)) = eff_prim {
+                let is_direct_lit_or_cast = match &expr.kind {
+                    ExprKind::Literal(Literal::Int { .. }) | ExprKind::Cast { .. } => true,
+                    ExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        expr: inner,
+                    } => matches!(inner.kind, ExprKind::Literal(Literal::Int { .. })),
+                    _ => false,
+                };
+                if !is_direct_lit_or_cast && !self.sema.has_reported_span_within(expr.span) {
+                    let shadowed = self.active_local_names();
+                    if let Some((min_v, max_v)) =
+                        Ty::int_prim_range_for_ptr_bits(dp, self.sema.target_ptr_bits)
+                    {
+                        if let Some(val) = self.sema.eval_const_expr_with_dest_i128(
+                            expr,
+                            Some(dp),
+                            &mut BTreeSet::new(),
+                            &shadowed,
+                        ) {
+                            if (val < min_v || val > max_v)
+                                && self
+                                    .sema
+                                    .f32_overflow_reported_spans
+                                    .insert((expr.span.start, expr.span.end))
+                            {
+                                self.sema.emit(
+                                    Diagnostic::new(
+                                        DiagnosticKind::TypeMismatch,
+                                        expr.span,
+                                        format!(
+                                            "constant expression {} out of range for '{}' on {}-bit target '{}' ({min_v}..={max_v})",
+                                            val,
+                                            dp.as_str(),
+                                            self.sema.target_ptr_bits,
+                                            self.sema.target_name
+                                        ),
+                                    )
+                                    .with_note(format!(
+                                        "'{}' has {}-bit pointer width ({min_v}..={max_v}) on target '{}'",
+                                        dp.as_str(),
+                                        self.sema.target_ptr_bits,
+                                        self.sema.target_name
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     pub(super) fn check_int_lit_range_or_emit(&mut self, val: i128, prim: PrimType, span: Span) {
-        let Some((min_v, max_v)) = Ty::int_prim_range(prim) else {
+        let Some((min_v, max_v)) = Ty::int_prim_range_for_ptr_bits(prim, self.sema.target_ptr_bits)
+        else {
             return;
         };
         if (val < min_v || val > max_v)
@@ -5489,27 +5560,37 @@ impl<'a> BodyChecker<'a> {
                 .f32_overflow_reported_spans
                 .insert((span.start, span.end))
         {
-            let note = if matches!(prim, PrimType::Usize | PrimType::Isize) {
-                format!(
-                    "`{}` guarantees only the portable 16-bit safe literal range ({min_v}..={max_v}) across 16/32/64-bit targets; use a concrete width (e.g. `u32` / `i32`) and an explicit `as {}` cast when targeting wider platforms",
+            if matches!(prim, PrimType::Usize | PrimType::Isize) {
+                let msg = format!(
+                    "integer literal {} out of range for '{}' on {}-bit target '{}' ({min_v}..={max_v})",
+                    val,
                     prim.as_str(),
-                    prim.as_str()
-                )
+                    self.sema.target_ptr_bits,
+                    self.sema.target_name
+                );
+                let note = format!(
+                    "'{}' has {}-bit pointer width ({min_v}..={max_v}) on target '{}' (use `--board`/`--chip` for a wider target or a concrete fixed-width type)",
+                    prim.as_str(),
+                    self.sema.target_ptr_bits,
+                    self.sema.target_name
+                );
+                self.sema
+                    .emit(Diagnostic::new(DiagnosticKind::TypeMismatch, span, msg).with_note(note));
             } else {
-                format!("valid range for `{}` is {min_v}..={max_v}", prim.as_str())
-            };
-            self.sema.emit(
-                Diagnostic::new(
-                    DiagnosticKind::TypeMismatch,
-                    span,
-                    format!(
-                        "integer literal {} out of range for '{}'",
-                        val,
-                        prim.as_str()
-                    ),
-                )
-                .with_note(note),
-            );
+                let note = format!("valid range for `{}` is {min_v}..={max_v}", prim.as_str());
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "integer literal {} out of range for '{}'",
+                            val,
+                            prim.as_str()
+                        ),
+                    )
+                    .with_note(note),
+                );
+            }
         }
     }
 }

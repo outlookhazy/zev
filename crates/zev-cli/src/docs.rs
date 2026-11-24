@@ -185,11 +185,13 @@ Use `import board;` and `hal.*` for portable firmware, then target hardware boar
 - Lossless Integer Coercion & Destination-Typed Arithmetic: implicit integer conversions are strictly
   lossless (unsigned -> wider unsigned / strictly wider signed; signed -> wider signed; wire-endian
   `u16be`/`u32le`... <-> same-width native). Narrowing and signed<->unsigned require explicit `as`.
-  `usize`/`isize` use target-portable bounds (`u8`/`u16` -> `usize` -> `u64`, literal `0..=65535`;
-  `i8`/`i16`/`u8` -> `isize` -> `i64`, literal `-32768..=32767`). Literals are range-checked against their
-  destination (`u8 x = 300;` -> `E0019`), incompatible binary/comparison operands (`u32 < i32`) error, and
-  arithmetic expressions widened to a destination compute at that destination width (`u16 w = a + b;`
-  with `u8 a = 200, b = 100` -> `300`, whereas `(a + b) as u16` -> `44`).
+  `usize`/`isize` conversions with fixed widths stay portable (`u8`/`u16` -> `usize` -> `u64`,
+  `i8`/`i16`/`u8` -> `isize` -> `i64`), while `usize`/`isize` literals and constant expressions are
+  range-checked against the selected target's pointer width (`16` on AVR, `32` on Cortex-M and RISC-V,
+  `64` on host; plain `zevc check` with no `--board`/`--chip` uses `host`). Literals are range-checked
+  against their destination (`u8 x = 300;` -> `E0019`), incompatible binary/comparison operands
+  (`u32 < i32`) error, and arithmetic expressions widened to a destination compute at that
+  destination width (`u16 w = a + b;` with `u8 a = 200, b = 100` -> `300`, whereas `(a + b) as u16` -> `44`).
 
 ## 2. Wire `packed struct`, In-Memory `struct`, `enum` & `.rodata` `const`
 ```zev

@@ -485,8 +485,17 @@ impl<'a> CoroutineLowerCtx<'a> {
                     } else {
                         let raw_p = self.lower_expr(period, None)?;
                         let host_ty = raw_p.ty.host_value_type();
+                        let norm_ty = match host_ty {
+                            MirType::I8 | MirType::I16 | MirType::I32 => MirType::I32,
+                            MirType::I64 => MirType::I64,
+                            MirType::Isize => MirType::Isize,
+                            MirType::U64 => MirType::U64,
+                            MirType::Usize => MirType::Usize,
+                            _ => MirType::U32,
+                        };
+                        let raw_p = widen_arith_mir_expr(raw_p, &norm_ty);
                         let is_signed = matches!(
-                            host_ty,
+                            norm_ty,
                             MirType::I8
                                 | MirType::I16
                                 | MirType::I32
@@ -611,14 +620,6 @@ impl<'a> CoroutineLowerCtx<'a> {
                             }
                             (pv, None)
                         } else {
-                            let norm_ty = match host_ty {
-                                MirType::I8 | MirType::I16 | MirType::I32 => MirType::I32,
-                                MirType::I64 => MirType::I64,
-                                MirType::Isize => MirType::Isize,
-                                MirType::U64 => MirType::U64,
-                                MirType::Usize => MirType::Usize,
-                                _ => MirType::U32,
-                            };
                             let pv = self.alloc_temp("every_period", norm_ty.clone());
                             (pv, Some(coerce_or_cast_int(raw_p, &norm_ty)))
                         }
@@ -1357,7 +1358,7 @@ impl<'a> CoroutineLowerCtx<'a> {
     ) -> Result<(), MirLowerError> {
         let code_expr = if let Some(ce) = code_arg_opt {
             let raw = self.lower_expr(ce, Some(&MirType::I32))?;
-            let coerced = coerce_or_cast_int(raw, &MirType::I32);
+            let coerced = coerce_expr_if_needed(raw, &MirType::I32);
             if self.has_active_defers_from(0) {
                 let tmp = self.alloc_temp("exit_code", MirType::I32);
                 self.cur_stmts.push(MirStmt::Assign {
@@ -2928,35 +2929,7 @@ impl<'a> CoroutineLowerCtx<'a> {
     }
 
     pub(super) fn coerce_arg_for_param(&mut self, arg: MirExpr, param_ty: &MirType) -> MirExpr {
-        if let (MirType::Array { elem, len }, MirType::Slice(_), MirExprKind::Var(vid)) =
-            (&arg.ty, param_ty, &arg.kind)
-        {
-            return MirExpr::new(
-                MirExprKind::ArrayToSlice {
-                    array_place: Box::new(MirPlace::Var(*vid)),
-                    len: *len,
-                    elem_ty: *elem.clone(),
-                },
-                param_ty.clone(),
-            );
-        }
-        if let (MirType::Array { elem, len }, MirType::Slice(_)) = (&arg.ty, param_ty) {
-            if is_rodata_const_mir_expr(&arg) {
-                let e_ty = *elem.clone();
-                let n = *len;
-                return MirExpr::new(
-                    MirExprKind::SubSlice {
-                        base: Box::new(arg),
-                        start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
-                        end: Box::new(MirExpr::new(MirExprKind::IntLit(n as i128), MirType::Usize)),
-                        elem_ty: e_ty,
-                        base_is_array: true,
-                    },
-                    param_ty.clone(),
-                );
-            }
-        }
-        coerce_expr_if_needed(arg, param_ty)
+        coerce_call_arg_expr(arg, param_ty)
     }
 
     pub(super) fn lower_place(

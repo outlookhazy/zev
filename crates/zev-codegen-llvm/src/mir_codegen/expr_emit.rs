@@ -174,7 +174,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let (bptr, bty, bpacked) = self.emit_place_ptr(base)?;
                 let iv = self.emit_expr(index)?;
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
-                let ic = self.coerce(iv, &usize_ty, false);
+                let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
                 let ety = self.ctx.llvm_ty(elem_ty);
                 if *is_slice {
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
@@ -260,7 +260,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 };
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let iv = self.emit_expr(index)?;
-                let ic = self.coerce(iv, &usize_ty, false);
+                let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
                 let blty = self.ctx.llvm_ty(&bty);
                 let ep = self.next_tmp();
                 self.emit_line(format!(
@@ -755,7 +755,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             } => {
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let iv = self.emit_expr(index)?;
-                let ic = self.coerce(iv, &usize_ty, false);
+                let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
                 let ety = self.ctx.llvm_ty(&expr.ty);
                 if *is_slice {
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
@@ -832,8 +832,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let ety = self.ctx.llvm_ty(elem_ty);
                 let st_v = self.emit_expr(start)?;
                 let en_v = self.emit_expr(end)?;
-                let st_c = self.coerce(st_v, &usize_ty, false);
-                let en_c = self.coerce(en_v, &usize_ty, false);
+                let st_c = self.coerce(st_v, &usize_ty, !start.ty.is_unsigned());
+                let en_c = self.coerce(en_v, &usize_ty, !end.ty.is_unsigned());
 
                 let (base_ptr, base_len) = if *base_is_array
                     || matches!(base.ty, MirType::Array { .. })
