@@ -80,9 +80,23 @@ impl<'a> BodyChecker<'a> {
     }
 
     pub(super) fn check_expr_raw(&mut self, expr: &Expr) -> ExprVal {
+        let val = self.check_expr_raw_inner(expr);
+        self.expr_tys
+            .insert(expr as *const Expr as usize, val.ty.clone());
+        val
+    }
+
+    fn check_expr_raw_inner(&mut self, expr: &Expr) -> ExprVal {
         match &expr.kind {
             ExprKind::Literal(lit) => match lit {
-                Literal::Int(_) => ExprVal::scalar(Ty::IntLit, expr.span),
+                Literal::Int {
+                    value,
+                    suffix: Some(p),
+                } => {
+                    self.check_int_lit_range_or_emit(i128::from(*value), *p, expr.span);
+                    ExprVal::scalar(Ty::Prim(*p), expr.span)
+                }
+                Literal::Int { suffix: None, .. } => ExprVal::scalar(Ty::IntLit, expr.span),
                 Literal::Float {
                     suffix: Some(p), ..
                 } => ExprVal::scalar(Ty::Prim(*p), expr.span),
@@ -105,6 +119,7 @@ impl<'a> BodyChecker<'a> {
 
             ExprKind::Cast { expr: inner, ty } => {
                 let iv = self.check_expr_infallible(inner);
+                self.validate_int_expr_at_type(inner, None);
                 let target_ty = self.sema.resolve_type(ty);
                 self.sema
                     .check_type_no_byval_mmio(&target_ty, ty.span, "cast target type");
@@ -166,6 +181,7 @@ impl<'a> BodyChecker<'a> {
             ExprKind::Index { target, index } => {
                 let (tv, mmio_arr) = self.check_expr_infallible_allow_mmio_array(target);
                 let iv = self.check_expr_infallible(index);
+                self.validate_int_expr_at_type(index, None);
                 if !iv.ty.is_integer() && !iv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -225,6 +241,7 @@ impl<'a> BodyChecker<'a> {
             ExprKind::Slice { target, start, end } => {
                 if let Some(s) = start {
                     let sv = self.check_expr_infallible(s);
+                    self.validate_int_expr_at_type(s, None);
                     if !sv.ty.is_integer() && !sv.ty.is_error() {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
@@ -235,6 +252,7 @@ impl<'a> BodyChecker<'a> {
                 }
                 if let Some(e) = end {
                     let ev = self.check_expr_infallible(e);
+                    self.validate_int_expr_at_type(e, None);
                     if !ev.ty.is_integer() && !ev.ty.is_error() {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
@@ -376,7 +394,7 @@ impl<'a> BodyChecker<'a> {
                                 )
                             },
                         ) {
-                            self.sema.check_f32_coercion_expr(&fi.value, &decl_field.ty);
+                            self.check_coerced_expr(&fi.value, &decl_field.ty);
                         }
                         if decl_field.ty.contains_reference(&self.sema.structs)
                             || decl_field.ty.contains_fn_ptr(&self.sema.structs)
@@ -455,6 +473,17 @@ impl<'a> BodyChecker<'a> {
                         Some(cur) if matches!(cur, Ty::FloatLit) && ev.ty.is_float() => {
                             elem_ty = Some(ev.ty);
                         }
+                        Some(cur) if cur.is_integer() && ev.ty.is_integer() => {
+                            if let Some(unified) = try_unify_integer(cur, &ev.ty) {
+                                elem_ty = Some(unified);
+                            } else {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    e.span,
+                                    format!("array element has type '{}', expected '{}'", ev.ty, cur),
+                                ));
+                            }
+                        }
                         Some(cur) => {
                             let _ = self.sema.check_assignable_or_emit(
                                 &ev.ty,
@@ -470,6 +499,16 @@ impl<'a> BodyChecker<'a> {
                 if final_elem == Ty::f32() {
                     for e in elems {
                         self.sema.check_f32_coercion_expr(e, &final_elem);
+                    }
+                } else if let Ty::Prim(ep) = final_elem {
+                    if ep.is_integer() {
+                        for e in elems {
+                            self.validate_int_expr_at_type(e, Some(Ty::host_prim(ep)));
+                        }
+                    }
+                } else if matches!(final_elem, Ty::IntLit) {
+                    for e in elems {
+                        self.validate_int_expr_at_type(e, None);
                     }
                 }
                 ExprVal {
@@ -529,7 +568,15 @@ impl<'a> BodyChecker<'a> {
                 self.merge_branch_vars(&base_vars, &[base_vars.clone(), fallback_vars], expr.span);
                 self.leases = base_leases.clone();
                 self.leases.join_branches(&[base_leases, fallback_leases]);
-                if !fv.ty.is_assignable_to(&iv.ty) && !iv.ty.is_assignable_to(&fv.ty) {
+                let int_unified = if iv.ty.is_integer() && fv.ty.is_integer() {
+                    try_unify_integer(&iv.ty, &fv.ty)
+                } else {
+                    None
+                };
+                if !fv.ty.is_assignable_to(&iv.ty)
+                    && !iv.ty.is_assignable_to(&fv.ty)
+                    && int_unified.is_none()
+                {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::InvalidOrFallback,
                         fallback.span,
@@ -539,15 +586,15 @@ impl<'a> BodyChecker<'a> {
                         ),
                     ));
                 }
-                let res_ty = if matches!(iv.ty, Ty::IntLit | Ty::FloatLit) {
+                let res_ty = if let Some(u) = int_unified {
+                    u
+                } else if matches!(iv.ty, Ty::IntLit | Ty::FloatLit) {
                     fv.ty.clone()
                 } else {
                     iv.ty.clone()
                 };
-                if res_ty == Ty::f32() {
-                    self.sema.check_f32_coercion_expr(inner, &res_ty);
-                    self.sema.check_f32_coercion_expr(fallback, &res_ty);
-                }
+                self.check_coerced_expr(inner, &res_ty);
+                self.check_coerced_expr(fallback, &res_ty);
                 let prov = if res_ty.contains_reference(&self.sema.structs) {
                     iv.prov.merge(&fv.prov)
                 } else {
@@ -979,10 +1026,47 @@ impl<'a> BodyChecker<'a> {
                         format!("bitwise '~' requires an integer, found '{}'", iv.ty),
                     ));
                 }
-                ExprVal::scalar(iv.ty, span)
+                let out_ty = match iv.ty {
+                    Ty::Prim(p) if p.is_integer() => Ty::Prim(Ty::host_prim(p)),
+                    other => other,
+                };
+                ExprVal::scalar(out_ty, span)
             }
 
             UnaryOp::Neg => {
+                if let ExprKind::Literal(Literal::Int { value, suffix }) = &inner.kind {
+                    let inner_ty = suffix.map(Ty::Prim).unwrap_or(Ty::IntLit);
+                    self.expr_tys
+                        .insert(inner as *const Expr as usize, inner_ty);
+                    return match suffix {
+                        Some(p) if p.is_signed() => {
+                            self.check_int_lit_range_or_emit(-i128::from(*value), *p, span);
+                            ExprVal::scalar(Ty::Prim(*p), span)
+                        }
+                        Some(p) => {
+                            self.check_int_lit_range_or_emit(i128::from(*value), *p, inner.span);
+                            ExprVal::scalar(Ty::Prim(Ty::host_prim(*p)), span)
+                        }
+                        None => {
+                            if *value > (i64::MAX as u64) + 1
+                                && self
+                                    .sema
+                                    .f32_overflow_reported_spans
+                                    .insert((span.start, span.end))
+                            {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    span,
+                                    format!(
+                                        "integer literal -{} out of range for any integer type",
+                                        value
+                                    ),
+                                ));
+                            }
+                            ExprVal::scalar(Ty::IntLit, span)
+                        }
+                    };
+                }
                 let iv = self.check_expr_infallible(inner);
                 if !iv.ty.is_numeric() && !iv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
@@ -992,7 +1076,8 @@ impl<'a> BodyChecker<'a> {
                     ));
                 }
                 let out_ty = match iv.ty {
-                    Ty::IntLit => Ty::Prim(PrimType::I32),
+                    Ty::IntLit => Ty::IntLit,
+                    Ty::Prim(p) if p.is_integer() => Ty::Prim(Ty::host_prim(p)),
                     other => other,
                 };
                 ExprVal::scalar(out_ty, span)
@@ -1054,10 +1139,31 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return ExprVal::error(span);
                 }
+                if lv.ty.is_integer() && rv.ty.is_integer() {
+                    if let Some(common) = try_unify_integer(&lv.ty, &rv.ty) {
+                        let dst = match common {
+                            Ty::Prim(p) => Some(p),
+                            _ => None,
+                        };
+                        self.validate_int_expr_at_type(lhs, dst);
+                        self.validate_int_expr_at_type(rhs, dst);
+                    } else {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "cannot compare incompatible types '{}' and '{}' with '{}' (use an explicit `as` cast)",
+                                lv.ty,
+                                rv.ty,
+                                op.as_str()
+                            ),
+                        ));
+                    }
+                    return ExprVal::scalar(Ty::bool(), span);
+                }
                 let unified_float = unify_float_arith(&lv.ty, &rv.ty);
                 let compat = lv.ty.is_assignable_to(&rv.ty)
                     || rv.ty.is_assignable_to(&lv.ty)
-                    || (lv.ty.is_integer() && rv.ty.is_integer())
                     || unified_float.is_some();
                 if !compat {
                     self.sema.emit(Diagnostic::new(
@@ -1078,10 +1184,30 @@ impl<'a> BodyChecker<'a> {
             }
 
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
+                if lv.ty.is_integer() && rv.ty.is_integer() {
+                    if let Some(common) = try_unify_integer(&lv.ty, &rv.ty) {
+                        let dst = match common {
+                            Ty::Prim(p) => Some(p),
+                            _ => None,
+                        };
+                        self.validate_int_expr_at_type(lhs, dst);
+                        self.validate_int_expr_at_type(rhs, dst);
+                    } else {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "comparison '{}' requires compatible integer operands, found '{}' and '{}' (use an explicit `as` cast)",
+                                op.as_str(),
+                                lv.ty,
+                                rv.ty
+                            ),
+                        ));
+                    }
+                    return ExprVal::scalar(Ty::bool(), span);
+                }
                 let unified_float = unify_float_arith(&lv.ty, &rv.ty);
-                let valid_cmp = (lv.ty.is_integer() && rv.ty.is_integer())
-                    || unified_float.is_some();
-                if !valid_cmp {
+                if unified_float.is_none() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
@@ -1101,8 +1227,21 @@ impl<'a> BodyChecker<'a> {
 
             BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem => {
                 if lv.ty.is_integer() && rv.ty.is_integer() {
-                    let res_ty = unify_integer_arith(&lv.ty, &rv.ty);
-                    ExprVal::scalar(res_ty, span)
+                    if let Some(res_ty) = try_unify_integer(&lv.ty, &rv.ty) {
+                        ExprVal::scalar(res_ty, span)
+                    } else {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "operator '{}' requires compatible integer operands, found '{}' and '{}' (use an explicit `as` cast)",
+                                op.as_str(),
+                                lv.ty,
+                                rv.ty
+                            ),
+                        ));
+                        ExprVal::error(span)
+                    }
                 } else if let Some(float_ty) = unify_float_arith(&lv.ty, &rv.ty) {
                     if float_ty == Ty::f32() {
                         self.sema.check_f32_coercion_expr(lhs, &Ty::f32());
@@ -1138,8 +1277,21 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return ExprVal::error(span);
                 }
-                let res_ty = unify_integer_arith(&lv.ty, &rv.ty);
-                ExprVal::scalar(res_ty, span)
+                if let Some(res_ty) = try_unify_integer(&lv.ty, &rv.ty) {
+                    ExprVal::scalar(res_ty, span)
+                } else {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "operator '{}' requires compatible integer operands, found '{}' and '{}' (use an explicit `as` cast)",
+                            op.as_str(),
+                            lv.ty,
+                            rv.ty
+                        ),
+                    ));
+                    ExprVal::error(span)
+                }
             }
 
             BinaryOp::Shl | BinaryOp::Shr => {
@@ -1156,9 +1308,11 @@ impl<'a> BodyChecker<'a> {
                     ));
                     return ExprVal::error(span);
                 }
-                self.check_const_shift_amount(op.as_str(), &lv.ty, rhs);
+                self.validate_int_expr_at_type(rhs, None);
                 // L-H1: Shift result takes the host integer type of the shifted left operand
                 // rather than promoting to a wider right-hand shift amount (`0x8000_0000u32 >> 4i32` -> `u32`).
+                // Constant shift range check runs in `validate_int_expr_at_type` so destination-widened shifts
+                // like `u32 bit = a << 8` (where `a: u8`) validate at `u32`.
                 let res_ty = match &lv.ty {
                     Ty::Prim(p) => Ty::Prim(Ty::host_prim(*p)),
                     Ty::IntLit => Ty::IntLit,
@@ -1178,7 +1332,12 @@ impl<'a> BodyChecker<'a> {
             return;
         };
         let max_bits = lhs_ty.fixed_int_bit_width().unwrap_or(64);
-        if sh < 0 || sh >= i128::from(max_bits) {
+        if (sh < 0 || sh >= i128::from(max_bits))
+            && self
+                .sema
+                .f32_overflow_reported_spans
+                .insert((rhs_expr.span.start, rhs_expr.span.end))
+        {
             let ty_desc = if matches!(lhs_ty, Ty::IntLit) {
                 "integer".to_string()
             } else {
@@ -1952,7 +2111,7 @@ impl<'a> BodyChecker<'a> {
                             DiagnosticKind::TypeMismatch,
                             || format!("argument {} has type '{}', expected '{}'", i + 1, av.ty, expected),
                         ) {
-                            self.sema.check_f32_coercion_expr(&arg.value, expected);
+                            self.check_coerced_expr(&arg.value, expected);
                         }
                     }
                 }
@@ -2043,7 +2202,7 @@ impl<'a> BodyChecker<'a> {
                         )
                     },
                 ) {
-                    self.sema.check_f32_coercion_expr(&arg.value, &param.ty);
+                    self.check_coerced_expr(&arg.value, &param.ty);
                 }
                 av.prov = self.coerce_array_to_slice_prov(
                     &arg.value,
@@ -2652,7 +2811,7 @@ impl<'a> BodyChecker<'a> {
                                     ),
                                 ));
                             } else {
-                                self.sema.check_f32_coercion_expr(&arg.value, expected);
+                                self.check_coerced_expr(&arg.value, expected);
                             }
                         }
                     }
@@ -2772,6 +2931,8 @@ impl<'a> BodyChecker<'a> {
                                 av.ty
                             ),
                         ));
+                    } else {
+                        self.validate_int_expr_at_type(&args[0].value, None);
                     }
                 }
                 ExprVal::scalar(Ty::void(), span)
@@ -2831,6 +2992,8 @@ impl<'a> BodyChecker<'a> {
                             args[0].span,
                             format!("'sys.tick_by' expects `u32` milliseconds, found '{}'", av.ty),
                         ));
+                    } else {
+                        self.check_coerced_expr(&args[0].value, &Ty::u32());
                     }
                 }
                 ExprVal::scalar(Ty::void(), span)
@@ -3063,6 +3226,8 @@ impl<'a> BodyChecker<'a> {
                                 av.ty
                             ),
                         ));
+                    } else if av.ty != Ty::IrqToken {
+                        self.check_coerced_expr(&args[0].value, &Ty::u32());
                     }
                 }
                 ExprVal::scalar(Ty::void(), span)
@@ -3092,6 +3257,8 @@ impl<'a> BodyChecker<'a> {
                                 s_val.ty
                             ),
                         ));
+                    } else {
+                        self.check_coerced_expr(&args[0].value, &Ty::u32());
                     }
                     let m_val = self.check_expr_infallible(&args[1].value);
                     if !m_val.ty.is_assignable_to(&Ty::u32()) && !m_val.ty.is_error() {
@@ -3103,6 +3270,8 @@ impl<'a> BodyChecker<'a> {
                                 m_val.ty
                             ),
                         ));
+                    } else {
+                        self.check_coerced_expr(&args[1].value, &Ty::u32());
                     }
                 }
                 ExprVal::scalar(Ty::void(), span)
@@ -3126,6 +3295,8 @@ impl<'a> BodyChecker<'a> {
                             args[0].span,
                             format!("'sys.exit' expects `i32` exit code, found '{}'", av.ty),
                         ));
+                    } else {
+                        self.check_coerced_expr(&args[0].value, &Ty::Prim(PrimType::I32));
                     }
                 }
                 ExprVal::scalar(Ty::void(), span)
@@ -3202,6 +3373,8 @@ impl<'a> BodyChecker<'a> {
                                 m, val_ty, num_val.ty
                             ),
                         ));
+                    } else {
+                        self.check_coerced_expr(&args[1].value, &val_ty);
                     }
                 }
                 ExprVal::scalar(Ty::void(), span)
@@ -3327,6 +3500,8 @@ impl<'a> BodyChecker<'a> {
                     method_name, addr_val.ty
                 ),
             ));
+        } else {
+            self.check_coerced_expr(&args[0].value, &Ty::usize());
         }
 
         if has_stack_bound {
@@ -3340,6 +3515,8 @@ impl<'a> BodyChecker<'a> {
                         method_name, bound_val.ty
                     ),
                 ));
+            } else {
+                self.check_coerced_expr(&args[1].value, &Ty::usize());
             }
             let const_bound = self
                 .eval_const_usize_expr(&args[1].value)
@@ -4102,7 +4279,7 @@ impl<'a> BodyChecker<'a> {
                 )
             },
         ) {
-            self.sema.check_f32_coercion_expr(arg_expr, elem);
+            self.check_coerced_expr(arg_expr, elem);
         }
     }
 
@@ -4390,7 +4567,7 @@ impl<'a> BodyChecker<'a> {
                         ..
                     }) = clause.body.stmts.last()
                     {
-                        self.sema.check_f32_coercion_expr(last_expr, &iv.ty);
+                        self.check_coerced_expr(last_expr, &iv.ty);
                     }
                     merged_prov = merged_prov.merge(&tv.prov);
                 } else {
@@ -4612,7 +4789,7 @@ impl<'a> BodyChecker<'a> {
                     ),
                 ));
             } else {
-                self.sema.check_f32_coercion_expr(value_expr, &target_ty);
+                self.check_coerced_expr(value_expr, &target_ty);
             }
         } else {
             self.check_compound_op_types(op, &target_ty, value_expr, &rhs.ty, stmt_span);
@@ -4956,7 +5133,7 @@ impl<'a> BodyChecker<'a> {
                         ),
                     ));
                 } else {
-                    self.sema.check_f32_coercion_expr(&a.value, &param.ty);
+                    self.check_coerced_expr(&a.value, &param.ty);
                 }
             }
             let spec = self.classify_irq_attach_arg(&a.value, &av);
@@ -5012,5 +5189,155 @@ impl<'a> BodyChecker<'a> {
             self.has_attached_irq = true;
         }
         ExprVal::scalar(Ty::void(), span)
+    }
+
+    pub(super) fn check_coerced_expr(&mut self, expr: &Expr, target_ty: &Ty) {
+        self.sema.check_f32_coercion_expr(expr, target_ty);
+        self.validate_int_coercion(expr, target_ty);
+    }
+
+    pub(super) fn validate_int_coercion(&mut self, expr: &Expr, target_ty: &Ty) {
+        match target_ty {
+            Ty::Prim(p) if p.is_integer() => {
+                self.validate_int_expr_at_type(expr, Some(Ty::host_prim(*p)));
+            }
+            Ty::Array { elem, .. } | Ty::Slice(elem) => {
+                if let ExprKind::ArrayLit(elems) = &expr.kind {
+                    for e in elems {
+                        self.validate_int_coercion(e, elem);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn validate_int_expr_at_type(&mut self, expr: &Expr, dest: Option<PrimType>) {
+        let nat_ty = self.expr_tys.get(&(expr as *const Expr as usize)).cloned();
+        let eff_prim = dest.map(Ty::host_prim).or_else(|| match &nat_ty {
+            Some(Ty::Prim(p)) if p.is_integer() => Some(Ty::host_prim(*p)),
+            _ => None,
+        });
+        match &expr.kind {
+            ExprKind::Literal(Literal::Int {
+                value,
+                suffix: None,
+            }) => {
+                if let Some(dp) = eff_prim {
+                    self.check_int_lit_range_or_emit(i128::from(*value), dp, expr.span);
+                }
+            }
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                expr: inner,
+            } => {
+                if let ExprKind::Literal(Literal::Int {
+                    value,
+                    suffix: None,
+                }) = &inner.kind
+                {
+                    if let Some(dp) = eff_prim {
+                        self.check_int_lit_range_or_emit(-i128::from(*value), dp, expr.span);
+                    }
+                } else if nat_ty
+                    .as_ref()
+                    .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit))
+                {
+                    self.validate_int_expr_at_type(inner, eff_prim);
+                }
+            }
+            ExprKind::Unary {
+                op: UnaryOp::BitNot,
+                expr: inner,
+            } => {
+                if nat_ty
+                    .as_ref()
+                    .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit))
+                {
+                    self.validate_int_expr_at_type(inner, eff_prim);
+                }
+            }
+            ExprKind::Binary {
+                op: op @ (BinaryOp::Shl | BinaryOp::Shr),
+                lhs,
+                rhs,
+            } => {
+                if nat_ty
+                    .as_ref()
+                    .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit))
+                {
+                    let check_ty = eff_prim
+                        .map(Ty::Prim)
+                        .or_else(|| nat_ty.clone())
+                        .unwrap_or(Ty::IntLit);
+                    self.check_const_shift_amount(op.as_str(), &check_ty, rhs);
+                    self.validate_int_expr_at_type(lhs, eff_prim);
+                }
+            }
+            ExprKind::Binary {
+                op:
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitXor,
+                lhs,
+                rhs,
+            } => {
+                if nat_ty
+                    .as_ref()
+                    .is_some_and(|t| t.is_integer() || matches!(t, Ty::IntLit))
+                {
+                    self.validate_int_expr_at_type(lhs, eff_prim);
+                    self.validate_int_expr_at_type(rhs, eff_prim);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn check_int_lit_range_or_emit(
+        &mut self,
+        val: i128,
+        prim: PrimType,
+        span: Span,
+    ) {
+        let Some((min_v, max_v)) = Ty::int_prim_range(prim) else {
+            return;
+        };
+        if (val < min_v || val > max_v)
+            && self
+                .sema
+                .f32_overflow_reported_spans
+                .insert((span.start, span.end))
+        {
+            let note = if matches!(prim, PrimType::Usize | PrimType::Isize) {
+                format!(
+                    "`{}` guarantees only the portable 16-bit safe literal range ({min_v}..={max_v}) across 16/32/64-bit targets; use a concrete width (e.g. `u32` / `i32`) and an explicit `as {}` cast when targeting wider platforms",
+                    prim.as_str(),
+                    prim.as_str()
+                )
+            } else {
+                format!(
+                    "valid range for `{}` is {min_v}..={max_v}",
+                    prim.as_str()
+                )
+            };
+            self.sema.emit(
+                Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!(
+                        "integer literal {} out of range for '{}'",
+                        val,
+                        prim.as_str()
+                    ),
+                )
+                .with_note(note),
+            );
+        }
     }
 }

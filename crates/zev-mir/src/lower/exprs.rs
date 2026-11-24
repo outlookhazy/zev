@@ -793,6 +793,13 @@ pub(super) fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirEx
         return expr;
     }
     let host_target = target_ty.host_value_type();
+    if is_scalar_int_mir_type(&expr.ty)
+        && is_scalar_int_mir_type(&host_target)
+        && can_widen_mir_int(&expr.ty.host_value_type(), &host_target)
+        && expr.ty.host_value_type() != host_target
+    {
+        return widen_arith_mir_expr(expr, &host_target);
+    }
     if let (MirType::Result { ok, .. }, MirExprKind::Var(vid)) = (&expr.ty, &expr.kind) {
         if **ok == *target_ty || ok.host_value_type() == host_target {
             return MirExpr::new(MirExprKind::ResultVal(*vid), ok.as_ref().clone());
@@ -901,26 +908,36 @@ pub(super) fn lower_leaf_expr(
 ) -> Result<MirExpr, MirLowerError> {
     match &expr.kind {
         ExprKind::Literal(lit) => match lit {
-            Literal::Int(v) => {
-                let ty = expected
-                    .map(|t| t.host_value_type())
-                    .filter(|t| {
-                        matches!(
-                            t,
-                            MirType::U8
-                                | MirType::U16
-                                | MirType::U32
-                                | MirType::U64
-                                | MirType::Usize
-                                | MirType::I8
-                                | MirType::I16
-                                | MirType::I32
-                                | MirType::I64
-                                | MirType::Isize
-                        )
-                    })
-                    .unwrap_or(MirType::U32);
-                Ok(MirExpr::new(MirExprKind::IntLit(*v as i128), ty))
+            Literal::Int { value, suffix } => {
+                let ty = if let Some(p) = suffix {
+                    convert_prim_type(*p).host_value_type()
+                } else {
+                    expected
+                        .map(|t| t.host_value_type())
+                        .filter(|t| {
+                            matches!(
+                                t,
+                                MirType::U8
+                                    | MirType::U16
+                                    | MirType::U32
+                                    | MirType::U64
+                                    | MirType::Usize
+                                    | MirType::I8
+                                    | MirType::I16
+                                    | MirType::I32
+                                    | MirType::I64
+                                    | MirType::Isize
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            if *value > u32::MAX as u64 {
+                                MirType::U64
+                            } else {
+                                MirType::U32
+                            }
+                        })
+                };
+                Ok(MirExpr::new(MirExprKind::IntLit(*value as i128), ty))
             }
             Literal::Float { bits, suffix } => {
                 let ty = match suffix {
@@ -1070,6 +1087,26 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             ))
         }
         ExprKind::Unary { op, expr: inner } => {
+            if *op == UnaryOp::Neg {
+                if let ExprKind::Literal(Literal::Int {
+                    value,
+                    suffix: None,
+                }) = &inner.kind
+                {
+                    let neg_val = -i128::from(*value);
+                    let ty = expected
+                        .map(|t| t.host_value_type())
+                        .filter(is_scalar_int_mir_type)
+                        .unwrap_or_else(|| {
+                            if neg_val >= i32::MIN as i128 {
+                                MirType::I32
+                            } else {
+                                MirType::I64
+                            }
+                        });
+                    return Ok(MirExpr::new(MirExprKind::IntLit(neg_val), ty));
+                }
+            }
             let sub = be.lower_sub(inner, expected)?;
             finish_unary(*op, sub)
         }
@@ -1697,19 +1734,16 @@ pub(super) fn finish_unary(op: UnaryOp, sub: MirExpr) -> Result<MirExpr, MirLowe
                     fty,
                 ));
             }
-            let signed_ty = match sub.ty.host_value_type() {
-                MirType::U64 => MirType::I64,
-                MirType::Usize => MirType::Isize,
-                MirType::U8 | MirType::U16 | MirType::U32 => MirType::I32,
-                other => other,
-            };
-            let coerced_sub = coerce_or_cast_int(sub, &signed_ty);
+            let ty = sub.ty.host_value_type();
+            if let MirExprKind::IntLit(v) = sub.kind {
+                return Ok(MirExpr::new(MirExprKind::IntLit(-v), ty));
+            }
             Ok(MirExpr::new(
                 MirExprKind::Unary {
                     op: MirUnaryOp::Neg,
-                    expr: Box::new(coerced_sub),
+                    expr: Box::new(sub),
                 },
-                signed_ty,
+                ty,
             ))
         }
         UnaryOp::AddrOf => unreachable!(),
@@ -1718,14 +1752,15 @@ pub(super) fn finish_unary(op: UnaryOp, sub: MirExpr) -> Result<MirExpr, MirLowe
 
 pub(super) fn ast_is_untyped_int_lit(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::Literal(Literal::Int(_))
+        ExprKind::Literal(Literal::Int { suffix: None, .. })
         | ExprKind::Literal(Literal::Float { suffix: None, .. }) => true,
         ExprKind::Unary {
             op: UnaryOp::Neg,
             expr: inner,
         } => matches!(
             inner.kind,
-            ExprKind::Literal(Literal::Int(_)) | ExprKind::Literal(Literal::Float { suffix: None, .. })
+            ExprKind::Literal(Literal::Int { suffix: None, .. })
+                | ExprKind::Literal(Literal::Float { suffix: None, .. })
         ),
         _ => false,
     }
@@ -1744,13 +1779,6 @@ pub(super) fn is_scalar_int_mir_type(ty: &MirType) -> bool {
             | MirType::I32
             | MirType::I64
             | MirType::Isize
-    )
-}
-
-pub(super) fn is_signed_int_mir_type(ty: &MirType) -> bool {
-    matches!(
-        ty.host_value_type(),
-        MirType::I8 | MirType::I16 | MirType::I32 | MirType::I64 | MirType::Isize
     )
 }
 
@@ -1774,6 +1802,108 @@ pub(super) fn coerce_or_cast_int(expr: MirExpr, target_ty: &MirType) -> MirExpr 
     )
 }
 
+pub(super) fn can_widen_mir_int(src: &MirType, dst: &MirType) -> bool {
+    use MirType::*;
+    match (src.host_value_type(), dst.host_value_type()) {
+        (U8, U8 | U16 | U32 | U64 | Usize | I16 | I32 | I64 | Isize) => true,
+        (U16, U16 | U32 | U64 | Usize | I32 | I64) => true,
+        (U32, U32 | U64 | I64) => true,
+        (U64, U64) => true,
+        (Usize, Usize | U64) => true,
+        (I8, I8 | I16 | I32 | I64 | Isize) => true,
+        (I16, I16 | I32 | I64 | Isize) => true,
+        (I32, I32 | I64) => true,
+        (I64, I64) => true,
+        (Isize, Isize | I64) => true,
+        _ => false,
+    }
+}
+
+pub(super) fn unify_mir_int_types(lhs: &MirType, rhs: &MirType) -> MirType {
+    if can_widen_mir_int(lhs, rhs) {
+        rhs.host_value_type()
+    } else if can_widen_mir_int(rhs, lhs) {
+        lhs.host_value_type()
+    } else {
+        lhs.host_value_type()
+    }
+}
+
+pub(super) fn widen_arith_mir_expr(expr: MirExpr, target_ty: &MirType) -> MirExpr {
+    let target = target_ty.host_value_type();
+    let cur_host = expr.ty.host_value_type();
+    if !is_scalar_int_mir_type(&target)
+        || !is_scalar_int_mir_type(&expr.ty)
+        || cur_host == target
+        || !can_widen_mir_int(&cur_host, &target)
+    {
+        return expr;
+    }
+    let orig_ty = expr.ty;
+    match expr.kind {
+        MirExprKind::IntLit(v) => MirExpr::new(MirExprKind::IntLit(v), target),
+        MirExprKind::Unary {
+            op: op @ (MirUnaryOp::Neg | MirUnaryOp::BitNot),
+            expr: inner,
+        } => {
+            let widened_inner = widen_arith_mir_expr(*inner, &target);
+            MirExpr::new(
+                MirExprKind::Unary {
+                    op,
+                    expr: Box::new(widened_inner),
+                },
+                target,
+            )
+        }
+        MirExprKind::Binary {
+            op:
+                op @ (MirBinOp::Add
+                | MirBinOp::Sub
+                | MirBinOp::Mul
+                | MirBinOp::Div
+                | MirBinOp::Rem
+                | MirBinOp::BitAnd
+                | MirBinOp::BitOr
+                | MirBinOp::BitXor),
+            lhs,
+            rhs,
+        } => {
+            let wl = widen_arith_mir_expr(*lhs, &target);
+            let wr = widen_arith_mir_expr(*rhs, &target);
+            MirExpr::new(
+                MirExprKind::Binary {
+                    op,
+                    lhs: Box::new(wl),
+                    rhs: Box::new(wr),
+                },
+                target,
+            )
+        }
+        MirExprKind::Binary {
+            op: op @ (MirBinOp::Shl | MirBinOp::Shr),
+            lhs,
+            rhs,
+        } => {
+            let wl = widen_arith_mir_expr(*lhs, &target);
+            MirExpr::new(
+                MirExprKind::Binary {
+                    op,
+                    lhs: Box::new(wl),
+                    rhs,
+                },
+                target,
+            )
+        }
+        other_kind => MirExpr::new(
+            MirExprKind::Cast {
+                expr: Box::new(MirExpr::new(other_kind, orig_ty)),
+                target_ty: target.clone(),
+            },
+            target,
+        ),
+    }
+}
+
 pub(super) fn finish_binary(op: BinaryOp, mut lhs: MirExpr, mut rhs: MirExpr) -> MirExpr {
     let is_shift = matches!(op, BinaryOp::Shl | BinaryOp::Shr);
     // Unify float literal precision if one side is `f32` and the other is a `FloatLit`
@@ -1781,20 +1911,10 @@ pub(super) fn finish_binary(op: BinaryOp, mut lhs: MirExpr, mut rhs: MirExpr) ->
         rhs = coerce_expr_if_needed(rhs, &MirType::F32);
     } else if rhs.ty == MirType::F32 && matches!(lhs.kind, MirExprKind::FloatLit(_)) {
         lhs = coerce_expr_if_needed(lhs, &MirType::F32);
-    } else if !is_shift
-        && is_signed_int_mir_type(&rhs.ty)
-        && lhs.ty.is_unsigned()
-        && is_scalar_int_mir_type(&lhs.ty)
-    {
-        let target = rhs.ty.host_value_type();
-        lhs = coerce_or_cast_int(lhs, &target);
-    } else if !is_shift
-        && is_signed_int_mir_type(&lhs.ty)
-        && rhs.ty.is_unsigned()
-        && is_scalar_int_mir_type(&rhs.ty)
-    {
-        let target = lhs.ty.host_value_type();
-        rhs = coerce_or_cast_int(rhs, &target);
+    } else if !is_shift && is_scalar_int_mir_type(&lhs.ty) && is_scalar_int_mir_type(&rhs.ty) {
+        let common = unify_mir_int_types(&lhs.ty, &rhs.ty);
+        lhs = widen_arith_mir_expr(lhs, &common);
+        rhs = widen_arith_mir_expr(rhs, &common);
     }
 
     let mop = convert_bin_op(op);
@@ -1809,7 +1929,11 @@ pub(super) fn finish_binary(op: BinaryOp, mut lhs: MirExpr, mut rhs: MirExpr) ->
         | MirBinOp::LogicalOr => MirType::Bool,
         _ => lhs.ty.host_value_type(),
     };
-    let rhs_coerced = coerce_expr_if_needed(rhs, &lhs.ty.host_value_type());
+    let rhs_coerced = if is_shift {
+        rhs
+    } else {
+        coerce_expr_if_needed(rhs, &lhs.ty.host_value_type())
+    };
     MirExpr::new(
         MirExprKind::Binary {
             op: mop,

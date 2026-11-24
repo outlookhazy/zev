@@ -40,7 +40,13 @@ mod tests {
     }
 
     fn expr_int(v: u64) -> Expr {
-        Expr::new(ExprKind::Literal(Literal::Int(v)), Span::dummy())
+        Expr::new(
+            ExprKind::Literal(Literal::Int {
+                value: v,
+                suffix: None,
+            }),
+            Span::dummy(),
+        )
     }
 
     fn expr_id(name: &str) -> Expr {

@@ -820,11 +820,11 @@ mod tests {
                 u32 a = telemetry_ch.recv();
                 u32 b = telemetry_ch.recv();
                 u32 c = telemetry_ch.recv();
-                sys.log_kv("chan_sum=", a + b + c);
+                sys.log_kv("chan_sum=", (a + b + c) as i32);
 
                 sys.pend_irq(1);
                 fault_sig.wait();
-                sys.log_kv("sig_boosted_prio=", sys.current_prio());
+                sys.log_kv("sig_boosted_prio=", sys.current_prio() as i32);
                 sys.exit(0);
             }
         "#;
@@ -6729,7 +6729,7 @@ task runner() {
 
     // Thumb-1 `adds r0, r0, r1` (0x1840) ; `bx lr` (0x4770) written into SRAM 0x2000_7F00
     STUB.code = 0x4770_1840u32;
-    u32 rom_sum = sys.rom_call_u32(0x2000_7F01usize, 128, 100u32, 23u32);
+    u32 rom_sum = sys.rom_call_u32(0x2000_7F01u32 as usize, 128, 100u32, 23u32);
     assert(rom_sum == 123u32);
 
     println(f"SYS_HOOKS_OK now={now} idle={STUB.idle_hits} rom={rom_sum}");
@@ -7574,5 +7574,58 @@ fn main() {
 
         let (_mir, _ll, qres) = run_zev_cortex_m_qemu("masked_variable_bit_shifts", src);
         assert!(qres.exec.stdout.contains("SHIFT_MASK_OK"), "unexpected qemu output: {}", qres.exec.stdout);
+    }
+
+    #[test]
+    fn destination_typed_arithmetic_and_integer_table_in_qemu() {
+        let src = r#"
+u16 calc_sum(u8 x, u8 y) {
+    return x + y;
+}
+
+task verifier() {
+    u8 a = 200;
+    u8 b = 100;
+    u16 sec = 100;
+    u32 reg32 = 0x1234_56FFu32;
+    u8 mask8 = 0x0Fu8;
+
+    u16 w = a + b;
+    u32 ms = sec * 1000;
+    u32 bit = a << 8;
+    u32 masked = reg32 & ~mask8;
+    u8 s = a + b;
+    u16 narrow_cast = (a + b) as u16;
+    i16 neg_u8 = -a;
+    u16 comp_w = 0;
+    comp_w += a + b;
+
+    if (w == 300u16
+        && calc_sum(a, b) == 300u16
+        && ms == 100_000u32
+        && bit == 51_200u32
+        && masked == 0x1234_56F0u32
+        && s == 44u8
+        && narrow_cast == 44u16
+        && neg_u8 == -200i16
+        && comp_w == 300u16
+        && (a + b) == 300u16
+        && (a << 8) == 51_200u32)
+    {
+        println("INT_SEMANTICS_OK");
+    }
+    sys.exit(0);
+}
+
+fn main() {
+    spawn verifier() @normal;
+}
+"#;
+        let (_mir, _ll, qres) = run_zev_cortex_m_qemu("destination_typed_arithmetic", src);
+        assert!(
+            qres.exec.stdout.contains("INT_SEMANTICS_OK"),
+            "unexpected qemu output: {}",
+            qres.exec.stdout
+        );
     }
 }

@@ -571,7 +571,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let sv = self.emit_expr(sub)?;
                 match op {
                     MirUnaryOp::Neg => {
-                        let sc = self.coerce(sv, &dst_lty, true);
+                        let sc = self.coerce(sv, &dst_lty, !sub.ty.is_unsigned());
                         let t = self.next_tmp();
                         if dst_lty == "float" || dst_lty == "double" {
                             self.emit_line(format!("{t} = fneg {dst_lty} {}", sc.repr));
@@ -589,7 +589,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         Ok(SsaVal::new("i8", b8))
                     }
                     MirUnaryOp::BitNot => {
-                        let sc = self.coerce(sv, &dst_lty, false);
+                        let sc = self.coerce(sv, &dst_lty, !sub.ty.is_unsigned());
                         let t = self.next_tmp();
                         self.emit_line(format!("{t} = xor {dst_lty} {}, -1", sc.repr));
                         Ok(SsaVal::new(dst_lty, t))

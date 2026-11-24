@@ -295,7 +295,8 @@ impl<'a> BodyChecker<'a> {
                 FormatPart::Hole { expr, spec, .. } => {
                     let Some(ty) = self.structural_expr_ty(expr).or_else(|| match &expr.kind {
                         ExprKind::Literal(Literal::String(_)) => Some(Ty::Str),
-                        ExprKind::Literal(Literal::Int(_)) => Some(Ty::IntLit),
+                        ExprKind::Literal(Literal::Int { suffix: Some(p), .. }) => Some(Ty::Prim(*p)),
+                        ExprKind::Literal(Literal::Int { suffix: None, .. }) => Some(Ty::IntLit),
                         ExprKind::Literal(Literal::Float { .. }) => Some(Ty::FloatLit),
                         ExprKind::Literal(Literal::Bool(_)) => Some(Ty::bool()),
                         _ => None,
@@ -327,7 +328,7 @@ impl<'a> BodyChecker<'a> {
                     width.unwrap_or(1).max(1) as usize
                 }
                 _ => match &expr.kind {
-                    ExprKind::Literal(Literal::Int(n)) => {
+                    ExprKind::Literal(Literal::Int { value: n, .. }) => {
                         if *n == 0 {
                             1
                         } else {
@@ -338,7 +339,7 @@ impl<'a> BodyChecker<'a> {
                         op: UnaryOp::Neg,
                         expr: inner,
                     } => {
-                        if let ExprKind::Literal(Literal::Int(n)) = &inner.kind {
+                        if let ExprKind::Literal(Literal::Int { value: n, .. }) = &inner.kind {
                             let d = if *n == 0 { 1 } else { n.ilog10() as usize + 1 };
                             d + 1
                         } else {
@@ -560,6 +561,7 @@ impl<'a> BodyChecker<'a> {
                     span: hole_span,
                 } => {
                     let hv = self.check_expr_infallible(expr);
+                    self.validate_int_expr_at_type(expr, None);
                     if let Some(dst_prov) = alias_dst {
                         if !hv.ty.is_error()
                             && (hv.ty.contains_reference(&self.sema.structs)
@@ -653,7 +655,15 @@ impl<'a> BodyChecker<'a> {
             let int_prim = match ty {
                 Ty::Prim(p) => *p,
                 Ty::IntLit => match &expr.kind {
-                    ExprKind::Literal(Literal::Int(v)) if *v > i32::MAX as u64 => PrimType::U64,
+                    ExprKind::Literal(Literal::Int { value, .. }) if *value > i32::MAX as u64 => {
+                        PrimType::U64
+                    }
+                    ExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        expr: inner,
+                    } if matches!(&inner.kind, ExprKind::Literal(Literal::Int { value, .. }) if *value > (i32::MAX as u64) + 1) => {
+                        PrimType::I64
+                    }
                     _ => PrimType::I32,
                 },
                 _ => PrimType::I32,

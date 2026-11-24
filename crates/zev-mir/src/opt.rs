@@ -5165,7 +5165,15 @@ mod tests {
             )
         };
         let ty_ptr_watch = |p| TypeExpr::new(TypeKind::Ptr(Box::new(ty_watch(p))), sp);
-        let expr_int = |v| Expr::new(ExprKind::Literal(Literal::Int(v)), sp);
+        let expr_int = |v| {
+            Expr::new(
+                ExprKind::Literal(Literal::Int {
+                    value: v,
+                    suffix: None,
+                }),
+                sp,
+            )
+        };
         let expr_id = |n: &str| Expr::new(ExprKind::Ident(Ident::dummy(n)), sp);
         let expr_addr = |n: &str| {
             Expr::new(

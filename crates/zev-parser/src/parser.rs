@@ -1201,7 +1201,7 @@ impl<'a> Parser<'a> {
                 self.expect(&TokenKind::LParen)?;
                 let tok = self.peek_token();
                 let core_id = match tok.kind {
-                    TokenKind::Int(n) => {
+                    TokenKind::Int { value: n, .. } => {
                         self.bump();
                         u32::try_from(n).map_err(|_| {
                             self.err_at("core index out of `u32` range", tok.span)
@@ -1229,7 +1229,7 @@ impl<'a> Parser<'a> {
                     let arg_tok = self.bump();
                     let s = match arg_tok.kind {
                         TokenKind::Ident(s) | TokenKind::String(s) => s,
-                        TokenKind::Int(n) => n.to_string(),
+                        TokenKind::Int { value: n, .. } => n.to_string(),
                         other => {
                             return Err(self
                                 .err_at(format!("unexpected attribute argument {other}"), arg_tok.span)
@@ -1618,7 +1618,7 @@ impl<'a> Parser<'a> {
                 let neg = self.eat(&TokenKind::Minus);
                 let tok = self.peek_token();
                 match tok.kind {
-                    TokenKind::Int(n) => {
+                    TokenKind::Int { value: n, .. } => {
                         self.bump();
                         v_end = tok.span;
                         let val = i64::try_from(n).map_err(|_| {
@@ -3002,8 +3002,13 @@ impl<'a> Parser<'a> {
 
     /// Parse a concrete `[16]` (`ArrayLen::Fixed(16)`) or symbolic/const `[N]` (`ArrayLen::Expr(...)`) array bound.
     fn parse_array_len(&mut self) -> Result<ArrayLen, ParseError> {
-        if matches!(self.peek_kind(), TokenKind::Int(_))
-            && self.peek_n_kind(1) == TokenKind::RBracket
+        if matches!(
+            self.peek_kind(),
+            TokenKind::Int {
+                suffix: None | Some(PrimType::Usize),
+                ..
+            }
+        ) && self.peek_n_kind(1) == TokenKind::RBracket
         {
             let n = self.parse_usize_literal("array length")?;
             Ok(ArrayLen::Fixed(n))
@@ -3019,7 +3024,7 @@ impl<'a> Parser<'a> {
     fn parse_usize_literal(&mut self, context: &str) -> Result<usize, ParseError> {
         let tok = self.peek_token();
         match tok.kind {
-            TokenKind::Int(n) => {
+            TokenKind::Int { value: n, .. } => {
                 self.bump();
                 usize::try_from(n).map_err(|_| {
                     self.err_at(format!("{context} out of `usize` range"), tok.span)
@@ -3330,7 +3335,13 @@ impl<'a> Parser<'a> {
                         StmtKind::Assign {
                             target,
                             op: AssignOp::AddAssign,
-                            value: Expr::new(ExprKind::Literal(Literal::Int(1)), plus_span),
+                            value: Expr::new(
+                                ExprKind::Literal(Literal::Int {
+                                    value: 1,
+                                    suffix: None,
+                                }),
+                                plus_span,
+                            ),
                         },
                         start.merge(semi.span),
                     ));
@@ -3344,7 +3355,13 @@ impl<'a> Parser<'a> {
                         StmtKind::Assign {
                             target,
                             op: AssignOp::SubAssign,
-                            value: Expr::new(ExprKind::Literal(Literal::Int(1)), minus_span),
+                            value: Expr::new(
+                                ExprKind::Literal(Literal::Int {
+                                    value: 1,
+                                    suffix: None,
+                                }),
+                                minus_span,
+                            ),
                         },
                         start.merge(semi.span),
                     ));
@@ -3359,7 +3376,13 @@ impl<'a> Parser<'a> {
                         StmtKind::Assign {
                             target: expr,
                             op: AssignOp::AddAssign,
-                            value: Expr::new(ExprKind::Literal(Literal::Int(1)), plus_span),
+                            value: Expr::new(
+                                ExprKind::Literal(Literal::Int {
+                                    value: 1,
+                                    suffix: None,
+                                }),
+                                plus_span,
+                            ),
                         },
                         start.merge(semi.span),
                     ))
@@ -3371,7 +3394,13 @@ impl<'a> Parser<'a> {
                         StmtKind::Assign {
                             target: expr,
                             op: AssignOp::SubAssign,
-                            value: Expr::new(ExprKind::Literal(Literal::Int(1)), minus_span),
+                            value: Expr::new(
+                                ExprKind::Literal(Literal::Int {
+                                    value: 1,
+                                    suffix: None,
+                                }),
+                                minus_span,
+                            ),
                         },
                         start.merge(semi.span),
                     ))
@@ -3933,9 +3962,12 @@ impl<'a> Parser<'a> {
                     Ok(SwitchPat::Qualified { path, span })
                 }
             }
-            TokenKind::Int(n) => {
+            TokenKind::Int { value, suffix } => {
                 self.bump();
-                Ok(SwitchPat::Literal(Literal::Int(n), tok.span))
+                Ok(SwitchPat::Literal(
+                    Literal::Int { value, suffix },
+                    tok.span,
+                ))
             }
             TokenKind::KwTrue => {
                 self.bump();
@@ -4373,7 +4405,7 @@ impl<'a> Parser<'a> {
         matches!(
             self.peek_kind(),
             TokenKind::Ident(_)
-                | TokenKind::Int(_)
+                | TokenKind::Int { .. }
                 | TokenKind::FloatLit { .. }
                 | TokenKind::Duration(_, _)
                 | TokenKind::String(_)
@@ -4759,9 +4791,12 @@ impl<'a> Parser<'a> {
     fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek_token();
         match tok.kind {
-            TokenKind::Int(n) => {
+            TokenKind::Int { value, suffix } => {
                 self.bump();
-                Ok(Expr::new(ExprKind::Literal(Literal::Int(n)), tok.span))
+                Ok(Expr::new(
+                    ExprKind::Literal(Literal::Int { value, suffix }),
+                    tok.span,
+                ))
             }
             TokenKind::FloatLit { bits, suffix } => {
                 self.bump();
@@ -4912,7 +4947,7 @@ impl<'a> Parser<'a> {
             TokenKind::Dot
                 if matches!(
                     self.peek_n_kind(1),
-                    TokenKind::Int(_) | TokenKind::FloatLit { .. }
+                    TokenKind::Int { .. } | TokenKind::FloatLit { .. }
                 ) =>
             {
                 let dot_tok = self.bump();

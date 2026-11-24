@@ -2170,6 +2170,46 @@ fn main() {
     }
 
     #[test]
+    fn host_sanitize_verifies_destination_typed_integer_semantics_table() {
+        let src = "\
+fn main() {
+    u8 a = 200;
+    u8 b = 100;
+    u16 sec = 100;
+    u32 reg32 = 0x1234_56FFu32;
+    u8 mask8 = 0x0Fu8;
+
+    u16 w = a + b;
+    u32 ms = sec * 1000;
+    u32 bit = a << 8;
+    u32 masked = reg32 & ~mask8;
+    u8 s = a + b;
+    u16 w_cast = (a + b) as u16;
+    i16 neg_u8 = -a;
+
+    assert(w == 300u16);
+    assert(ms == 100_000u32);
+    assert(bit == 51_200u32);
+    assert(masked == 0x1234_56F0u32);
+    assert(s == 44u8);
+    assert(w_cast == 44u16);
+    assert(neg_u8 == -200i16);
+    assert((a + b) == 300u16);
+    sys.exit(0);
+}
+";
+        let temp = TempWorkDir::create("zevc-int-sem").unwrap();
+        let src_path = temp.dir.join("int_sem.zev");
+        std::fs::write(&src_path, src).unwrap();
+
+        let (_, mir) = compile_to_mir(&[src_path]).expect("int_sem.zev must compile");
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &host_opts).unwrap();
+        let host_exit = runner::compile_and_run_host_llvm(&host_ll, true, &[]).unwrap();
+        assert_eq!(host_exit, 0);
+    }
+
+    #[test]
     fn arduino_uno_example_checks_and_avr_target_resolves() {
         for alias in ["avr", "atmega328p", "uno", "arduino-uno"] {
             let opts = resolve_llvm_options(Some(alias))

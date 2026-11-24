@@ -351,5 +351,6 @@ pub(super) struct BodyChecker<'a> {
     /// When inside a `defer` statement, records the lexical scope depth owning that `defer`.
     pub(super) active_defer_owner_depth: Option<u32>,
     pub(super) next_lease_var_id: u64,
+    pub(super) expr_tys: std::collections::HashMap<usize, Ty>,
 }
 

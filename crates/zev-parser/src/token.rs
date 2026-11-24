@@ -32,7 +32,10 @@ pub enum LexedFormatPart {
 pub enum TokenKind {
     // ── Identifiers & Literals ──
     Ident(String),
-    Int(u64),
+    Int {
+        value: u64,
+        suffix: Option<PrimType>,
+    },
     FloatLit {
         bits: u64,
         suffix: Option<PrimType>,
@@ -257,7 +260,14 @@ impl fmt::Display for TokenKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Ident(s) => write!(f, "identifier `{s}`"),
-            Self::Int(n) => write!(f, "integer `{n}`"),
+            Self::Int {
+                value,
+                suffix: Some(s),
+            } => write!(f, "integer `{value}{}`", s.as_str()),
+            Self::Int {
+                value,
+                suffix: None,
+            } => write!(f, "integer `{value}`"),
             Self::FloatLit { bits, suffix } => {
                 let val = f64::from_bits(*bits);
                 match suffix {

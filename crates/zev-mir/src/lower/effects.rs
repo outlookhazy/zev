@@ -20,31 +20,36 @@ pub(super) fn discover_systick_config(
                 if let ExprKind::Ident(id) = &receiver.kind {
                     if id.name == SYS_NAMESPACE {
                         match SysMethod::from_name(&method.name) {
-                            Some(SysMethod::UseSystick) => {
-                                if let Some(first) = args.first() {
-                                    if let ExprKind::Literal(Literal::Int(hz)) = &first.value.kind {
-                                        syms.systick_hz = Some(*hz);
+                                Some(SysMethod::UseSystick) => {
+                                    if let Some(first) = args.first() {
+                                        if let ExprKind::Literal(Literal::Int { value: hz, .. }) =
+                                            &first.value.kind
+                                        {
+                                            syms.systick_hz = Some(*hz);
+                                        }
                                     }
-                                }
-                                if let Some(second) = args.get(1) {
-                                    if let ExprKind::Literal(Literal::Duration(d)) = &second.value.kind
-                                    {
-                                        let us = d.as_micros();
-                                        if us > 0 {
-                                            syms.tick_period_us = us;
+                                    if let Some(second) = args.get(1) {
+                                        if let ExprKind::Literal(Literal::Duration(d)) =
+                                            &second.value.kind
+                                        {
+                                            let us = d.as_micros();
+                                            if us > 0 {
+                                                syms.tick_period_us = us;
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Some(SysMethod::SetTickUs) => {
-                                if let Some(first) = args.first() {
-                                    if let ExprKind::Literal(Literal::Int(us)) = &first.value.kind {
-                                        if *us > 0 {
-                                            syms.tick_period_us = *us;
+                                Some(SysMethod::SetTickUs) => {
+                                    if let Some(first) = args.first() {
+                                        if let ExprKind::Literal(Literal::Int { value: us, .. }) =
+                                            &first.value.kind
+                                        {
+                                            if *us > 0 {
+                                                syms.tick_period_us = *us;
+                                            }
                                         }
                                     }
                                 }
-                            }
                             Some(SysMethod::SetTick | SysMethod::SetTickPeriod) => {
                                 if let Some(first) = args.first() {
                                     if let ExprKind::Literal(Literal::Duration(d)) = &first.value.kind

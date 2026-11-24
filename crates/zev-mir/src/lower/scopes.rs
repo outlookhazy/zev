@@ -272,7 +272,7 @@ pub(super) fn lower_rom_call_args_be<B: LowerBackend>(
 
 pub(super) fn eval_const_expr(expr: &Expr, syms: &ModuleSymbols) -> Option<ConstVal> {
     match &expr.kind {
-        ExprKind::Literal(Literal::Int(v)) => Some(ConstVal::Int(*v as i128)),
+        ExprKind::Literal(Literal::Int { value, .. }) => Some(ConstVal::Int(*value as i128)),
         ExprKind::Literal(Literal::Bool(b)) => Some(ConstVal::Bool(*b)),
         ExprKind::Ident(id) => {
             if let Some(&cv) = syms.const_vals.get(&id.name) {
@@ -344,7 +344,7 @@ pub(super) fn convert_switch_pat(
     match pat {
         SwitchPat::Wildcard(_) | SwitchPat::Qualified { .. } => None,
         SwitchPat::Literal(lit, _) => match lit {
-            Literal::Int(v) => Some(MirSwitchPattern::Int(*v as i128)),
+            Literal::Int { value, .. } => Some(MirSwitchPattern::Int(*value as i128)),
             Literal::Bool(b) => Some(MirSwitchPattern::Bool(*b)),
             _ => None,
         },

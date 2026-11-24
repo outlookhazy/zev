@@ -39,6 +39,7 @@ impl<'a> BodyChecker<'a> {
             loop_lease_frames: Vec::new(),
             active_defer_owner_depth: None,
             next_lease_var_id: 0,
+            expr_tys: std::collections::HashMap::new(),
         }
     }
 
@@ -737,7 +738,7 @@ impl<'a> BodyChecker<'a> {
                             )
                         },
                     ) {
-                        self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
+                        self.check_coerced_expr(init_expr, &resolved_ty);
                     }
                     if resolved_ty.is_linear_lease() {
                         if val.ty.is_error() {
@@ -905,7 +906,7 @@ impl<'a> BodyChecker<'a> {
                                 ),
                             ));
                         } else {
-                            self.sema.check_f32_coercion_expr(init_expr, &resolved_ty);
+                            self.check_coerced_expr(init_expr, &resolved_ty);
                         }
                         let shadowed = self.active_local_names();
                         if !self.sema.is_compile_time_const_expr_with_shadowed(
@@ -1040,7 +1041,7 @@ impl<'a> BodyChecker<'a> {
                                         )
                                     },
                                 ) {
-                                    self.sema.check_f32_coercion_expr(e, ret_ty);
+                                    self.check_coerced_expr(e, ret_ty);
                                 }
                                 if ret_ty.contains_reference(&self.sema.structs) {
                                     let ret_prov = self.coerce_array_to_slice_prov(
@@ -1215,7 +1216,7 @@ impl<'a> BodyChecker<'a> {
                                 ));
                             } else {
                                 if let Some(p_expr) = partial {
-                                    self.sema.check_f32_coercion_expr(p_expr, ret_ty);
+                                    self.check_coerced_expr(p_expr, ret_ty);
                                     let partial_prov = self.coerce_array_to_slice_prov(
                                         p_expr,
                                         &pv.ty,
@@ -1500,7 +1501,7 @@ impl<'a> BodyChecker<'a> {
                 let pv = self.check_expr_infallible(period);
                 if pv.ty.is_integer() {
                     let is_zero = match &period.kind {
-                        ExprKind::Literal(Literal::Int(0)) => true,
+                        ExprKind::Literal(Literal::Int { value: 0, .. }) => true,
                         ExprKind::Ident(id) => self
                             .sema
                             .consts
@@ -1509,7 +1510,7 @@ impl<'a> BodyChecker<'a> {
                         _ => false,
                     };
                     let const_ticks = match &period.kind {
-                        ExprKind::Literal(Literal::Int(v)) => Some(*v),
+                        ExprKind::Literal(Literal::Int { value, .. }) => Some(*value),
                         ExprKind::Ident(id) => {
                             self.sema.consts.get(&id.name).and_then(|c| c.int_value)
                         }
@@ -1594,6 +1595,8 @@ impl<'a> BodyChecker<'a> {
                             sv.ty, resolved_var_ty
                         ),
                     ));
+                } else {
+                    self.check_coerced_expr(start, &resolved_var_ty);
                 }
                 let ev = self.check_expr_infallible(end);
                 if !ev.ty.is_assignable_to(&resolved_var_ty)
@@ -1608,6 +1611,8 @@ impl<'a> BodyChecker<'a> {
                             ev.ty, resolved_var_ty
                         ),
                     ));
+                } else {
+                    self.check_coerced_expr(end, &resolved_var_ty);
                 }
 
                 self.check_for_loop_with_binding(
@@ -1743,6 +1748,7 @@ impl<'a> BodyChecker<'a> {
 
             StmtKind::Switch { scrutinee, arms } => {
                 let sv = self.check_expr_infallible(scrutinee);
+                self.validate_int_expr_at_type(scrutinee, None);
                 let base_vars = self.snapshot_outer_vars();
                 let base_leases = self.leases.clone();
                 let mut live_var_branches = Vec::new();
@@ -1760,7 +1766,10 @@ impl<'a> BodyChecker<'a> {
                         }
                         SwitchPat::Literal(lit, pat_span) => {
                             let lit_ty = match lit {
-                                Literal::Int(_) => Ty::IntLit,
+                                Literal::Int {
+                                    suffix: Some(p), ..
+                                } => Ty::Prim(*p),
+                                Literal::Int { suffix: None, .. } => Ty::IntLit,
                                 Literal::Float { suffix: Some(p), .. } => Ty::Prim(*p),
                                 Literal::Float { suffix: None, .. } => Ty::FloatLit,
                                 Literal::Bool(_) => Ty::bool(),
@@ -1779,6 +1788,29 @@ impl<'a> BodyChecker<'a> {
                                         lit_ty, sv.ty
                                     ),
                                 ));
+                            } else if let (
+                                Literal::Int {
+                                    value,
+                                    suffix: None,
+                                },
+                                Ty::Prim(p),
+                            ) = (lit, &sv.ty)
+                            {
+                                self.check_int_lit_range_or_emit(
+                                    i128::from(*value),
+                                    *p,
+                                    *pat_span,
+                                );
+                            } else if let Literal::Int {
+                                value,
+                                suffix: Some(p),
+                            } = lit
+                            {
+                                self.check_int_lit_range_or_emit(
+                                    i128::from(*value),
+                                    *p,
+                                    *pat_span,
+                                );
                             }
                         }
                         SwitchPat::Ident {
@@ -2038,7 +2070,7 @@ impl<'a> BodyChecker<'a> {
                                     )
                                 },
                             ) {
-                                self.sema.check_f32_coercion_expr(&arm.call, &resolved_ty);
+                                self.check_coerced_expr(&arm.call, &resolved_ty);
                             }
                         }
                         let decl_depth = self.current_depth();
@@ -2119,6 +2151,8 @@ impl<'a> BodyChecker<'a> {
                                         tv.ty
                                     ),
                                 ));
+                            } else {
+                                self.check_coerced_expr(&t.expr, &Ty::u32());
                             }
                         }
                     }
@@ -2209,6 +2243,7 @@ impl<'a> BodyChecker<'a> {
 
             StmtKind::Expr(e) => {
                 let ev = self.check_expr_infallible(e);
+                self.validate_int_expr_at_type(e, None);
                 if ev.ty.is_linear_lease() {
                     self.sema.emit(
                         Diagnostic::new(
@@ -2617,7 +2652,7 @@ impl<'a> BodyChecker<'a> {
                         )
                     },
                 ) {
-                    self.sema.check_f32_coercion_expr(&arg.value, &param.ty);
+                    self.check_coerced_expr(&arg.value, &param.ty);
                 }
                 if param.ty.contains_reference(&self.sema.structs) {
                     let arg_prov = self.coerce_array_to_slice_prov(
@@ -2784,7 +2819,7 @@ impl<'a> BodyChecker<'a> {
                         )
                     },
                 ) {
-                    self.sema.check_f32_coercion_expr(value_expr, &var_info.ty);
+                    self.check_coerced_expr(value_expr, &var_info.ty);
                 }
 
                 if var_info.ty.is_linear_lease() {
@@ -2999,7 +3034,7 @@ impl<'a> BodyChecker<'a> {
                             )
                         },
                     ) {
-                        self.sema.check_f32_coercion_expr(value_expr, &field_ty);
+                        self.check_coerced_expr(value_expr, &field_ty);
                     }
                 } else {
                     self.check_compound_op_types(op, &field_ty, value_expr, &rhs.ty, stmt_span);
@@ -3152,7 +3187,7 @@ impl<'a> BodyChecker<'a> {
                             )
                         },
                     ) {
-                        self.sema.check_f32_coercion_expr(value_expr, pointee_ty);
+                        self.check_coerced_expr(value_expr, pointee_ty);
                     }
                 } else {
                     self.check_compound_op_types(op, pointee_ty, value_expr, &rhs.ty, stmt_span);
@@ -3270,7 +3305,7 @@ impl<'a> BodyChecker<'a> {
                             )
                         },
                     ) {
-                        self.sema.check_f32_coercion_expr(value_expr, &elem_ty);
+                        self.check_coerced_expr(value_expr, &elem_ty);
                     }
                 } else {
                     self.check_compound_op_types(op, &elem_ty, value_expr, &rhs.ty, stmt_span);
@@ -3325,6 +3360,24 @@ impl<'a> BodyChecker<'a> {
         if lhs.is_error() || rhs.is_error() {
             return;
         }
+        if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
+            if !(lhs.is_integer() && rhs.is_integer()) {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!(
+                        "compound shift '{}' requires integer operands, found '{}' and '{}'",
+                        op.as_str(),
+                        lhs,
+                        rhs
+                    ),
+                ));
+            } else {
+                self.validate_int_expr_at_type(rhs_expr, None);
+                self.check_const_shift_amount(op.as_str(), lhs, rhs_expr);
+            }
+            return;
+        }
         let float_arith_ok = matches!(
             op,
             AssignOp::AddAssign
@@ -3335,7 +3388,8 @@ impl<'a> BodyChecker<'a> {
         ) && lhs.is_float()
             && rhs.is_float()
             && rhs.is_assignable_to(lhs);
-        if !(lhs.is_integer() && rhs.is_integer()) && !float_arith_ok {
+        let int_arith_ok = lhs.is_integer() && rhs.is_integer() && rhs.is_assignable_to(lhs);
+        if !int_arith_ok && !float_arith_ok {
             self.sema.emit(Diagnostic::new(
                 DiagnosticKind::TypeMismatch,
                 span,
@@ -3346,10 +3400,8 @@ impl<'a> BodyChecker<'a> {
                     rhs
                 ),
             ));
-        } else if float_arith_ok {
-            self.sema.check_f32_coercion_expr(rhs_expr, lhs);
-        } else if matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) {
-            self.check_const_shift_amount(op.as_str(), lhs, rhs_expr);
+        } else {
+            self.check_coerced_expr(rhs_expr, lhs);
         }
     }
 

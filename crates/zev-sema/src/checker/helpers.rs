@@ -217,22 +217,22 @@ pub(super) const fn int_bin_worst_case(p: PrimType) -> usize {
     }
 }
 
-pub(super) fn unify_integer_arith(lhs: &Ty, rhs: &Ty) -> Ty {
+pub(super) fn try_unify_integer(lhs: &Ty, rhs: &Ty) -> Option<Ty> {
     match (lhs, rhs) {
-        (Ty::IntLit, Ty::IntLit) => Ty::IntLit,
-        (Ty::IntLit, Ty::Prim(p)) | (Ty::Prim(p), Ty::IntLit) => Ty::Prim(Ty::host_prim(*p)),
-        (Ty::Prim(a), Ty::Prim(b)) => {
-            let ha = Ty::host_prim(*a);
-            let hb = Ty::host_prim(*b);
-            if ha == hb {
-                Ty::Prim(ha)
-            } else if ha.byte_size(4) >= hb.byte_size(4) {
-                Ty::Prim(ha)
+        (Ty::IntLit, Ty::IntLit) => Some(Ty::IntLit),
+        (Ty::IntLit, Ty::Prim(p)) | (Ty::Prim(p), Ty::IntLit) if p.is_integer() => {
+            Some(Ty::Prim(Ty::host_prim(*p)))
+        }
+        (Ty::Prim(a), Ty::Prim(b)) if a.is_integer() && b.is_integer() => {
+            if Ty::can_implicitly_widen_int(*a, *b) {
+                Some(Ty::Prim(Ty::host_prim(*b)))
+            } else if Ty::can_implicitly_widen_int(*b, *a) {
+                Some(Ty::Prim(Ty::host_prim(*a)))
             } else {
-                Ty::Prim(hb)
+                None
             }
         }
-        _ => Ty::u32(),
+        _ => None,
     }
 }
 
