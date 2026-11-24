@@ -352,10 +352,10 @@ fn reject_auto_yield_loop_in_noyield_and_unbounded_loop_in_critical() {
 
 #[test]
 fn extern_c_callback_safety_direct_and_struct_wrapped() {
-    // Non-yielding callback to extern "C" is allowed!
+    // Non-yielding callback to extern "C" (`noyield fn`) is allowed; plain `fn` in extern "C"` is rejected (`E0006`).
     expect_ok(
         r#"
-        extern "C" fn register_blk_hook(fn(u32) -> i32 cb);
+        extern "C" fn register_blk_hook(noyield fn(u32) -> i32 cb);
 
         fn fast_hook(u32 sector) -> i32 {
             return 0;
@@ -367,10 +367,25 @@ fn extern_c_callback_safety_direct_and_struct_wrapped() {
         "#,
     );
 
-    // Direct/transitive yielding callback passed to extern "C" is rejected!
     expect_err_kind(
         r#"
         extern "C" fn register_blk_hook(fn(u32) -> i32 cb);
+
+        fn fast_hook(u32 sector) -> i32 {
+            return 0;
+        }
+
+        fn main() {
+            register_blk_hook(fast_hook);
+        }
+        "#,
+        DiagnosticKind::YieldingCallbackToExternC,
+    );
+
+    // Direct/transitive yielding callback passed to extern "C" is rejected!
+    expect_err_kind(
+        r#"
+        extern "C" fn register_blk_hook(noyield fn(u32) -> i32 cb);
         signal flash_ready;
 
         fn wait_flash() {
@@ -393,7 +408,7 @@ fn extern_c_callback_safety_direct_and_struct_wrapped() {
     expect_err_kind(
         r#"
         struct BlockOps {
-            fn(u32) -> i32 read_block;
+            noyield fn(u32) -> i32 read_block;
         }
         extern "C" fn mount_fs(*BlockOps ops);
 
@@ -1034,7 +1049,7 @@ fn qa_adversarial_checklist_suite() {
     // (g) Passing yielding function as callback to `extern "C"`
     expect_err_kind(
         r#"
-        extern "C" fn register_irq_cb(fn() cb);
+        extern "C" fn register_irq_cb(noyield fn() cb);
         fn bad_cb() { checkpoint(); }
         fn main() { register_irq_cb(bad_cb); }
         "#,
@@ -1228,7 +1243,7 @@ fn multi_hop_shortest_transitive_yield_chains() {
     // Transitive yield chain on `extern "C"` callback
     let cb_diags = expect_err_kind(
         r#"
-        extern "C" fn reg_hook(fn() cb);
+        extern "C" fn reg_hook(noyield fn() cb);
         signal done;
         fn inner_block() {
             done.wait();
@@ -2311,7 +2326,7 @@ fn three_tier_fn_effects_noyield_specialization_and_dual_specialized_fns() {
     );
     expect_err_kind(
         r#"
-        extern "C" fn reg_cb(fn() cb);
+        extern "C" fn reg_cb(noyield fn() cb);
         fn soft_fn() { checkpoint(); }
         fn main() {
             reg_cb(soft_fn);
@@ -7545,8 +7560,8 @@ fn main() { pick(5_000_000_000, 4); }
 
 #[test]
 fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to_noyield() {
-    // 1. Hard-blocking targets rejected across locals, struct fields, arguments, returns, arrays, and generics,
-    //    naming the shortest blocking chain and stating "not yet supported through function pointers".
+    // 1. Plain `fn(...)` ACCEPTS hard-blocking targets across locals, struct fields, arguments, returns, arrays, and generics
+    //    (Item 9 yielding indirect calls), whereas `noyield fn(...)` REJECTS hard-blocking targets with the shortest chain (`E0003`).
     let blocking_cases = [
         (
             "local",
@@ -7555,6 +7570,15 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
             fn slow([]u8 a) -> bool { leaf_delay(); return true; }
             task sh() {
                 fn([]u8) -> bool h = slow;
+                loop { bool _ok = h("x"); delay(1ms); }
+            }
+            fn main() { spawn sh() @normal; }
+            "#,
+            r#"
+            fn leaf_delay() { delay(10ms); }
+            fn slow([]u8 a) -> bool { leaf_delay(); return true; }
+            task sh() {
+                noyield fn([]u8) -> bool h = slow;
                 loop { bool _ok = h("x"); delay(1ms); }
             }
             fn main() { spawn sh() @normal; }
@@ -7571,6 +7595,14 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
             }
             fn wait_tick_wrap([]u8 _b) -> bool { wait_tick(); return true; }
             "#,
+            r#"
+            fn wait_tick() { delay(5ms); }
+            struct Handler { noyield fn([]u8) -> bool run; }
+            fn main() {
+                Handler _h = Handler { run: wait_tick_wrap };
+            }
+            fn wait_tick_wrap([]u8 _b) -> bool { wait_tick(); return true; }
+            "#,
             "wait_tick_wrap() -> wait_tick() -> delay()",
         ),
         (
@@ -7580,6 +7612,11 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
             fn reg(fn([]u8) -> bool _cb) {}
             fn main() { reg(slow); }
             "#,
+            r#"
+            fn slow([]u8 a) -> bool { delay(10ms); return true; }
+            fn reg(noyield fn([]u8) -> bool _cb) {}
+            fn main() { reg(slow); }
+            "#,
             "slow() -> delay()",
         ),
         (
@@ -7587,6 +7624,11 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
             r#"
             fn slow([]u8 a) -> bool { delay(10ms); return true; }
             fn get_cb() -> fn([]u8) -> bool { return slow; }
+            fn main() {}
+            "#,
+            r#"
+            fn slow([]u8 a) -> bool { delay(10ms); return true; }
+            fn get_cb() -> noyield fn([]u8) -> bool { return slow; }
             fn main() {}
             "#,
             "slow() -> delay()",
@@ -7606,21 +7648,42 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
                 via_generic<u8>(1u8);
             }
             "#,
+            r#"
+            struct Box<T> { T cb; }
+            fn slow_u8(u8 _x) -> bool { delay(3ms); return true; }
+            fn take<T>(noyield fn(T) -> bool _cb) {}
+            fn via_generic<T>(T _v) {
+                noyield fn(u8) -> bool _h = slow_u8;
+            }
+            fn main() {
+                Box<noyield fn(u8) -> bool> _b = Box<noyield fn(u8) -> bool> { cb: slow_u8 };
+                take<u8>(slow_u8);
+                via_generic<u8>(1u8);
+            }
+            "#,
             "delay()",
         ),
     ];
 
-    for (label, src, expected_chain) in blocking_cases {
-        let p = zev_parser::parse_str(src).unwrap();
-        let out = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+    for (label, plain_ok_src, noyield_err_src, expected_chain) in blocking_cases {
+        let p_ok = zev_parser::parse_str(plain_ok_src).unwrap();
+        let out_ok = analyze_and_monomorphize_programs(&[p_ok], &AnalyzeOptions::default());
         assert!(
-            out.diagnostics.iter().any(|d| {
+            out_ok.diagnostics.is_empty(),
+            "case '{label}' plain fn(...) must accept hard-blocking targets under Item 9, got: {:?}",
+            out_ok.diagnostics
+        );
+
+        let p_err = zev_parser::parse_str(noyield_err_src).unwrap();
+        let out_err = analyze_and_monomorphize_programs(&[p_err], &AnalyzeOptions::default());
+        assert!(
+            out_err.diagnostics.iter().any(|d| {
                 d.kind == DiagnosticKind::YieldInNoYield
-                    && d.message.contains("not yet supported through function pointers")
+                    && d.message.contains("cannot assign hard-blocking function")
                     && d.note.iter().any(|n| n.contains(expected_chain))
             }),
-            "case '{label}' expected blocking fn-ptr error containing chain '{expected_chain}', got: {:?}",
-            out.diagnostics
+            "case '{label}' expected noyield fn blocking error containing chain '{expected_chain}', got: {:?}",
+            out_err.diagnostics
         );
     }
 
@@ -7715,7 +7778,9 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
         );
     }
 
-    // 3. Soft-yielding (`while` loop and `checkpoint()`) targets are accepted cleanly and routed to `noyield` clone.
+    // 3. Soft-yielding (`while` loop and `checkpoint()`) targets:
+    //    - via `noyield fn(...)`: routed to `soft_yielding_in_noyield` (`__noyield` clone)
+    //    - via plain `fn(...)`: routed to `soft_yielding_in_coro` (`@__syn_fn_step_*` coroutine)
     let soft_src = r#"
         fn soft_while(u32 n) -> u32 {
             u32 s = 0u32;
@@ -7726,13 +7791,23 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
             }
             return s;
         }
-        struct Ops { fn(u32) -> u32 work; }
+        fn soft_plain(u32 n) -> u32 {
+            u32 i = 0u32;
+            while (i < n) {
+                i += 1u32;
+            }
+            return i;
+        }
+        struct Ops { noyield fn(u32) -> u32 work; fn(u32) -> u32 coop; }
         task sh() {
-            fn(u32) -> u32 h = soft_while;
-            Ops op = Ops { work: soft_while };
+            noyield fn(u32) -> u32 h = soft_while;
+            fn(u32) -> u32 p = soft_plain;
+            Ops op = Ops { work: soft_while, coop: soft_plain };
             loop {
                 u32 _a = h(4u32);
                 u32 _b = (op.work)(4u32);
+                u32 _c = p(4u32);
+                u32 _d = op.coop(4u32);
                 delay(1ms);
             }
         }
@@ -7748,6 +7823,11 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
         model.1.soft_yielding_in_noyield.contains("soft_while"),
         "soft_while should be scheduled for __noyield clone generation: {:?}",
         model.1.soft_yielding_in_noyield
+    );
+    assert!(
+        model.1.soft_yielding_in_coro.contains("soft_plain"),
+        "soft_plain should be scheduled for coroutine generation: {:?}",
+        model.1.soft_yielding_in_coro
     );
 }
 
@@ -7845,7 +7925,7 @@ fn main() {
         .map(|m| (m, Vec::<zev_sema::Diagnostic>::new()))
         .unwrap_or_else(|d| panic!("item3 valid program must pass sema: {d:#?}"));
     assert!(diags.is_empty());
-    assert!(model.1.soft_yielding_in_noyield.contains("cmd_soft"));
+    assert!(model.1.soft_yielding_in_coro.contains("cmd_soft"));
 
     // Unhandled fallible indirect calls (E0016)
     for (label, bad_src) in [
@@ -8256,10 +8336,12 @@ fn item5_width_and_alignment_sema_static_fit_and_type_checks() {
         e_ring_too_small.diagnostics
     );
 
-    // 2. Proven-fit without catch/or: u8:>5 fits in [5]u8; [4]u8:<12 fits in [12]u8
+    // 2. Proven-fit without catch/or: u8:>5 fits in [5]u8; [4]u8:<12 fits in [12]u8;
+    //    bool:>6 / bool:<6 fit in [6]u8; enum:<9 fits in [9]u8 and enum:>3 fits in [7]u8.
     let ok_fit = analyze_and_monomorphize_programs(
         &[zev_parser::parse_str(
             r#"
+enum Mode { Idle, Running }
 fn main() {
     u8 x = 3;
     [5]u8 b1;
@@ -8267,6 +8349,15 @@ fn main() {
     [4]u8 arr = ['a', 'b', 'c', 'd'];
     [12]u8 b2;
     []u8 _o2 = fmt_buf(b2, f"{arr:<12}");
+    bool fl = false;
+    [6]u8 b3;
+    []u8 _o3 = fmt_buf(b3, f"{fl:>6}");
+    []u8 _o4 = fmt_buf(b3, f"{fl:<6}");
+    Mode m = Mode.Idle;
+    [9]u8 b4;
+    []u8 _o5 = fmt_buf(b4, f"{m:<9}");
+    [7]u8 b5;
+    []u8 _o6 = fmt_buf(b5, f"{m:>3}");
 }
 "#,
         )
@@ -8279,8 +8370,35 @@ fn main() {
         ok_fit.diagnostics
     );
 
-    // 3. Zero-padded alignment `{s:0>5}` and `{s:0<5}` are accepted for text,
-    //    while numeric `{s:05}`, `{s:>4x}`, `{true:>5}`, `{1.5f32:>5}` are rejected.
+    for (label, src) in [
+        (
+            "bool_padded_too_small",
+            "fn f(bool b) -> usize { [5]u8 buf; []u8 r = fmt_buf(buf, f\"{b:>6}\") or buf[0..0]; return r.len; } fn main() {}",
+        ),
+        (
+            "enum_padded_too_small_width",
+            "enum Mode { Idle, Running } fn f(Mode m) -> usize { [8]u8 buf; []u8 r = fmt_buf(buf, f\"{m:<9}\") or buf[0..0]; return r.len; } fn main() {}",
+        ),
+        (
+            "enum_padded_too_small_variant",
+            "enum Mode { Idle, Running } fn f(Mode m) -> usize { [6]u8 buf; []u8 r = fmt_buf(buf, f\"{m:>3}\") or buf[0..0]; return r.len; } fn main() {}",
+        ),
+    ] {
+        let e = analyze_and_monomorphize_programs(
+            &[zev_parser::parse_str(src).unwrap()],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            e.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::FormatBufferTooSmall),
+            "{label}: expected E0028 FormatBufferTooSmall, got {:?}",
+            e.diagnostics
+        );
+    }
+
+    // 3. Zero-padded alignment `{s:0>5}` and `{s:0<5}` (and `{b:0>6}`, `{e:0<9}`) are accepted,
+    //    while numeric bare zero-pad or hex `{s:05}`, `{s:>4x}`, `{true:05}`, `{e:>5x}`, `{1.5f32:>5}` are rejected.
     let ok_text_zero_fill = analyze_and_monomorphize_programs(
         &[
             zev_parser::parse_str("fn main() { []u8 s = \"hi\"; println(f\"{s:0>5}|{s:0<5}\"); }")
@@ -8304,8 +8422,20 @@ fn main() {
             "fn main() { []u8 s = \"hi\"; println(f\"{s:>4x}\"); }",
         ),
         (
-            "bool_width",
-            "fn main() { bool b = true; println(f\"{b:>5}\"); }",
+            "bool_bare_05",
+            "fn main() { bool b = true; println(f\"{b:05}\"); }",
+        ),
+        (
+            "bool_hex_pad",
+            "fn main() { bool b = true; println(f\"{b:>5x}\"); }",
+        ),
+        (
+            "enum_bare_05",
+            "enum E { A } fn main() { E e = E.A; println(f\"{e:05}\"); }",
+        ),
+        (
+            "enum_hex_pad",
+            "enum E { A } fn main() { E e = E.A; println(f\"{e:>5x}\"); }",
         ),
         (
             "float_width",
@@ -8451,4 +8581,165 @@ fn pr22_fnptr_invariance_rejects_mismatched_signatures() {
         "exact fn ptr match should pass, got {:?}",
         exact.diagnostics
     );
+}
+
+#[test]
+fn item9_yielding_indirect_calls_noyield_fn_widening_context_and_e0012_cycles() {
+    // 1. `noyield fn` is callable inside isr, critical, noyield, and defer (including with SoftYielding targets)
+    //    and widens cleanly to plain `fn`.
+    expect_ok(
+        r#"
+        fn soft(u32 n) -> u32 {
+            u32 s = 0u32;
+            while (n > 0u32) {
+                s += n;
+                n -= 1u32;
+            }
+            return s;
+        }
+        irq IRQ_0 = 0;
+        isr h_isr() {
+            noyield fn(u32) -> u32 cb = soft;
+            u32 _v = cb(3u32);
+        }
+        fn run_crit() {
+            noyield fn(u32) -> u32 cb = soft;
+            critical { u32 _a = cb(2u32); }
+            noyield { u32 _b = cb(2u32); }
+            defer { u32 _c = cb(1u32); }
+            fn(u32) -> u32 wide = cb;
+            u32 _d = wide(1u32);
+        }
+        fn main() {
+            IRQ_0.attach(h_isr());
+            run_crit();
+        }
+        "#,
+    );
+
+    // 2. Assigning or casting plain `fn` -> `noyield fn` or `*void`, or passing plain `fn` to `sys.set_*` / `extern "C"`, is rejected.
+    for (label, bad_src, expected_kind) in [
+        (
+            "plain_to_noyield_local",
+            "fn fast() {} fn main() { fn() p = fast; noyield fn() ny = p; }",
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "plain_cast_noyield",
+            "fn fast() {} fn main() { fn() p = fast; noyield fn() ny = p as noyield fn(); }",
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "plain_to_void_ptr",
+            "fn fast() {} fn main() { fn() p = fast; *void v = p; }",
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "plain_to_sys_set_putc",
+            "fn fast(u8 _c) {} fn main() { fn(u8) p = fast; sys.set_putc(p); }",
+            DiagnosticKind::TypeMismatch,
+        ),
+        (
+            "plain_to_sys_set_fault",
+            "fn fast() {} fn main() { fn() p = fast; sys.set_fault_handler(p); }",
+            DiagnosticKind::TypeMismatch,
+        ),
+        (
+            "extern_c_struct_with_plain_fn",
+            "struct Ops { fn(u8) cb; } extern \"C\" fn reg(*Ops o); fn fast(u8 _c) {} fn main() { Ops o = Ops { cb: fast }; reg(&o); }",
+            DiagnosticKind::YieldingCallbackToExternC,
+        ),
+    ] {
+        let p = zev_parser::parse_str(bad_src).unwrap();
+        let res = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            res.diagnostics.iter().any(|d| d.kind == expected_kind),
+            "{label}: expected {expected_kind:?}, got {:?}",
+            res.diagnostics
+        );
+    }
+
+    // 3. Calling plain `fn` directly OR transitively in restricted scopes (isr, critical, noyield, defer) is rejected
+    //    even if C(sig) currently contains only non-yielding targets.
+    for (label, src, expected_kind) in [
+        (
+            "direct_plain_in_isr",
+            "irq IRQ_0 = 0; fn fast() {} isr h() { fn() p = fast; p(); } fn main() { IRQ_0.attach(h()); }",
+            DiagnosticKind::YieldInIsr,
+        ),
+        (
+            "direct_plain_in_critical",
+            "fn fast() {} fn main() { fn() p = fast; critical { p(); } }",
+            DiagnosticKind::YieldInCritical,
+        ),
+        (
+            "direct_plain_in_noyield",
+            "fn fast() {} fn main() { fn() p = fast; noyield { p(); } }",
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "direct_plain_in_defer",
+            "fn fast() {} fn main() { fn() p = fast; defer { p(); } }",
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "transitive_plain_in_critical",
+            "fn fast() {} fn call_p(fn() p) { p(); } fn main() { critical { call_p(fast); } }",
+            DiagnosticKind::YieldInCritical,
+        ),
+        (
+            "transitive_plain_in_noyield",
+            "fn fast() {} fn call_p(fn() p) { p(); } fn main() { noyield { call_p(fast); } }",
+            DiagnosticKind::YieldInNoYield,
+        ),
+    ] {
+        let p = zev_parser::parse_str(src).unwrap();
+        let res = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            res.diagnostics.iter().any(|d| d.kind == expected_kind),
+            "{label}: expected {expected_kind:?}, got {:?}",
+            res.diagnostics
+        );
+    }
+
+    // 4. Indirect yielding recursion cycles via plain `fn` (self + mutual) are rejected with `E0012`.
+    for (label, cycle_src) in [
+        (
+            "indirect_self_cycle",
+            r#"
+            fn rec_step(fn(u32) -> u32 next, u32 n) -> u32 {
+                delay(1ms);
+                if (n == 0u32) { return 0u32; }
+                return next(n - 1u32);
+            }
+            fn leaf_step(u32 n) -> u32 {
+                fn(fn(u32) -> u32, u32) -> u32 self_ref = rec_step;
+                return self_ref(leaf_step, n);
+            }
+            fn main() { u32 _r = leaf_step(2u32); }
+            "#,
+        ),
+        (
+            "indirect_const_table_cycle",
+            r#"
+            struct Handler { fn(u32) run; }
+            const [1]Handler TBL = [ Handler { run: bounce_a } ];
+            fn bounce_a(u32 n) {
+                delay(1ms);
+                if (n > 0u32) { TBL[0].run(n - 1u32); }
+            }
+            fn main() { TBL[0].run(3u32); }
+            "#,
+        ),
+    ] {
+        let p = zev_parser::parse_str(cycle_src).unwrap();
+        let res = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::YieldingRecursion),
+            "{label}: expected E0012 YieldingRecursion, got {:?}",
+            res.diagnostics
+        );
+    }
 }

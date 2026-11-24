@@ -700,6 +700,12 @@ impl<'a> BodyChecker<'a> {
         if ty.is_bool() {
             return match spec {
                 FormatSpec::Default | FormatSpec::Debug => Some(5),
+                FormatSpec::Padded {
+                    align,
+                    zero_pad,
+                    width,
+                    base: zev_ast::FormatPadBase::Default,
+                } if align.is_some() || !zero_pad => Some(5usize.max(width as usize)),
                 _ => {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -812,7 +818,7 @@ impl<'a> BodyChecker<'a> {
             };
         }
 
-        // 5. Enum variant names (`{err}` or `{err:?}`), bounded by `<EnumName>(?)` fallback.
+        // 5. Enum variant names (`{err}`, `{err:?}`, `{err:<9}`), bounded by `<EnumName>(?)` fallback.
         if let Ty::Enum(enum_name) = ty {
             return match spec {
                 FormatSpec::Default | FormatSpec::Debug => {
@@ -821,6 +827,15 @@ impl<'a> BodyChecker<'a> {
                         variants_max.max(enum_name.len() + 3)
                     })
                 }
+                FormatSpec::Padded {
+                    align,
+                    zero_pad,
+                    width,
+                    base: zev_ast::FormatPadBase::Default,
+                } if align.is_some() || !zero_pad => self.sema.enums.get(enum_name).map(|en| {
+                    let variants_max = en.variants.iter().map(|v| v.len()).max().unwrap_or(0);
+                    variants_max.max(enum_name.len() + 3).max(width as usize)
+                }),
                 _ => {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,

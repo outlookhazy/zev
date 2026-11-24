@@ -3114,6 +3114,87 @@ fn pick_bare() -> (fn(u8) -> u8) error {
     }
 
     #[test]
+    fn item9_parses_noyield_fn_ptr_types_and_preserves_noyield_blocks() {
+        let src = r#"
+enum Err { Bad }
+struct Ops {
+    noyield fn(*u8) flush;
+    fn(u32) -> bool error Err run;
+}
+extern "C" fn reg_cb(noyield fn(u8) cb);
+const noyield fn(u8) -> u8 CF = inc;
+fn pick() -> (noyield fn(u8) -> u8) error Err {
+    noyield fn(u8) -> u8 f = inc;
+    (noyield fn(u8) -> u8 error Err) g = inc_err;
+    noyield { inc(1); }
+    return f;
+}
+"#;
+        let prog = parse_str(src).expect("noyield fn-ptr types and noyield blocks must parse");
+        let ItemKind::Struct(st) = &prog.items[1].kind else {
+            panic!("expected Struct Ops");
+        };
+        assert!(matches!(
+            &st.fields[0].ty.kind,
+            TypeKind::FnPtr {
+                is_noyield: true,
+                error_spec: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &st.fields[1].ty.kind,
+            TypeKind::FnPtr {
+                is_noyield: false,
+                error_spec: Some(_),
+                ..
+            }
+        ));
+        let ItemKind::Fn(ext) = &prog.items[2].kind else {
+            panic!("expected extern fn reg_cb");
+        };
+        assert!(matches!(
+            &ext.params[0].ty.kind,
+            TypeKind::FnPtr {
+                is_noyield: true,
+                ..
+            }
+        ));
+        let ItemKind::Const(c) = &prog.items[3].kind else {
+            panic!("expected const CF");
+        };
+        assert!(matches!(
+            &c.ty.kind,
+            TypeKind::FnPtr {
+                is_noyield: true,
+                ..
+            }
+        ));
+        let ItemKind::Fn(pick) = &prog.items[4].kind else {
+            panic!("expected fn pick");
+        };
+        assert!(matches!(
+            &pick.ret_type.kind,
+            TypeKind::FnPtr {
+                is_noyield: true,
+                error_spec: None,
+                ..
+            }
+        ));
+        assert!(matches!(&pick.error_spec, Some(ErrorSpec::Typed(_))));
+        let body = pick.body.as_ref().unwrap();
+        assert!(matches!(
+            &body.stmts[0].kind,
+            StmtKind::VarDecl { ty, .. } if matches!(&ty.kind, TypeKind::FnPtr { is_noyield: true, .. })
+        ));
+        assert!(matches!(
+            &body.stmts[1].kind,
+            StmtKind::VarDecl { ty, .. } if matches!(&ty.kind, TypeKind::FnPtr { is_noyield: true, error_spec: Some(_), .. })
+        ));
+        assert!(matches!(&body.stmts[2].kind, StmtKind::NoYield { .. }));
+    }
+
+    #[test]
     fn item5_parses_width_and_alignment_format_specifiers() {
         use zev_ast::{FormatAlign, FormatPadBase, FormatPart, FormatSpec};
 

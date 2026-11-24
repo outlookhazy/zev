@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use zev_ast::Span;
 
 use crate::ir::{
     MirBlock, MirChildCallSlot, MirExpr, MirExprKind, MirFmtChunk, MirFnBody, MirFunction,
@@ -184,6 +185,19 @@ pub struct ArchRamTotals {
     pub heap_bytes: usize,
 }
 
+/// Static call-site report for an indirect function-pointer call (`zevc ram` / `check --json`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectCallSiteRam {
+    pub caller: String,
+    pub span: Span,
+    pub signature: String,
+    pub is_noyield: bool,
+    pub candidates: Vec<String>,
+    pub yielding_candidates: Vec<String>,
+    pub frame_bytes_32: usize,
+    pub frame_bytes_64: usize,
+}
+
 /// Complete zero-heap static SRAM report for a lowered `MirModule`.
 #[derive(Debug, Clone, Default)]
 pub struct RamReport {
@@ -195,6 +209,7 @@ pub struct RamReport {
     pub isr_states: Vec<(String, String, usize, usize)>,
     pub dual_specialized_fns: Vec<DualSpecializedFnRam>,
     pub monomorphized_instances: Vec<MonomorphizedMirItem>,
+    pub indirect_call_sites: Vec<IndirectCallSiteRam>,
     pub mcu32: ArchRamTotals,
     pub host64: ArchRamTotals,
 }
@@ -539,6 +554,35 @@ impl RamReport {
                             ));
                         }
                     }
+                }
+            }
+        }
+
+        if !self.indirect_call_sites.is_empty() {
+            out.push_str("\n8. Indirect Function-Pointer Call Sites\n");
+            out.push_str("--------------------------------------------------------------------------------\n");
+            for site in &self.indirect_call_sites {
+                let cands = if site.candidates.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    site.candidates.join(", ")
+                };
+                if site.frame_bytes_32 > 0 || site.frame_bytes_64 > 0 {
+                    out.push_str(&format!(
+                        "  {} ({}:{}) `{}` -> candidates [{}] (union frame: {} B 32b / {} B 64b)\n",
+                        site.caller,
+                        site.span.line,
+                        site.span.col,
+                        site.signature,
+                        cands,
+                        site.frame_bytes_32,
+                        site.frame_bytes_64
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  {} ({}:{}) `{}` -> candidates [{}] (0 B frame, direct call)\n",
+                        site.caller, site.span.line, site.span.col, site.signature, cands
+                    ));
                 }
             }
         }
@@ -1165,6 +1209,7 @@ pub fn compute_ram_report_with_subsystems(
         isr_states,
         dual_specialized_fns,
         monomorphized_instances: Vec::new(),
+        indirect_call_sites: Vec::new(),
         mcu32,
         host64,
     }
@@ -1522,6 +1567,26 @@ pub fn populate_module_ram_report(module: &mut MirModule) {
         }
         rep.monomorphized_instances = module.monomorphized_instances.clone();
     }
+    for site in &module.indirect_call_sites {
+        let mut frame_bytes_32 = 0usize;
+        let mut frame_bytes_64 = 0usize;
+        for cand in &site.yielding_candidates {
+            if let Some(fr) = rep.fn_frames.iter().find(|r| &r.name == cand) {
+                frame_bytes_32 = frame_bytes_32.max(fr.packed_bytes_32);
+                frame_bytes_64 = frame_bytes_64.max(fr.packed_bytes_64);
+            }
+        }
+        rep.indirect_call_sites.push(IndirectCallSiteRam {
+            caller: site.caller.clone(),
+            span: site.span,
+            signature: site.signature.clone(),
+            is_noyield: site.is_noyield,
+            candidates: site.candidates.clone(),
+            yielding_candidates: site.yielding_candidates.clone(),
+            frame_bytes_32,
+            frame_bytes_64,
+        });
+    }
     module.ram_report = rep;
 }
 
@@ -1602,11 +1667,13 @@ fn fold_fmt_chunks_run(
             MirFmtChunk::Int { value, .. }
             | MirFmtChunk::Float { value, .. }
             | MirFmtChunk::Bool(value)
+            | MirFmtChunk::PaddedBool { value, .. }
             | MirFmtChunk::Str(value)
             | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
             | MirFmtChunk::PaddedBytes { slice: value, .. }
-            | MirFmtChunk::EnumName { value, .. } => {
+            | MirFmtChunk::EnumName { value, .. }
+            | MirFmtChunk::PaddedEnumName { value, .. } => {
                 fold_expr_run(value, fn_map, cache, visiting, kind, extra_blocks);
             }
             MirFmtChunk::DebugSlice { slice, .. } => {

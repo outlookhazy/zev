@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) type IndirectSigInfo = (Vec<MirType>, MirType, MirErrorSpec, Vec<String>, bool);
+
 #[derive(Clone, Copy)]
 pub(super) struct LoopContext {
     pub(super) continue_bb: BlockId,
@@ -1859,6 +1861,9 @@ impl<'a> CoroutineLowerCtx<'a> {
     }
 
     pub(super) fn is_void_yielding_stmt_expr(&self, expr: &Expr) -> bool {
+        if let Some((_, ret, error_spec, _, _)) = self.peek_yielding_indirect_call(expr) {
+            return ret.is_void() && !error_spec.has_error();
+        }
         match &expr.kind {
             ExprKind::Call {
                 callee,
@@ -1911,6 +1916,13 @@ impl<'a> CoroutineLowerCtx<'a> {
         &mut self,
         expr: &Expr,
     ) -> Result<bool, MirLowerError> {
+        if let Some((_, ret, error_spec, _, _)) = self.peek_yielding_indirect_call(expr) {
+            if ret.is_void() && !error_spec.has_error() {
+                let _ = self.emit_yielding_indirect_call(expr)?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
         match &expr.kind {
             ExprKind::Call {
                 callee,
@@ -2217,6 +2229,7 @@ impl<'a> CoroutineLowerCtx<'a> {
         }
         let sink_ptr_var = lower_user_sink_ptr_var_be(&args[0].value, self)?;
         let chunks = lower_user_sink_chunks_be(&args[1].value, newline, self)?;
+        let slice_u8_ty = MirType::Slice(Box::new(MirType::U8));
         let scratch_cap = user_sink_scratch_cap(&chunks);
         let scratch = if scratch_cap > 0 {
             let sv = self.alloc_temp(
@@ -2226,7 +2239,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                     len: scratch_cap,
                 },
             );
-            Some((sv, scratch_cap))
+            let fmt_res_ty = MirType::Result {
+                ok: Box::new(slice_u8_ty.clone()),
+                err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
+            };
+            let rv = self.alloc_temp("sink_fmt_res", fmt_res_ty);
+            Some((sv, scratch_cap, rv))
         } else {
             None
         };
@@ -2250,7 +2268,6 @@ impl<'a> CoroutineLowerCtx<'a> {
         });
         let err_join_bb = res_vid_opt.map(|_| self.alloc_bb());
         let sink_ptr_ty = self.vars[sink_ptr_var.0].ty.clone();
-        let slice_u8_ty = MirType::Slice(Box::new(MirType::U8));
 
         let emit_chunk_write = |this: &mut Self, slice_expr: MirExpr| {
             let call_args = vec![
@@ -2387,170 +2404,40 @@ impl<'a> CoroutineLowerCtx<'a> {
                         MirExpr::new(MirExprKind::StringLit("]".to_string()), slice_u8_ty.clone()),
                     );
                 }
-                MirFmtChunk::PaddedBytes { slice, pad } => {
-                    let raw_slice = slice;
-                    let s_var = self.alloc_temp("sink_pad_s", slice_u8_ty.clone());
-                    self.cur_stmts.push(MirStmt::Assign {
-                        target: MirPlace::Var(s_var),
-                        op: MirAssignOp::Assign,
-                        value: raw_slice,
-                    });
-                    let slen_var = self.alloc_temp("sink_pad_len", MirType::Usize);
-                    self.cur_stmts.push(MirStmt::Assign {
-                        target: MirPlace::Var(slen_var),
-                        op: MirAssignOp::Assign,
-                        value: MirExpr::new(
-                            MirExprKind::SliceLen(Box::new(MirExpr::new(
-                                MirExprKind::Var(s_var),
-                                slice_u8_ty.clone(),
-                            ))),
-                            MirType::Usize,
+                MirFmtChunk::PaddedBytes { .. }
+                | MirFmtChunk::PaddedBool { .. }
+                | MirFmtChunk::PaddedEnumName { .. }
+                | MirFmtChunk::PaddedStr { .. } => {
+                    let (raw_slice, pad) = match ch {
+                        MirFmtChunk::PaddedBytes { slice, pad } => (slice, pad),
+                        MirFmtChunk::PaddedBool { value, pad } => (
+                            chunk_to_slice_or_scalar_be(MirFmtChunk::Bool(value), scratch, self),
+                            pad,
                         ),
-                    });
-                    let rem_var = self.alloc_temp("sink_pad_rem", MirType::Usize);
-                    let w_lit =
-                        MirExpr::new(MirExprKind::IntLit(i128::from(pad.width)), MirType::Usize);
-                    self.cur_stmts.push(MirStmt::If {
-                        cond: MirExpr::new(
-                            MirExprKind::Binary {
-                                op: MirBinOp::Lt,
-                                lhs: Box::new(MirExpr::new(
-                                    MirExprKind::Var(slen_var),
-                                    MirType::Usize,
-                                )),
-                                rhs: Box::new(w_lit.clone()),
-                            },
-                            MirType::Bool,
+                        MirFmtChunk::PaddedEnumName {
+                            enum_name,
+                            value,
+                            pad,
+                        } => (
+                            chunk_to_slice_or_scalar_be(
+                                MirFmtChunk::EnumName { enum_name, value },
+                                scratch,
+                                self,
+                            ),
+                            pad,
                         ),
-                        then_body: vec![MirStmt::Assign {
-                            target: MirPlace::Var(rem_var),
-                            op: MirAssignOp::Assign,
-                            value: MirExpr::new(
-                                MirExprKind::Binary {
-                                    op: MirBinOp::Sub,
-                                    lhs: Box::new(w_lit),
-                                    rhs: Box::new(MirExpr::new(
-                                        MirExprKind::Var(slen_var),
-                                        MirType::Usize,
-                                    )),
-                                },
-                                MirType::Usize,
-                            ),
-                        }],
-                        else_body: vec![MirStmt::Assign {
-                            target: MirPlace::Var(rem_var),
-                            op: MirAssignOp::Assign,
-                            value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
-                        }],
-                    });
-                    let emit_pad = |this: &mut Self| {
-                        let fill_str = if pad.zero_pad {
-                            "0000000000000000"
-                        } else {
-                            "                "
-                        };
-                        let hdr_bb = this.alloc_bb();
-                        let body_bb = this.alloc_bb();
-                        let done_bb = this.alloc_bb();
-                        this.seal_bb(MirTerminator::Goto(hdr_bb), hdr_bb, false);
-                        this.seal_bb(
-                            MirTerminator::Branch {
-                                cond: MirExpr::new(
-                                    MirExprKind::Binary {
-                                        op: MirBinOp::Gt,
-                                        lhs: Box::new(MirExpr::new(
-                                            MirExprKind::Var(rem_var),
-                                            MirType::Usize,
-                                        )),
-                                        rhs: Box::new(MirExpr::new(
-                                            MirExprKind::IntLit(0),
-                                            MirType::Usize,
-                                        )),
-                                    },
-                                    MirType::Bool,
-                                ),
-                                then_bb: body_bb,
-                                else_bb: done_bb,
-                            },
-                            body_bb,
-                            false,
-                        );
-                        let step_var = this.alloc_temp("sink_pad_step", MirType::Usize);
-                        this.cur_stmts.push(MirStmt::If {
-                            cond: MirExpr::new(
-                                MirExprKind::Binary {
-                                    op: MirBinOp::Gt,
-                                    lhs: Box::new(MirExpr::new(
-                                        MirExprKind::Var(rem_var),
-                                        MirType::Usize,
-                                    )),
-                                    rhs: Box::new(MirExpr::new(
-                                        MirExprKind::IntLit(16),
-                                        MirType::Usize,
-                                    )),
-                                },
-                                MirType::Bool,
-                            ),
-                            then_body: vec![MirStmt::Assign {
-                                target: MirPlace::Var(step_var),
-                                op: MirAssignOp::Assign,
-                                value: MirExpr::new(MirExprKind::IntLit(16), MirType::Usize),
-                            }],
-                            else_body: vec![MirStmt::Assign {
-                                target: MirPlace::Var(step_var),
-                                op: MirAssignOp::Assign,
-                                value: MirExpr::new(MirExprKind::Var(rem_var), MirType::Usize),
-                            }],
-                        });
-                        let pad_slice = MirExpr::new(
-                            MirExprKind::SubSlice {
-                                base: Box::new(MirExpr::new(
-                                    MirExprKind::StringLit(fill_str.to_string()),
+                        MirFmtChunk::PaddedStr { cstr, pad } => {
+                            let s = if let MirExprKind::StringLit(s) = cstr.kind {
+                                MirExpr::new(MirExprKind::StringLit(s), slice_u8_ty.clone())
+                            } else {
+                                MirExpr::new(
+                                    MirExprKind::CStrToSlice(Box::new(cstr)),
                                     slice_u8_ty.clone(),
-                                )),
-                                start: Box::new(MirExpr::new(
-                                    MirExprKind::IntLit(0),
-                                    MirType::Usize,
-                                )),
-                                end: Box::new(MirExpr::new(
-                                    MirExprKind::Var(step_var),
-                                    MirType::Usize,
-                                )),
-                                elem_ty: MirType::U8,
-                                base_is_array: false,
-                            },
-                            slice_u8_ty.clone(),
-                        );
-                        emit_chunk_write(this, pad_slice);
-                        this.cur_stmts.push(MirStmt::Assign {
-                            target: MirPlace::Var(rem_var),
-                            op: MirAssignOp::SubAssign,
-                            value: MirExpr::new(MirExprKind::Var(step_var), MirType::Usize),
-                        });
-                        this.seal_bb(MirTerminator::Goto(hdr_bb), done_bb, false);
-                    };
-                    if pad.left_align {
-                        emit_chunk_write(
-                            self,
-                            MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
-                        );
-                        emit_pad(self);
-                    } else {
-                        emit_pad(self);
-                        emit_chunk_write(
-                            self,
-                            MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
-                        );
-                    }
-                }
-                MirFmtChunk::PaddedStr { cstr, pad } => {
-                    let raw_slice = if let MirExprKind::StringLit(s) = cstr.kind {
-                        MirExpr::new(MirExprKind::StringLit(s), slice_u8_ty.clone())
-                    } else {
-                        MirExpr::new(
-                            MirExprKind::CStrToSlice(Box::new(cstr)),
-                            slice_u8_ty.clone(),
-                        )
+                                )
+                            };
+                            (s, pad)
+                        }
+                        _ => unreachable!(),
                     };
                     let s_var = self.alloc_temp("sink_pad_s", slice_u8_ty.clone());
                     self.cur_stmts.push(MirStmt::Assign {
@@ -3036,6 +2923,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                             return Ok(MirExpr::new(MirExprKind::Var(dst_vid), env_ty));
                         }
                     }
+                }
+                if let Some(res) = self.try_lower_yielding_indirect_expr(expr)? {
+                    return Ok(res);
                 }
                 self.lower_non_yielding_expr(expr, expected)
             }
@@ -3663,9 +3553,424 @@ impl<'a> CoroutineLowerCtx<'a> {
                         },
                     }
                 }
+                if let Some(res) = self.try_lower_yielding_indirect_expr(expr)? {
+                    return Ok(res);
+                }
                 self.lower_non_yielding_expr(expr, expected)
             }
             _ => self.lower_non_yielding_expr(expr, expected),
+        }
+    }
+
+    fn peek_expr_mir_ty(&self, expr: &Expr) -> Option<MirType> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                if let Some(vid) = self.scopes.lookup(&id.name) {
+                    return Some(self.vars[vid.0].ty.clone());
+                }
+                if let Some(cty) = self.syms.consts.get(&id.name) {
+                    return Some(cty.clone());
+                }
+                if let Some((sname, _)) = self.syms.subsystems.get(&id.name) {
+                    return Some(MirType::Ptr(Box::new(MirType::Struct(sname.clone()))));
+                }
+                if let Some(pinfo) = self.syms.primitives.get(&id.name) {
+                    return Some(MirType::Ptr(Box::new(MirType::Primitive(
+                        pinfo.kind.clone(),
+                    ))));
+                }
+                None
+            }
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                expr: inner,
+            } => self
+                .peek_expr_mir_ty(inner)
+                .map(|t| MirType::Ptr(Box::new(t))),
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                expr: inner,
+            } => match self.peek_expr_mir_ty(inner)? {
+                MirType::Ptr(elem) => Some(*elem),
+                _ => None,
+            },
+            ExprKind::Cast { ty, .. } => Some(self.syms.resolve_type(ty)),
+            ExprKind::StructLit { module, name, .. } => {
+                let sname = if let Some(mod_id) = module {
+                    self.syms
+                        .candidate_module_names(&mod_id.name, &name.name)
+                        .into_iter()
+                        .find(|c| self.syms.structs.contains_key(c))
+                        .unwrap_or_else(|| format!("{}.{}", mod_id.name, name.name))
+                } else {
+                    name.name.clone()
+                };
+                Some(MirType::Struct(sname))
+            }
+            ExprKind::Field { target, field } => {
+                if let Some(tty) = self.peek_expr_mir_ty(target) {
+                    let base = match tty {
+                        MirType::Ptr(inner) => *inner,
+                        other => other,
+                    };
+                    if let MirType::Struct(sname) = base {
+                        return self.syms.structs.get(&sname).and_then(|st| {
+                            st.fields
+                                .iter()
+                                .find(|f| f.name == field.name)
+                                .map(|f| f.ty.clone())
+                        });
+                    }
+                }
+                if let ExprKind::Ident(id) = &target.kind {
+                    if self.scopes.lookup(&id.name).is_none()
+                        && self.syms.import_aliases.contains_key(&id.name)
+                    {
+                        for cand in self.syms.candidate_module_names(&id.name, &field.name) {
+                            if let Some(cty) = self.syms.consts.get(&cand) {
+                                return Some(cty.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Index { target, .. } => match self.peek_expr_mir_ty(target)? {
+                MirType::Slice(elem) | MirType::Array { elem, .. } => Some(*elem),
+                MirType::Ptr(inner) => match *inner {
+                    MirType::Slice(elem) | MirType::Array { elem, .. } => Some(*elem),
+                    other => Some(other),
+                },
+                _ => None,
+            },
+            ExprKind::Slice { target, .. } => match self.peek_expr_mir_ty(target)? {
+                MirType::Slice(elem) | MirType::Array { elem, .. } => Some(MirType::Slice(elem)),
+                MirType::Ptr(inner) => match *inner {
+                    MirType::Slice(elem) | MirType::Array { elem, .. } => {
+                        Some(MirType::Slice(elem))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            ExprKind::Or { expr: inner, .. } | ExprKind::Catch { expr: inner, .. } => {
+                self.peek_expr_mir_ty(inner)
+            }
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(id) = &callee.kind {
+                    if self.scopes.lookup(&id.name).is_none() {
+                        if let Some(sig) = self.syms.fns.get(&id.name) {
+                            return Some(sig.ret_ty.clone());
+                        }
+                    }
+                }
+                match self.peek_expr_mir_ty(callee)? {
+                    MirType::FnPtr { ret, .. } => Some(*ret),
+                    _ => None,
+                }
+            }
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
+                let rty = self.peek_expr_mir_ty(receiver)?;
+                let base = match rty {
+                    MirType::Ptr(inner) => *inner,
+                    other => other,
+                };
+                if let MirType::Struct(sname) = base {
+                    if let Some(MirType::FnPtr { ret, .. }) =
+                        self.syms.structs.get(&sname).and_then(|st| {
+                            st.fields
+                                .iter()
+                                .find(|f| f.name == method.name)
+                                .map(|f| f.ty.clone())
+                        })
+                    {
+                        return Some(*ret);
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn resolve_indirect_sig_info(&self, fp_ty: &MirType) -> Option<IndirectSigInfo> {
+        let MirType::FnPtr {
+            is_noyield,
+            params,
+            ret,
+            error_spec,
+        } = fp_ty
+        else {
+            return None;
+        };
+        if *is_noyield || self.in_noyield {
+            return None;
+        }
+        let sig_key = canonical_mir_fnptr_sig(params, ret, error_spec);
+        let cands = self.syms.plain_direct_candidates.get(&sig_key)?;
+        let yielding_cands: Vec<String> = cands
+            .iter()
+            .filter(|c| self.syms.fns.get(c.as_str()).is_some_and(|s| s.is_yielding))
+            .cloned()
+            .collect();
+        if yielding_cands.is_empty() {
+            return None;
+        }
+        let has_direct_fallback = self.syms.sig_has_noyield_widening.contains(&sig_key)
+            || cands
+                .iter()
+                .any(|c| self.syms.fns.get(c.as_str()).is_none_or(|s| !s.is_yielding));
+        Some((
+            params.clone(),
+            (**ret).clone(),
+            (**error_spec).clone(),
+            yielding_cands,
+            has_direct_fallback,
+        ))
+    }
+
+    fn peek_yielding_indirect_call(&self, expr: &Expr) -> Option<IndirectSigInfo> {
+        match &expr.kind {
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                if resolve_user_sink_write_callee(callee, generic_args, args).is_some() {
+                    return None;
+                }
+                if let ExprKind::Ident(id) = &callee.kind {
+                    if self.scopes.lookup(&id.name).is_none()
+                        && (BuiltinFn::from_name(&id.name).is_some()
+                            || self.syms.fns.contains_key(&id.name))
+                    {
+                        return None;
+                    }
+                }
+                let fp_ty = self.peek_expr_mir_ty(callee)?;
+                self.resolve_indirect_sig_info(&fp_ty)
+            }
+            ExprKind::MethodCall {
+                receiver, method, ..
+            } => {
+                if let ExprKind::Ident(id) = &receiver.kind {
+                    if id.name == SYS_NAMESPACE {
+                        return None;
+                    }
+                }
+                let rty = self.peek_expr_mir_ty(receiver)?;
+                let base = match rty {
+                    MirType::Ptr(inner) => *inner,
+                    other => other,
+                };
+                if let MirType::Struct(sname) = base {
+                    let fty = self.syms.structs.get(&sname).and_then(|st| {
+                        st.fields
+                            .iter()
+                            .find(|f| f.name == method.name)
+                            .map(|f| f.ty.clone())
+                    })?;
+                    return self.resolve_indirect_sig_info(&fty);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn try_lower_yielding_indirect_expr(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<Option<MirExpr>, MirLowerError> {
+        if self.peek_yielding_indirect_call(expr).is_none() {
+            return Ok(None);
+        }
+        let me = self.emit_yielding_indirect_call(expr)?;
+        Ok(Some(me))
+    }
+
+    fn emit_yielding_indirect_call(&mut self, expr: &Expr) -> Result<MirExpr, MirLowerError> {
+        let (fp_expr, args) = match &expr.kind {
+            ExprKind::Call { callee, args, .. } => {
+                let ce = self.lower_expr(callee, None)?;
+                (ce, args.as_slice())
+            }
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                let recv_me = self.lower_expr(receiver, None)?;
+                let (sname, is_ptr) = match &recv_me.ty {
+                    MirType::Struct(s) => (s.clone(), false),
+                    MirType::Ptr(inner) => match inner.as_ref() {
+                        MirType::Struct(s) => (s.clone(), true),
+                        _ => {
+                            return Err(MirLowerError {
+                                message: "expected struct receiver for method field call"
+                                    .to_string(),
+                                span: expr.span,
+                            });
+                        }
+                    },
+                    _ => {
+                        return Err(MirLowerError {
+                            message: "expected struct receiver for method field call".to_string(),
+                            span: expr.span,
+                        });
+                    }
+                };
+                let (fty, is_packed) = self
+                    .syms
+                    .structs
+                    .get(&sname)
+                    .and_then(|st| {
+                        st.fields
+                            .iter()
+                            .find(|f| f.name == method.name)
+                            .map(|f| (f.ty.clone(), st.packed))
+                    })
+                    .ok_or_else(|| MirLowerError {
+                        message: format!(
+                            "struct `{sname}` has no function pointer field `{}`",
+                            method.name
+                        ),
+                        span: expr.span,
+                    })?;
+                let fe = MirExpr::new(
+                    MirExprKind::FieldAccess {
+                        base: Box::new(recv_me),
+                        struct_name: sname,
+                        is_ptr,
+                        packed: is_packed,
+                        field: method.name.clone(),
+                        raw_field_ty: fty.clone(),
+                    },
+                    fty,
+                );
+                (fe, args.as_slice())
+            }
+            _ => {
+                return Err(MirLowerError {
+                    message: "expected call expression for yielding indirect dispatch".to_string(),
+                    span: expr.span,
+                });
+            }
+        };
+
+        let fp_ty = fp_expr.ty.clone();
+        let (params, ret, error_spec, yielding_cands, has_direct_fallback) = self
+            .resolve_indirect_sig_info(&fp_ty)
+            .ok_or_else(|| MirLowerError {
+                message: "internal error: missing yielding indirect call signature".to_string(),
+                span: expr.span,
+            })?;
+
+        let fp_tmp = self.alloc_temp("ind_fp", fp_ty.clone());
+        self.cur_stmts.push(MirStmt::Assign {
+            target: MirPlace::Var(fp_tmp),
+            op: MirAssignOp::Assign,
+            value: fp_expr,
+        });
+
+        let mut arg_vars = Vec::with_capacity(args.len());
+        for (idx, a) in args.iter().enumerate() {
+            let exp = params.get(idx);
+            let raw = self.lower_expr(&a.value, exp)?;
+            let pty = exp.cloned().unwrap_or_else(|| raw.ty.clone());
+            let coerced = coerce_expr_be(raw, &pty, self);
+            let moved = consume_moved_lease_be(coerced, self);
+            let avid = self.alloc_temp("ind_arg", pty.clone());
+            self.cur_stmts.push(MirStmt::Assign {
+                target: MirPlace::Var(avid),
+                op: MirAssignOp::Assign,
+                value: moved,
+            });
+            arg_vars.push(MirExpr::new(MirExprKind::Var(avid), pty));
+        }
+
+        let env_ty = if error_spec.has_error() {
+            MirType::Result {
+                ok: Box::new(ret.clone()),
+                err: error_spec.err_type().map(Box::new),
+            }
+        } else {
+            ret
+        };
+        let (dst_vid_opt, call_dst) = if env_ty.is_void() {
+            (None, None)
+        } else {
+            let vid = self.alloc_temp("ind_ret", env_ty.clone());
+            let cdst = if error_spec.has_error() {
+                MirCallDst::Result(vid)
+            } else {
+                MirCallDst::Value(vid)
+            };
+            (Some(vid), Some(cdst))
+        };
+
+        let join_bb = self.alloc_bb();
+        for (idx, cand) in yielding_cands.iter().enumerate() {
+            let is_last = idx + 1 == yielding_cands.len();
+            if !has_direct_fallback && is_last {
+                self.emit_yielding_fn_call_exprs(cand, arg_vars.clone(), call_dst.clone());
+                self.seal_bb(MirTerminator::Goto(join_bb), join_bb, false);
+            } else {
+                let call_bb = self.alloc_bb();
+                let next_bb = self.alloc_bb();
+                let cond = MirExpr::new(
+                    MirExprKind::Binary {
+                        op: MirBinOp::Eq,
+                        lhs: Box::new(MirExpr::new(MirExprKind::Var(fp_tmp), fp_ty.clone())),
+                        rhs: Box::new(MirExpr::new(
+                            MirExprKind::FnAddr(cand.clone()),
+                            fp_ty.clone(),
+                        )),
+                    },
+                    MirType::Bool,
+                );
+                self.seal_bb(
+                    MirTerminator::Branch {
+                        cond,
+                        then_bb: call_bb,
+                        else_bb: next_bb,
+                    },
+                    call_bb,
+                    false,
+                );
+                self.emit_yielding_fn_call_exprs(cand, arg_vars.clone(), call_dst.clone());
+                self.seal_bb(MirTerminator::Goto(join_bb), next_bb, false);
+            }
+        }
+
+        if has_direct_fallback {
+            let callee_name = self.vars[fp_tmp.0].name.clone();
+            let call_expr = MirExpr::new(
+                MirExprKind::CallDirect {
+                    callee: callee_name,
+                    is_extern_c: true,
+                    args: arg_vars,
+                },
+                env_ty.clone(),
+            );
+            if let Some(vid) = dst_vid_opt {
+                self.cur_stmts.push(MirStmt::Assign {
+                    target: MirPlace::Var(vid),
+                    op: MirAssignOp::Assign,
+                    value: call_expr,
+                });
+            } else {
+                self.cur_stmts.push(MirStmt::Expr(call_expr));
+            }
+            self.seal_bb(MirTerminator::Goto(join_bb), join_bb, false);
+        }
+
+        if let Some(vid) = dst_vid_opt {
+            Ok(MirExpr::new(MirExprKind::Var(vid), env_ty))
+        } else {
+            Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void))
         }
     }
 

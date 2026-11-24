@@ -37,6 +37,8 @@ impl Analyzer {
             recorded_byte_ring_ops: Vec::new(),
             recorded_watch_writes: Vec::new(),
             fn_ptr_value_sites: Vec::new(),
+            noyield_fn_ptr_spans: BTreeSet::new(),
+            plain_indirect_call_sites: Vec::new(),
             extern_callback_arg_spans: BTreeSet::new(),
             spawned_task_field_endpoints: BTreeMap::new(),
             prim_escaping_ref_params: BTreeMap::new(),
@@ -565,6 +567,56 @@ impl Analyzer {
                     actual
                 ),
             ));
+        } else if matches!(
+            (actual, expected),
+            (
+                Ty::FnPtr {
+                    kind: FnPtrKind::Plain,
+                    params: pa,
+                    ret: ra,
+                    error_spec: ea,
+                },
+                Ty::FnPtr {
+                    kind: FnPtrKind::NoYield,
+                    params: pb,
+                    ret: rb,
+                    error_spec: eb,
+                }
+            ) if ea == eb && pa == pb && ra == rb
+        ) {
+            self.emit(
+                Diagnostic::new(
+                    DiagnosticKind::YieldInNoYield,
+                    span,
+                    format!(
+                        "cannot assign plain '{}' pointer to '{}': plain `fn(...)` pointers may target yielding functions",
+                        actual, expected
+                    ),
+                )
+                .with_note("declare the source pointer or parameter as `noyield fn(...)`, or assign a non-yielding / `SoftYielding` function directly"),
+            );
+        } else if matches!(
+            (actual, expected),
+            (
+                Ty::FnPtr {
+                    kind: FnPtrKind::Plain,
+                    error_spec,
+                    ..
+                },
+                Ty::Ptr(inner)
+            ) if inner.is_void() && !error_spec.is_fallible()
+        ) {
+            self.emit(
+                Diagnostic::new(
+                    DiagnosticKind::YieldInNoYield,
+                    span,
+                    format!(
+                        "cannot convert plain '{}' pointer to '*void': plain `fn(...)` pointers may target yielding functions",
+                        actual
+                    ),
+                )
+                .with_note("declare the pointer as `noyield fn(...)` for C / opaque `*void` callbacks"),
+            );
         } else if matches!(
             (actual, expected),
             (
@@ -1817,6 +1869,23 @@ impl Analyzer {
         }
 
         let params = self.resolve_params(&f.params, &f.name.name, !f.is_extern_c);
+        if f.is_extern_c {
+            for param in &params {
+                if let Some(plain_ty) = ty_contains_plain_fn_ptr(&param.ty, &self.structs) {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldingCallbackToExternC,
+                            param.span,
+                            format!(
+                                "extern \"C\" parameter '{}' of '{}' contains plain '{}' pointer; C callbacks must use 'noyield fn(...)'",
+                                param.name, f.name.name, plain_ty
+                            ),
+                        )
+                        .with_note("replace `fn(...)` with `noyield fn(...)` on callbacks crossed with C stack frames"),
+                    );
+                }
+            }
+        }
         let callable_kind = if f.is_extern_c {
             CallableKind::ExternCFn
         } else {
@@ -2183,6 +2252,7 @@ impl Analyzer {
                 params,
                 ret,
                 error_spec,
+                is_noyield,
             } => {
                 let ps = params.iter().map(|p| self.resolve_type(p)).collect();
                 let r = self.resolve_type(ret);
@@ -2216,6 +2286,11 @@ impl Analyzer {
                     params: ps,
                     ret: Box::new(r),
                     error_spec: Box::new(resolved_err),
+                    kind: if *is_noyield {
+                        FnPtrKind::NoYield
+                    } else {
+                        FnPtrKind::Plain
+                    },
                 }
             }
         }
@@ -2491,6 +2566,104 @@ impl Analyzer {
     // ─────────────────────────────────────────────────────────────────────────
 
     pub(super) fn run_whole_program_verification(&mut self) {
+        // 0. Collect whole-program candidate sets `C(sig)` for plain `fn(sig)` pointers and wire
+        //    indirect call edges into `self.call_graph` before yield/cycle inference so indirect
+        //    blocking chains and `E0012` indirect yielding cycles are resolved uniformly.
+        let mut plain_candidates: HashMap<FnPtrSigKey, BTreeSet<String>> = HashMap::new();
+        for site in &self.fn_ptr_value_sites {
+            let is_direct_extern_arg =
+                self.extern_callback_arg_spans
+                    .iter()
+                    .any(|&(pidx, es, ee)| {
+                        pidx == site.prog_idx && site.span.start >= es && site.span.end <= ee
+                    });
+            let is_noyield_target = self.noyield_fn_ptr_spans.iter().any(|&(pidx, ns, ne)| {
+                pidx == site.prog_idx && site.span.start >= ns && site.span.end <= ne
+            });
+            if is_direct_extern_arg || is_noyield_target {
+                continue;
+            }
+            if let Some(fn_info) = self.functions.get(&site.fn_name) {
+                let sig: FnPtrSigKey = (
+                    fn_info.params.iter().map(|p| p.ty.clone()).collect(),
+                    fn_info.ret_ty.clone(),
+                    fn_info.error_spec.clone(),
+                );
+                plain_candidates
+                    .entry(sig)
+                    .or_default()
+                    .insert(site.fn_name.clone());
+            }
+        }
+
+        let indirect_sites = self.plain_indirect_call_sites.clone();
+        for site in &indirect_sites {
+            if site.ctx.in_isr {
+                let isr_name = site.caller.strip_prefix("isr::").unwrap_or(&site.caller);
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::YieldInIsr,
+                        site.span,
+                        format!(
+                            "cannot call plain function pointer '{}' inside ISR '{}'",
+                            site.sig_display, isr_name
+                        ),
+                    )
+                    .with_file(site.file.clone())
+                    .with_note("plain `fn(...)` pointers may invoke yielding functions; declare the pointer as `noyield fn(...)` or call a non-yielding function directly"),
+                );
+            } else if site.ctx.in_critical {
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::YieldInCritical,
+                        site.span,
+                        format!(
+                            "cannot call plain function pointer '{}' inside 'critical' block (IRQs are masked)",
+                            site.sig_display
+                        ),
+                    )
+                    .with_file(site.file.clone())
+                    .with_note("plain `fn(...)` pointers may invoke yielding functions; declare the pointer as `noyield fn(...)`"),
+                );
+            } else if site.ctx.in_defer {
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::YieldInNoYield,
+                        site.span,
+                        format!(
+                            "cannot call plain function pointer '{}' inside 'defer' cleanup statement",
+                            site.sig_display
+                        ),
+                    )
+                    .with_file(site.file.clone())
+                    .with_note("`defer` statements execute synchronously on scope exit; use `noyield fn(...)` for deferred callbacks"),
+                );
+            } else if site.ctx.in_noyield {
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::YieldInNoYield,
+                        site.span,
+                        format!(
+                            "cannot call plain function pointer '{}' inside 'noyield' scope",
+                            site.sig_display
+                        ),
+                    )
+                    .with_file(site.file.clone())
+                    .with_note("plain `fn(...)` pointers may target hard-blocking functions; declare the pointer as `noyield fn(...)` to allow calling inside `noyield`"),
+                );
+            } else if let Some(cands) = plain_candidates.get(&site.sig) {
+                for cand in cands {
+                    self.call_graph.add_edge(CallEdge {
+                        caller: site.caller.clone(),
+                        caller_kind: site.caller_kind,
+                        callee: cand.clone(),
+                        span: site.span,
+                        ctx: site.ctx,
+                    });
+                }
+            }
+        }
+
         self.call_graph.infer_yields();
 
         // 1. Check all recorded call edges against `isr`, `critical`, `defer`, `noyield`, and boot-spawn contexts.
@@ -2525,6 +2698,20 @@ impl Analyzer {
                         .with_file(caller_file.clone())
                         .with_note(note),
                     );
+                } else if callee_node.calls_plain_fnptr {
+                    let isr_name = edge.caller.strip_prefix("isr::").unwrap_or(&edge.caller);
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInIsr,
+                            edge.span,
+                            format!(
+                                "cannot call '{}' inside ISR '{}' because it invokes a plain function pointer",
+                                edge.callee, isr_name
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note("plain `fn(...)` pointers may invoke yielding functions; use `noyield fn(...)` instead"),
+                    );
                 }
             } else if edge.ctx.in_critical {
                 if callee_node.any_yield_effect.can_yield() {
@@ -2548,6 +2735,19 @@ impl Analyzer {
                         )
                         .with_file(caller_file.clone())
                         .with_note(note),
+                    );
+                } else if callee_node.calls_plain_fnptr {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInCritical,
+                            edge.span,
+                            format!(
+                                "cannot call '{}' inside 'critical' block because it invokes a plain function pointer",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note("plain `fn(...)` pointers may invoke yielding functions; use `noyield fn(...)` instead"),
                     );
                 }
             } else if edge.ctx.in_defer {
@@ -2573,29 +2773,57 @@ impl Analyzer {
                         .with_file(caller_file.clone())
                         .with_note(note),
                     );
+                } else if callee_node.calls_plain_fnptr {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            edge.span,
+                            format!(
+                                "cannot call '{}' inside 'defer' cleanup statement because it invokes a plain function pointer",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note("plain `fn(...)` pointers may invoke yielding functions; use `noyield fn(...)` instead"),
+                    );
                 }
-            } else if edge.ctx.in_noyield && callee_node.effect == FnEffect::HardBlocking {
-                let caller_disp = edge.caller.strip_prefix("task::").unwrap_or(&edge.caller);
-                let sub_chain = self
-                    .call_graph
-                    .shortest_hard_yield_chain(&edge.callee)
-                    .join(" -> ");
-                let note = format!(
-                    "yield chain: noyield block in {} -> {}; move hard-blocking calls outside `noyield {{ ... }}` (`SoftYielding` functions that only call `checkpoint()` ARE allowed inside `noyield`)",
-                    caller_disp, sub_chain
-                );
-                self.emit(
-                    Diagnostic::new(
-                        DiagnosticKind::YieldInNoYield,
-                        edge.span,
-                        format!(
-                            "cannot call hard-blocking function '{}' inside 'noyield' scope",
-                            edge.callee
-                        ),
-                    )
-                    .with_file(caller_file.clone())
-                    .with_note(note),
-                );
+            } else if edge.ctx.in_noyield {
+                if callee_node.effect == FnEffect::HardBlocking {
+                    let caller_disp = edge.caller.strip_prefix("task::").unwrap_or(&edge.caller);
+                    let sub_chain = self
+                        .call_graph
+                        .shortest_hard_yield_chain(&edge.callee)
+                        .join(" -> ");
+                    let note = format!(
+                        "yield chain: noyield block in {} -> {}; move hard-blocking calls outside `noyield {{ ... }}` (`SoftYielding` functions that only call `checkpoint()` ARE allowed inside `noyield`)",
+                        caller_disp, sub_chain
+                    );
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            edge.span,
+                            format!(
+                                "cannot call hard-blocking function '{}' inside 'noyield' scope",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note(note),
+                    );
+                } else if callee_node.calls_plain_fnptr {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            edge.span,
+                            format!(
+                                "cannot call '{}' inside 'noyield' scope because it invokes a plain function pointer",
+                                edge.callee
+                            ),
+                        )
+                        .with_file(caller_file.clone())
+                        .with_note("plain `fn(...)` pointers may target hard-blocking functions; use `noyield fn(...)` instead"),
+                    );
+                }
             }
 
             // 1b. Boot-only `spawns_in_boot` call-site checks.
@@ -2890,12 +3118,16 @@ impl Analyzer {
             }
         }
 
-        // 2b. Check general function-pointer value sites (locals, fields, args, returns, generics):
-        //     - Hard-blocking targets are rejected with shortest blocking chain ("not yet supported through function pointers").
-        //     - Soft-yielding targets are seeded in `noyield` mode so pointer calls target `{fn}__noyield`.
+        // 2b. Check general function-pointer value sites:
+        //     - `noyield fn(...)` sites reject `HardBlocking` targets (`E0003` with shortest chain)
+        //       and seed `SoftYielding` targets into `soft_yielding_in_noyield`.
+        //     - Plain `fn(...)` sites allow `HardBlocking` targets and seed `SoftYielding` targets
+        //       into `soft_yielding_in_coro` (for cooperative `@__syn_fn_step_*` dispatch).
         let fn_ptr_sites = self.fn_ptr_value_sites.clone();
         let extern_arg_spans = self.extern_callback_arg_spans.clone();
-        let mut soft_fn_ptr_targets = BTreeSet::new();
+        let noyield_spans = self.noyield_fn_ptr_spans.clone();
+        let mut soft_noyield_targets = BTreeSet::new();
+        let mut soft_coro_targets = BTreeSet::new();
         for site in &fn_ptr_sites {
             let is_direct_extern_arg = extern_arg_spans.iter().any(|&(pidx, es, ee)| {
                 pidx == site.prog_idx && site.span.start >= es && site.span.end <= ee
@@ -2903,37 +3135,44 @@ impl Analyzer {
             if is_direct_extern_arg {
                 continue;
             }
+            let is_noyield_target = noyield_spans.iter().any(|&(pidx, ns, ne)| {
+                pidx == site.prog_idx && site.span.start >= ns && site.span.end <= ne
+            });
             let Some(node) = self.call_graph.nodes.get(&site.fn_name).cloned() else {
                 continue;
             };
-            match node.effect {
-                FnEffect::HardBlocking => {
-                    let disp = self
-                        .display_names
-                        .get(&site.fn_name)
-                        .cloned()
-                        .unwrap_or_else(|| site.fn_name.clone());
-                    let chain = self
-                        .call_graph
-                        .shortest_hard_yield_chain(&site.fn_name)
-                        .join(" -> ");
-                    self.emit(
-                        Diagnostic::new(
-                            DiagnosticKind::YieldInNoYield,
-                            site.span,
-                            format!(
-                                "hard-blocking function '{}' is not yet supported through function pointers",
-                                disp
-                            ),
-                        )
-                        .with_file(site.file.clone())
-                        .with_note(format!("shortest blocking chain: {}", chain)),
-                    );
+            if is_noyield_target {
+                match node.effect {
+                    FnEffect::HardBlocking => {
+                        let disp = self
+                            .display_names
+                            .get(&site.fn_name)
+                            .cloned()
+                            .unwrap_or_else(|| site.fn_name.clone());
+                        let chain = self
+                            .call_graph
+                            .shortest_hard_yield_chain(&site.fn_name)
+                            .join(" -> ");
+                        self.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::YieldInNoYield,
+                                site.span,
+                                format!(
+                                    "cannot assign hard-blocking function '{}' to 'noyield fn' pointer",
+                                    disp
+                                ),
+                            )
+                            .with_file(site.file.clone())
+                            .with_note(format!("shortest blocking chain: {}", chain)),
+                        );
+                    }
+                    FnEffect::SoftYielding => {
+                        soft_noyield_targets.insert(site.fn_name.clone());
+                    }
+                    FnEffect::NonYielding => {}
                 }
-                FnEffect::SoftYielding => {
-                    soft_fn_ptr_targets.insert(site.fn_name.clone());
-                }
-                FnEffect::NonYielding => {}
+            } else if node.effect == FnEffect::SoftYielding {
+                soft_coro_targets.insert(site.fn_name.clone());
             }
         }
 
@@ -3007,7 +3246,7 @@ impl Analyzer {
         // 5. Compute 3-tier `SoftYielding` coroutine vs `noyield` dual specializations.
         let (soft_coro, soft_ny, dual_spec) = self
             .call_graph
-            .compute_soft_specializations(&soft_fn_ptr_targets);
+            .compute_soft_specializations(&soft_noyield_targets, &soft_coro_targets);
         self.soft_yielding_in_coro = soft_coro;
         self.soft_yielding_in_noyield = soft_ny;
         self.dual_specialized_fns = dual_spec;

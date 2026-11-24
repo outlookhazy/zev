@@ -521,6 +521,7 @@ impl<'a> ScanCtx<'a> {
                 params,
                 ret,
                 error_spec,
+                ..
             } => {
                 for p in params {
                     self.record_prim_types_in_ty(p, seen_structs);
@@ -632,11 +633,13 @@ impl<'a> ScanCtx<'a> {
             MirFmtChunk::Int { value, .. }
             | MirFmtChunk::Float { value, .. }
             | MirFmtChunk::Bool(value)
+            | MirFmtChunk::PaddedBool { value, .. }
             | MirFmtChunk::Str(value)
             | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
             | MirFmtChunk::PaddedBytes { slice: value, .. }
             | MirFmtChunk::EnumName { value, .. }
+            | MirFmtChunk::PaddedEnumName { value, .. }
             | MirFmtChunk::DebugSlice { slice: value, .. } => {
                 self.visit_expr(value, in_isr, callees);
             }
@@ -760,6 +763,7 @@ impl<'a> ScanCtx<'a> {
                                     params,
                                     ret,
                                     error_spec,
+                                    ..
                                 } => {
                                     Some((params.clone(), (**ret).clone(), (**error_spec).clone()))
                                 }
@@ -2528,11 +2532,13 @@ impl VarUsageInfo {
             MirFmtChunk::Int { value, .. }
             | MirFmtChunk::Float { value, .. }
             | MirFmtChunk::Bool(value)
+            | MirFmtChunk::PaddedBool { value, .. }
             | MirFmtChunk::Str(value)
             | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
             | MirFmtChunk::PaddedBytes { slice: value, .. }
             | MirFmtChunk::EnumName { value, .. }
+            | MirFmtChunk::PaddedEnumName { value, .. }
             | MirFmtChunk::DebugSlice { slice: value, .. } => self.visit_expr(value),
         }
     }
@@ -3274,11 +3280,13 @@ fn fmt_chunk_reads_var(ch: &MirFmtChunk, target: VarId) -> bool {
         MirFmtChunk::Int { value, .. }
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
+        | MirFmtChunk::PaddedBool { value, .. }
         | MirFmtChunk::Str(value)
         | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
         | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::PaddedEnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => expr_reads_var(value, target),
     }
 }
@@ -3434,11 +3442,13 @@ fn subst_fmt_chunk(ch: &mut MirFmtChunk, target: VarId, repl: &MirExpr) {
         MirFmtChunk::Int { value, .. }
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
+        | MirFmtChunk::PaddedBool { value, .. }
         | MirFmtChunk::Str(value)
         | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
         | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::PaddedEnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => subst_expr(value, target, repl),
     }
 }
@@ -4066,11 +4076,13 @@ fn collect_fn_addrs_and_calls_fmt(
         MirFmtChunk::Int { value, .. }
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
+        | MirFmtChunk::PaddedBool { value, .. }
         | MirFmtChunk::Str(value)
         | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
         | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::PaddedEnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => {
             collect_fn_addrs_and_calls_expr(value, addr_taken_fns, call_sites);
         }
@@ -5376,6 +5388,33 @@ pub fn prune_unreachable_functions(module: &mut MirModule) {
         item.kind == crate::ir::MonomorphizedItemKind::Struct
             || reachable.contains(&item.mangled_name)
     });
+    let extern_names: BTreeSet<&str> = module.extern_fns.iter().map(|e| e.name.as_str()).collect();
+    let bp_names: BTreeSet<&str> = module
+        .task_blueprints
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    let isr_names: BTreeSet<&str> = module.isrs.iter().map(|i| i.name.as_str()).collect();
+    module.indirect_call_sites.retain_mut(|site| {
+        let caller_alive = if site.caller == "main" {
+            module.boot.present || bp_names.contains("main")
+        } else if let Some(fname) = site.caller.strip_prefix("fn ") {
+            reachable.contains(fname)
+        } else if let Some(tname) = site.caller.strip_prefix("task ") {
+            bp_names.contains(tname)
+        } else if let Some(iname) = site.caller.strip_prefix("isr ") {
+            isr_names.contains(iname)
+        } else {
+            true
+        };
+        if !caller_alive {
+            return false;
+        }
+        site.candidates
+            .retain(|c| reachable.contains(c) || extern_names.contains(c.as_str()));
+        site.yielding_candidates.retain(|c| reachable.contains(c));
+        true
+    });
     if module.boot.from_main_entry {
         prune_unused_imported_globals(module);
     }
@@ -5407,6 +5446,7 @@ mod tests {
             spawned_tasks: vec![],
             dual_specialized_fns: vec![],
             monomorphized_instances: vec![],
+            indirect_call_sites: vec![],
             formatted_enums: vec![],
             boot: MirBootSequence {
                 present: true,
@@ -7164,6 +7204,7 @@ mod tests {
         let mut mir = empty_module();
         let port_ptr = MirType::Ptr(Box::new(MirType::Struct("SerialPort".to_string())));
         let fn_ptr_ty = MirType::FnPtr {
+            is_noyield: true,
             params: vec![],
             ret: Box::new(MirType::Void),
             error_spec: Box::new(MirErrorSpec::None),
@@ -7364,6 +7405,7 @@ mod tests {
                         MirStmt::Expr(MirExpr::new(
                             MirExprKind::FnAddr("cb_taken".to_string()),
                             MirType::FnPtr {
+                                is_noyield: true,
                                 params: vec![port_ptr.clone()],
                                 ret: Box::new(MirType::Void),
                                 error_spec: Box::new(MirErrorSpec::None),
@@ -7725,11 +7767,13 @@ mod tests {
     fn b_h1_indirect_fnptr_and_const_prim_init_visibility() {
         let mut mir = empty_module();
         let fn_void_ty = MirType::FnPtr {
+            is_noyield: true,
             params: vec![MirType::U32],
             ret: Box::new(MirType::Void),
             error_spec: Box::new(MirErrorSpec::None),
         };
         let fn_other_ty = MirType::FnPtr {
+            is_noyield: true,
             params: vec![MirType::U8, MirType::U8],
             ret: Box::new(MirType::Void),
             error_spec: Box::new(MirErrorSpec::None),

@@ -70,6 +70,10 @@ pub struct CallNode {
     /// Shortest witness chain explaining why `can_yield` is true
     /// (e.g. `["log_fault()", "write_page()", "checkpoint() [yields here]"]`).
     pub yield_chain: Vec<String>,
+    /// Site info if this callable directly invokes a plain (potentially yielding) `fn(...)` pointer.
+    pub direct_plain_fnptr: Option<(Span, String)>,
+    /// True if this callable directly or transitively invokes a plain `fn(...)` pointer.
+    pub calls_plain_fnptr: bool,
     pub span: Span,
 }
 
@@ -106,9 +110,28 @@ impl CallGraph {
                 attaches_in_boot: false,
                 attach_chain: Vec::new(),
                 yield_chain: Vec::new(),
+                direct_plain_fnptr: None,
+                calls_plain_fnptr: false,
                 span,
             },
         );
+    }
+
+    pub fn mark_direct_plain_fnptr_call(
+        &mut self,
+        name: &str,
+        span: Span,
+        sig_desc: impl Into<String>,
+    ) {
+        if let Some(node) = self.nodes.get_mut(name) {
+            if node.kind == CallableKind::ExternCFn {
+                return;
+            }
+            if node.direct_plain_fnptr.is_none() {
+                node.direct_plain_fnptr = Some((span, sig_desc.into()));
+            }
+            node.calls_plain_fnptr = true;
+        }
     }
 
     pub fn mark_direct_yield(&mut self, name: &str, tier: FnEffect, reason: impl Into<String>) {
@@ -187,10 +210,12 @@ impl CallGraph {
                 node.effect = FnEffect::NonYielding;
                 node.any_yield_effect = FnEffect::NonYielding;
                 node.can_yield = false;
+                node.calls_plain_fnptr = false;
             } else {
                 node.effect = node.direct_effect;
                 node.any_yield_effect = node.direct_effect;
                 node.can_yield = node.effect.can_yield();
+                node.calls_plain_fnptr = node.direct_plain_fnptr.is_some();
             }
         }
 
@@ -199,10 +224,15 @@ impl CallGraph {
         loop {
             let mut changed = false;
             for edge in &self.edges {
-                let Some((callee_eff, callee_any_eff, callee_spawns)) = self
-                    .nodes
-                    .get(&edge.callee)
-                    .map(|c| (c.effect, c.any_yield_effect, c.spawns_in_boot))
+                let Some((callee_eff, callee_any_eff, callee_spawns, callee_plain_fp)) =
+                    self.nodes.get(&edge.callee).map(|c| {
+                        (
+                            c.effect,
+                            c.any_yield_effect,
+                            c.spawns_in_boot,
+                            c.calls_plain_fnptr,
+                        )
+                    })
                 else {
                     continue;
                 };
@@ -227,6 +257,14 @@ impl CallGraph {
                     let next_any = caller.any_yield_effect.max(callee_any_eff);
                     if next_any != caller.any_yield_effect {
                         caller.any_yield_effect = next_any;
+                        changed = true;
+                    }
+
+                    if callee_plain_fp
+                        && caller.kind == CallableKind::Fn
+                        && !caller.calls_plain_fnptr
+                    {
+                        caller.calls_plain_fnptr = true;
                         changed = true;
                     }
 
@@ -285,11 +323,12 @@ impl CallGraph {
     }
 
     /// Compute `(soft_yielding_in_coro, soft_yielding_in_noyield, dual_specialized_fns)` via 2-state
-    /// `(node, Coro | NoYield)` reachability from `main`, all `task`s, uncalled root `fn`s, and
-    /// function-pointer targets (which invoke the non-yielding specialization).
+    /// `(node, Coro | NoYield)` reachability from `main`, all `task`s, uncalled root `fn`s,
+    /// `noyield fn` targets (invoking `{f}__noyield`), and plain `fn` targets (invoking coroutines).
     pub fn compute_soft_specializations(
         &self,
-        fn_ptr_targets: &BTreeSet<String>,
+        noyield_fn_ptr_targets: &BTreeSet<String>,
+        coro_fn_ptr_targets: &BTreeSet<String>,
     ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
         #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
         enum ExecMode {
@@ -323,7 +362,18 @@ impl CallGraph {
         let mut soft_in_coro = BTreeSet::new();
         let mut soft_in_noyield = BTreeSet::new();
 
-        for fname in fn_ptr_targets {
+        for fname in coro_fn_ptr_targets {
+            if let Some(node) = self.nodes.get(fname.as_str()) {
+                if node.kind == CallableKind::Fn && node.effect == FnEffect::SoftYielding {
+                    soft_in_coro.insert(node.name.clone());
+                    if visited.insert((node.name.as_str(), ExecMode::Coro)) {
+                        queue.push_back((node.name.as_str(), ExecMode::Coro));
+                    }
+                }
+            }
+        }
+
+        for fname in noyield_fn_ptr_targets {
             if let Some(node) = self.nodes.get(fname.as_str()) {
                 if node.kind == CallableKind::Fn && node.effect == FnEffect::SoftYielding {
                     soft_in_noyield.insert(node.name.clone());

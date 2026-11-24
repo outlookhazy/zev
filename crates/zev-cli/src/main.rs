@@ -9,8 +9,8 @@ mod svd;
 
 use cli::{parse_args, Command, HELP_TEXT};
 use diag::{
-    format_check_human_ok, primary_doc_cmd, render_check_json_err, render_check_json_ok_with_tasks,
-    JsonDiag, SourceFile, TaskRunSummary,
+    format_check_human_ok, primary_doc_cmd, render_check_json_err, render_check_json_ok_full,
+    IndirectCallSiteSummary, JsonDiag, SourceFile, TaskRunSummary,
 };
 use runner::TempWorkDir;
 use std::collections::{HashMap, HashSet};
@@ -525,6 +525,10 @@ fn execute_check_command(
     let verified_files = bundle.programs.len();
     let dual_vec: Vec<String> = bundle.sema.dual_specialized_fns.iter().cloned().collect();
     if json {
+        let primary_file = files
+            .first()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
         let task_runs: Vec<TaskRunSummary> = mir
             .ram_report
             .spawned_tasks
@@ -538,9 +542,25 @@ fn execute_check_command(
                 max_run_blocks: t.max_run_blocks,
             })
             .collect();
+        let indirect_sites: Vec<IndirectCallSiteSummary> = mir
+            .ram_report
+            .indirect_call_sites
+            .iter()
+            .map(|s| IndirectCallSiteSummary {
+                caller: s.caller.clone(),
+                file: primary_file.clone(),
+                line: s.span.line as usize,
+                col: s.span.col as usize,
+                signature: s.signature.clone(),
+                is_noyield: s.is_noyield,
+                candidates: s.candidates.clone(),
+                frame_bytes_32: s.frame_bytes_32,
+                frame_bytes_64: s.frame_bytes_64,
+            })
+            .collect();
         CheckExecOutcome {
             exit_code: ExitCode::SUCCESS,
-            stdout: Some(render_check_json_ok_with_tasks(
+            stdout: Some(render_check_json_ok_full(
                 verified_files,
                 bundle.sema.spawned_tasks.len(),
                 bundle.sema.primitives.len(),
@@ -548,6 +568,7 @@ fn execute_check_command(
                 &dual_vec,
                 &bundle.sema.monomorphized_instances,
                 &task_runs,
+                &indirect_sites,
             )),
             stderr: None,
         }
@@ -2046,7 +2067,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diag::render_check_json_ok;
+    use crate::diag::{render_check_json_ok, render_check_json_ok_with_tasks};
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -6722,7 +6743,7 @@ fn main() {
             r2.contains("\x08 \x08"),
             "expected BS erase echo sequence in {r2:?}"
         );
-        assert!(r2.contains("u=12\nok\r\n> "), "unexpected {r2:?}");
+        assert!(r2.contains("u=12\r\nok\r\n> "), "unexpected {r2:?}");
         assert!(
             !r2.starts_with("\x08"),
             "BS/DEL at col 0 must not emit erase: {r2:?}"
@@ -6737,8 +6758,8 @@ fn main() {
         // 4. Bare CR, then split CRLF across two chunks
         stdin.write_all(b"u 7\ru 8\r").unwrap();
         stdin.flush().unwrap();
-        let r4a = read_until(&mut acc, b"u=8\nok\r\n> ");
-        assert!(r4a.contains("u=7\nok\r\n> "), "bare CR failed: {r4a:?}");
+        let r4a = read_until(&mut acc, b"u=8\r\nok\r\n> ");
+        assert!(r4a.contains("u=7\r\nok\r\n> "), "bare CR failed: {r4a:?}");
 
         // Now send the trailing `\n` from CRLF followed by `u 9\n`
         stdin.write_all(b"\nu 9\n").unwrap();
@@ -6748,7 +6769,10 @@ fn main() {
             !r4b.starts_with("\r\n> "),
             "CRLF tail emitted spurious prompt: {r4b:?}"
         );
-        assert!(r4b.contains("u=9\nok\r\n> "), "split CRLF failed: {r4b:?}");
+        assert!(
+            r4b.contains("u=9\r\nok\r\n> "),
+            "split CRLF failed: {r4b:?}"
+        );
 
         // 5. >64B line overflow + BS while overflowed, then clean next command
         let mut long_line = vec![b'u', b' '];
@@ -6766,7 +6790,7 @@ fn main() {
         stdin.flush().unwrap();
         let r5b = read_until(&mut acc, b"> ");
         assert!(
-            r5b.contains("u=55\nok\r\n> "),
+            r5b.contains("u=55\r\nok\r\n> "),
             "next line after overflow corrupted: {r5b:?}"
         );
 
@@ -6820,7 +6844,7 @@ fn main() {
             "echo off leaked prompt on u=33: {r7b:?}"
         );
         assert!(
-            r7b.contains("u=33\nok\r\nok\r\n> "),
+            r7b.contains("u=33\r\nok\r\nok\r\n> "),
             "echo off/on failed: {r7b:?}"
         );
 
@@ -6897,5 +6921,822 @@ fn main() {
         .expect("15-char command within 16B custom buffer must succeed");
         let c_out = String::from_utf8_lossy(&c_tr2).replace("\r\n", "\n");
         assert!(c_out.contains("say=ok16\nok\n"), "c_out={c_out:?}");
+    }
+
+    #[test]
+    fn item9_yielding_shell_handlers_const_table_widening_and_crlf_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-item9-shell").unwrap();
+        let src = r#"
+import board;
+import hal.i2c as i2c;
+import std.io as io;
+import std.shell as shell;
+
+fn fast_add(u32 a, u32 b) -> u32 {
+    return a + b;
+}
+
+fn soft_double(u32 x) -> u32 {
+    checkpoint();
+    return x * 2u32;
+}
+
+fn apply_fast(fn(u32, u32) -> u32 f, u32 a, u32 b) -> u32 {
+    return f(a, b);
+}
+
+fn cmd_led(*shell.Session s, []u8 args) error shell.Err {
+    bool on = shell.arg_bool(args, 0) catch { error Usage; };
+    board.set_led(on);
+    println(s, f"led={on}");
+}
+
+fn cmd_scan(*shell.Session s, []u8 _args) error shell.Err {
+    delay(1ms);
+    i2c.Bus bus = board.default_i2c();
+    bool ack = bus.probe_7bit(0x3Cu8) or false;
+    noyield fn(u32) -> u32 ny = soft_double;
+    fn(u32) -> u32 widened = ny;
+    u32 w = widened(7u32);
+    u32 z = apply_fast(fast_add, 3u32, 5u32);
+    println(s, f"scan=0x3c ack={ack} w={w} z={z}");
+}
+
+const [2]shell.Cmd CMDS = [
+    shell.Cmd { name: "led",  help: "led on|off",      run: cmd_led  },
+    shell.Cmd { name: "scan", help: "delay+i2c probe", run: cmd_scan },
+];
+
+fn main() {
+    board.init();
+    io.DuplexStream console = board.console_open();
+    spawn shell.serve(console, CMDS) @normal;
+}
+"#;
+        let app_path = temp.dir.join("item9_shell.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        // 1. `zevc check --json` reports yielding and 0 B non-yielding indirect call sites.
+        let check_res = execute_check_command(
+            std::slice::from_ref(&app_path),
+            &[],
+            Some("lm3s6965_evb"),
+            None,
+            true,
+        );
+        assert_eq!(check_res.exit_code, ExitCode::SUCCESS);
+        let check_json = check_res.stdout.expect("check json");
+        assert!(
+            check_json.contains("\"indirect_call_sites\""),
+            "missing indirect_call_sites in check json:\n{check_json}"
+        );
+        assert!(
+            check_json.contains("\"caller\": \"fn std_shell__Session__poll_once\"")
+                && check_json.contains("\"candidates\": [\"cmd_led\", \"cmd_scan\"]")
+                && check_json.contains("\"frame_bytes_32\": 140"),
+            "missing shell handler candidates in check json:\n{check_json}"
+        );
+        assert!(
+            check_json.contains("\"caller\": \"fn apply_fast\"")
+                && check_json.contains("\"candidates\": [\"fast_add\"]")
+                && check_json.contains("\"frame_bytes_32\": 0"),
+            "expected zero-cost non-yielding indirect site for apply_fast:\n{check_json}"
+        );
+
+        // 2. `zevc ram --board lm3s6965_evb` Section 8 reports union frame sizes and 0 B direct fallback.
+        match execute_ram_command_with_spec(
+            std::slice::from_ref(&app_path),
+            &[],
+            None,
+            Some("lm3s6965_evb"),
+            None,
+            None,
+        ) {
+            RamExecOutcome::Output {
+                text,
+                within_budget,
+            } => {
+                assert!(within_budget, "{text}");
+                assert!(
+                    text.contains("8. Indirect Function-Pointer Call Sites"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("std_shell__Session__poll_once")
+                        && text.contains("candidates [cmd_led, cmd_scan] (union frame:"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("apply_fast")
+                        && text.contains("candidates [fast_add] (0 B frame, direct call)"),
+                    "{text}"
+                );
+            }
+            _ => panic!("expected ram output"),
+        }
+
+        let cmds = vec![
+            "help".to_string(),
+            "led on".to_string(),
+            "scan".to_string(),
+            "echo off".to_string(),
+            "scan".to_string(),
+            "echo on".to_string(),
+        ];
+        let verify_raw_crlf = |bytes: &[u8], tag: &str| {
+            let s = String::from_utf8_lossy(bytes);
+            assert!(
+                s.contains("  scan         delay+i2c probe\r\nok\r\n"),
+                "{tag} help CRLF missing: {s:?}"
+            );
+            assert!(
+                s.contains("led=true\r\nok\r\n"),
+                "{tag} led CRLF missing: {s:?}"
+            );
+            assert!(
+                s.contains("scan=0x3c ack=false w=14 z=8\r\nok\r\n"),
+                "{tag} scan CRLF missing: {s:?}"
+            );
+            // Verify zero bare `\n` emitted through Session.write (`std.shell` or `println(s, ...)`).
+            assert!(
+                !s.contains("scan=0x3c ack=false w=14 z=8\n") && !s.contains("led=true\n"),
+                "{tag} bare LF leaked from Session.write: {s:?}"
+            );
+        };
+        let timeout = std::time::Duration::from_millis(5_000);
+
+        // 3. Host `--sanitize` scripted run
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let mut h_child = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+        let mut h_tr = Vec::new();
+        script_runner::run_script_on_child_to(&mut h_child, &cmds, timeout, &mut h_tr)
+            .expect("host scripted item9 shell run");
+        verify_raw_crlf(&h_tr, "host");
+
+        // 4. QEMU `lm3s6965_evb` scripted run
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("item9_shell_qemu.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let mut q_child = zev_codegen_llvm::spawn_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+            true,
+        )
+        .unwrap();
+        let mut q_tr = Vec::new();
+        script_runner::run_script_on_child_to(&mut q_child, &cmds, timeout, &mut q_tr)
+            .expect("qemu scripted item9 shell run");
+        verify_raw_crlf(&q_tr, "qemu");
+    }
+
+    #[test]
+    fn item9_periodic_task_stays_on_schedule_during_large_shell_write_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-item9-sched-flood").unwrap();
+
+        // Part A: Custom DuplexStream with byte_ring<16> TX drained slowly at 4 B/ms.
+        // Printing 160 B (>10x TX ring) forces repeated `Session.write` yields via `wait_write()`
+        // while `heartbeat` continues firing every 5ms on schedule.
+        let paced_src = r#"
+import board;
+import std.io as io;
+import std.shell as shell;
+
+byte_ring<32> sim_rx;
+byte_ring<16> sim_tx;
+byte_ring<256> out_cap;
+signal tx_kick;
+signal drain_stop;
+watch<u32> beats = 0;
+
+fn paced_flush(*byte_ring _tx) {
+    tx_kick.notify();
+}
+
+fn cmd_burst(*shell.Session s, []u8 _args) error shell.Err {
+    u32 b0 = beats.read();
+    for (u32 k in 0..4) {
+        println(s, "0123456789abcdef0123456789abcdef012345");
+    }
+    u32 b1 = beats.read();
+    assert(b1 >= b0 + 5u32);
+    println(s, f"beats_delta_ok={b1 >= b0 + 5u32} b0={b0} b1={b1}");
+}
+
+const [1]shell.Cmd CMDS = [
+    shell.Cmd { name: "burst", help: "10x ring write", run: cmd_burst },
+];
+
+task heartbeat() {
+    u32 n = 0;
+    loop every 5ms {
+        n += 1u32;
+        beats.publish(n);
+    }
+}
+
+task uart_tx_drain() {
+    loop {
+        if (sim_tx.is_empty()) {
+            tx_kick.wait(timeout: 5ms) catch { };
+        }
+        for (u32 _j in 0..4) {
+            u8 b = sim_tx.try_pop_byte() catch { break; };
+            bool _ok = out_cap.push_byte(b);
+        }
+        delay(1ms);
+    }
+}
+
+task shell_driver() {
+    io.DuplexStream port = io.DuplexStream { rx: &sim_rx, tx: &sim_tx, flush: paced_flush };
+    [32]u8 lbuf;
+    shell.Session sess = shell.Session.make(port, lbuf);
+    sess.begin();
+    bool _p = sim_rx.push("burst\n") > 0usize;
+    sess.poll_once(CMDS);
+    // Wait briefly for remaining TX bytes to drain from sim_tx.
+    while (!sim_tx.is_empty()) {
+        delay(1ms);
+    }
+    delay(2ms);
+    [256]u8 rec;
+    usize n = out_cap.pop(rec);
+    []u8 view = rec[0..n];
+    assert(n > 180usize);
+    // Check CRLF translation on shell lines without emitting bare LF.
+    bool saw_crlf = false;
+    bool saw_ok = false;
+    for (usize i in 0..n) {
+        if (i + 1usize < n && view[i] == 13u8 && view[i + 1usize] == 10u8) {
+            saw_crlf = true;
+        }
+        if (i + 4usize <= n
+            && view[i] == 'o'
+            && view[i + 1usize] == 'k'
+            && view[i + 2usize] == 13u8
+            && view[i + 3usize] == 10u8)
+        {
+            saw_ok = true;
+        }
+        if (view[i] == 10u8) {
+            assert(i > 0usize && view[i - 1usize] == 13u8);
+        }
+    }
+    assert(saw_crlf);
+    assert(saw_ok);
+    println("[PASS] PACED_SHELL_FLOOD_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    board.init();
+    spawn heartbeat() @normal;
+    spawn uart_tx_drain() @normal;
+    spawn shell_driver() @low;
+}
+"#;
+        let paced_path = temp.dir.join("paced_flood.zev");
+        std::fs::write(&paced_path, paced_src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, paced_h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&paced_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let paced_h_ll =
+            zev_codegen_llvm::emit_llvm_ir_with_options(&paced_h_mir, &host_opts).unwrap();
+        let (h_code, h_out) =
+            runner::compile_and_run_host_llvm_output(&paced_h_ll, true, &[]).unwrap();
+        assert_eq!(h_code, 0, "host paced flood failed:\n{h_out}");
+        assert!(h_out.contains("[PASS] PACED_SHELL_FLOOD_OK"), "{h_out}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, paced_q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&paced_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let q_res = zev_codegen_llvm::run_qemu_cortex_m(
+            &paced_q_mir,
+            &temp.dir.join("paced_flood_qemu.elf"),
+            &qemu_opts,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            q_res.exec.exit_code, 0,
+            "qemu paced flood failed:\n{}",
+            q_res.exec.stdout
+        );
+        assert!(
+            q_res.exec.stdout.contains("[PASS] PACED_SHELL_FLOOD_OK"),
+            "{}",
+            q_res.exec.stdout
+        );
+
+        // Part B: Full `board.console_open()` + `shell.serve` writing >10x console ring (1,280+ B).
+        let console_src = r#"
+import board;
+import std.io as io;
+import std.shell as shell;
+
+watch<u32> ticks = 0;
+
+task periodic() {
+    u32 n = 0;
+    loop every 5ms {
+        n += 1u32;
+        ticks.publish(n);
+    }
+}
+
+fn cmd_flood(*shell.Session s, []u8 _args) error shell.Err {
+    for (u32 i in 0..16) {
+        println(s, f"ROW={i:02} 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc");
+    }
+    println(s, f"ticks={ticks.read()}");
+}
+
+const [1]shell.Cmd CMDS = [
+    shell.Cmd { name: "flood", help: "10x console ring flood", run: cmd_flood },
+];
+
+fn main() {
+    board.init();
+    io.DuplexStream console = board.console_open();
+    spawn periodic() @normal;
+    spawn shell.serve(console, CMDS) @low;
+}
+"#;
+        let con_path = temp.dir.join("con_flood.zev");
+        std::fs::write(&con_path, console_src).unwrap();
+        let flood_cmds = vec!["flood".to_string()];
+        let timeout = std::time::Duration::from_millis(5_000);
+        let check_flood = |bytes: &[u8], tag: &str| {
+            let s = String::from_utf8_lossy(bytes);
+            for i in 0..16 {
+                let pat = format!(
+                    "ROW={i:02} 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc\r\n"
+                );
+                assert!(s.contains(&pat), "{tag} missing row {i}:\n{s}");
+            }
+            assert!(s.contains("ticks="), "{tag} missing ticks: {s}");
+            assert!(s.contains("\r\nok\r\n"), "{tag} missing ok CRLF: {s}");
+        };
+
+        let (_, con_h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&con_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let con_h_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&con_h_mir, &host_opts).unwrap();
+        let con_h_bin = runner::compile_host_llvm_binary(&temp, &con_h_ll, true).unwrap();
+        let mut con_h_child = runner::spawn_host_llvm_binary(&con_h_bin, &[]).unwrap();
+        let mut con_h_tr = Vec::new();
+        script_runner::run_script_on_child_to(
+            &mut con_h_child,
+            &flood_cmds,
+            timeout,
+            &mut con_h_tr,
+        )
+        .expect("host 10x console flood");
+        check_flood(&con_h_tr, "host_console");
+
+        let (_, con_q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&con_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let con_q_elf = zev_codegen_llvm::build_elf(
+            &con_q_mir,
+            &temp.dir.join("con_flood_qemu.elf"),
+            &qemu_opts,
+        )
+        .unwrap();
+        let mut con_q_child = zev_codegen_llvm::spawn_elf_in_qemu(
+            &con_q_elf.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+            true,
+        )
+        .unwrap();
+        let mut con_q_tr = Vec::new();
+        script_runner::run_script_on_child_to(
+            &mut con_q_child,
+            &flood_cmds,
+            timeout,
+            &mut con_q_tr,
+        )
+        .expect("qemu 10x console flood");
+        check_flood(&con_q_tr, "qemu_console");
+    }
+
+    #[test]
+    fn item9_indirect_yield_defer_restart_and_wait_timeout_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-item9-control").unwrap();
+        let src = r#"
+import board;
+
+enum OpErr {
+    Abort,
+}
+
+inbox<u8, 64> trace_log;
+watch<u32> restarts = 0;
+signal start_restart;
+signal start_wait;
+signal wake_sig;
+signal restart_done;
+signal wait_done;
+
+fn tag(u8 ch) {
+    bool _ok = trace_log.try_send(ch);
+}
+
+fn ind_ok() error OpErr {
+    defer { tag('2'); }
+    delay(2ms);
+    return;
+}
+
+fn ind_fail() error OpErr {
+    defer { tag('3'); }
+    delay(2ms);
+    error Abort;
+}
+
+fn ind_wait_arm() error OpErr {
+    defer { tag('W'); }
+    wait {
+        wake_sig.wait() => { tag('S'); },
+        timeout(6ms) => { tag('T'); },
+    }
+    return;
+}
+
+fn run_with_defer(fn() error OpErr op, bool early_ret) error OpErr {
+    defer { tag('O'); }
+    {
+        defer { tag('I'); }
+        op() catch (OpErr e) {
+            tag('E');
+            error e;
+        };
+        if (early_ret) {
+            return;
+        }
+    }
+    tag('X');
+}
+
+task restart_worker() {
+    if (restarts.read() == 0u32) {
+        start_restart.wait();
+    }
+    u32 uninit_acc;
+    u32 init_acc = 11u32;
+    defer { tag('R'); }
+    fn() error OpErr op = ind_ok;
+    op() catch { };
+    u32 r = restarts.read();
+    if (r == 0u32) {
+        assert(uninit_acc == 0u32);
+        assert(init_acc == 11u32);
+        uninit_acc = 55u32;
+        init_acc = 99u32;
+        restarts.publish(1u32);
+        restart;
+    }
+    assert(uninit_acc == 0u32);
+    assert(init_acc == 11u32);
+    restart_done.notify();
+    loop {
+        delay(50ms);
+    }
+}
+
+task wait_worker() {
+    start_wait.wait();
+    fn() error OpErr wf = ind_wait_arm;
+    // First wait times out at +6ms ('T', then defer 'W').
+    wf() catch { };
+    // Second wait begins at +8ms with 6ms timeout (expires at +14ms); coordinator wakes at +10ms ('S', 'W').
+    delay(2ms);
+    wf() catch { };
+    wait_done.notify();
+    loop {
+        delay(50ms);
+    }
+}
+
+task coordinator() {
+    // 1. Defer LIFO on yielding indirect normal return: '2', 'I', 'O'.
+    run_with_defer(ind_ok, true) catch { assert(false); };
+    // 2. Defer LIFO on yielding indirect error propagation: '3', 'E', 'I', 'O'.
+    bool saw_err = false;
+    run_with_defer(ind_fail, false) catch (OpErr _e) { saw_err = true; };
+    assert(saw_err);
+
+    // 3. Drive restart + wait/timeout across indirect yielding calls deterministically.
+    start_restart.notify();
+    restart_done.wait();
+    start_wait.notify();
+    delay(10ms);
+    wake_sig.notify();
+    wait_done.wait();
+
+    [64]u8 buf;
+    usize n = 0usize;
+    for (usize _i in 0..64) {
+        u8 ch = trace_log.try_recv() catch { break; };
+        buf[n] = ch;
+        n += 1usize;
+    }
+    []u8 seq = buf[0..n];
+    // Deterministic trace: "2IO" + "3EIO" + "2R2" + "TWSW"
+    assert(n >= 14usize);
+    assert(seq[0..14] == "2IO3EIO2R2TWSW");
+    println(f"[PASS] ITEM9_CONTROL_OK:{seq}");
+    sys.exit(0);
+}
+
+fn main() {
+    board.init();
+    spawn restart_worker() @normal;
+    spawn wait_worker() @normal;
+    spawn coordinator() @low;
+}
+"#;
+        let app_path = temp.dir.join("item9_control.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let h_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&h_mir, &host_opts).unwrap();
+        let (h_code, h_out) = runner::compile_and_run_host_llvm_output(&h_ll, true, &[]).unwrap();
+        assert_eq!(h_code, 0, "host control failed:\n{h_out}");
+        assert!(h_out.contains("[PASS] ITEM9_CONTROL_OK:2IO3EIO"), "{h_out}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let q_res = zev_codegen_llvm::run_qemu_cortex_m(
+            &q_mir,
+            &temp.dir.join("item9_control_qemu.elf"),
+            &qemu_opts,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            q_res.exec.exit_code, 0,
+            "qemu control:\n{}",
+            q_res.exec.stdout
+        );
+        assert!(
+            q_res
+                .exec
+                .stdout
+                .contains("[PASS] ITEM9_CONTROL_OK:2IO3EIO"),
+            "{}",
+            q_res.exec.stdout
+        );
+    }
+
+    #[test]
+    fn item9_padded_bool_and_enum_all_sinks_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-item9-pad-be").unwrap();
+        let src = r#"
+import board;
+
+enum Mode {
+    Idle,
+    Running,
+}
+
+byte_ring<128> out_ring;
+
+struct MemSink {
+    [128]u8 buf;
+    usize len;
+}
+
+impl MemSink {
+    pub fn write(*self, []u8 bytes) {
+        for (u8 b in bytes) {
+            if (self.len < 128) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+
+    fn view(*self) -> []u8 {
+        return self.buf[0..self.len];
+    }
+}
+
+struct YieldSink {
+    [128]u8 buf;
+    usize len;
+}
+
+impl YieldSink {
+    pub fn write(*self, []u8 bytes) {
+        if (bytes.len > 0) {
+            delay(1ms);
+        }
+        for (u8 b in bytes) {
+            if (self.len < 128) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+
+    fn view(*self) -> []u8 {
+        return self.buf[0..self.len];
+    }
+}
+
+signal ys_done;
+
+fn check_non_yielding() {
+    bool t = true;
+    bool f = false;
+    Mode m0 = Mode.Idle;
+    Mode m1 = Mode.Running;
+    []u8 expected = "  true|false |00true|Idle     |  Running|Idle|0000Idle";
+
+    // Proven-fit without `or`/`catch`: 6+1+6+1+6+1+9+1+9+1+7+1+8 = 52 <= 64
+    [64]u8 fb;
+    []u8 fb_out = fmt_buf(
+        fb,
+        f"{t:>6}|{f:<6}|{t:0>6}|{m0:<9}|{m1:>9}|{m0:>3}|{m0:0>8}"
+    );
+    assert(fb_out == expected);
+
+    usize rn = fmt_ring(
+        &out_ring,
+        f"{t:>6}|{f:<6}|{t:0>6}|{m0:<9}|{m1:>9}|{m0:>3}|{m0:0>8}"
+    ) or 0;
+    assert(rn == expected.len);
+    [128]u8 rtmp;
+    usize popped = out_ring.pop(rtmp);
+    assert(rtmp[0..popped] == expected);
+
+    MemSink ms;
+    ms.len = 0;
+    print(
+        ms,
+        f"{t:>6}|{f:<6}|{t:0>6}|{m0:<9}|{m1:>9}|{m0:>3}|{m0:0>8}"
+    );
+    assert(ms.view() == expected);
+
+    println(f"CON:{t:>6}|{f:<6}|{t:0>6}|{m0:<9}|{m1:>9}|{m0:>3}|{m0:0>8}");
+}
+
+task yielding_driver() {
+    bool t = true;
+    bool f = false;
+    Mode m0 = Mode.Idle;
+    Mode m1 = Mode.Running;
+    YieldSink ys;
+    ys.len = 0;
+    print(
+        ys,
+        f"{t:>6}|{f:<6}|{t:0>6}|{m0:<9}|{m1:>9}|{m0:>3}|{m0:0>8}"
+    );
+    assert(ys.view() == "  true|false |00true|Idle     |  Running|Idle|0000Idle");
+    ys_done.notify();
+    loop {
+        delay(50ms);
+    }
+}
+
+task verifier() {
+    ys_done.wait();
+    println("ITEM9_PAD_BOOL_ENUM_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    board.init();
+    check_non_yielding();
+    spawn yielding_driver() @normal;
+    spawn verifier() @low;
+}
+"#;
+        let app_path = temp.dir.join("pad_bool_enum.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        let expected_line = "CON:  true|false |00true|Idle     |  Running|Idle|0000Idle";
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let h_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&h_mir, &host_opts).unwrap();
+        let (h_code, h_out) = runner::compile_and_run_host_llvm_output(&h_ll, true, &[]).unwrap();
+        assert_eq!(h_code, 0, "host padded bool/enum:\n{h_out}");
+        assert!(h_out.contains(expected_line), "{h_out}");
+        assert!(h_out.contains("ITEM9_PAD_BOOL_ENUM_OK"), "{h_out}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let q_res = zev_codegen_llvm::run_qemu_cortex_m(
+            &q_mir,
+            &temp.dir.join("pad_bool_enum_qemu.elf"),
+            &qemu_opts,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            q_res.exec.exit_code, 0,
+            "qemu padded bool/enum:\n{}",
+            q_res.exec.stdout
+        );
+        assert!(
+            q_res.exec.stdout.contains(expected_line),
+            "{}",
+            q_res.exec.stdout
+        );
+        assert!(
+            q_res.exec.stdout.contains("ITEM9_PAD_BOOL_ENUM_OK"),
+            "{}",
+            q_res.exec.stdout
+        );
     }
 }

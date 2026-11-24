@@ -33,11 +33,12 @@ pub enum Ty {
     OsPrimitive(ResolvedOsPrimitive),
     /// Linear, move-only buffer lease `Lease<T>` allocated from a `pool<T, K>`.
     Lease(Box<Ty>),
-    /// Function pointer or function reference (`fn(T1, T2) -> Ret [error E]`).
+    /// Function pointer or function reference (`[noyield] fn(T1, T2) -> Ret [error E]`).
     FnPtr {
         params: Vec<Ty>,
         ret: Box<Ty>,
         error_spec: Box<ResolvedErrorSpec>,
+        kind: FnPtrKind,
     },
     /// Typed MMIO register block layout (`UartRegs`), usable behind pointer `*UartRegs` (`mmio` values cannot be copied by value).
     MmioLayout(String),
@@ -49,6 +50,17 @@ pub enum Ty {
     Namespace(NamespaceKind),
     /// Error recovery sentinel to prevent cascading duplicate diagnostics.
     Error,
+}
+
+/// Calling discipline for a [`Ty::FnPtr`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FnPtrKind {
+    /// Plain `fn(...)` pointer: may target yielding or non-yielding functions.
+    Plain,
+    /// Restricted `noyield fn(...)` pointer: targets cannot hard-block (`SoftYielding` uses `__noyield`).
+    NoYield,
+    /// Direct reference to a named `fn` before coercing to `Plain` or `NoYield`.
+    FnItem,
 }
 
 /// Built-in or user type namespace kinds in receiver position (`sys.use_systick`, `CmdFrame.from_bytes`).
@@ -577,24 +589,40 @@ impl Ty {
                 true
             }
 
-            // Function pointers must match parameter types, return type, and error spec identically
-            // because Zev uses zero-trampoline direct indirect calls with C-compatible ABI signatures.
+            // Function pointers must match parameter types, return type, and error spec identically.
+            // `FnItem` coerces to both `Plain` and `NoYield` (effect-checked in Pass 3);
+            // `noyield fn` widens to `fn`, while `fn` cannot narrow to `noyield fn`.
             (
                 Ty::FnPtr {
                     params: pa,
                     ret: ra,
                     error_spec: ea,
+                    kind: ka,
                 },
                 Ty::FnPtr {
                     params: pb,
                     ret: rb,
                     error_spec: eb,
+                    kind: kb,
                 },
-            ) => ea == eb && pa == pb && ra == rb,
-            // Allow passing a non-fallible function reference to opaque `*void` callback parameter in extern "C".
-            (Ty::FnPtr { error_spec, .. }, Ty::Ptr(inner)) if inner.is_void() => {
-                !error_spec.is_fallible()
+            ) => {
+                ea == eb
+                    && pa == pb
+                    && ra == rb
+                    && matches!(
+                        (ka, kb),
+                        (FnPtrKind::FnItem, _)
+                            | (FnPtrKind::NoYield, _)
+                            | (FnPtrKind::Plain, FnPtrKind::Plain | FnPtrKind::FnItem)
+                    )
             }
+            // Allow passing an infallible non-yielding / function-item reference to opaque `*void` callback parameter in extern "C".
+            (
+                Ty::FnPtr {
+                    kind, error_spec, ..
+                },
+                Ty::Ptr(inner),
+            ) if inner.is_void() => !matches!(kind, FnPtrKind::Plain) && !error_spec.is_fallible(),
 
             _ => false,
         }
@@ -671,8 +699,13 @@ impl fmt::Display for Ty {
                 params,
                 ret,
                 error_spec,
+                kind,
             } => {
-                write!(f, "fn(")?;
+                if *kind == FnPtrKind::NoYield {
+                    write!(f, "noyield fn(")?;
+                } else {
+                    write!(f, "fn(")?;
+                }
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;

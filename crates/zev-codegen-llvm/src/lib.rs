@@ -8264,11 +8264,11 @@ fn main() {
                 return a + b;
             }
             struct Handlers {
-                fn([]u8) -> u32 sum;
-                fn(u32, u32) -> u32 add;
+                noyield fn([]u8) -> u32 sum;
+                noyield fn(u32, u32) -> u32 add;
             }
             task sh() {
-                fn([]u8) -> u32 h = sum_while;
+                noyield fn([]u8) -> u32 h = sum_while;
                 Handlers tbl = Handlers { sum: sum_while, add: add_chk };
                 u32 a = h("AB");
                 u32 b = (tbl.sum)("CD");
@@ -8644,5 +8644,143 @@ fn main() {
             proof.format_table()
         );
         assert!(proof.within_budget, "{}", proof.format_table());
+    }
+
+    #[test]
+    fn item9_stack_high_water_proof_yielding_and_nonyielding_fnptrs() {
+        let root = repo_root();
+        let targets = [
+            (
+                "lm3s6965_evb",
+                32u64,
+                r#"
+import chip.lm3s6965 as hw;
+isr tick_isr(*watch<u32> w) { state u32 c = 0; c += 1; w.publish(c); }
+fn attach_board_isr(*watch<u32> w) { hw.IRQ_UART0.attach(tick_isr(w)); }
+"#,
+            ),
+            (
+                "esp32c6_pico",
+                64u64,
+                r#"
+import chip.esp32c6 as hw;
+isr tick_isr(*watch<u32> w) { state u32 c = 0; c += 1; w.publish(c); }
+fn attach_board_isr(*watch<u32> w) { hw.IRQ_USB_DEVICE.attach(tick_isr(w)); }
+"#,
+            ),
+            (
+                "arduino_uno",
+                2u64,
+                r#"
+import chip.atmega328p as hw;
+isr tick_isr(*watch<u32> w) { state u32 c = 0; c += 1; w.publish(c); }
+fn attach_board_isr(*watch<u32> w) { hw.IRQ_TIMER0_COMPA.attach(tick_isr(w)); }
+"#,
+            ),
+        ];
+
+        for (board_name, hw_oh, isr_part) in targets {
+            let full_src = format!(
+                r#"
+enum CmdErr {{
+    Failed,
+}}
+
+byte_ring<64> rx_ring;
+byte_ring<64> tx_ring;
+watch<u32> ticks = 0;
+
+struct Hook {{
+    noyield fn(*byte_ring) flush;
+}}
+
+struct Cmd {{
+    []u8 name;
+    fn(*Hook, u32) -> u32 error CmdErr run;
+}}
+
+fn flush_byte(*byte_ring tx) {{
+    u8 _b = tx.try_pop_byte() catch {{ 0u8 }};
+}}
+
+fn child_leaf(u32 v) -> u32 {{
+    delay(2ms);
+    return v + 7u32;
+}}
+
+fn cmd_heavy(*Hook hk, u32 x) -> u32 error CmdErr {{
+    [16]u8 scratch;
+    scratch[0] = (x & 0xFFu32) as u8;
+    (hk.flush)(&tx_ring);
+    u32 r = child_leaf(x + (scratch[0] as u32));
+    if (r == 0u32) {{
+        error Failed;
+    }}
+    return r;
+}}
+
+fn cmd_light(*Hook hk, u32 x) -> u32 error CmdErr {{
+    (hk.flush)(&tx_ring);
+    return x + 1u32;
+}}
+
+const [2]Cmd CMDS = [
+    Cmd {{ name: "heavy", run: cmd_heavy }},
+    Cmd {{ name: "light", run: cmd_light }},
+];
+
+{isr_part}
+
+task shell_loop() {{
+    Hook hk = Hook {{ flush: flush_byte }};
+    u32 idx = 0u32;
+    loop {{
+        []u8 _c = rx_ring.wait_read();
+        rx_ring.consume(_c.len);
+        u32 _v = (CMDS[(idx & 1u32) as usize].run)(&hk, idx) catch {{ 0u32 }};
+        idx += 1u32;
+    }}
+}}
+
+fn main() {{
+    attach_board_isr(&ticks);
+    spawn shell_loop() @normal;
+}}
+"#
+            );
+            let spec = TargetSpec::resolve(None, Some(board_name)).expect("board spec");
+            let opts = CodegenOptions::from_spec(spec.clone());
+            let prog = zev_parser::parse_str_named(&full_src, "item9_stack.zev")
+                .expect("parse item9 stack test");
+            let aopts = zev_sema::AnalyzeOptions {
+                include_dirs: vec![root.clone()],
+                hal_dir: spec.hal_dir.clone(),
+                board_module: spec.board_module.clone(),
+                target_ptr_bits: spec.isa.ptr_bits(),
+                target_name: spec.chip_name.clone(),
+                ..zev_sema::AnalyzeOptions::default()
+            };
+            let (mono_progs, _) =
+                zev_sema::analyze_and_monomorphize_named_programs(&[(&prog, None)], &aopts)
+                    .into_result()
+                    .unwrap_or_else(|d| panic!("{board_name} sema failed: {d:#?}"));
+            let mir = zev_mir::lower_programs(&mono_progs)
+                .unwrap_or_else(|e| panic!("{board_name} MIR failed: {e:?}"));
+            let proof =
+                analyze_hardware_stack_high_water(&mir, &opts).expect("stack high-water proof");
+            assert!(
+                !proof.has_cycle,
+                "{board_name}: unexpected cycle in stack proof:\n{}",
+                proof.format_table()
+            );
+            assert!(
+                proof.within_budget,
+                "{board_name}: over budget:\n{}",
+                proof.format_table()
+            );
+            assert_eq!(proof.isr_hw_overhead_bytes, hw_oh);
+            assert!(proof.sched_task_stack_bytes > 0);
+            assert!(proof.worst_isr_stack_bytes >= hw_oh);
+        }
     }
 }

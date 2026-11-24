@@ -3078,6 +3078,22 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{call_kw} void @__syn_fmt_bool(ptr {sink}, i8 {b8})"
                 ));
             }
+            MirFmtChunk::PaddedBool { value, pad } => {
+                let vv = self.emit_expr(value)?;
+                let b1 = self.coerce_to_i1(vv);
+                let t_idx = self.ctx.intern_string("true");
+                let f_idx = self.ctx.intern_string("false");
+                let sp = self.next_tmp();
+                self.emit_line(format!(
+                    "{sp} = select i1 {b1}, ptr @.str.{t_idx}, ptr @.str.{f_idx}"
+                ));
+                let w = i32::from(pad.width);
+                let la = i32::from(pad.left_align);
+                let fill = if pad.zero_pad { 48 } else { 32 };
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_fmt_cstr_pad(ptr {sink}, ptr {sp}, i32 {w}, i8 {la}, i8 {fill})"
+                ));
+            }
             MirFmtChunk::Str(value) => {
                 let vv = self.emit_expr(value)?;
                 let p = self.coerce_str_ptr(vv);
@@ -3137,6 +3153,26 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 self.emit_line(format!(
                     "{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {np})"
+                ));
+            }
+            MirFmtChunk::PaddedEnumName {
+                enum_name,
+                value,
+                pad,
+            } => {
+                let vv = self.emit_expr(value)?;
+                let v32 = self.coerce(vv, "i32", true);
+                let eid = sanitize_ident(enum_name);
+                let np = self.next_tmp();
+                self.emit_line(format!(
+                    "{np} = {call_kw} ptr @__syn_enum_name_{eid}(i32 {})",
+                    v32.repr
+                ));
+                let w = i32::from(pad.width);
+                let la = i32::from(pad.left_align);
+                let fill = if pad.zero_pad { 48 } else { 32 };
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_fmt_cstr_pad(ptr {sink}, ptr {np}, i32 {w}, i8 {la}, i8 {fill})"
                 ));
             }
             MirFmtChunk::DebugSlice { elem_ty, slice } => {

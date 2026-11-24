@@ -296,8 +296,12 @@ fn clamp<T>(T val, T lo, T hi) -> T {
   (pass `-I <dir>` for custom roots).
 
 ## 5. Function-Pointer Types & `error` Clause Binding
-- Function-pointer types use `fn(Arg1, Arg2) [-> Ret] [error [E]]` and may be stored in locals, struct fields,
-  and `.rodata` `const` tables (e.g., `const fn(u8) -> u8 F = inc;`).
+- Function-pointer types use `[noyield] fn(Arg1, Arg2) [-> Ret] [error [E]]` and may be stored in locals,
+  struct fields, and `.rodata` `const` tables (e.g., `const fn(u8) -> u8 F = inc;`).
+- Plain `fn(...)` pointers may target matching functions of any effect (including `HardBlocking`) and yield
+  cooperatively at indirect call sites; `noyield fn(...)` forbids `HardBlocking` targets, runs `SoftYielding`
+  targets via their direct non-yielding specialization, widens implicitly to `fn(...)`, and is required in
+  `noyield` / `critical` / `isr` / `defer`, `extern \"C\"` parameters, and `sys.set_*` hooks.
 - `error` binds to the innermost `fn(...)` type being parsed. When a **fallible function** returns an **infallible
   function pointer**, parenthesize the pointer type so `error E` binds to the outer function:
   - `fn pick() -> fn(u8) -> u8 error E` returns a *fallible* function pointer (`fn() -> (fn(u8) -> u8 error E)`).
@@ -453,8 +457,14 @@ fn main() {
    - In normal `task` flow, runs as a union-packed coroutine sharing the CPU smoothly.
    - Inside `noyield { ... }`, **auto-specializes a direct `0 B`-`.bss` stack clone** (`{fn}__noyield`,
      checkpoints stripped) reported transparently in `zevc ram` and `zevc check --json`!
-   - Function pointers referencing a `SoftYielding` function point to `{fn}__noyield` and execute
-     without sharing the CPU (`HardBlocking` functions are not yet supported through function pointers).
+   - Function pointers:
+     - Plain `fn(...)` pointers may target `NonYielding`, `SoftYielding`, or `HardBlocking` functions. Each indirect
+       call site reserves a disjoint union coroutine frame over its whole-program per-signature candidate set
+       (reported per call site in `zevc ram` Section 8 and `zevc check --json` `indirect_call_sites`), falling back to
+       a `0 B` direct indirect call when no candidate yields; legal only where hard-blocking calls are permitted.
+     - `noyield fn(...)` pointers forbid `HardBlocking` targets, specialize `SoftYielding` targets to their direct
+       stack-only clone, widen implicitly to plain `fn(...)`, and are required in `noyield` / `critical` / `isr` /
+       `defer`, `extern \"C\"`, and `sys.set_*` hooks.
    - Still **forbidden** inside `critical`, `isr`, `defer`, and `extern \"C\"` callbacks (`E0003`–`E0006`).
 3. **`HardBlocking`**: Awaits external events or time (`delay`, `wait { ... }`, `inbox.recv`/`send`,
    `watch.wait_change`, `signal.wait`, `ping_pong.wait_chunk`, `byte_ring.wait_read`, `pool.alloc`,
@@ -687,26 +697,26 @@ format-string parser, zero global handler registry):
     `enum` variant names (`.rodata` emitted only for formatted enums!).
   - `{v:x}` / `{v:X}` / `{v:04x}` — Hexadecimal with optional zero-padded width; `{v:b}` / `{v:08b}` — Binary.
   - `{v:>5}` / `{s:<12}` / `{v:05}` / `{v:0>5}` / `{v:>6x}` / `{v:>8b}` — Width, `<`/`>` alignment,
-    and space/`0` padding for integers and `[]u8`/`[N]u8`/string text on every sink (`E0028` static fit checks account for padded width; values longer than `width` are never truncated).
+    and space/`0` padding for integers, `[]u8`/`[N]u8`/string text, `bool`, and `enum` variant names on every sink (`E0028` static fit checks account for padded width; values longer than `width` are never truncated).
   - `{t:.2}` — Compact (~150 B Arduino-style) fixed-decimal `f32`/`f64` (`\"nan\"`, `\"inf\"`, `\"ovf\"`).
   - `{t:e}` / `{t:.3e}` — Scientific float (linked via `--gc-sections` *only* if `:e` appears in program!).
   - `{pkt:?}` — Compile-time struct field debug expansion (`\"CmdFrame { op: 1, ... }\"`).
 
 ## 1b. Optional Console Input & On-Device Shell (`std.io` / `std.shell`)
 - `board.console_open() -> io.DuplexStream` is optional per board: calling it allocates the board's RX/TX `byte_ring`s, attaches UART/USB interrupts, and routes `println(...)` through the shared TX ring so task output stays line-intact. Programs that do not call `console_open()` pay 0 bytes.
-- `std.shell` provides `Err` (`Usage`, `Unknown`, `LineTooLong`, `Failed`), `Cmd { []u8 name; []u8 help; fn(*Session, []u8) error Err run; }`, `Session` (a `println(s, f\"...\")` sink with `Session.make(port, custom_buf)` / `.begin()` / `.poll_once(cmds)`), `pub task serve(io.DuplexStream port, []Cmd cmds)` (64-byte line buffer, `help`, `echo on|off`, CR/LF/CRLF, BS/DEL), and `arg_u32` / `arg_i32` / `arg_hex` / `arg_bool` / `arg_str`.
+- `std.shell` provides `Err` (`Usage`, `Unknown`, `LineTooLong`, `Failed`), `Cmd { []u8 name; []u8 help; fn(*Session, []u8) error Err run; }` (supporting yielding handlers natively), `Session` (a `println(s, f\"...\")` sink whose `.write()` translates LF -> CRLF without doubling CRLF, with `Session.make(port, custom_buf)` / `.begin()` / `.poll_once(cmds)`), `pub task serve(io.DuplexStream port, []Cmd cmds)` (64-byte line buffer, `help`, `echo on|off`, CR/LF/CRLF, BS/DEL), and `arg_u32` / `arg_i32` / `arg_hex` / `arg_bool` / `arg_str`.
 
 ## 2. Portable Built-Ins, `.zev` BSP Hooks & `sys.*` Namespace
 - `assert(cond);` / `delay(10ms);` / `checkpoint();` / `set_priority(@low);`
 - `sys.use_systick(u32 hz);` — Configures core timer (`12_000_000` on QEMU LM3S, `125_000_000` RP2040, `170_000_000` STM32G4).
 - `sys.tick();` / `sys.tick_ms();` / `sys.tick_by(u32 ms);` — Advances the 1 ms scheduler tick from a pure-`.zev` timer `isr` (e.g., `Timer0` on Uno, `TCB3` on ATmega4809).
 - Explicit OS hooks wired directly from `.zev` `bsp.*` / application code (zero hardcoded board MMIO or magic symbol names in Rust/LLVM):
-  - `sys.set_putc(fn(u8))` — Console output backend for `print` / `println` / `sys.log`.
-  - `sys.set_clock_ms(fn() -> u32)` — Monotonic millisecond hardware clock reader backing `sys.now_ms()`.
-  - `sys.set_exit(fn(i32))` — Target shutdown/reboot handler invoked by `sys.exit(code)`.
-  - `sys.set_fault_handler(fn())` — Hardware fault hook invoked before halt on fatal traps.
-  - `sys.set_idle(fn(u32, u32))` — Idle sleep hook (`(in_sim, sleep_depth)`).
-  - `sys.set_irq_router(fn(u32, u32), fn(u32))` — RISC-V interrupt matrix routing and acknowledge hooks (`route(irq, slot)`, `ack(irq)`).
+  - `sys.set_putc(noyield fn(u8))` — Console output backend for `print` / `println` / `sys.log`.
+  - `sys.set_clock_ms(noyield fn() -> u32)` — Monotonic millisecond hardware clock reader backing `sys.now_ms()`.
+  - `sys.set_exit(noyield fn(i32))` — Target shutdown/reboot handler invoked by `sys.exit(code)`.
+  - `sys.set_fault_handler(noyield fn())` — Hardware fault hook invoked before halt on fatal traps.
+  - `sys.set_idle(noyield fn(u32, u32))` — Idle sleep hook (`(in_sim, sleep_depth)`).
+  - `sys.set_irq_router(noyield fn(u32, u32), noyield fn(u32))` — RISC-V interrupt matrix routing and acknowledge hooks (`route(irq, slot)`, `ack(irq)`).
   - `sys.rom_call_u32` / `sys.rom_call_void` / `sys.rom_call_noreturn` — Stack-bounded external ROM ABI calls (`stack_bound` proved statically via `.stack_sizes`).
 - `sys.now_ms() -> u32` / `sys.now_ticks() -> u32` — Current monotonic millisecond tick counter.
 - `sys.nop();` — Single-cycle CPU no-op barrier for short MMIO settle delays (use `hal.time.spin_us(u32)` for `<50 us` hardware settle delays; DMA sleep-depth clamping is managed automatically by `@dma_safe` `ping_pong` / `pool`).

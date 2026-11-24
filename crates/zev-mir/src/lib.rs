@@ -17,8 +17,8 @@ pub use ir::*;
 pub use lower::{lower_program, lower_programs, MirLowerError};
 pub use ram::{
     collect_dma_layout_structs, compute_ram_report, populate_module_ram_report, ArchRamTotals,
-    ChildSlotRamInfo, DualSpecializedFnRam, FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign,
-    SpawnedTaskRam, TargetAbi, TaskRunKind, VarRamInfo,
+    ChildSlotRamInfo, DualSpecializedFnRam, FrameLayoutReport, IndirectCallSiteRam, PrimitiveRam,
+    RamReport, SizeAlign, SpawnedTaskRam, TargetAbi, TaskRunKind, VarRamInfo,
 };
 pub use zev_ast::{decoded_string_byte_len, decoded_string_bytes};
 
@@ -5097,127 +5097,160 @@ mod tests {
     #[test]
     fn item1_soft_yielding_fnptr_lowers_to_noyield_clone() {
         let sp = Span::dummy();
-        let prog = Program::new(
-            vec![
-                Item {
-                    attrs: vec![],
-                    is_pub: false,
-                    kind: ItemKind::Fn(FnDecl {
+        let make_prog = |is_noyield: bool| {
+            Program::new(
+                vec![
+                    Item {
                         attrs: vec![],
-                        generic_params: vec![],
-                        is_extern_c: false,
-                        is_variadic: false,
-                        name: id("soft_acc"),
-                        params: vec![Param {
-                            ty: ty_prim(PrimType::U32),
-                            name: id("n"),
+                        is_pub: false,
+                        kind: ItemKind::Fn(FnDecl {
+                            attrs: vec![],
+                            generic_params: vec![],
+                            is_extern_c: false,
+                            is_variadic: false,
+                            name: id("soft_acc"),
+                            params: vec![Param {
+                                ty: ty_prim(PrimType::U32),
+                                name: id("n"),
+                                span: sp,
+                            }],
+                            ret_type: ty_prim(PrimType::U32),
+                            error_spec: None,
+                            body: Some(Block::new(
+                                vec![
+                                    Stmt::new(
+                                        StmtKind::While {
+                                            cond: Expr::new(
+                                                ExprKind::Literal(Literal::Bool(false)),
+                                                sp,
+                                            ),
+                                            body: Block::new(vec![], sp),
+                                        },
+                                        sp,
+                                    ),
+                                    Stmt::new(StmtKind::Return(Some(expr_id("n"))), sp),
+                                ],
+                                sp,
+                            )),
                             span: sp,
-                        }],
-                        ret_type: ty_prim(PrimType::U32),
-                        error_spec: None,
-                        body: Some(Block::new(
-                            vec![
-                                Stmt::new(
-                                    StmtKind::While {
-                                        cond: Expr::new(
-                                            ExprKind::Literal(Literal::Bool(false)),
-                                            sp,
-                                        ),
-                                        body: Block::new(vec![], sp),
-                                    },
-                                    sp,
-                                ),
-                                Stmt::new(StmtKind::Return(Some(expr_id("n"))), sp),
-                            ],
-                            sp,
-                        )),
+                        }),
                         span: sp,
-                    }),
-                    span: sp,
-                },
-                Item {
-                    attrs: vec![],
-                    is_pub: false,
-                    kind: ItemKind::Task(TaskDecl {
+                    },
+                    Item {
                         attrs: vec![],
-                        name: id("sh"),
-                        params: vec![],
-                        body: Block::new(
-                            vec![
-                                Stmt::new(
-                                    StmtKind::VarDecl {
-                                        ty: TypeExpr::new(
-                                            TypeKind::FnPtr {
-                                                params: vec![ty_prim(PrimType::U32)],
-                                                ret: Box::new(ty_prim(PrimType::U32)),
-                                                error_spec: None,
-                                            },
-                                            sp,
-                                        ),
-                                        name: id("h"),
-                                        init: Some(expr_id("soft_acc")),
-                                    },
-                                    sp,
-                                ),
-                                Stmt::new(
-                                    StmtKind::Loop {
-                                        body: Block::new(
-                                            vec![Stmt::new(
-                                                StmtKind::VarDecl {
-                                                    ty: ty_prim(PrimType::U32),
-                                                    name: id("x"),
-                                                    init: Some(Expr::new(
-                                                        ExprKind::Call {
-                                                            callee: Box::new(expr_id("h")),
-                                                            generic_args: vec![],
-                                                            args: vec![CallArg {
-                                                                name: None,
-                                                                value: expr_int(5),
-                                                                span: sp,
-                                                            }],
-                                                        },
-                                                        sp,
-                                                    )),
+                        is_pub: false,
+                        kind: ItemKind::Task(TaskDecl {
+                            attrs: vec![],
+                            name: id("sh"),
+                            params: vec![],
+                            body: Block::new(
+                                vec![
+                                    Stmt::new(
+                                        StmtKind::VarDecl {
+                                            ty: TypeExpr::new(
+                                                TypeKind::FnPtr {
+                                                    is_noyield,
+                                                    params: vec![ty_prim(PrimType::U32)],
+                                                    ret: Box::new(ty_prim(PrimType::U32)),
+                                                    error_spec: None,
                                                 },
                                                 sp,
-                                            )],
-                                            sp,
-                                        ),
-                                    },
-                                    sp,
-                                ),
-                            ],
-                            sp,
-                        ),
+                                            ),
+                                            name: id("h"),
+                                            init: Some(expr_id("soft_acc")),
+                                        },
+                                        sp,
+                                    ),
+                                    Stmt::new(
+                                        StmtKind::Loop {
+                                            body: Block::new(
+                                                vec![Stmt::new(
+                                                    StmtKind::VarDecl {
+                                                        ty: ty_prim(PrimType::U32),
+                                                        name: id("x"),
+                                                        init: Some(Expr::new(
+                                                            ExprKind::Call {
+                                                                callee: Box::new(expr_id("h")),
+                                                                generic_args: vec![],
+                                                                args: vec![CallArg {
+                                                                    name: None,
+                                                                    value: expr_int(5),
+                                                                    span: sp,
+                                                                }],
+                                                            },
+                                                            sp,
+                                                        )),
+                                                    },
+                                                    sp,
+                                                )],
+                                                sp,
+                                            ),
+                                        },
+                                        sp,
+                                    ),
+                                ],
+                                sp,
+                            ),
+                            span: sp,
+                        }),
                         span: sp,
-                    }),
-                    span: sp,
-                },
-            ],
-            sp,
-        );
-        let mir = lower_program(&prog).expect("MIR lower");
-        let ny_fn = mir
+                    },
+                ],
+                sp,
+            )
+        };
+
+        // 1. `noyield fn(u32) -> u32`: binds to direct `soft_acc__noyield`, 0 child slots.
+        let mir_ny = lower_program(&make_prog(true)).expect("MIR lower noyield");
+        let ny_fn = mir_ny
             .functions
             .iter()
             .find(|f| f.name == "soft_acc__noyield")
             .expect("soft_acc__noyield Direct fn must be emitted");
         assert!(!ny_fn.is_yielding);
         assert!(matches!(ny_fn.body, MirFnBody::Direct(_)));
-
-        let sh = mir
+        let sh_ny = mir_ny
             .task_blueprints
             .iter()
             .find(|t| t.name == "sh")
             .expect("sh blueprint");
-        let saw_ny_addr = sh
+        assert!(sh_ny.child_slots.is_empty());
+        let saw_ny_addr = sh_ny
             .blocks
             .iter()
             .flat_map(|b| b.stmts.iter())
             .any(|s| format!("{s:?}").contains("FnAddr(\"soft_acc__noyield\")"));
         assert!(
             saw_ny_addr,
-            "task sh must reference soft_acc__noyield FnAddr"
+            "noyield fn must reference soft_acc__noyield FnAddr"
+        );
+
+        // 2. Plain `fn(u32) -> u32`: binds to yielding `soft_acc` and lowers call to CallYielding.
+        let mir_plain = lower_program(&make_prog(false)).expect("MIR lower plain");
+        let coro_fn = mir_plain
+            .functions
+            .iter()
+            .find(|f| f.name == "soft_acc")
+            .expect("soft_acc Coroutine fn must be emitted");
+        assert!(coro_fn.is_yielding);
+        let sh_plain = mir_plain
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "sh")
+            .expect("sh blueprint");
+        assert!(
+            sh_plain.child_slots.iter().any(|s| s.callee == "soft_acc"),
+            "plain fn call must reserve soft_acc child slot: {:?}",
+            sh_plain.child_slots
+        );
+        let saw_plain_addr = sh_plain
+            .blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .any(|s| format!("{s:?}").contains("FnAddr(\"soft_acc\")"));
+        assert!(
+            saw_plain_addr,
+            "plain fn must reference yielding soft_acc FnAddr"
         );
     }
 }

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.tick_by(u32 ms)`, `sys.set_putc(fn(u8))`, `sys.set_clock_ms(fn() -> u32)`, `sys.set_exit(fn(i32))`, `sys.set_fault_handler(fn())`, `sys.set_idle(fn(u32, u32))`, `sys.set_irq_router(fn(u32, u32), fn(u32))`, `sys.rom_call_u32(usize fn_addr, usize stack_bound, ...) -> u32`, `sys.rom_call_void(usize fn_addr, usize stack_bound, ...)`, `sys.rom_call_noreturn(usize fn_addr, ...)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.fuzz_irqs(u32 seed, u32 irq_mask)`, `sys.nop()`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
+pub(super) const VALID_SYS_METHODS_NOTE: &str = "valid portable `sys.*` methods: `sys.use_systick(u32 hz)`, `sys.tick()`, `sys.tick_ms()`, `sys.tick_by(u32 ms)`, `sys.set_putc(noyield fn(u8))`, `sys.set_clock_ms(noyield fn() -> u32)`, `sys.set_exit(noyield fn(i32))`, `sys.set_fault_handler(noyield fn())`, `sys.set_idle(noyield fn(u32, u32))`, `sys.set_irq_router(noyield fn(u32, u32), noyield fn(u32))`, `sys.rom_call_u32(usize fn_addr, usize stack_bound, ...) -> u32`, `sys.rom_call_void(usize fn_addr, usize stack_bound, ...)`, `sys.rom_call_noreturn(usize fn_addr, ...)`, `sys.now_ms() -> u32`, `sys.now_ticks() -> u32`, `sys.current_prio() -> u32`, `sys.sleep_depth() -> u32`, `sys.wfi_count() -> u32`, `sys.trace_sleep(bool on)`, `sys.pend_irq(u32 irq)`, `sys.fuzz_irqs(u32 seed, u32 irq_mask)`, `sys.nop()`, `sys.exit(i32 code)`, `sys.log(*u8 msg)`, `sys.log_kv(*u8 label, i32 val)`, `sys.log_hex(*u8 label, u32 val)`, `sys.delay(dur)`";
 
 pub(super) fn is_string_arg_ty(ty: &Ty) -> bool {
     matches!(ty, Ty::Str)
@@ -164,9 +164,13 @@ pub(super) fn is_valid_cast(src: &Ty, dst: &Ty) -> bool {
         {
             true
         }
-        (Ty::FnPtr { error_spec, .. }, Ty::Ptr(inner)) if inner.is_void() => {
-            !error_spec.is_fallible()
-        }
+        (Ty::FnPtr { .. }, Ty::FnPtr { .. }) => src.is_assignable_to(dst),
+        (
+            Ty::FnPtr {
+                kind, error_spec, ..
+            },
+            Ty::Ptr(inner),
+        ) if inner.is_void() => !matches!(kind, FnPtrKind::Plain) && !error_spec.is_fallible(),
         _ => false,
     }
 }
@@ -347,6 +351,7 @@ pub(super) fn ty_contains_linear_lease(ty: &Ty) -> bool {
             params,
             ret,
             error_spec,
+            ..
         } => {
             params.iter().any(ty_contains_linear_lease)
                 || ty_contains_linear_lease(ret)
@@ -365,6 +370,7 @@ pub(super) fn ty_contains_byval_mmio(ty: &Ty) -> Option<&str> {
             params,
             ret,
             error_spec,
+            ..
         } => params
             .iter()
             .find_map(ty_contains_byval_mmio)
@@ -388,6 +394,7 @@ pub(super) fn ty_contains_bare_unsized_prim(ty: &Ty) -> Option<String> {
             params,
             ret,
             error_spec,
+            ..
         } => params
             .iter()
             .find_map(ty_contains_bare_unsized_prim)
@@ -426,6 +433,7 @@ pub(super) fn ty_contains_byval_subsys<'a>(
             params,
             ret,
             error_spec,
+            ..
         } => params
             .iter()
             .find_map(|p| ty_contains_byval_subsys(p, structs))
@@ -434,6 +442,41 @@ pub(super) fn ty_contains_byval_subsys<'a>(
                 ResolvedErrorSpec::Typed(et) => ty_contains_byval_subsys(et, structs),
                 _ => None,
             }),
+        _ => None,
+    }
+}
+
+pub(super) fn ty_contains_plain_fn_ptr(
+    ty: &Ty,
+    structs: &BTreeMap<String, StructInfo>,
+) -> Option<String> {
+    let mut visited = BTreeSet::new();
+    ty_contains_plain_fn_ptr_inner(ty, structs, &mut visited)
+}
+
+fn ty_contains_plain_fn_ptr_inner(
+    ty: &Ty,
+    structs: &BTreeMap<String, StructInfo>,
+    visited: &mut BTreeSet<String>,
+) -> Option<String> {
+    match ty {
+        Ty::FnPtr {
+            kind: FnPtrKind::Plain,
+            ..
+        } => Some(ty.to_string()),
+        Ty::Ptr(inner) | Ty::Slice(inner) | Ty::Lease(inner) | Ty::Array { elem: inner, .. } => {
+            ty_contains_plain_fn_ptr_inner(inner, structs, visited)
+        }
+        Ty::Struct(name) => {
+            if !visited.insert(name.clone()) {
+                return None;
+            }
+            structs.get(name).and_then(|s| {
+                s.fields
+                    .iter()
+                    .find_map(|f| ty_contains_plain_fn_ptr_inner(&f.ty, structs, visited))
+            })
+        }
         _ => None,
     }
 }

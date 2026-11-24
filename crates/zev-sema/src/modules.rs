@@ -1353,6 +1353,7 @@ impl<'a> AstRewriter<'a> {
                 params,
                 ret,
                 error_spec,
+                is_noyield,
             } => TypeKind::FnPtr {
                 params: params.iter().map(|p| self.rewrite_type(p)).collect(),
                 ret: Box::new(self.rewrite_type(ret)),
@@ -1362,6 +1363,7 @@ impl<'a> AstRewriter<'a> {
                         ErrorSpec::Typed(et) => ErrorSpec::Typed(self.rewrite_type(et)),
                     })
                 }),
+                is_noyield: *is_noyield,
             },
         };
         TypeExpr::new(kind, span)
@@ -2086,6 +2088,7 @@ fn check_pub_surface_type(
             params,
             ret,
             error_spec,
+            ..
         } => {
             for p in params {
                 check_pub_surface_type(p, generic_type_params, local_type_is_pub, item_desc, rw);
@@ -2687,14 +2690,17 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
                 params: px,
                 ret: rx,
                 error_spec: ex,
+                is_noyield: nx,
             },
             TypeKind::FnPtr {
                 params: py,
                 ret: ry,
                 error_spec: ey,
+                is_noyield: ny,
             },
         ) => {
-            px.len() == py.len()
+            nx == ny
+                && px.len() == py.len()
                 && px
                     .iter()
                     .zip(py.iter())

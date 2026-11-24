@@ -242,9 +242,15 @@ fn main() { IRQ_0.attach(bad_isr()); }
 
     // ── E0006: YieldingCallbackToExternC ─────────────────────────────────────
     e0006_yielding_callback_passed_to_extern_c(expect_err, DiagnosticKind::YieldingCallbackToExternC) => r#"
-extern "C" fn register_cb(fn(u8) cb);
+extern "C" fn register_cb(noyield fn(u8) cb);
 fn my_cb(u8 b) { checkpoint(); }
 fn main() { register_cb(my_cb); }
+"#;
+
+    e0006_plain_fn_param_in_extern_c_rejected(expect_err, DiagnosticKind::YieldingCallbackToExternC) => r#"
+extern "C" fn register_plain(fn(u8) cb);
+fn fast_cb(u8 _b) {}
+fn main() { register_plain(fast_cb); }
 "#;
 
     e0006_yielding_callback_passed_to_sys_set_putc(expect_err, DiagnosticKind::YieldingCallbackToExternC) => r#"

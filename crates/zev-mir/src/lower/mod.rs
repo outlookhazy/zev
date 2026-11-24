@@ -1,27 +1,27 @@
 //! Lowering pass from `zev_ast::Program` into Coroutine State-Machine & Kernel MIR (`MirModule`).
 
-pub(super) use std::collections::{BTreeMap, BTreeSet, VecDeque};
+pub(super) use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 pub(super) use std::fmt;
 
 pub(super) use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, BuiltinFn, CallArg, CatchClause,
     DurationLit, ErrorSpec, Expr, ExprKind, FnDecl, FormatAlign, FormatPadBase, FormatPart,
-    FormatSpec, GenericArg, IsrDecl, ItemKind, Literal, MmioAccess, MmioDeclKind, MmioRegDecl,
-    OsPrimitiveType, PrimType, Priority, Program, Span, SpawnStmt, Stmt, StmtKind, SwitchPat,
-    SysMethod, TaskDecl, TypeExpr, TypeKind, UnaryOp, SYS_NAMESPACE,
+    FormatSpec, GenericArg, Ident, IsrDecl, ItemKind, Literal, MmioAccess, MmioDeclKind,
+    MmioRegDecl, OsPrimitiveType, PrimType, Priority, Program, Span, SpawnStmt, Stmt, StmtKind,
+    SwitchPat, SysMethod, TaskDecl, TypeExpr, TypeKind, UnaryOp, SYS_NAMESPACE,
 };
 
 pub(super) use crate::ir::{
-    BlockId, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootSequence, MirBootStep,
-    MirCallDst, MirChildCallSlot, MirConst, MirEnum, MirErrorSpec, MirExpr, MirExprKind,
-    MirExternFn, MirField, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction, MirImport, MirIntFmt,
-    MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl, MirIsrStateVar,
-    MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPadSpec, MirPlace,
-    MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirPrimitive,
-    MirPriority, MirSpawnInstance, MirStmt, MirStruct, MirSubsystemGlobal, MirSwitchPattern,
-    MirSysQuery, MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm,
-    MirWaitArmOp, MirWaitTimer, MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem, VarId,
-    VarRole,
+    BlockId, IndirectCallSiteMir, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootSequence,
+    MirBootStep, MirCallDst, MirChildCallSlot, MirConst, MirEnum, MirErrorSpec, MirExpr,
+    MirExprKind, MirExternFn, MirField, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction,
+    MirImport, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl,
+    MirIsrStateVar, MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule,
+    MirPadSpec, MirPlace, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget,
+    MirPrimViewKind, MirPrimitive, MirPriority, MirSpawnInstance, MirStmt, MirStruct,
+    MirSubsystemGlobal, MirSwitchPattern, MirSysQuery, MirTaskBlueprint, MirTerminator, MirType,
+    MirUnaryOp, MirVar, MirWaitArm, MirWaitArmOp, MirWaitTimer, MirYieldKind,
+    MonomorphizedItemKind, MonomorphizedMirItem, VarId, VarRole,
 };
 pub(super) use crate::liveness::{analyze_fn_frame, analyze_isr_frame, analyze_task_frame};
 pub(super) use crate::ram::{populate_module_ram_report, RamReport};
@@ -79,6 +79,49 @@ pub(super) enum ConstVal {
     Bool(bool),
 }
 
+pub(super) type MirFnPtrSigKey = (Vec<MirType>, MirType, MirErrorSpec);
+
+pub(super) fn canonical_mir_fnptr_ty(ty: &MirType) -> MirType {
+    match ty.host_value_type() {
+        MirType::Ptr(inner) => MirType::Ptr(Box::new(canonical_mir_fnptr_ty(&inner))),
+        MirType::Slice(inner) => MirType::Slice(Box::new(canonical_mir_fnptr_ty(&inner))),
+        MirType::Array { elem, len } => MirType::Array {
+            elem: Box::new(canonical_mir_fnptr_ty(&elem)),
+            len,
+        },
+        MirType::FnPtr {
+            params,
+            ret,
+            error_spec,
+            ..
+        } => MirType::FnPtr {
+            is_noyield: false,
+            params: params.iter().map(canonical_mir_fnptr_ty).collect(),
+            ret: Box::new(canonical_mir_fnptr_ty(&ret)),
+            error_spec: Box::new(match *error_spec {
+                MirErrorSpec::Typed(e) => MirErrorSpec::Typed(canonical_mir_fnptr_ty(&e)),
+                other => other,
+            }),
+        },
+        other => other,
+    }
+}
+
+pub(super) fn canonical_mir_fnptr_sig(
+    params: &[MirType],
+    ret: &MirType,
+    error_spec: &MirErrorSpec,
+) -> MirFnPtrSigKey {
+    (
+        params.iter().map(canonical_mir_fnptr_ty).collect(),
+        canonical_mir_fnptr_ty(ret),
+        match error_spec {
+            MirErrorSpec::Typed(e) => MirErrorSpec::Typed(canonical_mir_fnptr_ty(e)),
+            other => other.clone(),
+        },
+    )
+}
+
 /// Global module symbol table used during lowering.
 pub(super) struct ModuleSymbols {
     pub(super) tick_period_us: u64,
@@ -101,6 +144,10 @@ pub(super) struct ModuleSymbols {
     pub(super) soft_yielding_in_noyield: BTreeSet<String>,
     pub(super) dual_specialized_fns: BTreeSet<String>,
     pub(super) boost_capable_fns: BTreeSet<String>,
+    pub(super) plain_direct_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
+    pub(super) noyield_fnptr_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
+    pub(super) sig_has_noyield_widening: HashSet<MirFnPtrSigKey>,
+    pub(super) raw_indirect_call_sites: Vec<(String, Span, MirFnPtrSigKey, String, bool)>,
 }
 
 impl ModuleSymbols {
@@ -287,10 +334,12 @@ impl ModuleSymbols {
             }
             TypeKind::OsPrimitive(op) => MirType::Primitive(self.resolve_os_prim_type(op)),
             TypeKind::FnPtr {
+                is_noyield,
                 params,
                 ret,
                 error_spec,
             } => MirType::FnPtr {
+                is_noyield: *is_noyield,
                 params: params.iter().map(|p| self.resolve_type(p)).collect(),
                 ret: Box::new(self.resolve_type(ret)),
                 error_spec: Box::new(match error_spec.as_deref() {
@@ -491,6 +540,10 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         soft_yielding_in_noyield: BTreeSet::new(),
         dual_specialized_fns: BTreeSet::new(),
         boost_capable_fns: BTreeSet::new(),
+        plain_direct_candidates: HashMap::new(),
+        noyield_fnptr_candidates: HashMap::new(),
+        sig_has_noyield_widening: HashSet::new(),
+        raw_indirect_call_sites: Vec::new(),
     };
 
     let mut mir_imports = Vec::new();
@@ -1133,6 +1186,58 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
 
     let dual_specialized_fns: Vec<String> = syms.dual_specialized_fns.iter().cloned().collect();
     let monomorphized_instances: Vec<MonomorphizedMirItem> = mono_map.into_values().collect();
+    let mut indirect_call_sites = Vec::with_capacity(syms.raw_indirect_call_sites.len());
+    for (caller, span, sig_key, signature, is_noyield) in &syms.raw_indirect_call_sites {
+        let mut cands = BTreeSet::new();
+        let mut yielding_cands = Vec::new();
+        if *is_noyield {
+            if let Some(ny_set) = syms.noyield_fnptr_candidates.get(sig_key) {
+                for c in ny_set {
+                    let is_soft = syms
+                        .fns
+                        .get(c)
+                        .is_some_and(|s| s.effect == MirFnEffect::SoftYielding);
+                    if is_soft && syms.soft_yielding_in_noyield.contains(c) {
+                        cands.insert(format!("{c}__noyield"));
+                    } else {
+                        cands.insert(c.clone());
+                    }
+                }
+            }
+        } else {
+            if let Some(plain_set) = syms.plain_direct_candidates.get(sig_key) {
+                for c in plain_set {
+                    cands.insert(c.clone());
+                    if syms.fns.get(c).is_some_and(|s| s.is_yielding) {
+                        yielding_cands.push(c.clone());
+                    }
+                }
+            }
+            if syms.sig_has_noyield_widening.contains(sig_key) {
+                if let Some(ny_set) = syms.noyield_fnptr_candidates.get(sig_key) {
+                    for c in ny_set {
+                        let is_soft = syms
+                            .fns
+                            .get(c)
+                            .is_some_and(|s| s.effect == MirFnEffect::SoftYielding);
+                        if is_soft && syms.soft_yielding_in_noyield.contains(c) {
+                            cands.insert(format!("{c}__noyield"));
+                        } else {
+                            cands.insert(c.clone());
+                        }
+                    }
+                }
+            }
+        }
+        indirect_call_sites.push(IndirectCallSiteMir {
+            caller: caller.clone(),
+            span: *span,
+            signature: signature.clone(),
+            is_noyield: *is_noyield,
+            candidates: cands.into_iter().collect(),
+            yielding_candidates: yielding_cands,
+        });
+    }
     let formatted_enums =
         collect_formatted_enums(&mir_isrs, &mir_functions, &mir_blueprints, &boot);
 
@@ -1155,6 +1260,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         spawned_tasks,
         dual_specialized_fns,
         monomorphized_instances,
+        indirect_call_sites,
         formatted_enums,
         boot,
         visibility: crate::opt::VisibilityReport::default(),

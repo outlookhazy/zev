@@ -182,6 +182,23 @@ pub(super) fn infer_effects_and_specializations(
         );
     }
 
+    // Discover per-signature plain vs `noyield` function-pointer candidates and indirect call sites
+    // BEFORE fixed-point effect inference so calling a plain `fn(...)` pointer propagates candidate
+    // yield effects and soft-yielding functions specialize per calling convention.
+    let fp_scan = scan_program_fnptrs(program_items, syms);
+    for (caller_key, sig_key, in_noyield, in_restricted) in &fp_scan.plain_indirect_call_edges {
+        if let Some(cands) = fp_scan.plain_direct_candidates.get(sig_key) {
+            for cand in cands {
+                edges.push(RawCallEdge {
+                    caller: caller_key.clone(),
+                    callee: cand.clone(),
+                    in_noyield: *in_noyield,
+                    in_restricted: *in_restricted,
+                });
+            }
+        }
+    }
+
     let mut cur_eff = direct_eff;
     let mut spawns_in_boot = direct_spawns;
     loop {
@@ -274,42 +291,30 @@ pub(super) fn infer_effects_and_specializations(
     let mut soft_in_coro = BTreeSet::new();
     let mut soft_in_noyield = BTreeSet::new();
 
-    // Soft-yielding functions referenced as function-pointer values invoke their
-    // non-yielding specialization (`__noyield`) across all indirect call sites.
-    let mut fn_value_refs = BTreeSet::new();
-    for item in program_items {
-        match &item.kind {
-            ItemKind::Const(cd) => {
-                collect_fn_value_refs_expr(&cd.value, &fn_names, &mut fn_value_refs)
-            }
-            ItemKind::OsPrimitive(pd) => {
-                if let Some(ie) = &pd.init {
-                    collect_fn_value_refs_expr(ie, &fn_names, &mut fn_value_refs);
-                }
-            }
-            ItemKind::Isr(id) => {
-                collect_fn_value_refs_stmts(&id.body.stmts, &fn_names, &mut fn_value_refs)
-            }
-            ItemKind::Fn(fd) => {
-                if let Some(b) = &fd.body {
-                    collect_fn_value_refs_stmts(&b.stmts, &fn_names, &mut fn_value_refs);
-                }
-            }
-            ItemKind::Task(td) => {
-                collect_fn_value_refs_stmts(&td.body.stmts, &fn_names, &mut fn_value_refs)
-            }
-            _ => {}
-        }
-    }
-    for fname in fn_value_refs {
+    // Soft-yielding functions coerced to `noyield fn(...)` (or `*void` / bare) invoke their
+    // non-yielding clone (`__noyield`); those assigned directly to plain `fn(...)` invoke their
+    // coroutine step function (`@__syn_fn_step_*`).
+    for fname in fp_scan.noyield_fnptr_candidates.values().flatten() {
         if syms
             .fns
-            .get(&fname)
+            .get(fname)
             .is_some_and(|sig| sig.effect == MirFnEffect::SoftYielding)
         {
             soft_in_noyield.insert(fname.clone());
             if visited.insert((fname.clone(), ExecMode::NoYield)) {
-                queue.push_back((fname, ExecMode::NoYield));
+                queue.push_back((fname.clone(), ExecMode::NoYield));
+            }
+        }
+    }
+    for fname in fp_scan.plain_direct_candidates.values().flatten() {
+        if syms
+            .fns
+            .get(fname)
+            .is_some_and(|sig| sig.effect == MirFnEffect::SoftYielding)
+        {
+            soft_in_coro.insert(fname.clone());
+            if visited.insert((fname.clone(), ExecMode::Coro)) {
+                queue.push_back((fname.clone(), ExecMode::Coro));
             }
         }
     }
@@ -374,181 +379,813 @@ pub(super) fn infer_effects_and_specializations(
     syms.soft_yielding_in_coro = soft_in_coro;
     syms.soft_yielding_in_noyield = soft_in_noyield;
     syms.boost_capable_fns = boost_capable;
+    syms.plain_direct_candidates = fp_scan.plain_direct_candidates;
+    syms.noyield_fnptr_candidates = fp_scan.noyield_fnptr_candidates;
+    syms.sig_has_noyield_widening = fp_scan.sig_has_noyield_widening;
+    syms.raw_indirect_call_sites = fp_scan.raw_indirect_call_sites;
 }
 
-pub(super) fn ast_block_has_break(block: &Block) -> bool {
-    ast_stmts_have_break(&block.stmts)
+struct FnPtrAstScanAcc {
+    plain_direct_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
+    noyield_fnptr_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
+    sig_has_noyield_widening: HashSet<MirFnPtrSigKey>,
+    raw_indirect_call_sites: Vec<(String, Span, MirFnPtrSigKey, String, bool)>,
+    plain_indirect_call_edges: Vec<(String, MirFnPtrSigKey, bool, bool)>,
 }
 
-fn collect_fn_value_refs_stmts(
-    stmts: &[Stmt],
-    fn_names: &BTreeSet<String>,
-    out: &mut BTreeSet<String>,
-) {
-    for stmt in stmts {
-        match &stmt.kind {
-            StmtKind::VarDecl { init: Some(e), .. }
-            | StmtKind::Return(Some(e))
-            | StmtKind::Expr(e) => collect_fn_value_refs_expr(e, fn_names, out),
-            StmtKind::StateVar { init: Some(e), .. } => {
-                collect_fn_value_refs_expr(e, fn_names, out)
+struct FnPtrAstScanner<'a> {
+    syms: &'a ModuleSymbols,
+    caller_display: String,
+    caller_edge_key: String,
+    cur_ret_ty: MirType,
+    scopes: Vec<BTreeMap<String, MirType>>,
+    acc: FnPtrAstScanAcc,
+}
+
+impl<'a> FnPtrAstScanner<'a> {
+    fn new(syms: &'a ModuleSymbols) -> Self {
+        Self {
+            syms,
+            caller_display: String::new(),
+            caller_edge_key: String::new(),
+            cur_ret_ty: MirType::Void,
+            scopes: Vec::new(),
+            acc: FnPtrAstScanAcc {
+                plain_direct_candidates: HashMap::new(),
+                noyield_fnptr_candidates: HashMap::new(),
+                sig_has_noyield_widening: HashSet::new(),
+                raw_indirect_call_sites: Vec::new(),
+                plain_indirect_call_edges: Vec::new(),
+            },
+        }
+    }
+
+    fn push_scope(&mut self) {
+        self.scopes.push(BTreeMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn bind(&mut self, name: &str, ty: MirType) {
+        if let Some(top) = self.scopes.last_mut() {
+            top.insert(name.to_string(), ty);
+        }
+    }
+
+    fn lookup_var(&self, name: &str) -> Option<&MirType> {
+        for frame in self.scopes.iter().rev() {
+            if let Some(ty) = frame.get(name) {
+                return Some(ty);
             }
-            StmtKind::Assign { target, value, .. } => {
-                collect_fn_value_refs_expr(target, fn_names, out);
-                collect_fn_value_refs_expr(value, fn_names, out);
+        }
+        None
+    }
+
+    fn bare_fn_name<'b>(&self, expr: &'b Expr) -> Option<&'b str> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                if self.lookup_var(&id.name).is_none()
+                    && !self.syms.consts.contains_key(&id.name)
+                    && !self.syms.primitives.contains_key(&id.name)
+                    && !self.syms.subsystems.contains_key(&id.name)
+                    && !self.syms.mmio_instances.contains_key(&id.name)
+                    && !self.syms.irqs.contains_key(&id.name)
+                    && !self.syms.enums.contains_key(&id.name)
+                    && self.syms.fns.contains_key(&id.name)
+                {
+                    Some(id.name.as_str())
+                } else {
+                    None
+                }
             }
-            StmtKind::If {
-                cond,
-                then_block,
-                else_block,
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                expr: inner,
             } => {
-                collect_fn_value_refs_expr(cond, fn_names, out);
-                collect_fn_value_refs_stmts(&then_block.stmts, fn_names, out);
-                if let Some(eb) = else_block {
-                    collect_fn_value_refs_stmts(&eb.stmts, fn_names, out);
+                if let ExprKind::Ident(id) = &inner.kind {
+                    self.bare_fn_name_from_id(&id.name)
+                } else {
+                    None
                 }
             }
-            StmtKind::Switch { scrutinee, arms } => {
-                collect_fn_value_refs_expr(scrutinee, fn_names, out);
-                for arm in arms {
-                    collect_fn_value_refs_stmts(&arm.body.stmts, fn_names, out);
+            _ => None,
+        }
+    }
+
+    fn bare_fn_name_from_id<'b>(&self, name: &'b str) -> Option<&'b str> {
+        if self.lookup_var(name).is_none()
+            && !self.syms.consts.contains_key(name)
+            && !self.syms.primitives.contains_key(name)
+            && !self.syms.subsystems.contains_key(name)
+            && !self.syms.mmio_instances.contains_key(name)
+            && !self.syms.irqs.contains_key(name)
+            && !self.syms.enums.contains_key(name)
+            && self.syms.fns.contains_key(name)
+        {
+            Some(name)
+        } else {
+            None
+        }
+    }
+
+    fn resolve_struct_name(&self, module: Option<&Ident>, name: &Ident) -> String {
+        if let Some(mod_id) = module {
+            self.syms
+                .candidate_module_names(&mod_id.name, &name.name)
+                .into_iter()
+                .find(|c| self.syms.structs.contains_key(c))
+                .unwrap_or_else(|| format!("{}.{}", mod_id.name, name.name))
+        } else {
+            name.name.clone()
+        }
+    }
+
+    fn infer_expr_ty(&self, expr: &Expr) -> Option<MirType> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                if let Some(vty) = self.lookup_var(&id.name) {
+                    return Some(vty.clone());
+                }
+                if let Some(cty) = self.syms.consts.get(&id.name) {
+                    return Some(cty.clone());
+                }
+                if let Some((sname, _)) = self.syms.subsystems.get(&id.name) {
+                    return Some(MirType::Ptr(Box::new(MirType::Struct(sname.clone()))));
+                }
+                if let Some(pinfo) = self.syms.primitives.get(&id.name) {
+                    return Some(MirType::Ptr(Box::new(MirType::Primitive(
+                        pinfo.kind.clone(),
+                    ))));
+                }
+                None
+            }
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                expr: inner,
+            } => self.infer_expr_ty(inner).map(|t| MirType::Ptr(Box::new(t))),
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                expr: inner,
+            } => match self.infer_expr_ty(inner)? {
+                MirType::Ptr(elem) => Some(*elem),
+                _ => None,
+            },
+            ExprKind::Cast { ty, .. } => Some(self.syms.resolve_type(ty)),
+            ExprKind::StructLit { module, name, .. } => Some(MirType::Struct(
+                self.resolve_struct_name(module.as_ref(), name),
+            )),
+            ExprKind::Field { target, field } => {
+                if let Some(tty) = self.infer_expr_ty(target) {
+                    let base_ty = match tty {
+                        MirType::Ptr(inner) => *inner,
+                        other => other,
+                    };
+                    if let MirType::Struct(sname) = base_ty {
+                        return self.syms.structs.get(&sname).and_then(|st| {
+                            st.fields
+                                .iter()
+                                .find(|f| f.name == field.name)
+                                .map(|f| f.ty.clone())
+                        });
+                    }
+                }
+                if let ExprKind::Ident(id) = &target.kind {
+                    if self.lookup_var(&id.name).is_none()
+                        && self.syms.import_aliases.contains_key(&id.name)
+                    {
+                        for cand in self.syms.candidate_module_names(&id.name, &field.name) {
+                            if let Some(cty) = self.syms.consts.get(&cand) {
+                                return Some(cty.clone());
+                            }
+                        }
+                    }
+                }
+                None
+            }
+            ExprKind::Index { target, .. } => match self.infer_expr_ty(target)? {
+                MirType::Slice(elem) | MirType::Array { elem, .. } => Some(*elem),
+                MirType::Ptr(inner) => match *inner {
+                    MirType::Slice(elem) | MirType::Array { elem, .. } => Some(*elem),
+                    other => Some(other),
+                },
+                _ => None,
+            },
+            ExprKind::Slice { target, .. } => match self.infer_expr_ty(target)? {
+                MirType::Slice(elem) | MirType::Array { elem, .. } => Some(MirType::Slice(elem)),
+                MirType::Ptr(inner) => match *inner {
+                    MirType::Slice(elem) | MirType::Array { elem, .. } => {
+                        Some(MirType::Slice(elem))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            ExprKind::Or { expr: inner, .. } | ExprKind::Catch { expr: inner, .. } => {
+                self.infer_expr_ty(inner)
+            }
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(id) = &callee.kind {
+                    if self.lookup_var(&id.name).is_none() {
+                        if let Some(sig) = self.syms.fns.get(&id.name) {
+                            return Some(sig.ret_ty.clone());
+                        }
+                    }
+                }
+                match self.infer_expr_ty(callee)? {
+                    MirType::FnPtr { ret, .. } => Some(*ret),
+                    _ => None,
                 }
             }
-            StmtKind::Wait { arms, timer } => {
-                for arm in arms {
-                    collect_fn_value_refs_expr(&arm.call, fn_names, out);
-                    collect_fn_value_refs_stmts(&arm.body.stmts, fn_names, out);
-                }
-                if let Some(t) = timer {
-                    collect_fn_value_refs_expr(&t.expr, fn_names, out);
-                    collect_fn_value_refs_stmts(&t.body.stmts, fn_names, out);
-                }
-            }
-            StmtKind::While { cond, body } => {
-                collect_fn_value_refs_expr(cond, fn_names, out);
-                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
-            }
-            StmtKind::LoopEvery { period, body } => {
-                collect_fn_value_refs_expr(period, fn_names, out);
-                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
-            }
-            StmtKind::ForRange {
-                start, end, body, ..
+            ExprKind::MethodCall {
+                receiver, method, ..
             } => {
-                collect_fn_value_refs_expr(start, fn_names, out);
-                collect_fn_value_refs_expr(end, fn_names, out);
-                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
-            }
-            StmtKind::ForEach { iter, body, .. } => {
-                collect_fn_value_refs_expr(iter, fn_names, out);
-                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
-            }
-            StmtKind::Loop { body }
-            | StmtKind::NoYield { body }
-            | StmtKind::Critical { body }
-            | StmtKind::Block(body) => {
-                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
-            }
-            StmtKind::Defer(inner) => {
-                collect_fn_value_refs_stmts(std::slice::from_ref(inner.as_ref()), fn_names, out);
-            }
-            StmtKind::Error { reason, partial } => {
-                if let Some(r) = reason {
-                    collect_fn_value_refs_expr(r, fn_names, out);
+                let recv_ty = self.infer_expr_ty(receiver)?;
+                let base_ty = match recv_ty {
+                    MirType::Ptr(inner) => *inner,
+                    other => other,
+                };
+                if let MirType::Struct(sname) = base_ty {
+                    if let Some(MirType::FnPtr { ret, .. }) =
+                        self.syms.structs.get(&sname).and_then(|st| {
+                            st.fields
+                                .iter()
+                                .find(|f| f.name == method.name)
+                                .map(|f| f.ty.clone())
+                        })
+                    {
+                        return Some(*ret);
+                    }
                 }
-                if let Some(p) = partial {
-                    collect_fn_value_refs_expr(p, fn_names, out);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn sys_callback_expected_ty(method: &str, idx: usize) -> Option<MirType> {
+        let ny = |params: Vec<MirType>, ret: MirType| MirType::FnPtr {
+            is_noyield: true,
+            params,
+            ret: Box::new(ret),
+            error_spec: Box::new(MirErrorSpec::None),
+        };
+        match (SysMethod::from_name(method), idx) {
+            (Some(SysMethod::SetPutc), 0) => Some(ny(vec![MirType::U8], MirType::Void)),
+            (Some(SysMethod::SetClockMs), 0) => Some(ny(Vec::new(), MirType::U32)),
+            (Some(SysMethod::SetExit), 0) => Some(ny(vec![MirType::I32], MirType::Void)),
+            (Some(SysMethod::SetFaultHandler), 0) => Some(ny(Vec::new(), MirType::Void)),
+            (Some(SysMethod::SetIdle), 0) => {
+                Some(ny(vec![MirType::U32, MirType::U32], MirType::Void))
+            }
+            (Some(SysMethod::SetIrqRouter), 0) => {
+                Some(ny(vec![MirType::U32, MirType::U32], MirType::Void))
+            }
+            (Some(SysMethod::SetIrqRouter), 1) => Some(ny(vec![MirType::U32], MirType::Void)),
+            _ => None,
+        }
+    }
+
+    fn scan_stmts(&mut self, stmts: &[Stmt], in_noyield: bool, in_restricted: bool) {
+        for stmt in stmts {
+            match &stmt.kind {
+                StmtKind::VarDecl { ty, name, init } => {
+                    let vty = self.syms.resolve_type(ty);
+                    if let Some(ie) = init {
+                        self.scan_expr(ie, Some(&vty), in_noyield, in_restricted);
+                    }
+                    self.bind(&name.name, vty);
+                }
+                StmtKind::StateVar { ty, name, init } => {
+                    let vty = self.syms.resolve_type(ty);
+                    if let Some(ie) = init {
+                        self.scan_expr(ie, Some(&vty), true, true);
+                    }
+                    self.bind(&name.name, vty);
+                }
+                StmtKind::Assign { target, value, .. } => {
+                    self.scan_expr(target, None, in_noyield, in_restricted);
+                    let lhs_ty = self.infer_expr_ty(target).map(|t| t.host_value_type());
+                    self.scan_expr(value, lhs_ty.as_ref(), in_noyield, in_restricted);
+                }
+                StmtKind::Return(Some(e)) => {
+                    let ret = self.cur_ret_ty.clone();
+                    self.scan_expr(e, Some(&ret), in_noyield, in_restricted);
+                }
+                StmtKind::Expr(e) => {
+                    self.scan_expr(e, None, in_noyield, in_restricted);
+                }
+                StmtKind::If {
+                    cond,
+                    then_block,
+                    else_block,
+                } => {
+                    self.scan_expr(cond, Some(&MirType::Bool), in_noyield, in_restricted);
+                    self.push_scope();
+                    self.scan_stmts(&then_block.stmts, in_noyield, in_restricted);
+                    self.pop_scope();
+                    if let Some(eb) = else_block {
+                        self.push_scope();
+                        self.scan_stmts(&eb.stmts, in_noyield, in_restricted);
+                        self.pop_scope();
+                    }
+                }
+                StmtKind::Switch { scrutinee, arms } => {
+                    self.scan_expr(scrutinee, None, in_noyield, in_restricted);
+                    for arm in arms {
+                        self.push_scope();
+                        self.scan_stmts(&arm.body.stmts, in_noyield, in_restricted);
+                        self.pop_scope();
+                    }
+                }
+                StmtKind::Wait { arms, timer } => {
+                    for arm in arms {
+                        self.scan_expr(&arm.call, None, in_noyield, in_restricted);
+                        self.push_scope();
+                        if let Some((bty, bid)) = &arm.bind {
+                            self.bind(&bid.name, self.syms.resolve_type(bty));
+                        }
+                        self.scan_stmts(&arm.body.stmts, in_noyield, in_restricted);
+                        self.pop_scope();
+                    }
+                    if let Some(t) = timer {
+                        self.scan_expr(&t.expr, None, in_noyield, in_restricted);
+                        self.push_scope();
+                        self.scan_stmts(&t.body.stmts, in_noyield, in_restricted);
+                        self.pop_scope();
+                    }
+                }
+                StmtKind::While { cond, body } => {
+                    self.scan_expr(cond, Some(&MirType::Bool), in_noyield, in_restricted);
+                    self.push_scope();
+                    self.scan_stmts(&body.stmts, in_noyield, in_restricted);
+                    self.pop_scope();
+                }
+                StmtKind::LoopEvery { period, body } => {
+                    self.scan_expr(period, None, in_noyield, in_restricted);
+                    self.push_scope();
+                    self.scan_stmts(&body.stmts, in_noyield, in_restricted);
+                    self.pop_scope();
+                }
+                StmtKind::ForRange {
+                    var_ty,
+                    var_name,
+                    start,
+                    end,
+                    inclusive: _,
+                    body,
+                } => {
+                    let vty = self.syms.resolve_type(var_ty);
+                    self.scan_expr(start, Some(&vty), in_noyield, in_restricted);
+                    self.scan_expr(end, Some(&vty), in_noyield, in_restricted);
+                    self.push_scope();
+                    self.bind(&var_name.name, vty);
+                    self.scan_stmts(&body.stmts, in_noyield, in_restricted);
+                    self.pop_scope();
+                }
+                StmtKind::ForEach {
+                    elem_ty,
+                    elem_name,
+                    iter,
+                    body,
+                } => {
+                    let vty = self.syms.resolve_type(elem_ty);
+                    self.scan_expr(iter, None, in_noyield, in_restricted);
+                    self.push_scope();
+                    self.bind(&elem_name.name, vty);
+                    self.scan_stmts(&body.stmts, in_noyield, in_restricted);
+                    self.pop_scope();
+                }
+                StmtKind::Loop { body } | StmtKind::Block(body) => {
+                    self.push_scope();
+                    self.scan_stmts(&body.stmts, in_noyield, in_restricted);
+                    self.pop_scope();
+                }
+                StmtKind::NoYield { body } => {
+                    self.push_scope();
+                    self.scan_stmts(&body.stmts, true, in_restricted);
+                    self.pop_scope();
+                }
+                StmtKind::Critical { body } => {
+                    self.push_scope();
+                    self.scan_stmts(&body.stmts, true, true);
+                    self.pop_scope();
+                }
+                StmtKind::Defer(inner) => {
+                    self.scan_stmts(std::slice::from_ref(inner.as_ref()), true, true);
+                }
+                StmtKind::Error { reason, partial } => {
+                    if let Some(r) = reason {
+                        self.scan_expr(r, None, in_noyield, in_restricted);
+                    }
+                    if let Some(p) = partial {
+                        self.scan_expr(p, None, in_noyield, in_restricted);
+                    }
+                }
+                StmtKind::Spawn(sp) => {
+                    let bp_name = if let Some(mod_id) = &sp.module {
+                        self.syms
+                            .candidate_module_names(&mod_id.name, &sp.task.name)
+                            .into_iter()
+                            .find(|c| self.syms.tasks.contains_key(c))
+                            .unwrap_or_else(|| format!("{}.{}", mod_id.name, sp.task.name))
+                    } else {
+                        sp.task.name.clone()
+                    };
+                    let ptys = self.syms.tasks.get(&bp_name);
+                    for (idx, a) in sp.args.iter().enumerate() {
+                        let exp = ptys.and_then(|ps| ps.get(idx));
+                        self.scan_expr(&a.value, exp, in_noyield, in_restricted);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_expr(
+        &mut self,
+        expr: &Expr,
+        expected: Option<&MirType>,
+        in_noyield: bool,
+        in_restricted: bool,
+    ) {
+        if let Some(fname) = self.bare_fn_name(expr) {
+            if let Some(fn_sig) = self.syms.fns.get(fname) {
+                let sig_key =
+                    canonical_mir_fnptr_sig(&fn_sig.params, &fn_sig.ret_ty, &fn_sig.error_spec);
+                if matches!(
+                    expected,
+                    Some(MirType::FnPtr {
+                        is_noyield: false,
+                        ..
+                    })
+                ) {
+                    self.acc
+                        .plain_direct_candidates
+                        .entry(sig_key)
+                        .or_default()
+                        .insert(fname.to_string());
+                } else {
+                    self.acc
+                        .noyield_fnptr_candidates
+                        .entry(sig_key)
+                        .or_default()
+                        .insert(fname.to_string());
                 }
             }
-            StmtKind::Spawn(sp) => {
-                for a in &sp.args {
-                    collect_fn_value_refs_expr(&a.value, fn_names, out);
+            return;
+        }
+
+        if matches!(
+            expected,
+            Some(MirType::FnPtr {
+                is_noyield: false,
+                ..
+            })
+        ) {
+            if let Some(MirType::FnPtr {
+                is_noyield: true,
+                params,
+                ret,
+                error_spec,
+            }) = self.infer_expr_ty(expr)
+            {
+                let sig_key = canonical_mir_fnptr_sig(&params, &ret, &error_spec);
+                self.acc.sig_has_noyield_widening.insert(sig_key);
+            }
+        }
+
+        match &expr.kind {
+            ExprKind::Unary { expr: inner, .. } | ExprKind::Field { target: inner, .. } => {
+                self.scan_expr(inner, None, in_noyield, in_restricted);
+            }
+            ExprKind::Cast { expr: inner, ty } => {
+                let target_ty = self.syms.resolve_type(ty);
+                self.scan_expr(inner, Some(&target_ty), in_noyield, in_restricted);
+            }
+            ExprKind::Binary { op, lhs, rhs } => {
+                if matches!(op, BinaryOp::Eq | BinaryOp::Ne) {
+                    let lhs_fn = self.bare_fn_name(lhs).is_some();
+                    let rhs_fn = self.bare_fn_name(rhs).is_some();
+                    if lhs_fn && !rhs_fn {
+                        let rty = self.infer_expr_ty(rhs);
+                        self.scan_expr(rhs, None, in_noyield, in_restricted);
+                        self.scan_expr(lhs, rty.as_ref(), in_noyield, in_restricted);
+                        return;
+                    }
+                    if rhs_fn && !lhs_fn {
+                        let lty = self.infer_expr_ty(lhs);
+                        self.scan_expr(lhs, None, in_noyield, in_restricted);
+                        self.scan_expr(rhs, lty.as_ref(), in_noyield, in_restricted);
+                        return;
+                    }
                 }
+                self.scan_expr(lhs, None, in_noyield, in_restricted);
+                self.scan_expr(rhs, None, in_noyield, in_restricted);
+            }
+            ExprKind::Index { target, index } => {
+                self.scan_expr(target, None, in_noyield, in_restricted);
+                self.scan_expr(index, Some(&MirType::Usize), in_noyield, in_restricted);
+            }
+            ExprKind::Slice { target, start, end } => {
+                self.scan_expr(target, None, in_noyield, in_restricted);
+                if let Some(s) = start {
+                    self.scan_expr(s, Some(&MirType::Usize), in_noyield, in_restricted);
+                }
+                if let Some(e) = end {
+                    self.scan_expr(e, Some(&MirType::Usize), in_noyield, in_restricted);
+                }
+            }
+            ExprKind::Or {
+                expr: inner,
+                fallback,
+            } => {
+                self.scan_expr(inner, expected, in_noyield, in_restricted);
+                self.scan_expr(fallback, expected, in_noyield, in_restricted);
+            }
+            ExprKind::Catch {
+                expr: inner,
+                clause,
+            } => {
+                self.scan_expr(inner, expected, in_noyield, in_restricted);
+                self.push_scope();
+                if let Some(ep) = &clause.err_param {
+                    let ety = self.syms.resolve_type(&ep.ty);
+                    self.bind(&ep.name.name, ety);
+                }
+                if let Some(pp) = &clause.partial_param {
+                    let pty = self.syms.resolve_type(&pp.ty);
+                    self.bind(&pp.name.name, pty);
+                }
+                if let Some((last_stmt, prefix_stmts)) = clause.body.stmts.split_last() {
+                    self.scan_stmts(prefix_stmts, in_noyield, in_restricted);
+                    if let StmtKind::Expr(tail_expr) = &last_stmt.kind {
+                        self.scan_expr(tail_expr, expected, in_noyield, in_restricted);
+                    } else {
+                        self.scan_stmts(std::slice::from_ref(last_stmt), in_noyield, in_restricted);
+                    }
+                }
+                self.pop_scope();
+            }
+            ExprKind::StructLit {
+                module,
+                name,
+                fields,
+                ..
+            } => {
+                let sname = self.resolve_struct_name(module.as_ref(), name);
+                let st = self.syms.structs.get(&sname);
+                for f in fields {
+                    let fty = st
+                        .and_then(|s| s.fields.iter().find(|sf| sf.name == f.name.name))
+                        .map(|sf| sf.ty.host_value_type());
+                    self.scan_expr(&f.value, fty.as_ref(), in_noyield, in_restricted);
+                }
+            }
+            ExprKind::ArrayLit(elems) => {
+                let elem_exp = match expected {
+                    Some(MirType::Array { elem, .. } | MirType::Slice(elem)) => {
+                        Some((**elem).clone())
+                    }
+                    _ => None,
+                };
+                for e in elems {
+                    self.scan_expr(e, elem_exp.as_ref(), in_noyield, in_restricted);
+                }
+            }
+            ExprKind::FormatString(parts) => {
+                for part in parts {
+                    if let FormatPart::Hole { expr: he, .. } = part {
+                        self.scan_expr(he, None, in_noyield, in_restricted);
+                    }
+                }
+            }
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                if let Some((wfn, _)) = resolve_user_sink_write_callee(callee, generic_args, args) {
+                    if let Some(wsig) = self.syms.fns.get(&wfn) {
+                        if let Some(first) = args.first() {
+                            self.scan_expr(
+                                &first.value,
+                                wsig.params.first(),
+                                in_noyield,
+                                in_restricted,
+                            );
+                        }
+                    }
+                    for a in args.iter().skip(1) {
+                        self.scan_expr(&a.value, None, in_noyield, in_restricted);
+                    }
+                    return;
+                }
+                if let ExprKind::Ident(id) = &callee.kind {
+                    if self.lookup_var(&id.name).is_none()
+                        && BuiltinFn::from_name(&id.name).is_none()
+                    {
+                        if let Some(sig) = self.syms.fns.get(&id.name) {
+                            for (i, a) in args.iter().enumerate() {
+                                self.scan_expr(
+                                    &a.value,
+                                    sig.params.get(i),
+                                    in_noyield,
+                                    in_restricted,
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+                if let Some(fp_ty) = self.infer_expr_ty(callee) {
+                    if let MirType::FnPtr {
+                        is_noyield: fp_is_noyield,
+                        params,
+                        ret,
+                        error_spec,
+                    } = &fp_ty
+                    {
+                        let sig_key = canonical_mir_fnptr_sig(params, ret, error_spec);
+                        let sig_display = fp_ty.display_name();
+                        if !self.caller_display.is_empty() {
+                            self.acc.raw_indirect_call_sites.push((
+                                self.caller_display.clone(),
+                                expr.span,
+                                sig_key.clone(),
+                                sig_display,
+                                *fp_is_noyield,
+                            ));
+                        }
+                        if !*fp_is_noyield && !self.caller_edge_key.is_empty() {
+                            self.acc.plain_indirect_call_edges.push((
+                                self.caller_edge_key.clone(),
+                                sig_key,
+                                in_noyield,
+                                in_restricted,
+                            ));
+                        }
+                        self.scan_expr(callee, None, in_noyield, in_restricted);
+                        for (i, a) in args.iter().enumerate() {
+                            self.scan_expr(&a.value, params.get(i), in_noyield, in_restricted);
+                        }
+                        return;
+                    }
+                }
+                self.scan_expr(callee, None, in_noyield, in_restricted);
+                for a in args {
+                    self.scan_expr(&a.value, None, in_noyield, in_restricted);
+                }
+            }
+            ExprKind::MethodCall {
+                receiver,
+                method,
+                args,
+            } => {
+                if let ExprKind::Ident(id) = &receiver.kind {
+                    if id.name == SYS_NAMESPACE {
+                        for (i, a) in args.iter().enumerate() {
+                            let exp = Self::sys_callback_expected_ty(&method.name, i);
+                            self.scan_expr(&a.value, exp.as_ref(), in_noyield, in_restricted);
+                        }
+                        return;
+                    }
+                }
+                let struct_field_fp = self.infer_expr_ty(receiver).and_then(|rty| {
+                    let base = match rty {
+                        MirType::Ptr(inner) => *inner,
+                        other => other,
+                    };
+                    if let MirType::Struct(sname) = base {
+                        self.syms.structs.get(&sname).and_then(|st| {
+                            st.fields
+                                .iter()
+                                .find(|f| f.name == method.name)
+                                .map(|f| f.ty.clone())
+                        })
+                    } else {
+                        None
+                    }
+                });
+                if let Some(fp_ty) = struct_field_fp {
+                    if let MirType::FnPtr {
+                        is_noyield: fp_is_noyield,
+                        params,
+                        ret,
+                        error_spec,
+                    } = &fp_ty
+                    {
+                        let sig_key = canonical_mir_fnptr_sig(params, ret, error_spec);
+                        let sig_display = fp_ty.display_name();
+                        if !self.caller_display.is_empty() {
+                            self.acc.raw_indirect_call_sites.push((
+                                self.caller_display.clone(),
+                                expr.span,
+                                sig_key.clone(),
+                                sig_display,
+                                *fp_is_noyield,
+                            ));
+                        }
+                        if !*fp_is_noyield && !self.caller_edge_key.is_empty() {
+                            self.acc.plain_indirect_call_edges.push((
+                                self.caller_edge_key.clone(),
+                                sig_key,
+                                in_noyield,
+                                in_restricted,
+                            ));
+                        }
+                        self.scan_expr(receiver, None, in_noyield, in_restricted);
+                        for (i, a) in args.iter().enumerate() {
+                            self.scan_expr(&a.value, params.get(i), in_noyield, in_restricted);
+                        }
+                        return;
+                    }
+                }
+                self.scan_expr(receiver, None, in_noyield, in_restricted);
+                for a in args {
+                    self.scan_expr(&a.value, None, in_noyield, in_restricted);
+                }
+            }
+            ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Priority(_) => {}
+        }
+    }
+}
+
+fn scan_program_fnptrs(program_items: &[zev_ast::Item], syms: &ModuleSymbols) -> FnPtrAstScanAcc {
+    let mut sc = FnPtrAstScanner::new(syms);
+    for item in program_items {
+        match &item.kind {
+            ItemKind::Const(cd) => {
+                let cty = syms.resolve_type(&cd.ty);
+                sc.caller_display.clear();
+                sc.caller_edge_key.clear();
+                sc.cur_ret_ty = MirType::Void;
+                sc.scan_expr(&cd.value, Some(&cty), false, false);
+            }
+            ItemKind::OsPrimitive(pd) => {
+                if let Some(ie) = &pd.init {
+                    let elem_ty = match syms.resolve_os_prim_type(&pd.ty) {
+                        MirPrimKind::Watch { elem } | MirPrimKind::Guarded { elem } => Some(*elem),
+                        _ => None,
+                    };
+                    sc.caller_display.clear();
+                    sc.caller_edge_key.clear();
+                    sc.cur_ret_ty = MirType::Void;
+                    sc.scan_expr(ie, elem_ty.as_ref(), false, false);
+                }
+            }
+            ItemKind::Isr(id) => {
+                sc.caller_display = format!("isr {}", id.vector.name);
+                sc.caller_edge_key = format!("isr::{}", id.vector.name);
+                sc.cur_ret_ty = MirType::Void;
+                sc.push_scope();
+                for p in &id.params {
+                    sc.bind(&p.name.name, syms.resolve_type(&p.ty));
+                }
+                sc.scan_stmts(&id.body.stmts, true, true);
+                sc.pop_scope();
+            }
+            ItemKind::Fn(fd) => {
+                if !fd.generic_params.is_empty() {
+                    continue;
+                }
+                if let Some(body) = &fd.body {
+                    sc.caller_display = if fd.name.name == "main" {
+                        "main".to_string()
+                    } else {
+                        format!("fn {}", fd.name.name)
+                    };
+                    sc.caller_edge_key = fd.name.name.clone();
+                    sc.cur_ret_ty = syms.resolve_type(&fd.ret_type);
+                    sc.push_scope();
+                    for p in &fd.params {
+                        sc.bind(&p.name.name, syms.resolve_type(&p.ty));
+                    }
+                    sc.scan_stmts(&body.stmts, false, false);
+                    sc.pop_scope();
+                }
+            }
+            ItemKind::Task(td) => {
+                sc.caller_display = format!("task {}", td.name.name);
+                sc.caller_edge_key = format!("task::{}", td.name.name);
+                sc.cur_ret_ty = MirType::Void;
+                sc.push_scope();
+                for p in &td.params {
+                    sc.bind(&p.name.name, syms.resolve_type(&p.ty));
+                }
+                sc.scan_stmts(&td.body.stmts, false, false);
+                sc.pop_scope();
             }
             _ => {}
         }
     }
+    sc.acc
 }
 
-fn collect_fn_value_refs_expr(
-    expr: &Expr,
-    fn_names: &BTreeSet<String>,
-    out: &mut BTreeSet<String>,
-) {
-    match &expr.kind {
-        ExprKind::Ident(id) => {
-            if fn_names.contains(&id.name) {
-                out.insert(id.name.clone());
-            }
-        }
-        ExprKind::Unary { expr: inner, .. }
-        | ExprKind::Cast { expr: inner, .. }
-        | ExprKind::Field { target: inner, .. } => {
-            collect_fn_value_refs_expr(inner, fn_names, out);
-        }
-        ExprKind::Binary { lhs, rhs, .. }
-        | ExprKind::Index {
-            target: lhs,
-            index: rhs,
-        }
-        | ExprKind::Or {
-            expr: lhs,
-            fallback: rhs,
-        } => {
-            collect_fn_value_refs_expr(lhs, fn_names, out);
-            collect_fn_value_refs_expr(rhs, fn_names, out);
-        }
-        ExprKind::Slice { target, start, end } => {
-            collect_fn_value_refs_expr(target, fn_names, out);
-            if let Some(s) = start {
-                collect_fn_value_refs_expr(s, fn_names, out);
-            }
-            if let Some(e) = end {
-                collect_fn_value_refs_expr(e, fn_names, out);
-            }
-        }
-        ExprKind::Call { callee, args, .. } => {
-            let direct_fn =
-                matches!(&callee.kind, ExprKind::Ident(id) if fn_names.contains(&id.name));
-            if !direct_fn {
-                collect_fn_value_refs_expr(callee, fn_names, out);
-            }
-            for a in args {
-                collect_fn_value_refs_expr(&a.value, fn_names, out);
-            }
-        }
-        ExprKind::MethodCall { receiver, args, .. } => {
-            collect_fn_value_refs_expr(receiver, fn_names, out);
-            for a in args {
-                collect_fn_value_refs_expr(&a.value, fn_names, out);
-            }
-        }
-        ExprKind::StructLit { fields, .. } => {
-            for f in fields {
-                collect_fn_value_refs_expr(&f.value, fn_names, out);
-            }
-        }
-        ExprKind::ArrayLit(elems) => {
-            for e in elems {
-                collect_fn_value_refs_expr(e, fn_names, out);
-            }
-        }
-        ExprKind::FormatString(parts) => {
-            for part in parts {
-                if let FormatPart::Hole { expr: he, .. } = part {
-                    collect_fn_value_refs_expr(he, fn_names, out);
-                }
-            }
-        }
-        ExprKind::Catch {
-            expr: inner,
-            clause,
-        } => {
-            collect_fn_value_refs_expr(inner, fn_names, out);
-            collect_fn_value_refs_stmts(&clause.body.stmts, fn_names, out);
-        }
-        ExprKind::Literal(_) | ExprKind::Priority(_) => {}
-    }
+pub(super) fn ast_block_has_break(block: &Block) -> bool {
+    ast_stmts_have_break(&block.stmts)
 }
 
 pub(super) fn ast_stmts_have_break(stmts: &[Stmt]) -> bool {
@@ -1140,12 +1777,212 @@ pub(super) fn stmt_slice_can_yield(
     if eff.can_yield() {
         return true;
     }
-    edges.iter().any(|e| {
+    if edges.iter().any(|e| {
         syms.fns.get(&e.callee).is_some_and(|f| {
             f.effect == MirFnEffect::HardBlocking
                 || (f.effect == MirFnEffect::SoftYielding && !e.in_noyield)
         })
-    })
+    }) {
+        return true;
+    }
+
+    // Check indirect plain function-pointer calls in `stmts` (both via `raw_indirect_call_sites`
+    // spans for split `boot_slice`/`tail_slice`, and via AST scan for synthetic `Span::dummy()` tests).
+    let mut span_set = BTreeSet::new();
+    collect_expr_spans_in_stmts(stmts, &mut span_set);
+    for (caller, span, sig_key, _, is_noyield) in &syms.raw_indirect_call_sites {
+        if caller == "main"
+            && !*is_noyield
+            && span.end > 0
+            && span_set.contains(&(span.start, span.end))
+            && syms
+                .plain_direct_candidates
+                .get(sig_key)
+                .is_some_and(|cands| {
+                    cands
+                        .iter()
+                        .any(|c| syms.fns.get(c).is_some_and(|f| f.effect.can_yield()))
+                })
+        {
+            return true;
+        }
+    }
+
+    let mut slice_sc = FnPtrAstScanner::new(syms);
+    slice_sc.caller_display = "slice".to_string();
+    slice_sc.caller_edge_key = "slice".to_string();
+    slice_sc.push_scope();
+    slice_sc.scan_stmts(stmts, false, false);
+    slice_sc.pop_scope();
+    slice_sc
+        .acc
+        .plain_indirect_call_edges
+        .iter()
+        .any(|(_, sig_key, in_noyield, in_restricted)| {
+            !*in_restricted
+                && syms
+                    .plain_direct_candidates
+                    .get(sig_key)
+                    .is_some_and(|cands| {
+                        cands.iter().any(|c| {
+                            syms.fns.get(c).is_some_and(|f| {
+                                f.effect == MirFnEffect::HardBlocking
+                                    || (f.effect == MirFnEffect::SoftYielding && !*in_noyield)
+                            })
+                        })
+                    })
+        })
+}
+
+fn collect_expr_spans_in_stmts(stmts: &[Stmt], out: &mut BTreeSet<(u32, u32)>) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::VarDecl { init: Some(e), .. }
+            | StmtKind::StateVar { init: Some(e), .. }
+            | StmtKind::Return(Some(e))
+            | StmtKind::Expr(e) => collect_expr_spans_in_expr(e, out),
+            StmtKind::Assign { target, value, .. } => {
+                collect_expr_spans_in_expr(target, out);
+                collect_expr_spans_in_expr(value, out);
+            }
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                collect_expr_spans_in_expr(cond, out);
+                collect_expr_spans_in_stmts(&then_block.stmts, out);
+                if let Some(eb) = else_block {
+                    collect_expr_spans_in_stmts(&eb.stmts, out);
+                }
+            }
+            StmtKind::Switch { scrutinee, arms } => {
+                collect_expr_spans_in_expr(scrutinee, out);
+                for arm in arms {
+                    collect_expr_spans_in_stmts(&arm.body.stmts, out);
+                }
+            }
+            StmtKind::Wait { arms, timer } => {
+                for arm in arms {
+                    collect_expr_spans_in_expr(&arm.call, out);
+                    collect_expr_spans_in_stmts(&arm.body.stmts, out);
+                }
+                if let Some(t) = timer {
+                    collect_expr_spans_in_expr(&t.expr, out);
+                    collect_expr_spans_in_stmts(&t.body.stmts, out);
+                }
+            }
+            StmtKind::While { cond, body } => {
+                collect_expr_spans_in_expr(cond, out);
+                collect_expr_spans_in_stmts(&body.stmts, out);
+            }
+            StmtKind::LoopEvery { period, body } => {
+                collect_expr_spans_in_expr(period, out);
+                collect_expr_spans_in_stmts(&body.stmts, out);
+            }
+            StmtKind::ForRange {
+                start, end, body, ..
+            } => {
+                collect_expr_spans_in_expr(start, out);
+                collect_expr_spans_in_expr(end, out);
+                collect_expr_spans_in_stmts(&body.stmts, out);
+            }
+            StmtKind::ForEach { iter, body, .. } => {
+                collect_expr_spans_in_expr(iter, out);
+                collect_expr_spans_in_stmts(&body.stmts, out);
+            }
+            StmtKind::Loop { body }
+            | StmtKind::NoYield { body }
+            | StmtKind::Critical { body }
+            | StmtKind::Block(body) => {
+                collect_expr_spans_in_stmts(&body.stmts, out);
+            }
+            StmtKind::Defer(inner) => {
+                collect_expr_spans_in_stmts(std::slice::from_ref(inner.as_ref()), out);
+            }
+            StmtKind::Error { reason, partial } => {
+                if let Some(r) = reason {
+                    collect_expr_spans_in_expr(r, out);
+                }
+                if let Some(p) = partial {
+                    collect_expr_spans_in_expr(p, out);
+                }
+            }
+            StmtKind::Spawn(sp) => {
+                for a in &sp.args {
+                    collect_expr_spans_in_expr(&a.value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_expr_spans_in_expr(expr: &Expr, out: &mut BTreeSet<(u32, u32)>) {
+    out.insert((expr.span.start, expr.span.end));
+    match &expr.kind {
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Field { target: inner, .. } => collect_expr_spans_in_expr(inner, out),
+        ExprKind::Binary { lhs, rhs, .. }
+        | ExprKind::Index {
+            target: lhs,
+            index: rhs,
+        }
+        | ExprKind::Or {
+            expr: lhs,
+            fallback: rhs,
+        } => {
+            collect_expr_spans_in_expr(lhs, out);
+            collect_expr_spans_in_expr(rhs, out);
+        }
+        ExprKind::Slice { target, start, end } => {
+            collect_expr_spans_in_expr(target, out);
+            if let Some(s) = start {
+                collect_expr_spans_in_expr(s, out);
+            }
+            if let Some(e) = end {
+                collect_expr_spans_in_expr(e, out);
+            }
+        }
+        ExprKind::Call { callee, args, .. } => {
+            collect_expr_spans_in_expr(callee, out);
+            for a in args {
+                collect_expr_spans_in_expr(&a.value, out);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_expr_spans_in_expr(receiver, out);
+            for a in args {
+                collect_expr_spans_in_expr(&a.value, out);
+            }
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for f in fields {
+                collect_expr_spans_in_expr(&f.value, out);
+            }
+        }
+        ExprKind::ArrayLit(elems) => {
+            for e in elems {
+                collect_expr_spans_in_expr(e, out);
+            }
+        }
+        ExprKind::FormatString(parts) => {
+            for part in parts {
+                if let FormatPart::Hole { expr: he, .. } = part {
+                    collect_expr_spans_in_expr(he, out);
+                }
+            }
+        }
+        ExprKind::Catch {
+            expr: inner,
+            clause,
+        } => {
+            collect_expr_spans_in_expr(inner, out);
+            collect_expr_spans_in_stmts(&clause.body.stmts, out);
+        }
+        ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Priority(_) => {}
+    }
 }
 
 pub(super) fn stmt_contains_boot_spawn(stmt: &Stmt, syms: &ModuleSymbols) -> bool {
