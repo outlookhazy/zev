@@ -2070,7 +2070,7 @@ fn loop_every_runtime_period_and_unified_inbox_methods() {
                 if (!cmd_q.is_empty() || cmd_q.is_full() || cmd_q.len() > 0) {
                     u32 v1 = cmd_q.try_recv() or 0;
                     u32 v2 = cmd_q.recv();
-                    sys.log_kv("sum=", v1 + v2);
+                    sys.log_kv("sum=", (v1 + v2) as i32);
                 }
             }
         }
@@ -2186,7 +2186,7 @@ fn three_tier_fn_effects_noyield_specialization_and_dual_specialized_fns() {
 
         fn main() {
             u32 v = atomic_wrapper(10);
-            sys.log_kv("v=", v);
+            sys.log_kv("v=", v as i32);
             spawn bg_hasher() @low;
         }
         "#,
@@ -5305,7 +5305,7 @@ fn regression_s_h1_place_addr_provenance_preserving_scalar_reads() {
             *Packet p = id_pkt(&pkt);
             *u32 h = get_hdr(p);
             u8 b = read_once();
-            sys.log_kv("h=", *h);
+            sys.log_kv("h=", (*h) as i32);
             sys.log_kv("b=", b);
         }
         "#,
@@ -5511,7 +5511,7 @@ fn regression_s_h4_s_h5_mmio_and_os_primitive_void_coercion_and_casts() {
             *byte_ring<16> bp1 = &br as *byte_ring<16>;
             *byte_ring bp2 = &br as *byte_ring;
             *inbox<u32> qp = &q as *inbox<u32>;
-            sys.log_kv("a=", addr);
+            sys.log_kv("a=", addr as i32);
             p2.cr = 1;
             sp.notify();
             bp1.push_byte(1);
@@ -5574,7 +5574,7 @@ fn regression_s_h6_byval_deref_vs_projection() {
             (*s).tx.push_byte(1);
             usize n = (*br).len();
             *u32 hp = &(*pkt).hdr;
-            sys.log_kv("v=", v + *hp + (u32)n);
+            sys.log_kv("v=", (v + *hp + (u32)n) as i32);
         }
 
         fn main() {
@@ -5802,7 +5802,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
             fn main() {
                 RootMode m = Shared;
                 u32 x = hal_init((u32)m + ma.pick_a() + mb.pick_b());
-                sys.log_kv("x=", x);
+                sys.log_kv("x=", x as i32);
             }
             "#,
         );
@@ -5966,7 +5966,7 @@ fn regression_l_h1_shift_preserves_lhs_integer_type() {
             u8 c = 1u8 << 3u32;
             u16 d = 0x8000u16 >> 1usize;
             i8 e = (-8i8) >> 1u32;
-            sys.log_kv("a=", a + b + (u32)c + (u32)d + (u32)e);
+            sys.log_kv("a=", (a + b + (u32)c + (u32)d + (e as u32)) as i32);
         }
         "#,
     );
@@ -6860,6 +6860,76 @@ fn main() {
 }
 "#;
     expect_ok(valid);
+}
+
+#[test]
+fn integer_conversion_portability_ranges_and_widening_sema() {
+    // 1. Positive: lossless widening, wire-endian <-> native, `usize`/`isize` portable subsets,
+    //    `i8::MIN`, and destination-widened shifts.
+    expect_ok(
+        r#"
+        packed struct Pkt { u16be val; }
+        fn main() {
+            u8 a = 200;
+            u8 b = 100;
+            u16 w = a + b;
+            u32 bit = a << 8;
+            u32 mask_hi = 0x1234_56FFu32 & ~a;
+            i8 mn = -128;
+            i8 mn_s = -128i8;
+            i16 neg_w = -a;
+            u64 wide_u = (0x10usize) as u64;
+            usize p_u = a;
+            p_u = w;
+            u64 from_usize = p_u;
+            i64 from_isize = (-32768i16);
+            isize p_i = -32768;
+            i64 p_i64 = p_i;
+            p_i = a;
+            u16 native = 12;
+            Pkt pkt = Pkt { val: native };
+            u16 back = pkt.val;
+            u32 _keep = w + bit + mask_hi + from_usize as u32 + (mn as u32) + (mn_s as u32) + (neg_w as u32) + (wide_u as u32) + (from_isize as u32) + (p_i64 as u32) + back;
+        }
+        "#,
+    );
+
+    // 2. Negative: narrowing, signed <-> unsigned, non-portable `usize`/`isize`, out-of-range literals,
+    //    mixed-signedness comparisons/binary ops, and non-widened `as` shift overflow (`E0024`).
+    for bad in [
+        "fn main() { u8 x = 300; }",
+        "fn main() { u8 x = -1; }",
+        "fn main() { i8 x = 128; }",
+        "fn main() { i8 x = -129; }",
+        "fn main() { u8 x = 300u8; }",
+        "fn main() { i8 x = -129i8; }",
+        "fn main() { u16 a = 1; u8 b = a; }",
+        "fn main() { i32 a = -1; u32 b = a; }",
+        "fn main() { u32 a = 1; i32 b = a; }",
+        "fn main() { i16 a = 1; i32 b = 2; u32 c = a + b; }",
+        "fn main() { u32 a = 1; i32 b = 2; bool c = a < b; }",
+        "fn main() { u32 a = 1; i32 b = 2; u32 c = a + b; }",
+        "fn main() { u32 a = 1; usize b = a; }",
+        "fn main() { usize a = 1; u32 b = a; }",
+        "fn main() { usize a = 1; i64 b = a; }",
+        "fn main() { u16 a = 1; isize b = a; }",
+        "fn main() { i32 a = 1; isize b = a; }",
+        "fn main() { isize a = 1; usize b = a; }",
+        "fn main() { usize a = 65536; }",
+        "fn main() { isize a = 32768; }",
+        "fn main() { isize a = -32769; }",
+        "packed struct P { u16be x; } fn main() { P p = P { x: 1 }; u16le q = 2; bool _b = p.x == q; }",
+        "fn main() { u8 a = 200; u32 w = 0; w = (a + 300) as u32; }",
+    ] {
+        expect_err_kind(bad, DiagnosticKind::TypeMismatch);
+    }
+
+    for bad_shift in [
+        "fn main() { u8 a = 200; u32 x = (a << 8) as u32; }",
+        "fn main() { u8 a = 200; u8 x = a << 8; }",
+    ] {
+        expect_err_kind(bad_shift, DiagnosticKind::InvalidOperation);
+    }
 }
 
 

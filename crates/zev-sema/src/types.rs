@@ -415,6 +415,73 @@ impl Ty {
         }
     }
 
+    /// Inclusive mathematical `[min, max]` literal range for each integer primitive.
+    /// Pointer-sized `usize`/`isize` use portable 16-bit safe bounds (`0..=65535` / `-32768..=32767`)
+    /// so programs behave identically across 16-bit AVR, 32-bit MCU, and 64-bit host targets.
+    pub const fn int_prim_range(p: PrimType) -> Option<(i128, i128)> {
+        match p {
+            PrimType::U8 => Some((0, u8::MAX as i128)),
+            PrimType::U16 | PrimType::U16Be | PrimType::U16Le => Some((0, u16::MAX as i128)),
+            PrimType::U32 | PrimType::U32Be | PrimType::U32Le => Some((0, u32::MAX as i128)),
+            PrimType::U64 | PrimType::U64Be | PrimType::U64Le => Some((0, u64::MAX as i128)),
+            PrimType::Usize => Some((0, u16::MAX as i128)),
+            PrimType::I8 => Some((i8::MIN as i128, i8::MAX as i128)),
+            PrimType::I16 => Some((i16::MIN as i128, i16::MAX as i128)),
+            PrimType::I32 => Some((i32::MIN as i128, i32::MAX as i128)),
+            PrimType::I64 => Some((i64::MIN as i128, i64::MAX as i128)),
+            PrimType::Isize => Some((i16::MIN as i128, i16::MAX as i128)),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` iff `src` converts implicitly and losslessly to `dst` across all targets.
+    pub const fn can_implicitly_widen_int(src: PrimType, dst: PrimType) -> bool {
+        use PrimType::*;
+        if !src.is_integer() || !dst.is_integer() {
+            return false;
+        }
+        if matches!(
+            (src, dst),
+            (U8, U8)
+                | (U16, U16)
+                | (U32, U32)
+                | (U64, U64)
+                | (Usize, Usize)
+                | (I8, I8)
+                | (I16, I16)
+                | (I32, I32)
+                | (I64, I64)
+                | (Isize, Isize)
+                | (U16Be, U16Be)
+                | (U16Le, U16Le)
+                | (U32Be, U32Be)
+                | (U32Le, U32Le)
+                | (U64Be, U64Be)
+                | (U64Le, U64Le)
+        ) {
+            return true;
+        }
+        // Distinct wire-endian types do not implicitly convert directly between themselves.
+        if src.is_endian() && dst.is_endian() {
+            return false;
+        }
+        let hs = Self::host_prim(src);
+        let hd = Self::host_prim(dst);
+        matches!(
+            (hs, hd),
+            (U8, U8 | U16 | U32 | U64 | Usize | I16 | I32 | I64 | Isize)
+                | (U16, U16 | U32 | U64 | Usize | I32 | I64)
+                | (U32, U32 | U64 | I64)
+                | (U64, U64)
+                | (Usize, Usize | U64)
+                | (I8, I8 | I16 | I32 | I64 | Isize)
+                | (I16, I16 | I32 | I64 | Isize)
+                | (I32, I32 | I64)
+                | (I64, I64)
+                | (Isize, Isize | I64)
+        )
+    }
+
     /// Checks whether a value of type `actual` can be assigned/passed to `expected`.
     pub fn is_assignable_to(&self, expected: &Ty) -> bool {
         if self.is_error() || expected.is_error() {
@@ -424,17 +491,17 @@ impl Ty {
             return true;
         }
         match (self, expected) {
-            // Untyped integer literals coerce to any integer type.
+            // Untyped integer literals coerce to any integer type (range-checked separately).
             (Ty::IntLit, Ty::Prim(p)) if p.is_integer() => true,
-            (Ty::Prim(p), Ty::IntLit) if p.is_integer() => true,
 
             // Unsuffixed float literals coerce to `f32` or `f64`.
             (Ty::FloatLit, Ty::Prim(PrimType::F32 | PrimType::F64)) => true,
             (Ty::Prim(PrimType::F32 | PrimType::F64), Ty::FloatLit) => true,
 
-            // Wire-endian types and fixed-width integers convert among integer types in C-style
-            // firmware expressions, while keeping strict separation from bool, floats, enums, durations, and pointers.
-            (Ty::Prim(a), Ty::Prim(b)) if a.is_integer() && b.is_integer() => true,
+            // Lossless integer widening and same-width wire-endian <-> native conversions only.
+            (Ty::Prim(a), Ty::Prim(b)) if a.is_integer() && b.is_integer() => {
+                Self::can_implicitly_widen_int(*a, *b)
+            }
 
             // Fixed-array `[N]T` coerces elementwise for literal arrays (`[1, 2]` -> `[2]u32`,
             // `[0.5, 1.0]` -> `[2]f32`) and `[N]T` coerces to slice `[]T` when element types match.

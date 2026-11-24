@@ -287,6 +287,23 @@ impl PrimType {
         )
     }
 
+    /// Maps explicit integer width literal suffixes (`u8`..`isize`) to [`PrimType`].
+    pub fn from_int_suffix(s: &str) -> Option<Self> {
+        match s {
+            "u8" => Some(Self::U8),
+            "u16" => Some(Self::U16),
+            "u32" => Some(Self::U32),
+            "u64" => Some(Self::U64),
+            "usize" => Some(Self::Usize),
+            "i8" => Some(Self::I8),
+            "i16" => Some(Self::I16),
+            "i32" => Some(Self::I32),
+            "i64" => Some(Self::I64),
+            "isize" => Some(Self::Isize),
+            _ => None,
+        }
+    }
+
     pub const fn is_big_endian(self) -> bool {
         matches!(self, Self::U16Be | Self::U32Be | Self::U64Be)
     }
@@ -1119,7 +1136,11 @@ pub enum FormatPart {
 /// Literal values.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Literal {
-    Int(u64),
+    Int {
+        value: u64,
+        /// Optional explicit integer width suffix (`u8`, `i32`, `usize`, ...).
+        suffix: Option<PrimType>,
+    },
     Float {
         /// IEEE-754 `f64::to_bits()` representation of the parsed literal.
         bits: u64,
@@ -1489,8 +1510,20 @@ mod tests {
             StmtKind::ForRange {
                 var_ty: TypeExpr::new(TypeKind::Prim(PrimType::Usize), sp),
                 var_name: Ident::dummy("i"),
-                start: Box::new(Expr::new(ExprKind::Literal(Literal::Int(0)), sp)),
-                end: Box::new(Expr::new(ExprKind::Literal(Literal::Int(8)), sp)),
+                start: Box::new(Expr::new(
+                    ExprKind::Literal(Literal::Int {
+                        value: 0,
+                        suffix: None,
+                    }),
+                    sp,
+                )),
+                end: Box::new(Expr::new(
+                    ExprKind::Literal(Literal::Int {
+                        value: 8,
+                        suffix: None,
+                    }),
+                    sp,
+                )),
                 inclusive: true,
                 body: Block::new(vec![], sp),
             },

@@ -1793,7 +1793,10 @@ fn main() {
             StmtKind::VarDecl {
                 init:
                     Some(Expr {
-                        kind: ExprKind::Literal(Literal::Int(255)),
+                        kind: ExprKind::Literal(Literal::Int {
+                            value: 255,
+                            suffix: None,
+                        }),
                         ..
                     }),
                 ..
@@ -2673,5 +2676,86 @@ task sup() {
         }
         parse_str("fn main() { wait { a.wait() => {} timeout 5ms => {} deadline 10u32 => {} } }")
             .expect_err("duplicate timer arm in wait block must fail parse");
+    }
+
+    #[test]
+    fn preserves_integer_literal_width_suffixes_and_rejects_c_suffixes() {
+        let prog = parse_str(
+            r#"
+fn main() {
+    u8 a = 10u8;
+    i32 b = -5i32;
+    usize c = 42usize;
+    u32 d = 7;
+}
+"#,
+        )
+        .expect("valid width suffixes parse cleanly");
+        let ItemKind::Fn(f) = &prog.items[0].kind else {
+            panic!("expected fn");
+        };
+        let body = f.body.as_ref().expect("fn body");
+        assert!(matches!(
+            body.stmts[0].kind,
+            StmtKind::VarDecl {
+                init: Some(Expr {
+                    kind: ExprKind::Literal(Literal::Int {
+                        value: 10,
+                        suffix: Some(PrimType::U8)
+                    }),
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            body.stmts[1].kind,
+            StmtKind::VarDecl {
+                init: Some(Expr {
+                    kind: ExprKind::Unary {
+                        op: UnaryOp::Neg,
+                        expr: ref inner,
+                    },
+                    ..
+                }),
+                ..
+            } if matches!(
+                inner.kind,
+                ExprKind::Literal(Literal::Int { value: 5, suffix: Some(PrimType::I32) })
+            )
+        ));
+        assert!(matches!(
+            body.stmts[2].kind,
+            StmtKind::VarDecl {
+                init: Some(Expr {
+                    kind: ExprKind::Literal(Literal::Int {
+                        value: 42,
+                        suffix: Some(PrimType::Usize)
+                    }),
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(matches!(
+            body.stmts[3].kind,
+            StmtKind::VarDecl {
+                init: Some(Expr {
+                    kind: ExprKind::Literal(Literal::Int {
+                        value: 7,
+                        suffix: None
+                    }),
+                    ..
+                }),
+                ..
+            }
+        ));
+        for bad in [
+            "fn main() { u32 x = 10u; }",
+            "fn main() { u32 x = 10UL; }",
+            "fn main() { i32 x = 10L; }",
+        ] {
+            parse_str(bad).expect_err("C integer suffix must be rejected");
+        }
     }
 }

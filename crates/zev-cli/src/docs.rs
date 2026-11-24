@@ -87,9 +87,17 @@ pub const TOPIC_DOCS: &[TopicDoc] = &[
 - IEEE-754 Floats: `f32`, `f64` (`0.25f32`, `2.5e-3`, casts `raw as f32` / saturating `val as i32`)
 - Wire-Endian (valid in `packed struct`): `u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le`
 - Compound: fat slices `[]u8` (`.len`, `buf[i]`, `buf[0..5]`), pointers `*i32 p` / `*u8`, arrays `[16]u8`
-- Defined Arithmetic & Locals: integer `+`/`-`/`*` wrap in two's complement; constant shifts outside
+- Defined Arithmetic & Conversions: integer `+`/`-`/`*` wrap in two's complement; constant shifts outside
   `0..bit_width` fail at compile time (`E0024`) while variable shifts mask by `(bit_width - 1)`; `/`/`%` by `0`
   and out-of-bounds indexing/subslicing trap via `@__syn_panic`; uninitialized locals zero-initialize.
+- Lossless Integer Coercion & Destination-Typed Arithmetic: implicit integer conversions are strictly
+  lossless (unsigned -> wider unsigned / strictly wider signed; signed -> wider signed; wire-endian
+  `u16be`/`u32le`... <-> same-width native). Narrowing and signed<->unsigned require explicit `as`.
+  `usize`/`isize` use target-portable bounds (`u8`/`u16` -> `usize` -> `u64`, literal `0..=65535`;
+  `i8`/`i16`/`u8` -> `isize` -> `i64`, literal `-32768..=32767`). Literals are range-checked against their
+  destination (`u8 x = 300;` -> `E0019`), incompatible binary/comparison operands (`u32 < i32`) error, and
+  arithmetic expressions widened to a destination compute at that destination width (`u16 w = a + b;`
+  with `u8 a = 200, b = 100` -> `300`, whereas `(a + b) as u16` -> `44`).
 
 ## 2. Wire `packed struct`, In-Memory `struct`, `enum` & `.rodata` `const`
 ```zev

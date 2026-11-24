@@ -696,18 +696,40 @@ impl<'a> Lexer<'a> {
             .with_doc_topic("syntax")
         })?;
 
-        let kind = match suffix {
-            "" => TokenKind::Int(value),
-            "us" => TokenKind::Duration(value, DurationUnit::Us),
-            "ms" => TokenKind::Duration(value, DurationUnit::Ms),
-            "s" => TokenKind::Duration(value, DurationUnit::S),
-            "u" | "U" | "l" | "L" | "ul" | "UL" | "ull" | "ULL" | "u8" | "u16" | "u32"
-            | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize" => TokenKind::Int(value),
-            bad => {
-                return Err(self
-                    .err_at(format!("unknown numeric/duration suffix `{bad}`"), span)
-                    .with_doc_topic("syntax")
-                    .with_hint("valid suffixes are `us`, `ms`, `s`, `f32`, `f64`, or integer widths (`u32`, etc.)"));
+        let kind = if suffix.is_empty() {
+            TokenKind::Int {
+                value,
+                suffix: None,
+            }
+        } else if let Some(int_suffix) = PrimType::from_int_suffix(suffix) {
+            TokenKind::Int {
+                value,
+                suffix: Some(int_suffix),
+            }
+        } else {
+            match suffix {
+                "us" => TokenKind::Duration(value, DurationUnit::Us),
+                "ms" => TokenKind::Duration(value, DurationUnit::Ms),
+                "s" => TokenKind::Duration(value, DurationUnit::S),
+                "u" | "U" | "l" | "L" | "ul" | "UL" | "ull" | "ULL" => {
+                    return Err(self
+                        .err_at(
+                            format!("C-style integer suffix `{suffix}` is not supported in Zev"),
+                            span,
+                        )
+                        .with_doc_topic("syntax")
+                        .with_hint(
+                            "use an explicit width suffix (`u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, `isize`) or omit the suffix",
+                        ));
+                }
+                bad => {
+                    return Err(self
+                        .err_at(format!("unknown numeric/duration suffix `{bad}`"), span)
+                        .with_doc_topic("syntax")
+                        .with_hint(
+                            "valid suffixes are `us`, `ms`, `s`, `f32`, `f64`, or integer widths (`u32`, etc.)",
+                        ));
+                }
             }
         };
 
@@ -1209,7 +1231,13 @@ impl<'a> Lexer<'a> {
                 .with_doc_topic("syntax"));
         }
         let span = self.span_from(start, start_line, start_col);
-        Ok(Token::new(TokenKind::Int(byte_or_char), span))
+        Ok(Token::new(
+            TokenKind::Int {
+                value: byte_or_char,
+                suffix: None,
+            },
+            span,
+        ))
     }
 
     fn lex_escape(

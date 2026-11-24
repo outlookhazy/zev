@@ -1093,7 +1093,7 @@ impl<'a> Monomorphizer<'a> {
         visiting: &mut BTreeSet<String>,
     ) -> Option<i128> {
         match &expr.kind {
-            ExprKind::Literal(Literal::Int(v)) => Some(*v as i128),
+            ExprKind::Literal(Literal::Int { value, .. }) => Some(*value as i128),
             ExprKind::Ident(id) => {
                 if let Some(&v) = local_consts.get(&id.name) {
                     Some(v as i128)
@@ -2706,7 +2706,13 @@ impl<'a> Monomorphizer<'a> {
                             && env.consts.contains_key(&name.name) =>
                         {
                             let n = env.consts[&name.name];
-                            SwitchPat::Literal(Literal::Int(n as u64), *span)
+                            SwitchPat::Literal(
+                                Literal::Int {
+                                    value: n as u64,
+                                    suffix: Some(PrimType::Usize),
+                                },
+                                *span,
+                            )
                         }
                         SwitchPat::Ident { prefix, name, span } => SwitchPat::Ident {
                             prefix: prefix.clone(),
@@ -2853,7 +2859,10 @@ impl<'a> Monomorphizer<'a> {
         match &expr.kind {
             ExprKind::Literal(lit) => {
                 let ity = match lit {
-                    Literal::Int(_) => InferTy::IntLit,
+                    Literal::Int { suffix: Some(p), .. } => {
+                        InferTy::Concrete(TypeExpr::new(TypeKind::Prim(*p), expr.span))
+                    }
+                    Literal::Int { suffix: None, .. } => InferTy::IntLit,
                     Literal::Float { suffix: Some(p), .. } => {
                         InferTy::Concrete(TypeExpr::new(TypeKind::Prim(*p), expr.span))
                     }
@@ -2877,7 +2886,13 @@ impl<'a> Monomorphizer<'a> {
                 // Local variables/parameters shadow generic `ConstUsize` parameters of the same name (`M10`).
                 if !scopes_contain(scopes, &id.name) {
                     if let Some(&n) = env.consts.get(&id.name) {
-                        let lit_expr = Expr::new(ExprKind::Literal(Literal::Int(n as u64)), expr.span);
+                        let lit_expr = Expr::new(
+                            ExprKind::Literal(Literal::Int {
+                                value: n as u64,
+                                suffix: Some(PrimType::Usize),
+                            }),
+                            expr.span,
+                        );
                         let ity = InferTy::Concrete(TypeExpr::new(
                             TypeKind::Prim(PrimType::Usize),
                             expr.span,
@@ -4388,7 +4403,7 @@ fn mangle_generic_arg_ast(arg: &GenericArg) -> String {
     match arg {
         GenericArg::Type(te) => mangle_type_expr(te),
         GenericArg::Const(Expr {
-            kind: ExprKind::Literal(Literal::Int(v)),
+            kind: ExprKind::Literal(Literal::Int { value: v, .. }),
             ..
         }) => v.to_string(),
         GenericArg::Const(Expr {
