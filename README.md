@@ -48,13 +48,13 @@ What `zevc` enforces and synthesizes from this file:
 - **Zero heap, single stack:** Every `spawn` in `main()`'s boot tree allocates a fixed `.bss` coroutine frame (`MAX_TASKS <= 32`), union-packing disjoint child frames and reporting worst-case SRAM + stack depth via `zevc ram`.
 - **Call-graph inferred yielding (no `async`/`.await`):** Functions are inferred as `NonYielding`, `SoftYielding` (auto-cloned as zero-`.bss` stack functions inside `noyield`), or `HardBlocking` (statically forbidden in `noyield`, `critical`, `isr`, and `defer`).
 - **Task/ISR & MMIO safety:** Raw mutable globals are rejected (`E0001`/`E0002`); `@ro`, `@wo`, and `@w1c` register rules prevent read-modify-write interrupt-clear bugs (`E0031`); `wait { ... }` polls and parks atomically across multiple primitives with zero lost wakeups.
-- **Defined runtime semantics:** Out-of-bounds array/slice/MMIO indexing and division by zero trap deterministically (`@__syn_panic`), variable bit-shifts mask by `(bit_width - 1)`, float-to-int casts saturate, and host simulation runs the exact same LLVM scheduler IR under Clang ASan+UBSan (`sys.fuzz_irqs`).
+- **Defined runtime semantics:** Out-of-bounds array/slice/MMIO indexing and division by zero trap deterministically (`@__syn_panic`), variable bit-shifts mask by `(bit_width - 1)`, float-to-int casts saturate, `sys.trace_sleep(bool)` accepts sleep-tracing hooks alongside `sys.sleep_depth()` / `sys.wfi_count()` / `sys.set_idle`, and host simulation runs the exact same LLVM scheduler IR under Clang ASan+UBSan (`sys.fuzz_irqs`).
 
 ---
 
-## Targets
+## Targets & Project Manifest (`zev.toml`)
 
-Board and chip definitions live declaratively in `boards/*.toml` and `chips/*.toml`. A single portable source ([`examples/portable_controller_demo.zev`](examples/portable_controller_demo.zev)) using `import board;` and `hal.*` compiles across five targets:
+Board and chip definitions live declaratively in `boards/*.toml` and `chips/*.toml`, and an optional `zev.toml` project manifest (`[project]` with optional `name`, `entry`, `board`, `chip`, `port`, and `opt_level` keys) is auto-discovered from the input directory upward (also adding that directory to `-I` module roots) so `zevc build`, `zevc flash`, and `zevc ram --board` work without repeating CLI flags. A single portable source ([`examples/portable_controller_demo.zev`](examples/portable_controller_demo.zev)) using `import board;` and `hal.*` compiles across five targets:
 
 | Target (`--board`) | MCU / Architecture | Runtime / Artifact |
 |---|---|---|
