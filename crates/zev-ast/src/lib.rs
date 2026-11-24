@@ -1104,6 +1104,24 @@ pub enum ExprKind {
     },
 }
 
+/// Alignment direction for padded format holes (`{x:>5}`, `{x:<12}`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FormatAlign {
+    Left,
+    Right,
+}
+
+/// Base/radix for padded format holes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FormatPadBase {
+    /// Decimal for integers, plain bytes for text (`[]u8` / `[N]u8` / `str` / `*u8`).
+    Default,
+    Hex {
+        upper: bool,
+    },
+    Bin,
+}
+
 /// Compile-time resolved format specifier inside an `f"..."` interpolation hole.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FormatSpec {
@@ -1120,6 +1138,13 @@ pub enum FormatSpec {
     Sci { precision: Option<u8> },
     /// `{pkt:?}` — compile-time struct/value debug expansion.
     Debug,
+    /// Width/alignment-padded formatting (`{x:>5}`, `{x:<12}`, `{x:05}`, `{x:>05}`, `{x:>6x}`, ...).
+    Padded {
+        align: Option<FormatAlign>,
+        zero_pad: bool,
+        width: u8,
+        base: FormatPadBase,
+    },
 }
 
 /// Segment of a zero-heap `f"..."` format string (`ExprKind::FormatString`).

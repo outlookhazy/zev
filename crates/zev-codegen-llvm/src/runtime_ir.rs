@@ -17,6 +17,7 @@ pub struct RuntimeIrFeatures {
     pub uses_floats: bool,
     pub uses_fmt: bool,
     pub uses_fmt_float_sci: bool,
+    pub uses_fmt_pad: bool,
     pub uses_rv_irqs: bool,
     pub uses_sys_tick: bool,
     pub uses_clock_hook: bool,
@@ -29,6 +30,7 @@ impl RuntimeIrFeatures {
             uses_floats: true,
             uses_fmt: true,
             uses_fmt_float_sci: true,
+            uses_fmt_pad: true,
             uses_rv_irqs: false,
             uses_sys_tick: true,
             uses_clock_hook: false,
@@ -240,6 +242,7 @@ entry:
             spec.isa,
             features.uses_floats || features.uses_fmt_float_sci,
             features.uses_fmt_float_sci,
+            features.uses_fmt_pad,
         );
     }
     emit_scheduler_core_ir(
@@ -3781,6 +3784,7 @@ fn emit_zero_heap_fmt_ir(
     isa: CpuIsa,
     emit_float_fixed: bool,
     emit_float_sci: bool,
+    emit_pad: bool,
 ) {
     let fn_as = isa.fn_addrspace_attr();
     let call_kw = isa.call_kw();
@@ -4577,6 +4581,253 @@ define weak void @__syn_fmt_f32_sci(ptr %sink, float %val, i32 %prec){fn_as} noi
 entry:
   %d = {call_kw} double @__extendsfdf2(float %val)
   {call_kw} void @__syn_fmt_f64_sci(ptr %sink, double %d, i32 %prec)
+  ret void
+}}
+"#,
+        );
+    }
+
+    if emit_pad {
+        let _ = write!(
+            out,
+            r#"; ── Width & Alignment Formatting Helpers (`ld.lld --gc-sections`, only emitted when width/align specifiers are used) ──
+define weak void @__syn_fmt_repeat(ptr %sink, i8 %ch, i32 %cnt){fn_as} noinline #99 {{
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %inext, %body ]
+  %done = icmp sge i32 %i, %cnt
+  br i1 %done, label %exit, label %body
+body:
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  %inext = add i32 %i, 1
+  br label %loop
+exit:
+  ret void
+}}
+
+define weak void @__syn_fmt_bytes_pad(ptr %sink, ptr %data, i32 %len, i32 %width, i8 %left_align, i8 %fill_ch){fn_as} noinline #99 {{
+entry:
+  %raw_pad = sub i32 %width, %len
+  %pneg = icmp slt i32 %raw_pad, 0
+  %pad = select i1 %pneg, i32 0, i32 %raw_pad
+  %is_left = icmp ne i8 %left_align, 0
+  br i1 %is_left, label %do_left, label %do_right
+do_left:
+  {call_kw} void @__syn_fmt_bytes(ptr %sink, ptr %data, i32 %len)
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 %fill_ch, i32 %pad)
+  ret void
+do_right:
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 %fill_ch, i32 %pad)
+  {call_kw} void @__syn_fmt_bytes(ptr %sink, ptr %data, i32 %len)
+  ret void
+}}
+
+define weak void @__syn_fmt_cstr_pad(ptr %sink, ptr %cstr, i32 %width, i8 %left_align, i8 %fill_ch){fn_as} noinline #99 {{
+entry:
+  %isnull = icmp eq ptr %cstr, null
+  br i1 %isnull, label %done, label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %inext, %step ]
+  %bp = getelementptr i8, ptr %cstr, i32 %i
+  %b = load i8, ptr %bp, align 1
+  %is_nul = icmp eq i8 %b, 0
+  br i1 %is_nul, label %done, label %step
+step:
+  %inext = add i32 %i, 1
+  br label %loop
+done:
+  %clen = phi i32 [ 0, %entry ], [ %i, %loop ]
+  {call_kw} void @__syn_fmt_bytes_pad(ptr %sink, ptr %cstr, i32 %clen, i32 %width, i8 %left_align, i8 %fill_ch)
+  ret void
+}}
+
+define weak void @__syn_fmt_int32_pad(ptr %sink, i32 %val, i8 %is_signed, i32 %base, i8 %upper, i32 %width, i8 %left_align, i8 %zero_pad, i8 %left_fill){fn_as} noinline #99 {{
+entry:
+  %buf = alloca [32 x i8], align 1
+  %is_s = icmp ne i8 %is_signed, 0
+  %lt0 = icmp slt i32 %val, 0
+  %is_neg = and i1 %is_s, %lt0
+  %negv = sub i32 0, %val
+  %mag = select i1 %is_neg, i32 %negv, i32 %val
+  %is_dec = icmp eq i32 %base, 10
+  %is_hex = icmp eq i32 %base, 16
+  %is_up = icmp ne i8 %upper, 0
+  %sh = select i1 %is_hex, i32 4, i32 1
+  %msk = select i1 %is_hex, i32 15, i32 1
+  %a_off = select i1 %is_up, i32 55, i32 87
+  br label %eloop
+eloop:
+  %v = phi i32 [ %mag, %entry ], [ %q, %eloop_cont ]
+  %len = phi i32 [ 0, %entry ], [ %len1, %eloop_cont ]
+  br i1 %is_dec, label %dig_dec, label %dig_pow2
+dig_dec:
+  %rem10 = urem i32 %v, 10
+  %q10 = udiv i32 %v, 10
+  %c10 = add i32 %rem10, 48
+  br label %dig_join
+dig_pow2:
+  %remp = and i32 %v, %msk
+  %qp = lshr i32 %v, %sh
+  %is_af = icmp uge i32 %remp, 10
+  %c_af = add i32 %remp, %a_off
+  %c_09 = add i32 %remp, 48
+  %cp2 = select i1 %is_af, i32 %c_af, i32 %c_09
+  br label %dig_join
+dig_join:
+  %q = phi i32 [ %q10, %dig_dec ], [ %qp, %dig_pow2 ]
+  %c32 = phi i32 [ %c10, %dig_dec ], [ %cp2, %dig_pow2 ]
+  %c8 = trunc i32 %c32 to i8
+  %sp = getelementptr inbounds [32 x i8], ptr %buf, i32 0, i32 %len
+  store i8 %c8, ptr %sp, align 1
+  %len1 = add i32 %len, 1
+  %more = icmp ne i32 %q, 0
+  br i1 %more, label %eloop_cont, label %eloop_done
+eloop_cont:
+  br label %eloop
+eloop_done:
+  %sign_w = zext i1 %is_neg to i32
+  %nat = add i32 %len1, %sign_w
+  %pad_raw = sub i32 %width, %nat
+  %pneg = icmp slt i32 %pad_raw, 0
+  %pad = select i1 %pneg, i32 0, i32 %pad_raw
+  %is_left = icmp ne i8 %left_align, 0
+  br i1 %is_left, label %do_left, label %do_right
+do_right:
+  %is_z = icmp ne i8 %zero_pad, 0
+  br i1 %is_z, label %r_zero, label %r_space
+r_zero:
+  br i1 %is_neg, label %rz_sign, label %rz_pad
+rz_sign:
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %rz_pad
+rz_pad:
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 48, i32 %pad)
+  br label %emit_init
+r_space:
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 32, i32 %pad)
+  br i1 %is_neg, label %rs_sign, label %emit_init
+rs_sign:
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %emit_init
+do_left:
+  br i1 %is_neg, label %dl_sign, label %emit_init
+dl_sign:
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %emit_init
+emit_init:
+  br label %emit_loop
+emit_loop:
+  %idx = phi i32 [ %len1, %emit_init ], [ %idx_prev, %emit_body ]
+  %edone = icmp eq i32 %idx, 0
+  br i1 %edone, label %post_emit, label %emit_body
+emit_body:
+  %idx_prev = sub i32 %idx, 1
+  %cp = getelementptr inbounds [32 x i8], ptr %buf, i32 0, i32 %idx_prev
+  %ch = load i8, ptr %cp, align 1
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  br label %emit_loop
+post_emit:
+  br i1 %is_left, label %tail_pad, label %done
+tail_pad:
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 %left_fill, i32 %pad)
+  br label %done
+done:
+  ret void
+}}
+
+define weak void @__syn_fmt_int64_pad(ptr %sink, i64 %val, i8 %is_signed, i32 %base, i8 %upper, i32 %width, i8 %left_align, i8 %zero_pad, i8 %left_fill){fn_as} noinline #99 {{
+entry:
+  %buf = alloca [64 x i8], align 1
+  %rem_slot = alloca i64, align 8
+  %is_s = icmp ne i8 %is_signed, 0
+  %lt0 = icmp slt i64 %val, 0
+  %is_neg = and i1 %is_s, %lt0
+  %negv = sub i64 0, %val
+  %mag = select i1 %is_neg, i64 %negv, i64 %val
+  %is_dec = icmp eq i32 %base, 10
+  %is_hex = icmp eq i32 %base, 16
+  %is_up = icmp ne i8 %upper, 0
+  %sh = select i1 %is_hex, i64 4, i64 1
+  %msk = select i1 %is_hex, i64 15, i64 1
+  %a_off = select i1 %is_up, i64 55, i64 87
+  br label %eloop
+eloop:
+  %v = phi i64 [ %mag, %entry ], [ %q, %eloop_cont ]
+  %len = phi i32 [ 0, %entry ], [ %len1, %eloop_cont ]
+  br i1 %is_dec, label %dig_dec, label %dig_pow2
+dig_dec:
+  %q10 = {call_kw} i64 @__syn_udivrem64(i64 %v, i64 10, ptr %rem_slot)
+  %rem10 = load i64, ptr %rem_slot, align 8
+  %c10 = add i64 %rem10, 48
+  br label %dig_join
+dig_pow2:
+  %remp = and i64 %v, %msk
+  %qp = lshr i64 %v, %sh
+  %is_af = icmp uge i64 %remp, 10
+  %c_af = add i64 %remp, %a_off
+  %c_09 = add i64 %remp, 48
+  %cp2 = select i1 %is_af, i64 %c_af, i64 %c_09
+  br label %dig_join
+dig_join:
+  %q = phi i64 [ %q10, %dig_dec ], [ %qp, %dig_pow2 ]
+  %c64 = phi i64 [ %c10, %dig_dec ], [ %cp2, %dig_pow2 ]
+  %c8 = trunc i64 %c64 to i8
+  %sp = getelementptr inbounds [64 x i8], ptr %buf, i32 0, i32 %len
+  store i8 %c8, ptr %sp, align 1
+  %len1 = add i32 %len, 1
+  %more = icmp ne i64 %q, 0
+  br i1 %more, label %eloop_cont, label %eloop_done
+eloop_cont:
+  br label %eloop
+eloop_done:
+  %sign_w = zext i1 %is_neg to i32
+  %nat = add i32 %len1, %sign_w
+  %pad_raw = sub i32 %width, %nat
+  %pneg = icmp slt i32 %pad_raw, 0
+  %pad = select i1 %pneg, i32 0, i32 %pad_raw
+  %is_left = icmp ne i8 %left_align, 0
+  br i1 %is_left, label %do_left, label %do_right
+do_right:
+  %is_z = icmp ne i8 %zero_pad, 0
+  br i1 %is_z, label %r_zero, label %r_space
+r_zero:
+  br i1 %is_neg, label %rz_sign, label %rz_pad
+rz_sign:
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %rz_pad
+rz_pad:
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 48, i32 %pad)
+  br label %emit_init
+r_space:
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 32, i32 %pad)
+  br i1 %is_neg, label %rs_sign, label %emit_init
+rs_sign:
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %emit_init
+do_left:
+  br i1 %is_neg, label %dl_sign, label %emit_init
+dl_sign:
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 45)
+  br label %emit_init
+emit_init:
+  br label %emit_loop
+emit_loop:
+  %idx = phi i32 [ %len1, %emit_init ], [ %idx_prev, %emit_body ]
+  %edone = icmp eq i32 %idx, 0
+  br i1 %edone, label %post_emit, label %emit_body
+emit_body:
+  %idx_prev = sub i32 %idx, 1
+  %cp = getelementptr inbounds [64 x i8], ptr %buf, i32 0, i32 %idx_prev
+  %ch = load i8, ptr %cp, align 1
+  {call_kw} void @__syn_fmt_putc(ptr %sink, i8 %ch)
+  br label %emit_loop
+post_emit:
+  br i1 %is_left, label %tail_pad, label %done
+tail_pad:
+  {call_kw} void @__syn_fmt_repeat(ptr %sink, i8 %left_fill, i32 %pad)
+  br label %done
+done:
   ret void
 }}
 "#,

@@ -5,10 +5,10 @@ pub(super) use std::fmt;
 
 pub(super) use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, BuiltinFn, CallArg, CatchClause,
-    DurationLit, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec, GenericArg, IsrDecl,
-    ItemKind, Literal, MmioAccess, MmioDeclKind, MmioRegDecl, OsPrimitiveType, PrimType, Priority,
-    Program, Span, SpawnStmt, Stmt, StmtKind, SwitchPat, SysMethod, TaskDecl, TypeExpr, TypeKind,
-    UnaryOp, SYS_NAMESPACE,
+    DurationLit, ErrorSpec, Expr, ExprKind, FnDecl, FormatAlign, FormatPadBase, FormatPart,
+    FormatSpec, GenericArg, IsrDecl, ItemKind, Literal, MmioAccess, MmioDeclKind, MmioRegDecl,
+    OsPrimitiveType, PrimType, Priority, Program, Span, SpawnStmt, Stmt, StmtKind, SwitchPat,
+    SysMethod, TaskDecl, TypeExpr, TypeKind, UnaryOp, SYS_NAMESPACE,
 };
 
 pub(super) use crate::ir::{
@@ -16,11 +16,12 @@ pub(super) use crate::ir::{
     MirCallDst, MirChildCallSlot, MirConst, MirEnum, MirErrorSpec, MirExpr, MirExprKind,
     MirExternFn, MirField, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction, MirImport, MirIntFmt,
     MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl, MirIsrStateVar,
-    MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPlace, MirPrimKind,
-    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirPrimitive, MirPriority,
-    MirSpawnInstance, MirStmt, MirStruct, MirSubsystemGlobal, MirSwitchPattern, MirSysQuery,
-    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm, MirWaitArmOp,
-    MirWaitTimer, MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem, VarId, VarRole,
+    MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPadSpec, MirPlace,
+    MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirPrimitive,
+    MirPriority, MirSpawnInstance, MirStmt, MirStruct, MirSubsystemGlobal, MirSwitchPattern,
+    MirSysQuery, MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm,
+    MirWaitArmOp, MirWaitTimer, MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem, VarId,
+    VarRole,
 };
 pub(super) use crate::liveness::{analyze_fn_frame, analyze_isr_frame, analyze_task_frame};
 pub(super) use crate::ram::{populate_module_ram_report, RamReport};

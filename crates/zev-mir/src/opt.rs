@@ -633,7 +633,9 @@ impl<'a> ScanCtx<'a> {
             | MirFmtChunk::Float { value, .. }
             | MirFmtChunk::Bool(value)
             | MirFmtChunk::Str(value)
+            | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
+            | MirFmtChunk::PaddedBytes { slice: value, .. }
             | MirFmtChunk::EnumName { value, .. }
             | MirFmtChunk::DebugSlice { slice: value, .. } => {
                 self.visit_expr(value, in_isr, callees);
@@ -2525,7 +2527,9 @@ impl VarUsageInfo {
             | MirFmtChunk::Float { value, .. }
             | MirFmtChunk::Bool(value)
             | MirFmtChunk::Str(value)
+            | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
+            | MirFmtChunk::PaddedBytes { slice: value, .. }
             | MirFmtChunk::EnumName { value, .. }
             | MirFmtChunk::DebugSlice { slice: value, .. } => self.visit_expr(value),
         }
@@ -3269,7 +3273,9 @@ fn fmt_chunk_reads_var(ch: &MirFmtChunk, target: VarId) -> bool {
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
         | MirFmtChunk::Str(value)
+        | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
+        | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => expr_reads_var(value, target),
     }
@@ -3427,7 +3433,9 @@ fn subst_fmt_chunk(ch: &mut MirFmtChunk, target: VarId, repl: &MirExpr) {
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
         | MirFmtChunk::Str(value)
+        | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
+        | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => subst_expr(value, target, repl),
     }
@@ -4057,7 +4065,9 @@ fn collect_fn_addrs_and_calls_fmt(
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
         | MirFmtChunk::Str(value)
+        | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
+        | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => {
             collect_fn_addrs_and_calls_expr(value, addr_taken_fns, call_sites);

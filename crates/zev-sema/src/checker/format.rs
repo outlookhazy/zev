@@ -87,26 +87,44 @@ impl<'a> BodyChecker<'a> {
             None
         };
 
-        if let (Some(cap), Some(worst)) = (self.static_dst_capacity(dst_expr, &dv.ty), worst_len) {
-            if worst > cap {
-                self.sema.emit(
-                    Diagnostic::new(
-                        DiagnosticKind::FormatBufferTooSmall,
-                        span,
-                        format!(
-                            "format string worst-case length ({} bytes) exceeds destination buffer capacity ({} bytes)",
-                            worst, cap
-                        ),
-                    )
-                    .with_note(format!(
-                        "increase the destination buffer to at least `[{}]u8`, or format into a `[]u8` slice and handle truncation with `catch (FmtErr err, []u8 clamped) {{ ... }}`",
-                        worst
-                    )),
-                );
+        if let Some(cap) = self.static_dst_capacity(dst_expr, &dv.ty) {
+            if let Some(worst) = worst_len {
+                if worst > cap {
+                    self.sema.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::FormatBufferTooSmall,
+                            span,
+                            format!(
+                                "format string worst-case length ({} bytes) exceeds destination buffer capacity ({} bytes)",
+                                worst, cap
+                            ),
+                        )
+                        .with_note(format!(
+                            "increase the destination buffer to at least `[{}]u8`, or format into a `[]u8` slice and handle truncation with `catch (FmtErr err, []u8 clamped) {{ ... }}`",
+                            worst
+                        )),
+                    );
+                }
                 self.proven_infallible_spans.insert((span.start, span.end));
-            } else {
-                // Worst-case length is statically proven to fit inside `cap`!
-                self.proven_infallible_spans.insert((span.start, span.end));
+            } else if let ExprKind::FormatString(parts) = &args[1].value.kind {
+                let min_len = self.min_format_string_len(parts);
+                if min_len > cap {
+                    self.sema.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::FormatBufferTooSmall,
+                            span,
+                            format!(
+                                "format output minimum length ({} bytes) exceeds destination buffer capacity ({} bytes)",
+                                min_len, cap
+                            ),
+                        )
+                        .with_note(format!(
+                            "increase the destination buffer to at least `[{}]u8`",
+                            min_len
+                        )),
+                    );
+                    self.proven_infallible_spans.insert((span.start, span.end));
+                }
             }
         }
 
@@ -310,7 +328,11 @@ impl<'a> BodyChecker<'a> {
 
     pub(super) fn min_format_value_len(&self, ty: &Ty, spec: &FormatSpec, expr: &Expr) -> usize {
         if let ExprKind::Literal(Literal::String(s)) = &expr.kind {
-            return zev_ast::decoded_string_byte_len(s);
+            let len = zev_ast::decoded_string_byte_len(s);
+            return match spec {
+                FormatSpec::Padded { width, .. } => len.max(*width as usize),
+                _ => len,
+            };
         }
         if ty.is_bool() {
             return if let ExprKind::Literal(Literal::Bool(b)) = &expr.kind {
@@ -327,6 +349,30 @@ impl<'a> BodyChecker<'a> {
             return match spec {
                 FormatSpec::Hex { width, .. } | FormatSpec::Bin { width } => {
                     width.unwrap_or(1).max(1) as usize
+                }
+                FormatSpec::Padded { width, .. } => {
+                    let nat = match &expr.kind {
+                        ExprKind::Literal(Literal::Int { value: n, .. }) => {
+                            if *n == 0 {
+                                1
+                            } else {
+                                n.ilog10() as usize + 1
+                            }
+                        }
+                        ExprKind::Unary {
+                            op: UnaryOp::Neg,
+                            expr: inner,
+                        } => {
+                            if let ExprKind::Literal(Literal::Int { value: n, .. }) = &inner.kind {
+                                let d = if *n == 0 { 1 } else { n.ilog10() as usize + 1 };
+                                d + 1
+                            } else {
+                                1
+                            }
+                        }
+                        _ => 1,
+                    };
+                    nat.max(*width as usize)
                 }
                 _ => match &expr.kind {
                     ExprKind::Literal(Literal::Int { value: n, .. }) => {
@@ -374,6 +420,12 @@ impl<'a> BodyChecker<'a> {
         }
         match (ty, spec) {
             (Ty::Array { elem, len }, FormatSpec::Default) if **elem == Ty::u8() => *len,
+            (Ty::Array { elem, len }, FormatSpec::Padded { width, .. }) if **elem == Ty::u8() => {
+                (*len).max(*width as usize)
+            }
+            (Ty::Str | Ty::Slice(_) | Ty::Ptr(_), FormatSpec::Padded { width, .. }) => {
+                *width as usize
+            }
             (Ty::Struct(_) | Ty::Slice(_) | Ty::Array { .. }, FormatSpec::Debug) => {
                 let mut visiting = BTreeSet::new();
                 self.debug_min_case_ty(ty, &mut visiting)
@@ -625,6 +677,14 @@ impl<'a> BodyChecker<'a> {
                 FormatSpec::Default | FormatSpec::Debug => {
                     Some(zev_ast::decoded_string_byte_len(s))
                 }
+                FormatSpec::Padded {
+                    align,
+                    zero_pad,
+                    width,
+                    base: zev_ast::FormatPadBase::Default,
+                } if align.is_some() || !zero_pad => {
+                    Some(zev_ast::decoded_string_byte_len(s).max(width as usize))
+                }
                 _ => {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -679,6 +739,14 @@ impl<'a> BodyChecker<'a> {
                     let w = width.unwrap_or(0) as usize;
                     Some(int_bin_worst_case(int_prim).max(w))
                 }
+                FormatSpec::Padded { width, base, .. } => {
+                    let nat = match base {
+                        zev_ast::FormatPadBase::Default => int_decimal_worst_case(int_prim),
+                        zev_ast::FormatPadBase::Hex { .. } => int_hex_worst_case(int_prim),
+                        zev_ast::FormatPadBase::Bin => int_bin_worst_case(int_prim),
+                    };
+                    Some(nat.max(width as usize))
+                }
                 FormatSpec::Fixed { .. } | FormatSpec::Sci { .. } => {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -730,12 +798,12 @@ impl<'a> BodyChecker<'a> {
                         Some(if is_f32 { 9 + p } else { 10 + p })
                     }
                 }
-                FormatSpec::Hex { .. } | FormatSpec::Bin { .. } => {
+                FormatSpec::Hex { .. } | FormatSpec::Bin { .. } | FormatSpec::Padded { .. } => {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
                         format!(
-                            "hex/binary format specifier requires an integer type, found '{}'",
+                            "hex/binary/width format specifier cannot be applied to floating-point type '{}'",
                             ty
                         ),
                     ));
@@ -770,13 +838,55 @@ impl<'a> BodyChecker<'a> {
         // 6. Byte strings/slices, structs under `:?`, and uniform pointer addresses under `:?`.
         match (ty, spec) {
             (Ty::Str, FormatSpec::Default | FormatSpec::Debug) => None,
+            (
+                Ty::Str,
+                FormatSpec::Padded {
+                    align,
+                    zero_pad,
+                    base: zev_ast::FormatPadBase::Default,
+                    ..
+                },
+            ) if align.is_some() || !zero_pad => None,
             (Ty::Slice(elem), FormatSpec::Default) if **elem == Ty::u8() => None,
+            (
+                Ty::Slice(elem),
+                FormatSpec::Padded {
+                    align,
+                    zero_pad,
+                    base: zev_ast::FormatPadBase::Default,
+                    ..
+                },
+            ) if **elem == Ty::u8() && (align.is_some() || !zero_pad) => None,
             (Ty::Ptr(inner), FormatSpec::Default)
                 if matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8)) =>
             {
                 None
             }
+            (
+                Ty::Ptr(inner),
+                FormatSpec::Padded {
+                    align,
+                    zero_pad,
+                    base: zev_ast::FormatPadBase::Default,
+                    ..
+                },
+            ) if matches!(**inner, Ty::Prim(PrimType::U8 | PrimType::I8))
+                && (align.is_some() || !zero_pad) =>
+            {
+                None
+            }
             (Ty::Array { elem, len }, FormatSpec::Default) if **elem == Ty::u8() => Some(*len),
+            (
+                Ty::Array { elem, len },
+                FormatSpec::Padded {
+                    align,
+                    zero_pad,
+                    width,
+                    base: zev_ast::FormatPadBase::Default,
+                },
+            ) if **elem == Ty::u8() && (align.is_some() || !zero_pad) => {
+                Some((*len).max(width as usize))
+            }
 
             (Ty::Struct(st_name), FormatSpec::Debug) => {
                 let mut visiting = BTreeSet::new();

@@ -651,6 +651,8 @@ format-string parser, zero global handler registry):
   - `{v}` — Decimal integers, `bool`, `[]u8` / string literals, default `.2` fixed float, and automatic
     `enum` variant names (`.rodata` emitted only for formatted enums!).
   - `{v:x}` / `{v:X}` / `{v:04x}` — Hexadecimal with optional zero-padded width; `{v:b}` / `{v:08b}` — Binary.
+  - `{v:>5}` / `{s:<12}` / `{v:05}` / `{v:0>5}` / `{v:>6x}` / `{v:>8b}` — Width, `<`/`>` alignment,
+    and space/`0` padding for integers and `[]u8`/`[N]u8`/string text on every sink (`E0028` static fit checks account for padded width; values longer than `width` are never truncated).
   - `{t:.2}` — Compact (~150 B Arduino-style) fixed-decimal `f32`/`f64` (`\"nan\"`, `\"inf\"`, `\"ovf\"`).
   - `{t:e}` / `{t:.3e}` — Scientific float (linked via `--gc-sections` *only* if `:e` appears in program!).
   - `{pkt:?}` — Compile-time struct field debug expansion (`\"CmdFrame { op: 1, ... }\"`).
