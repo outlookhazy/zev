@@ -118,6 +118,16 @@ pub enum IrqModel {
         vector_slots: u32,
         max_irq_source: u32,
         reserved_slots: Vec<u32>,
+        /// `routing = "identity"`: the interrupt source number is the vector slot (controllers
+        /// such as PFIC / CLIC that dispatch by interrupt number). Default `"dynamic"` assigns
+        /// free CPU interrupt lines and maps sources onto them through `sys.set_irq_router`.
+        identity_routing: bool,
+        /// `enable_csr = "mie"` (default) enables attached slots through the `mie` CSR.
+        /// `"none"` leaves `mie` untouched for cores that do not implement it; lines are then
+        /// enabled by the `sys.set_irq_router` route hook in the interrupt controller itself.
+        write_mie: bool,
+        /// Vector slots that enter the exception trampoline (default `[0]`).
+        exception_slots: Vec<u32>,
     },
     None,
 }
@@ -142,6 +152,8 @@ pub struct TargetSpec {
     pub has_fpu: bool,
     pub iram_in_data: bool,
     pub allow_sleep_deep: bool,
+    /// RISC-V only: `false` makes the idle loop poll instead of executing `wfi`.
+    pub allow_wfi: bool,
     pub semihosting: bool,
     pub hal_dir: Option<String>,
     pub board_module: Option<String>,
@@ -185,6 +197,7 @@ impl TargetSpec {
             has_fpu: false,
             iram_in_data: false,
             allow_sleep_deep: false,
+            allow_wfi: true,
             semihosting: false,
             hal_dir: None,
             board_module: None,
@@ -351,6 +364,7 @@ impl TargetSpec {
         let has_fpu = cdoc.opt_bool("chip", "has_fpu")?.unwrap_or(false);
         let iram_in_data = cdoc.opt_bool("chip", "iram_in_data")?.unwrap_or(false);
         let allow_sleep_deep = cdoc.opt_bool("chip", "allow_sleep_deep")?.unwrap_or(false);
+        let allow_wfi = cdoc.opt_bool("chip", "allow_wfi")?.unwrap_or(true);
         let mut semihosting = cdoc.opt_bool("chip", "semihosting")?.unwrap_or(false);
         let mut hal_dir = cdoc.opt_str("chip", "hal_dir")?;
 
@@ -382,13 +396,78 @@ impl TargetSpec {
                     .opt_u32("irq", "data_ram_offset")?
                     .unwrap_or(0x0080_0000),
             },
-            "riscv-vectored" => IrqModel::RiscvVectored {
-                vector_slots: cdoc.opt_u32("irq", "vector_slots")?.unwrap_or(32),
-                max_irq_source: cdoc.req_u32("irq", "max_irq_source")?,
-                reserved_slots: cdoc
-                    .opt_u32_array("irq", "reserved_slots")?
-                    .unwrap_or_default(),
-            },
+            "riscv-vectored" => {
+                let vector_slots = cdoc.opt_u32("irq", "vector_slots")?.unwrap_or(32);
+                let identity_routing = match cdoc
+                    .opt_str("irq", "routing")?
+                    .unwrap_or_else(|| "dynamic".to_string())
+                    .as_str()
+                {
+                    "dynamic" => false,
+                    "identity" => true,
+                    other => {
+                        return Err(CodegenError::new(
+                            "toml",
+                            format!(
+                                "unknown `[irq].routing` '{other}' (expected \"dynamic\" or \"identity\")"
+                            ),
+                        ));
+                    }
+                };
+                let write_mie = match cdoc
+                    .opt_str("irq", "enable_csr")?
+                    .unwrap_or_else(|| "mie".to_string())
+                    .as_str()
+                {
+                    "mie" => true,
+                    "none" => false,
+                    other => {
+                        return Err(CodegenError::new(
+                            "toml",
+                            format!(
+                                "unknown `[irq].enable_csr` '{other}' (expected \"mie\" or \"none\")"
+                            ),
+                        ));
+                    }
+                };
+                // `mie` is a 32-bit CSR with one enable bit per slot, and the vector table is
+                // indexed by a `u8` slot.
+                if write_mie && vector_slots > 32 {
+                    return Err(CodegenError::new(
+                        "toml",
+                        format!(
+                            "`[irq].vector_slots` = {vector_slots} exceeds the 32 lines of the `mie` CSR; set `enable_csr = \"none\"` for controllers that enable lines themselves"
+                        ),
+                    ));
+                }
+                if vector_slots == 0 || vector_slots > 256 {
+                    return Err(CodegenError::new(
+                        "toml",
+                        format!("`[irq].vector_slots` = {vector_slots} must be in 1..=256"),
+                    ));
+                }
+                let exception_slots = cdoc
+                    .opt_u32_array("irq", "exception_slots")?
+                    .unwrap_or_else(|| vec![0]);
+                if let Some(bad) = exception_slots.iter().find(|s| **s >= vector_slots) {
+                    return Err(CodegenError::new(
+                        "toml",
+                        format!(
+                            "`[irq].exception_slots` entry {bad} is outside `vector_slots` (0..{vector_slots})"
+                        ),
+                    ));
+                }
+                IrqModel::RiscvVectored {
+                    vector_slots,
+                    max_irq_source: cdoc.req_u32("irq", "max_irq_source")?,
+                    reserved_slots: cdoc
+                        .opt_u32_array("irq", "reserved_slots")?
+                        .unwrap_or_default(),
+                    identity_routing,
+                    write_mie,
+                    exception_slots,
+                }
+            }
             "none" => IrqModel::None,
             other => {
                 return Err(CodegenError::new(
@@ -500,6 +579,7 @@ impl TargetSpec {
             has_fpu,
             iram_in_data,
             allow_sleep_deep,
+            allow_wfi,
             semihosting,
             hal_dir,
             board_module,

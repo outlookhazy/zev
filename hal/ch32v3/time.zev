@@ -1,0 +1,43 @@
+// Portable HAL microsecond hardware settle spin (CH32V30x core system timer)
+
+import chip.ch32v30x as hw;
+
+// The core timer counts HCLK cycles once the board module has started it. Before that, fall
+// back to a short bounded instruction spin.
+pub fn spin_us(u32 us) {
+    if (us == 0u32) {
+        return;
+    }
+    if ((hw.STK.ctlr & hw.STK_CTLR_STE) == 0u32) {
+        u32 n = us;
+        if (n > 500u32) {
+            n = 500u32;
+        }
+        for (u32 _i in 0..(n * 2u32)) {
+            sys.nop();
+        }
+        return;
+    }
+    // HCLK is 8 MHz (HSI) until the board module raises it; see `bsp` `HCLK_HZ`.
+    u32 ticks_per_us = 8u32;
+    u32 rem_us = us;
+    for (u32 _chunk in 0..4000) {
+        if (rem_us == 0u32) {
+            break;
+        }
+        u32 slice_us = rem_us;
+        if (slice_us > 500u32) {
+            slice_us = 500u32;
+        }
+        rem_us -= slice_us;
+        u32 target = slice_us * ticks_per_us;
+        u32 max_polls = (target * 4u32) + 256u32;
+        u32 t0 = hw.STK.cntl;
+        for (u32 _p in 0..max_polls) {
+            if ((hw.STK.cntl - t0) >= target) {
+                break;
+            }
+            sys.nop();
+        }
+    }
+}

@@ -58,4 +58,4 @@ jobs:
           cargo run --quiet --bin zevc -- run-qemu examples/portable_controller_demo.zev
 
       - name: Build bare-metal firmware images
-        run: make nucleo-f334r8 esp32c6 pico uno nano-every
+        run: make nucleo-f334r8 esp32c6 pico uno nano-every ch32v307

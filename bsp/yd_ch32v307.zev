@@ -1,0 +1,107 @@
+// VCC-GND Studio YD-CH32V307VCT6 Board Support Package
+//
+// Board topology only: onboard LEDs and user button, the 8 MHz HSI bring-up clock, the core
+// timer as the scheduler clock, and a USART1 console on PA9 (TX) / PA10 (RX). The board has no
+// USB-to-UART bridge, so the console needs an external 3.3 V adapter on those pins.
+//
+// UNVERIFIED ON HARDWARE: LED1 = PA15, LED2 = PB4 and the user button = PB3 are taken from a
+// manual for what appears to be the same board design; their polarity is assumed. Confirm with
+// `examples/ch32v307_blink.zev` before relying on them.
+
+import chip.ch32v30x as hw;
+import hal.gpio as gpio;
+
+pub const []u8 BOARD_NAME = "yd_ch32v307";
+pub const bool EXIT_ON_DONE = false;
+
+// Reset default: the internal 8 MHz RC oscillator with no PLL and no bus prescalers.
+pub const u32 HCLK_HZ = 8000000;
+pub const u32 CONSOLE_BAUD = 115200;
+
+pub const gpio.Pin PIN_LED1   = gpio.Pin { port: hw.PORT_A, pin: 15u8, active_low: false };
+pub const gpio.Pin PIN_LED2   = gpio.Pin { port: hw.PORT_B, pin: 4u8,  active_low: false };
+pub const gpio.Pin PIN_KEY    = gpio.Pin { port: hw.PORT_B, pin: 3u8,  active_low: true  };
+pub const gpio.Pin PIN_USER_OUT = gpio.Pin { port: hw.PORT_A, pin: 15u8, active_low: false };
+pub const gpio.Pin PIN_BUTTON   = gpio.Pin { port: hw.PORT_B, pin: 3u8,  active_low: true  };
+
+// Onboard 24C64 EEPROM bus (I2C2), recorded for drivers that follow.
+pub const gpio.Pin PIN_I2C2_SCL = gpio.Pin { port: hw.PORT_B, pin: 10u8, active_low: false };
+pub const gpio.Pin PIN_I2C2_SDA = gpio.Pin { port: hw.PORT_B, pin: 11u8, active_low: false };
+
+pub fn console_putc(u8 b) {
+    if (b == '\n') {
+        hw.usart1_tx_byte('\r');
+    }
+    hw.usart1_tx_byte(b);
+}
+
+pub fn on_fault() {
+    []u8 msg = "\n[FAULT] CH32V307 exception halted\n";
+    for (u8 b in msg) {
+        console_putc(b);
+    }
+}
+
+// Monotonic milliseconds from the free-running core timer (counts HCLK cycles).
+pub fn sys_now_ms() -> u32 {
+    return (hw.stk_read() / ((HCLK_HZ / 1000u32) as u64)) as u32;
+}
+
+pub fn init() {
+    sys.set_fault_handler(on_fault);
+    sys.set_irq_router(hw.route_irq, hw.ack_irq);
+
+    hw.stk_start_free_running();
+    sys.set_clock_ms(sys_now_ms);
+
+    // `set_mode` enables the port clock; writes before that are ignored by the hardware.
+    PIN_LED1.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    PIN_LED1.set_low();
+    PIN_LED2.set_mode(gpio.Mode.Output, gpio.Pull.None);
+    PIN_LED2.set_low();
+    PIN_KEY.set_mode(gpio.Mode.Input, gpio.Pull.Up);
+
+    hw.usart1_init(HCLK_HZ, CONSOLE_BAUD);
+    sys.set_putc(console_putc);
+}
+
+pub fn led_pin() -> gpio.Pin {
+    return PIN_LED1;
+}
+
+pub fn button_pin() -> gpio.Pin {
+    return PIN_KEY;
+}
+
+pub fn set_led(bool on) {
+    PIN_LED1.write(on);
+}
+
+pub fn toggle_led() {
+    PIN_LED1.toggle();
+}
+
+pub fn set_led2(bool on) {
+    PIN_LED2.write(on);
+}
+
+pub fn toggle_led2() {
+    PIN_LED2.toggle();
+}
+
+pub fn read_button() -> bool {
+    return PIN_KEY.read();
+}
+
+// Route the user button (PB3) to EXTI line 3, falling edge. Attach an `isr` to
+// `hw.IRQ_EXTI3` and clear the flag in it with `button_irq_clear()`.
+pub fn button_irq_enable() {
+    hw.RCC.apb2pcenr = hw.RCC.apb2pcenr | hw.RCC_APB2_AFIO;
+    u32 _stab = hw.RCC.apb2pcenr;
+    // AFIO_EXTICR1 bits [15:12] select the port for line 3: 1 = port B.
+    hw.AFIO.exticr[0] = (hw.AFIO.exticr[0] & (~0xF000u32)) | 0x1000u32;
+    hw.EXTI.ftenr = hw.EXTI.ftenr | (1u32 << 3);
+    hw.EXTI.rtenr = hw.EXTI.rtenr & (~(1u32 << 3));
+    hw.EXTI.intfr = 1u32 << 3;
+    hw.EXTI.intenr = hw.EXTI.intenr | (1u32 << 3);
+}
