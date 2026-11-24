@@ -2547,17 +2547,21 @@ impl<'a> Parser<'a> {
     // Types & Declarators
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Parse a standalone [`TypeExpr`] (handles prefix `*T`, `[]T`, `[N]T`, `fn(...) -> Ret`,
+    /// Parse a standalone [`TypeExpr`] (handles prefix `*T`, `[]T`, `[N]T`, `fn(...) [-> Ret] [error [E]]`,
     /// OS primitives, built-in primitives, qualified paths, and postfix `T*`, `T[]`, `T[N]`).
     pub fn parse_type(&mut self) -> Result<TypeExpr, ParseError> {
+        self.parse_type_with_mode(false)
+    }
+
+    fn parse_type_with_mode(&mut self, in_declarator: bool) -> Result<TypeExpr, ParseError> {
         self.check_recursion_depth(self.peek_span())?;
         self.recursion_depth += 1;
-        let res = self.parse_type_impl();
+        let res = self.parse_type_impl(in_declarator);
         self.recursion_depth -= 1;
         res
     }
 
-    fn parse_type_impl(&mut self) -> Result<TypeExpr, ParseError> {
+    fn parse_type_impl(&mut self, in_declarator: bool) -> Result<TypeExpr, ParseError> {
         let start = self.peek_span();
 
         // Trap foreign modifiers/references in type position:
@@ -2599,7 +2603,7 @@ impl<'a> Parser<'a> {
                     return Err(self.trap_p0009_mut_or_ref("*mut", start.merge(mut_span)));
                 }
                 let _ = self.eat(&TokenKind::KwConst);
-                let inner = self.parse_type()?;
+                let inner = self.parse_type_with_mode(in_declarator)?;
                 let span = start.merge(inner.span);
                 TypeExpr::new(TypeKind::Ptr(Box::new(inner)), span)
             }
@@ -2610,13 +2614,13 @@ impl<'a> Parser<'a> {
                         return Err(self.trap_p0001("mut", self.peek_span()));
                     }
                     let _ = self.eat(&TokenKind::KwConst);
-                    let elem = self.parse_type()?;
+                    let elem = self.parse_type_with_mode(in_declarator)?;
                     let span = start.merge(elem.span);
                     TypeExpr::new(TypeKind::Slice(Box::new(elem)), span)
                 } else {
                     let len = self.parse_array_len()?;
                     self.expect(&TokenKind::RBracket)?;
-                    let elem = self.parse_type()?;
+                    let elem = self.parse_type_with_mode(in_declarator)?;
                     let span = start.merge(elem.span);
                     TypeExpr::new(
                         TypeKind::Array {
@@ -2627,22 +2631,71 @@ impl<'a> Parser<'a> {
                     )
                 }
             }
+            TokenKind::LParen if self.peek_n_kind(1) == TokenKind::KwFn => {
+                self.bump();
+                let inner = self.parse_type_with_mode(false)?;
+                let rp = self.expect(&TokenKind::RParen)?;
+                TypeExpr::new(inner.kind, start.merge(rp.span))
+            }
             TokenKind::KwFn => {
-                // Note: function-pointer types `fn(T1, T2) -> Ret` KEEP `-> Ret`!
+                // Note: function-pointer types `fn(T1, T2) [-> Ret] [error [E]]` KEEP `-> Ret`!
                 self.bump();
                 let fn_params = self.parse_fn_ptr_param_types()?;
-                let (ret, end_span) = if self.eat(&TokenKind::Arrow) {
-                    let r = self.parse_type()?;
+                let (ret, mut end_span) = if self.eat(&TokenKind::Arrow) {
+                    let r = self.parse_type_with_mode(in_declarator)?;
                     let s = r.span;
                     (r, s)
                 } else {
                     let s = self.prev_span();
                     (TypeExpr::void(s), s)
                 };
+                let error_spec = if self.at(&TokenKind::KwError) {
+                    let err_tok = self.bump();
+                    let err_span = err_tok.span;
+                    if in_declarator {
+                        let cp = self.save();
+                        if let Ok(err_ty) = self.parse_type() {
+                            if matches!(self.peek_kind(), TokenKind::Ident(_) | TokenKind::KwMut)
+                                || (self.at(&TokenKind::LParen)
+                                    && self.peek_n_kind(1) == TokenKind::Star)
+                            {
+                                end_span = err_ty.span;
+                                Some(Box::new(ErrorSpec::Typed(err_ty)))
+                            } else {
+                                self.restore(cp);
+                                end_span = err_span;
+                                Some(Box::new(ErrorSpec::Bare(err_span)))
+                            }
+                        } else {
+                            self.restore(cp);
+                            end_span = err_span;
+                            Some(Box::new(ErrorSpec::Bare(err_span)))
+                        }
+                    } else if matches!(
+                        self.peek_kind(),
+                        TokenKind::Ident(_)
+                            | TokenKind::KwFn
+                            | TokenKind::Star
+                            | TokenKind::LBracket
+                            | TokenKind::KwConst
+                    ) || (self.at(&TokenKind::LParen)
+                        && self.peek_n_kind(1) == TokenKind::KwFn)
+                    {
+                        let err_ty = self.parse_type()?;
+                        end_span = err_ty.span;
+                        Some(Box::new(ErrorSpec::Typed(err_ty)))
+                    } else {
+                        end_span = err_span;
+                        Some(Box::new(ErrorSpec::Bare(err_span)))
+                    }
+                } else {
+                    None
+                };
                 TypeExpr::new(
                     TypeKind::FnPtr {
                         params: fn_params,
                         ret: Box::new(ret),
+                        error_spec,
                     },
                     start.merge(end_span),
                 )
@@ -2940,7 +2993,7 @@ impl<'a> Parser<'a> {
         }
 
         while !self.at(&TokenKind::RParen) && !self.at(&TokenKind::Eof) {
-            let ty = self.parse_type()?;
+            let ty = self.parse_type_with_mode(true)?;
             if matches!(self.peek_kind(), TokenKind::Ident(_)) {
                 self.bump();
             }
@@ -2969,7 +3022,7 @@ impl<'a> Parser<'a> {
             return Err(self.trap_p0001("mut", start));
         }
 
-        let ty = self.parse_type().map_err(|e| {
+        let ty = self.parse_type_with_mode(true).map_err(|e| {
             if e.code.is_some() {
                 e
             } else {
@@ -3583,6 +3636,9 @@ impl<'a> Parser<'a> {
             TokenKind::KwConst | TokenKind::KwFn => {
                 starts_with_known_type = true;
             }
+            TokenKind::LParen if self.peek_n_kind(1) == TokenKind::KwFn => {
+                starts_with_known_type = true;
+            }
             TokenKind::Star | TokenKind::LBracket => {}
             TokenKind::Ident(ref s) => {
                 if (PrimType::from_name(s).is_some()
@@ -3609,7 +3665,7 @@ impl<'a> Parser<'a> {
         }
 
         let cp = self.save();
-        let ok = match self.parse_type() {
+        let ok = match self.parse_type_with_mode(true) {
             Ok(_) => {
                 if self.at(&TokenKind::KwMut) {
                     true
@@ -4005,7 +4061,7 @@ impl<'a> Parser<'a> {
 
     fn try_parse_wait_arm_bind(&mut self) -> Result<Option<(TypeExpr, Ident)>, ParseError> {
         let cp = self.save();
-        if let Ok(ty) = self.parse_type() {
+        if let Ok(ty) = self.parse_type_with_mode(true) {
             if matches!(self.peek_kind(), TokenKind::Ident(_))
                 && self.peek_n_kind(1) == TokenKind::Eq
             {

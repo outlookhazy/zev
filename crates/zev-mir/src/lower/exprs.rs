@@ -1598,15 +1598,46 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                     ));
                 }
                 if let Some(vid) = be.scopes().lookup(&id.name) {
-                    if let MirType::FnPtr { params, ret } = be.vars()[vid.0].ty.clone() {
+                    if let MirType::FnPtr {
+                        params,
+                        ret,
+                        error_spec,
+                    } = be.vars()[vid.0].ty.clone()
+                    {
                         let fp_expr = MirExpr::new(
                             MirExprKind::Var(vid),
                             MirType::FnPtr {
                                 params: params.clone(),
                                 ret: ret.clone(),
+                                error_spec: error_spec.clone(),
                             },
                         );
-                        return lower_indirect_fnptr_call_be(fp_expr, &params, *ret, args, be);
+                        return lower_indirect_fnptr_call_be(
+                            fp_expr,
+                            &params,
+                            *ret,
+                            &error_spec,
+                            args,
+                            be,
+                        );
+                    }
+                }
+                if let Some(cty) = be.syms().consts.get(&id.name).cloned() {
+                    if let MirType::FnPtr {
+                        params,
+                        ret,
+                        error_spec,
+                    } = cty.clone()
+                    {
+                        let fp_expr = MirExpr::new(MirExprKind::ConstRef(id.name.clone()), cty);
+                        return lower_indirect_fnptr_call_be(
+                            fp_expr,
+                            &params,
+                            *ret,
+                            &error_spec,
+                            args,
+                            be,
+                        );
                     }
                 }
                 for a in args {
@@ -1622,8 +1653,13 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                 ));
             }
             if let Ok(ce) = be.lower_sub(callee, None) {
-                if let MirType::FnPtr { params, ret } = ce.ty.clone() {
-                    return lower_indirect_fnptr_call_be(ce, &params, *ret, args, be);
+                if let MirType::FnPtr {
+                    params,
+                    ret,
+                    error_spec,
+                } = ce.ty.clone()
+                {
+                    return lower_indirect_fnptr_call_be(ce, &params, *ret, &error_spec, args, be);
                 }
             }
             Err(MirLowerError {
@@ -1757,7 +1793,12 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                             .find(|f| f.name == method.name)
                             .map(|f| (f.ty.clone(), st.packed))
                     }) {
-                        if let MirType::FnPtr { params, ret } = fty.clone() {
+                        if let MirType::FnPtr {
+                            params,
+                            ret,
+                            error_spec,
+                        } = fty.clone()
+                        {
                             let fp_expr = MirExpr::new(
                                 MirExprKind::FieldAccess {
                                     base: Box::new(recv_me),
@@ -1769,7 +1810,14 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                                 },
                                 fty,
                             );
-                            return lower_indirect_fnptr_call_be(fp_expr, &params, *ret, args, be);
+                            return lower_indirect_fnptr_call_be(
+                                fp_expr,
+                                &params,
+                                *ret,
+                                &error_spec,
+                                args,
+                                be,
+                            );
                         }
                     }
                 }
@@ -1787,6 +1835,7 @@ pub(super) fn lower_indirect_fnptr_call_be<B: LowerBackend>(
     fp_expr: MirExpr,
     params: &[MirType],
     ret: MirType,
+    error_spec: &MirErrorSpec,
     args: &[CallArg],
     be: &mut B,
 ) -> Result<MirExpr, MirLowerError> {
@@ -1816,13 +1865,21 @@ pub(super) fn lower_indirect_fnptr_call_be<B: LowerBackend>(
         };
         largs.push(consume_moved_lease_be(coerced, be));
     }
+    let call_ret_ty = if error_spec.has_error() {
+        MirType::Result {
+            ok: Box::new(ret),
+            err: error_spec.err_type().map(Box::new),
+        }
+    } else {
+        ret
+    };
     Ok(MirExpr::new(
         MirExprKind::CallDirect {
             callee: callee_name,
             is_extern_c: true,
             args: largs,
         },
-        ret,
+        call_ret_ty,
     ))
 }
 

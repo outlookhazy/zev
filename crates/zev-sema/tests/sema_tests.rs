@@ -7746,3 +7746,138 @@ fn item2_missing_console_board_reports_no_console_input() {
         "expected missing console diagnostic, got:\n{rendered}"
     );
 }
+
+#[test]
+fn item3_const_fnptr_rodata_table_and_fallible_fnptr_semantics() {
+    let ok_src = r#"
+enum Err { Bad, Denied }
+struct Ctx { u32 acc; }
+struct Cmd {
+    []u8 name;
+    fn(*Ctx, u32) -> u32 error Err run;
+}
+
+const fn(u32) -> u32 FWD_ADD = forward_add;
+const fn(u32) -> u32 FWD_ADD_ADDR = &forward_add;
+const fn(*Ctx, u32) -> u32 error Err DIRECT_CONST = cmd_ok;
+const [2]Cmd COMMANDS = [
+    Cmd { name: "ok", run: cmd_ok },
+    Cmd { name: "soft", run: cmd_soft },
+];
+
+fn forward_add(u32 x) -> u32 { return x + 1u32; }
+
+fn cmd_ok(*Ctx c, u32 v) -> u32 error Err {
+    if (v == 0u32) { error Err.Bad; }
+    c.acc += v;
+    return c.acc;
+}
+
+fn cmd_soft(*Ctx c, u32 v) -> u32 error Err {
+    u32 i = 0u32;
+    while (i < v) {
+        c.acc += 1u32;
+        i += 1u32;
+    }
+    if (v == 99u32) { error Err.Denied; }
+    return c.acc;
+}
+
+fn bare_err_fn(u8 x) error {
+    if (x == 0u8) { error; }
+}
+
+fn propagate(*Ctx c, usize i, u32 v) -> u32 error Err {
+    return COMMANDS[i].run(c, v) catch (Err e) { error e; };
+}
+
+fn main() {
+    Ctx c = Ctx { acc: 0u32 };
+    u32 _a = FWD_ADD(2u32);
+    u32 _b = FWD_ADD_ADDR(3u32);
+    u32 _d = DIRECT_CONST(&c, 5u32) or 0u32;
+    u32 _e = COMMANDS[0].run(&c, 4u32) catch (Err err) { 0u32 };
+    u32 _p = propagate(&c, 1, 3u32) or 1u32;
+    fn(u8) error bfn = bare_err_fn;
+    bfn(0u8) catch { };
+}
+"#;
+    let p_ok = zev_parser::parse_str(ok_src).unwrap();
+    let (model, diags) = analyze_and_monomorphize_programs(&[p_ok], &AnalyzeOptions::default())
+        .into_result()
+        .map(|m| (m, Vec::<zev_sema::Diagnostic>::new()))
+        .unwrap_or_else(|d| panic!("item3 valid program must pass sema: {d:#?}"));
+    assert!(diags.is_empty());
+    assert!(model.1.soft_yielding_in_noyield.contains("cmd_soft"));
+
+    // Unhandled fallible indirect calls (E0016)
+    for (label, bad_src) in [
+        (
+            "var_unhandled",
+            r#"
+enum Err { Bad }
+fn f() error Err { error Err.Bad; }
+fn main() { fn() error Err fp = f; fp(); }
+"#,
+        ),
+        (
+            "table_unhandled",
+            r#"
+enum Err { Bad }
+struct Cmd { fn() error Err run; }
+const [1]Cmd TBL = [ Cmd { run: f } ];
+fn f() error Err { error Err.Bad; }
+fn main() { TBL[0].run(); }
+"#,
+        ),
+    ] {
+        let p = zev_parser::parse_str(bad_src).unwrap();
+        let out = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| matches!(d.kind, DiagnosticKind::UnhandledFallibleExpr)),
+            "{label}: expected E0016 UnhandledFallibleExpr, got {:?}",
+            out.diagnostics
+        );
+    }
+
+    // Mismatched error_spec on const / var / void error (E0019)
+    for (label, bad_src) in [
+        (
+            "const_mismatch_typed_vs_bare",
+            r#"
+enum Err { Bad }
+fn f() error Err { return; }
+const fn() error C = f;
+fn main() { C() catch { }; }
+"#,
+        ),
+        (
+            "var_mismatch_err_enum",
+            r#"
+enum E1 { A }
+enum E2 { B }
+fn f() error E1 { error E1.A; }
+fn main() { fn() error E2 fp = f; fp() catch (E2 _e) { }; }
+"#,
+        ),
+        (
+            "void_typed_error_spec",
+            r#"
+fn take(fn(u8) error void _cb) {}
+fn main() { }
+"#,
+        ),
+    ] {
+        let p = zev_parser::parse_str(bad_src).unwrap();
+        let out = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| matches!(d.kind, DiagnosticKind::ErrorSpecMismatch)),
+            "{label}: expected E0019 ErrorSpecMismatch, got {:?}",
+            out.diagnostics
+        );
+    }
+}

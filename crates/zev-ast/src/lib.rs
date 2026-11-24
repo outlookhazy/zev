@@ -456,10 +456,11 @@ pub enum TypeKind {
     OsPrimitive(OsPrimitiveType),
     /// Linear, move-only buffer lease `Lease<T>` allocated from a `pool<T, K>`.
     Lease(Box<TypeExpr>),
-    /// Function pointer type `fn(T1, T2) -> Ret` (for C interop callbacks, etc.).
+    /// Function pointer type `fn(T1, T2) [-> Ret] [error [E]]`.
     FnPtr {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
+        error_spec: Option<Box<ErrorSpec>>,
     },
 }
 

@@ -90,10 +90,11 @@ pub enum MirType {
     PrimView(MirPrimViewKind),
     /// Typed pointer to an `mmio` register layout (`*UartRegs`).
     MmioPtr(String),
-    /// Function pointer type (for C interop callbacks).
+    /// Function pointer type (with optional `error [E]` exit spec).
     FnPtr {
         params: Vec<MirType>,
         ret: Box<MirType>,
+        error_spec: Box<MirErrorSpec>,
     },
     /// Internal dual-exit return envelope `{ bool is_err; [Err err;] [Val val;] }`.
     Result {
@@ -192,12 +193,26 @@ impl MirType {
             MirType::Primitive(pk) => pk.mangle_name(),
             MirType::PrimView(vk) => vk.mangle_name(),
             MirType::MmioPtr(n) => format!("mmio_ptr_{n}"),
-            MirType::FnPtr { params, ret } => {
+            MirType::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
+                let err_sfx = match error_spec.as_ref() {
+                    MirErrorSpec::None => String::new(),
+                    MirErrorSpec::Untyped => "_err".to_string(),
+                    MirErrorSpec::Typed(e) => format!("_err_{}", e.mangle_name()),
+                };
                 if params.is_empty() {
-                    format!("fnptr_void_ret_{}", ret.mangle_name())
+                    format!("fnptr_void_ret_{}{}", ret.mangle_name(), err_sfx)
                 } else {
                     let ps: Vec<String> = params.iter().map(|p| p.mangle_name()).collect();
-                    format!("fnptr_{}_ret_{}", ps.join("_"), ret.mangle_name())
+                    format!(
+                        "fnptr_{}_ret_{}{}",
+                        ps.join("_"),
+                        ret.mangle_name(),
+                        err_sfx
+                    )
                 }
             }
             MirType::Result { ok, err } => match err {
@@ -388,7 +403,7 @@ pub struct MirPrimitive {
 }
 
 /// Function error exit specification (`error` or `error ErrType`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MirErrorSpec {
     /// No `error` exit path.
     None,

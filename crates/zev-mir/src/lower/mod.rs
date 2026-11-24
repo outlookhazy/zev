@@ -285,9 +285,18 @@ impl ModuleSymbols {
                 }
             }
             TypeKind::OsPrimitive(op) => MirType::Primitive(self.resolve_os_prim_type(op)),
-            TypeKind::FnPtr { params, ret } => MirType::FnPtr {
+            TypeKind::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => MirType::FnPtr {
                 params: params.iter().map(|p| self.resolve_type(p)).collect(),
                 ret: Box::new(self.resolve_type(ret)),
+                error_spec: Box::new(match error_spec.as_deref() {
+                    None => MirErrorSpec::None,
+                    Some(ErrorSpec::Bare(_)) => MirErrorSpec::Untyped,
+                    Some(ErrorSpec::Typed(et)) => MirErrorSpec::Typed(self.resolve_type(et)),
+                }),
             },
             TypeKind::Lease(elem) => MirType::Lease(Box::new(self.resolve_type(elem))),
         }

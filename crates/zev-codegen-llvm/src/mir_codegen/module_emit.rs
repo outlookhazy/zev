@@ -96,11 +96,18 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 feat.uses_i64 = true;
             }
             MirType::Ptr(inner) | MirType::Slice(inner) => scan_ty(inner, feat),
-            MirType::FnPtr { params, ret } => {
+            MirType::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
                 for p in params {
                     scan_ty(p, feat);
                 }
                 scan_ty(ret, feat);
+                if let Some(et) = error_spec.err_type() {
+                    scan_ty(&et, feat);
+                }
             }
             MirType::Array { elem, .. } => scan_ty(elem, feat),
             MirType::Result { ok, err } => {
@@ -736,6 +743,22 @@ pub(super) fn is_rodata_const_ty(ty: &MirType) -> bool {
 }
 
 impl<'a> ModuleCtx<'a> {
+    fn resolve_fnptr_const_target(&self, expr: &MirExpr) -> Option<String> {
+        let mut cur = expr;
+        for _ in 0..32 {
+            match &cur.kind {
+                MirExprKind::FnAddr(fname) => return Some(fname.clone()),
+                MirExprKind::Cast { expr: inner, .. } => cur = inner,
+                MirExprKind::ConstRef(cname) => {
+                    let c = self.module.consts.iter().find(|c| c.name == *cname)?;
+                    cur = &c.init;
+                }
+                _ => return None,
+            }
+        }
+        None
+    }
+
     pub(super) fn prepare(&mut self) -> Result<(), CodegenError> {
         // Enums
         for en in &self.module.enums {
@@ -746,12 +769,16 @@ impl<'a> ModuleCtx<'a> {
             }
         }
 
-        // Consts (scalars/floats inlined; aggregate/slice/str constants live in .rodata)
+        // Consts (scalars/floats/fnptrs inlined; aggregate/slice/str constants live in .rodata)
         for c in &self.module.consts {
             if is_rodata_const_ty(&c.ty) {
                 continue;
             }
-            if c.init.ty.is_float() {
+            if matches!(c.ty, MirType::FnPtr { .. }) {
+                if let Some(fname) = self.resolve_fnptr_const_target(&c.init) {
+                    self.fnptr_consts.insert(c.name.clone(), fname);
+                }
+            } else if c.init.ty.is_float() {
                 let bits = self.eval_const_float_bits(&c.init);
                 self.float_consts.insert(c.name.clone(), bits);
             } else {

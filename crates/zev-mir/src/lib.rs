@@ -5150,6 +5150,7 @@ mod tests {
                                             TypeKind::FnPtr {
                                                 params: vec![ty_prim(PrimType::U32)],
                                                 ret: Box::new(ty_prim(PrimType::U32)),
+                                                error_spec: None,
                                             },
                                             sp,
                                         ),

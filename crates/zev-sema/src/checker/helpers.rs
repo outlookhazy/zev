@@ -338,8 +338,14 @@ pub(super) fn ty_contains_linear_lease(ty: &Ty) -> bool {
         Ty::Lease(_) => true,
         Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Ptr(elem) => ty_contains_linear_lease(elem),
         Ty::OsPrimitive(os) => os.elem_ty().is_some_and(ty_contains_linear_lease),
-        Ty::FnPtr { params, ret, .. } => {
-            params.iter().any(ty_contains_linear_lease) || ty_contains_linear_lease(ret)
+        Ty::FnPtr {
+            params,
+            ret,
+            error_spec,
+        } => {
+            params.iter().any(ty_contains_linear_lease)
+                || ty_contains_linear_lease(ret)
+                || matches!(error_spec.as_ref(), ResolvedErrorSpec::Typed(et) if ty_contains_linear_lease(et))
         }
         _ => false,
     }
@@ -350,10 +356,18 @@ pub(super) fn ty_contains_byval_mmio(ty: &Ty) -> Option<&str> {
         Ty::MmioLayout(name) => Some(name.as_str()),
         Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Lease(elem) => ty_contains_byval_mmio(elem),
         Ty::OsPrimitive(os) => os.elem_ty().and_then(ty_contains_byval_mmio),
-        Ty::FnPtr { params, ret, .. } => params
+        Ty::FnPtr {
+            params,
+            ret,
+            error_spec,
+        } => params
             .iter()
             .find_map(ty_contains_byval_mmio)
-            .or_else(|| ty_contains_byval_mmio(ret)),
+            .or_else(|| ty_contains_byval_mmio(ret))
+            .or_else(|| match error_spec.as_ref() {
+                ResolvedErrorSpec::Typed(et) => ty_contains_byval_mmio(et),
+                _ => None,
+            }),
         _ => None,
     }
 }
@@ -365,10 +379,18 @@ pub(super) fn ty_contains_bare_unsized_prim(ty: &Ty) -> Option<String> {
         Ty::Array { elem, .. } | Ty::Slice(elem) | Ty::Lease(elem) => {
             ty_contains_bare_unsized_prim(elem)
         }
-        Ty::FnPtr { params, ret, .. } => params
+        Ty::FnPtr {
+            params,
+            ret,
+            error_spec,
+        } => params
             .iter()
             .find_map(ty_contains_bare_unsized_prim)
-            .or_else(|| ty_contains_bare_unsized_prim(ret)),
+            .or_else(|| ty_contains_bare_unsized_prim(ret))
+            .or_else(|| match error_spec.as_ref() {
+                ResolvedErrorSpec::Typed(et) => ty_contains_bare_unsized_prim(et),
+                _ => None,
+            }),
         _ => None,
     }
 }
@@ -395,10 +417,18 @@ pub(super) fn ty_contains_byval_subsys<'a>(
         Ty::OsPrimitive(os) => os
             .elem_ty()
             .and_then(|e| ty_contains_byval_subsys(e, structs)),
-        Ty::FnPtr { params, ret, .. } => params
+        Ty::FnPtr {
+            params,
+            ret,
+            error_spec,
+        } => params
             .iter()
             .find_map(|p| ty_contains_byval_subsys(p, structs))
-            .or_else(|| ty_contains_byval_subsys(ret, structs)),
+            .or_else(|| ty_contains_byval_subsys(ret, structs))
+            .or_else(|| match error_spec.as_ref() {
+                ResolvedErrorSpec::Typed(et) => ty_contains_byval_subsys(et, structs),
+                _ => None,
+            }),
         _ => None,
     }
 }
