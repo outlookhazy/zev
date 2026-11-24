@@ -466,55 +466,167 @@ impl<'a> CoroutineLowerCtx<'a> {
                 }
             }
             StmtKind::LoopEvery { period, body } => {
-                let period_expr = if let ExprKind::Literal(Literal::Duration(dur)) = &period.kind {
-                    let ticks = self.syms.duration_to_ticks(dur)?;
-                    if ticks == 0 {
-                        return Err(MirLowerError {
-                            message: "periodic `loop every` interval must be greater than 0"
-                                .to_string(),
-                            span: period.span,
-                        });
-                    }
-                    MirExpr::new(MirExprKind::TicksLit(ticks), MirType::U32)
-                } else {
-                    let raw_p = self.lower_expr(period, Some(&MirType::U32))?;
-                    let p_u32 = coerce_or_cast_int(raw_p, &MirType::U32);
-                    if self.syms.tick_period_us != 1_000 && self.syms.tick_period_us > 0 {
-                        let p_u64 = coerce_or_cast_int(p_u32, &MirType::U64);
-                        let scaled = MirExpr::new(
-                            MirExprKind::Binary {
-                                op: MirBinOp::Div,
-                                lhs: Box::new(MirExpr::new(
+                let (period_var, init_period_expr) =
+                    if let ExprKind::Literal(Literal::Duration(dur)) = &period.kind {
+                        let ticks = self.syms.duration_to_ticks(dur)?;
+                        if ticks == 0 {
+                            return Err(MirLowerError {
+                                message: "periodic `loop every` interval must be greater than 0"
+                                    .to_string(),
+                                span: period.span,
+                            });
+                        }
+                        let pv = self.alloc_temp("every_period", MirType::U32);
+                        (pv, Some(MirExpr::new(MirExprKind::TicksLit(ticks), MirType::U32)))
+                    } else {
+                        let raw_p = self.lower_expr(period, None)?;
+                        let host_ty = raw_p.ty.host_value_type();
+                        let is_signed = matches!(
+                            host_ty,
+                            MirType::I8
+                                | MirType::I16
+                                | MirType::I32
+                                | MirType::I64
+                                | MirType::Isize
+                        );
+                        if self.syms.tick_period_us != 1_000 && self.syms.tick_period_us > 0 {
+                            let t_us = self.syms.tick_period_us;
+                            let max_pre_u64 = (((zev_ast::MAX_DURATION_TICKS as u128)
+                                .saturating_mul(t_us as u128))
+                            .div_ceil(1_000))
+                            .min((u64::MAX / 1_000) as u128) as u64;
+                            let pv = self.alloc_temp("every_period", MirType::U32);
+                            let u_tmp = self.alloc_temp("every_u64", MirType::U64);
+                            let scaled_var = MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Div,
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::Binary {
+                                            op: MirBinOp::Mul,
+                                            lhs: Box::new(MirExpr::new(
+                                                MirExprKind::Var(u_tmp),
+                                                MirType::U64,
+                                            )),
+                                            rhs: Box::new(MirExpr::new(
+                                                MirExprKind::IntLit(1_000),
+                                                MirType::U64,
+                                            )),
+                                        },
+                                        MirType::U64,
+                                    )),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::IntLit(t_us as i128),
+                                        MirType::U64,
+                                    )),
+                                },
+                                MirType::U64,
+                            );
+                            let capped_stmt = MirStmt::If {
+                                cond: MirExpr::new(
                                     MirExprKind::Binary {
-                                        op: MirBinOp::Mul,
-                                        lhs: Box::new(p_u64),
+                                        op: MirBinOp::Gt,
+                                        lhs: Box::new(MirExpr::new(
+                                            MirExprKind::Var(u_tmp),
+                                            MirType::U64,
+                                        )),
                                         rhs: Box::new(MirExpr::new(
-                                            MirExprKind::IntLit(1_000),
+                                            MirExprKind::IntLit(max_pre_u64 as i128),
                                             MirType::U64,
                                         )),
                                     },
-                                    MirType::U64,
-                                )),
-                                rhs: Box::new(MirExpr::new(
-                                    MirExprKind::IntLit(self.syms.tick_period_us as i128),
-                                    MirType::U64,
-                                )),
-                            },
-                            MirType::U64,
-                        );
-                        coerce_or_cast_int(scaled, &MirType::U32)
-                    } else {
-                        p_u32
-                    }
-                };
+                                    MirType::Bool,
+                                ),
+                                then_body: vec![MirStmt::Assign {
+                                    target: MirPlace::Var(pv),
+                                    op: MirAssignOp::Assign,
+                                    value: MirExpr::new(
+                                        MirExprKind::IntLit(zev_ast::MAX_DURATION_TICKS as i128),
+                                        MirType::U32,
+                                    ),
+                                }],
+                                else_body: vec![MirStmt::Assign {
+                                    target: MirPlace::Var(pv),
+                                    op: MirAssignOp::Assign,
+                                    value: coerce_or_cast_int(scaled_var, &MirType::U32),
+                                }],
+                            };
+                            if is_signed {
+                                let s64 = coerce_or_cast_int(raw_p, &MirType::I64);
+                                let s_tmp = self.alloc_temp("every_s64", MirType::I64);
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(s_tmp),
+                                    op: MirAssignOp::Assign,
+                                    value: s64,
+                                });
+                                self.cur_stmts.push(MirStmt::If {
+                                    cond: MirExpr::new(
+                                        MirExprKind::Binary {
+                                            op: MirBinOp::Le,
+                                            lhs: Box::new(MirExpr::new(
+                                                MirExprKind::Var(s_tmp),
+                                                MirType::I64,
+                                            )),
+                                            rhs: Box::new(MirExpr::new(
+                                                MirExprKind::IntLit(0),
+                                                MirType::I64,
+                                            )),
+                                        },
+                                        MirType::Bool,
+                                    ),
+                                    then_body: vec![MirStmt::Assign {
+                                        target: MirPlace::Var(pv),
+                                        op: MirAssignOp::Assign,
+                                        value: MirExpr::new(MirExprKind::IntLit(1), MirType::U32),
+                                    }],
+                                    else_body: vec![
+                                        MirStmt::Assign {
+                                            target: MirPlace::Var(u_tmp),
+                                            op: MirAssignOp::Assign,
+                                            value: MirExpr::new(
+                                                MirExprKind::Cast {
+                                                    expr: Box::new(MirExpr::new(
+                                                        MirExprKind::Var(s_tmp),
+                                                        MirType::I64,
+                                                    )),
+                                                    target_ty: MirType::U64,
+                                                },
+                                                MirType::U64,
+                                            ),
+                                        },
+                                        capped_stmt,
+                                    ],
+                                });
+                            } else {
+                                self.cur_stmts.push(MirStmt::Assign {
+                                    target: MirPlace::Var(u_tmp),
+                                    op: MirAssignOp::Assign,
+                                    value: coerce_or_cast_int(raw_p, &MirType::U64),
+                                });
+                                self.cur_stmts.push(capped_stmt);
+                            }
+                            (pv, None)
+                        } else {
+                            let norm_ty = match host_ty {
+                                MirType::I8 | MirType::I16 | MirType::I32 => MirType::I32,
+                                MirType::I64 => MirType::I64,
+                                MirType::Isize => MirType::Isize,
+                                MirType::U64 => MirType::U64,
+                                MirType::Usize => MirType::Usize,
+                                _ => MirType::U32,
+                            };
+                            let pv = self.alloc_temp("every_period", norm_ty.clone());
+                            (pv, Some(coerce_or_cast_int(raw_p, &norm_ty)))
+                        }
+                    };
 
-                let period_var = self.alloc_temp("every_period", MirType::U32);
                 let deadline_var = self.alloc_temp("every_next", MirType::U32);
-                self.cur_stmts.push(MirStmt::Assign {
-                    target: MirPlace::Var(period_var),
-                    op: MirAssignOp::Assign,
-                    value: period_expr,
-                });
+                if let Some(period_expr) = init_period_expr {
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(period_var),
+                        op: MirAssignOp::Assign,
+                        value: period_expr,
+                    });
+                }
                 self.cur_stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(deadline_var),
                     op: MirAssignOp::Assign,

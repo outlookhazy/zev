@@ -241,7 +241,8 @@ A `task` is a permanent subsystem actor (`return;` and falling off `}` are compi
 move one-shot finite workflows into yielding `fn`s). Each static `spawn` allocates a dedicated `.bss`
 coroutine frame (`0 B` heap, single shared CPU stack):
 - **`loop every <period_expr> { ... }`**: Accepts compile-time durations (`1ms`, `20ms`) OR runtime tick
-  expressions (`period_ms`), and **skips/resyncs missed deadlines on overrun** (zero catch-up bursts).
+  expressions (`period_ms`), clamps runtime periods `<= 0` to `1` tick and `> 2147483647` (`i32::MAX`)
+  to `2147483647` ticks, and **skips/resyncs missed deadlines on overrun** (zero catch-up bursts).
   (Bare `every 1ms` is trapped via `P0011`.)
 - **`restart;`**: Unwinds active `defer`s, restores any temporary priority boost, zeroes task-local state
   (preserving `spawn` parameters), and jumps cleanly back to task entry.

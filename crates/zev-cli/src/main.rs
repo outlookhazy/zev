@@ -3107,4 +3107,153 @@ fn main() {
         let exit = runner::compile_and_run_host_llvm(&host_ll, true, &[]).unwrap();
         assert_eq!(exit, 0);
     }
+
+    #[test]
+    fn host_sanitize_verifies_runtime_loop_every_period_clamping() {
+        let src = "\
+watch<u32> cnt_zero = 0;
+watch<u32> cnt_neg = 0;
+watch<u32> cnt_u32_huge = 0;
+watch<u32> cnt_u64_huge = 0;
+
+task worker_zero(u8 p) {
+    u32 n = 0;
+    loop every p {
+        n += 1;
+        cnt_zero.publish(n);
+    }
+}
+
+task worker_neg(i32 p) {
+    u32 n = 0;
+    loop every p {
+        n += 1;
+        cnt_neg.publish(n);
+    }
+}
+
+task worker_u32_huge(u32 p) {
+    u32 n = 0;
+    loop every p {
+        n += 1;
+        cnt_u32_huge.publish(n);
+    }
+}
+
+task worker_u64_huge(u64 p) {
+    u32 n = 0;
+    loop every p {
+        n += 1;
+        cnt_u64_huge.publish(n);
+    }
+}
+
+task driver() {
+    // At t=0 all @high workers executed once and armed their next deadline.
+    assert(cnt_zero.read() == 1);
+    assert(cnt_neg.read() == 1);
+    assert(cnt_u32_huge.read() == 1);
+    assert(cnt_u64_huge.read() == 1);
+
+    // 0 and -5i32 clamp to 1 tick each; 3_000_000_000u32 and (1u64 << 40) clamp to 2_147_483_647 ticks.
+    delay(3ms);
+    assert(cnt_zero.read() == 4);
+    assert(cnt_neg.read() == 4);
+    assert(cnt_u32_huge.read() == 1);
+    assert(cnt_u64_huge.read() == 1);
+
+    // Advance just below i32::MAX (2_147_483_647): huge-period workers must still be parked.
+    sys.tick_by(2147483640);
+    delay(1ms); // now = 2_147_483_644
+    assert(cnt_u32_huge.read() == 1);
+    assert(cnt_u64_huge.read() == 1);
+
+    // Step across 2_147_483_647 (clamped i32::MAX horizon): both huge-period workers wake exactly once.
+    sys.tick_by(2);
+    delay(1ms); // now = 2_147_483_647
+    assert(cnt_u32_huge.read() == 2);
+    assert(cnt_u64_huge.read() == 2);
+
+    println(\"loop_every_clamp_ok\");
+    sys.exit(0);
+}
+
+fn main() {
+    u8 p0 = 0;
+    i32 p_neg = -5;
+    u32 p_u32 = 3000000000;
+    u64 p_u64 = 1u64 << 40;
+    spawn worker_zero(p0) @high;
+    spawn worker_neg(p_neg) @high;
+    spawn worker_u32_huge(p_u32) @high;
+    spawn worker_u64_huge(p_u64) @high;
+    spawn driver() @low;
+}
+";
+        let temp = TempWorkDir::create("zevc-loop-every-clamp").unwrap();
+        let src_path = temp.dir.join("clamp.zev");
+        std::fs::write(&src_path, src).unwrap();
+
+        let (_, mir) = compile_to_mir(&[src_path]).unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        assert!(host_ll.contains("icmp sle i32"));
+        assert!(host_ll.contains("icmp ugt i32"));
+        assert!(host_ll.contains("icmp ugt i64"));
+        assert!(host_ll.contains("2147483647"));
+
+        let exit = runner::compile_and_run_host_llvm(&host_ll, true, &[]).unwrap();
+        assert_eq!(exit, 0);
+
+        // Also verify custom sub-millisecond tick scaling (`sys.set_tick(500us)`) with signed negative and u64 huge periods.
+        let src_scaled = "\
+watch<u32> c_neg = 0;
+watch<u32> c_huge = 0;
+
+task w_neg(i64 p) {
+    u32 n = 0;
+    loop every p {
+        n += 1;
+        c_neg.publish(n);
+    }
+}
+
+task w_huge(u64 p) {
+    u32 n = 0;
+    loop every p {
+        n += 1;
+        c_huge.publish(n);
+    }
+}
+
+task driver() {
+    delay(2ms); // 4 ticks at 500us
+    assert(c_neg.read() == 5);
+    assert(c_huge.read() == 1);
+    sys.exit(0);
+}
+
+fn main() {
+    sys.set_tick(500us);
+    i64 pn = -5;
+    u64 ph = 1u64 << 40;
+    spawn w_neg(pn) @high;
+    spawn w_huge(ph) @high;
+    spawn driver() @low;
+}
+";
+        let src_scaled_path = temp.dir.join("clamp_scaled.zev");
+        std::fs::write(&src_scaled_path, src_scaled).unwrap();
+        let (_, mir_scaled) = compile_to_mir(&[src_scaled_path]).unwrap();
+        let ll_scaled = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir_scaled,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        let exit_scaled = runner::compile_and_run_host_llvm(&ll_scaled, true, &[]).unwrap();
+        assert_eq!(exit_scaled, 0);
+    }
 }
