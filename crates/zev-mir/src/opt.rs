@@ -1897,12 +1897,27 @@ fn is_scalar_int_mir_type(ty: &MirType) -> bool {
     )
 }
 
+fn int_lit_fits_mir_type(v: i128, target: &MirType) -> bool {
+    match target.host_value_type() {
+        MirType::U8 | MirType::I8 => (i128::from(i8::MIN)..=i128::from(u8::MAX)).contains(&v),
+        MirType::U16 | MirType::I16 => (i128::from(i16::MIN)..=i128::from(u16::MAX)).contains(&v),
+        MirType::U32 | MirType::I32 | MirType::Enum(_) => {
+            (i128::from(i32::MIN)..=i128::from(u32::MAX)).contains(&v)
+        }
+        MirType::U64 | MirType::I64 => (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&v),
+        MirType::Usize | MirType::Isize => {
+            (i128::from(i16::MIN)..=i128::from(u16::MAX)).contains(&v)
+        }
+        _ => false,
+    }
+}
+
 fn coerce_immediate_to_var_ty(expr: &MirExpr, target_ty: &MirType) -> Option<MirExpr> {
     if &expr.ty == target_ty {
         return Some(expr.clone());
     }
     if let MirExprKind::IntLit(v) = expr.kind {
-        if is_scalar_int_mir_type(target_ty) {
+        if is_scalar_int_mir_type(target_ty) && int_lit_fits_mir_type(v, target_ty) {
             return Some(MirExpr::new(
                 MirExprKind::IntLit(v),
                 target_ty.host_value_type(),

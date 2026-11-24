@@ -2794,7 +2794,10 @@ impl<'a> ModuleCtx<'a> {
         let _ = writeln!(out);
     }
 
-    pub(super) fn emit_isr_state_and_selector_globals_ir(&mut self, out: &mut String) {
+    pub(super) fn emit_isr_state_and_selector_globals_ir(
+        &mut self,
+        out: &mut String,
+    ) -> Result<(), CodegenError> {
         let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
         let mut emitted_state = BTreeSet::new();
         let mut state_lines = Vec::new();
@@ -2813,7 +2816,7 @@ impl<'a> ModuleCtx<'a> {
                     if emitted_state.insert(sym.clone()) {
                         let lty = self.llvm_ty(&sv.ty);
                         let (_, align) = self.size_align(&sv.ty, ptr_bytes);
-                        let init_val = self.const_expr_to_llvm(&sv.init, &sv.ty);
+                        let init_val = self.const_expr_to_llvm(&sv.init, &sv.ty)?;
                         state_lines.push(format!(
                             "@{sym} = internal global {lty} {init_val}, align {}",
                             align.max(1)
@@ -2870,9 +2873,14 @@ impl<'a> ModuleCtx<'a> {
             }
             let _ = writeln!(out);
         }
+        Ok(())
     }
 
-    pub(super) fn const_expr_to_llvm(&mut self, expr: &MirExpr, target_ty: &MirType) -> String {
+    pub(super) fn const_expr_to_llvm(
+        &mut self,
+        expr: &MirExpr,
+        target_ty: &MirType,
+    ) -> Result<String, CodegenError> {
         if let MirExprKind::ConstRef(cname) = &expr.kind {
             if let Some(init) = self
                 .module
@@ -2884,8 +2892,33 @@ impl<'a> ModuleCtx<'a> {
                 return self.const_expr_to_llvm(&init, target_ty);
             }
         }
+        let raw_lit = match &expr.kind {
+            MirExprKind::IntLit(v) => Some(*v),
+            MirExprKind::TicksLit(t) => Some(i128::from(*t)),
+            _ => None,
+        };
+        if let Some(lit) = raw_lit {
+            if matches!(
+                target_ty,
+                MirType::U8
+                    | MirType::I8
+                    | MirType::U16
+                    | MirType::I16
+                    | MirType::U32
+                    | MirType::I32
+                    | MirType::Enum(_)
+                    | MirType::U64
+                    | MirType::I64
+                    | MirType::Usize
+                    | MirType::Isize
+                    | MirType::EndianInt { .. }
+            ) {
+                let target_lty = self.llvm_ty(target_ty);
+                super::format_checked_llvm_int_const(&target_lty, lit)?;
+            }
+        }
         let ptr_bits = self.spec.isa.ptr_bits();
-        match target_ty {
+        Ok(match target_ty {
             MirType::Bool => {
                 if self.eval_const_int(expr) != 0 {
                     "1".to_string()
@@ -2893,8 +2926,12 @@ impl<'a> ModuleCtx<'a> {
                     "0".to_string()
                 }
             }
-            MirType::U8 => format!("{}", self.eval_const_int(expr) as u8),
-            MirType::I8 => format!("{}", self.eval_const_int(expr) as i8),
+            MirType::U8 => {
+                super::format_checked_llvm_int_const("i8", i128::from(self.eval_const_int(expr) as u8))?
+            }
+            MirType::I8 => {
+                super::format_checked_llvm_int_const("i8", i128::from(self.eval_const_int(expr) as i8))?
+            }
             MirType::U16
             | MirType::EndianInt {
                 bits: 16,
@@ -2911,7 +2948,7 @@ impl<'a> ModuleCtx<'a> {
                 ) {
                     v = v.swap_bytes();
                 }
-                format!("{v}")
+                super::format_checked_llvm_int_const("i16", i128::from(v))?
             }
             MirType::I16
             | MirType::EndianInt {
@@ -2929,7 +2966,7 @@ impl<'a> ModuleCtx<'a> {
                 ) {
                     v = v.swap_bytes();
                 }
-                format!("{v}")
+                super::format_checked_llvm_int_const("i16", i128::from(v))?
             }
             MirType::U32
             | MirType::EndianInt {
@@ -2947,7 +2984,7 @@ impl<'a> ModuleCtx<'a> {
                 ) {
                     v = v.swap_bytes();
                 }
-                format!("{v}")
+                super::format_checked_llvm_int_const("i32", i128::from(v))?
             }
             MirType::I32
             | MirType::Enum(_)
@@ -2966,7 +3003,7 @@ impl<'a> ModuleCtx<'a> {
                 ) {
                     v = v.swap_bytes();
                 }
-                format!("{v}")
+                super::format_checked_llvm_int_const("i32", i128::from(v))?
             }
             MirType::U64
             | MirType::EndianInt {
@@ -2984,7 +3021,7 @@ impl<'a> ModuleCtx<'a> {
                 ) {
                     v = v.swap_bytes();
                 }
-                format!("{v}")
+                super::format_checked_llvm_int_const("i64", i128::from(v))?
             }
             MirType::I64
             | MirType::EndianInt {
@@ -3002,24 +3039,24 @@ impl<'a> ModuleCtx<'a> {
                 ) {
                     v = v.swap_bytes();
                 }
-                format!("{v}")
+                super::format_checked_llvm_int_const("i64", i128::from(v))?
             }
             MirType::Usize => {
                 if ptr_bits == 64 {
-                    format!("{}", self.eval_const_int(expr) as u64)
+                    super::format_checked_llvm_int_const("i64", i128::from(self.eval_const_int(expr) as u64))?
                 } else if ptr_bits == 16 {
-                    format!("{}", self.eval_const_int(expr) as u16)
+                    super::format_checked_llvm_int_const("i16", i128::from(self.eval_const_int(expr) as u16))?
                 } else {
-                    format!("{}", self.eval_const_int(expr) as u32)
+                    super::format_checked_llvm_int_const("i32", i128::from(self.eval_const_int(expr) as u32))?
                 }
             }
             MirType::Isize => {
                 if ptr_bits == 64 {
-                    format!("{}", self.eval_const_int(expr) as i64)
+                    super::format_checked_llvm_int_const("i64", i128::from(self.eval_const_int(expr) as i64))?
                 } else if ptr_bits == 16 {
-                    format!("{}", self.eval_const_int(expr) as i16)
+                    super::format_checked_llvm_int_const("i16", i128::from(self.eval_const_int(expr) as i16))?
                 } else {
-                    format!("{}", self.eval_const_int(expr) as i32)
+                    super::format_checked_llvm_int_const("i32", i128::from(self.eval_const_int(expr) as i32))?
                 }
             }
             MirType::F32 => {
@@ -3091,11 +3128,14 @@ impl<'a> ModuleCtx<'a> {
                             "ptr"
                         };
                         if ptr_bits == 64 {
-                            format!("inttoptr (i64 {} to {dst_ptr})", *v as i64)
+                            let s = super::format_checked_llvm_int_const("i64", i128::from(*v as i64))?;
+                            format!("inttoptr (i64 {s} to {dst_ptr})")
                         } else if ptr_bits == 16 {
-                            format!("inttoptr (i16 {} to {dst_ptr})", *v as i16)
+                            let s = super::format_checked_llvm_int_const("i16", i128::from(*v as i16))?;
+                            format!("inttoptr (i16 {s} to {dst_ptr})")
                         } else {
-                            format!("inttoptr (i32 {} to {dst_ptr})", *v as i32)
+                            let s = super::format_checked_llvm_int_const("i32", i128::from(*v as i32))?;
+                            format!("inttoptr (i32 {s} to {dst_ptr})")
                         }
                     }
                     _ => "null".to_string(),
@@ -3104,7 +3144,9 @@ impl<'a> ModuleCtx<'a> {
             MirType::Slice(elem) => {
                 let usize_ty = self.spec.isa.usize_llvm_ty().to_string();
                 match &expr.kind {
-                    MirExprKind::Cast { expr: sub, .. } => self.const_expr_to_llvm(sub, target_ty),
+                    MirExprKind::Cast { expr: sub, .. } => {
+                        return self.const_expr_to_llvm(sub, target_ty);
+                    }
                     MirExprKind::SubSlice {
                         base,
                         start,
@@ -3121,10 +3163,10 @@ impl<'a> ModuleCtx<'a> {
                                 let cl_st = st.min(len);
                                 let cl_en = en.min(len).max(cl_st);
                                 let ety = self.llvm_ty(elem_ty);
-                                return format!(
+                                return Ok(format!(
                                     "{{ ptr getelementptr inbounds ([{len} x {ety}], ptr {sym}, {usize_ty} 0, {usize_ty} {cl_st}), {usize_ty} {} }}",
                                     cl_en - cl_st
-                                );
+                                ));
                             }
                         }
                         if *base_is_array {
@@ -3143,13 +3185,13 @@ impl<'a> ModuleCtx<'a> {
                                 let cl_st = st.min(len);
                                 let cl_en = en.min(len).max(cl_st);
                                 if cl_en == cl_st {
-                                    return format!("{{ ptr null, {usize_ty} 0 }}");
+                                    return Ok(format!("{{ ptr null, {usize_ty} 0 }}"));
                                 }
                                 let ety = self.llvm_ty(elem);
                                 let (_, eal) = self.size_align(elem, (ptr_bits / 8) as usize);
                                 let mut parts = Vec::with_capacity(len);
                                 for el in &elems {
-                                    let cv = self.const_expr_to_llvm(el, elem);
+                                    let cv = self.const_expr_to_llvm(el, elem)?;
                                     parts.push(format!("{ety} {cv}"));
                                 }
                                 let decl_body = format!(
@@ -3157,10 +3199,10 @@ impl<'a> ModuleCtx<'a> {
                                     parts.join(", ")
                                 );
                                 let idx = self.intern_const_blob(&decl_body);
-                                return format!(
+                                return Ok(format!(
                                     "{{ ptr getelementptr inbounds ([{len} x {ety}], ptr @.cblob.{idx}, {usize_ty} 0, {usize_ty} {cl_st}), {usize_ty} {} }}",
                                     cl_en - cl_st
-                                );
+                                ));
                             }
                         }
                         "zeroinitializer".to_string()
@@ -3179,7 +3221,7 @@ impl<'a> ModuleCtx<'a> {
                             let (_, eal) = self.size_align(elem, (ptr_bits / 8) as usize);
                             let mut parts = Vec::with_capacity(n);
                             for el in elems {
-                                let cv = self.const_expr_to_llvm(el, elem);
+                                let cv = self.const_expr_to_llvm(el, elem)?;
                                 parts.push(format!("{ety} {cv}"));
                             }
                             let decl_body = format!(
@@ -3209,7 +3251,7 @@ impl<'a> ModuleCtx<'a> {
                     let mut parts = Vec::with_capacity(n);
                     for i in 0..n {
                         if let Some(el) = elems.get(i) {
-                            let cv = self.const_expr_to_llvm(el, elem);
+                            let cv = self.const_expr_to_llvm(el, elem)?;
                             parts.push(format!("{ety} {cv}"));
                         } else {
                             parts.push(format!("{ety} zeroinitializer"));
@@ -3224,7 +3266,7 @@ impl<'a> ModuleCtx<'a> {
                 if let MirExprKind::StructLit { fields, .. } = &expr.kind {
                     if let Some(si) = self.structs.get(sname).cloned() {
                         if si.decl.fields.is_empty() {
-                            return "zeroinitializer".to_string();
+                            return Ok("zeroinitializer".to_string());
                         }
                         let by_field: HashMap<&str, &MirExpr> = fields
                             .iter()
@@ -3234,7 +3276,7 @@ impl<'a> ModuleCtx<'a> {
                         for fld in &si.decl.fields {
                             let fty = self.llvm_ty(&fld.ty);
                             if let Some(&fexpr) = by_field.get(fld.name.as_str()) {
-                                let cv = self.const_expr_to_llvm(fexpr, &fld.ty);
+                                let cv = self.const_expr_to_llvm(fexpr, &fld.ty)?;
                                 parts.push(format!("{fty} {cv}"));
                             } else {
                                 parts.push(format!("{fty} zeroinitializer"));
@@ -3255,7 +3297,7 @@ impl<'a> ModuleCtx<'a> {
             MirType::PrimView(vk) => {
                 if let MirExprKind::MakePrimView { ptr, cap, .. } = &expr.kind {
                     let usize_ty = self.spec.isa.usize_llvm_ty();
-                    let pconst = self.const_expr_to_llvm(ptr, &ptr.ty);
+                    let pconst = self.const_expr_to_llvm(ptr, &ptr.ty)?;
                     let n = (*cap).max(1);
                     match vk {
                         MirPrimViewKind::ByteRing => format!("{{ ptr {pconst}, {usize_ty} {n} }}"),
@@ -3280,7 +3322,7 @@ impl<'a> ModuleCtx<'a> {
                 }
             }
             _ => "zeroinitializer".to_string(),
-        }
+        })
     }
 
     pub(super) fn const_place_to_llvm_ptr(&self, place: &MirPlace) -> Option<String> {
@@ -3488,14 +3530,14 @@ ok_bb:
         }
     }
 
-    pub(super) fn emit_primitives_ir(&mut self, out: &mut String) {
+    pub(super) fn emit_primitives_ir(&mut self, out: &mut String) -> Result<(), CodegenError> {
         if self.distinct_prims.is_empty()
             && self.module.primitives.is_empty()
             && !self.uses_pool_lease
             && self.module.subsystems.is_empty()
             && self.distinct_inbox_views.is_empty()
         {
-            return;
+            return Ok(());
         }
         let fn_as = self.fn_as();
         let call_kw = self.call_kw();
@@ -3656,7 +3698,7 @@ ok_bb:
                     let (_, elem_align) = self.size_align(elem, ptr_bytes);
                     let watch_align = align.max(elem_align);
                     if let Some(init_expr) = p.init.clone() {
-                        let iv = self.const_expr_to_llvm(&init_expr, elem);
+                        let iv = self.const_expr_to_llvm(&init_expr, elem)?;
                         let _ = writeln!(
                             out,
                             "{gsym} = global {pty} {{ {ety} {iv}, i32 0, i32 0 }}, align {watch_align}"
@@ -3673,7 +3715,7 @@ ok_bb:
                     let (_, elem_align) = self.size_align(elem, ptr_bytes);
                     let guarded_align = align.max(elem_align);
                     if let Some(init_expr) = p.init.clone() {
-                        let iv = self.const_expr_to_llvm(&init_expr, elem);
+                        let iv = self.const_expr_to_llvm(&init_expr, elem)?;
                         let _ = writeln!(
                             out,
                             "{gsym} = global {pty} {{ {ety} {iv} }}, align {guarded_align}"
@@ -5479,6 +5521,7 @@ entry:
 }}"#
             );
         }
+        Ok(())
     }
 
     pub(super) fn emit_coroutine_frame_globals_ir(&self, out: &mut String) {
@@ -5644,7 +5687,7 @@ entry:
                 MirBakedArg::Const(expr) => {
                     let target_mir_ty = expected_ty.unwrap_or_else(|| expr.ty.clone());
                     let lty = self.llvm_ty(&target_mir_ty);
-                    let cval = self.const_expr_to_llvm(expr, &target_mir_ty);
+                    let cval = self.const_expr_to_llvm(expr, &target_mir_ty)?;
                     args.push(format!("{lty} {cval}"));
                 }
             }
@@ -5865,9 +5908,9 @@ entry:
         Ok(())
     }
 
-    pub(super) fn emit_rodata_consts_ir(&mut self, out: &mut String) {
+    pub(super) fn emit_rodata_consts_ir(&mut self, out: &mut String) -> Result<(), CodegenError> {
         if self.rodata_consts.is_empty() {
-            return;
+            return Ok(());
         }
         let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
         let _ = writeln!(out, "; ── Immutable Aggregate / Slice / String Constants (Flash .rodata) ──");
@@ -5881,13 +5924,14 @@ entry:
             let lty = self.llvm_ty(&cty);
             let (_, al) = self.size_align(&cty, ptr_bytes);
             let al = al.max(1);
-            let init = self.const_expr_to_llvm(&cinit, &cty);
+            let init = self.const_expr_to_llvm(&cinit, &cty)?;
             let _ = writeln!(
                 out,
                 "{sym} = private unnamed_addr constant {lty} {init}, align {al}"
             );
         }
         let _ = writeln!(out);
+        Ok(())
     }
 
     pub(super) fn emit_string_constants_ir(&self, out: &mut String) {
