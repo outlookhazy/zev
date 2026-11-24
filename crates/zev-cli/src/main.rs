@@ -8208,4 +8208,158 @@ fn main() {
             q_res.exec.stdout
         );
     }
+
+    #[test]
+    fn loop_body_locals_start_from_zero_and_multi_write_print_snapshots_host_and_qemu() {
+        // 1. A local declared without an initializer inside a loop body is zero on every
+        //    iteration (direct, yielding, `__noyield` clone, task body, nested loops, branches).
+        // 2. Every print evaluates its arguments, in source order, before the first byte is
+        //    written. For a print that needs several yielding writes this means one line never
+        //    mixes values from different moments.
+        let temp = TempWorkDir::create("zevc-fresh-locals-print-snapshot").unwrap();
+        let src = r#"
+import board;
+
+struct S { u32 n; }
+struct CapSink { [96]u8 buf; usize len; u32 writes; u32 evals_at_first_write; }
+watch<u32> shared = 10;
+watch<u32> evals = 0;
+
+impl CapSink {
+    pub fn write(*self, []u8 bytes) {
+        if (self.writes == 0) { self.evals_at_first_write = evals.read(); }
+        self.writes += 1;
+        delay(2ms);
+        for (u8 b in bytes) { if (self.len < 96) { self.buf[self.len] = b; self.len += 1; } }
+    }
+}
+
+struct PlainSink { u32 writes; u32 evals_at_first_write; }
+impl PlainSink {
+    pub fn write(*self, []u8 bytes) {
+        if (self.writes == 0 && bytes.len > 0) { self.evals_at_first_write = evals.read(); }
+        self.writes += 1;
+    }
+}
+
+fn counted(u32 v) -> u32 { evals.publish(evals.read() + 1); return v; }
+
+fn direct_loop() -> u32 { u32 seen = 0; for (u32 i in 0..3) { u32 x; S s; [2]u8 b; seen += x + s.n + (b[1] as u32); x = 5; s.n = 7; b[1] = 3u8; } return seen; }
+fn yielding_loop() -> u32 { u32 seen = 0; for (u32 i in 0..3) { u32 x; S s; [2]u8 b; seen += x + s.n + (b[1] as u32); x = 5; s.n = 7; b[1] = 3u8; delay(1ms); } return seen; }
+fn soft_loop() -> u32 { u32 seen = 0; u32 i = 0; while (i < 3) { u32 x; seen += x; x = 5; i += 1; } return seen; }
+fn nested_and_branches(u32 k) -> u32 {
+    u32 seen = 0;
+    for (u32 i in 0..2) {
+        for (u32 j in 0..2) { u32 inner; seen += inner; inner = 1; }
+        switch (k) { 0 => { u32 a; seen += a; a = 3; }, _ => { u32 b; seen += b; b = 4; }, }
+        if (i > 0) { u32 c; seen += c; c = 50; }
+        u32 outer; seen += outer; outer = 100;
+    }
+    return seen;
+}
+fn every_loop() -> u32 { u32 seen = 0; u32 n = 0; loop every 1ms { u32 x; seen += x; x = 9; n += 1; if (n == 3) { break; } } return seen; }
+fn helper(u32 add) -> u32 { u32 acc; acc += add; return acc; }
+
+task bump() { loop every 1ms { shared.publish(shared.read() + 1); } }
+
+task checks() {
+    u32 body = 0;
+    for (u32 i in 0..3) { u32 x; body += x; x = 5; delay(1ms); }
+    u32 clone = 0;
+    noyield { clone = soft_loop(); }
+    u32 helpers = 0;
+    for (u32 i in 0..3) { helpers += helper(5); }
+    assert(direct_loop() == 0);
+    assert(yielding_loop() == 0);
+    assert(soft_loop() == 0);
+    assert(clone == 0);
+    assert(nested_and_branches(1) == 0);
+    assert(every_loop() == 0);
+    assert(body == 0);
+    assert(helpers == 15);
+
+    CapSink s;
+    []u8 dyn = "mid";
+    println(&s, f"a={shared.read()} {dyn} b={shared.read()} {dyn} c={counted(shared.read())}{counted(0)}");
+    assert(s.writes > 1);
+    assert(s.evals_at_first_write == 2);
+    u32 a = 0; u32 b = 0; u32 c = 0; usize i = 2;
+    while (s.buf[i] != ' ') { a = a * 10 + ((s.buf[i] - '0') as u32); i += 1; }
+    i += 7;
+    while (s.buf[i] != ' ') { b = b * 10 + ((s.buf[i] - '0') as u32); i += 1; }
+    i += 7;
+    while (s.buf[i] != '\n') { c = c * 10 + ((s.buf[i] - '0') as u32); i += 1; }
+    assert(a == b);
+    assert(c == a * 10);
+    assert(shared.read() > a);
+    PlainSink plain;
+    u32 evals_before = evals.read();
+    println(&plain, f"x={counted(1)} y={counted(2)}");
+    assert(plain.writes > 1);
+    assert(plain.evals_at_first_write == evals_before + 2);
+    println(f"a={a} b={b} c={c} writes={s.writes}");
+    println("FRESH_LOCALS_AND_PRINT_SNAPSHOT_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    board.init();
+    spawn bump() @high;
+    spawn checks() @normal;
+}
+"#;
+        let app_path = temp.dir.join("fresh.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let h_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&h_mir, &host_opts).unwrap();
+        let (h_code, h_out) = runner::compile_and_run_host_llvm_output(&h_ll, true, &[]).unwrap();
+        assert_eq!(h_code, 0, "host run failed:\n{h_out}");
+        assert!(
+            h_out.contains("FRESH_LOCALS_AND_PRINT_SNAPSHOT_OK"),
+            "{h_out}"
+        );
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let q_res = zev_codegen_llvm::run_qemu_cortex_m(
+            &q_mir,
+            &temp.dir.join("fresh_qemu.elf"),
+            &qemu_opts,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            q_res.exec.exit_code, 0,
+            "qemu run failed:\n{}",
+            q_res.exec.stdout
+        );
+        assert!(
+            q_res
+                .exec
+                .stdout
+                .contains("FRESH_LOCALS_AND_PRINT_SNAPSHOT_OK"),
+            "{}",
+            q_res.exec.stdout
+        );
+    }
 }

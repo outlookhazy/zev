@@ -1457,7 +1457,8 @@ pub fn verify_yielding_fn_addr_candidates(module: &MirModule) -> Result<(), MirL
     fn visit_expr<'a>(expr: &'a MirExpr, out: &mut Vec<&'a MirExpr>) {
         out.push(expr);
         match &expr.kind {
-            MirExprKind::IntLit(_)
+            MirExprKind::ZeroValue
+            | MirExprKind::IntLit(_)
             | MirExprKind::FloatLit(_)
             | MirExprKind::BoolLit(_)
             | MirExprKind::StringLit(_)

@@ -1104,6 +1104,8 @@ impl MirExpr {
 
 #[derive(Debug, Clone)]
 pub enum MirExprKind {
+    /// The all-zero value of the expression's type (any type, including aggregates).
+    ZeroValue,
     IntLit(i128),
     /// IEEE-754 `f64::to_bits()` representation of a float literal (`MirExpr.ty` is `MirType::F32` or `MirType::F64`).
     FloatLit(u64),

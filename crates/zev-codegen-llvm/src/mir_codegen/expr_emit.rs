@@ -362,6 +362,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
     pub(super) fn emit_expr(&mut self, expr: &MirExpr) -> Result<SsaVal, CodegenError> {
         let dst_lty = self.ctx.llvm_ty(&expr.ty.host_value_type());
         match &expr.kind {
+            MirExprKind::ZeroValue => Ok(SsaVal::new(dst_lty, "zeroinitializer")),
             MirExprKind::IntLit(v) => {
                 if dst_lty == "ptr" || dst_lty == "ptr addrspace(1)" {
                     if *v == 0 {

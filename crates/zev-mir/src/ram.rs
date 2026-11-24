@@ -1692,7 +1692,8 @@ fn fold_expr_run(
     extra_blocks: &mut usize,
 ) {
     match &expr.kind {
-        MirExprKind::IntLit(_)
+        MirExprKind::ZeroValue
+        | MirExprKind::IntLit(_)
         | MirExprKind::FloatLit(_)
         | MirExprKind::BoolLit(_)
         | MirExprKind::StringLit(_)

@@ -648,7 +648,8 @@ impl<'a> ScanCtx<'a> {
 
     fn visit_expr(&mut self, expr: &MirExpr, in_isr: bool, callees: &mut BTreeSet<String>) {
         match &expr.kind {
-            MirExprKind::IntLit(_)
+            MirExprKind::ZeroValue
+            | MirExprKind::IntLit(_)
             | MirExprKind::FloatLit(_)
             | MirExprKind::BoolLit(_)
             | MirExprKind::StringLit(_)
@@ -2064,7 +2065,8 @@ fn is_pure_static_immediate(
     subsys_structs: &BTreeSet<String>,
 ) -> bool {
     match &expr.kind {
-        MirExprKind::IntLit(_)
+        MirExprKind::ZeroValue
+        | MirExprKind::IntLit(_)
         | MirExprKind::FloatLit(_)
         | MirExprKind::BoolLit(_)
         | MirExprKind::StringLit(_)
@@ -2545,7 +2547,8 @@ impl VarUsageInfo {
 
     fn visit_expr(&mut self, expr: &MirExpr) {
         match &expr.kind {
-            MirExprKind::IntLit(_)
+            MirExprKind::ZeroValue
+            | MirExprKind::IntLit(_)
             | MirExprKind::FloatLit(_)
             | MirExprKind::BoolLit(_)
             | MirExprKind::StringLit(_)
@@ -3126,7 +3129,8 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
         | MirExprKind::ResultIsErr(vid)
         | MirExprKind::ResultErr(vid)
         | MirExprKind::ResultVal(vid) => *vid == target,
-        MirExprKind::IntLit(_)
+        MirExprKind::ZeroValue
+        | MirExprKind::IntLit(_)
         | MirExprKind::FloatLit(_)
         | MirExprKind::BoolLit(_)
         | MirExprKind::StringLit(_)
@@ -3458,7 +3462,8 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
         MirExprKind::Var(vid) if *vid == target => {
             *expr = repl.clone();
         }
-        MirExprKind::IntLit(_)
+        MirExprKind::ZeroValue
+        | MirExprKind::IntLit(_)
         | MirExprKind::FloatLit(_)
         | MirExprKind::BoolLit(_)
         | MirExprKind::StringLit(_)
@@ -4026,7 +4031,8 @@ fn collect_fn_addrs_and_calls_expr(
                 collect_fn_addrs_and_calls_expr(len, addr_taken_fns, call_sites);
             }
         },
-        MirExprKind::IntLit(_)
+        MirExprKind::ZeroValue
+        | MirExprKind::IntLit(_)
         | MirExprKind::FloatLit(_)
         | MirExprKind::BoolLit(_)
         | MirExprKind::StringLit(_)

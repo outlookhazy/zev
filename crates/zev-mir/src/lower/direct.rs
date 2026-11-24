@@ -23,6 +23,8 @@ pub(super) struct DirectLowerCtx<'a> {
     pub(super) in_const_eval: bool,
     pub(super) isr_state_vars: Vec<MirIsrStateDecl>,
     pub(super) pending_stmts: Vec<MirStmt>,
+    /// Shared sink-print scratch: (buffer var, its capacity, `fmt_buf` result var).
+    pub(super) sink_fmt_scratch: Option<(VarId, usize, VarId)>,
 }
 
 impl<'a> DirectLowerCtx<'a> {
@@ -43,7 +45,38 @@ impl<'a> DirectLowerCtx<'a> {
             in_const_eval: false,
             isr_state_vars: Vec::new(),
             pending_stmts: Vec::new(),
+            sink_fmt_scratch: None,
         }
+    }
+
+    pub(super) fn acquire_sink_fmt_scratch(&mut self, cap: usize) -> (VarId, VarId) {
+        let cap = cap.max(1);
+        if let Some((buf, cur_cap, res)) = self.sink_fmt_scratch {
+            if cap > cur_cap {
+                self.vars[buf.0].ty = MirType::Array {
+                    elem: Box::new(MirType::U8),
+                    len: cap,
+                };
+                self.sink_fmt_scratch = Some((buf, cap, res));
+            }
+            return (buf, res);
+        }
+        let buf = self.alloc_temp(
+            "sink_fmt_buf",
+            MirType::Array {
+                elem: Box::new(MirType::U8),
+                len: cap,
+            },
+        );
+        let res = self.alloc_temp(
+            "sink_fmt_res",
+            MirType::Result {
+                ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+                err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
+            },
+        );
+        self.sink_fmt_scratch = Some((buf, cap, res));
+        (buf, res)
     }
 
     pub(super) fn new_with_boot(
@@ -68,6 +101,7 @@ impl<'a> DirectLowerCtx<'a> {
             in_const_eval: false,
             isr_state_vars: Vec::new(),
             pending_stmts: Vec::new(),
+            sink_fmt_scratch: None,
         }
     }
 
@@ -241,6 +275,14 @@ impl<'a> DirectLowerCtx<'a> {
                         target: MirPlace::Var(vid),
                         op: MirAssignOp::Assign,
                         value: coerced,
+                    });
+                } else if !self.loop_defer_depths.is_empty() {
+                    // Function entry zeroes every local once. A declaration inside a loop body runs
+                    // again on each iteration and must start from zero each time.
+                    out.push(MirStmt::Assign {
+                        target: MirPlace::Var(vid),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(MirExprKind::ZeroValue, vty),
                     });
                 }
             }

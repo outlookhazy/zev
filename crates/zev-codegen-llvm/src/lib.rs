@@ -9445,4 +9445,97 @@ fn main() {
             );
         }
     }
+
+    #[test]
+    fn sink_prints_share_one_scratch_buffer_and_loop_locals_rezero() {
+        let src = r#"
+struct Sink { u32 n; }
+impl Sink { pub fn write(*self, []u8 b) { self.n += b.len as u32; } }
+
+fn summed(u32 k) -> u32 {
+    Sink sk;
+    for (u32 i in 0..k) {
+        u32 fresh;
+        fresh += i;
+        println(&sk, f"direct {fresh}");
+        println(&sk, f"again {i}");
+    }
+    return sk.n;
+}
+
+task worker() {
+    Sink sk;
+    *Sink sp = &sk;
+    u32 n = summed(2);
+    loop {
+        u32 fresh;
+        fresh += n;
+        println(&sk, f"one {n}");
+        println(&sk, f"two {fresh}");
+        println(sp, f"three {n}");
+        println(sp, f"four {fresh}");
+        n += sk.n;
+        delay(1ms);
+    }
+}
+
+fn main() {
+    spawn worker() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str(src).expect("parse shared scratch");
+        let (mono_progs, _) = zev_sema::analyze_and_monomorphize_programs(
+            &[prog],
+            &zev_sema::AnalyzeOptions::default(),
+        )
+        .into_result()
+        .expect("sema shared scratch");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower shared scratch");
+
+        // One number-formatting scratch buffer per function or coroutine, not one per print site.
+        let scratch_bufs = |vars: &[zev_mir::MirVar]| {
+            vars.iter()
+                .filter(|v| {
+                    v.role == zev_mir::VarRole::CompilerTemp
+                        && matches!(&v.ty, zev_mir::MirType::Array { elem, .. } if **elem == zev_mir::MirType::U8)
+                })
+                .count()
+        };
+        let worker = mir
+            .task_blueprints
+            .iter()
+            .find(|b| b.name == "worker")
+            .expect("worker blueprint");
+        assert_eq!(scratch_bufs(&worker.vars), 1, "task scratch buffers");
+        let summed = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "summed")
+            .expect("summed fn");
+        assert_eq!(scratch_bufs(&summed.vars), 1, "fn scratch buffers");
+
+        // A sink that is already a pointer variable is used as is: only the two `&sk` sites in
+        // the task need a pointer temporary.
+        let ptr_temps = worker
+            .vars
+            .iter()
+            .filter(|v| {
+                v.role == zev_mir::VarRole::CompilerTemp
+                    && matches!(&v.ty, zev_mir::MirType::Ptr(inner) if matches!(**inner, zev_mir::MirType::Struct(_)))
+            })
+            .count();
+        assert_eq!(ptr_temps, 2, "sink pointer temporaries");
+
+        // The loop-body declaration is zeroed where it is declared, not only at entry.
+        let ll = emit_llvm_ir_with_options(&mir, &CodegenOptions::default())
+            .expect("emit LLVM IR for shared scratch");
+        let summed_ll = ll
+            .split("define ")
+            .find(|f| f.contains("@__syn_fn_summed("))
+            .expect("summed IR");
+        assert!(
+            summed_ll.matches("store i32 zeroinitializer").count() >= 1,
+            "loop-body local must be re-zeroed at its declaration:\n{summed_ll}"
+        );
+    }
 }

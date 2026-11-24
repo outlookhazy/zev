@@ -1277,7 +1277,8 @@ impl<'a> MirIndirectScan<'a> {
 
     fn scan_expr(&mut self, expr: &MirExpr, caller: Option<&MirNodeKey>, vars: &[MirVar]) {
         match &expr.kind {
-            MirExprKind::IntLit(_)
+            MirExprKind::ZeroValue
+            | MirExprKind::IntLit(_)
             | MirExprKind::FloatLit(_)
             | MirExprKind::BoolLit(_)
             | MirExprKind::StringLit(_)
