@@ -7697,4 +7697,66 @@ fn main() {
             qres.exec.stdout
         );
     }
+
+    #[test]
+    fn rejects_out_of_range_mir_integer_constants_as_ice() {
+        let mut mir = zev_mir::lower_program(&zev_parser::parse_str("fn main() {}").unwrap())
+            .expect("lower baseline empty program");
+
+        let mk_fn = |name: &str, ty: zev_mir::MirType, val: i128| -> zev_mir::MirFunction {
+            zev_mir::MirFunction {
+                name: name.to_string(),
+                params: Vec::new(),
+                ret_ty: zev_mir::MirType::Void,
+                error_spec: zev_mir::MirErrorSpec::None,
+                manual_yield: false,
+                is_yielding: false,
+                vars: vec![zev_mir::MirVar {
+                    id: zev_mir::VarId(0),
+                    name: "x".to_string(),
+                    ty: ty.clone(),
+                    role: zev_mir::VarRole::UserLocal,
+                    in_noyield_scope: false,
+                    addr_taken: false,
+                    hoisted: false,
+                }],
+                body: zev_mir::MirFnBody::Direct(vec![zev_mir::MirStmt::Assign {
+                    target: zev_mir::MirPlace::Var(zev_mir::VarId(0)),
+                    op: zev_mir::MirAssignOp::Assign,
+                    value: zev_mir::MirExpr::new(zev_mir::MirExprKind::IntLit(val), ty),
+                }]),
+            }
+        };
+
+        for (label, ty, val) in [
+            ("bad_i8_300", zev_mir::MirType::U8, 300i128),
+            ("bad_i8_neg200", zev_mir::MirType::I8, -200i128),
+            ("bad_i32_5e9", zev_mir::MirType::I32, 5_000_000_000i128),
+        ] {
+            let mut m = mir.clone();
+            m.functions.push(mk_fn(label, ty, val));
+            let err = emit_llvm_ir_with_options(&m, &CodegenOptions::host_linux())
+                .expect_err(&format!("{label} must raise ICE instead of emitting invalid LLVM constant"));
+            assert_eq!(err.stage, "ice", "{label}: {err:?}");
+        }
+
+        // Also catch out-of-range integer literals inside global primitive initializers.
+        mir.primitives.push(zev_mir::MirPrimitive {
+            name: "bad_w".to_string(),
+            kind: zev_mir::MirPrimKind::Watch {
+                elem: Box::new(zev_mir::MirType::U8),
+            },
+            dma_safe: false,
+            init: Some(zev_mir::MirExpr::new(
+                zev_mir::MirExprKind::IntLit(300),
+                zev_mir::MirType::U8,
+            )),
+            sleep_lock_bit: None,
+            dead_stripped: false,
+            irq_mask_elided: false,
+        });
+        let err_global = emit_llvm_ir_with_options(&mir, &CodegenOptions::host_linux())
+            .expect_err("out-of-range watch u8 init 300 must raise ICE");
+        assert_eq!(err_global.stage, "ice", "{err_global:?}");
+    }
 }

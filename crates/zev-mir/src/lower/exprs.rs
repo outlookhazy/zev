@@ -1782,16 +1782,37 @@ pub(super) fn is_scalar_int_mir_type(ty: &MirType) -> bool {
     )
 }
 
+pub(super) fn int_lit_fits_mir_type(v: i128, target: &MirType) -> bool {
+    match target.host_value_type() {
+        MirType::U8 | MirType::I8 => (i128::from(i8::MIN)..=i128::from(u8::MAX)).contains(&v),
+        MirType::U16 | MirType::I16 => (i128::from(i16::MIN)..=i128::from(u16::MAX)).contains(&v),
+        MirType::U32 | MirType::I32 | MirType::Enum(_) => {
+            (i128::from(i32::MIN)..=i128::from(u32::MAX)).contains(&v)
+        }
+        MirType::U64 | MirType::I64 => (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&v),
+        MirType::Usize | MirType::Isize => {
+            (i128::from(i16::MIN)..=i128::from(u16::MAX)).contains(&v)
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn coerce_or_cast_int(expr: MirExpr, target_ty: &MirType) -> MirExpr {
     let target = target_ty.host_value_type();
     if expr.ty.host_value_type() == target || target.is_void() {
         return expr;
     }
     if let MirExprKind::IntLit(v) = expr.kind {
-        if is_scalar_int_mir_type(&target) {
+        if is_scalar_int_mir_type(&target) && int_lit_fits_mir_type(v, &target) {
             return MirExpr::new(MirExprKind::IntLit(v), target);
         }
-        return MirExpr::new(MirExprKind::IntLit(v), expr.ty);
+        return MirExpr::new(
+            MirExprKind::Cast {
+                expr: Box::new(expr),
+                target_ty: target.clone(),
+            },
+            target,
+        );
     }
     MirExpr::new(
         MirExprKind::Cast {

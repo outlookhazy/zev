@@ -369,7 +369,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 } else if !dst_lty.starts_with('i') {
                     Ok(SsaVal::new(dst_lty, "zeroinitializer"))
                 } else {
-                    Ok(SsaVal::new(dst_lty, format!("{v}")))
+                    let lit = format_checked_llvm_int_const(&dst_lty, *v)?;
+                    Ok(SsaVal::new(dst_lty, lit))
                 }
             }
             MirExprKind::FloatLit(bits) => {
@@ -391,7 +392,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 Ok(SsaVal::new(target_fty, format!("0x{norm_bits:016X}")))
             }
             MirExprKind::BoolLit(b) => Ok(SsaVal::new("i8", if *b { "1" } else { "0" })),
-            MirExprKind::TicksLit(t) => Ok(SsaVal::new(dst_lty, format!("{t}"))),
+            MirExprKind::TicksLit(t) => {
+                let lit = format_checked_llvm_int_const(&dst_lty, i128::from(*t))?;
+                Ok(SsaVal::new(dst_lty, lit))
+            }
             MirExprKind::StringLit(s) => {
                 let idx = self.ctx.intern_string(s);
                 let slen = zev_ast::decoded_string_byte_len(s);

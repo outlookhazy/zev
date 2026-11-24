@@ -381,11 +381,11 @@ pub fn emit_llvm_ir_with_options(
     // 3. User struct type declarations + Host MMIO backing buffers + ISR / hook static state globals
     ctx.emit_struct_types_ir(&mut out);
     ctx.emit_mmio_host_buffers_ir(&mut out);
-    ctx.emit_isr_state_and_selector_globals_ir(&mut out);
+    ctx.emit_isr_state_and_selector_globals_ir(&mut out)?;
     ctx.emit_sys_hook_globals_ir(&mut out);
 
     // 4. OS primitive type declarations, global instances, and typed helper functions
-    ctx.emit_primitives_ir(&mut out);
+    ctx.emit_primitives_ir(&mut out)?;
 
     // 5. Coroutine frame struct types + static task/boot frame globals
     ctx.emit_coroutine_frame_globals_ir(&mut out);
@@ -421,10 +421,42 @@ pub fn emit_llvm_ir_with_options(
     ctx.emit_rom_wrappers_ir(&mut out);
 
     // 13. Immutable aggregate / slice / str constants and pooled string literals (.rodata)
-    ctx.emit_rodata_consts_ir(&mut out);
+    ctx.emit_rodata_consts_ir(&mut out)?;
     ctx.emit_string_constants_ir(&mut out);
 
     Ok(out)
+}
+
+/// Format an integer constant for LLVM type `llvm_ty`, raising an internal compiler error
+/// (`CodegenError::new("ice", ...)`) if `value` does not fit the signed-or-unsigned bit range.
+pub(super) fn format_checked_llvm_int_const(
+    llvm_ty: &str,
+    value: i128,
+) -> Result<String, CodegenError> {
+    let fits = match llvm_ty {
+        "i1" => (-1..=1).contains(&value),
+        "i8" => (i128::from(i8::MIN)..=i128::from(u8::MAX)).contains(&value),
+        "i16" => (i128::from(i16::MIN)..=i128::from(u16::MAX)).contains(&value),
+        "i32" => (i128::from(i32::MIN)..=i128::from(u32::MAX)).contains(&value),
+        "i64" => (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&value),
+        _ => {
+            return Err(CodegenError::new(
+                "ice",
+                format!(
+                    "internal compiler error: expected LLVM integer type, found `{llvm_ty}` for constant {value}"
+                ),
+            ));
+        }
+    };
+    if !fits {
+        return Err(CodegenError::new(
+            "ice",
+            format!(
+                "internal compiler error: integer constant {value} does not fit LLVM type `{llvm_ty}`"
+            ),
+        ));
+    }
+    Ok(value.to_string())
 }
 
 mod expr_emit;
