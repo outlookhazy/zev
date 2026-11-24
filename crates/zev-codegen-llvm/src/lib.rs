@@ -9160,7 +9160,7 @@ fn main() {
 
         // 1. Default opt_level is `-Os` on all 32-bit chips while `host` stays `-O2`
         //    and explicit `-O2` override remains selectable.
-        for chip in ["stm32f334r8", "lm3s6965", "esp32c6", "rp2040"] {
+        for chip in ["stm32f334r8", "lm3s6965", "esp32c6", "rp2040", "ch32v307"] {
             let spec = TargetSpec::resolve(Some(chip), None).expect(chip);
             assert_eq!(spec.opt_level, "-Os", "chip {chip} must default to -Os");
         }

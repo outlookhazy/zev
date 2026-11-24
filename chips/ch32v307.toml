@@ -11,7 +11,7 @@ features = "+m,+a,+c"
 triple = "riscv32-unknown-none-elf"
 datalayout = "e-m:e-p:32:32-i64:64-n32-S128"
 ptr_bits = 32
-opt_level = "-O2"
+opt_level = "-Os"
 hal_dir = "hal/ch32v3"
 # QingKe V4 documents WFI wake-up only through an interrupt taken by PFIC; whether a pending
 # interrupt wakes the core while `mstatus.MIE` is clear (which the masked-`wfi` idle relies on)
