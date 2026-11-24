@@ -285,9 +285,11 @@ impl CallGraph {
     }
 
     /// Compute `(soft_yielding_in_coro, soft_yielding_in_noyield, dual_specialized_fns)` via 2-state
-    /// `(node, Coro | NoYield)` reachability from `main`, all `task`s, and uncalled root `fn`s.
+    /// `(node, Coro | NoYield)` reachability from `main`, all `task`s, uncalled root `fn`s, and
+    /// function-pointer targets (which invoke the non-yielding specialization).
     pub fn compute_soft_specializations(
         &self,
+        fn_ptr_targets: &BTreeSet<String>,
     ) -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
         #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
         enum ExecMode {
@@ -320,6 +322,17 @@ impl CallGraph {
 
         let mut soft_in_coro = BTreeSet::new();
         let mut soft_in_noyield = BTreeSet::new();
+
+        for fname in fn_ptr_targets {
+            if let Some(node) = self.nodes.get(fname.as_str()) {
+                if node.kind == CallableKind::Fn && node.effect == FnEffect::SoftYielding {
+                    soft_in_noyield.insert(node.name.clone());
+                    if visited.insert((node.name.as_str(), ExecMode::NoYield)) {
+                        queue.push_back((node.name.as_str(), ExecMode::NoYield));
+                    }
+                }
+            }
+        }
 
         while let Some((curr, mode)) = queue.pop_front() {
             let Some(out_edges) = adj.get(curr) else {

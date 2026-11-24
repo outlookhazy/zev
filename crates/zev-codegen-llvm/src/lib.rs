@@ -8180,4 +8180,66 @@ fn main() {
             .expect_err("out-of-range watch u8 init 300 must raise ICE");
         assert_eq!(err_global.stage, "ice", "{err_global:?}");
     }
+
+    #[test]
+    fn item1_soft_yielding_fnptr_targets_noyield_clone_end_to_end() {
+        let dir = test_out_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = r#"
+            fn sum_while([]u8 s) -> u32 {
+                u32 total = 0u32;
+                usize i = 0;
+                while (i < s.len) {
+                    total += (s[i] as u32);
+                    i += 1;
+                }
+                return total;
+            }
+            fn add_chk(u32 a, u32 b) -> u32 {
+                checkpoint();
+                return a + b;
+            }
+            struct Handlers {
+                fn([]u8) -> u32 sum;
+                fn(u32, u32) -> u32 add;
+            }
+            task sh() {
+                fn([]u8) -> u32 h = sum_while;
+                Handlers tbl = Handlers { sum: sum_while, add: add_chk };
+                u32 a = h("AB");
+                u32 b = (tbl.sum)("CD");
+                u32 c = tbl.add(10u32, 32u32);
+                println(f"SOFT_PTR:{a}:{b}:{c}");
+                loop {
+                    sys.exit(0);
+                }
+            }
+            fn main() {
+                sys.use_systick(12_000_000);
+                spawn sh() @normal;
+            }
+        "#;
+        let mir = compile_src_mir(src);
+        let ll = emit_llvm_ir(&mir).expect("emit thumbv7m IR");
+        assert!(
+            ll.contains("@__syn_fn_sum_while__noyield(")
+                && ll.contains("@__syn_fn_add_chk__noyield("),
+            "expected direct __noyield targets in IR:\n{ll}"
+        );
+        assert!(
+            !ll.contains("@__syn_fn_step_sum_while") && !ll.contains("@__syn_fn_step_add_chk"),
+            "did not expect coroutine step symbols when only called via function pointer:\n{ll}"
+        );
+
+        let res = run_qemu_cortex_m(
+            &mir,
+            &dir.join("item1_soft_fnptr_cm3.elf"),
+            &CodegenOptions::default(),
+            &QemuRunOptions::default(),
+        )
+        .expect("QEMU execution of soft-yielding fnptr test");
+        assert_eq!(res.exec.exit_code, 0, "stdout: {}", res.exec.stdout);
+        // 'A' (65) + 'B' (66) = 131; 'C' (67) + 'D' (68) = 135; 10 + 32 = 42.
+        assert_eq!(res.exec.stdout, "SOFT_PTR:131:135:42\n");
+    }
 }

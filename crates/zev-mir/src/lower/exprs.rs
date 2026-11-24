@@ -1120,9 +1120,14 @@ pub(super) fn lower_leaf_expr(
                     MirType::MmioPtr(inst.layout.clone()),
                 ));
             }
-            if syms.fns.contains_key(&id.name) {
+            if let Some(sig) = syms.fns.get(&id.name) {
+                let target = if sig.effect == MirFnEffect::SoftYielding {
+                    format!("{}__noyield", id.name)
+                } else {
+                    id.name.clone()
+                };
                 return Ok(MirExpr::new(
-                    MirExprKind::FnAddr(id.name.clone()),
+                    MirExprKind::FnAddr(target),
                     expected.cloned().unwrap_or(MirType::Usize),
                 ));
             }
@@ -1168,9 +1173,14 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                             MirType::MmioPtr(inst.layout.clone()),
                         ));
                     }
-                    if be.syms().fns.contains_key(&id.name) {
+                    if let Some(sig) = be.syms().fns.get(&id.name) {
+                        let target = if sig.effect == MirFnEffect::SoftYielding {
+                            format!("{}__noyield", id.name)
+                        } else {
+                            id.name.clone()
+                        };
                         return Ok(MirExpr::new(
-                            MirExprKind::FnAddr(id.name.clone()),
+                            MirExprKind::FnAddr(target),
                             expected.cloned().unwrap_or(MirType::Usize),
                         ));
                     }

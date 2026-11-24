@@ -111,6 +111,7 @@ pub(super) fn infer_effects_and_specializations(
     fn_decls: &[&FnDecl],
     task_decls: &[&TaskDecl],
     main_decl: Option<&FnDecl>,
+    program_items: &[zev_ast::Item],
     syms: &mut ModuleSymbols,
 ) {
     let mut direct_eff: BTreeMap<String, MirFnEffect> = BTreeMap::new();
@@ -273,6 +274,46 @@ pub(super) fn infer_effects_and_specializations(
     let mut soft_in_coro = BTreeSet::new();
     let mut soft_in_noyield = BTreeSet::new();
 
+    // Soft-yielding functions referenced as function-pointer values invoke their
+    // non-yielding specialization (`__noyield`) across all indirect call sites.
+    let mut fn_value_refs = BTreeSet::new();
+    for item in program_items {
+        match &item.kind {
+            ItemKind::Const(cd) => {
+                collect_fn_value_refs_expr(&cd.value, &fn_names, &mut fn_value_refs)
+            }
+            ItemKind::OsPrimitive(pd) => {
+                if let Some(ie) = &pd.init {
+                    collect_fn_value_refs_expr(ie, &fn_names, &mut fn_value_refs);
+                }
+            }
+            ItemKind::Isr(id) => {
+                collect_fn_value_refs_stmts(&id.body.stmts, &fn_names, &mut fn_value_refs)
+            }
+            ItemKind::Fn(fd) => {
+                if let Some(b) = &fd.body {
+                    collect_fn_value_refs_stmts(&b.stmts, &fn_names, &mut fn_value_refs);
+                }
+            }
+            ItemKind::Task(td) => {
+                collect_fn_value_refs_stmts(&td.body.stmts, &fn_names, &mut fn_value_refs)
+            }
+            _ => {}
+        }
+    }
+    for fname in fn_value_refs {
+        if syms
+            .fns
+            .get(&fname)
+            .is_some_and(|sig| sig.effect == MirFnEffect::SoftYielding)
+        {
+            soft_in_noyield.insert(fname.clone());
+            if visited.insert((fname.clone(), ExecMode::NoYield)) {
+                queue.push_back((fname, ExecMode::NoYield));
+            }
+        }
+    }
+
     while let Some((curr, mode)) = queue.pop_front() {
         let Some(out_edges) = adj.get(curr.as_str()) else {
             continue;
@@ -337,6 +378,177 @@ pub(super) fn infer_effects_and_specializations(
 
 pub(super) fn ast_block_has_break(block: &Block) -> bool {
     ast_stmts_have_break(&block.stmts)
+}
+
+fn collect_fn_value_refs_stmts(
+    stmts: &[Stmt],
+    fn_names: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::VarDecl { init: Some(e), .. }
+            | StmtKind::Return(Some(e))
+            | StmtKind::Expr(e) => collect_fn_value_refs_expr(e, fn_names, out),
+            StmtKind::StateVar { init: Some(e), .. } => {
+                collect_fn_value_refs_expr(e, fn_names, out)
+            }
+            StmtKind::Assign { target, value, .. } => {
+                collect_fn_value_refs_expr(target, fn_names, out);
+                collect_fn_value_refs_expr(value, fn_names, out);
+            }
+            StmtKind::If {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                collect_fn_value_refs_expr(cond, fn_names, out);
+                collect_fn_value_refs_stmts(&then_block.stmts, fn_names, out);
+                if let Some(eb) = else_block {
+                    collect_fn_value_refs_stmts(&eb.stmts, fn_names, out);
+                }
+            }
+            StmtKind::Switch { scrutinee, arms } => {
+                collect_fn_value_refs_expr(scrutinee, fn_names, out);
+                for arm in arms {
+                    collect_fn_value_refs_stmts(&arm.body.stmts, fn_names, out);
+                }
+            }
+            StmtKind::Wait { arms, timer } => {
+                for arm in arms {
+                    collect_fn_value_refs_expr(&arm.call, fn_names, out);
+                    collect_fn_value_refs_stmts(&arm.body.stmts, fn_names, out);
+                }
+                if let Some(t) = timer {
+                    collect_fn_value_refs_expr(&t.expr, fn_names, out);
+                    collect_fn_value_refs_stmts(&t.body.stmts, fn_names, out);
+                }
+            }
+            StmtKind::While { cond, body } => {
+                collect_fn_value_refs_expr(cond, fn_names, out);
+                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
+            }
+            StmtKind::LoopEvery { period, body } => {
+                collect_fn_value_refs_expr(period, fn_names, out);
+                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
+            }
+            StmtKind::ForRange {
+                start, end, body, ..
+            } => {
+                collect_fn_value_refs_expr(start, fn_names, out);
+                collect_fn_value_refs_expr(end, fn_names, out);
+                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
+            }
+            StmtKind::ForEach { iter, body, .. } => {
+                collect_fn_value_refs_expr(iter, fn_names, out);
+                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
+            }
+            StmtKind::Loop { body }
+            | StmtKind::NoYield { body }
+            | StmtKind::Critical { body }
+            | StmtKind::Block(body) => {
+                collect_fn_value_refs_stmts(&body.stmts, fn_names, out);
+            }
+            StmtKind::Defer(inner) => {
+                collect_fn_value_refs_stmts(std::slice::from_ref(inner.as_ref()), fn_names, out);
+            }
+            StmtKind::Error { reason, partial } => {
+                if let Some(r) = reason {
+                    collect_fn_value_refs_expr(r, fn_names, out);
+                }
+                if let Some(p) = partial {
+                    collect_fn_value_refs_expr(p, fn_names, out);
+                }
+            }
+            StmtKind::Spawn(sp) => {
+                for a in &sp.args {
+                    collect_fn_value_refs_expr(&a.value, fn_names, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn collect_fn_value_refs_expr(
+    expr: &Expr,
+    fn_names: &BTreeSet<String>,
+    out: &mut BTreeSet<String>,
+) {
+    match &expr.kind {
+        ExprKind::Ident(id) => {
+            if fn_names.contains(&id.name) {
+                out.insert(id.name.clone());
+            }
+        }
+        ExprKind::Unary { expr: inner, .. }
+        | ExprKind::Cast { expr: inner, .. }
+        | ExprKind::Field { target: inner, .. } => {
+            collect_fn_value_refs_expr(inner, fn_names, out);
+        }
+        ExprKind::Binary { lhs, rhs, .. }
+        | ExprKind::Index {
+            target: lhs,
+            index: rhs,
+        }
+        | ExprKind::Or {
+            expr: lhs,
+            fallback: rhs,
+        } => {
+            collect_fn_value_refs_expr(lhs, fn_names, out);
+            collect_fn_value_refs_expr(rhs, fn_names, out);
+        }
+        ExprKind::Slice { target, start, end } => {
+            collect_fn_value_refs_expr(target, fn_names, out);
+            if let Some(s) = start {
+                collect_fn_value_refs_expr(s, fn_names, out);
+            }
+            if let Some(e) = end {
+                collect_fn_value_refs_expr(e, fn_names, out);
+            }
+        }
+        ExprKind::Call { callee, args, .. } => {
+            let direct_fn =
+                matches!(&callee.kind, ExprKind::Ident(id) if fn_names.contains(&id.name));
+            if !direct_fn {
+                collect_fn_value_refs_expr(callee, fn_names, out);
+            }
+            for a in args {
+                collect_fn_value_refs_expr(&a.value, fn_names, out);
+            }
+        }
+        ExprKind::MethodCall { receiver, args, .. } => {
+            collect_fn_value_refs_expr(receiver, fn_names, out);
+            for a in args {
+                collect_fn_value_refs_expr(&a.value, fn_names, out);
+            }
+        }
+        ExprKind::StructLit { fields, .. } => {
+            for f in fields {
+                collect_fn_value_refs_expr(&f.value, fn_names, out);
+            }
+        }
+        ExprKind::ArrayLit(elems) => {
+            for e in elems {
+                collect_fn_value_refs_expr(e, fn_names, out);
+            }
+        }
+        ExprKind::FormatString(parts) => {
+            for part in parts {
+                if let FormatPart::Hole { expr: he, .. } = part {
+                    collect_fn_value_refs_expr(he, fn_names, out);
+                }
+            }
+        }
+        ExprKind::Catch {
+            expr: inner,
+            clause,
+        } => {
+            collect_fn_value_refs_expr(inner, fn_names, out);
+            collect_fn_value_refs_stmts(&clause.body.stmts, fn_names, out);
+        }
+        ExprKind::Literal(_) | ExprKind::Priority(_) => {}
+    }
 }
 
 pub(super) fn ast_stmts_have_break(stmts: &[Stmt]) -> bool {

@@ -36,6 +36,8 @@ impl Analyzer {
             recorded_call_args: Vec::new(),
             recorded_byte_ring_ops: Vec::new(),
             recorded_watch_writes: Vec::new(),
+            fn_ptr_value_sites: Vec::new(),
+            extern_callback_arg_spans: BTreeSet::new(),
             spawned_task_field_endpoints: BTreeMap::new(),
             prim_escaping_ref_params: BTreeMap::new(),
             tasks: BTreeMap::new(),
@@ -2155,6 +2157,7 @@ impl Analyzer {
                 Ty::FnPtr {
                     params: ps,
                     ret: Box::new(r),
+                    error_spec: Box::new(ResolvedErrorSpec::None),
                 }
             }
         }
@@ -2825,6 +2828,53 @@ impl Analyzer {
             }
         }
 
+        // 2b. Check general function-pointer value sites (locals, fields, args, returns, generics):
+        //     - Hard-blocking targets are rejected with shortest blocking chain ("not yet supported through function pointers").
+        //     - Soft-yielding targets are seeded in `noyield` mode so pointer calls target `{fn}__noyield`.
+        let fn_ptr_sites = self.fn_ptr_value_sites.clone();
+        let extern_arg_spans = self.extern_callback_arg_spans.clone();
+        let mut soft_fn_ptr_targets = BTreeSet::new();
+        for site in &fn_ptr_sites {
+            let is_direct_extern_arg = extern_arg_spans.iter().any(|&(pidx, es, ee)| {
+                pidx == site.prog_idx && site.span.start >= es && site.span.end <= ee
+            });
+            if is_direct_extern_arg {
+                continue;
+            }
+            let Some(node) = self.call_graph.nodes.get(&site.fn_name).cloned() else {
+                continue;
+            };
+            match node.effect {
+                FnEffect::HardBlocking => {
+                    let disp = self
+                        .display_names
+                        .get(&site.fn_name)
+                        .cloned()
+                        .unwrap_or_else(|| site.fn_name.clone());
+                    let chain = self
+                        .call_graph
+                        .shortest_hard_yield_chain(&site.fn_name)
+                        .join(" -> ");
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            site.span,
+                            format!(
+                                "hard-blocking function '{}' is not yet supported through function pointers",
+                                disp
+                            ),
+                        )
+                        .with_file(site.file.clone())
+                        .with_note(format!("shortest blocking chain: {}", chain)),
+                    );
+                }
+                FnEffect::SoftYielding => {
+                    soft_fn_ptr_targets.insert(site.fn_name.clone());
+                }
+                FnEffect::NonYielding => {}
+            }
+        }
+
         // 3. Detect recursive call cycles across boot-spawning (`E0027`), boot-attaching (`E0032`), and yielding (`E0012`) functions.
         let spawning_cycles = self.call_graph.find_spawning_cycles();
         for (cycle, span) in &spawning_cycles {
@@ -2893,7 +2943,9 @@ impl Analyzer {
         self.verify_watch_single_writer();
 
         // 5. Compute 3-tier `SoftYielding` coroutine vs `noyield` dual specializations.
-        let (soft_coro, soft_ny, dual_spec) = self.call_graph.compute_soft_specializations();
+        let (soft_coro, soft_ny, dual_spec) = self
+            .call_graph
+            .compute_soft_specializations(&soft_fn_ptr_targets);
         self.soft_yielding_in_coro = soft_coro;
         self.soft_yielding_in_noyield = soft_ny;
         self.dual_specialized_fns = dual_spec;
@@ -4536,7 +4588,7 @@ impl Analyzer {
             Ty::Array { elem, .. } | Ty::Slice(elem) => {
                 self.check_disallowed_lease_type(elem, span, ctx, false);
             }
-            Ty::FnPtr { params, ret } => {
+            Ty::FnPtr { params, ret, .. } => {
                 for p in params {
                     self.check_disallowed_lease_type(p, span, ctx, false);
                 }
