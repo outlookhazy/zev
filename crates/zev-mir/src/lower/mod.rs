@@ -1097,6 +1097,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
     } else {
         MirBootSequence {
             present: false,
+            from_main_entry: false,
             vars: Vec::new(),
             steps: Vec::new(),
             boot_yielding_callees: Vec::new(),

@@ -64,6 +64,10 @@ pub struct FunctionInfo {
     pub yielding_callees: Vec<String>,
     /// Parameter indices whose reference/slice provenance may be returned by this function.
     pub return_param_origins: Vec<usize>,
+    /// Static endpoint returned directly (e.g. from `console_open()`), if unambiguous.
+    pub return_endpoint: Option<String>,
+    /// Static struct field endpoint bindings returned by this function (e.g. `DuplexStream.rx`).
+    pub return_field_endpoints: BTreeMap<String, String>,
     pub span: Span,
 }
 

@@ -377,6 +377,8 @@ pub(super) struct BodyChecker<'a> {
     pub(super) boot_steps: Vec<BootStep>,
     pub(super) boot_block_stack: Vec<Vec<IrqBootNode>>,
     pub(super) return_param_origins: BTreeSet<usize>,
+    pub(super) return_endpoint: Option<String>,
+    pub(super) return_field_endpoints: BTreeMap<String, String>,
     pub(super) recorded_boosts: Vec<PriorityBoostSite>,
     pub(super) proven_infallible_spans: BTreeSet<(u32, u32)>,
     pub(super) last_struct_lit_fields: BTreeMap<(u32, u32), BTreeMap<String, Provenance>>,

@@ -7713,3 +7713,36 @@ fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to
         model.1.soft_yielding_in_noyield
     );
 }
+
+#[test]
+fn item2_missing_console_board_reports_no_console_input() {
+    let tmp = std::env::temp_dir().join(format!(
+        "zev_item2_no_console_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("bsp")).unwrap();
+    std::fs::write(tmp.join("bsp/no_console.zev"), "pub fn init() {}\n").unwrap();
+    let app_path = tmp.join("app.zev");
+    let app_src = "import board;\nfn main() { board.init(); auto _c = board.console_open(); }\n";
+    let prog = zev_parser::parse_str_named(app_src, app_path.to_str().unwrap()).unwrap();
+    let aopts = AnalyzeOptions {
+        include_dirs: vec![tmp.clone()],
+        board_module: Some("bsp/no_console".to_string()),
+        ..AnalyzeOptions::default()
+    };
+    let out =
+        zev_sema::analyze_and_monomorphize_named_programs(&[(&prog, app_path.to_str())], &aopts);
+    let _ = std::fs::remove_dir_all(&tmp);
+    let rendered = out
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("does not provide console input"),
+        "expected missing console diagnostic, got:\n{rendered}"
+    );
+}

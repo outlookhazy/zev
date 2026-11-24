@@ -235,6 +235,12 @@ fn compute_terminator_live_before(
                         }
                         | MirWaitArmOp::ByteRingViewWaitRead {
                             dst_val, dst_res, ..
+                        }
+                        | MirWaitArmOp::ByteRingWaitWrite {
+                            dst_val, dst_res, ..
+                        }
+                        | MirWaitArmOp::ByteRingViewWaitWrite {
+                            dst_val, dst_res, ..
                         } => {
                             if let Some(dv) = dst_val {
                                 arm_live.remove(dv);
@@ -273,6 +279,7 @@ fn compute_terminator_live_before(
                         MirWaitArmOp::InboxRecv { target, .. }
                         | MirWaitArmOp::PoolAlloc { target, .. }
                         | MirWaitArmOp::ByteRingWaitRead { target, .. }
+                        | MirWaitArmOp::ByteRingWaitWrite { target, .. }
                         | MirWaitArmOp::SignalWait { target, .. }
                         | MirWaitArmOp::WaitQueueCommit { target, .. }
                         | MirWaitArmOp::PingPongWaitChunk { target, .. } => {
@@ -297,7 +304,8 @@ fn compute_terminator_live_before(
                             out.insert(*val_var);
                         }
                         MirWaitArmOp::InboxViewRecv { view, .. }
-                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                        | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
                             collect_expr_uses(view, &mut out);
                         }
                         MirWaitArmOp::InboxViewSend { view, val_var, .. } => {

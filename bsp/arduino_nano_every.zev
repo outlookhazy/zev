@@ -8,6 +8,60 @@
 //   - `SPI0`   (`ALT2`)     = `PE0` MOSI (`D11`) / `PE1` MISO (`D12`) / `PE2` SCK (`D13`) / `PE3` SS (`D8`)
 
 import chip.atmega4809 as hw;
+import std.io as io;
+
+byte_ring<64> console_rx;
+byte_ring<96> console_tx;
+
+isr nano_console_rx_isr(*byte_ring rx, *hw.UsartRegs uart) {
+    u8 b = uart.rxd_l;
+    bool _ok = rx.push_byte(b, boost: @high);
+}
+
+isr nano_console_tx_isr(*byte_ring tx, *hw.UsartRegs uart) {
+    u8 b = tx.try_pop_byte() catch {
+        u8 ctrl = uart.ctrla;
+        uart.ctrla = ctrl & (~hw.BIT_USART_DREIE);
+        return;
+    };
+    uart.txd_l = b;
+}
+
+fn nano_console_flush(*byte_ring tx) {
+    if (!tx.is_empty()) {
+        enable_uart_dre_irq();
+    }
+}
+
+fn nano_console_ring_putc(u8 b) {
+    if (!console_tx.push_byte(b)) {
+        enable_uart_dre_irq();
+        for (u32 spin in 0..4096) {
+            if (console_tx.push_byte(b)) {
+                enable_uart_dre_irq();
+                return;
+            }
+        }
+        return;
+    }
+    enable_uart_dre_irq();
+}
+
+pub fn init() {
+    init_board();
+}
+
+pub fn console_open() -> io.DuplexStream {
+    hw.IRQ_USART3_RXC.attach(nano_console_rx_isr(&console_rx, hw.USART3));
+    hw.IRQ_USART3_DRE.attach(nano_console_tx_isr(&console_tx, hw.USART3));
+    enable_uart_rx_irq();
+    sys.set_putc(nano_console_ring_putc);
+    return io.DuplexStream {
+        rx: &console_rx,
+        tx: &console_tx,
+        flush: nano_console_flush,
+    };
+}
 
 pub fn console_putc(u8 c) {
     noyield {

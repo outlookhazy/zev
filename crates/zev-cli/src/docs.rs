@@ -741,10 +741,14 @@ zevc check -I chip examples/motor_controller.zev examples/motor_support.zev
 
 ## 4. Sanitized Host LLVM Simulation (`run`)
 Unified `zev-codegen-llvm` backend emits host `x86_64` LLVM IR linked with Clang `-fsanitize=address,undefined`
-and deterministic `sys.fuzz_irqs(seed, mask)` IRQ interleaving — running the exact same scheduler IR as MCUs:
+and deterministic `sys.fuzz_irqs(seed, mask)` IRQ interleaving — running the exact same scheduler IR as MCUs.
+Piping input or redirecting `/dev/null` without `--script` / `--cmd` stops polling stdin at EOF and keeps the
+firmware running (tasks continue executing normally); use `--script` / `--cmd`, `--max-ticks`, or `sys.exit(...)`
+to bound or terminate non-interactive runs:
 ```bash
 zevc run --sanitize examples/sim_demo.zev
 zevc run --max-ticks 50 app.zev       # Bounds infinite `loop every` / `checkpoint()` firmware loops!
+zevc run app.zev --cmd help           # Scripted mode: stops after final `ok` / `err` response
 ```
 
 ## 5. ARM Cortex-M3 (`lm3s6965_evb`) ELF & QEMU

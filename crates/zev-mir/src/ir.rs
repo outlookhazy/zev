@@ -908,6 +908,17 @@ pub enum MirWaitArmOp {
         dst_val: Option<VarId>,
         dst_res: Option<VarId>,
     },
+    ByteRingWaitWrite {
+        target: MirPrimTarget,
+        cap: usize,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
+    ByteRingViewWaitWrite {
+        view: MirExpr,
+        dst_val: Option<VarId>,
+        dst_res: Option<VarId>,
+    },
 }
 
 /// One branch of a [`MirYieldKind::Wait`], polled top-to-bottom under one critical section.
@@ -1600,6 +1611,7 @@ pub enum MirBootStep {
 #[derive(Debug, Clone)]
 pub struct MirBootSequence {
     pub present: bool,
+    pub from_main_entry: bool,
     pub vars: Vec<MirVar>,
     pub steps: Vec<MirBootStep>,
     /// Static frames required only during `main()` sequential boot for `RunYieldingFn` calls.

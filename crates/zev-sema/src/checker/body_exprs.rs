@@ -2425,8 +2425,8 @@ impl<'a> BodyChecker<'a> {
             ty: fn_info.ret_ty.clone(),
             error_spec: fn_info.error_spec.clone(),
             prov: ret_prov,
-            endpoint_name: None,
-            field_endpoints: BTreeMap::new(),
+            endpoint_name: fn_info.return_endpoint.clone(),
+            field_endpoints: fn_info.return_field_endpoints.clone(),
             span,
         }
     }
@@ -4289,7 +4289,7 @@ impl<'a> BodyChecker<'a> {
 
             ResolvedOsPrimitive::ByteRing { .. } | ResolvedOsPrimitive::ByteRingUnsized => {
                 let spsc_role = match m {
-                    "push" | "push_byte" | "grant_write" | "commit_write" => {
+                    "push" | "push_byte" | "grant_write" | "commit_write" | "wait_write" => {
                         Some(ByteRingOpRole::Producer)
                     }
                     "wait_read" | "read_slice" | "pop" | "try_pop_byte" | "consume" => {
@@ -4383,6 +4383,33 @@ impl<'a> BodyChecker<'a> {
                                 ResolvedErrorSpec::None
                             },
                             prov,
+                            endpoint_name: None,
+                            field_endpoints: BTreeMap::new(),
+                            span,
+                        }
+                    }
+                    "wait_write" => {
+                        self.expect_positional_arity(m, &pos_vals, 0, span);
+                        if has_boost {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                span,
+                                "'byte_ring.wait_write()' does not accept 'boost:'",
+                            ));
+                        }
+                        self.record_direct_yield(
+                            span,
+                            FnEffect::HardBlocking,
+                            &format!("{}.wait_write()", source_key),
+                        );
+                        ExprVal {
+                            ty: Ty::usize(),
+                            error_spec: if has_timeout {
+                                ResolvedErrorSpec::Untyped
+                            } else {
+                                ResolvedErrorSpec::None
+                            },
+                            prov: Provenance::pure_static(),
                             endpoint_name: None,
                             field_endpoints: BTreeMap::new(),
                             span,

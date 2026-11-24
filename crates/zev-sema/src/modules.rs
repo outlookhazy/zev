@@ -1180,10 +1180,16 @@ impl<'a> AstRewriter<'a> {
         };
 
         let Some(sym) = found else {
-            self.emit(
-                span,
-                format!("module `{dot_path}` (imported as `{alias}`) has no member `{member}`"),
-            );
+            let msg = if (dot_path.starts_with("bsp.") || alias == "board")
+                && matches!(member, "console_open" | "console")
+            {
+                format!(
+                    "this board (`{dot_path}`) does not provide console input (`{alias}.{member}`)"
+                )
+            } else {
+                format!("module `{dot_path}` (imported as `{alias}`) has no member `{member}`")
+            };
+            self.emit(span, msg);
             return None;
         };
         if !sym.is_pub {

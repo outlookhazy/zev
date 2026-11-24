@@ -627,7 +627,8 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                                 }
                                 MirWaitArmOp::SignalWait { target, .. }
                                 | MirWaitArmOp::WaitQueueCommit { target, .. }
-                                | MirWaitArmOp::ByteRingWaitRead { target, .. } => {
+                                | MirWaitArmOp::ByteRingWaitRead { target, .. }
+                                | MirWaitArmOp::ByteRingWaitWrite { target, .. } => {
                                     scan_prim_target(target, feat);
                                 }
                                 MirWaitArmOp::InboxViewRecv { view, elem_ty, .. }
@@ -635,7 +636,8 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                                     scan_expr(view, feat);
                                     scan_ty(elem_ty, feat);
                                 }
-                                MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                                MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                                | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
                                     scan_expr(view, feat);
                                 }
                             }
@@ -1400,7 +1402,7 @@ impl<'a> ModuleCtx<'a> {
             "; ── Explicit `sys.*` Hook Wrappers (Zero-RAM when Unconditional/Unset) ──"
         );
         let putc_fallback = if self.spec.isa == CpuIsa::HostX86_64Linux {
-            "  %z = zext i8 %c to i32\n  %r = call i32 @putchar(i32 %z)\n  ret void"
+            "  %z = zext i8 %c to i32\n  %r = call i32 @putchar(i32 %z)\n  %is_nl = icmp eq i8 %c, 10\n  br i1 %is_nl, label %flush_nl, label %done\nflush_nl:\n  %rf = call i32 @fflush(ptr null)\n  br label %done\ndone:\n  ret void"
         } else if self.spec.isa == CpuIsa::ArmCortexM
             && self.spec.semihosting
             && self.spec.has_thumb2
@@ -1724,6 +1726,11 @@ impl<'a> ModuleCtx<'a> {
                                     self.scan_expr_for_prims(view);
                                     self.uses_byte_ring_view = true;
                                 }
+                                MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
+                                    self.scan_expr_for_prims(view);
+                                    self.uses_byte_ring_view = true;
+                                    self.uses_byte_ring_wait_write = true;
+                                }
                                 MirWaitArmOp::PoolAlloc {
                                     target,
                                     elem_ty,
@@ -1785,6 +1792,11 @@ impl<'a> ModuleCtx<'a> {
                                 MirWaitArmOp::ByteRingWaitRead { target, cap, .. } => {
                                     self.scan_prim_target_for_prims(target);
                                     self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                                }
+                                MirWaitArmOp::ByteRingWaitWrite { target, cap, .. } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                                    self.uses_byte_ring_wait_write = true;
                                 }
                             }
                         }
@@ -4440,6 +4452,19 @@ entry:
                     let ok_back = mk_slice_ok("b", "%pb", "%req_u");
                     let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
                     let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
+                    let mk_wake_writer = |tag: &str| -> String {
+                        if self.uses_byte_ring_wait_write {
+                            format!(
+                                "  %wm_w_{tag} = getelementptr inbounds {pty}, ptr %r, i32 0, i32 6\n  {call_kw} void @__syn_wake_all_mask(ptr %wm_w_{tag}, i32 -1)\n"
+                            )
+                        } else {
+                            String::new()
+                        }
+                    };
+                    let wake_w_ae = mk_wake_writer("ae");
+                    let wake_w_ah = mk_wake_writer("ah");
+                    let wake_w_wh = mk_wake_writer("wh");
+                    let wake_w_clr = mk_wake_writer("clr");
                     let _ = writeln!(
                         out,
                         r#"define i32 @__syn_ring_seg1_{id}(ptr %r){fn_as} nounwind{fn_sz} {{
@@ -4525,7 +4550,7 @@ do_tail_rst:
 skip_tail_rst:
   store i32 0, ptr %cp, align 4
   store i32 0, ptr %sp0, align 4
-  ret void
+{wake_w_ae}  ret void
 partial:
   %hp1 = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %h1 = load i32, ptr %hp1, align 4
@@ -4536,7 +4561,7 @@ adv_h:
   %nc1 = sub i32 %cnt, %rem
   store i32 %nh1, ptr %hp1, align 4
   store i32 %nc1, ptr %cp, align 4
-  ret void
+{wake_w_ah}  ret void
 wrap_h:
   %nh2 = sub i32 %rem, %s1
   %nc2 = sub i32 %cnt, %rem
@@ -4544,7 +4569,7 @@ wrap_h:
   store i32 %nh2, ptr %hp1, align 4
   store i32 %nc2, ptr %cp, align 4
   store i32 0, ptr %sp2, align 4
-  ret void
+{wake_w_wh}  ret void
 done:
   ret void
 }}
@@ -4937,7 +4962,7 @@ entry:
   store i32 0, ptr %gop, align 4
   store i32 0, ptr %gcp, align 4
   store i8 0, ptr %bp, align 1
-{crit_exit}  ret void
+{wake_w_clr}{crit_exit}  ret void
 }}"#
                     );
                 }
@@ -5079,6 +5104,19 @@ done:
             let ok_back = mk_slice_ok("b", "%pb", "%req_u");
             let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
             let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
+            let mk_vw_wake_writer = |tag: &str| -> String {
+                if self.uses_byte_ring_wait_write {
+                    format!(
+                        "  %wm_vw_{tag} = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 6\n  {call_kw} void @__syn_wake_all_mask(ptr %wm_vw_{tag}, i32 -1)\n"
+                    )
+                } else {
+                    String::new()
+                }
+            };
+            let vw_wake_w_ae = mk_vw_wake_writer("ae");
+            let vw_wake_w_ah = mk_vw_wake_writer("ah");
+            let vw_wake_w_wh = mk_vw_wake_writer("wh");
+            let vw_wake_w_clr = mk_vw_wake_writer("clr");
             let _ = writeln!(
                 out,
                 r#"define i32 @__syn_ring_view_seg1(ptr %r, i32 %cap){fn_as} nounwind{fn_sz} {{
@@ -5164,7 +5202,7 @@ do_tail_rst:
 skip_tail_rst:
   store i32 0, ptr %cp, align 4
   store i32 0, ptr %sp0, align 4
-  ret void
+{vw_wake_w_ae}  ret void
 partial:
   %hp1 = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %h1 = load i32, ptr %hp1, align 4
@@ -5175,7 +5213,7 @@ adv_h:
   %nc1 = sub i32 %cnt, %rem
   store i32 %nh1, ptr %hp1, align 4
   store i32 %nc1, ptr %cp, align 4
-  ret void
+{vw_wake_w_ah}  ret void
 wrap_h:
   %nh2 = sub i32 %rem, %s1
   %nc2 = sub i32 %cnt, %rem
@@ -5183,7 +5221,7 @@ wrap_h:
   store i32 %nh2, ptr %hp1, align 4
   store i32 %nc2, ptr %cp, align 4
   store i32 0, ptr %sp2, align 4
-  ret void
+{vw_wake_w_wh}  ret void
 done:
   ret void
 }}
@@ -5582,7 +5620,7 @@ entry:
   store i32 0, ptr %gop, align 4
   store i32 0, ptr %gcp, align 4
   store i8 0, ptr %bp, align 1
-{crit_exit}  ret void
+{vw_wake_w_clr}{crit_exit}  ret void
 }}"#
             );
         }
@@ -5636,6 +5674,18 @@ entry:
         let fn_as = self.fn_as();
         let _ = writeln!(out, "; ── Genuine External \"C\" FFI Declarations ──");
         for ext in &self.module.extern_fns {
+            if self.spec.isa == CpuIsa::HostX86_64Linux
+                && matches!(
+                    ext.name.as_str(),
+                    "__zev_sim_enable_console"
+                        | "__zev_sim_poll_stdin"
+                        | "__zev_sim_read_stdin_byte"
+                        | "__zev_sim_putc"
+                        | "__zev_sim_flush_stdout"
+                )
+            {
+                continue;
+            }
             let ret = self.llvm_ty(&ext.ret_ty);
             let mut ps: Vec<String> = ext.params.iter().map(|(_, t)| self.llvm_ty(t)).collect();
             if ext.variadic {

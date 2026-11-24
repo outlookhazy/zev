@@ -1064,6 +1064,19 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 true,
                             )
                         }
+                        LoweredPrimReceiver::ByteRingView(view) if method == "wait_write" => {
+                            let (vid, b) =
+                                alloc_arm_dst(self, &arm.bind, "wait_ring_w", MirType::Usize);
+                            (
+                                MirWaitArmOp::ByteRingViewWaitWrite {
+                                    view,
+                                    dst_val: Some(vid),
+                                    dst_res: None,
+                                },
+                                b,
+                                false,
+                            )
+                        }
                         LoweredPrimReceiver::Sized(target, pkind) => match (method, pkind) {
                             ("recv", MirPrimKind::Inbox { elem, cap }) => {
                                 let (vid, b) =
@@ -1100,6 +1113,20 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     },
                                     b,
                                     true,
+                                )
+                            }
+                            ("wait_write", MirPrimKind::ByteRing { cap }) => {
+                                let (vid, b) =
+                                    alloc_arm_dst(self, &arm.bind, "wait_ring_w", MirType::Usize);
+                                (
+                                    MirWaitArmOp::ByteRingWaitWrite {
+                                        target,
+                                        cap,
+                                        dst_val: Some(vid),
+                                        dst_res: None,
+                                    },
+                                    b,
+                                    false,
                                 )
                             }
                             ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
@@ -1634,6 +1661,24 @@ impl<'a> CoroutineLowerCtx<'a> {
                             self.may_hold_boost = true;
                             return Ok(true);
                         }
+                        LoweredPrimReceiver::ByteRingView(view)
+                            if m == "wait_write" && find_named_arg(args, "timeout").is_none() =>
+                        {
+                            self.emit_end_inbox_turn();
+                            let poll_bb = self.alloc_bb();
+                            let resume_bb = self.alloc_bb();
+                            self.emit_single_arm_wait(
+                                MirWaitArmOp::ByteRingViewWaitWrite {
+                                    view,
+                                    dst_val: Some(dst_vid),
+                                    dst_res: None,
+                                },
+                                None,
+                                poll_bb,
+                                resume_bb,
+                            );
+                            return Ok(true);
+                        }
                         LoweredPrimReceiver::InboxView(view, elem)
                             if m == "recv" && find_named_arg(args, "timeout").is_none() =>
                         {
@@ -1732,6 +1777,25 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     resume_bb,
                                 );
                                 self.may_hold_boost = true;
+                                return Ok(true);
+                            }
+                            ("wait_write", MirPrimKind::ByteRing { cap })
+                                if find_named_arg(args, "timeout").is_none() =>
+                            {
+                                self.emit_end_inbox_turn();
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::ByteRingWaitWrite {
+                                        target,
+                                        cap,
+                                        dst_val: Some(dst_vid),
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
                                 return Ok(true);
                             }
                             ("wait_change", MirPrimKind::Watch { elem })
@@ -2528,6 +2592,50 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
                             }
                         }
+                        LoweredPrimReceiver::ByteRingView(view) if m == "wait_write" => {
+                            self.emit_end_inbox_turn();
+                            if let Some(texpr) = find_named_arg(args, "timeout") {
+                                let dl_var = self.emit_wait_deadline_var("ring_deadline", texpr)?;
+                                let rty = MirType::Result {
+                                    ok: Box::new(MirType::Usize),
+                                    err: None,
+                                };
+                                let dst_res = self.alloc_temp("ring_w_res", rty.clone());
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::ByteRingViewWaitWrite {
+                                        view,
+                                        dst_val: None,
+                                        dst_res: Some(dst_res),
+                                    },
+                                    Some(MirWaitTimer {
+                                        deadline_var: dl_var,
+                                        timeout_bb: resume_bb,
+                                        timeout_err_res: Some(dst_res),
+                                        release_lease_on_timeout: None,
+                                    }),
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                            } else {
+                                let dst_val = self.alloc_temp("ring_space", MirType::Usize);
+                                let poll_bb = self.alloc_bb();
+                                let resume_bb = self.alloc_bb();
+                                self.emit_single_arm_wait(
+                                    MirWaitArmOp::ByteRingViewWaitWrite {
+                                        view,
+                                        dst_val: Some(dst_val),
+                                        dst_res: None,
+                                    },
+                                    None,
+                                    poll_bb,
+                                    resume_bb,
+                                );
+                                return Ok(MirExpr::new(MirExprKind::Var(dst_val), MirType::Usize));
+                            }
+                        }
                         LoweredPrimReceiver::ByteRingView(_) => {}
                         LoweredPrimReceiver::Sized(target, pkind) => match (m, pkind) {
                             ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
@@ -2763,6 +2871,56 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     );
                                     self.may_hold_boost = true;
                                     return Ok(MirExpr::new(MirExprKind::Var(dst_val), slice_ty));
+                                }
+                            }
+                            ("wait_write", MirPrimKind::ByteRing { cap }) => {
+                                self.emit_end_inbox_turn();
+                                if let Some(texpr) = find_named_arg(args, "timeout") {
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("ring_deadline", texpr)?;
+                                    let rty = MirType::Result {
+                                        ok: Box::new(MirType::Usize),
+                                        err: None,
+                                    };
+                                    let dst_res = self.alloc_temp("ring_w_res", rty.clone());
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::ByteRingWaitWrite {
+                                            target,
+                                            cap,
+                                            dst_val: None,
+                                            dst_res: Some(dst_res),
+                                        },
+                                        Some(MirWaitTimer {
+                                            deadline_var: dl_var,
+                                            timeout_bb: resume_bb,
+                                            timeout_err_res: Some(dst_res),
+                                            release_lease_on_timeout: None,
+                                        }),
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    return Ok(MirExpr::new(MirExprKind::Var(dst_res), rty));
+                                } else {
+                                    let dst_val = self.alloc_temp("ring_space", MirType::Usize);
+                                    let poll_bb = self.alloc_bb();
+                                    let resume_bb = self.alloc_bb();
+                                    self.emit_single_arm_wait(
+                                        MirWaitArmOp::ByteRingWaitWrite {
+                                            target,
+                                            cap,
+                                            dst_val: Some(dst_val),
+                                            dst_res: None,
+                                        },
+                                        None,
+                                        poll_bb,
+                                        resume_bb,
+                                    );
+                                    return Ok(MirExpr::new(
+                                        MirExprKind::Var(dst_val),
+                                        MirType::Usize,
+                                    ));
                                 }
                             }
                             ("wait", MirPrimKind::Signal) => {

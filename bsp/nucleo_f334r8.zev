@@ -8,6 +8,70 @@ import chip.stm32f334 as hw;
 import chip.stm32f3 as f3;
 import hal.{gpio, adc, pwm, spi, i2c};
 import std.bus as bus;
+import std.io as io;
+
+byte_ring<64>  console_rx;
+byte_ring<128> console_tx;
+
+isr usart2_console_isr(*byte_ring rx, *byte_ring tx) {
+    u32 st = hw.USART2.isr;
+    if ((st & (1u32 << 5)) != 0u32) {
+        u8 b = (hw.USART2.rdr & 0xFFu32) as u8;
+        bool _ok = rx.push_byte(b, boost: @high);
+    }
+    if ((st & (1u32 << 7)) != 0u32 && (hw.USART2.cr1 & (1u32 << 7)) != 0u32) {
+        u8 tb = tx.try_pop_byte() catch {
+            hw.USART2.cr1 = hw.USART2.cr1 & (~(1u32 << 7));
+            hw.USART2.icr = 0x0Fu32;
+            return;
+        };
+        hw.USART2.tdr = tb as u32;
+    }
+    hw.USART2.icr = 0x0Fu32;
+}
+
+fn usart2_console_flush(*byte_ring tx) {
+    if (!tx.is_empty()) {
+        critical {
+            hw.USART2.cr1 = hw.USART2.cr1 | (1u32 << 7);
+        }
+    }
+}
+
+fn nucleo_ring_push_one(u8 ch) {
+    if (!console_tx.push_byte(ch)) {
+        usart2_console_flush(&console_tx);
+        for (u32 spin in 0..50000) {
+            if (console_tx.push_byte(ch)) {
+                usart2_console_flush(&console_tx);
+                return;
+            }
+        }
+        return;
+    }
+    usart2_console_flush(&console_tx);
+}
+
+fn nucleo_console_ring_putc(u8 b) {
+    if (b == '\n') {
+        nucleo_ring_push_one('\r');
+    }
+    nucleo_ring_push_one(b);
+}
+
+pub fn console_open() -> io.DuplexStream {
+    critical {
+        hw.USART2.icr = 0x0Fu32;
+        hw.USART2.cr1 = hw.USART2.cr1 | (1u32 << 5) | (1u32 << 2);
+    }
+    hw.IRQ_USART2.attach(usart2_console_isr(&console_rx, &console_tx));
+    sys.set_putc(nucleo_console_ring_putc);
+    return io.DuplexStream {
+        rx: &console_rx,
+        tx: &console_tx,
+        flush: usart2_console_flush,
+    };
+}
 
 pub const []u8 BOARD_NAME = "nucleo_f334r8";
 pub const bool EXIT_ON_DONE = false;
@@ -68,7 +132,7 @@ pub fn init_board() -> u32 {
     PIN_LD2.set_mode(gpio.Mode.Output, gpio.Pull.None);
     PIN_B1.set_mode(gpio.Mode.Input, gpio.Pull.Up);
 
-    f3.usart2_init_vcp(115200u32, true);
+    f3.usart2_init_vcp(115200u32, false);
     sys.set_putc(console_putc);
     return clk;
 }

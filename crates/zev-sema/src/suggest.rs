@@ -308,6 +308,7 @@ pub fn advise_primitive_method(
                 "commit_write",
                 "read_slice",
                 "wait_read",
+                "wait_write",
                 "consume",
                 "pop",
                 "try_pop_byte",
@@ -332,7 +333,7 @@ pub fn advise_primitive_method(
                 _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
             };
             let table = format!(
-                "valid methods on `{}`: `.push(slice [, boost: @prio])`, `.push_byte(b [, boost: @prio])`, `.grant_write(len) -> []u8 error`, `.commit_write(n [, boost: @prio])`, `.read_slice() -> []u8`, `.wait_read([timeout: <dur>]) -> []u8`, `.consume(n)`, `.pop(dst)`, `.try_pop_byte() -> u8 error`, `.len()`, `.free_space()`, `.cap()`, `.is_empty()`, `.is_full()`, `.clear()`",
+                "valid methods on `{}`: `.push(slice [, boost: @prio])`, `.push_byte(b [, boost: @prio])`, `.grant_write(len) -> []u8 error`, `.commit_write(n [, boost: @prio])`, `.wait_write([timeout: <dur>]) -> usize`, `.read_slice() -> []u8`, `.wait_read([timeout: <dur>]) -> []u8`, `.consume(n)`, `.pop(dst)`, `.try_pop_byte() -> u8 error`, `.len()`, `.free_space()`, `.cap()`, `.is_empty()`, `.is_full()`, `.clear()`",
                 prim
             );
             (direct, table)

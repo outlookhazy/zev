@@ -107,6 +107,8 @@ cargo run --quiet --bin zevc -- doc --list
 cargo run --quiet --bin zevc -- doc E0034
 
 # Host x86_64 LLVM simulation with AddressSanitizer + UBSan
+# Note: without `--script`/`--cmd`, stdin reaching EOF stops console polling without exiting;
+# use `--script`/`--cmd`, `--max-ticks`, or `sys.exit(...)` to end non-interactive runs.
 cargo run --quiet --bin zevc -- run --sanitize examples/portable_controller_demo.zev
 make demo
 

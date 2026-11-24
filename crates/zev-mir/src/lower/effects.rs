@@ -996,6 +996,7 @@ pub(super) fn scan_expr_effect(
                 m,
                 "wait_chunk"
                     | "wait_read"
+                    | "wait_write"
                     | "recv"
                     | "wait"
                     | "send"
@@ -1948,6 +1949,7 @@ pub(super) fn lower_main_entry<'a>(
 
     Ok(MirBootSequence {
         present: true,
+        from_main_entry: true,
         vars: boot_vars_vec,
         steps: boot_steps,
         boot_yielding_callees: boot_yielding_callees.into_iter().collect(),

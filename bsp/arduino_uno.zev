@@ -1,5 +1,79 @@
 // Arduino Uno R3 (ATmega328P 16 MHz) Board Support Package (100% Pure .zev)
 import chip.atmega328p as hw;
+import std.io as io;
+
+byte_ring<32> console_rx;
+byte_ring<64> console_tx;
+
+isr uno_console_rx_isr(*byte_ring rx, *hw.Usart0Regs uart) {
+    u8 b = uart.udr0;
+    bool _ok = rx.push_byte(b, boost: @high);
+}
+
+isr uno_console_tx_isr(*byte_ring tx, *hw.Usart0Regs uart) {
+    u8 b = tx.try_pop_byte() catch {
+        u8 ctrl = uart.ucsr0b;
+        uart.ucsr0b = ctrl & (~hw.BIT_UDRIE0);
+        return;
+    };
+    uart.udr0 = b;
+}
+
+fn uno_console_flush(*byte_ring tx) {
+    if (!tx.is_empty()) {
+        enable_uart_udre_irq();
+    }
+}
+
+fn uno_console_ring_putc(u8 b) {
+    if (!console_tx.push_byte(b)) {
+        enable_uart_udre_irq();
+        for (u32 spin in 0..4096) {
+            if (console_tx.push_byte(b)) {
+                enable_uart_udre_irq();
+                return;
+            }
+        }
+        return;
+    }
+    enable_uart_udre_irq();
+}
+
+pub fn init() {
+    critical {
+        hw.MCU_CTRL.mcusr = 0;
+        hw.WDT_REGS.wdtcsr = 0x18;
+        hw.WDT_REGS.wdtcsr = 0;
+        hw.MCU_CTRL.smcr = 1;
+        // Enable TX only (`TXEN0 = 0x08`); receiver stays off until `console_open()`.
+        hw.USART0.ucsr0a = 0x02;
+        hw.USART0.ubrr0 = 16;
+        hw.USART0.ucsr0c = 0x06;
+        hw.USART0.ucsr0b = 0x08;
+        hw.TIMER0.tccr0a = 0x02;
+        hw.TIMER0.tccr0b = 0x03;
+        hw.TIMER0.tcnt0 = 0;
+        hw.TIMER0.ocr0a = 249;
+        hw.TIFR.tifr0 = 0x02;
+        hw.TIMSK_REGS.timsk0 = 0x02;
+    }
+    sys.set_putc(console_putc);
+    init_board_gpio();
+}
+
+pub fn console_open() -> io.DuplexStream {
+    hw.IRQ_USART_RX.attach(uno_console_rx_isr(&console_rx, hw.USART0));
+    hw.IRQ_USART_UDRE.attach(uno_console_tx_isr(&console_tx, hw.USART0));
+    sys.set_putc(uno_console_ring_putc);
+    critical {
+        hw.USART0.ucsr0b = hw.USART0.ucsr0b | 0x10u8 | hw.BIT_RXCIE0;
+    }
+    return io.DuplexStream {
+        rx: &console_rx,
+        tx: &console_tx,
+        flush: uno_console_flush,
+    };
+}
 
 pub fn init_mcu_core() {
     critical {

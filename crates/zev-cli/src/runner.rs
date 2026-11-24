@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,11 +38,17 @@ pub(crate) fn find_clang() -> String {
     zev_codegen_llvm::find_tool("/bin/clang", "clang")
 }
 
-fn compile_host_llvm_binary(
+pub(crate) fn compile_host_llvm_binary(
     temp: &TempWorkDir,
     ll_source: &str,
     sanitize: bool,
 ) -> Result<PathBuf, String> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(
+            "zevc run host simulation is not supported on this OS/architecture yet (requires x86_64 Linux)"
+                .to_string(),
+        );
+    }
     let ll_path = temp.dir.join("program.ll");
     let bin_path = temp.dir.join("program");
 
@@ -85,6 +91,7 @@ pub fn compile_and_run_host_llvm(
 ) -> Result<i32, String> {
     let temp = TempWorkDir::create("zevc-run")?;
     let bin_path = compile_host_llvm_binary(&temp, ll_source, sanitize)?;
+    let _tty_guard = crate::serial::InteractiveTtyGuard::enter(true);
 
     let status = Command::new(&bin_path)
         .args(run_args)
@@ -95,6 +102,19 @@ pub fn compile_and_run_host_llvm(
         .map_err(|e| format!("failed to execute compiled simulation binary: {e}"))?;
 
     Ok(status.code().unwrap_or(1))
+}
+
+pub fn spawn_host_llvm_binary(
+    bin_path: &Path,
+    run_args: &[String],
+) -> Result<std::process::Child, String> {
+    Command::new(bin_path)
+        .args(run_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| format!("failed to spawn compiled simulation binary: {e}"))
 }
 
 #[cfg(test)]

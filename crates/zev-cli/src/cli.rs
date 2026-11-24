@@ -22,6 +22,9 @@ pub enum Command {
         include_dirs: Vec<PathBuf>,
         sanitize: bool,
         max_ticks: Option<u64>,
+        script: Option<PathBuf>,
+        cmds: Vec<String>,
+        script_timeout_ms: Option<u64>,
         run_args: Vec<String>,
     },
     EmitLlvm {
@@ -50,6 +53,17 @@ pub enum Command {
         port: Option<String>,
         opt_level: Option<String>,
         output: Option<PathBuf>,
+        monitor: bool,
+        script: Option<PathBuf>,
+        cmds: Vec<String>,
+        script_timeout_ms: Option<u64>,
+    },
+    Monitor {
+        board: Option<String>,
+        port: Option<String>,
+        script: Option<PathBuf>,
+        cmds: Vec<String>,
+        script_timeout_ms: Option<u64>,
     },
     BuildElf {
         files: Vec<PathBuf>,
@@ -62,6 +76,9 @@ pub enum Command {
         include_dirs: Vec<PathBuf>,
         max_ticks: Option<u64>,
         opt_level: String,
+        script: Option<PathBuf>,
+        cmds: Vec<String>,
+        script_timeout_ms: Option<u64>,
     },
     BuildEsp32C6 {
         files: Vec<PathBuf>,
@@ -140,8 +157,10 @@ COMMANDS:
                                             Parse and statically verify .zev source files (with target-bound `hal.*`)
     build [--board <b>] [--chip <c>] [--emit-ll] [OPT] [-o <out>] [files...]
                                             Build ELF/BIN/UF2/LLVM IR from TOML specs (`zev.toml` aware)
-    flash [--board <b>] [--chip <c>] [--port <p>] [OPT] [-o <out>] [files...]
+    flash [--board <b>] [--chip <c>] [--port <p>] [--monitor] [OPT] [-o <out>] [files...]
                                             Build and flash firmware using board TOML `flash_cmd` (`zev.toml` aware)
+    monitor [--board <b>] [--port <p>] [--script <f> | --cmd <line>...]
+                                            Open a board's serial console (`115200 8N1`) or run a scripted check
     ram [--board <b> | --chip <c> | --target <t>] [OPT] [-I <dir>] <files...>
                                             Print static SRAM budget (+ optional HW stack proof)
     run [-I <dir>] <files...> [OPTIONS]     Compile host LLVM 23 IR via clang and run deterministic host simulation
@@ -167,9 +186,15 @@ LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build, flash, build-*, flash
     --opt-level <O0|O1|O2|O3|Os|Oz>         Explicit long-form optimization level selector
     --target <cortex-m3|esp32c6|avr|nano-every|rp2040|host> Legacy target alias (`ram`: MCUs; `emit-llvm`: +host)
 
-RUN & RUN-QEMU OPTIONS:
+RUN, RUN-QEMU, MONITOR & SCRIPT OPTIONS:
     --sanitize                              Compile host simulation binary with -fsanitize=address,undefined (`run` only)
     --max-ticks <N>                         Bound simulation / QEMU execution to N millisecond ticks
+    --monitor                               Open serial monitor after flashing (`flash` only)
+    --script <path>                         Send command lines lockstep, waiting for `ok` / `err` (`run`/`run-qemu`/`flash`/`monitor`)
+    --cmd <line>                            Inline scripted command line (repeatable; runs after `--script`)
+    --script-timeout-ms <ms>                Per-command response timeout in scripted mode (default: 5000 ms)
+                                            Note: piping/closing stdin on `run` without `--script`/`--cmd` stops polling stdin at EOF
+                                            and keeps running; use `--script`/`--cmd`, `--max-ticks`, or `sys.exit(...)` to stop.
     -- <args...>                            Forward trailing arguments to compiled host binary (`run` only)
 ";
 
@@ -210,6 +235,7 @@ where
         "ram" => parse_ram(&raw[1..]),
         "build" => parse_build(&raw[1..]),
         "flash" => parse_flash(&raw[1..]),
+        "monitor" => parse_monitor(&raw[1..]),
         "emit-llvm" => parse_emit_llvm(&raw[1..]),
         "build-elf" => match parse_files_with_output_and_opt(&raw[1..], "build-elf")? {
             Some((files, include_dirs, opt_level, output)) => Ok(Command::BuildElf {
@@ -307,7 +333,7 @@ where
         },
         "run" => parse_run(&raw[1..]),
         other => Err(format!(
-            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `run`, `emit-llvm`, `build`, `flash`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, `flash-nano-every`, `build-rp2040`, or `flash-rp2040`; try `zevc --help`)"
+            "unknown subcommand `{other}` (expected `doc`, `import-svd`, `check`, `ram`, `run`, `emit-llvm`, `build`, `flash`, `monitor`, `build-elf`, `run-qemu`, `build-esp32c6`, `flash-esp32c6`, `build-avr`, `flash-avr`, `build-nano-every`, `flash-nano-every`, `build-rp2040`, or `flash-rp2040`; try `zevc --help`)"
         )),
     }
 }
@@ -522,6 +548,80 @@ fn try_parse_board_or_chip_arg(
             ));
         }
         *chip = Some(val.to_string());
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[derive(Default)]
+struct ParsedScriptArgs {
+    script: Option<PathBuf>,
+    cmds: Vec<String>,
+    timeout_ms: Option<u64>,
+}
+
+fn try_parse_script_arg(
+    args: &[String],
+    i: &mut usize,
+    parsed: &mut ParsedScriptArgs,
+    subcmd: &str,
+) -> Result<bool, String> {
+    let arg = &args[*i];
+    if arg == "--script" {
+        *i += 1;
+        if *i >= args.len() || args[*i].is_empty() {
+            return Err(format!(
+                "`--script` requires a file path for `zevc {subcmd}`"
+            ));
+        }
+        parsed.script = Some(PathBuf::from(&args[*i]));
+        return Ok(true);
+    }
+    if let Some(val) = arg.strip_prefix("--script=") {
+        if val.is_empty() {
+            return Err(format!(
+                "`--script=` requires a file path for `zevc {subcmd}`"
+            ));
+        }
+        parsed.script = Some(PathBuf::from(val));
+        return Ok(true);
+    }
+    if arg == "--cmd" {
+        *i += 1;
+        if *i >= args.len() {
+            return Err(format!(
+                "`--cmd` requires a command line for `zevc {subcmd}`"
+            ));
+        }
+        parsed.cmds.push(args[*i].clone());
+        return Ok(true);
+    }
+    if let Some(val) = arg.strip_prefix("--cmd=") {
+        parsed.cmds.push(val.to_string());
+        return Ok(true);
+    }
+    if arg == "--script-timeout-ms" {
+        *i += 1;
+        if *i >= args.len() {
+            return Err(format!(
+                "`--script-timeout-ms` requires a positive integer for `zevc {subcmd}`"
+            ));
+        }
+        let ms = args[*i]
+            .parse::<u64>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| format!("invalid `--script-timeout-ms` value `{}`", args[*i]))?;
+        parsed.timeout_ms = Some(ms);
+        return Ok(true);
+    }
+    if let Some(val) = arg.strip_prefix("--script-timeout-ms=") {
+        let ms = val
+            .parse::<u64>()
+            .ok()
+            .filter(|&v| v > 0)
+            .ok_or_else(|| format!("invalid `--script-timeout-ms` value `{val}`"))?;
+        parsed.timeout_ms = Some(ms);
         return Ok(true);
     }
     Ok(false)
@@ -819,17 +919,21 @@ fn parse_flash(args: &[String]) -> Result<Command, String> {
     let mut port: Option<String> = None;
     let mut opt_level: Option<String> = None;
     let mut output: Option<PathBuf> = None;
+    let mut monitor = false;
+    let mut script_args = ParsedScriptArgs::default();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
         if try_parse_include_arg(args, &mut i, &mut include_dirs, "flash")?
             || try_parse_board_or_chip_arg(args, &mut i, &mut board, &mut chip, "flash")?
+            || try_parse_script_arg(args, &mut i, &mut script_args, "flash")?
         {
             i += 1;
             continue;
         }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
+            "--monitor" => monitor = true,
             "-p" | "--port" => {
                 i += 1;
                 if i >= args.len() || args[i].is_empty() {
@@ -884,6 +988,81 @@ fn parse_flash(args: &[String]) -> Result<Command, String> {
         port,
         opt_level,
         output,
+        monitor,
+        script: script_args.script,
+        cmds: script_args.cmds,
+        script_timeout_ms: script_args.timeout_ms,
+    })
+}
+
+fn parse_monitor(args: &[String]) -> Result<Command, String> {
+    let mut board: Option<String> = None;
+    let mut port: Option<String> = None;
+    let mut script_args = ParsedScriptArgs::default();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if try_parse_script_arg(args, &mut i, &mut script_args, "monitor")? {
+            i += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "-h" | "--help" => return Ok(Command::Help),
+            "--board" => {
+                i += 1;
+                if i >= args.len() || args[i].is_empty() {
+                    return Err(
+                        "`--board` requires a board name or `.toml` path for `zevc monitor`"
+                            .to_string(),
+                    );
+                }
+                board = Some(args[i].clone());
+            }
+            "-p" | "--port" => {
+                i += 1;
+                if i >= args.len() || args[i].is_empty() {
+                    return Err(
+                        "`--port` requires a serial device path for `zevc monitor`".to_string()
+                    );
+                }
+                port = Some(args[i].clone());
+            }
+            _ if arg.starts_with("--board=") => {
+                let val = &arg["--board=".len()..];
+                if val.is_empty() {
+                    return Err(
+                        "`--board=` requires a board name or `.toml` path for `zevc monitor`"
+                            .to_string(),
+                    );
+                }
+                board = Some(val.to_string());
+            }
+            _ if arg.starts_with("--port=") => {
+                let val = &arg["--port=".len()..];
+                if val.is_empty() {
+                    return Err(
+                        "`--port=` requires a serial device path for `zevc monitor`".to_string()
+                    );
+                }
+                port = Some(val.to_string());
+            }
+            _ if arg.starts_with('-') => {
+                return Err(format!("unexpected option `{arg}` for `zevc monitor`"));
+            }
+            other => {
+                return Err(format!(
+                    "unexpected positional argument `{other}` for `zevc monitor`"
+                ));
+            }
+        }
+        i += 1;
+    }
+    Ok(Command::Monitor {
+        board,
+        port,
+        script: script_args.script,
+        cmds: script_args.cmds,
+        script_timeout_ms: script_args.timeout_ms,
     })
 }
 
@@ -892,10 +1071,13 @@ fn parse_run_qemu(args: &[String]) -> Result<Command, String> {
     let mut include_dirs = Vec::new();
     let mut max_ticks: Option<u64> = None;
     let mut opt_level = "-O2".to_string();
+    let mut script_args = ParsedScriptArgs::default();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, "run-qemu")? {
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "run-qemu")?
+            || try_parse_script_arg(args, &mut i, &mut script_args, "run-qemu")?
+        {
             i += 1;
             continue;
         }
@@ -951,6 +1133,9 @@ fn parse_run_qemu(args: &[String]) -> Result<Command, String> {
         include_dirs,
         max_ticks,
         opt_level,
+        script: script_args.script,
+        cmds: script_args.cmds,
+        script_timeout_ms: script_args.timeout_ms,
     })
 }
 
@@ -1037,6 +1222,7 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
     let mut include_dirs = Vec::new();
     let mut sanitize = false;
     let mut max_ticks = None;
+    let mut script_args = ParsedScriptArgs::default();
     let mut run_args = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1045,7 +1231,9 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
             run_args.extend_from_slice(&args[i + 1..]);
             break;
         }
-        if try_parse_include_arg(args, &mut i, &mut include_dirs, "run")? {
+        if try_parse_include_arg(args, &mut i, &mut include_dirs, "run")?
+            || try_parse_script_arg(args, &mut i, &mut script_args, "run")?
+        {
             i += 1;
             continue;
         }
@@ -1084,6 +1272,9 @@ fn parse_run(args: &[String]) -> Result<Command, String> {
         include_dirs,
         sanitize,
         max_ticks,
+        script: script_args.script,
+        cmds: script_args.cmds,
+        script_timeout_ms: script_args.timeout_ms,
         run_args,
     })
 }
@@ -1326,6 +1517,9 @@ mod tests {
                 include_dirs: vec![],
                 max_ticks: Some(50),
                 opt_level: "-Oz".to_string(),
+                script: None,
+                cmds: vec![],
+                script_timeout_ms: None,
             }
         );
 
@@ -1483,6 +1677,9 @@ mod tests {
                 include_dirs: vec![],
                 sanitize: true,
                 max_ticks: Some(500),
+                script: None,
+                cmds: vec![],
+                script_timeout_ms: None,
                 run_args: vec!["--trace".to_string()],
             }
         );
@@ -1586,6 +1783,9 @@ mod tests {
                 include_dirs: expected_dirs.clone(),
                 sanitize: true,
                 max_ticks: None,
+                script: None,
+                cmds: vec![],
+                script_timeout_ms: None,
                 run_args: vec!["-I".to_string(), "user_arg".to_string()],
             }
         );
@@ -1629,6 +1829,9 @@ mod tests {
                 include_dirs: expected_dirs.clone(),
                 max_ticks: None,
                 opt_level: "-O2".to_string(),
+                script: None,
+                cmds: vec![],
+                script_timeout_ms: None,
             }
         );
 
@@ -1889,6 +2092,59 @@ mod tests {
                 port: Some("/dev/ttyACM0".to_string()),
                 opt_level: None,
                 output: None,
+                monitor: false,
+                script: None,
+                cmds: Vec::new(),
+                script_timeout_ms: None,
+            }
+        );
+
+        assert_eq!(
+            parse_args([
+                "flash",
+                "--board",
+                "rpi_pico_w",
+                "--monitor",
+                "--cmd",
+                "help",
+                "--script-timeout-ms",
+                "2500",
+                "examples/pico_w_demo.zev",
+            ])
+            .unwrap(),
+            Command::Flash {
+                files: vec![PathBuf::from("examples/pico_w_demo.zev")],
+                include_dirs: Vec::new(),
+                board: Some("rpi_pico_w".to_string()),
+                chip: None,
+                port: None,
+                opt_level: None,
+                output: None,
+                monitor: true,
+                script: None,
+                cmds: vec!["help".to_string()],
+                script_timeout_ms: Some(2500),
+            }
+        );
+
+        assert_eq!(
+            parse_args([
+                "monitor",
+                "--board",
+                "nucleo_f334r8",
+                "--port",
+                "/dev/ttyACM0",
+                "--script",
+                "cmds.txt",
+                "--cmd=status",
+            ])
+            .unwrap(),
+            Command::Monitor {
+                board: Some("nucleo_f334r8".to_string()),
+                port: Some("/dev/ttyACM0".to_string()),
+                script: Some(PathBuf::from("cmds.txt")),
+                cmds: vec!["status".to_string()],
+                script_timeout_ms: None,
             }
         );
 

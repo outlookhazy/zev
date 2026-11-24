@@ -1399,7 +1399,7 @@ pub fn run_elf_in_qemu(
         .arg("-monitor")
         .arg("none")
         .arg("-chardev")
-        .arg("stdio,id=con0,mux=on")
+        .arg("stdio,id=con0,mux=on,signal=off")
         .arg("-serial")
         .arg("chardev:con0")
         .arg("-semihosting-config")
@@ -1467,6 +1467,44 @@ pub fn run_elf_in_qemu(
         exit_code,
         elapsed,
     })
+}
+
+/// Spawn `/bin/qemu-system-arm` with multiplexed UART0 + semihosting on stdio for
+/// interactive console I/O (`piped_stdio == false`) or lockstep scripted I/O (`piped_stdio == true`).
+pub fn spawn_elf_in_qemu(
+    elf_path: &Path,
+    qemu_opts: &QemuRunOptions,
+    piped_stdio: bool,
+) -> Result<std::process::Child, CodegenError> {
+    let qemu = find_tool("/bin/qemu-system-arm", "qemu-system-arm");
+    let mut cmd = Command::new(&qemu);
+    cmd.arg("-M")
+        .arg(&qemu_opts.machine)
+        .arg("-cpu")
+        .arg(&qemu_opts.cpu)
+        .arg("-display")
+        .arg("none")
+        .arg("-monitor")
+        .arg("none")
+        .arg("-chardev")
+        .arg("stdio,id=con0,mux=on,signal=off")
+        .arg("-serial")
+        .arg("chardev:con0")
+        .arg("-semihosting-config")
+        .arg("enable=on,target=native,chardev=con0")
+        .arg("-kernel")
+        .arg(elf_path);
+    if piped_stdio {
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+    } else {
+        cmd.stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit());
+    }
+    cmd.spawn()
+        .map_err(|e| CodegenError::new("qemu", format!("failed to spawn `{qemu}`: {e}")))
 }
 
 /// Verify textual `.ll` IR using LLVM 23 `/bin/opt -passes=verify -disable-output`.
