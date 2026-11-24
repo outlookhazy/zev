@@ -3,6 +3,7 @@
 // Board topology only: onboard LEDs and user button, the 8 MHz HSI bring-up clock, the core
 // timer as the scheduler clock, and a USART1 console on PA9 (TX) / PA10 (RX). The board has no
 // USB-to-UART bridge, so the console needs an external 3.3 V adapter on those pins.
+// `console_open()` is optional: programs that never call it pay nothing for console input.
 //
 // UNVERIFIED ON HARDWARE: LED1 = PA15, LED2 = PB4 and the user button = PB3 are taken from a
 // manual for what appears to be the same board design; their polarity is assumed. Confirm with
@@ -10,6 +11,7 @@
 
 import chip.ch32v30x as hw;
 import hal.gpio as gpio;
+import std.io as io;
 
 pub const []u8 BOARD_NAME = "yd_ch32v307";
 pub const bool EXIT_ON_DONE = false;
@@ -38,6 +40,75 @@ pub fn console_putc(u8 b) {
 // Runs from the panic path, so it must not be able to panic itself: no indexing, no division.
 pub fn on_fault() {
     print("\n[FAULT] CH32V307 exception halted\n");
+}
+
+// ── Optional interactive console (USART1, interrupt-driven both ways) ───────
+byte_ring<64>  console_rx;
+byte_ring<128> console_tx;
+
+isr usart1_console_isr(*byte_ring rx, *byte_ring tx) {
+    u16 st = hw.USART1.statr;
+    // Reading DATAR clears both RXNE and a pending overrun.
+    if ((st & (hw.USART_STATR_RXNE | hw.USART_STATR_ORE)) != 0u16) {
+        u8 b = (hw.USART1.datar & 0xFFu16) as u8;
+        if ((st & hw.USART_STATR_RXNE) != 0u16) {
+            bool _ok = rx.push_byte(b, boost: @high);
+        }
+    }
+    if ((st & hw.USART_STATR_TXE) != 0u16 && (hw.USART1.ctlr1 & hw.USART_CTLR1_TXEIE) != 0u16) {
+        u8 tb = tx.try_pop_byte() catch {
+            // Nothing left to send: stop the transmit-empty interrupt until the next flush.
+            hw.USART1.ctlr1 = hw.USART1.ctlr1 & (~hw.USART_CTLR1_TXEIE);
+            return;
+        };
+        hw.USART1.datar = tb as u16;
+    }
+}
+
+fn usart1_console_flush(*byte_ring tx) {
+    if (!tx.is_empty()) {
+        critical {
+            hw.USART1.ctlr1 = hw.USART1.ctlr1 | hw.USART_CTLR1_TXEIE;
+        }
+    }
+}
+
+fn console_ring_push_one(u8 ch) {
+    if (!console_tx.push_byte(ch)) {
+        usart1_console_flush(&console_tx);
+        for (u32 spin in 0..50000) {
+            if (console_tx.push_byte(ch)) {
+                usart1_console_flush(&console_tx);
+                return;
+            }
+        }
+        return;
+    }
+    usart1_console_flush(&console_tx);
+}
+
+// After `console_open()`, `print`/`println` share the transmit ring with the console stream
+// so their output cannot interleave byte by byte.
+fn console_ring_putc(u8 b) {
+    if (b == '\n') {
+        console_ring_push_one('\r');
+    }
+    console_ring_push_one(b);
+}
+
+// Enable the receiver and hand back the console stream. Call from `main()`'s boot phase,
+// after `init()`.
+pub fn console_open() -> io.DuplexStream {
+    critical {
+        hw.USART1.ctlr1 = hw.USART1.ctlr1 | hw.USART_CTLR1_RE | hw.USART_CTLR1_RXNEIE;
+    }
+    hw.IRQ_USART1.attach(usart1_console_isr(&console_rx, &console_tx));
+    sys.set_putc(console_ring_putc);
+    return io.DuplexStream {
+        rx: &console_rx,
+        tx: &console_tx,
+        flush: usart1_console_flush,
+    };
 }
 
 // Monotonic milliseconds from the free-running core timer (counts HCLK cycles).

@@ -105,12 +105,14 @@ pub const u32 RCC_APB2_IOPE   = 0x0000_0040;
 pub const u32 RCC_APB2_USART1 = 0x0000_4000;
 
 // ── USART Status / Control Bits ─────────────────────────────────────────────
+pub const u16 USART_STATR_ORE    = 0x0008;
 pub const u16 USART_STATR_RXNE   = 0x0020;
 pub const u16 USART_STATR_TC     = 0x0040;
 pub const u16 USART_STATR_TXE    = 0x0080;
 pub const u16 USART_CTLR1_RE     = 0x0004;
 pub const u16 USART_CTLR1_TE     = 0x0008;
 pub const u16 USART_CTLR1_RXNEIE = 0x0020;
+pub const u16 USART_CTLR1_TXEIE  = 0x0080;
 pub const u16 USART_CTLR1_UE     = 0x2000;
 
 // ── System Timer Control Bits ───────────────────────────────────────────────
