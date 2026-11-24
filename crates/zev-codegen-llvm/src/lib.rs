@@ -428,6 +428,29 @@ mod tests {
             !demo_ll.contains("csrw mie"),
             "`mie` write would fault on QingKe V4"
         );
+
+        // 3. The portable shell demo runs unchanged: `board.console_open()` attaches the
+        //    USART1 interrupt (number 53) and nothing else.
+        let (_, shell_opts, shell_mir) =
+            compile_example_for_board("examples/portable_shell_demo.zev", "yd_ch32v307");
+        let shell_ll = emit_llvm_ir_with_options(&shell_mir, &shell_opts).expect("shell IR");
+        assert!(shell_ll.contains("module asm \"  j __syn_rv_irq_tramp_53\""));
+        assert!(shell_ll.contains("call void @__syn_on_rv_irq_route(i32 53, i32 53)"));
+        assert_eq!(
+            shell_ll
+                .matches("module asm \"  j __syn_rv_irq_tramp_")
+                .count(),
+            1,
+            "only the console interrupt is attached"
+        );
+        assert!(!shell_ll.contains("csrw mie"));
+        // A program that never opens the console carries none of it.
+        for console_sym in ["console_rx", "console_tx", "usart1_console_isr"] {
+            assert!(
+                !blink_ll.contains(console_sym),
+                "blink must not contain `{console_sym}` when `console_open()` is never called"
+            );
+        }
         assert!(
             !demo_ll.contains(wfi_insn),
             "idle must poll while `allow_wfi = false`"
@@ -440,9 +463,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
-        for (example, has_irq) in [
-            ("examples/ch32v307_blink.zev", false),
-            ("examples/ch32v307_demo.zev", true),
+        for (example, irq_slot) in [
+            ("examples/ch32v307_blink.zev", None),
+            ("examples/ch32v307_demo.zev", Some(25u32)),
+            ("examples/portable_shell_demo.zev", Some(53u32)),
         ] {
             let (spec, opts, mir) = compile_example_for_board(example, "yd_ch32v307");
             let stem = Path::new(example).file_stem().unwrap().to_string_lossy();
@@ -481,11 +505,14 @@ mod tests {
             );
             assert_eq!(
                 disasm.contains("mtvec"),
-                has_irq,
+                irq_slot.is_some(),
                 "{example}: mtvec is written only when an interrupt is attached"
             );
-            if has_irq {
-                assert!(disasm.contains("<__syn_rv_irq_tramp_25>:"));
+            if let Some(slot) = irq_slot {
+                assert!(
+                    disasm.contains(&format!("<__syn_rv_irq_tramp_{slot}>:")),
+                    "{example}: missing trampoline for interrupt {slot}"
+                );
             }
 
             let proof = analyze_hardware_stack_high_water(&mir, &opts)

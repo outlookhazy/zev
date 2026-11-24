@@ -48,6 +48,7 @@ check:
 	$(ZEVC) check --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
 	$(ZEVC) check --board yd_ch32v307 examples/ch32v307_blink.zev
 	$(ZEVC) check --board yd_ch32v307 examples/ch32v307_demo.zev
+	$(ZEVC) check --board yd_ch32v307 examples/portable_shell_demo.zev
 
 ram:
 	$(ZEVC) ram examples/motor_controller.zev examples/motor_support.zev
@@ -93,6 +94,7 @@ flash-nucleo-f334r8:
 ch32v307:
 	$(ZEVC) build --board yd_ch32v307 examples/ch32v307_blink.zev -o $(BUILD_DIR)/ch32v307/ch32v307_blink.bin
 	$(ZEVC) build --board yd_ch32v307 examples/ch32v307_demo.zev -o $(BUILD_DIR)/ch32v307/ch32v307_demo.bin
+	$(ZEVC) build --board yd_ch32v307 examples/portable_shell_demo.zev -o $(BUILD_DIR)/ch32v307/portable_shell_demo.bin
 
 # Hold BOOT0, tap RST, release, then run this (USB bootloader 4348:55e0, via `wchisp`).
 flash-ch32v307:

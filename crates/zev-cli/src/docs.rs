@@ -869,7 +869,10 @@ Flash over the chip's USB bootloader: hold `BOOT0`, tap `RST`, release, then:
 zevc build --board yd_ch32v307 examples/ch32v307_blink.zev -o build/ch32v307_blink.bin
 zevc flash --board yd_ch32v307 examples/ch32v307_blink.zev      # runs `wchisp flash <image>`
 zevc flash --board yd_ch32v307 examples/ch32v307_demo.zev       # button interrupt via PFIC
+zevc flash --board yd_ch32v307 examples/portable_shell_demo.zev # `std.shell` on USART1 (PA9/PA10)
 ```
+`board.console_open()` is optional and interrupt-driven on `USART1` (interrupt 53). The board has no
+USB-to-UART bridge, so the console needs an external 3.3 V adapter on `PA9` (TX) / `PA10` (RX).
 ",
     },
 ];
