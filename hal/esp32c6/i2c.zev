@@ -8,7 +8,7 @@ pub struct Bus {
     u32 timeout_ms;
 }
 
-pub Bus make_bus(u8 unit, u32 timeout_ms) {
+pub fn make_bus(u8 unit, u32 timeout_ms) -> Bus {
     return Bus {
         unit: unit,
         timeout_ms: timeout_ms,
@@ -22,7 +22,7 @@ const u32 CMD_STOP   = 2u32 << 11;
 const u32 CMD_ACK_EN = 1u32 << 8;
 const u32 CMD_ACK_VAL_NACK = 1u32 << 10;
 
-u32 eff_timeout(u32 to_ms) {
+fn eff_timeout(u32 to_ms) -> u32 {
     if (to_ms == 0u32) {
         return 25u32;
     }
@@ -41,7 +41,7 @@ fn start_i2c0_xfer() {
     hw.I2C0.ctr = hw.I2C0.ctr | (1u32 << 5);  // I2C_TRANS_START
 }
 
-bool wait_i2c0_done(u32 timeout_ms) error bus.BusStatus {
+fn wait_i2c0_done(u32 timeout_ms) -> bool error bus.BusStatus {
     u32 t0 = sys.now_ms();
     u32 limit = eff_timeout(timeout_ms);
     for (u32 iter in 0..100_000) {
@@ -70,7 +70,7 @@ bool wait_i2c0_done(u32 timeout_ms) error bus.BusStatus {
 }
 
 impl Bus {
-    pub bool probe_7bit(self, u8 addr7) error bus.BusStatus {
+    pub fn probe_7bit(self, u8 addr7) -> bool error bus.BusStatus {
         checkpoint();
         if (self.unit != 1u8 || addr7 > 127u8) {
             error bus.BusStatus.FrameErr;

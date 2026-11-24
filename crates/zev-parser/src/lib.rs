@@ -234,14 +234,14 @@ mod tests {
         let src = r#"
             enum ReadErr { Timeout, Disconnected }
 
-            void simple_check(u8 x) error {
+            fn simple_check(u8 x) error {
                 if (x == 0) {
                     error;
                 }
                 return;
             }
 
-            usize read_packet([]u8 dst) error ReadErr {
+            fn read_packet([]u8 dst) -> usize error ReadErr {
                 usize n = 3;
                 if (dst.len < 4) {
                     error Timeout, n;
@@ -331,7 +331,7 @@ mod tests {
             }
 
             extern "C" fn c_register_hook(fn(u32) -> i32 cb);
-            extern "C" i32 c_legacy_hook(fn(u8) cb);
+            extern "C" fn c_legacy_hook(fn(u8) cb) -> i32;
 
             @manual_yield
             task worker(u8 id) {
@@ -432,10 +432,10 @@ mod tests {
 
             extern "C" {
                 fn uart_putc(u8 ch);
-                i32 printf(*const u8 fmt, ...);
+                fn printf(*const u8 fmt, ...) -> i32;
             }
 
-            u32 bare_metal_ops([]u8 data) {
+            fn bare_metal_ops([]u8 data) -> u32 {
                 u32 acc = 0;
                 usize i = 0;
                 while (i < data.len) {
@@ -538,7 +538,7 @@ mod tests {
             "#,
             r#"
                 enum IoErr { ShortRead }
-                usize read_some([]u8 b) error IoErr {
+                fn read_some([]u8 b) -> usize error IoErr {
                     error ShortRead, 2;
                 }
                 fn main() {
@@ -638,10 +638,16 @@ mod tests {
             "u16 x",
         );
         assert_trap(
-            "fn clamp(u16 x) -> u16 { return x; }",
+            "task t() -> u16 { loop { delay(1ms); } }",
             "P0002",
-            "syntax",
-            "u16 clamp",
+            "tasks",
+            "remove `-> ...`",
+        );
+        assert_trap(
+            "isr h() -> u16 { }",
+            "P0002",
+            "tasks",
+            "remove `-> ...`",
         );
         assert_trap(
             "struct S { field: u32 }",
@@ -659,19 +665,19 @@ mod tests {
             "fn read_button() bool { return true; }",
             "P0002",
             "syntax",
-            "bool read_button",
+            "fn read_button(...) -> bool",
         );
         assert_trap(
             "fn view() []u8 { return buf[0..1]; }",
             "P0002",
             "syntax",
-            "[]u8 view",
+            "fn view(...) -> []u8",
         );
         assert_trap(
             "fn make_s() MyType { return MyType {}; }",
             "P0002",
             "syntax",
-            "MyType make_s",
+            "fn make_s(...) -> MyType",
         );
         assert_trap(
             "fn noop() void { return; }",
@@ -760,13 +766,13 @@ mod tests {
             "catch",
         );
         assert_trap(
-            "u16 read_reg() error IoErr { return error.Timeout; }",
+            "fn read_reg() -> u16 error IoErr { return error.Timeout; }",
             "P0007",
             "errors",
             "error BadCrc;",
         );
         assert_trap(
-            "u16 read_reg() error IoErr { return Err(Timeout); }",
+            "fn read_reg() -> u16 error IoErr { return Err(Timeout); }",
             "P0007",
             "errors",
             "error BadCrc;",
@@ -860,7 +866,7 @@ mod tests {
             "Lease<",
         );
         assert_trap(
-            "u8 f(*lease<u8, 8> l) { return 0; }",
+            "fn f(*lease<u8, 8> l) -> u8 { return 0; }",
             "P0013",
             "dma",
             "Lease<",
@@ -906,7 +912,7 @@ mod tests {
             "[4]u8",
         );
         assert_trap(
-            "extern \"C\" i32 reg_cb(void (*cb)(u8));",
+            "extern \"C\" fn reg_cb(void (*cb)(u8)) -> i32;",
             "P0014",
             "syntax",
             "fn(...) cb",
@@ -949,7 +955,7 @@ mod tests {
 
         // P0015: C-style `->` member access
         assert_trap(
-            "struct Foo { u32 x; }\nu32 f(*Foo p) { return p->x; }",
+            "struct Foo { u32 x; }\nfn f(*Foo p) -> u32 { return p->x; }",
             "P0015",
             "use `.`",
         );
@@ -1018,6 +1024,42 @@ mod tests {
     }
 
     #[test]
+    fn trap_p0018_and_fn_returning_fn_pointer() {
+        let assert_p0018 = |src: &str, want_hint: &str| {
+            let err = parse_str(src).expect_err(&format!("expected P0018 for:\n{src}"));
+            let msg = format!("{err:?}");
+            assert!(msg.contains("P0018"), "expected P0018 for:\n{src}\ngot:\n{msg}");
+            assert!(
+                msg.contains(want_hint),
+                "expected hint {want_hint:?} for:\n{src}\ngot:\n{msg}"
+            );
+        };
+
+        assert_p0018("u16 crc16([]u8 buf) { return 0; }", "fn crc16(...) -> u16");
+        assert_p0018("void setup_clocks() {}", "fn setup_clocks(...)");
+        assert_p0018("fn u16 crc16([]u8 buf) { return 0; }", "fn crc16(...) -> u16");
+        assert_p0018(
+            "struct Foo { u32 x; }\nimpl Foo { u32 count(*self) { return self.x; } }",
+            "fn count(...) -> u32",
+        );
+        assert_p0018("extern \"C\" i32 c_add(i32 a, i32 b);", "fn c_add(...) -> i32");
+        assert_p0018("extern \"C\" { void c_init(); }", "fn c_init(...)");
+
+        // Function returning a function pointer type `fn pick() -> fn(u32) -> u32`
+        let prog = parse_str(
+            "fn inc(u32 x) -> u32 { return x + 1u32; }\nfn pick() -> fn(u32) -> u32 { return inc; }\n",
+        )
+        .expect("fn returning fn pointer must parse");
+        match &prog.items[1].kind {
+            ItemKind::Fn(f) => assert!(matches!(
+                &f.ret_type.kind,
+                TypeKind::FnPtr { params, .. } if params.len() == 1
+            )),
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parses_pool_dma_slot_and_linear_lease_types() {
         let src = r#"
 struct DmaSubsys {
@@ -1027,7 +1069,7 @@ struct DmaSubsys {
 }
 pub @dma_safe pool<u32, 8> g_pool;
 
-Lease<[16]u8> process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> buf) error {
+fn process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> buf) -> Lease<[16]u8> error {
     Lease<[16]u8> next = p.alloc();
     return next;
 }
@@ -1077,7 +1119,7 @@ Lease<[16]u8> process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> 
             fn spi_cs_low() {}
             fn spi_cs_high() {}
 
-            u32 sum_packet([]u8 buf, u32 limit) {
+            fn sum_packet([]u8 buf, u32 limit) -> u32 {
                 spi_cs_low();
                 defer spi_cs_high();
                 defer {
@@ -1310,11 +1352,11 @@ pub import chip.stm32f3.{rcc, tim};
                 i16 temp;
             }
 
-            DecodedPacket decode([]u8 raw) error PacketErr {
+            fn decode([]u8 raw) -> DecodedPacket error PacketErr {
                 error BadLen;
             }
 
-            u16 read_partial([]u8 raw) error PacketErr {
+            fn read_partial([]u8 raw) -> u16 error PacketErr {
                 error BadCrc, 4;
             }
 
@@ -1401,7 +1443,7 @@ pub import chip.stm32f3.{rcc, tim};
         // Non-final expression without `;` inside `catch` must still fail cleanly
         assert!(parse_str("fn main() { u16 x = foo() catch { bar() 42 }; }").is_err());
         // Missing `;` at the end of a regular `fn` block must still fail cleanly
-        assert!(parse_str("u16 f() { 42 }").is_err());
+        assert!(parse_str("fn f() -> u16 { 42 }").is_err());
     }
 
     #[test]
@@ -1513,7 +1555,7 @@ pub import chip.stm32f3.{rcc, tim};
                 T inner;
             }
 
-            T clamp<T>(T val, T lo, T hi) {
+            fn clamp<T>(T val, T lo, T hi) -> T {
                 T v = val;
                 if (v < lo) {
                     return lo;
@@ -2087,11 +2129,11 @@ pub struct Vec2 { u32 x; u32 y; }
 pub enum Mode { Idle = 0, Run = 1 }
 pub const u32 BAUD = 115200;
 pub fn helper(u32 a) {}
-pub u32 add(u32 a, u32 b) { return a + b; }
+pub fn add(u32 a, u32 b) -> u32 { return a + b; }
 pub extern "C" fn c_hook(u32 v);
 extern "C" {
     pub fn ext_pub(u32 x);
-    u32 ext_priv(u32 y);
+    fn ext_priv(u32 y) -> u32;
 }
 @high pub task worker(u32 id) {}
 pub @normal isr exti0(u32 pin) {}
@@ -2467,7 +2509,7 @@ struct Holder {
     u32 clamp;
 }
 
-FixedVec<u32, N + 1> grow_n<usize N>(FixedVec<u32, N> v) {
+fn grow_n<usize N>(FixedVec<u32, N> v) -> FixedVec<u32, N + 1> {
     return FixedVec<u32, (N + 1)> { items: [0] };
 }
 
@@ -2636,11 +2678,11 @@ struct Pin { u8 port; u8 pin; }
 struct FixedVec<T, usize N> { [N]T data; usize len; }
 
 impl Pin {
-    pub Pin make(u8 port, u8 pin) {
+    pub fn make(u8 port, u8 pin) -> Pin {
         return Pin { port: port, pin: pin };
     }
 
-    pub u8 port_id(self) {
+    pub fn port_id(self) -> u8 {
         return self.port;
     }
 
@@ -2656,7 +2698,7 @@ impl<T, usize N> FixedVec<T, N> {
 }
 
 impl<usize N> FixedVec<f32, N> {
-    pub f32 avg(*self) {
+    pub fn avg(*self) -> f32 {
         return self.data[0];
     }
 }

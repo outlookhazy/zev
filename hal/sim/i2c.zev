@@ -14,7 +14,7 @@ pub struct Bus {
     u32 timeout_ms;
 }
 
-pub Bus make_bus(u8 unit, u32 timeout_ms) {
+pub fn make_bus(u8 unit, u32 timeout_ms) -> Bus {
     return Bus {
         unit: unit,
         timeout_ms: timeout_ms,
@@ -22,7 +22,7 @@ pub Bus make_bus(u8 unit, u32 timeout_ms) {
 }
 
 impl Bus {
-    pub bool probe_7bit(self, u8 addr7) error bus.BusStatus {
+    pub fn probe_7bit(self, u8 addr7) -> bool error bus.BusStatus {
         checkpoint();
         if (addr7 > 127u8 || self.unit == 0u8) {
             error bus.BusStatus.FrameErr;

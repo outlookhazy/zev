@@ -3,7 +3,7 @@
 import chip.stm32f334 as hw;
 import std.bus as bus;
 
-pub u32 sysclk_hz() {
+pub fn sysclk_hz() -> u32 {
     u32 cfgr = hw.RCC.cfgr;
     u32 sws = (cfgr >> 2) & 3u32;
     if (sws == 0u32 || sws == 1u32) {
@@ -24,7 +24,7 @@ pub u32 sysclk_hz() {
     return 8_000_000u32;
 }
 
-pub u32 hclk_hz() {
+pub fn hclk_hz() -> u32 {
     u32 sys_hz = sysclk_hz();
     u32 hpre = (hw.RCC.cfgr >> 4) & 0xFu32;
     if (hpre < 8u32) {
@@ -36,7 +36,7 @@ pub u32 hclk_hz() {
     return sys_hz >> (hpre - 6u32);
 }
 
-pub u32 pclk1_hz() {
+pub fn pclk1_hz() -> u32 {
     u32 hclk = hclk_hz();
     u32 ppre1 = (hw.RCC.cfgr >> 8) & 7u32;
     if (ppre1 < 4u32) {
@@ -45,7 +45,7 @@ pub u32 pclk1_hz() {
     return hclk >> (ppre1 - 3u32);
 }
 
-pub u32 pclk2_hz() {
+pub fn pclk2_hz() -> u32 {
     u32 hclk = hclk_hz();
     u32 ppre2 = (hw.RCC.cfgr >> 11) & 7u32;
     if (ppre2 < 4u32) {
@@ -54,7 +54,7 @@ pub u32 pclk2_hz() {
     return hclk >> (ppre2 - 3u32);
 }
 
-pub u32 tim_pclk1_hz() {
+pub fn tim_pclk1_hz() -> u32 {
     u32 pclk1 = pclk1_hz();
     u32 ppre1 = (hw.RCC.cfgr >> 8) & 7u32;
     if (ppre1 >= 4u32) {
@@ -63,7 +63,7 @@ pub u32 tim_pclk1_hz() {
     return pclk1;
 }
 
-pub u32 tim_pclk2_hz() {
+pub fn tim_pclk2_hz() -> u32 {
     u32 pclk2 = pclk2_hz();
     u32 ppre2 = (hw.RCC.cfgr >> 11) & 7u32;
     if (ppre2 >= 4u32) {
@@ -73,7 +73,7 @@ pub u32 tim_pclk2_hz() {
 }
 
 // Configure 72 MHz SYSCLK from 8 MHz external clock (HSEBYP x9), falling back to 64 MHz HSI/2 x16.
-pub u32 configure_pll_hse_bypass_72mhz() {
+pub fn configure_pll_hse_bypass_72mhz() -> u32 {
     hw.RCC.cr = hw.RCC.cr | 1u32; // HSION
     for (u32 spin in 0..100_000) {
         if ((hw.RCC.cr & 2u32) != 0u32) {
@@ -141,7 +141,7 @@ pub u32 configure_pll_hse_bypass_72mhz() {
     return sysclk_hz();
 }
 
-pub bus.ResetReason read_reset_reason(bool clear) {
+pub fn read_reset_reason(bool clear) -> bus.ResetReason {
     u32 csr = hw.RCC.csr;
     bus.ResetReason r = bus.ResetReason.PowerOn;
     if ((csr & (1u32 << 29)) != 0u32) {
@@ -185,7 +185,7 @@ pub fn iwdg_feed() {
     hw.IWDG.kr = 0xAAAAu32;
 }
 
-pub u32 read_uid_word(usize idx) {
+pub fn read_uid_word(usize idx) -> u32 {
     if (idx >= 3) {
         return 0u32;
     }

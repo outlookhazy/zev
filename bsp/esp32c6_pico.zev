@@ -46,7 +46,7 @@ pub fn init_soc() {
     sys.set_irq_router(hw.route_irq, hw.ack_irq);
 }
 
-pub u32 sys_now_ms() {
+pub fn sys_now_ms() -> u32 {
     hw.SYSTIMER.unit0_op = 1 << 30;
     u32 _sync0 = hw.SYSTIMER.conf;
     u32 _sync1 = hw.SYSTIMER.conf;
@@ -90,7 +90,7 @@ pub fn init_board_gpio() {
     hw.GPIO.enable_w1ts = 1 << PIN_WS2812_RGB;
 }
 
-pub u32 read_boot_button() {
+pub fn read_boot_button() -> u32 {
     return (hw.GPIO.in_reg >> PIN_BOOT_BTN) & 1;
 }
 
@@ -98,7 +98,7 @@ pub fn clear_gpio_irq() {
     hw.GPIO.status_w1tc = 1 << PIN_BOOT_BTN;
 }
 
-pub u32 read_systimer_ticks() {
+pub fn read_systimer_ticks() -> u32 {
     hw.SYSTIMER.unit0_op = 1 << 30;
     for (u32 i in 0..64) {
         if ((hw.SYSTIMER.unit0_op & (1 << 29)) != 0) {
@@ -140,11 +140,11 @@ pub fn enable_usb_rx_irq() {
     hw.USB_DEVICE.int_ena = hw.USB_DEVICE.int_ena | 4;
 }
 
-pub bool usb_rx_avail() {
+pub fn usb_rx_avail() -> bool {
     return (hw.USB_DEVICE.ep1_conf & 4) != 0;
 }
 
-pub u8 usb_rx_read_byte() {
+pub fn usb_rx_read_byte() -> u8 {
     return (hw.USB_DEVICE.ep1 & 0xFF) as u8;
 }
 
@@ -152,7 +152,7 @@ pub fn clear_usb_rx_irq() {
     hw.USB_DEVICE.int_clr = 4;
 }
 
-usize regi2c_enable_sar() {
+fn regi2c_enable_sar() -> usize {
     // 1. Release analog peripheral I2C from reset and power it up in PMU (BIT(26) | BIT(27)).
     hw.PMU.rf_pwc = hw.PMU.rf_pwc | (1 << 26) | (1 << 27);
 
@@ -187,7 +187,7 @@ fn regi2c_wait_idle(usize m) {
     }
 }
 
-u8 regi2c_sar_read(u8 reg_add) {
+fn regi2c_sar_read(u8 reg_add) -> u8 {
     usize m = regi2c_enable_sar();
     regi2c_wait_idle(m);
     hw.I2C_ANA_MST.i2c_ctrl[m] = 0x69u32 | ((reg_add as u32) << 8);
@@ -218,15 +218,15 @@ pub fn init_temp_sensor() {
     }
 }
 
-pub u32 read_die_temp_raw() {
+pub fn read_die_temp_raw() -> u32 {
     return hw.APB_SARADC.tsens_ctrl & 0xFF;
 }
 
-pub u8 read_tsens_dac() {
+pub fn read_tsens_dac() -> u8 {
     return regi2c_sar_read(6) & 0x0F;
 }
 
-pub i32 read_temp_calib_tenths_c() {
+pub fn read_temp_calib_tenths_c() -> i32 {
     u32 raw_cal = hw.EFUSE.rd_sys_part1_data4 & 0x1FF;
     i32 mag = (raw_cal & 0xFF) as i32;
     if ((raw_cal & 0x100) != 0) {
@@ -235,7 +235,7 @@ pub i32 read_temp_calib_tenths_c() {
     return mag;
 }
 
-pub f32 read_die_temp_c() {
+pub fn read_die_temp_c() -> f32 {
     f32 uncal = 0.4386f32 * (read_die_temp_raw() as f32) - 20.52f32;
     f32 cal_c = (read_temp_calib_tenths_c() as f32) * 0.1f32;
     return uncal - cal_c;
@@ -322,15 +322,15 @@ pub fn set_led(bool on) {
     }
 }
 
-pub bool read_button() {
+pub fn read_button() -> bool {
     return PIN_BUTTON.read();
 }
 
-pub adc.Channel default_adc() {
+pub fn default_adc() -> adc.Channel {
     return adc.make_channel(1u8, 0u8, 3300u16);
 }
 
-pub pwm.Channel default_pwm() {
+pub fn default_pwm() -> pwm.Channel {
     hw.PCR.ledc_conf = 3u32;
     hw.PCR.ledc_conf = 1u32;
     hw.PCR.ledc_sclk_conf = (1u32 << 22) | (3u32 << 20); // 40 MHz XTAL clock
@@ -342,7 +342,7 @@ pub pwm.Channel default_pwm() {
     return pwm.make_channel(0u8, 1u8, 0u8, 1024u32, 0u16);
 }
 
-pub spi.Bus default_spi() {
+pub fn default_spi() -> spi.Bus {
     hw.PCR.spi2_conf = 3u32;
     hw.PCR.spi2_conf = 1u32;
     hw.PCR.spi2_clkm_conf = 1u32 << 22; // 40 MHz XTAL clock
@@ -370,7 +370,7 @@ pub spi.Bus default_spi() {
     return spi.make_bus(2u8, 10u32);
 }
 
-pub i2c.Bus default_i2c() {
+pub fn default_i2c() -> i2c.Bus {
     hw.PCR.i2c_conf = 3u32;
     hw.PCR.i2c_conf = 1u32;
     hw.PCR.i2c_sclk_conf = 1u32 << 22; // 40 MHz XTAL

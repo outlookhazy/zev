@@ -20,7 +20,7 @@ pub struct Pin {
     bool active_low;
 }
 
-pub Pin make_pin(u8 port, u8 pin, bool active_low) {
+pub fn make_pin(u8 port, u8 pin, bool active_low) -> Pin {
     return Pin {
         port: port,
         pin: pin,
@@ -53,7 +53,7 @@ impl Pin {
         }
     }
 
-    pub bool read(self) {
+    pub fn read(self) -> bool {
         if (self.port != 0u8 || self.pin >= 8u8) {
             return false;
         }

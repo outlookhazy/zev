@@ -27,7 +27,7 @@ pub struct Pin {
     bool active_low;
 }
 
-pub Pin make_pin(u8 port, u8 pin, bool active_low) {
+pub fn make_pin(u8 port, u8 pin, bool active_low) -> Pin {
     return Pin {
         port: port,
         pin: pin,
@@ -35,7 +35,7 @@ pub Pin make_pin(u8 port, u8 pin, bool active_low) {
     };
 }
 
-u32 mode_bits(Mode m) {
+fn mode_bits(Mode m) -> u32 {
     switch (m) {
         Mode.Input  => { return 0u32; }
         Mode.Output => { return 1u32; }
@@ -43,7 +43,7 @@ u32 mode_bits(Mode m) {
     }
 }
 
-u32 pull_bits(Pull p) {
+fn pull_bits(Pull p) -> u32 {
     switch (p) {
         Pull.None => { return 0u32; }
         Pull.Up   => { return 1u32; }
@@ -63,7 +63,7 @@ impl Pin {
         SIM_GPIO.pupdr[p] = (SIM_GPIO.pupdr[p] & (~mask)) | (pull_bits(pull) << sh);
     }
 
-    pub bool read(self) {
+    pub fn read(self) -> bool {
         if (self.port >= 4u8 || self.pin >= 16u8) {
             return self.active_low;
         }

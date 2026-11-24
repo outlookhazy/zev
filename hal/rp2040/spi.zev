@@ -8,14 +8,14 @@ pub struct Bus {
     u32 timeout_ms;
 }
 
-pub Bus make_bus(u8 unit, u32 timeout_ms) {
+pub fn make_bus(u8 unit, u32 timeout_ms) -> Bus {
     return Bus {
         unit: unit,
         timeout_ms: timeout_ms,
     };
 }
 
-u32 eff_timeout(u32 to_ms) {
+fn eff_timeout(u32 to_ms) -> u32 {
     if (to_ms == 0u32) {
         return 25u32;
     }
@@ -23,7 +23,7 @@ u32 eff_timeout(u32 to_ms) {
 }
 
 impl Bus {
-    pub u8 transfer_byte(self, u8 tx) error bus.BusStatus {
+    pub fn transfer_byte(self, u8 tx) -> u8 error bus.BusStatus {
         checkpoint();
         if (self.unit != 1u8) {
             error bus.BusStatus.FrameErr;

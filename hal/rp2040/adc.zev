@@ -9,7 +9,7 @@ pub struct Channel {
     u16 vdda_mv;
 }
 
-pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv) {
+pub fn make_channel(u8 unit, u8 ch, u16 vdda_mv) -> Channel {
     return Channel {
         unit: unit,
         ch: ch,
@@ -18,7 +18,7 @@ pub Channel make_channel(u8 unit, u8 ch, u16 vdda_mv) {
 }
 
 impl Channel {
-    pub u16 read_u16(self) error bus.BusStatus {
+    pub fn read_u16(self) -> u16 error bus.BusStatus {
         checkpoint();
         if (self.unit != 1u8 || self.ch >= 5u8) {
             error bus.BusStatus.FrameErr;
@@ -47,7 +47,7 @@ impl Channel {
         error bus.BusStatus.Timeout;
     }
 
-    pub u32 read_mv(self) error bus.BusStatus {
+    pub fn read_mv(self) -> u32 error bus.BusStatus {
         u16 raw = self.read_u16() catch (bus.BusStatus err) {
             error err;
         };

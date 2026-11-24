@@ -357,7 +357,7 @@ fn extern_c_callback_safety_direct_and_struct_wrapped() {
         r#"
         extern "C" fn register_blk_hook(fn(u32) -> i32 cb);
 
-        i32 fast_hook(u32 sector) {
+        fn fast_hook(u32 sector) -> i32 {
             return 0;
         }
 
@@ -377,7 +377,7 @@ fn extern_c_callback_safety_direct_and_struct_wrapped() {
             flash_ready.wait();
         }
 
-        i32 bad_yielding_hook(u32 sector) {
+        fn bad_yielding_hook(u32 sector) -> i32 {
             wait_flash();
             return 0;
         }
@@ -397,7 +397,7 @@ fn extern_c_callback_safety_direct_and_struct_wrapped() {
         }
         extern "C" fn mount_fs(*BlockOps ops);
 
-        i32 bad_read(u32 lba) {
+        fn bad_read(u32 lba) -> i32 {
             checkpoint();
             return 0;
         }
@@ -488,14 +488,14 @@ fn allow_local_struct_wrapping_and_downward_calls_for_dma_slices() {
         @dma_safe ping_pong<u8, 64> rx_dma;
         @dma_safe pool<[32]u8, 4>   spi_pool;
 
-        u8 peek_first(*ByteReader r) {
+        fn peek_first(*ByteReader r) -> u8 {
             if (r.buf.len == 0) {
                 return 0;
             }
             return r.buf[0];
         }
 
-        ByteReader make_sub_reader([]u8 chunk) {
+        fn make_sub_reader([]u8 chunk) -> ByteReader {
             return ByteReader { buf: chunk[0..4], pos: 0 };
         }
 
@@ -607,7 +607,7 @@ fn reject_returning_local_pointer_slice_or_leased_wrapper() {
     // Returning `&local` upward
     expect_err_kind(
         r#"
-        *i32 bad_ret_ptr() {
+        fn bad_ret_ptr() -> *i32 {
             i32 local_val = 42;
             return &local_val;
         }
@@ -619,7 +619,7 @@ fn reject_returning_local_pointer_slice_or_leased_wrapper() {
     // Returning slice of local fixed array upward
     expect_err_kind(
         r#"
-        []u8 bad_ret_slice() {
+        fn bad_ret_slice() -> []u8 {
             [8]u8 tmp = [1, 2, 3, 4, 5, 6, 7, 8];
             return tmp[0..4];
         }
@@ -637,7 +637,7 @@ fn reject_returning_local_pointer_slice_or_leased_wrapper() {
         }
         @dma_safe ping_pong<u8, 64> rx_dma;
 
-        ByteReader bad_ret_lease() {
+        fn bad_ret_lease() -> ByteReader {
             []u8 half = rx_dma.wait_chunk();
             return ByteReader { buf: half, pos: 0 };
         }
@@ -694,7 +694,7 @@ fn reject_reading_stale_dma_slice_or_wrapper_after_second_wait_chunk() {
         }
         @dma_safe ping_pong<u8, 64> rx_dma;
 
-        ByteReader wrap([]u8 b) {
+        fn wrap([]u8 b) -> ByteReader {
             return ByteReader { buf: b, pos: 0 };
         }
 
@@ -744,7 +744,7 @@ fn reject_yielding_recursion_cycle_and_allow_nonyielding_recursion() {
     // Pure stack recursion without yields is allowed
     let model = expect_ok(
         r#"
-        u32 fact(u32 n) {
+        fn fact(u32 n) -> u32 {
             if (n <= 1) {
                 return 1;
             }
@@ -855,7 +855,7 @@ fn dual_exit_error_partial_progress_catch_and_or_validation() {
             error;
         }
 
-        usize read_packet([]u8 dst, bool fail_halfway) error IoErr {
+        fn read_packet([]u8 dst, bool fail_halfway) -> usize error IoErr {
             if (dst.len == 0) {
                 error BusFault;
             }
@@ -886,7 +886,7 @@ fn dual_exit_error_partial_progress_catch_and_or_validation() {
     expect_err_kind(
         r#"
         enum Err { Bad }
-        u16 fallible() error Err {
+        fn fallible() -> u16 error Err {
             error Bad;
         }
         fn main() {
@@ -900,7 +900,7 @@ fn dual_exit_error_partial_progress_catch_and_or_validation() {
     expect_err_kind(
         r#"
         enum Err { Bad }
-        u16 fallible() error Err {
+        fn fallible() -> u16 error Err {
             error;
         }
         fn main() {}
@@ -911,7 +911,7 @@ fn dual_exit_error_partial_progress_catch_and_or_validation() {
     // 2-param `catch (Err e, u16 p)` on untyped bare `error` fn must be rejected
     expect_err_kind(
         r#"
-        u16 bare_fail() error {
+        fn bare_fail() -> u16 error {
             error;
         }
         fn main() {
@@ -926,7 +926,7 @@ fn dual_exit_error_partial_progress_catch_and_or_validation() {
     // Missing return in non-void function must be rejected
     expect_err_kind(
         r#"
-        u16 forgot_return(bool flag) {
+        fn forgot_return(bool flag) -> u16 {
             if (flag) {
                 return 1;
             }
@@ -1040,7 +1040,7 @@ fn qa_adversarial_checklist_suite() {
     expect_ok(
         r#"
         enum IoErr { ShortRead }
-        usize read_some([]u8 b) error IoErr {
+        fn read_some([]u8 b) -> usize error IoErr {
             error ShortRead, 2;
         }
         fn main() {
@@ -1533,7 +1533,7 @@ fn validate_value_producing_catch_blocks_e0017() {
             i16 temp;
         }
 
-        DecodedPacket decode(u8 raw) error PacketErr {
+        fn decode(u8 raw) -> DecodedPacket error PacketErr {
             if (raw == 0) {
                 error BadHeader;
             }
@@ -1559,7 +1559,7 @@ fn validate_value_producing_catch_blocks_e0017() {
     let d_missing_val = expect_err_kind(
         r#"
         enum PacketErr { BadHeader }
-        u32 decode_u32(u8 raw) error PacketErr {
+        fn decode_u32(u8 raw) -> u32 error PacketErr {
             error BadHeader;
         }
         fn main() {
@@ -1581,7 +1581,7 @@ fn validate_value_producing_catch_blocks_e0017() {
             u8  cmd;
             i16 temp;
         }
-        DecodedPacket decode(u8 raw) error PacketErr {
+        fn decode(u8 raw) -> DecodedPacket error PacketErr {
             error BadHeader;
         }
         fn main() {
@@ -1598,7 +1598,7 @@ fn validate_value_producing_catch_blocks_e0017() {
     let d_void_tail = expect_err_kind(
         r#"
         enum PacketErr { BadHeader }
-        u32 decode_u32(u8 raw) error PacketErr {
+        fn decode_u32(u8 raw) -> u32 error PacketErr {
             error BadHeader;
         }
         fn main() {
@@ -1623,7 +1623,7 @@ fn unreachable_code_e0025_all_diverging_forms_and_single_warning_per_tail() {
     // 1. Multiple statements after `return;` emit E0025 ONLY ONCE per unreachable tail.
     let diags = expect_err_kind(
         r#"
-        u32 compute() {
+        fn compute() -> u32 {
             return 7;
             u32 dead1 = 1;
             u32 dead2 = dead1 + 2;
@@ -2141,16 +2141,16 @@ fn three_tier_fn_effects_noyield_specialization_and_dual_specialized_fns() {
     //    coroutine task AND inside `noyield { ... }`! Meanwhile `fast_only_soft` is ONLY called in `noyield`.
     let model = expect_ok(
         r#"
-        u32 pure_mix(u32 a, u32 b) {
+        fn pure_mix(u32 a, u32 b) -> u32 {
             return a ^ b;
         }
 
-        u32 sha_round(u32 acc) {
+        fn sha_round(u32 acc) -> u32 {
             checkpoint();
             return pure_mix(acc, 0x5A5A);
         }
 
-        u32 sha_block(u32 seed) {
+        fn sha_block(u32 seed) -> u32 {
             u32 cur = seed;
             u32 iter = 0;
             loop {
@@ -2163,12 +2163,12 @@ fn three_tier_fn_effects_noyield_specialization_and_dual_specialized_fns() {
             return cur;
         }
 
-        u32 fast_only_soft(u32 x) {
+        fn fast_only_soft(u32 x) -> u32 {
             checkpoint();
             return x + 1;
         }
 
-        u32 atomic_wrapper(u32 x) {
+        fn atomic_wrapper(u32 x) -> u32 {
             u32 out = 0;
             noyield {
                 out = fast_only_soft(x) + sha_block(x);
@@ -2278,7 +2278,7 @@ fn defer_and_bounded_for_in_verification() {
         watch<u32> isr_sum = 0;
         watch<u32> last_sum = 0;
 
-        u32 tx_frame([]u8 payload, bool fail) error SpiErr {
+        fn tx_frame([]u8 payload, bool fail) -> u32 error SpiErr {
             hw.GPIOA.brr = 1;
             defer hw.GPIOA.bsrr = 1;
 
@@ -2470,14 +2470,14 @@ fn wave2_floats_f32_f64_literals_coercion_ops_casts_and_errors() {
 
         enum SensorErr { Disconnected }
 
-        f32 read_adc_volts(u16 raw, bool ok) error SensorErr {
+        fn read_adc_volts(u16 raw, bool ok) -> f32 error SensorErr {
             if (!ok) {
                 error Disconnected;
             }
             return (raw as f32) * 3.3 / 4095.0;
         }
 
-        f32 step_pid(*PidState st, f32 target, f32 measured) {
+        fn step_pid(*PidState st, f32 target, f32 measured) -> f32 {
             f32 err = target - measured;
             st.integral += err * 0.01;
             st.integral -= 0.0;
@@ -2557,7 +2557,7 @@ fn wave2_monomorphize_generic_structs_fns_inference_mangling_and_attrs() {
             usize len;
         }
 
-        T clamp<T>(T val, T lo, T hi) {
+        fn clamp<T>(T val, T lo, T hi) -> T {
             if (val < lo) {
                 return lo;
             }
@@ -2567,7 +2567,7 @@ fn wave2_monomorphize_generic_structs_fns_inference_mangling_and_attrs() {
             return val;
         }
 
-        bool vec_push<T, usize N>(*FixedVec<T, N> v, T item) {
+        fn vec_push<T, usize N>(*FixedVec<T, N> v, T item) -> bool {
             if (v.len >= N) {
                 return false;
             }
@@ -2749,11 +2749,11 @@ fn wave2_monomorphize_sema_invariants_yield_cloning_and_dma_provenance() {
             usize cursor;
         }
 
-        SliceView<T> make_view<T>([]T s) {
+        fn make_view<T>([]T s) -> SliceView<T> {
             return SliceView<T> { buf: s, cursor: 0 };
         }
 
-        T smooth_step<T>(T cur, T target) {
+        fn smooth_step<T>(T cur, T target) -> T {
             checkpoint();
             if (cur < target) {
                 return target;
@@ -2806,7 +2806,7 @@ fn wave2_monomorphize_sema_invariants_yield_cloning_and_dma_provenance() {
         r#"
         @dma_safe ping_pong<u8, 32> rx_dma;
         struct SliceView<T> { []T buf; }
-        SliceView<T> wrap<T>([]T s) { return SliceView<T> { buf: s }; }
+        fn wrap<T>([]T s) -> SliceView<T> { return SliceView<T> { buf: s }; }
         task bad() {
             loop {
                 SliceView<u8> v = wrap(rx_dma.wait_chunk());
@@ -2823,7 +2823,7 @@ fn wave2_monomorphize_sema_invariants_yield_cloning_and_dma_provenance() {
     // 4. Returning `&local` from a monomorphized generic function -> E0009 (`ReturnLocalReference`)!
     expect_err_kind(
         r#"
-        *T dangle<T>(T v) {
+        fn dangle<T>(T v) -> *T {
             T local_copy = v;
             return &local_copy;
         }
@@ -2837,7 +2837,7 @@ fn wave2_monomorphize_sema_invariants_yield_cloning_and_dma_provenance() {
     // 5. Hard-blocking generic function called inside `noyield` -> E0003 (`YieldInNoYield`)!
     expect_err_kind(
         r#"
-        T nap_and_echo<T>(T x) {
+        fn nap_and_echo<T>(T x) -> T {
             delay(2ms);
             return x;
         }
@@ -2864,7 +2864,7 @@ fn wave2_generic_instantiation_errors_e0029() {
         (
             "wrong fn generic arity",
             r#"
-            T id<T>(T x) { return x; }
+            fn id<T>(T x) -> T { return x; }
             fn main() { u32 y = id<u32, u16>(1); }
             "#,
         ),
@@ -2878,7 +2878,7 @@ fn wave2_generic_instantiation_errors_e0029() {
         (
             "generic args on non-generic fn",
             r#"
-            u32 plain_fn(u32 x) { return x; }
+            fn plain_fn(u32 x) -> u32 { return x; }
             fn main() { u32 y = plain_fn<u32>(1); }
             "#,
         ),
@@ -2907,21 +2907,21 @@ fn wave2_generic_instantiation_errors_e0029() {
         (
             "uninferable type parameter",
             r#"
-            T make_zero<T>() { return 0 as T; }
+            fn make_zero<T>() -> T { return 0 as T; }
             fn main() { u32 x = make_zero(); }
             "#,
         ),
         (
             "uninferable const usize parameter",
             r#"
-            usize get_cap<usize N>() { return N; }
+            fn get_cap<usize N>() -> usize { return N; }
             fn main() { usize c = get_cap(); }
             "#,
         ),
         (
             "conflicting inferred float types (f32 vs f64)",
             r#"
-            T pick<T>(T a, T b) { return a; }
+            fn pick<T>(T a, T b) -> T { return a; }
             fn main() { f32 x = pick(1.0f32, 2.0f64); }
             "#,
         ),
@@ -2986,10 +2986,10 @@ fn local_bindings_shadow_same_named_generic_fn_templates() {
     // template of the same name instead of tripping `E0029` in the monomorphizer.
     let model = expect_ok(
         r#"
-        u32 lim<usize N>(u32 x) { return x + (N as u32); }
-        u32 inc(u32 x) { return x + 1u32; }
-        u32 use_param(u32 lim) { return lim * 2u32; }
-        u32 via_ptr() {
+        fn lim<usize N>(u32 x) -> u32 { return x + (N as u32); }
+        fn inc(u32 x) -> u32 { return x + 1u32; }
+        fn use_param(u32 lim) -> u32 { return lim * 2u32; }
+        fn via_ptr() -> u32 {
             fn(u32) -> u32 lim = inc;
             return lim(3u32);
         }
@@ -3012,7 +3012,7 @@ fn local_bindings_shadow_same_named_generic_fn_templates() {
     // A bare reference that really does resolve to the template is still rejected.
     expect_err_kind(
         r#"
-        u32 lim<usize N>(u32 x) { return x + (N as u32); }
+        fn lim<usize N>(u32 x) -> u32 { return x + (N as u32); }
         fn main() { u32 y = lim + 1u32; }
         "#,
         DiagnosticKind::GenericInstantiationError,
@@ -3225,7 +3225,7 @@ fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
     // 4. Returning slice backed by local `[N]u8` stack buffer from `fmt_buf` -> E0009 (`ReturnLocalReference`)!
     expect_err_kind(
         r#"
-        []u8 bad_return(u16 rpm) {
+        fn bad_return(u16 rpm) -> []u8 {
             [16]u8 local_buf;
             return fmt_buf(local_buf, f"rpm={rpm}");
         }
@@ -3497,11 +3497,11 @@ fn r2a_h4_h5_injective_mangling_and_monomorphization_cap() {
         struct GInner_L_u8_R { u8 v; }
         struct Outer<T> { T item; }
 
-        usize pair_tag<A, B>(A a, B b) {
+        fn pair_tag<A, B>(A a, B b) -> usize {
             return 1;
         }
 
-        usize kind_tag<T>(T v) {
+        fn kind_tag<T>(T v) -> usize {
             return 2;
         }
 
@@ -3584,11 +3584,11 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
             [N]u8 data;
         }
 
-        T first_elem<T, usize N>([N]T arr) {
+        fn first_elem<T, usize N>([N]T arr) -> T {
             return arr[0];
         }
 
-        usize switch_and_shadow<usize N>(usize x) {
+        fn switch_and_shadow<usize N>(usize x) -> usize {
             switch (x) {
                 N => {
                     usize N = 99;
@@ -3678,7 +3678,7 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
         r#"fn main() { f32 x = -1e40; }"#,
         r#"fn take(f32 x) {} fn main() { take(1e40); }"#,
         r#"watch<f32> w = 1e40; fn main() {}"#,
-        r#"f32 ret_bad() { return 1e40; } fn main() {}"#,
+        r#"fn ret_bad() -> f32 { return 1e40; } fn main() {}"#,
     ] {
         let diags = expect_err_kind(bad_f32, DiagnosticKind::TypeMismatch);
         assert!(
@@ -3725,7 +3725,7 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
     // 5. Low: Error inside a monomorphized `fn` body carries `instantiated from` call-site note!
     let inst_note_diags = expect_err_kind(
         r#"
-        T bad_generic<T>(T x) {
+        fn bad_generic<T>(T x) -> T {
             bool flag = x;
             if (flag) {}
             return x;
@@ -3754,7 +3754,7 @@ fn r4_struct_fnptr_field_call_and_ptr_receiver_validation() {
             F cb;
         }
 
-        u32 add10(u32 x) {
+        fn add10(u32 x) -> u32 {
             return x + 10;
         }
 
@@ -3773,7 +3773,7 @@ fn r4_struct_fnptr_field_call_and_ptr_receiver_validation() {
     for bad_call in [
         r#"
         struct BoxFn<F> { F cb; }
-        u32 add10(u32 x) { return x + 10; }
+        fn add10(u32 x) -> u32 { return x + 10; }
         fn main() {
             BoxFn<fn(u32) -> u32> bf = BoxFn<fn(u32) -> u32> { cb: add10 };
             u32 r = bf.cb(1, 2);
@@ -3781,7 +3781,7 @@ fn r4_struct_fnptr_field_call_and_ptr_receiver_validation() {
         "#,
         r#"
         struct BoxFn<F> { F cb; }
-        u32 add10(u32 x) { return x + 10; }
+        fn add10(u32 x) -> u32 { return x + 10; }
         fn main() {
             BoxFn<fn(u32) -> u32> bf = BoxFn<fn(u32) -> u32> { cb: add10 };
             u32 r = bf.cb(true);
@@ -3851,7 +3851,7 @@ fn wave1_module_resolution_diamond_pub_extern_c_and_generics() {
         pub const u32 DEFAULT_BAUD = 115200;
         pub enum Mode { Idle = 0, Active = 1 }
         pub struct Box<T, usize N> { [N]T data; }
-        pub T first_item<T, usize N>(Box<T, N> b) { return b.data[0]; }
+        pub fn first_item<T, usize N>(Box<T, N> b) -> T { return b.data[0]; }
         pub extern "C" fn hal_tick();
         "#,
     );
@@ -4096,7 +4096,7 @@ fn wave1_mmio_validation_and_e0031_enforcement() {
             @rw u32 cr @ 0x00;
         }
 
-        void step_uart(*UartRegs r) {
+        fn step_uart(*UartRegs r) {
             r.cr1 |= 1;
             (*r).cr1 = 2;
             u16 st = r.sr;
@@ -4142,8 +4142,8 @@ fn wave1_mmio_validation_and_e0031_enforcement() {
         "mmio Regs { @rw u32 a @ 0x00; } mmio P : Regs @ 0x1_0000_0000; fn main() {}",
         // By-value `mmio` local, parameter, return, struct field, array, cast
         "mmio Regs { @rw u32 a @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { Regs r; }",
-        "mmio Regs { @rw u32 a @ 0x00; } void take(Regs r) {} fn main() {}",
-        "mmio Regs { @rw u32 a @ 0x00; } Regs make() { while (true) {} } fn main() {}",
+        "mmio Regs { @rw u32 a @ 0x00; } fn take(Regs r) {} fn main() {}",
+        "mmio Regs { @rw u32 a @ 0x00; } fn make() -> Regs { while (true) {} } fn main() {}",
         "mmio Regs { @rw u32 a @ 0x00; } struct Holder { Regs r; } fn main() {}",
         "mmio Regs { @rw u32 a @ 0x00; } mmio P : Regs @ 0x4000_0000; fn main() { P as Regs; }",
         // Taking `&regs.icr` or `&regs.arr[0]`
@@ -4200,7 +4200,7 @@ fn wave1_irq_boot_tree_attachment_shared_and_e0032_errors() {
         }
         isr simple_isr {}
 
-        void bind_uart_irq(*UartRegs regs, u32 tag) {
+        fn bind_uart_irq(*UartRegs regs, u32 tag) {
             IRQ_MODE.attach(fast_isr(regs, tag));
         }
 
@@ -4255,9 +4255,9 @@ fn wave1_irq_boot_tree_attachment_shared_and_e0032_errors() {
         // Local stack address passed to `attach`
         "irq Q = 5; isr h(*u32 p) {} fn main() { u32 local = 1; Q.attach(h(&local)); }",
         // Non-const runtime arg forwarded through boot helper!
-        "irq Q = 5; isr h(u32 x) {} void setup(u32 x) { Q.attach(h(x)); } u32 dyn_val() { return 7; } fn main() { setup(dyn_val()); }",
+        "irq Q = 5; isr h(u32 x) {} fn setup(u32 x) { Q.attach(h(x)); } fn dyn_val() -> u32 { return 7; } fn main() { setup(dyn_val()); }",
         // Helper forwarding param with no boot callers
-        "irq Q = 5; isr h(u32 x) {} void dead_setup(u32 x) { Q.attach(h(x)); } fn main() {}",
+        "irq Q = 5; isr h(u32 x) {} fn dead_setup(u32 x) { Q.attach(h(x)); } fn main() {}",
     ] {
         expect_err_kind(bad_irq, DiagnosticKind::IrqAttachmentError);
     }
@@ -4271,7 +4271,7 @@ fn wave1_isr_state_and_e0033_escape_checks() {
         struct Pair { u32 a; u32 b; }
         const u32 ZERO = 0;
 
-        void bump(*u32 p) {
+        fn bump(*u32 p) {
             *p += 1;
         }
 
@@ -4323,8 +4323,8 @@ fn wave1_audit_frontend_regression_tests() {
     expect_err_kind(
         r#"
         watch<*u32> leak_w;
-        void forward(*u32 p) { leak_w.publish(p); }
-        void bounce(*u32 p) { forward(p); }
+        fn forward(*u32 p) { leak_w.publish(p); }
+        fn bounce(*u32 p) { forward(p); }
         isr bad() {
             state u32 x = 0;
             bounce(&x);
@@ -4340,7 +4340,7 @@ fn wave1_audit_frontend_regression_tests() {
         irq Q0 = 5;
         isr h0 {}
         isr h1 {}
-        void helper() {
+        fn helper() {
             if (true) {
                 Q0.attach(h0);
                 return;
@@ -4361,7 +4361,7 @@ fn wave1_audit_frontend_regression_tests() {
         irq Q1 = 6;
         isr h0 {}
         isr h1 {}
-        void helper() {
+        fn helper() {
             if (true) {
                 Q0.attach(h0);
                 return;
@@ -4390,7 +4390,7 @@ fn wave1_audit_frontend_regression_tests() {
     );
     expect_err_kind(
         r#"
-        *u32 dangle() {
+        fn dangle() -> *u32 {
             [4]u32 local = [1, 2, 3, 4];
             return local.ptr;
         }
@@ -4427,8 +4427,8 @@ fn wave1_audit_frontend_regression_tests() {
 
     // #10: MMIO register array OOB + unindexed `.ptr` / slice / rvalue / whole-array write -> E0031.
     for bad_mmio_arr in [
-        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; u32 f() { return DEV.r[4]; } fn main() {}",
-        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; const i32 N = -1; u32 f() { return DEV.r[N]; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() -> u32 { return DEV.r[4]; } fn main() {}",
+        "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; const i32 N = -1; fn f() -> u32 { return DEV.r[N]; } fn main() {}",
         "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { DEV.r[4] = 1; } fn main() {}",
         "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { *u32 p = DEV.r.ptr; } fn main() {}",
         "mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000; fn f() { []u32 s = DEV.r[0..2]; } fn main() {}",
@@ -4442,7 +4442,7 @@ fn wave1_audit_frontend_regression_tests() {
         r#"
         mmio R { @rw [4]u32 r @ 0x0; } mmio DEV : R @ 0x40000000;
         const usize IDX = 99;
-        u32 read_at(usize IDX) { return DEV.r[IDX]; }
+        fn read_at(usize IDX) -> u32 { return DEV.r[IDX]; }
         fn main() { u32 v = read_at(1); }
         "#,
     );
@@ -4470,11 +4470,11 @@ pub struct Ring<T, usize N> {
 }
 pub enum Kind { Alpha, Beta }
 pub const u32 MODE_A = 1;
-pub bool take2(bool a, bool b) { return a && b; }
+pub fn take2(bool a, bool b) -> bool { return a && b; }
 const u32 N = 999;
 pub const u32 A = 10;
 pub const u32 C = 20;
-u32 secret_helper() { return 7; }
+fn secret_helper() -> u32 { return 7; }
 "#;
     std::fs::write(tmp.join("sub.zev"), mod_src).expect("write sub.zev");
 
@@ -4685,7 +4685,7 @@ fn main() {
         "struct Bad { byte_ring r; } fn main() {}",
         "struct Bad { inbox<u8> q; } fn main() {}",
         "fn f(byte_ring r) {} fn main() {}",
-        "inbox<u8> f() { fn_unreachable(); } fn fn_unreachable() {}",
+        "fn f() -> inbox<u8> { fn_unreachable(); } fn fn_unreachable() {}",
         "fn main() { byte_ring r; }",
         "fn main() { inbox<u8> q; }",
     ] {
@@ -4814,7 +4814,7 @@ fn main() {
     let sub_def = "struct S { byte_ring<16> rx; }";
     for bad in [
         format!("{sub_def} fn f(S x) {{}} fn main() {{}}"),
-        format!("{sub_def} S f() {{}} fn main() {{}}"),
+        format!("{sub_def} fn f() -> S {{}} fn main() {{}}"),
         format!("{sub_def} fn main() {{ S local_s; }}"),
         format!("{sub_def} byte_ring<16> tmp; fn main() {{ S s = S {{ rx: tmp }}; }}"),
         format!("{sub_def} fn main() {{ [4]u8 b = [0, 0, 0, 0]; S s = S.from_bytes(b[0..4]) catch {{ return; }}; }}"),
@@ -4906,11 +4906,11 @@ fn publish_cell<T>(*StatusCell<T> cell, T val) {
     cell.state.publish(val);
 }
 
-T read_cell<T>(*StatusCell<T> cell) {
+fn read_cell<T>(*StatusCell<T> cell) -> T {
     return cell.state.read();
 }
 
-Lease<T> alloc_from<T>(*pool<T, 8> p) {
+fn alloc_from<T>(*pool<T, 8> p) -> Lease<T> {
     return p.alloc();
 }
 
@@ -5126,7 +5126,7 @@ fn rejects_e0034_linear_lease_violations_and_e0011_stale_get() {
         "fn main() { [2]Lease<u8> arr; }",
         "fn main() { []Lease<u8> sl; }",
         "pool<u8, 4> p; fn main() { Lease<u8> l = p.alloc(); *Lease<u8> ptr = &l; l.release(); }",
-        "enum E { Fail } pool<u8, 4> p; Lease<u8> f() error E { Lease<u8> l = p.alloc(); error E.Fail, l; } fn main() {}",
+        "enum E { Fail } pool<u8, 4> p; fn f() -> Lease<u8> error E { Lease<u8> l = p.alloc(); error E.Fail, l; } fn main() {}",
     ] {
         expect_err_kind(bad, DiagnosticKind::LinearLeaseViolation);
     }
@@ -5149,7 +5149,7 @@ fn rejects_e0034_linear_lease_violations_and_e0011_stale_get() {
     expect_err_kind(
         r#"
         pool<u8, 4> p;
-        *u8 bad_ret() {
+        fn bad_ret() -> *u8 {
             Lease<u8> l = p.alloc();
             defer l.release();
             return l.get();
@@ -5215,7 +5215,7 @@ fn sys_tick_and_set_putc_hooks_validation() {
     // 3. `sys.set_putc` wrong callback signature -> TypeMismatch
     for bad_sig in [
         "fn bad(u16 c) {} fn main() { sys.set_putc(bad); }",
-        "u8 bad(u8 c) { return c; } fn main() { sys.set_putc(bad); }",
+        "fn bad(u8 c) -> u8 { return c; } fn main() { sys.set_putc(bad); }",
         "fn bad() {} fn main() { sys.set_putc(bad); }",
         "fn main() { sys.set_putc(); }",
     ] {
@@ -5278,15 +5278,15 @@ fn regression_s_h1_place_addr_provenance_preserving_scalar_reads() {
             [4]u8 payload;
         }
 
-        *u32 get_hdr(*Packet p) {
+        fn get_hdr(*Packet p) -> *u32 {
             return &p.hdr;
         }
 
-        *Packet id_pkt(*Packet p) {
+        fn id_pkt(*Packet p) -> *Packet {
             return &(*p);
         }
 
-        u8 read_once() {
+        fn read_once() -> u8 {
             []u8 sl = rx.read_slice();
             u8 first = sl[0];
             rx.consume(1);
@@ -5355,7 +5355,7 @@ fn regression_s_h1_place_addr_provenance_preserving_scalar_reads() {
     for bad in [
         r#"
         struct Packet { u32 hdr; }
-        *u32 esc_field() {
+        fn esc_field() -> *u32 {
             Packet pkt = Packet { hdr: 1 };
             *Packet p = &pkt;
             return &p.hdr;
@@ -5363,7 +5363,7 @@ fn regression_s_h1_place_addr_provenance_preserving_scalar_reads() {
         fn main() {}
         "#,
         r#"
-        *u32 esc_deref() {
+        fn esc_deref() -> *u32 {
             u32 x = 5;
             *u32 p = &x;
             return &(*p);
@@ -5372,7 +5372,7 @@ fn regression_s_h1_place_addr_provenance_preserving_scalar_reads() {
         "#,
         r#"
         byte_ring<16> rx;
-        *u8 esc_slice_elem() {
+        fn esc_slice_elem() -> *u8 {
             []u8 sl = rx.read_slice();
             return &sl[0];
         }
@@ -5380,7 +5380,7 @@ fn regression_s_h1_place_addr_provenance_preserving_scalar_reads() {
         "#,
         r#"
         byte_ring<16> rx;
-        *u8 esc_slice_ptr() {
+        fn esc_slice_ptr() -> *u8 {
             []u8 sl = rx.read_slice();
             return sl.ptr;
         }
@@ -5409,7 +5409,7 @@ fn regression_s_h2_short_circuit_and_or_lease_control_flow() {
             r#"
             struct Pkt {{ u32 id; }}
             pool<Pkt, 2> p;
-            bool take_it(Lease<Pkt> l) {{
+            fn take_it(Lease<Pkt> l) -> bool {{
                 l.release();
                 return true;
             }}
@@ -5451,7 +5451,7 @@ fn regression_s_h3_catch_mmio_and_linear_lease_bindings() {
     expect_err_kind(
         r#"
         mmio Regs { @rw u32 cr @ 0; }
-        u32 fall() error u32 { error 1; }
+        fn fall() -> u32 error u32 { error 1; }
         fn main() {
             u32 r = fall() catch (Regs e) { return; };
         }
@@ -5465,7 +5465,7 @@ fn regression_s_h3_catch_mmio_and_linear_lease_bindings() {
         struct Pkt { u32 x; }
         pool<Pkt, 2> p;
         enum AllocErr { Empty }
-        Lease<Pkt> try_get() error AllocErr {
+        fn try_get() -> Lease<Pkt> error AllocErr {
             Lease<Pkt> l = p.alloc(timeout: 1ms) catch { error Empty; };
             return l;
         }
@@ -5764,10 +5764,10 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
         ws.write(
             "mod_a.zev",
             r#"
-            pub extern "C" u32 hal_init(u32 v);
+            pub extern "C" fn hal_init(u32 v) -> u32;
             enum PrivA { Shared, OnlyA }
             pub enum PubA { Common, ExtraA }
-            pub u32 pick_a() {
+            pub fn pick_a() -> u32 {
                 PrivA x = Shared;
                 PubA y = Common;
                 return (x as u32) + (y as u32);
@@ -5777,9 +5777,9 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
         ws.write(
             "mod_b.zev",
             r#"
-            pub extern "C" u32 hal_init(u32 v);
+            pub extern "C" fn hal_init(u32 v) -> u32;
             pub enum PubB { Shared, Common, ExtraB }
-            pub u32 pick_b() {
+            pub fn pick_b() -> u32 {
                 PubB x = Shared;
                 return x as u32;
             }
@@ -5790,7 +5790,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
             r#"
             import mod_a as ma;
             import mod_b as mb;
-            extern "C" u32 hal_init(u32 v);
+            extern "C" fn hal_init(u32 v) -> u32;
             enum RootMode { Shared = 1 }
             fn main() {
                 RootMode m = Shared;
@@ -5802,7 +5802,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
         let root2 = ws.write(
             "extra.zev",
             r#"
-            pub extern "C" u32 hal_init(u32 v);
+            pub extern "C" fn hal_init(u32 v) -> u32;
             "#,
         );
         let p1 = zev_parser::parse_str_named(
@@ -5830,7 +5830,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
     for priv_pub_mod in [
         "struct Priv { u32 x; } pub struct Wrap { Priv p; }",
         "struct Priv { u32 x; } pub fn f(Priv p) {}",
-        "struct Priv { u32 x; } pub Priv f() { return Priv { x: 1 }; }",
+        "struct Priv { u32 x; } pub fn f() -> Priv { return Priv { x: 1 }; }",
         "enum PrivE { E0 } pub fn f() error PrivE { error E0; }",
         "struct Priv { u32 x; } pub extern \"C\" fn c_f(Priv p);",
         "enum PrivE { E0 } pub const PrivE C = PrivE.E0;",
@@ -5974,7 +5974,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
         irq IRQ_TIMER = 1;
 
         fn uart_putc(u8 c) { usize _u = c as usize; }
-        u32 read_ms() { return 42; }
+        fn read_ms() -> u32 { return 42; }
         fn on_exit(i32 code) { i32 _c = code; }
         fn on_fault() {}
         fn on_idle(u32 ms, u32 depth) { u32 _x = ms + depth; }
@@ -5985,7 +5985,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
             sys.tick_by(10);
         }
 
-        u32 lookup_rom(usize tbl, u32 code) {
+        fn lookup_rom(usize tbl, u32 code) -> u32 {
             u32 r = sys.rom_call_u32(0x18usize, ROM_LOOKUP_STACK, tbl, code);
             sys.rom_call_void(0x20usize, 16, r);
             return r;
@@ -5995,7 +5995,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
             sys.rom_call_noreturn(0x100usize, 0u32, 0u32);
         }
 
-        u32 diverging_fn() {
+        fn diverging_fn() -> u32 {
             sys.rom_call_noreturn(0x100usize);
         }
 
@@ -6032,7 +6032,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
     for bad in [
         "fn main() { sys.tick_by(); }",
         "fn main() { sys.tick_by(true); }",
-        "i32 bad() { return 0; } fn main() { sys.set_clock_ms(bad); }",
+        "fn bad() -> i32 { return 0; } fn main() { sys.set_clock_ms(bad); }",
         "fn bad(u32 x) {} fn main() { sys.set_exit(bad); }",
         "fn bad(u8 x) {} fn main() { sys.set_fault_handler(bad); }",
         "fn bad(u32 x) {} fn main() { sys.set_idle(bad); }",
@@ -6048,7 +6048,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
 
     // 3. Fallible (`error`) callback rejected on all new hooks -> TypeMismatch
     for bad_fallible in [
-        "u32 f() error { error; } fn main() { sys.set_clock_ms(f); }",
+        "fn f() -> u32 error { error; } fn main() { sys.set_clock_ms(f); }",
         "fn f(i32 c) error { error; } fn main() { sys.set_exit(f); }",
         "fn f() error { error; } fn main() { sys.set_fault_handler(f); }",
         "fn f(u32 a, u32 b) error { error; } fn main() { sys.set_idle(f); }",
@@ -6060,7 +6060,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
 
     // 4. Yielding callbacks rejected on all new hooks -> YieldingCallbackToExternC
     for bad_yielding in [
-        "u32 f() { checkpoint(); return 1; } fn main() { sys.set_clock_ms(f); }",
+        "fn f() -> u32 { checkpoint(); return 1; } fn main() { sys.set_clock_ms(f); }",
         "fn f(i32 c) { i32 _c = c; checkpoint(); } fn main() { sys.set_exit(f); }",
         "fn f() { checkpoint(); } fn main() { sys.set_fault_handler(f); }",
         "fn f(u32 a, u32 b) { u32 _x = a + b; checkpoint(); } fn main() { sys.set_idle(f); }",
@@ -6072,7 +6072,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
 
     // 5. Calling any `sys.set_*` inside an `isr` rejected -> InvalidControlFlow
     for bad_in_isr in [
-        "irq IRQ0 = 1; u32 f() { return 0; } isr h() { sys.set_clock_ms(f); } fn main() { IRQ0.attach(h); }",
+        "irq IRQ0 = 1; fn f() -> u32 { return 0; } isr h() { sys.set_clock_ms(f); } fn main() { IRQ0.attach(h); }",
         "irq IRQ0 = 1; fn f(i32 c) {} isr h() { sys.set_exit(f); } fn main() { IRQ0.attach(h); }",
         "irq IRQ0 = 1; fn f() {} isr h() { sys.set_fault_handler(f); } fn main() { IRQ0.attach(h); }",
         "irq IRQ0 = 1; fn f(u32 a, u32 b) {} isr h() { sys.set_idle(f); } fn main() { IRQ0.attach(h); }",
@@ -6237,7 +6237,7 @@ fn grouped_imports_pub_import_reexports_and_ambiguity() {
         base.join("pkg/a.zev"),
         r#"
 pub struct ItemA { u8 v; }
-pub u8 helper_a() { return 1u8; }
+pub fn helper_a() -> u8 { return 1u8; }
 "#,
     )
     .unwrap();
@@ -6245,14 +6245,14 @@ pub u8 helper_a() { return 1u8; }
         base.join("pkg/b.zev"),
         r#"
 pub struct ItemB { u16 v; }
-pub u16 helper_b() { return 2u16; }
+pub fn helper_b() -> u16 { return 2u16; }
 "#,
     )
     .unwrap();
     std::fs::write(
         base.join("pkg/dup.zev"),
         r#"
-pub u8 helper_a() { return 9u8; }
+pub fn helper_a() -> u8 { return 9u8; }
 "#,
     )
     .unwrap();
@@ -6322,11 +6322,11 @@ fn same_module_impl_ownership_visibility_and_generic_specialization() {
 pub struct Widget { u8 id; }
 
 impl Widget {
-    pub Widget make(u8 id) {
+    pub fn make(u8 id) -> Widget {
         return Widget { id: id };
     }
 
-    pub u8 id(self) {
+    pub fn id(self) -> u8 {
         return self.id;
     }
 
@@ -6352,7 +6352,7 @@ pub import modlib.inner;
 import modlib.facade as m;
 
 impl m.Widget {
-    pub u8 ext(self) { return self.id; }
+    pub fn ext(self) -> u8 { return self.id; }
 }
 
 fn main() {}
@@ -6369,7 +6369,7 @@ fn main() {}
 import modlib.facade as m;
 
 impl Widget {
-    pub u8 ext(self) { return 0u8; }
+    pub fn ext(self) -> u8 { return 0u8; }
 }
 
 fn main() {}
@@ -6416,7 +6416,7 @@ impl<T, usize N> Pair<T, N> {
 }
 
 impl<usize N> Pair<f32, N> {
-    pub f32 sum(*self) {
+    pub fn sum(*self) -> f32 {
         f32 s = 0.0f32;
         for (usize i in 0..self.len) {
             s += self.vals[i];
@@ -6427,7 +6427,7 @@ impl<usize N> Pair<f32, N> {
 
 struct Tag { u8 code; }
 impl Tag {
-    pub u8 get(self) { return self.code; }
+    pub fn get(self) -> u8 { return self.code; }
     pub fn bump(*self) { self.code += 1u8; }
 }
 
@@ -6462,7 +6462,7 @@ fn main() {
 fn const_aggregate_validation_and_mutability_guards() {
     // Non-constant struct/array initializers rejected
     let non_const_arr = r#"
-u16 runtime_val() { return 7u16; }
+fn runtime_val() -> u16 { return 7u16; }
 const [2]u16 BAD = [1u16, runtime_val()];
 fn main() {}
 "#;
@@ -6493,7 +6493,7 @@ fn main() {
 struct Pin { u8 port; }
 const Pin P = Pin { port: 1u8 };
 const [3]u16 LUT = [10u16, 20u16, 30u16];
-u16 take([]u16 s) { return s[0]; }
+fn take([]u16 s) -> u16 { return s[0]; }
 fn main() {
     u8 _p = P.port;
     u16 _x = LUT[1];

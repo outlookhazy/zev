@@ -6,7 +6,7 @@ import chip.stm32f3.gpio as cgpio;
 import hal.pwm as pwm;
 import std.math as math;
 
-u32 f_hrtim_hz() {
+fn f_hrtim_hz() -> u32 {
     u32 sws = (hw.RCC.cfgr >> 2) & 3u32;
     bool pll_src = (hw.RCC.cfgr3 & hw.RCC_CFGR3_HRTIM1SW_PLL) != 0u32;
     if (sws == 2u32 && pll_src) {
@@ -15,7 +15,7 @@ u32 f_hrtim_hz() {
     return rcc.pclk2_hz();
 }
 
-pub bool hrtim_dll_calibrate() {
+pub fn hrtim_dll_calibrate() -> bool {
     u32 sws = (hw.RCC.cfgr >> 2) & 3u32;
     if (sws == 2u32) {
         hw.RCC.cfgr3 = hw.RCC.cfgr3 | hw.RCC_CFGR3_HRTIM1SW_PLL;
@@ -35,7 +35,7 @@ pub bool hrtim_dll_calibrate() {
     return false;
 }
 
-pub pwm.Channel hrtim_cha1_pwm_pa8_start(u32 freq_hz, u16 initial_permil, *bool ok_out) {
+pub fn hrtim_cha1_pwm_pa8_start(u32 freq_hz, u16 initial_permil, *bool ok_out) -> pwm.Channel {
     *ok_out = false;
     if (freq_hz == 0u32 || !hrtim_dll_calibrate()) {
         return pwm.make_channel(1u8, 0u8, 0u8, 0u32, 0u16);

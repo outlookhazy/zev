@@ -235,7 +235,7 @@ isr dma1_ch1_isr(*dma_slot<DmaBurst> inflight, *inbox<Lease<DmaBurst>, 2> done_q
 }
 
 // ── Streaming NMEA-0183 Fixed-Point Parser Helpers (over std.str) ────────────
-usize nmea_verify_payload_len([]u8 buf) {
+fn nmea_verify_payload_len([]u8 buf) -> usize {
     usize star = str.find_byte(buf, '*') catch {
         return 0;
     };
@@ -252,7 +252,7 @@ usize nmea_verify_payload_len([]u8 buf) {
     return star;
 }
 
-i32 parse_coord_udeg([]u8 fld, []u8 hemi) {
+fn parse_coord_udeg([]u8 fld, []u8 hemi) -> i32 {
     if (fld.len < 4) {
         return 0i32;
     }
@@ -288,7 +288,7 @@ i32 parse_coord_udeg([]u8 fld, []u8 hemi) {
     return udeg as i32;
 }
 
-i32 parse_alt_dm([]u8 fld) {
+fn parse_alt_dm([]u8 fld) -> i32 {
     if (fld.len == 0) {
         return 0i32;
     }
@@ -469,7 +469,7 @@ task cli_worker(*byte_ring rx, *inbox<SupEvent, 8> sup) {
 }
 
 // ── Application-Level Hardware Validation Suites (HAL + Chip Drivers) ───────
-u32 sample_a0_window_pct(gpio.Pin pin_a0, u32 window_ms) {
+fn sample_a0_window_pct(gpio.Pin pin_a0, u32 window_ms) -> u32 {
     u32 t0 = sys.now_ms();
     u32 highs = 0u32;
     u32 total = 0u32;
@@ -490,7 +490,7 @@ u32 sample_a0_window_pct(gpio.Pin pin_a0, u32 window_ms) {
     return ((highs * 100u32) + (total / 2u32)) / total;
 }
 
-u32 sample_a0_pwm_pct(*pwm.Channel ch, gpio.Pin pin_a0, u16 duty_permil) {
+fn sample_a0_pwm_pct(*pwm.Channel ch, gpio.Pin pin_a0, u16 duty_permil) -> u32 {
     ch.set_duty_permil(duty_permil);
 
     // Yield >= 3 ms ticks so OC1PE preload register latches on a clean 1 kHz PWM period boundary.
@@ -498,7 +498,7 @@ u32 sample_a0_pwm_pct(*pwm.Channel ch, gpio.Pin pin_a0, u16 duty_permil) {
     return sample_a0_window_pct(pin_a0, 20u32);
 }
 
-LoopbackReport run_d7_a0_loopback_test() {
+fn run_d7_a0_loopback_test() -> LoopbackReport {
     f3.tim1_pwm_ch1_stop();
     bsp.ARD_A0.set_mode(gpio.Mode.Input, gpio.Pull.Down);
     bsp.ARD_D7.set_low();
@@ -532,7 +532,7 @@ LoopbackReport run_d7_a0_loopback_test() {
     };
 }
 
-u16 probe_a1_with_discharge() {
+fn probe_a1_with_discharge() -> u16 {
     bsp.ARD_A1.set_mode(gpio.Mode.Input, gpio.Pull.Down);
     htime.spin_us(40u32);
     bsp.ARD_A1.set_mode(gpio.Mode.Analog, gpio.Pull.None);
@@ -541,7 +541,7 @@ u16 probe_a1_with_discharge() {
     return ch_a1.read_u16() or 0u16;
 }
 
-AnalogReport run_analog_test() {
+fn run_analog_test() -> AnalogReport {
     u16 vref_counts = f3.read_vrefint_counts() or 0u16;
 
     // Sample D7 (PA8) -> A0 (PA0) analog levels via ADC1_IN1, then restore A0 digital input.
@@ -620,7 +620,7 @@ AnalogReport run_analog_test() {
     };
 }
 
-CanReport run_bxcan_test() {
+fn run_bxcan_test() -> CanReport {
     f3.can1_init(500_000u32, f3.CAN_MODE_SILENT_LOOPBACK);
 
     bus.CanFrame tx1 = bus.CanFrame {
@@ -723,7 +723,7 @@ fn print_gps_report() {
     println(f"[PINS] pb0_fix(A3)={p.pb0_level}(edges={p.pb0_fix_edges}) pc1_pps(A4)={p.pc1_level}(edges={p.pc1_pps_edges}) pb1_pps={p.pb1_level}(edges={p.pb1_pps_edges}) btn_b1={p.button_pressed}(edges={p.button_edges}) tim2_ms={p.tim2_ticks}");
 }
 
-u8 reset_reason_code(bus.ResetReason rr) {
+fn reset_reason_code(bus.ResetReason rr) -> u8 {
     switch (rr) {
         bus.ResetReason.PowerOn       => { return 1u8; }
         bus.ResetReason.PinReset      => { return 2u8; }
@@ -736,7 +736,7 @@ u8 reset_reason_code(bus.ResetReason rr) {
     }
 }
 
-bool print_system_report(bus.ResetReason boot_rr) {
+fn print_system_report(bus.ResetReason boot_rr) -> bool {
     u32 sysclk = f3.sysclk_hz();
     u32 hclk = f3.hclk_hz();
     u32 pclk1 = f3.pclk1_hz();
@@ -762,7 +762,7 @@ bool print_system_report(bus.ResetReason boot_rr) {
     return ok;
 }
 
-bool print_fpu_report() {
+fn print_fpu_report() -> bool {
     u32 rt_one = 0u32;
     if (f3.sysclk_hz() >= 1_000_000u32) {
         rt_one = 1u32;
@@ -797,7 +797,7 @@ bool print_fpu_report() {
     return ok;
 }
 
-bool print_hrtim_report() {
+fn print_hrtim_report() -> bool {
     f3.tim1_pwm_ch1_stop();
     bsp.ARD_A0.set_mode(gpio.Mode.Input, gpio.Pull.Down);
 
@@ -824,7 +824,7 @@ bool print_hrtim_report() {
     return ok;
 }
 
-bool print_flash_nvs_report() {
+fn print_flash_nvs_report() -> bool {
     bool erase_ok = f3.flash_nvs_erase();
     checkpoint();
     u32 blank = f3.flash_nvs_read_u32(0);
@@ -850,7 +850,7 @@ bool print_flash_nvs_report() {
     return ok;
 }
 
-bool print_bus_probe_report() {
+fn print_bus_probe_report() -> bool {
     spi.Bus spi1 = f3.spi1_init(bus.SpiMode.Mode0, 4u8, f3.SPI1_PINS_PB3_5, 25u32);
     bool spi_ok = true;
     u8 spi_echo = spi1.transfer_byte(0xA5u8) catch {
@@ -878,25 +878,25 @@ bool print_bus_probe_report() {
     return ok;
 }
 
-bool print_loopback_report() {
+fn print_loopback_report() -> bool {
     LoopbackReport lb = run_d7_a0_loopback_test();
     println(f"[LOOPBACK D7(PA8)->A0(PA0)] ok={lb.ok} dig0={lb.dig_low_ok} dig1={lb.dig_high_ok} pwm25={lb.pwm25_pct}% pwm75={lb.pwm75_pct}%");
     return lb.ok;
 }
 
-bool print_analog_report() {
+fn print_analog_report() -> bool {
     AnalogReport an = run_analog_test();
     println(f"[ANALOG] ok={an.ok} vref_cnt={an.vref_counts} a0_lo={an.a0_low_counts} a0_hi={an.a0_high_counts} dac_adc2=({an.dac_low_adc2},{an.dac_high_adc2}) a1_probe=({an.a1_low_adc1},{an.a1_high_adc1},jumper={an.a2_a1_jumper}) comp2=({an.comp_low_out},{an.comp_high_out},csr=0x{an.comp_csr_lo:08x}/0x{an.comp_csr_hi:08x})");
     return an.ok;
 }
 
-bool print_can_report() {
+fn print_can_report() -> bool {
     CanReport can = run_bxcan_test();
     println(f"[CAN] ok={can.ok} std(ok={can.std_ok},id=0x{can.std_id:03x},dlc={can.std_dlc}) ext(ok={can.ext_ok},id=0x{can.ext_id:08x},dlc={can.ext_dlc})");
     return can.ok;
 }
 
-bool run_dma_test() {
+fn run_dma_test() -> bool {
     Lease<DmaBurst> job = dma_pool.try_alloc() catch {
         println("[DMA] ok=false err=pool_empty");
         return false;

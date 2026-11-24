@@ -2,7 +2,7 @@
 
 import chip.esp32c6 as hw;
 
-u32 read_systimer_lo() {
+fn read_systimer_lo() -> u32 {
     hw.SYSTIMER.unit0_op = 1u32 << 30;
     for (u32 _w in 0..256) {
         if ((hw.SYSTIMER.unit0_op & (1u32 << 29)) != 0u32) {

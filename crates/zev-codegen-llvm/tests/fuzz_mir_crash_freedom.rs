@@ -126,9 +126,10 @@ fn synthesize_program(rng: &mut XorShift64, idx: usize) -> String {
 
     if use_generics {
         s.push_str(
-            "T id_val<T>(T x) {\n\
-                 return x;\n\
-             }\n",
+            "fn id_val<T>(T x) -> T {\
+return x;\
+}\
+",
         );
     }
 
@@ -140,7 +141,7 @@ fn synthesize_program(rng: &mut XorShift64, idx: usize) -> String {
     }
 
     s.push_str(&format!(
-        "u32 helper_calc(Pair p, {ty} n) {{\n\
+        "fn helper_calc(Pair p, {ty} n) -> u32 {{\n\
              u32 acc = p.a {op} p.b;\n"
     ));
 

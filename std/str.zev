@@ -6,11 +6,11 @@ pub enum ParseErr {
     Overflow,
 }
 
-bool is_ascii_ws(u8 b) {
+fn is_ascii_ws(u8 b) -> bool {
     return b == ' ' || b == '\t' || b == '\r' || b == '\n';
 }
 
-pub []u8 trim_ascii([]u8 s) {
+pub fn trim_ascii([]u8 s) -> []u8 {
     usize start = 0;
     usize end = s.len;
     noyield {
@@ -30,7 +30,7 @@ pub []u8 trim_ascii([]u8 s) {
     return s[start..end];
 }
 
-pub bool eq_bytes([]u8 a, []u8 b) {
+pub fn eq_bytes([]u8 a, []u8 b) -> bool {
     if (a.len != b.len) {
         return false;
     }
@@ -42,7 +42,7 @@ pub bool eq_bytes([]u8 a, []u8 b) {
     return true;
 }
 
-pub bool starts_with([]u8 s, []u8 prefix) {
+pub fn starts_with([]u8 s, []u8 prefix) -> bool {
     if (s.len < prefix.len) {
         return false;
     }
@@ -54,7 +54,7 @@ pub bool starts_with([]u8 s, []u8 prefix) {
     return true;
 }
 
-pub usize find_byte([]u8 s, u8 needle) error ParseErr {
+pub fn find_byte([]u8 s, u8 needle) -> usize error ParseErr {
     for (usize i in 0..s.len) {
         if (s[i] == needle) {
             return i;
@@ -63,7 +63,7 @@ pub usize find_byte([]u8 s, u8 needle) error ParseErr {
     error Empty;
 }
 
-pub []u8 split_nth([]u8 s, u8 delim, usize target_idx) error ParseErr {
+pub fn split_nth([]u8 s, u8 delim, usize target_idx) -> []u8 error ParseErr {
     usize cur_idx = 0;
     usize start = 0;
     for (usize i in 0..s.len) {
@@ -81,11 +81,11 @@ pub []u8 split_nth([]u8 s, u8 delim, usize target_idx) error ParseErr {
     error Empty;
 }
 
-pub []u8 field_or_empty([]u8 s, u8 delim, usize target_idx) {
+pub fn field_or_empty([]u8 s, u8 delim, usize target_idx) -> []u8 {
     return split_nth(s, delim, target_idx) or s[0..0];
 }
 
-pub u8 hex_val(u8 c) error ParseErr {
+pub fn hex_val(u8 c) -> u8 error ParseErr {
     if (c >= '0' && c <= '9') {
         return c - '0';
     }
@@ -98,7 +98,7 @@ pub u8 hex_val(u8 c) error ParseErr {
     error InvalidByte;
 }
 
-pub u8 parse_hex_u8([]u8 s) error ParseErr {
+pub fn parse_hex_u8([]u8 s) -> u8 error ParseErr {
     if (s.len == 0) {
         error Empty;
     }
@@ -113,7 +113,7 @@ pub u8 parse_hex_u8([]u8 s) error ParseErr {
     return acc;
 }
 
-pub u32 parse_hex_u32([]u8 s) error ParseErr {
+pub fn parse_hex_u32([]u8 s) -> u32 error ParseErr {
     if (s.len == 0) {
         error Empty;
     }
@@ -128,7 +128,7 @@ pub u32 parse_hex_u32([]u8 s) error ParseErr {
     return acc;
 }
 
-pub u32 parse_u32([]u8 s) error ParseErr {
+pub fn parse_u32([]u8 s) -> u32 error ParseErr {
     if (s.len == 0) {
         error Empty;
     }
@@ -146,7 +146,7 @@ pub u32 parse_u32([]u8 s) error ParseErr {
     return acc;
 }
 
-pub i32 parse_i32([]u8 s) error ParseErr {
+pub fn parse_i32([]u8 s) -> i32 error ParseErr {
     if (s.len == 0) {
         error Empty;
     }
@@ -186,7 +186,7 @@ pub i32 parse_i32([]u8 s) error ParseErr {
     return acc as i32;
 }
 
-pub u8 xor_checksum([]u8 s) {
+pub fn xor_checksum([]u8 s) -> u8 {
     u8 acc = 0u8;
     for (u8 b in s) {
         acc = acc ^ b;

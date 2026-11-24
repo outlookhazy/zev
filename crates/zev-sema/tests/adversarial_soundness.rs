@@ -295,7 +295,7 @@ fn main() { bad_scope_assign(); }
 
     // ── E0009: ReturnLocalReference ──────────────────────────────────────────
     e0009_return_local_subslice(expect_err, DiagnosticKind::ReturnLocalReference) => r#"
-[]u8 bad_ret() {
+fn bad_ret() -> []u8 {
     [4]u8 local_arr = [1u8, 2u8, 3u8, 4u8];
     return local_arr[0..2];
 }
@@ -304,7 +304,7 @@ fn main() { []u8 _s = bad_ret(); }
 
     e0009_return_struct_wrapping_local_array_slice(expect_err, DiagnosticKind::ReturnLocalReference) => r#"
 struct SliceWrap { []u8 s; }
-SliceWrap bad_ret_struct() {
+fn bad_ret_struct() -> SliceWrap {
     [4]u8 arr = [1u8, 2u8, 3u8, 4u8];
     return SliceWrap { s: arr };
 }
@@ -312,7 +312,7 @@ fn main() { SliceWrap _w = bad_ret_struct(); }
 "#;
 
     e0009_return_local_array_directly_as_slice(expect_err, DiagnosticKind::ReturnLocalReference) => r#"
-[]u8 bad_direct() {
+fn bad_direct() -> []u8 {
     [4]u8 arr = [1u8, 2u8, 3u8, 4u8];
     return arr;
 }
@@ -320,7 +320,7 @@ fn main() { []u8 _s = bad_direct(); }
 "#;
 
     e0009_return_local_slice_bound_via_array_coercion(expect_err, DiagnosticKind::ReturnLocalReference) => r#"
-[]u8 bad_via_local() {
+fn bad_via_local() -> []u8 {
     [4]u8 arr = [1u8, 2u8, 3u8, 4u8];
     []u8 s = arr;
     return s;
@@ -329,8 +329,8 @@ fn main() { []u8 _s = bad_via_local(); }
 "#;
 
     e0009_return_local_array_through_identity_helper(expect_err, DiagnosticKind::ReturnLocalReference) => r#"
-[]u8 id([]u8 x) { return x; }
-[]u8 bad_via_call() {
+fn id([]u8 x) -> []u8 { return x; }
+fn bad_via_call() -> []u8 {
     [4]u8 local_arr = [1u8, 2u8, 3u8, 4u8];
     return id(local_arr);
 }
@@ -461,7 +461,7 @@ fn main() { spawn w() @normal; }
 
     // ── E0014: ReturnMismatch ────────────────────────────────────────────────
     e0014_missing_return_on_else_branch_rejected(expect_err, DiagnosticKind::ReturnMismatch) => r#"
-u32 missing_else(bool c) {
+fn missing_else(bool c) -> u32 {
     if (c) {
         return 1u32;
     }
@@ -470,7 +470,7 @@ fn main() { u32 _x = missing_else(false); }
 "#;
 
     e0014_wrong_return_value_type_rejected(expect_err, DiagnosticKind::ReturnMismatch) => r#"
-u32 wrong_ty() {
+fn wrong_ty() -> u32 {
     return true;
 }
 fn main() { u32 _x = wrong_ty(); }
@@ -506,7 +506,7 @@ fn main() {
 
     e0016_unhandled_typed_error_call_rejected(expect_err, DiagnosticKind::UnhandledFallibleExpr) => r#"
 enum BusErr { Nack }
-u8 read_reg() error BusErr { error Nack; }
+fn read_reg() -> u8 error BusErr { error Nack; }
 fn main() {
     u8 _v = read_reg();
 }
@@ -515,7 +515,7 @@ fn main() {
     // ── E0017: InvalidCatchSignature ─────────────────────────────────────────
     e0017_value_catch_without_fallback_or_diverge_rejected(expect_err, DiagnosticKind::InvalidCatchSignature) => r#"
 enum E { Fail }
-u32 fallible() error E { error Fail; }
+fn fallible() -> u32 error E { error Fail; }
 fn bad() {
     u32 _x = fallible() catch (E _) {
         sys.nop();
@@ -526,7 +526,7 @@ fn main() { bad(); }
 
     e0017_catch_wrong_parameter_type_rejected(expect_err, DiagnosticKind::InvalidCatchSignature) => r#"
 enum E { Fail }
-u32 fallible() error E { error Fail; }
+fn fallible() -> u32 error E { error Fail; }
 fn bad() {
     u32 _x = fallible() catch (u32 _wrong) {
         return;
@@ -538,14 +538,14 @@ fn main() { bad(); }
     // ── E0018: InvalidOrFallback ─────────────────────────────────────────────
     e0018_mismatched_or_fallback_type_rejected(expect_err, DiagnosticKind::InvalidOrFallback) => r#"
 enum E { Fail }
-u32 fallible() error E { error Fail; }
+fn fallible() -> u32 error E { error Fail; }
 fn main() {
     u32 _x = fallible() or false;
 }
 "#;
 
     e0018_or_fallback_on_infallible_expr_rejected(expect_err, DiagnosticKind::InvalidOrFallback) => r#"
-u32 pure_val() { return 7u32; }
+fn pure_val() -> u32 { return 7u32; }
 fn main() {
     u32 _x = pure_val() or 0u32;
 }
@@ -658,7 +658,7 @@ fn main() { spawn t() @normal; }
 "#;
 
     e0025_statement_after_return_rejected(expect_err, DiagnosticKind::UnreachableCode) => r#"
-u32 dead_tail() {
+fn dead_tail() -> u32 {
     return 1u32;
     u32 x = 2u32;
     return x;
@@ -756,7 +756,7 @@ fn main() { fmt_enum_too_small(State.Ok); }
 
     // ── E0029: GenericInstantiationError ─────────────────────────────────────
     e0029_generic_wrong_type_arg_arity_rejected(expect_mono_err, DiagnosticKind::GenericInstantiationError) => r#"
-T id_val<T>(T x) { return x; }
+fn id_val<T>(T x) -> T { return x; }
 fn main() {
     u32 _v = id_val<u32, u8>(1u32);
 }
@@ -1050,7 +1050,7 @@ fn main() { leak_wrapper(); }
     e0034_leaking_lease_inside_catch_block_rejected(expect_err, DiagnosticKind::LinearLeaseViolation) => r#"
 enum E { Fail }
 pool<[4]u8, 2> p;
-u32 fallible() error E { error Fail; }
+fn fallible() -> u32 error E { error Fail; }
 fn bad_catch() {
     u32 _v = fallible() catch (E _) {
         Lease<[4]u8> _l = p.try_alloc() catch { return; };
@@ -1088,7 +1088,7 @@ fn e0030_forged_private_canonical_symbol_across_modules_rejected() {
     std::fs::create_dir_all(&base).expect("create temp module dir");
     std::fs::write(
         base.join("vault.zev"),
-        "u32 hidden_key() { return 7u32; }\npub u32 public_api() { return hidden_key(); }\n",
+        "fn hidden_key() -> u32 { return 7u32; }\npub fn public_api() -> u32 { return hidden_key(); }\n",
     )
     .expect("write vault.zev");
 
@@ -1224,8 +1224,8 @@ fn positive_const_and_caller_ptr_array_to_slice_return() {
         r#"
 const [4]u8 LUT = [1u8, 2u8, 3u8, 4u8];
 struct S { [4]u8 arr; }
-[]u8 lut_view() { return LUT; }
-[]u8 view(*S p) { return p.arr; }
+fn lut_view() -> []u8 { return LUT; }
+fn view(*S p) -> []u8 { return p.arr; }
 fn main() {
     []u8 _a = lut_view();
     S inst = S { arr: [5u8, 6u8, 7u8, 8u8] };

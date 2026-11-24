@@ -33,7 +33,7 @@ pub fn clear_motor_enable() {
     hw.GPIOA.data = 0;
 }
 
-pub u32 read_motor_enable() {
+pub fn read_motor_enable() -> u32 {
     return hw.GPIOA.data & 1;
 }
 
@@ -43,7 +43,7 @@ pub fn set_pwm_duty(u8 ch, u16 duty) {
     }
 }
 
-pub u32 read_pwm_duty(u8 ch) {
+pub fn read_pwm_duty(u8 ch) -> u32 {
     if (ch == 1) {
         return hw.TIMER0.tamatchr;
     }
@@ -72,22 +72,22 @@ pub fn set_led(bool on) {
     PIN_USER_OUT.write(on);
 }
 
-pub bool read_button() {
+pub fn read_button() -> bool {
     return PIN_BUTTON.read();
 }
 
-pub adc.Channel default_adc() {
+pub fn default_adc() -> adc.Channel {
     return adc.make_channel(1u8, 1u8, 3300u16);
 }
 
-pub pwm.Channel default_pwm() {
+pub fn default_pwm() -> pwm.Channel {
     return pwm.make_channel(0u8, 1u8, 0u8, 1000u32, 0u16);
 }
 
-pub spi.Bus default_spi() {
+pub fn default_spi() -> spi.Bus {
     return spi.make_bus(1u8, 10u32);
 }
 
-pub i2c.Bus default_i2c() {
+pub fn default_i2c() -> i2c.Bus {
     return i2c.make_bus(1u8, 10u32);
 }

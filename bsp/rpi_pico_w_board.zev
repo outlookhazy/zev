@@ -64,15 +64,15 @@ pub fn set_led(bool on) {
     PIN_USER_OUT.write(on);
 }
 
-pub bool read_button() {
+pub fn read_button() -> bool {
     return PIN_BUTTON.read();
 }
 
-pub adc.Channel default_adc() {
+pub fn default_adc() -> adc.Channel {
     return adc.make_channel(1u8, 4u8, 3300u16);
 }
 
-pub pwm.Channel default_pwm() {
+pub fn default_pwm() -> pwm.Channel {
     hw.RESETS_CLR.reset = hw.RESETS_PWM;
     for (u32 _w in 0..1024) {
         if ((hw.RESETS.reset_done & hw.RESETS_PWM) != 0u32) {
@@ -90,7 +90,7 @@ pub pwm.Channel default_pwm() {
     return pwm.make_channel(0u8, 2u8, 0u8, 1000u32, 0u16);
 }
 
-pub spi.Bus default_spi() {
+pub fn default_spi() -> spi.Bus {
     hw.RESETS_CLR.reset = hw.RESETS_SPI0;
     for (u32 _w in 0..1024) {
         if ((hw.RESETS.reset_done & hw.RESETS_SPI0) != 0u32) {
@@ -111,7 +111,7 @@ pub spi.Bus default_spi() {
     return spi.make_bus(1u8, 10u32);
 }
 
-pub i2c.Bus default_i2c() {
+pub fn default_i2c() -> i2c.Bus {
     hw.RESETS_CLR.reset = hw.RESETS_I2C0;
     for (u32 _w in 0..1024) {
         if ((hw.RESETS.reset_done & hw.RESETS_I2C0) != 0u32) {

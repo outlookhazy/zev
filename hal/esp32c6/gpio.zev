@@ -20,7 +20,7 @@ pub struct Pin {
     bool active_low;
 }
 
-pub Pin make_pin(u8 port, u8 pin, bool active_low) {
+pub fn make_pin(u8 port, u8 pin, bool active_low) -> Pin {
     return Pin {
         port: port,
         pin: pin,
@@ -28,7 +28,7 @@ pub Pin make_pin(u8 port, u8 pin, bool active_low) {
     };
 }
 
-bool pin_guarded(u8 port, u8 pin) {
+fn pin_guarded(u8 port, u8 pin) -> bool {
     if (port != 0u8 || pin >= 31u8) {
         return true;
     }
@@ -39,7 +39,7 @@ bool pin_guarded(u8 port, u8 pin) {
     return false;
 }
 
-u32 pull_cfg(Pull p) {
+fn pull_cfg(Pull p) -> u32 {
     switch (p) {
         Pull.None => { return 0u32; }
         Pull.Up   => { return 1u32 << 8; } // FUN_WPU
@@ -73,7 +73,7 @@ impl Pin {
         }
     }
 
-    pub bool read(self) {
+    pub fn read(self) -> bool {
         if (self.port != 0u8 || self.pin >= 31u8) {
             return false;
         }

@@ -30,7 +30,7 @@ pub fn set_pwm_duty(u8 ch, u16 duty) {
     }
 }
 
-pub u32 read_pwm_duty(u8 ch) {
+pub fn read_pwm_duty(u8 ch) -> u32 {
     if (ch >= 1 && ch <= 4) {
         usize idx = (ch - 1) as usize;
         return hw.TIM1.ccr[idx];

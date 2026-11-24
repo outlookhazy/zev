@@ -27,7 +27,7 @@ struct Controller {
 }
 
 impl Controller {
-    Controller make(pwm.Channel ch, u16 target_mv) {
+    fn make(pwm.Channel ch, u16 target_mv) -> Controller {
         return Controller {
             drive: ch,
             target_mv: target_mv,
@@ -59,7 +59,7 @@ impl Controller {
     }
 }
 
-u16 sum_slice([]u16 xs) {
+fn sum_slice([]u16 xs) -> u16 {
     u16 total = 0u16;
     for (u16 x in xs) {
         total += x;

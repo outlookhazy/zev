@@ -1703,7 +1703,7 @@ mod tests {
             ("p5.zev", "fn main() { match x { } }\n", "P0005"),
             (
                 "p6.zev",
-                "enum E { A }\nu16 f() error E { error A; }\nfn main() { u16 v = f() catch |e| { return; }; }\n",
+                "enum E { A }\nfn f() -> u16 error E { error A; }\nfn main() { u16 v = f() catch |e| { return; }; }\n",
                 "P0006",
             ),
             ("p7.zev", "!u16 f() { return 1; }\n", "P0007"),
@@ -1771,7 +1771,7 @@ mod tests {
 
         let ok = check_temp_file(
             "partial_ok.zev",
-            "enum IoErr { Timeout }\nu32 read_chunk() error IoErr {\n    error Timeout, 12;\n}\nfn main() {\n    u32 n = read_chunk() catch (IoErr e, u32 partial) {\n        return;\n    };\n}\n",
+            "enum IoErr { Timeout }\nfn read_chunk() -> u32 error IoErr {\n    error Timeout, 12;\n}\nfn main() {\n    u32 n = read_chunk() catch (IoErr e, u32 partial) {\n        return;\n    };\n}\n",
         )
         .unwrap_or_else(|e| panic!("partial_ok.zev must pass:\n{}", e.human));
         let ok_dual: Vec<String> = ok.sema.dual_specialized_fns.iter().cloned().collect();
@@ -1793,7 +1793,7 @@ mod tests {
         let dual_src = "\
 watch<u32> latest = 0;
 
-u32 hash_chunk(u32 seed) {
+fn hash_chunk(u32 seed) -> u32 {
     u32 acc = seed;
     for (u32 i in 0..4) {
         acc = (acc * 33) ^ i;
@@ -1887,7 +1887,7 @@ struct FixedVec<T, usize N> {
     usize len;
 }
 
-T clamp<T>(T val, T lo, T hi) {
+fn clamp<T>(T val, T lo, T hi) -> T {
     if (val < lo) {
         return lo;
     }
@@ -2018,11 +2018,11 @@ struct FixedVec<T, usize N> {
     usize len;
 }
 
-T scale_add<T, usize N>(T v) {
+fn scale_add<T, usize N>(T v) -> T {
     return v;
 }
 
-bool check_window(bool lo_ok, bool hi_ok) {
+fn check_window(bool lo_ok, bool hi_ok) -> bool {
     return lo_ok && hi_ok;
 }
 ";
@@ -2106,7 +2106,7 @@ struct DecodedPacket {
 
 enum PacketErr { Corrupt }
 
-DecodedPacket decode_bad() error PacketErr {
+fn decode_bad() -> DecodedPacket error PacketErr {
     error Corrupt;
 }
 
@@ -2601,7 +2601,7 @@ isr on_fpool(*inbox<Lease<u32>, 1> rel_q, *signal done_s) {
     done_s.notify(boost: @high);
 }
 
-u32 wait_watch_helper(*watch<u32> w) {
+fn wait_watch_helper(*watch<u32> w) -> u32 {
     return w.wait_change(timeout: 500ms) catch {
         return 999999u32;
     };
@@ -3074,5 +3074,37 @@ fn main() {
         assert!(json.contains("\"max_run_kind\": \"bounded-for\""), "json={json}");
         assert!(json.contains("\"blueprint\": \"t_spin\""), "json={json}");
         assert!(json.contains("\"max_run_kind\": \"noyield-spin\""), "json={json}");
+    }
+
+    #[test]
+    fn fn_pick_returns_fn_pointer_and_runs() {
+        let src = "\
+fn inc_one(u32 x) -> u32 {
+    return x + 1u32;
+}
+
+fn pick() -> fn(u32) -> u32 {
+    return inc_one;
+}
+
+fn main() {
+    fn(u32) -> u32 cb = pick();
+    assert(cb(41u32) == 42u32);
+    assert(pick()(99u32) == 100u32);
+    sys.exit(0);
+}
+";
+        let temp = TempWorkDir::create("zevc-fn-pick-ptr").unwrap();
+        let src_path = temp.dir.join("pick.zev");
+        std::fs::write(&src_path, src).unwrap();
+
+        let (_, mir) = compile_to_mir(&[src_path]).expect("fn pick() -> fn(u32) -> u32 must check & lower");
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        let exit = runner::compile_and_run_host_llvm(&host_ll, true, &[]).unwrap();
+        assert_eq!(exit, 0);
     }
 }

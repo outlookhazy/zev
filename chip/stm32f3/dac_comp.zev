@@ -25,11 +25,11 @@ pub fn comp2_enable_pa7_vrefint() {
     hw.SYSCFG_COMP.comp2_csr = (3u32 << 4) | 1u32; // INM=VREFINT, INP=PA7, EN=1
 }
 
-pub bool comp2_read_out() {
+pub fn comp2_read_out() -> bool {
     return (hw.SYSCFG_COMP.comp2_csr & (1u32 << 30)) != 0u32;
 }
 
-pub u32 comp2_raw_csr() {
+pub fn comp2_raw_csr() -> u32 {
     return hw.SYSCFG_COMP.comp2_csr;
 }
 

@@ -2,7 +2,7 @@
 //!
 //! Designed so an AI coding agent or embedded systems engineer can learn idiomatic Zev
 //! in 1 tool call (`zevc doc`), drill into focused ~60-line topic guides (`zevc doc <topic>`),
-//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0017`, `E0001`..`E0034`).
+//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0018`, `E0001`..`E0034`).
 
 use crate::docs_errors::{ErrorDoc, ERROR_DOCS};
 use std::fmt::Write;
@@ -42,13 +42,13 @@ ROSETTA STONE (FOREIGN HABIT -> IDIOMATIC ZEV):
   Foreign Habit (Rust / Zig / Go / C)     | Idiomatic Zev (`.zev`)
   ----------------------------------------+-----------------------------------------------------
   `let mut x: u32 = 1;` / `var x = 1;`    | `u32 x = 1;` / `f32 gain = 0.25f32;`
-  `fn add(a: u16, b: u16) -> u16`         | `u16 add(u16 a, u16 b)`   (`fn init()` = `void`)
+  `fn add(a: u16, b: u16) -> u16`         | `fn add(u16 a, u16 b) -> u16` (`fn init()` = `void`)
   `uint8_t *p;` / `uint8_t buf[16];`      | `*u8 p;` / `[16]u8 buf;`  (canonical prefix syntax)
   `template<class T, size_t N>` / `Vec<T>`| `struct FixedVec<T, usize N> { [N]T data; usize len; }`
-  `async fn f()` + `f().await`            | `u16 f()` + `f()`         (3-tier call-graph inferred)
+  `async fn f()` + `f().await`            | `fn f() -> u16` + `f()`       (3-tier call-graph inferred)
   `select { a = ch1 => ..., b = ch2 }`    | `wait { Ev a = q1.recv() => ..., timeout 50ms => ... }`
   `match ev { A => ..., B => ... }`       | `switch (ev) { A => { ... } _ => { ... } }`
-  `Result<u16, E>` / `!u16` / `try f()`   | `u16 f() error E` + `error Bad;` + `catch (E e)` / `or 0`
+  `Result<u16, E>` / `!u16` / `try f()`   | `fn f() -> u16 error E` + `error Bad;` + `catch (E e)` / `or 0`
   `for (int i=0; i<n; i++)` / `for i in`  | `for (usize i in 0..n) { ... }` / `for (u8 b in slice)`
   `every 1ms { ... }` / `chan<T, N>`      | `loop every 1ms { ... }` / unified `inbox<T, N>`
   `struct R<'a> { b: &'a mut [u8] }`      | `struct R { []u8 b; }` + `*byte_ring` / `*inbox<T>` views
@@ -66,7 +66,7 @@ SHARDED TOPIC GUIDES (`zevc doc <topic>`):
   zevc doc targets      `zevc check [--json]`, `ram --board`, `import-svd`, `run --sanitize`, `run-qemu`, ESP32-C6, AVR, RP2040
 
 ERROR CODE EXPLAINERS (`zevc doc <code>` or `zevc doc --list`):
-  Parser Traps   : P0001..P0017  (rewrites for `let`, `->`, `async`, `select`, `for(;;)`, `every`, `chan`, `lease`, postfix `*`/`[]`, `->`/`:`/`(T)x` casts)
+  Parser Traps   : P0001..P0018  (rewrites for `let`, `:`, `async`, `select`, `for(;;)`, `every`, `chan`, `lease`, postfix `*`/`[]`, `->`/`:`/`(T)x`/`Ret fn` casts & decls)
   Static Verifier: E0001..E0034  (isolation, 3-tier yields, DMA/linear `Lease<T>`, `modules`, `mmio`, `irq.attach`, `state`)
 ================================================================================
 ";
@@ -118,7 +118,7 @@ Aggregate `const` structs/arrays live in `.rodata` and support direct field read
 read-only slicing (`LUT_DUTY[0..2]`); taking `&CONST.field` or calling a `*self` method on a `const`
 value is rejected at compile time.
 
-## 3. Same-Module `impl` Blocks, `Ret name(...)` Signatures & `<T, usize N>` Generics
+## 3. Same-Module `impl` Blocks, `fn name(...) [-> Ret]` Signatures & `<T, usize N>` Generics
 - User `struct`s and `fn`s support compile-time monomorphized `<T>` and `<T, usize N>` parameters (`zevc ram`
   and `zevc check --json` report concrete Flash instantiations; `E0029` on misuse).
 - `<...>` disambiguation is purely syntactic: after `ident` or `module.ident` in expression position, `<...>`
@@ -145,13 +145,13 @@ impl<T, usize N> FixedVec<T, N> {
 }
 
 impl<usize N> FixedVec<f32, N> {
-    pub f32 first_or_zero(*self) {
+    pub fn first_or_zero(*self) -> f32 {
         if (self.len == 0) { return 0.0f32; }
         return self.data[0];
     }
 }
 
-T clamp<T>(T val, T lo, T hi) {
+fn clamp<T>(T val, T lo, T hi) -> T {
     if (val < lo) { return lo; }
     if (val > hi) { return hi; }
     return val;
@@ -182,7 +182,7 @@ tag-wrapping boilerplate (`NonYielding` functions return `{ OkTy, i32 }` by valu
 
 - **Boolean failure (`error` suffix)**:
   ```zev
-  u16 read_byte([]u8 buf) error {
+  fn read_byte([]u8 buf) -> u16 error {
       if (buf.len == 0) {
           error;
       }
@@ -193,7 +193,7 @@ tag-wrapping boilerplate (`NonYielding` functions return `{ OkTy, i32 }` by valu
   ```zev
   enum ParseErr { TooShort, BadCrc }
 
-  u16 parse_setpoint([]u8 buf, u16 expected_crc) error ParseErr {
+  fn parse_setpoint([]u8 buf, u16 expected_crc) -> u16 error ParseErr {
       if (buf.len < 5) { error TooShort; }
       CmdFrame f = CmdFrame.from_bytes(buf[0..5]) catch { error TooShort; };
       if (f.crc != expected_crc) { error BadCrc; }
@@ -327,7 +327,7 @@ fn main() {
 
 ## 2. Explicit Atomicity Brakes (`noyield`, `critical`, `@manual_yield`)
 ```zev
-u32 hash_block([]u8 data) {           // Inferred `SoftYielding` (`checkpoint()` only)
+fn hash_block([]u8 data) -> u32 {           // Inferred `SoftYielding` (`checkpoint()` only)
     u32 h = 5381;
     for (u8 b in data) {
         h = (h * 33) ^ (b as u32);
@@ -768,7 +768,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
         }
     }
 
-    // 2. Error code match (`P0001`..`P0017`, `E0001`..`E0034`, case-insensitive)
+    // 2. Error code match (`P0001`..`P0018`, `E0001`..`E0034`, case-insensitive)
     let upper = q.to_ascii_uppercase();
     for err_doc in ERROR_DOCS {
         if err_doc.code == upper {
@@ -777,7 +777,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
     }
 
     Err(format!(
-        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0017 / E0001..E0034 codes)"
+        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0018 / E0001..E0034 codes)"
     ))
 }
 
@@ -791,13 +791,13 @@ mod tests {
         assert!(primer.contains("ROSETTA STONE"));
         assert!(primer.contains("zevc doc syntax"));
         assert!(primer.contains("zevc doc runtime"));
-        assert!(primer.contains("P0001..P0017"));
+        assert!(primer.contains("P0001..P0018"));
         assert!(primer.contains("E0001..E0034"));
 
         let list = lookup_doc(None, true).unwrap();
         assert!(list.contains("runtime"));
         assert!(list.contains("P0001"));
-        assert!(list.contains("P0017"));
+        assert!(list.contains("P0018"));
         assert!(list.contains("E0001"));
         assert!(list.contains("E0034"));
     }
@@ -940,7 +940,7 @@ mod tests {
 
     #[test]
     fn all_error_codes_resolve_and_bad_and_good_snippets_verify() {
-        for n in 1..=17 {
+        for n in 1..=18 {
             let code = format!("P{n:04}");
             let lower = code.to_ascii_lowercase();
             let doc = lookup_doc(Some(&lower), false)
@@ -955,7 +955,7 @@ mod tests {
             assert!(doc.contains(&code));
         }
 
-        assert_eq!(ERROR_DOCS.len(), 51);
+        assert_eq!(ERROR_DOCS.len(), 52);
         for e in ERROR_DOCS {
             // 1. Every GOOD snippet must parse, monomorphize & pass zev-sema, AND lower cleanly
             //    through zev-mir and zev-codegen-llvm (both Cortex-M and host x86_64 LLVM IR)!

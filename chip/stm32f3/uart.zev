@@ -35,7 +35,7 @@ pub fn usart2_tx_byte(u8 b) {
     hw.USART2.tdr = b as u32;
 }
 
-pub u32 usart1_clk_hz() {
+pub fn usart1_clk_hz() -> u32 {
     u32 sw = hw.RCC.cfgr3 & 3u32;
     if (sw == 0u32) {
         return rcc.pclk1_hz();
@@ -83,7 +83,7 @@ pub fn usart1_init_gps_dma_circular(u32 baud, usize buf_addr, u32 total_bytes) {
 }
 
 // Clear DMA1_CH5 + USART1 error flags and return bit0=HTIF5 (half 0 done), bit1=TCIF5 (half 1 done).
-pub u8 usart1_dma_rx_ack() {
+pub fn usart1_dma_rx_ack() -> u8 {
     u32 st = hw.DMA1.isr;
     hw.DMA1.ifcr = 0x000F_0000u32;
     hw.USART1.icr = 0x0Fu32;
