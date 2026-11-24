@@ -35,11 +35,9 @@ pub fn console_putc(u8 b) {
     hw.usart1_tx_byte(b);
 }
 
+// Runs from the panic path, so it must not be able to panic itself: no indexing, no division.
 pub fn on_fault() {
-    []u8 msg = "\n[FAULT] CH32V307 exception halted\n";
-    for (u8 b in msg) {
-        console_putc(b);
-    }
+    print("\n[FAULT] CH32V307 exception halted\n");
 }
 
 // Monotonic milliseconds from the free-running core timer (counts HCLK cycles).
