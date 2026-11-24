@@ -1835,7 +1835,18 @@ impl<'a> CoroutineLowerCtx<'a> {
 
     pub(super) fn is_void_yielding_stmt_expr(&self, expr: &Expr) -> bool {
         match &expr.kind {
-            ExprKind::Call { callee, .. } => {
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                if let Some((wfn, _)) = resolve_user_sink_write_callee(callee, generic_args, args) {
+                    if let Some(sig) = self.syms.fns.get(&wfn) {
+                        let yields_here = sig.is_yielding
+                            && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
+                        return yields_here && !sig.error_spec.has_error();
+                    }
+                }
                 if let ExprKind::Ident(id) = &callee.kind {
                     if matches!(
                         id.name.as_str(),
@@ -1876,7 +1887,25 @@ impl<'a> CoroutineLowerCtx<'a> {
         expr: &Expr,
     ) -> Result<bool, MirLowerError> {
         match &expr.kind {
-            ExprKind::Call { callee, args, .. } => {
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                if let Some((wfn, newline)) =
+                    resolve_user_sink_write_callee(callee, generic_args, args)
+                {
+                    if let Some(sig) = self.syms.fns.get(&wfn).cloned() {
+                        let yields_here = sig.is_yielding
+                            && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
+                        if yields_here && !sig.error_spec.has_error() {
+                            let _ = self.emit_yielding_user_sink_print(
+                                &wfn, &sig, newline, args, expr.span,
+                            )?;
+                            return Ok(true);
+                        }
+                    }
+                }
                 if let ExprKind::Ident(id) = &callee.kind {
                     match BuiltinFn::from_name(&id.name) {
                         Some(b) if b.is_blocking_delay() => {
@@ -2101,23 +2130,12 @@ impl<'a> CoroutineLowerCtx<'a> {
         Ok(())
     }
 
-    pub(super) fn emit_yielding_fn_call(
+    pub(super) fn emit_yielding_fn_call_exprs(
         &mut self,
         callee: &str,
-        sig: &FnSig,
-        args: &[CallArg],
+        largs: Vec<MirExpr>,
         dst: Option<MirCallDst>,
-    ) -> Result<(), MirLowerError> {
-        let mut largs = Vec::new();
-        for (idx, a) in args.iter().enumerate() {
-            let me = self.lower_expr(&a.value, sig.params.get(idx))?;
-            let coerced = if let Some(pty) = sig.params.get(idx) {
-                self.coerce_arg_for_param(me, pty)
-            } else {
-                me
-            };
-            largs.push(consume_moved_lease_be(coerced, self));
-        }
+    ) {
         let slot_idx = self.child_slots.len();
         let slot_name = format!("c{slot_idx}_{callee}");
         self.child_slots.push(MirChildCallSlot {
@@ -2154,6 +2172,228 @@ impl<'a> CoroutineLowerCtx<'a> {
         if self.syms.boost_capable_fns.contains(callee) {
             self.may_hold_boost = true;
         }
+    }
+
+    pub(super) fn emit_yielding_user_sink_print(
+        &mut self,
+        wfn: &str,
+        sig: &FnSig,
+        newline: bool,
+        args: &[CallArg],
+        span: Span,
+    ) -> Result<MirExpr, MirLowerError> {
+        if sig.spawns_in_boot {
+            return Err(MirLowerError {
+                message: format!(
+                    "boot helper `{wfn}` (contains `spawn` or IRQ `.attach`) may only be called during `fn main()` boot"
+                ),
+                span,
+            });
+        }
+        let sink_ptr_var = lower_user_sink_ptr_var_be(&args[0].value, self)?;
+        let chunks = lower_user_sink_chunks_be(&args[1].value, newline, self)?;
+        let scratch_cap = user_sink_scratch_cap(&chunks);
+        let scratch = if scratch_cap > 0 {
+            let sv = self.alloc_temp(
+                "sink_fmt_buf",
+                MirType::Array {
+                    elem: Box::new(MirType::U8),
+                    len: scratch_cap,
+                },
+            );
+            Some((sv, scratch_cap))
+        } else {
+            None
+        };
+
+        let res_ty_opt = if sig.error_spec.has_error() {
+            Some(MirType::Result {
+                ok: Box::new(MirType::Void),
+                err: sig.error_spec.err_type().map(Box::new),
+            })
+        } else {
+            None
+        };
+        let res_vid_opt = res_ty_opt.as_ref().map(|rt| {
+            let rv = self.alloc_temp("sink_write_res", rt.clone());
+            self.cur_stmts.push(MirStmt::Assign {
+                target: MirPlace::Var(rv),
+                op: MirAssignOp::Assign,
+                value: MirExpr::new(MirExprKind::IntLit(0), rt.clone()),
+            });
+            rv
+        });
+        let err_join_bb = res_vid_opt.map(|_| self.alloc_bb());
+        let sink_ptr_ty = self.vars[sink_ptr_var.0].ty.clone();
+        let slice_u8_ty = MirType::Slice(Box::new(MirType::U8));
+
+        let emit_chunk_write = |this: &mut Self, slice_expr: MirExpr| {
+            let call_args = vec![
+                MirExpr::new(MirExprKind::Var(sink_ptr_var), sink_ptr_ty.clone()),
+                slice_expr,
+            ];
+            this.emit_yielding_fn_call_exprs(wfn, call_args, res_vid_opt.map(MirCallDst::Result));
+            if let (Some(rv), Some(ej_bb)) = (res_vid_opt, err_join_bb) {
+                let ok_bb = this.alloc_bb();
+                this.seal_bb(
+                    MirTerminator::Branch {
+                        cond: MirExpr::new(MirExprKind::ResultIsErr(rv), MirType::Bool),
+                        then_bb: ej_bb,
+                        else_bb: ok_bb,
+                    },
+                    ok_bb,
+                    false,
+                );
+            }
+        };
+
+        for ch in chunks {
+            match ch {
+                MirFmtChunk::DebugSlice { slice, .. } => {
+                    let ds_ty = slice.ty.clone();
+                    let raw_el_ty = match &ds_ty {
+                        MirType::Slice(inner) => (**inner).clone(),
+                        _ => MirType::U8,
+                    };
+                    let ds_var = self.alloc_temp("sink_ds", ds_ty.clone());
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(ds_var),
+                        op: MirAssignOp::Assign,
+                        value: slice,
+                    });
+                    emit_chunk_write(
+                        self,
+                        MirExpr::new(MirExprKind::StringLit("[".to_string()), slice_u8_ty.clone()),
+                    );
+                    let idx_var = self.alloc_temp("sink_ds_i", MirType::Usize);
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(idx_var),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
+                    });
+                    let hdr_bb = self.alloc_bb();
+                    let body_bb = self.alloc_bb();
+                    let sep_bb = self.alloc_bb();
+                    let el_bb = self.alloc_bb();
+                    let done_bb = self.alloc_bb();
+                    self.seal_bb(MirTerminator::Goto(hdr_bb), hdr_bb, false);
+                    let len_expr = MirExpr::new(
+                        MirExprKind::SliceLen(Box::new(MirExpr::new(
+                            MirExprKind::Var(ds_var),
+                            ds_ty.clone(),
+                        ))),
+                        MirType::Usize,
+                    );
+                    self.seal_bb(
+                        MirTerminator::Branch {
+                            cond: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Lt,
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(idx_var),
+                                        MirType::Usize,
+                                    )),
+                                    rhs: Box::new(len_expr),
+                                },
+                                MirType::Bool,
+                            ),
+                            then_bb: body_bb,
+                            else_bb: done_bb,
+                        },
+                        body_bb,
+                        false,
+                    );
+                    self.seal_bb(
+                        MirTerminator::Branch {
+                            cond: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Gt,
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(idx_var),
+                                        MirType::Usize,
+                                    )),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::IntLit(0),
+                                        MirType::Usize,
+                                    )),
+                                },
+                                MirType::Bool,
+                            ),
+                            then_bb: sep_bb,
+                            else_bb: el_bb,
+                        },
+                        sep_bb,
+                        false,
+                    );
+                    emit_chunk_write(
+                        self,
+                        MirExpr::new(
+                            MirExprKind::StringLit(", ".to_string()),
+                            slice_u8_ty.clone(),
+                        ),
+                    );
+                    self.seal_bb(MirTerminator::Goto(el_bb), el_bb, false);
+                    let el_expr = MirExpr::new(
+                        MirExprKind::Index {
+                            base: Box::new(MirExpr::new(MirExprKind::Var(ds_var), ds_ty.clone())),
+                            index: Box::new(MirExpr::new(
+                                MirExprKind::Var(idx_var),
+                                MirType::Usize,
+                            )),
+                            is_slice: true,
+                        },
+                        raw_el_ty,
+                    );
+                    let mut el_chunks = Vec::new();
+                    emit_fmt_value_be(el_expr, FormatSpec::Debug, span, &mut el_chunks, self)?;
+                    for el_ch in el_chunks {
+                        let sl = chunk_to_slice_or_scalar_be(el_ch, scratch, self);
+                        emit_chunk_write(self, sl);
+                    }
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(idx_var),
+                        op: MirAssignOp::AddAssign,
+                        value: MirExpr::new(MirExprKind::IntLit(1), MirType::Usize),
+                    });
+                    self.seal_bb(MirTerminator::Goto(hdr_bb), done_bb, false);
+                    emit_chunk_write(
+                        self,
+                        MirExpr::new(MirExprKind::StringLit("]".to_string()), slice_u8_ty.clone()),
+                    );
+                }
+                other_ch => {
+                    let sl = chunk_to_slice_or_scalar_be(other_ch, scratch, self);
+                    emit_chunk_write(self, sl);
+                }
+            }
+        }
+
+        if let (Some(ej_bb), Some(rv), Some(rty)) = (err_join_bb, res_vid_opt, res_ty_opt) {
+            self.seal_bb(MirTerminator::Goto(ej_bb), ej_bb, false);
+            Ok(MirExpr::new(MirExprKind::Var(rv), rty))
+        } else {
+            Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void))
+        }
+    }
+
+    pub(super) fn emit_yielding_fn_call(
+        &mut self,
+        callee: &str,
+        sig: &FnSig,
+        args: &[CallArg],
+        dst: Option<MirCallDst>,
+    ) -> Result<(), MirLowerError> {
+        let mut largs = Vec::new();
+        for (idx, a) in args.iter().enumerate() {
+            let me = self.lower_expr(&a.value, sig.params.get(idx))?;
+            let coerced = if let Some(pty) = sig.params.get(idx) {
+                self.coerce_arg_for_param(me, pty)
+            } else {
+                me
+            };
+            largs.push(consume_moved_lease_be(coerced, self));
+        }
+        self.emit_yielding_fn_call_exprs(callee, largs, dst);
         Ok(())
     }
 
@@ -2388,7 +2628,25 @@ impl<'a> CoroutineLowerCtx<'a> {
                     Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void))
                 }
             }
-            ExprKind::Call { callee, args, .. } => {
+            ExprKind::Call {
+                callee,
+                generic_args,
+                args,
+            } => {
+                if let Some((wfn, newline)) =
+                    resolve_user_sink_write_callee(callee, generic_args, args)
+                {
+                    if let Some(sig) = self.syms.fns.get(&wfn).cloned() {
+                        let yields_here = sig.is_yielding
+                            && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
+                        if yields_here {
+                            return self.emit_yielding_user_sink_print(
+                                &wfn, &sig, newline, args, expr.span,
+                            );
+                        }
+                    }
+                    return self.lower_non_yielding_expr(expr, expected);
+                }
                 if let ExprKind::Ident(id) = &callee.kind {
                     if let Some(sig) = self.syms.fns.get(&id.name).cloned() {
                         if sig.spawns_in_boot {

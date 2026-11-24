@@ -205,7 +205,9 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 scan_ty(raw_field_ty, feat);
                 scan_expr(base, feat);
             }
-            MirExprKind::SliceLen(sub) | MirExprKind::FromBytes { slice: sub, .. } => {
+            MirExprKind::SliceLen(sub)
+            | MirExprKind::CStrToSlice(sub)
+            | MirExprKind::FromBytes { slice: sub, .. } => {
                 scan_expr(sub, feat);
             }
             MirExprKind::Index { base, index, .. } => {
@@ -2037,6 +2039,7 @@ impl<'a> ModuleCtx<'a> {
         match &expr.kind {
             MirExprKind::Unary { expr: e, .. }
             | MirExprKind::Cast { expr: e, .. }
+            | MirExprKind::CStrToSlice(e)
             | MirExprKind::FieldAccess { base: e, .. }
             | MirExprKind::SliceLen(e)
             | MirExprKind::FromBytes { slice: e, .. } => self.scan_expr_for_prims(e),

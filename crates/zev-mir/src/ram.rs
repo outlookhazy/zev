@@ -1652,6 +1652,7 @@ fn fold_expr_run(
         }
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
+        | MirExprKind::CStrToSlice(inner)
         | MirExprKind::FieldAccess { base: inner, .. }
         | MirExprKind::SliceLen(inner)
         | MirExprKind::FromBytes { slice: inner, .. }

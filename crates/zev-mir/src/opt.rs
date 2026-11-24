@@ -694,6 +694,7 @@ impl<'a> ScanCtx<'a> {
             }
             MirExprKind::Unary { expr: inner, .. }
             | MirExprKind::Cast { expr: inner, .. }
+            | MirExprKind::CStrToSlice(inner)
             | MirExprKind::FieldAccess { base: inner, .. }
             | MirExprKind::SliceLen(inner)
             | MirExprKind::FromBytes { slice: inner, .. }
@@ -2115,6 +2116,7 @@ fn is_pure_static_immediate(
         | MirExprKind::ArrayLit { .. }
         | MirExprKind::MmioRead { .. }
         | MirExprKind::Var(_)
+        | MirExprKind::CStrToSlice(_)
         | MirExprKind::SliceLen(_)
         | MirExprKind::Index { .. }
         | MirExprKind::SubSlice { .. }
@@ -2329,7 +2331,8 @@ fn mir_expr_eq(a: &MirExpr, b: &MirExpr) -> bool {
                 && ea.len() == eb.len()
                 && ea.iter().zip(eb.iter()).all(|(x, y)| mir_expr_eq(x, y))
         }
-        (MirExprKind::SliceLen(ea), MirExprKind::SliceLen(eb)) => mir_expr_eq(ea, eb),
+        (MirExprKind::SliceLen(ea), MirExprKind::SliceLen(eb))
+        | (MirExprKind::CStrToSlice(ea), MirExprKind::CStrToSlice(eb)) => mir_expr_eq(ea, eb),
         (
             MirExprKind::Index {
                 base: ba,
@@ -2559,6 +2562,7 @@ impl VarUsageInfo {
             }
             MirExprKind::Unary { expr: inner, .. }
             | MirExprKind::Cast { expr: inner, .. }
+            | MirExprKind::CStrToSlice(inner)
             | MirExprKind::FieldAccess { base: inner, .. }
             | MirExprKind::SliceLen(inner)
             | MirExprKind::FromBytes { slice: inner, .. }
@@ -3131,6 +3135,7 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
         }
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
+        | MirExprKind::CStrToSlice(inner)
         | MirExprKind::FieldAccess { base: inner, .. }
         | MirExprKind::SliceLen(inner)
         | MirExprKind::FromBytes { slice: inner, .. }
@@ -3460,6 +3465,7 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
         }
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
+        | MirExprKind::CStrToSlice(inner)
         | MirExprKind::FieldAccess { base: inner, .. }
         | MirExprKind::SliceLen(inner)
         | MirExprKind::FromBytes { slice: inner, .. }
@@ -3858,6 +3864,7 @@ fn collect_fn_addrs_and_calls_expr(
         MirExprKind::MakePrimView { ptr, .. }
         | MirExprKind::Unary { expr: ptr, .. }
         | MirExprKind::Cast { expr: ptr, .. }
+        | MirExprKind::CStrToSlice(ptr)
         | MirExprKind::FieldAccess { base: ptr, .. }
         | MirExprKind::SliceLen(ptr)
         | MirExprKind::FromBytes { slice: ptr, .. }

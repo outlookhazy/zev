@@ -599,6 +599,7 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
         }
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
+        | MirExprKind::CStrToSlice(inner)
         | MirExprKind::SliceLen(inner)
         | MirExprKind::MakePrimView { ptr: inner, .. } => {
             collect_expr_uses(inner, uses);
@@ -784,6 +785,7 @@ fn collect_addr_of_vars(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
         }
         MirExprKind::Unary { expr: inner, .. }
         | MirExprKind::Cast { expr: inner, .. }
+        | MirExprKind::CStrToSlice(inner)
         | MirExprKind::FieldAccess { base: inner, .. }
         | MirExprKind::FromBytes { slice: inner, .. }
         | MirExprKind::SliceLen(inner) => collect_addr_of_vars(inner, out),
@@ -921,6 +923,7 @@ fn collect_alias_sources_expr(expr: &MirExpr, out: &mut BTreeSet<VarId>) {
         | MirExprKind::FieldAccess { base, .. }
         | MirExprKind::Index { base, .. }
         | MirExprKind::Cast { expr: base, .. }
+        | MirExprKind::CStrToSlice(base)
         | MirExprKind::Unary { expr: base, .. } => {
             collect_alias_sources_expr(base, out);
         }

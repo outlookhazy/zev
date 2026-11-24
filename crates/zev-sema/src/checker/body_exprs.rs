@@ -169,7 +169,12 @@ impl<'a> BodyChecker<'a> {
                 generic_args,
                 args,
             } => {
-                if !generic_args.is_empty() {
+                let is_resolved_user_sink = matches!(
+                    &callee.kind,
+                    ExprKind::Ident(id) if matches!(id.name.as_str(), "print" | "println")
+                ) && args.len() == 2
+                    && generic_args.len() == 1;
+                if !generic_args.is_empty() && !is_resolved_user_sink {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::GenericInstantiationError,
                         expr.span,
@@ -548,10 +553,10 @@ impl<'a> BodyChecker<'a> {
                     Diagnostic::new(
                         DiagnosticKind::InvalidOperation,
                         expr.span,
-                        "zero-heap format string 'f\"...\"' cannot allocate a standalone string value",
+                        "zero-heap format string 'f\"...\"' cannot allocate a standalone string value; pass it directly to a sink such as `println(sink, f\"...\")`",
                     )
                     .with_note(
-                        "pass `f\"...\"` directly into a sink: `println(f\"...\");`, `print(f\"...\");`, or `fmt_buf(dst, f\"...\")`",
+                        "pass `f\"...\"` directly into a sink: `println(f\"...\");`, `print(f\"...\");`, `println(sink, f\"...\");`, `print(sink, f\"...\");`, `fmt_buf(dst, f\"...\")`, or `fmt_ring(tx, f\"...\")`",
                     ),
                 );
                 ExprVal::error(expr.span)
@@ -2751,19 +2756,22 @@ impl<'a> BodyChecker<'a> {
             }
 
             BuiltinFn::Print | BuiltinFn::Println => {
+                if args.len() == 2 {
+                    return Some(self.check_user_sink_print_call(name, args, span));
+                }
                 if args.len() != 1 {
                     self.sema.emit(
                         Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
                             span,
                             format!(
-                                "'{}' expects 1 argument (`*u8`, string literal, or `f\"...\"` format string), found {}",
+                                "'{}' expects 1 argument (message) or 2 arguments (sink, message), found {}",
                                 name,
                                 args.len()
                             ),
                         )
                         .with_note(format!(
-                            "pass `{}(f\"val={{x}}\");` or `{}(\"boot ok\");`",
+                            "pass `{}(f\"val={{x}}\");` or `{}(sink, f\"val={{x}}\");`",
                             name, name
                         )),
                     );
@@ -2789,8 +2797,8 @@ impl<'a> BodyChecker<'a> {
                                 ),
                             )
                             .with_note(format!(
-                                "use `{}(f\"val={{expr}}\");`, `sys.log_kv(\"val=\", expr);`, or `sys.log_hex(\"val=\", expr);` to print values",
-                                name
+                                "use `{}(f\"val={{expr}}\");`, `{}(sink, f\"val={{expr}}\");`, or `sys.log_kv(\"val=\", expr);`",
+                                name, name
                             )),
                         );
                     }
@@ -2834,6 +2842,247 @@ impl<'a> BodyChecker<'a> {
                 }
                 Some(ExprVal::scalar(Ty::void(), span))
             }
+        }
+    }
+
+    fn check_user_sink_print_call(
+        &mut self,
+        fn_name: &str,
+        args: &[CallArg],
+        span: Span,
+    ) -> ExprVal {
+        for a in args {
+            if let Some(arg_name) = &a.name {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    arg_name.span,
+                    format!(
+                        "unknown named argument '{}:' in '{}'",
+                        arg_name.name, fn_name
+                    ),
+                ));
+            }
+        }
+
+        let sv = self.check_expr_infallible(&args[0].value);
+        if let ExprKind::FormatString(parts) = &args[1].value.kind {
+            let _ = self.check_format_string(parts);
+        } else {
+            let mv = self.check_expr_infallible(&args[1].value);
+            if !is_print_arg_ty(&mv.ty) && !mv.ty.is_error() {
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        args[1].span,
+                        format!(
+                            "'{}' expects a format string `f\"...\"`, string literal, `*u8`, or `[]u8` as its second argument, found '{}'",
+                            fn_name, mv.ty
+                        ),
+                    )
+                    .with_note(format!(
+                        "use `{}(sink, f\"val={{expr}}\");` or `{}(sink, slice);`",
+                        fn_name, fn_name
+                    )),
+                );
+            }
+        }
+
+        let struct_name = match &sv.ty {
+            Ty::Error => return ExprVal::error(span),
+            Ty::Struct(s) => {
+                if let Some(cname) = self.root_const_of_place(&args[0].value) {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        args[0].span,
+                        format!(
+                            "cannot pass immutable `const` '{}' as mutable `*self` sink to '{}'",
+                            cname, fn_name
+                        ),
+                    ));
+                    return ExprVal::error(span);
+                }
+                s.clone()
+            }
+            Ty::Ptr(inner) => match &**inner {
+                Ty::Struct(s) => s.clone(),
+                Ty::Error => return ExprVal::error(span),
+                _ => {
+                    self.sema.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            args[0].span,
+                            format!(
+                                "first argument to '{}(sink, ...)' must be a struct or `*Struct` implementing `fn write(*self, []u8)`, found '{}'",
+                                fn_name, sv.ty
+                            ),
+                        )
+                        .with_note("define `pub fn write(*self, []u8 bytes)` in an `impl` block for your sink type"),
+                    );
+                    return ExprVal::error(span);
+                }
+            },
+            _ => {
+                self.sema.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        args[0].span,
+                        format!(
+                            "first argument to '{}(sink, ...)' must be a struct or `*Struct` implementing `fn write(*self, []u8)`, found '{}'",
+                            fn_name, sv.ty
+                        ),
+                    )
+                    .with_note("define `pub fn write(*self, []u8 bytes)` in an `impl` block for your sink type"),
+                );
+                return ExprVal::error(span);
+            }
+        };
+
+        let write_fn_name = format!("{struct_name}__write");
+        let Some(write_info) = self.sema.functions.get(&write_fn_name).cloned() else {
+            self.sema.emit(
+                Diagnostic::new(
+                    DiagnosticKind::UndefinedSymbol,
+                    args[0].span,
+                    format!(
+                        "sink type '{}' does not implement `fn write(*self, []u8)` required by '{}'",
+                        struct_name, fn_name
+                    ),
+                )
+                .with_note(format!(
+                    "add `impl {} {{ pub fn write(*self, []u8 bytes) {{ ... }} }}`",
+                    struct_name
+                )),
+            );
+            return ExprVal::error(span);
+        };
+
+        let expected_recv = Ty::Ptr(Box::new(Ty::Struct(struct_name.clone())));
+        let expected_slice = Ty::Slice(Box::new(Ty::u8()));
+        let sig_ok = write_info.params.len() == 2
+            && write_info.params[0].ty == expected_recv
+            && write_info.params[1].ty == expected_slice
+            && write_info.ret_ty.is_void();
+        if !sig_ok {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                args[0].span,
+                format!(
+                    "method '{}.write' used by '{}' must have signature `fn write(*self, []u8)` (returning void, optional `error [E]`)",
+                    struct_name, fn_name
+                ),
+            ));
+            return ExprVal::error(span);
+        }
+
+        self.sema.call_graph.add_edge(CallEdge {
+            caller: self.caller_key.clone(),
+            caller_kind: self.caller_kind,
+            callee: write_fn_name.clone(),
+            span,
+            ctx: self.call_context(),
+        });
+
+        let sink_prov = if matches!(&sv.ty, Ty::Struct(_)) {
+            let base_prov = match &args[0].value.kind {
+                ExprKind::Ident(id) => {
+                    if let Some(local) = self.lookup_local(&id.name) {
+                        if local.is_isr_state {
+                            Provenance::addr_of_isr_state(&local.name, local.decl_depth)
+                        } else {
+                            Provenance::addr_of_local(&local.name, local.decl_depth)
+                        }
+                    } else if self.sema.primitives.contains_key(&id.name)
+                        || self.sema.subsystems.contains_key(&id.name)
+                        || self.sema.mmio_instances.contains_key(&id.name)
+                        || self.sema.consts.contains_key(&id.name)
+                    {
+                        Provenance::addr_of_static()
+                    } else {
+                        Provenance::addr_of_local("<temp>", self.current_depth())
+                    }
+                }
+                _ => Provenance::addr_of_local("<temp>", self.current_depth()),
+            };
+            base_prov.merge_place_with_val_origins(&sv.prov)
+        } else {
+            sv.prov.clone()
+        };
+
+        let sink_boot_arg = BootCallArg {
+            static_endpoint: sv
+                .endpoint_name
+                .clone()
+                .filter(|ep| !ep.starts_with("param:")),
+            endpoint_from_param: self.resolve_param_endpoint_index(&sv.endpoint_name),
+            field_endpoints: self.extract_field_endpoint_specs(&sv),
+            has_non_static_local_ref: sink_prov.has_non_returning_origin(),
+            has_isr_state_ref: !sink_prov.isr_state_origins.is_empty(),
+            ref_param_origins: sink_prov.param_origins.clone(),
+            span: args[0].span,
+        };
+        let slice_boot_arg = BootCallArg {
+            static_endpoint: None,
+            endpoint_from_param: None,
+            field_endpoints: BTreeMap::new(),
+            has_non_static_local_ref: false,
+            has_isr_state_ref: false,
+            ref_param_origins: BTreeSet::new(),
+            span: args[1].span,
+        };
+        let boot_call_args = vec![sink_boot_arg, slice_boot_arg];
+
+        let in_main_post_boot = self.in_main_post_boot();
+        let in_main_after_spawn = self.in_main_after_spawn();
+        let in_main_after_irq_attach = self.in_main_after_irq_attach();
+        self.sema.recorded_call_args.push(RecordedCallArgs {
+            caller: self.caller_key.clone(),
+            callee: write_fn_name.clone(),
+            args: boot_call_args.clone(),
+            in_main_post_boot,
+            in_main_after_spawn,
+            in_main_after_irq_attach,
+        });
+        if self.caller_key == "main" {
+            let (spawns, attaches) = self.sema.fn_boot_flags(&write_fn_name);
+            if spawns {
+                self.has_spawned = true;
+            }
+            if attaches {
+                self.has_attached_irq = true;
+            }
+        }
+        if self.can_record_boot_step() {
+            let sink_attach_spec = self.classify_irq_attach_arg(&args[0].value, &sv);
+            let dummy_slice_val = ExprVal::scalar(Ty::Slice(Box::new(Ty::u8())), args[1].span);
+            let slice_attach_spec = self.classify_irq_attach_arg(&args[1].value, &dummy_slice_val);
+            let boot_attach_args = vec![
+                BootAttachCallArg {
+                    spec: sink_attach_spec,
+                },
+                BootAttachCallArg {
+                    spec: slice_attach_spec,
+                },
+            ];
+            self.boot_steps.push(BootStep::HelperCall {
+                callee: write_fn_name.clone(),
+                conditional: self.branch_depth > 0,
+                args: boot_call_args,
+            });
+            if let Some(top) = self.boot_block_stack.last_mut() {
+                top.push(IrqBootNode::Call {
+                    callee: write_fn_name,
+                    args: boot_attach_args,
+                });
+            }
+        }
+
+        ExprVal {
+            ty: Ty::void(),
+            error_spec: write_info.error_spec,
+            prov: Provenance::pure_static(),
+            endpoint_name: None,
+            field_endpoints: BTreeMap::new(),
+            span,
         }
     }
 

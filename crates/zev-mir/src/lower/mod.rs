@@ -5,10 +5,10 @@ pub(super) use std::fmt;
 
 pub(super) use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, BuiltinFn, CallArg, CatchClause,
-    DurationLit, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec, IsrDecl, ItemKind,
-    Literal, MmioAccess, MmioDeclKind, MmioRegDecl, OsPrimitiveType, PrimType, Priority, Program,
-    Span, SpawnStmt, Stmt, StmtKind, SwitchPat, SysMethod, TaskDecl, TypeExpr, TypeKind, UnaryOp,
-    SYS_NAMESPACE,
+    DurationLit, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec, GenericArg, IsrDecl,
+    ItemKind, Literal, MmioAccess, MmioDeclKind, MmioRegDecl, OsPrimitiveType, PrimType, Priority,
+    Program, Span, SpawnStmt, Stmt, StmtKind, SwitchPat, SysMethod, TaskDecl, TypeExpr, TypeKind,
+    UnaryOp, SYS_NAMESPACE,
 };
 
 pub(super) use crate::ir::{

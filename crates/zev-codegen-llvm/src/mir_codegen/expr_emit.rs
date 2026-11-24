@@ -633,6 +633,59 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 rhs,
                 elem_ty,
             } => self.emit_seq_eq(*eq, lhs, rhs, elem_ty),
+            MirExprKind::CStrToSlice(sub) => {
+                let sv = self.emit_expr(sub)?;
+                let p = self.coerce_str_ptr(sv);
+                let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
+                let sl_ty = format!("{{ ptr, {usize_ty} }}");
+                let chk_lbl = self.next_label("cstr_chk");
+                let hdr_lbl = self.next_label("cstr_hdr");
+                let step_lbl = self.next_label("cstr_step");
+                let done_lbl = self.next_label("cstr_done");
+                self.emit_term(format!("br label %{chk_lbl}"));
+                self.start_block(&chk_lbl);
+                let is_null = self.next_tmp();
+                self.emit_line(format!("{is_null} = icmp eq ptr {}, null", p.repr));
+                self.emit_term(format!(
+                    "br i1 {is_null}, label %{done_lbl}, label %{hdr_lbl}"
+                ));
+                self.start_block(&hdr_lbl);
+                let idx = self.next_tmp();
+                let next_idx = self.next_tmp();
+                self.emit_line(format!(
+                    "{idx} = phi {usize_ty} [ 0, %{chk_lbl} ], [ {next_idx}, %{step_lbl} ]"
+                ));
+                let cp = self.next_tmp();
+                let ch = self.next_tmp();
+                let is_z = self.next_tmp();
+                self.emit_line(format!(
+                    "{cp} = getelementptr inbounds i8, ptr {}, {usize_ty} {idx}",
+                    p.repr
+                ));
+                self.emit_line(format!("{ch} = load i8, ptr {cp}, align 1"));
+                self.emit_line(format!("{is_z} = icmp eq i8 {ch}, 0"));
+                self.emit_term(format!(
+                    "br i1 {is_z}, label %{done_lbl}, label %{step_lbl}"
+                ));
+                self.start_block(&step_lbl);
+                self.emit_line(format!("{next_idx} = add {usize_ty} {idx}, 1"));
+                self.emit_term(format!("br label %{hdr_lbl}"));
+                self.start_block(&done_lbl);
+                let final_len = self.next_tmp();
+                self.emit_line(format!(
+                    "{final_len} = phi {usize_ty} [ 0, %{chk_lbl} ], [ {idx}, %{hdr_lbl} ]"
+                ));
+                let s0 = self.next_tmp();
+                let s1 = self.next_tmp();
+                self.emit_line(format!(
+                    "{s0} = insertvalue {sl_ty} poison, ptr {}, 0",
+                    p.repr
+                ));
+                self.emit_line(format!(
+                    "{s1} = insertvalue {sl_ty} {s0}, {usize_ty} {final_len}, 1"
+                ));
+                Ok(SsaVal::new(sl_ty, s1))
+            }
             MirExprKind::Cast {
                 expr: sub,
                 target_ty,
