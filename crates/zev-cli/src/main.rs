@@ -5133,4 +5133,98 @@ fn main() {
             qres.stdout
         );
     }
+
+    #[test]
+    fn item3_parenthesized_fnptr_return_with_outer_error_runs_on_host_and_qemu() {
+        let temp = TempWorkDir::create("item3_paren_fnptr_return").unwrap();
+        let app_path = temp.dir.join("app.zev");
+        let src = r#"import board;
+
+enum PickErr { Unavailable }
+enum CallErr { Boom }
+
+fn inc_infallible(u8 x) -> u8 {
+    return x + 1u8;
+}
+
+fn inc_fallible(u8 x) -> u8 error CallErr {
+    if (x == 0u8) { error CallErr.Boom; }
+    return x + 2u8;
+}
+
+fn pick_infallible(bool ok) -> (fn(u8) -> u8) error PickErr {
+    if (!ok) { error PickErr.Unavailable; }
+    return inc_infallible;
+}
+
+fn pick_both(bool ok) -> (fn(u8) -> u8 error CallErr) error PickErr {
+    if (!ok) { error PickErr.Unavailable; }
+    return inc_fallible;
+}
+
+fn main() {
+    board.init();
+    (fn(u8) -> u8) f = pick_infallible(true) or inc_infallible;
+    u8 a = f(41u8);
+
+    u8 err_hit = 0u8;
+    (fn(u8) -> u8) _miss = pick_infallible(false) catch (PickErr e) {
+        if (e == PickErr.Unavailable) { err_hit = 1u8; }
+        inc_infallible
+    };
+
+    (fn(u8) -> u8 error CallErr) g = pick_both(true) or inc_fallible;
+    u8 b = g(10u8) or 0u8;
+    u8 c = g(0u8) or 77u8;
+
+    println(f"paren a={a} err={err_hit} b={b} c={c}");
+    sys.exit(0);
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let expected = "paren a=42 err=1 b=12 c=77";
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "host failed: {stdout}");
+        assert!(stdout.contains(expected), "host stdout={stdout:?}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("item3_paren_qemu.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout.contains(expected),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
 }

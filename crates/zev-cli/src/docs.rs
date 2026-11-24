@@ -259,6 +259,15 @@ fn clamp<T>(T val, T lo, T hi) -> T {
 - File/directory modules are **private by default**: prefix exports with `pub`, group imports cleanly via
   `import hal.{time, gpio, pwm};`, and re-export child modules/symbols via `pub import chip.stm32f3.{rcc, gpio};`
   (pass `-I <dir>` for custom roots).
+
+## 5. Function-Pointer Types & `error` Clause Binding
+- Function-pointer types use `fn(Arg1, Arg2) [-> Ret] [error [E]]` and may be stored in locals, struct fields,
+  and `.rodata` `const` tables (e.g., `const fn(u8) -> u8 F = inc;`).
+- `error` binds to the innermost `fn(...)` type being parsed. When a **fallible function** returns an **infallible
+  function pointer**, parenthesize the pointer type so `error E` binds to the outer function:
+  - `fn pick() -> fn(u8) -> u8 error E` returns a *fallible* function pointer (`fn() -> (fn(u8) -> u8 error E)`).
+  - `fn pick() -> (fn(u8) -> u8) error E` is a *fallible* function returning an *infallible* function pointer.
+  - `fn pick() -> (fn(u8) -> u8 error E1) error E2` binds `E1` to the pointer and `E2` to `pick`.
 ",
     },
     TopicDoc {

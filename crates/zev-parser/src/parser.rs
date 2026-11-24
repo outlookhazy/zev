@@ -2631,6 +2631,12 @@ impl<'a> Parser<'a> {
                     )
                 }
             }
+            TokenKind::LParen if self.peek_n_kind(1) == TokenKind::KwFn => {
+                self.bump();
+                let inner = self.parse_type_with_mode(false)?;
+                let rp = self.expect(&TokenKind::RParen)?;
+                TypeExpr::new(inner.kind, start.merge(rp.span))
+            }
             TokenKind::KwFn => {
                 // Note: function-pointer types `fn(T1, T2) [-> Ret] [error [E]]` KEEP `-> Ret`!
                 self.bump();
@@ -2672,7 +2678,9 @@ impl<'a> Parser<'a> {
                             | TokenKind::Star
                             | TokenKind::LBracket
                             | TokenKind::KwConst
-                    ) {
+                    ) || (self.at(&TokenKind::LParen)
+                        && self.peek_n_kind(1) == TokenKind::KwFn)
+                    {
                         let err_ty = self.parse_type()?;
                         end_span = err_ty.span;
                         Some(Box::new(ErrorSpec::Typed(err_ty)))
@@ -3626,6 +3634,9 @@ impl<'a> Parser<'a> {
         let mut starts_with_known_type = false;
         match self.peek_kind() {
             TokenKind::KwConst | TokenKind::KwFn => {
+                starts_with_known_type = true;
+            }
+            TokenKind::LParen if self.peek_n_kind(1) == TokenKind::KwFn => {
                 starts_with_known_type = true;
             }
             TokenKind::Star | TokenKind::LBracket => {}
