@@ -157,6 +157,28 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             (direct, table)
         }
 
+        ResolvedOsPrimitive::Guarded { elem } => {
+            let valid = ["get", "set"];
+            let direct = match method {
+                "read" | "load" | "peek" | "value" | "val" | "recv" | "borrow" => {
+                    Some(format!("`.get() -> {}` (inside `critical {{ ... }}`)", elem))
+                }
+                "publish" | "write" | "store" | "send" | "post" | "put" | "update" => {
+                    Some(format!("`.set({} val)` (inside `critical {{ ... }}`)", elem))
+                }
+                "wait" | "wait_change" | "changed" => Some(
+                    "`guarded<T>` is not a wait source; pair it with a `wait_queue` (call `.prepare_wait()` inside `critical { ... }` and `.commit_wait()`)"
+                        .to_string(),
+                ),
+                _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
+            };
+            let table = format!(
+                "valid methods on `{}` (only inside `critical {{ ... }}`): `.get() -> {}`, `.set({} val)`",
+                prim, elem, elem
+            );
+            (direct, table)
+        }
+
         ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => {
             let valid = [
                 "post", "try_post", "send", "try_send", "recv", "try_recv", "len", "cap",

@@ -2591,6 +2591,18 @@ impl<'a> Parser<'a> {
                             start.merge(gt_span),
                         )
                     }
+                    "guarded" if self.peek_n_kind(1) == TokenKind::Lt => {
+                        self.bump();
+                        self.expect(&TokenKind::Lt)?;
+                        let elem = self.parse_type()?;
+                        let gt_span = self.expect_type_gt()?;
+                        TypeExpr::new(
+                            TypeKind::OsPrimitive(OsPrimitiveType::Guarded {
+                                elem: Box::new(elem),
+                            }),
+                            start.merge(gt_span),
+                        )
+                    }
                     "byte_ring" if self.peek_n_kind(1) == TokenKind::Lt => {
                         self.bump();
                         self.expect(&TokenKind::Lt)?;
@@ -3492,6 +3504,7 @@ impl<'a> Parser<'a> {
                         s.as_str(),
                         "signal"
                             | "watch"
+                            | "guarded"
                             | "inbox"
                             | "byte_ring"
                             | "ping_pong"

@@ -2275,6 +2275,7 @@ fn defer_and_bounded_for_in_verification() {
 
         enum SpiErr { TransferFailed }
         @dma_safe ping_pong<u8, 32> rx_dma;
+        watch<u32> isr_sum = 0;
         watch<u32> last_sum = 0;
 
         u32 tx_frame([]u8 payload, bool fail) error SpiErr {
@@ -2300,7 +2301,7 @@ fn defer_and_bounded_for_in_verification() {
             for (u8 v in lut) {
                 s += v;
             }
-            last_sum.publish(s);
+            isr_sum.publish(s);
             rx_dma.flip();
         }
 
@@ -6930,6 +6931,233 @@ fn integer_conversion_portability_ranges_and_widening_sema() {
     ] {
         expect_err_kind(bad_shift, DiagnosticKind::InvalidOperation);
     }
+}
+
+#[test]
+fn watch_single_writer_and_guarded_critical_cell_semantics() {
+    // 1. Positive: boot-phase `main()` initialization + 1 writer task + multiple readers,
+    //    plus unrelated `irq.attach` before boot-phase `publish()`.
+    let ok_watch = expect_ok(
+        r#"
+        watch<u32> telemetry = 0;
+        signal ping;
+        irq IRQ_TEST = 1;
+
+        isr ping_isr(*signal s) {
+            s.notify();
+        }
+
+        fn boot_init_helper() {
+            telemetry.publish(1);
+        }
+
+        task writer() {
+            u32 seq = 10;
+            loop every 5ms {
+                seq += 1;
+                telemetry.publish(seq);
+            }
+        }
+
+        task reader_a(*watch<u32> w) {
+            loop {
+                u32 _v = w.wait_change();
+            }
+        }
+
+        task reader_b(*watch<u32> w) {
+            loop every 10ms {
+                u32 _v = w.read();
+            }
+        }
+
+        fn main() {
+            telemetry.publish(0);
+            boot_init_helper();
+            IRQ_TEST.attach(ping_isr(&ping));
+            telemetry.publish(2); // Still before `spawn`, and no ISR publishes to `telemetry`
+            spawn writer() @high;
+            spawn reader_a(&telemetry) @normal;
+            spawn reader_b(&telemetry) @low;
+        }
+        "#,
+    );
+    assert!(ok_watch.primitives.contains_key("telemetry"));
+
+    // 2. Negative (`E0002`): two tasks publishing to the same `watch<T>`.
+    expect_err_kind(
+        r#"
+        watch<u32> w = 0;
+        task t1(*watch<u32> pw) { loop { pw.publish(1); delay(5ms); } }
+        task t2(*watch<u32> pw) { loop { pw.publish(2); delay(5ms); } }
+        fn main() {
+            spawn t1(&w) @normal;
+            spawn t2(&w) @normal;
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 3. Negative (`E0002`): two spawned instances of the same task writing one `watch<T>`.
+    expect_err_kind(
+        r#"
+        watch<u32> w = 0;
+        task t() { loop { w.publish(1); delay(5ms); } }
+        fn main() {
+            spawn t() @high;
+            spawn t() @normal;
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 4. Negative (`E0002`): task + ISR publishing to the same `watch<T>`.
+    expect_err_kind(
+        r#"
+        watch<u32> w = 0;
+        irq IRQ_T = 2;
+        isr w_isr(*watch<u32> pw) { pw.publish(1); }
+        task t(*watch<u32> pw) { loop { pw.publish(2); delay(5ms); } }
+        fn main() {
+            IRQ_T.attach(w_isr(&w));
+            spawn t(&w) @normal;
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 5. Negative (`E0002`): `main()` post-spawn write + task write.
+    expect_err_kind(
+        r#"
+        watch<u32> w = 0;
+        task t(*watch<u32> pw) { loop { pw.publish(2); delay(5ms); } }
+        fn main() {
+            spawn t(&w) @normal;
+            loop {
+                w.publish(3);
+                delay(10ms);
+            }
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 6. Negative (`E0002`): `main()` write after `irq.attach` + same ISR publishing.
+    expect_err_kind(
+        r#"
+        watch<u32> w = 0;
+        irq IRQ_T = 2;
+        isr w_isr(*watch<u32> pw) { pw.publish(1); }
+        fn main() {
+            IRQ_T.attach(w_isr(&w));
+            w.publish(2);
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+
+    // 7. Negative (`E0024`): `guarded<T>` `.get()`/`.set()` outside `critical { ... }`,
+    //    including inside helpers called from `critical`, ISRs, and inside `wait { ... }`.
+    for bad_guarded in [
+        r#"
+        guarded<u32> g = 0;
+        fn main() { u32 _x = g.get(); }
+        "#,
+        r#"
+        guarded<u32> g = 0;
+        fn main() { g.set(1); }
+        "#,
+        r#"
+        guarded<u32> g = 0;
+        task t() { loop { g.set(g.get() + 1); delay(5ms); } }
+        fn main() { spawn t() @normal; }
+        "#,
+        r#"
+        guarded<u32> g = 0;
+        irq IRQ_G = 1;
+        isr g_isr() { g.set(1); }
+        fn main() { IRQ_G.attach(g_isr); }
+        "#,
+        r#"
+        guarded<u32> g = 0;
+        fn raw_set(u32 v) { g.set(v); }
+        fn main() { critical { raw_set(1); } }
+        "#,
+        r#"
+        guarded<u32> g = 0;
+        task t() {
+            loop {
+                wait {
+                    u32 v = g.get() => { delay(1ms); }
+                    timeout 5ms => {}
+                }
+            }
+        }
+        fn main() { spawn t() @normal; }
+        "#,
+    ] {
+        expect_err_kind(bad_guarded, DiagnosticKind::InvalidOperation);
+    }
+
+    // 8. Negative (`E0033`): escaping ISR `state` pointer via `guarded<*u32>.set(&x)` in `critical`.
+    expect_err_kind(
+        r#"
+        guarded<*u32> leak_g;
+        irq IRQ_G = 1;
+        isr bad() {
+            state u32 x = 0;
+            critical { leak_g.set(&x); }
+        }
+        fn main() { IRQ_G.attach(bad); }
+        "#,
+        DiagnosticKind::InvalidIsrState,
+    );
+
+    // 9. Positive: multi-writer `guarded<T>` accessed safely inside `critical { ... }`
+    //    across multiple tasks and an ISR.
+    let ok_guarded = expect_ok(
+        r#"
+        guarded<u32> shared_acc = 10;
+        wait_queue shared_wq;
+        irq IRQ_G = 2;
+
+        isr bump_isr() {
+            critical { shared_acc.set(shared_acc.get() + 1); }
+            shared_wq.wake_all();
+        }
+
+        task worker_a() {
+            loop every 5ms {
+                critical { shared_acc.set(shared_acc.get() + 2); }
+                shared_wq.wake_one();
+            }
+        }
+
+        task worker_b() {
+            loop {
+                bool ok = false;
+                critical {
+                    if (shared_acc.get() >= 20) {
+                        shared_acc.set(0);
+                        ok = true;
+                    } else {
+                        shared_wq.prepare_wait();
+                    }
+                }
+                if (!ok) {
+                    shared_wq.commit_wait();
+                }
+            }
+        }
+
+        fn main() {
+            IRQ_G.attach(bump_isr);
+            spawn worker_a() @high;
+            spawn worker_b() @normal;
+        }
+        "#,
+    );
+    assert!(ok_guarded.primitives.contains_key("shared_acc"));
 }
 
 

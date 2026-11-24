@@ -1068,6 +1068,21 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{v} = {call_kw} {ety} @__syn_watch_read_{id}(ptr {wptr})"));
                 Ok(SsaVal::new(ety, v))
             }
+            MirPrimReadOp::GuardedGet { target, elem_ty } => {
+                let pk = MirPrimKind::Guarded {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
+                let gptr = self.resolve_prim_ptr(target)?;
+                let ety = self.ctx.llvm_ty(elem_ty);
+                let vp = self.next_tmp();
+                self.emit_line(format!(
+                    "{vp} = getelementptr inbounds {pty}, ptr {gptr}, i32 0, i32 0"
+                ));
+                let v = self.next_tmp();
+                self.emit_line(format!("{v} = load volatile {ety}, ptr {vp}, align 1"));
+                Ok(SsaVal::new(ety, v))
+            }
             MirPrimReadOp::WatchGen { target, elem_ty } => {
                 let pk = MirPrimKind::Watch {
                     elem: Box::new(elem_ty.clone()),

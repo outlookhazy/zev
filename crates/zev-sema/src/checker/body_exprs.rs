@@ -769,7 +769,7 @@ impl<'a> BodyChecker<'a> {
                     ),
                 )
                 .with_note(format!(
-                    "raw global declared at {}; replace with `watch<{ty}> {name} = 0;` (read via `{name}.read()`, update via `{name}.publish(val)`) or `inbox<{ty}, 8> {name};` (queued events via `{name}.post(ev)` / `{name}.recv()`)",
+                    "raw global declared at {}; replace with `watch<{ty}> {name} = 0;` (single writer via `{name}.read()`/`{name}.publish(val)`), `guarded<{ty}> {name} = 0;` (multi-writer inside `critical {{ ... }}` via `{name}.get()`/`{name}.set(val)`), or `inbox<{ty}, 8> {name};` (queued events via `{name}.post(ev)` / `{name}.recv()`)",
                     ig.decl_span,
                     ty = ty_str,
                     name = ident.name
@@ -2248,11 +2248,15 @@ impl<'a> BodyChecker<'a> {
 
         if !fn_info.is_extern_c {
             let in_main_post_boot = self.in_main_post_boot();
+            let in_main_after_spawn = self.in_main_after_spawn();
+            let in_main_after_irq_attach = self.in_main_after_irq_attach();
             self.sema.recorded_call_args.push(RecordedCallArgs {
                 caller: self.caller_key.clone(),
                 callee: fn_info.name.clone(),
                 args: boot_call_args.clone(),
                 in_main_post_boot,
+                in_main_after_spawn,
+                in_main_after_irq_attach,
             });
             if self.caller_key == "main" {
                 let (spawns, attaches) = self.sema.fn_boot_flags(&fn_info.name);
@@ -3759,6 +3763,7 @@ impl<'a> BodyChecker<'a> {
                     ExprVal::scalar((**elem).clone(), span)
                 }
                 "publish" => {
+                    self.record_watch_publish(source_key, span);
                     self.expect_single_elem(m, &pos_vals, elem, span);
                     ExprVal::scalar(Ty::void(), span)
                 }
@@ -3781,6 +3786,58 @@ impl<'a> BodyChecker<'a> {
                         field_endpoints: BTreeMap::new(),
                         span,
                     }
+                }
+                _ => self.unknown_prim_method(prim, method, span),
+            },
+
+            ResolvedOsPrimitive::Guarded { elem } => match m {
+                "get" => {
+                    self.expect_positional_arity(m, &pos_vals, 0, span);
+                    if has_timeout || has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "'guarded.get()' does not accept 'timeout:' or 'boost:' arguments",
+                        ));
+                    }
+                    if !self.in_critical() {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                span,
+                                format!(
+                                    "'{}.get()' on `guarded<T>` may only be called inside a 'critical {{ ... }}' block",
+                                    source_key
+                                ),
+                            )
+                            .with_note("wrap multi-writer `guarded<T>` reads and writes in `critical { ... }` to prevent task/ISR races"),
+                        );
+                    }
+                    ExprVal::scalar((**elem).clone(), span)
+                }
+                "set" => {
+                    self.expect_single_elem(m, &pos_vals, elem, span);
+                    if has_timeout || has_boost {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidOperation,
+                            span,
+                            "'guarded.set()' does not accept 'timeout:' or 'boost:' arguments",
+                        ));
+                    }
+                    if !self.in_critical() {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::InvalidOperation,
+                                span,
+                                format!(
+                                    "'{}.set()' on `guarded<T>` may only be called inside a 'critical {{ ... }}' block",
+                                    source_key
+                                ),
+                            )
+                            .with_note("wrap multi-writer `guarded<T>` reads and writes in `critical { ... }` to prevent task/ISR races"),
+                        );
+                    }
+                    ExprVal::scalar(Ty::void(), span)
                 }
                 _ => self.unknown_prim_method(prim, method, span),
             },

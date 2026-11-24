@@ -164,6 +164,14 @@ pub(super) struct RecordedByteRingOp {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct RecordedWatchWrite {
+    pub(super) caller: String,
+    pub(super) target: EndpointSpec,
+    pub(super) span: Span,
+    pub(super) file: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(super) enum ActiveBodyKind {
     Fn {
         ret_ty: Ty,
@@ -254,6 +262,8 @@ pub(super) struct RecordedCallArgs {
     pub(super) callee: String,
     pub(super) args: Vec<BootCallArg>,
     pub(super) in_main_post_boot: bool,
+    pub(super) in_main_after_spawn: bool,
+    pub(super) in_main_after_irq_attach: bool,
 }
 
 pub(crate) struct Analyzer {
@@ -288,6 +298,7 @@ pub(crate) struct Analyzer {
     pub(super) fn_boot_steps: BTreeMap<String, Vec<BootStep>>,
     pub(super) recorded_call_args: Vec<RecordedCallArgs>,
     pub(super) recorded_byte_ring_ops: Vec<RecordedByteRingOp>,
+    pub(super) recorded_watch_writes: Vec<RecordedWatchWrite>,
     pub(super) spawned_task_field_endpoints: BTreeMap<usize, Vec<BTreeMap<String, String>>>,
     pub(super) prim_escaping_ref_params: BTreeMap<String, BTreeSet<usize>>,
     pub(super) tasks: BTreeMap<String, TaskInfo>,
@@ -332,6 +343,7 @@ pub(super) struct BodyChecker<'a> {
     pub(super) branch_depth: u32,
     pub(super) after_diverge: bool,
     pub(super) main_supervisor_started: bool,
+    pub(super) in_main_supervisor_loop: bool,
     pub(super) has_spawned: bool,
     pub(super) has_attached_irq: bool,
     pub(super) param_names: Vec<String>,

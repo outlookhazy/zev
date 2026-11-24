@@ -336,8 +336,10 @@ pub enum OsPrimitiveType {
     Inbox { elem: Box<TypeExpr>, cap: usize },
     /// `*inbox<T>` — unsized pointer view over any `inbox<T, N>`.
     InboxUnsized { elem: Box<TypeExpr> },
-    /// `watch<T>` — single-writer, zero-lock latest-value cell.
+    /// `watch<T>` — single-writer latest-value cell.
     Watch { elem: Box<TypeExpr> },
+    /// `guarded<T>` — multi-writer shared cell accessible only inside `critical { ... }`.
+    Guarded { elem: Box<TypeExpr> },
     /// `ping_pong<T, N>` — double-buffered zero-copy DMA endpoint (`N` = half/buffer size).
     PingPong { elem: Box<TypeExpr>, cap: usize },
     /// `pool<T, K>` — bounded zero-copy DMA/buffer pool of `cap` slots (1..=32).
@@ -358,6 +360,7 @@ impl OsPrimitiveType {
             Self::Signal => "signal",
             Self::Inbox { .. } | Self::InboxUnsized { .. } => "inbox",
             Self::Watch { .. } => "watch",
+            Self::Guarded { .. } => "guarded",
             Self::PingPong { .. } => "ping_pong",
             Self::Pool { .. } => "pool",
             Self::DmaSlot { .. } => "dma_slot",

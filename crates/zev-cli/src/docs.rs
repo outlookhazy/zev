@@ -29,9 +29,10 @@ CORE MENTAL MODEL (5 RULES):
      unguarded `while (cond)` compute loops that auto-specialize direct clones in `noyield { ... }`),
      and `HardBlocking` (`wait { ... }`, `recv`, `send`, `wait`, `wait_change`, `wait_chunk`, `delay`).
   4. Strict Task/ISR Isolation: Zero mutable raw globals. Cross-task/ISR state goes exclusively through
-     static primitives: `watch<T>`, unified `inbox<T, N>` (`.post`, `.send`, `.recv`), `signal`,
-     `byte_ring<N>`, `wait_queue` + `std.sync` (`Semaphore`, `EventFlags`, `Latch`, `Barrier<N>`),
-     `@dma_safe ping_pong<T, N>`, and `@dma_safe pool<T, K>` + `Lease<T>`.
+     static primitives: `watch<T>` (enforced single-writer), `guarded<T>` (multi-writer inside `critical`),
+     unified `inbox<T, N>` (`.post`, `.send`, `.recv`), `signal`, `byte_ring<N>`, `wait_queue` + `std.sync`
+     (`Semaphore`, `EventFlags`, `Latch`, `Barrier<N>`), `@dma_safe ping_pong<T, N>`, and
+     `@dma_safe pool<T, K>` + `Lease<T>`.
   5. Dual-Exit Errors, `defer`, Zero-Heap `f\"...\"` & Defined Safety: Normal exit `return val;`, failure
      `error [E [, v]];` (`or`/`catch`). Out-of-bounds indices/subslices/MMIO arrays and div/rem by zero
      trap deterministically (`@__syn_panic`), `INT_MIN / -1` evaluates to `INT_MIN` (`% -1` -> `0`), and
@@ -366,10 +367,10 @@ fn spi_burst_transfer([]u8 tx, *hw.GpioRegs cs_port, *hw.SpiRegs spi) {
     TopicDoc {
         name: "primitives",
         aliases: &[
-            "prim", "signal", "watch", "inbox", "byte_ring", "chan", "channel", "channels",
+            "prim", "signal", "watch", "guarded", "inbox", "byte_ring", "chan", "channel", "channels",
             "isolation", "globals", "boost", "subsystem", "subsystems", "view", "views",
         ],
-        summary: "Static OS primitives, subsystem `struct`s, `*byte_ring`/`*inbox<T>` views, and `boost:`",
+        summary: "Static OS primitives, `guarded<T>`, subsystem `struct`s, `*byte_ring`/`*inbox<T>` views, and `boost:`",
         body: "\
 # Zev Topic Guide: `primitives`
 
@@ -380,7 +381,8 @@ values or static scheduler-aware OS primitives at module scope and pass pointers
 
 | Primitive | Purpose | Non-Blocking (ISR & Task Safe) | Yielding (Task-Only) |
 |---|---|---|---|
-| `watch<T> w = init;` | Latest-value cell | `w.read() -> T`, `w.publish(v)` | `w.wait_change([timeout: d]) -> T` |
+| `watch<T> w = init;` | Enforced single-writer cell | `w.read() -> T`, `w.publish(v)` | `w.wait_change([timeout: d]) -> T` |
+| `guarded<T> g = init;` | Multi-writer (`critical` only) | `g.get() -> T`, `g.set(v)` (in `critical`) | *(not waitable; pair with `wait_queue`)* |
 | `inbox<T, N> q;` | Unified bounded queue | `q.post(v [, boost: @prio])`, `q.try_send(v) -> bool`, `q.try_recv()` | `q.send(v [, timeout: d])`, `q.recv([timeout: d]) -> T` |
 | `byte_ring<N> r;` | Contiguous BipBuffer byte stream | `r.push(s [, boost:])`, `r.push_byte(b [, boost:])`, `r.grant_write(n)`, `r.commit_write(n [, boost:])`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
 | `signal s;` | Lightweight wakeup | `s.notify([boost: @prio])`, `s.try_wait() -> bool`, `s.clear()` | `s.wait([timeout: d])` |
@@ -418,7 +420,7 @@ import chip.stm32g4 as hw;
 
 enum SupEvent { Overcurrent, BadPacket, IdleCheck }
 
-watch<u16>         motor1_rpm = 0;
+guarded<u16>       motor1_rpm = 0;
 inbox<SupEvent, 8> sup_inbox;
 
 isr overcurrent_isr(*inbox<SupEvent, 8> sup, *hw.GpioRegs gpio) {
@@ -434,7 +436,7 @@ fn main() {
     loop {
         SupEvent ev = sup_inbox.recv(timeout: 5s) or IdleCheck;
         switch (ev) {
-            Overcurrent => { motor1_rpm.publish(0); }
+            Overcurrent => { critical { motor1_rpm.set(0); } }
             BadPacket   => {}
             IdleCheck   => {}
         }

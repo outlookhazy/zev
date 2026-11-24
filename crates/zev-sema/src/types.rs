@@ -66,6 +66,7 @@ pub enum PrimitiveKind {
     Signal,
     Inbox,
     Watch,
+    Guarded,
     PingPong,
     Pool,
     DmaSlot,
@@ -79,6 +80,7 @@ impl PrimitiveKind {
             Self::Signal => "signal",
             Self::Inbox => "inbox",
             Self::Watch => "watch",
+            Self::Guarded => "guarded",
             Self::PingPong => "ping_pong",
             Self::Pool => "pool",
             Self::DmaSlot => "dma_slot",
@@ -107,6 +109,7 @@ pub enum ResolvedOsPrimitive {
     Inbox { elem: Box<Ty>, cap: usize },
     InboxUnsized { elem: Box<Ty> },
     Watch { elem: Box<Ty> },
+    Guarded { elem: Box<Ty> },
     PingPong { elem: Box<Ty>, cap: usize },
     Pool { elem: Box<Ty>, cap: usize },
     DmaSlot { elem: Box<Ty> },
@@ -123,6 +126,7 @@ impl ResolvedOsPrimitive {
             Self::Signal => PrimitiveKind::Signal,
             Self::Inbox { .. } | Self::InboxUnsized { .. } => PrimitiveKind::Inbox,
             Self::Watch { .. } => PrimitiveKind::Watch,
+            Self::Guarded { .. } => PrimitiveKind::Guarded,
             Self::PingPong { .. } => PrimitiveKind::PingPong,
             Self::Pool { .. } => PrimitiveKind::Pool,
             Self::DmaSlot { .. } => PrimitiveKind::DmaSlot,
@@ -141,6 +145,7 @@ impl ResolvedOsPrimitive {
             Self::Inbox { elem, .. }
             | Self::InboxUnsized { elem }
             | Self::Watch { elem }
+            | Self::Guarded { elem }
             | Self::PingPong { elem, .. }
             | Self::Pool { elem, .. }
             | Self::DmaSlot { elem } => Some(elem),
@@ -153,6 +158,7 @@ impl ResolvedOsPrimitive {
             Self::Signal
             | Self::WaitQueue
             | Self::Watch { .. }
+            | Self::Guarded { .. }
             | Self::DmaSlot { .. }
             | Self::InboxUnsized { .. }
             | Self::ByteRingUnsized => None,
@@ -172,6 +178,7 @@ impl fmt::Display for ResolvedOsPrimitive {
             Self::Inbox { elem, cap } => write!(f, "inbox<{}, {}>", elem, cap),
             Self::InboxUnsized { elem } => write!(f, "inbox<{}>", elem),
             Self::Watch { elem } => write!(f, "watch<{}>", elem),
+            Self::Guarded { elem } => write!(f, "guarded<{}>", elem),
             Self::PingPong { elem, cap } => write!(f, "ping_pong<{}, {}>", elem, cap),
             Self::Pool { elem, cap } => write!(f, "pool<{}, {}>", elem, cap),
             Self::DmaSlot { elem } => write!(f, "dma_slot<{}>", elem),
@@ -613,6 +620,7 @@ impl Ty {
             Self::OsPrimitive(p) => match p {
                 ResolvedOsPrimitive::Signal | ResolvedOsPrimitive::WaitQueue => 4,
                 ResolvedOsPrimitive::Watch { elem } => elem.byte_size(ptr_bytes, structs) + 4,
+                ResolvedOsPrimitive::Guarded { elem } => elem.byte_size(ptr_bytes, structs),
                 ResolvedOsPrimitive::Inbox { elem, cap } => {
                     elem.byte_size(ptr_bytes, structs) * cap + 16
                 }

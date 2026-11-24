@@ -222,10 +222,10 @@ mod tests {
                     TypeKind::Ptr(inner) => {
                         assert!(matches!(
                             inner.kind,
-                            TypeKind::OsPrimitive(OsPrimitiveType::Watch { .. })
+                            TypeKind::OsPrimitive(OsPrimitiveType::Guarded { .. })
                         ));
                     }
-                    other => panic!("expected Ptr(Watch), got {other:?}"),
+                    other => panic!("expected Ptr(Guarded), got {other:?}"),
                 }
             }
             other => panic!("expected Task, got {other:?}"),

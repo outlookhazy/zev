@@ -3045,6 +3045,28 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     vc.repr
                 ));
             }
+            MirPrimNonBlockingOp::GuardedSet {
+                target,
+                elem_ty,
+                value,
+            } => {
+                let pk = MirPrimKind::Guarded {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
+                let gptr = self.resolve_prim_ptr(target)?;
+                let ety = self.ctx.llvm_ty(elem_ty);
+                let vv = self.emit_expr(value)?;
+                let vc = self.coerce(vv, &ety, !value.ty.is_unsigned());
+                let vp = self.next_tmp();
+                self.emit_line(format!(
+                    "{vp} = getelementptr inbounds {pty}, ptr {gptr}, i32 0, i32 0"
+                ));
+                self.emit_line(format!(
+                    "store volatile {ety} {}, ptr {vp}, align 1",
+                    vc.repr
+                ));
+            }
             MirPrimNonBlockingOp::InboxPost {
                 target,
                 elem_ty,

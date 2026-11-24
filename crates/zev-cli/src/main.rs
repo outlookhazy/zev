@@ -2557,7 +2557,7 @@ pool<u32, 1> fpool;
 inbox<Lease<u32>, 1> prelease_q;
 signal pool_rel_sig;
 
-watch<u32> done_mask = 0;
+guarded<u32> done_mask = 0;
 
 irq IRQ_INBOX = 1;
 irq IRQ_SIG   = 2;
@@ -2606,7 +2606,7 @@ u32 wait_watch_helper(*watch<u32> w) {
     };
 }
 
-task t_inbox(*inbox<u32, 2> q, *watch<u32> dm) {
+task t_inbox(*inbox<u32, 2> q, *guarded<u32> dm) {
     for (u32 i in 0..35) {
         u32 v = q.recv();
         if (v != i + 1u32) {
@@ -2615,21 +2615,21 @@ task t_inbox(*inbox<u32, 2> q, *watch<u32> dm) {
         }
         critical { sys.nop(); }
     }
-    critical { dm.publish(dm.read() | 1u32); }
+    critical { dm.set(dm.get() | 1u32); }
     loop { delay(5000ms); }
 }
 
-task t_signal(*signal s, *watch<u32> req, *watch<u32> dm) {
+task t_signal(*signal s, *watch<u32> req, *guarded<u32> dm) {
     for (u32 i in 0..35) {
         req.publish(i + 1u32);
         critical { sys.nop(); }
         s.wait();
     }
-    critical { dm.publish(dm.read() | 2u32); }
+    critical { dm.set(dm.get() | 2u32); }
     loop { delay(5000ms); }
 }
 
-task t_ring(*byte_ring<8> r, *watch<u32> dm) {
+task t_ring(*byte_ring<8> r, *guarded<u32> dm) {
     u32 got = 0u32;
     while (got < 35u32) {
         []u8 c = r.wait_read();
@@ -2644,11 +2644,11 @@ task t_ring(*byte_ring<8> r, *watch<u32> dm) {
         r.consume(c.len);
         critical { sys.nop(); }
     }
-    critical { dm.publish(dm.read() | 4u32); }
+    critical { dm.set(dm.get() | 4u32); }
     loop { delay(5000ms); }
 }
 
-task t_watch(*watch<u32> w, *watch<u32> dm) {
+task t_watch(*watch<u32> w, *guarded<u32> dm) {
     u32 prev = 0u32;
     for (u32 i in 0..20) {
         u32 v = 0u32;
@@ -2664,11 +2664,11 @@ task t_watch(*watch<u32> w, *watch<u32> dm) {
         prev = v;
         critical { sys.nop(); }
     }
-    critical { dm.publish(dm.read() | 8u32); }
+    critical { dm.set(dm.get() | 8u32); }
     loop { delay(5000ms); }
 }
 
-task t_pool(*pool<u32, 1> p, *inbox<Lease<u32>, 1> rel_q, *signal rel_s, *watch<u32> dm) {
+task t_pool(*pool<u32, 1> p, *inbox<Lease<u32>, 1> rel_q, *signal rel_s, *guarded<u32> dm) {
     for (u32 i in 0..20) {
         Lease<u32> l1 = p.alloc();
         *u32 p1 = l1.get();
@@ -2681,12 +2681,15 @@ task t_pool(*pool<u32, 1> p, *inbox<Lease<u32>, 1> rel_q, *signal rel_s, *watch<
         rel_s.wait();
         critical { sys.nop(); }
     }
-    critical { dm.publish(dm.read() | 16u32); }
+    critical { dm.set(dm.get() | 16u32); }
     loop { delay(5000ms); }
 }
 
-task t_pacer(*watch<u32> dm) {
-    while (dm.read() != 31u32) {
+task t_pacer(*guarded<u32> dm) {
+    loop {
+        u32 cur = 0u32;
+        critical { cur = dm.get(); }
+        if (cur == 31u32) { break; }
         delay(1ms);
         critical { sys.nop(); }
     }
@@ -2738,8 +2741,8 @@ sync.EventFlags flags;
 sync.Latch gate;
 sync.Barrier<3> barrier;
 
-watch<u32> barrier_trips = 0;
-watch<u32> done_mask = 0;
+guarded<u32> barrier_trips = 0;
+guarded<u32> done_mask = 0;
 
 irq IRQ_SEM = 1;
 irq IRQ_FLAGS = 2;
@@ -2763,43 +2766,48 @@ isr on_latch(*sync.Latch g) {
     }
 }
 
-task t_sem_worker(*sync.Semaphore s, *watch<u32> dm) {
+task t_sem_worker(*sync.Semaphore s, *guarded<u32> dm) {
     for (u32 i in 0..25) {
         s.acquire();
         critical { sys.nop(); }
     }
-    critical { dm.publish(dm.read() | 1u32); }
+    critical { dm.set(dm.get() | 1u32); }
     loop { delay(5000ms); }
 }
 
-task t_flags_worker(*sync.EventFlags f, *sync.Latch g, *watch<u32> dm) {
+task t_flags_worker(*sync.EventFlags f, *sync.Latch g, *guarded<u32> dm) {
     g.wait();
     assert(g.is_ready());
     u32 got = f.wait_all(0x03u32);
     assert((got & 0x03u32) == 0x03u32);
     f.clear(0x03u32);
-    critical { dm.publish(dm.read() | 2u32); }
+    critical { dm.set(dm.get() | 2u32); }
     loop { delay(5000ms); }
 }
 
-task t_barrier_peer(u32 id, *sync.Barrier<3> b, *sync.Latch g, *watch<u32> trips, *watch<u32> dm) {
+task t_barrier_peer(u32 id, *sync.Barrier<3> b, *sync.Latch g, *guarded<u32> trips, *guarded<u32> dm) {
     g.wait();
     for (u32 r in 0..5) {
         if (b.wait()) {
-            critical { trips.publish(trips.read() + 1u32); }
+            critical { trips.set(trips.get() + 1u32); }
         }
         checkpoint();
     }
-    critical { dm.publish(dm.read() | (1u32 << (2u32 + id))); }
+    critical { dm.set(dm.get() | (1u32 << (2u32 + id))); }
     loop { delay(5000ms); }
 }
 
-task t_pacer(*watch<u32> dm, *watch<u32> trips) {
-    while (dm.read() != 31u32) {
+task t_pacer(*guarded<u32> dm, *guarded<u32> trips) {
+    loop {
+        u32 cur = 0u32;
+        critical { cur = dm.get(); }
+        if (cur == 31u32) { break; }
         delay(1ms);
         critical { sys.nop(); }
     }
-    assert(trips.read() == 5u32);
+    u32 tr = 0u32;
+    critical { tr = trips.get(); }
+    assert(tr == 5u32);
     println("std_sync_fuzz_ok");
     sys.exit(0);
 }

@@ -383,7 +383,7 @@ fn main() {
         code: "E0001",
         summary: "Illegal raw mutable global variable declared at top level",
         topic: "primitives",
-        why: "Raw mutable globals allow silent ISR-vs-task preemption races on multi-byte state and bypass scheduler wakeup tracking. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `inbox<T, N>`, `byte_ring<N>`, `signal`, `wait_queue`, `ping_pong<T, N>`, `pool<T, K>`, `dma_slot<T>`).",
+        why: "Raw mutable globals allow silent ISR-vs-task preemption races on multi-byte state and bypass scheduler wakeup tracking. Top-level state in Zev must be either an immutable `const` or a scheduler-aware static OS primitive (`watch<T>`, `guarded<T>`, `inbox<T, N>`, `byte_ring<N>`, `signal`, `wait_queue`, `ping_pong<T, N>`, `pool<T, K>`, `dma_slot<T>`).",
         bad_zev: "\
 u32 latest_rpm = 0;
 
@@ -400,9 +400,9 @@ fn main() {
     },
     ErrorDoc {
         code: "E0002",
-        summary: "Task, ISR, or function reads/writes a raw mutable global (isolation violation)",
+        summary: "Task, ISR, or function violates global isolation, `watch<T>` single-writer, or `byte_ring` SPSC exclusivity",
         topic: "primitives",
-        why: "Hardware ISRs can preempt any cooperative task between instructions unless interrupts are masked, and raw shared variables have no wakeup discipline. Replacing raw shared globals with `watch<T>` (latest value) or `inbox<Ev, N>` (event queue with optional `boost: @critical`) makes cross-context dataflow atomic and wakeup-aware.",
+        why: "Hardware ISRs can preempt any cooperative task between instructions unless interrupts are masked, and raw shared variables have no wakeup discipline. Replacing raw shared globals with `watch<T>` (single-writer latest value), `guarded<T>` (multi-writer inside `critical { ... }`), or `inbox<Ev, N>` (MPSC event queue with optional `boost: @critical`) makes cross-context dataflow atomic and race-free.",
         bad_zev: "\
 bool overcurrent_latched = false;
 

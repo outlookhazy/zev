@@ -293,6 +293,9 @@ impl ModuleSymbols {
             OsPrimitiveType::Watch { elem } => MirPrimKind::Watch {
                 elem: Box::new(self.resolve_type(elem)),
             },
+            OsPrimitiveType::Guarded { elem } => MirPrimKind::Guarded {
+                elem: Box::new(self.resolve_type(elem)),
+            },
             OsPrimitiveType::Inbox { elem, cap } => MirPrimKind::Inbox {
                 elem: Box::new(self.resolve_type(elem)),
                 cap: *cap,
@@ -896,7 +899,9 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                     })?;
                 let init = if let Some(ie) = &pd.init {
                     let elem_ty = match &pinfo.kind {
-                        MirPrimKind::Watch { elem } => Some(elem.as_ref()),
+                        MirPrimKind::Watch { elem } | MirPrimKind::Guarded { elem } => {
+                            Some(elem.as_ref())
+                        }
                         _ => None,
                     };
                     let mut dummy_ctx =

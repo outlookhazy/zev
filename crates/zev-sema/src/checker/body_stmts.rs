@@ -23,6 +23,7 @@ impl<'a> BodyChecker<'a> {
             branch_depth: 0,
             after_diverge: false,
             main_supervisor_started: false,
+            in_main_supervisor_loop: false,
             has_spawned: false,
             has_attached_irq: false,
             param_names: Vec::new(),
@@ -83,6 +84,15 @@ impl<'a> BodyChecker<'a> {
         self.caller_key == "main" && (self.has_spawned || self.has_attached_irq)
     }
 
+    pub(super) fn in_main_after_spawn(&self) -> bool {
+        self.caller_key == "main"
+            && (self.has_spawned || self.in_main_supervisor_loop || self.main_supervisor_started)
+    }
+
+    pub(super) fn in_main_after_irq_attach(&self) -> bool {
+        self.caller_key == "main" && self.has_attached_irq
+    }
+
     pub(super) fn resolve_endpoint_spec(&self, ep: &str) -> EndpointSpec {
         if let Some(rest) = ep.strip_prefix("param:") {
             let (pname, suffix) = match rest.split_once('.') {
@@ -135,6 +145,32 @@ impl<'a> BodyChecker<'a> {
             caller,
             role,
             method: method.to_string(),
+            target,
+            span,
+            file: self.sema.current_file.clone(),
+        });
+    }
+
+    pub(super) fn record_watch_publish(&mut self, source_key: &str, span: Span) {
+        if source_key == "<anon_endpoint>" {
+            return;
+        }
+        let caller = if self.caller_key == "main" {
+            if self.in_main_after_spawn() {
+                "main::post_spawn".to_string()
+            } else if self.in_main_after_irq_attach() {
+                "main::post_irq_pre_spawn".to_string()
+            } else {
+                // Sequential boot initialization in `main()` before `spawn` / `irq.attach`
+                // and before `main()`'s supervisor loop does not race with concurrent actors.
+                return;
+            }
+        } else {
+            self.caller_key.clone()
+        };
+        let target = self.resolve_endpoint_spec(source_key);
+        self.sema.recorded_watch_writes.push(RecordedWatchWrite {
+            caller,
             target,
             span,
             file: self.sema.current_file.clone(),
@@ -1418,7 +1454,12 @@ impl<'a> BodyChecker<'a> {
                 if is_while_true && !has_break {
                     self.check_unconsumed_leases_on_exit(stmt.span, "enter infinite while loop", 0);
                 }
+                let prev_sup_loop = self.in_main_supervisor_loop;
+                if is_while_true && !has_break && self.caller_key == "main" {
+                    self.in_main_supervisor_loop = true;
+                }
                 self.check_loop_body(body, is_while_true && !has_break);
+                self.in_main_supervisor_loop = prev_sup_loop;
                 if is_while_true && self.caller_key == "main" {
                     self.main_supervisor_started = true;
                 }
@@ -1490,7 +1531,12 @@ impl<'a> BodyChecker<'a> {
                 if !has_break {
                     self.check_unconsumed_leases_on_exit(stmt.span, "enter infinite loop", 0);
                 }
+                let prev_sup_loop = self.in_main_supervisor_loop;
+                if !has_break && self.caller_key == "main" {
+                    self.in_main_supervisor_loop = true;
+                }
                 self.check_loop_body(body, !has_break);
+                self.in_main_supervisor_loop = prev_sup_loop;
                 if self.caller_key == "main" {
                     self.main_supervisor_started = true;
                 }
@@ -1556,7 +1602,12 @@ impl<'a> BodyChecker<'a> {
                         0,
                     );
                 }
+                let prev_sup_loop = self.in_main_supervisor_loop;
+                if !has_break && self.caller_key == "main" {
+                    self.in_main_supervisor_loop = true;
+                }
                 self.check_loop_body(body, !has_break);
+                self.in_main_supervisor_loop = prev_sup_loop;
                 if self.caller_key == "main" {
                     self.main_supervisor_started = true;
                 }
@@ -2022,11 +2073,15 @@ impl<'a> BodyChecker<'a> {
                                 );
                             }
                             if !valid_consumer_call && !rv.ty.is_error() {
-                                self.sema.emit(Diagnostic::new(
+                                let mut d = Diagnostic::new(
                                     DiagnosticKind::InvalidOperation,
                                     arm.call.span,
                                     "unsupported 'wait { ... }' arm: arms must be direct blocking consumer calls (`inbox.recv()`, `signal.wait()`, `byte_ring.wait_read()`, `ping_pong.wait_chunk()`, `watch.wait_change()`, `pool.alloc()`)",
-                                ));
+                                );
+                                if matches!(prim_opt, Some(ResolvedOsPrimitive::Guarded { .. })) {
+                                    d = d.with_note("`guarded<T>` is not a wait source; pair it with a `wait_queue` (`prepare_wait()` inside `critical`, then `commit_wait()` or sleep outside `wait`)");
+                                }
+                                self.sema.emit(d);
                             }
                         }
                         _ => {
@@ -2778,7 +2833,7 @@ impl<'a> BodyChecker<'a> {
                             ),
                         )
                         .with_note(format!(
-                            "declared at {}; replace raw global `{name}` with `watch<{ty}> {name} = 0;` (then `{name}.publish(val);`) or `inbox<{ty}, 8> {name};` (then `{name}.post(ev);`)",
+                            "declared at {}; replace raw global `{name}` with `watch<{ty}> {name} = 0;` (single writer via `{name}.publish(val);`), `guarded<{ty}> {name} = 0;` (multi-writer inside `critical {{ ... }}` via `{name}.set(val);`), or `inbox<{ty}, 8> {name};` (queued events via `{name}.post(ev);`)",
                             ig.decl_span,
                             name = ident.name,
                             ty = ty_str
