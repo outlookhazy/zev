@@ -577,7 +577,8 @@ impl Ty {
                 true
             }
 
-            // Function pointers match when parameter/return types and error specs are compatible.
+            // Function pointers must match parameter types, return type, and error spec identically
+            // because Zev uses zero-trampoline direct indirect calls with C-compatible ABI signatures.
             (
                 Ty::FnPtr {
                     params: pa,
@@ -589,12 +590,7 @@ impl Ty {
                     ret: rb,
                     error_spec: eb,
                 },
-            ) => {
-                ea == eb
-                    && pa.len() == pb.len()
-                    && pa.iter().zip(pb.iter()).all(|(a, b)| a.is_assignable_to(b))
-                    && ra.is_assignable_to(rb)
-            }
+            ) => ea == eb && pa == pb && ra == rb,
             // Allow passing a non-fallible function reference to opaque `*void` callback parameter in extern "C".
             (Ty::FnPtr { error_spec, .. }, Ty::Ptr(inner)) if inner.is_void() => {
                 !error_spec.is_fallible()

@@ -253,6 +253,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirExprKind::Index {
                 base,
                 index,
+                raw_elem_ty,
                 is_slice: false,
             } => {
                 let Some((bp, bty, packed)) = self.try_emit_rodata_const_ptr(base)? else {
@@ -269,7 +270,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 let elem_mir = match &bty {
                     MirType::Array { elem, .. } => elem.as_ref().clone(),
-                    _ => expr.ty.clone(),
+                    _ => raw_elem_ty.clone(),
                 };
                 Ok(Some((ep, elem_mir, packed)))
             }
@@ -748,7 +749,20 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let mut cur = SsaVal::new(&aty, "zeroinitializer");
                 for (i, e) in elems.iter().enumerate() {
                     let ev = self.emit_expr(e)?;
-                    let ec = self.coerce(ev, &ety, !e.ty.is_unsigned());
+                    let mut ec = self.coerce(ev, &ety, !e.ty.is_unsigned());
+                    if let MirType::EndianInt {
+                        bits,
+                        big_endian: true,
+                        ..
+                    } = elem_ty
+                    {
+                        let sw = self.next_tmp();
+                        self.emit_line(format!(
+                            "{sw} = call i{bits} @llvm.bswap.i{bits}(i{bits} {})",
+                            ec.repr
+                        ));
+                        ec = SsaVal::new(ety.clone(), sw);
+                    }
                     let nxt = self.next_tmp();
                     self.emit_line(format!(
                         "{nxt} = insertvalue {aty} {}, {ety} {}, {i}",
@@ -820,12 +834,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirExprKind::Index {
                 base,
                 index,
+                raw_elem_ty,
                 is_slice,
             } => {
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let iv = self.emit_expr(index)?;
                 let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
-                let ety = self.ctx.llvm_ty(&expr.ty);
+                let ety = self.ctx.llvm_ty(raw_elem_ty);
                 if *is_slice {
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
                     let bv = self.emit_expr(base)?;
@@ -841,7 +856,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         "{ep} = getelementptr {ety}, ptr {dp}, {usize_ty} {}",
                         ic.repr
                     ));
-                    Ok(self.load_from_place_ptr(&ep, &expr.ty, false))
+                    Ok(self.load_from_place_ptr(&ep, raw_elem_ty, false))
                 } else if let Some((bp, bty, packed)) = self.try_emit_rodata_const_ptr(base)? {
                     if let MirType::Array { len, .. } = &bty {
                         if *len == 0 {
@@ -861,7 +876,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         "{ep} = getelementptr inbounds {blty}, ptr {bp}, {usize_ty} 0, {usize_ty} {}",
                         ic.repr
                     ));
-                    Ok(self.load_from_place_ptr(&ep, &expr.ty, packed))
+                    Ok(self.load_from_place_ptr(&ep, raw_elem_ty, packed))
                 } else {
                     if let MirType::Array { len, .. } = &base.ty {
                         if *len == 0 {
@@ -886,7 +901,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         "{ep} = getelementptr inbounds {}, ptr {tmp}, {usize_ty} 0, {usize_ty} {}",
                         bv.ty, ic.repr
                     ));
-                    Ok(self.load_from_place_ptr(&ep, &expr.ty, false))
+                    Ok(self.load_from_place_ptr(&ep, raw_elem_ty, false))
                 }
             }
             MirExprKind::SubSlice {

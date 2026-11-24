@@ -268,6 +268,7 @@ impl RomWrapperSpec {
 pub(super) struct FnLlvmSig {
     pub(super) symbol: String,
     pub(super) params: Vec<MirType>,
+    pub(super) ret_mir_ty: MirType,
     pub(super) ret_llvm_ty: String,
 }
 

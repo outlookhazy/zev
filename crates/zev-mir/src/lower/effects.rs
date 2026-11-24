@@ -1815,7 +1815,11 @@ pub(super) fn lower_main_entry<'a>(
                         let exp = fn_sig.params.get(i);
                         let raw = dctx.lower_expr_with_stmts(&a.value, exp, &mut pre_stmts)?;
                         let coerced = if let Some(pty) = exp {
-                            coerce_call_arg_expr(raw, pty)
+                            let mut be = DirectBackend {
+                                ctx: &mut dctx,
+                                stmts: &mut pre_stmts,
+                            };
+                            coerce_expr_be(raw, pty, &mut be)
                         } else {
                             raw
                         };
@@ -1849,14 +1853,18 @@ pub(super) fn lower_main_entry<'a>(
                         span: stmt.span,
                     })?;
                     let vty = syms.resolve_type(ty);
-                    let vid = dctx.declare_var(&name.name, vty, VarRole::UserLocal);
+                    let vid = dctx.declare_var(&name.name, vty.clone(), VarRole::UserLocal);
                     let mut pre_stmts = Vec::new();
                     let mut largs = Vec::new();
                     for (i, a) in args.iter().enumerate() {
                         let exp = fn_sig.params.get(i);
                         let raw = dctx.lower_expr_with_stmts(&a.value, exp, &mut pre_stmts)?;
                         let coerced = if let Some(pty) = exp {
-                            coerce_call_arg_expr(raw, pty)
+                            let mut be = DirectBackend {
+                                ctx: &mut dctx,
+                                stmts: &mut pre_stmts,
+                            };
+                            coerce_expr_be(raw, pty, &mut be)
                         } else {
                             raw
                         };
@@ -1866,16 +1874,43 @@ pub(super) fn lower_main_entry<'a>(
                         boot_steps.push(MirBootStep::Stmt(Box::new(ps)));
                     }
                     boot_yielding_callees.insert(cname.clone());
-                    let dst = if fn_sig.error_spec.has_error() {
-                        Some(MirCallDst::Result(vid))
+                    if !fn_sig.error_spec.has_error() && fn_sig.ret_ty != vty && !vty.is_void() {
+                        let ytmp = dctx.alloc_temp("boot_ycall", fn_sig.ret_ty.clone());
+                        boot_steps.push(MirBootStep::RunYieldingFn {
+                            callee: cname,
+                            args: largs,
+                            dst: Some(MirCallDst::Value(ytmp)),
+                        });
+                        let mut post_stmts = Vec::new();
+                        let mut be = DirectBackend {
+                            ctx: &mut dctx,
+                            stmts: &mut post_stmts,
+                        };
+                        let coerced = coerce_expr_be(
+                            MirExpr::new(MirExprKind::Var(ytmp), fn_sig.ret_ty),
+                            &vty,
+                            &mut be,
+                        );
+                        post_stmts.push(MirStmt::Assign {
+                            target: MirPlace::Var(vid),
+                            op: MirAssignOp::Assign,
+                            value: coerced,
+                        });
+                        for ps in post_stmts {
+                            boot_steps.push(MirBootStep::Stmt(Box::new(ps)));
+                        }
                     } else {
-                        Some(MirCallDst::Value(vid))
-                    };
-                    boot_steps.push(MirBootStep::RunYieldingFn {
-                        callee: cname,
-                        args: largs,
-                        dst,
-                    });
+                        let dst = if fn_sig.error_spec.has_error() {
+                            Some(MirCallDst::Result(vid))
+                        } else {
+                            Some(MirCallDst::Value(vid))
+                        };
+                        boot_steps.push(MirBootStep::RunYieldingFn {
+                            callee: cname,
+                            args: largs,
+                            dst,
+                        });
+                    }
                 }
                 _ => {
                     let lowered = dctx.lower_stmt(stmt)?;

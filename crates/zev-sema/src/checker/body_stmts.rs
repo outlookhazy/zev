@@ -3396,10 +3396,12 @@ impl<'a> BodyChecker<'a> {
                     self.check_compound_op_types(op, &elem_ty, value_expr, &rhs.ty, stmt_span);
                 }
                 if elem_ty.contains_reference(&self.sema.structs) {
+                    let rhs_prov =
+                        self.coerce_array_to_slice_prov(value_expr, &rhs.ty, &elem_ty, &rhs.prov);
                     if let Some(root_name) = root_ident_of(seq_expr) {
                         if let Some(root_var) = self.lookup_local(&root_name) {
-                            if root_var.decl_depth < rhs.prov.origin_depth {
-                                if !rhs.prov.isr_state_origins.is_empty() {
+                            if root_var.decl_depth < rhs_prov.origin_depth {
+                                if !rhs_prov.isr_state_origins.is_empty() {
                                     self.sema.emit(Diagnostic::new(
                                         DiagnosticKind::InvalidIsrState,
                                         stmt_span,
@@ -3414,7 +3416,7 @@ impl<'a> BodyChecker<'a> {
                                         stmt_span,
                                         format!(
                                             "cannot escape value of scope depth {} into array/slice '{}' at scope depth {}",
-                                            rhs.prov.origin_depth, root_name, root_var.decl_depth
+                                            rhs_prov.origin_depth, root_name, root_var.decl_depth
                                         ),
                                     ));
                                 }

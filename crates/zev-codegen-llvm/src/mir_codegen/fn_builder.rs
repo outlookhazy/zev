@@ -128,12 +128,28 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             ));
         }
         for (idx, &vid) in param_vids.iter().enumerate() {
-            let lty = self.ctx.llvm_ty(&self.vars[vid.0].ty);
+            let pty_mir = self.vars[vid.0].ty.clone();
+            let lty = self.ctx.llvm_ty(&pty_mir);
             let al = self.stack_align(&lty);
-            self.emit_line(format!(
-                "store {lty} %arg{idx}, ptr %v_{}, align {al}",
-                vid.0
-            ));
+            if matches!(
+                pty_mir,
+                MirType::EndianInt {
+                    big_endian: true,
+                    ..
+                }
+            ) {
+                self.store_to_place_ptr(
+                    &format!("%v_{}", vid.0),
+                    &pty_mir,
+                    false,
+                    SsaVal::new(lty, format!("%arg{idx}")),
+                );
+            } else {
+                self.emit_line(format!(
+                    "store {lty} %arg{idx}, ptr %v_{}, align {al}",
+                    vid.0
+                ));
+            }
         }
     }
 
@@ -792,15 +808,26 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 ));
                 for (i, &pvid) in callee_fn.params.iter().enumerate() {
                     if let Some(&pgep) = child_layout.hoisted_var_gep.get(&pvid) {
+                        let pty_mir = callee_fn.vars[pvid.0].ty.clone();
                         let pp = self.next_tmp();
                         self.emit_line(format!(
                             "{pp} = getelementptr inbounds {}, ptr {cptr}, i32 0, i32 {pgep}",
                             child_layout.llvm_name
                         ));
-                        self.emit_line(format!(
-                            "store {} {}, ptr {pp}, align 4",
-                            eval_args[i].ty, eval_args[i].repr
-                        ));
+                        if matches!(
+                            pty_mir,
+                            MirType::EndianInt {
+                                big_endian: true,
+                                ..
+                            }
+                        ) {
+                            self.store_to_place_ptr(&pp, &pty_mir, false, eval_args[i].clone());
+                        } else {
+                            self.emit_line(format!(
+                                "store {} {}, ptr {pp}, align 4",
+                                eval_args[i].ty, eval_args[i].repr
+                            ));
+                        }
                     }
                 }
                 self.emit_term(format!("br label %bb_{}", poll_bb.0));
@@ -880,14 +907,31 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             MirCallDst::Value(v) | MirCallDst::Result(v) => *v,
                         };
                         let dp = self.var_ptr(dvid);
-                        let dty = self.ctx.llvm_ty(&self.vars[dvid.0].ty);
-                        let signed = !self.vars[dvid.0].ty.is_unsigned();
+                        let d_mir = self.vars[dvid.0].ty.clone();
+                        let dty = self.ctx.llvm_ty(&d_mir);
+                        let signed = if matches!(d, MirCallDst::Value(_)) {
+                            !child_sig.ret_mir_ty.is_unsigned()
+                        } else {
+                            !d_mir.is_unsigned()
+                        };
                         let coerced =
                             self.coerce(SsaVal::new(&child_layout.ret_llvm_ty, rv), &dty, signed);
-                        self.emit_line(format!(
-                            "store {} {}, ptr {dp}, align 4",
-                            coerced.ty, coerced.repr
-                        ));
+                        if matches!(d, MirCallDst::Value(_))
+                            && matches!(
+                                d_mir,
+                                MirType::EndianInt {
+                                    big_endian: true,
+                                    ..
+                                }
+                            )
+                        {
+                            self.store_to_place_ptr(&dp, &d_mir, false, coerced);
+                        } else {
+                            self.emit_line(format!(
+                                "store {} {}, ptr {dp}, align 4",
+                                coerced.ty, coerced.repr
+                            ));
+                        }
                     }
                 }
                 self.emit_term(format!("br label %bb_{}", resume_bb.0));
@@ -2083,15 +2127,26 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         ));
         for (i, &pvid) in callee_fn.params.iter().enumerate() {
             if let Some(&pgep) = child_layout.hoisted_var_gep.get(&pvid) {
+                let pty_mir = callee_fn.vars[pvid.0].ty.clone();
                 let pp = self.next_tmp();
                 self.emit_line(format!(
                     "{pp} = getelementptr inbounds {}, ptr {fsym}, i32 0, i32 {pgep}",
                     child_layout.llvm_name
                 ));
-                self.emit_line(format!(
-                    "store {} {}, ptr {pp}, align 4",
-                    eval_args[i].ty, eval_args[i].repr
-                ));
+                if matches!(
+                    pty_mir,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    self.store_to_place_ptr(&pp, &pty_mir, false, eval_args[i].clone());
+                } else {
+                    self.emit_line(format!(
+                        "store {} {}, ptr {pp}, align 4",
+                        eval_args[i].ty, eval_args[i].repr
+                    ));
+                }
             }
         }
 
@@ -2142,13 +2197,30 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     MirCallDst::Value(v) | MirCallDst::Result(v) => *v,
                 };
                 let dp = self.var_ptr(dvid);
-                let dty = self.ctx.llvm_ty(&self.vars[dvid.0].ty);
-                let signed = !self.vars[dvid.0].ty.is_unsigned();
+                let d_mir = self.vars[dvid.0].ty.clone();
+                let dty = self.ctx.llvm_ty(&d_mir);
+                let signed = if matches!(d, MirCallDst::Value(_)) {
+                    !child_sig.ret_mir_ty.is_unsigned()
+                } else {
+                    !d_mir.is_unsigned()
+                };
                 let coerced = self.coerce(SsaVal::new(&child_layout.ret_llvm_ty, rv), &dty, signed);
-                self.emit_line(format!(
-                    "store {} {}, ptr {dp}, align 4",
-                    coerced.ty, coerced.repr
-                ));
+                if matches!(d, MirCallDst::Value(_))
+                    && matches!(
+                        d_mir,
+                        MirType::EndianInt {
+                            big_endian: true,
+                            ..
+                        }
+                    )
+                {
+                    self.store_to_place_ptr(&dp, &d_mir, false, coerced);
+                } else {
+                    self.emit_line(format!(
+                        "store {} {}, ptr {dp}, align 4",
+                        coerced.ty, coerced.repr
+                    ));
+                }
             }
         }
         Ok(())
@@ -2321,15 +2393,26 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         ));
         for (i, &pvid) in bp.params.iter().enumerate() {
             if let Some(&pgep) = bp_layout.hoisted_var_gep.get(&pvid) {
+                let pty_mir = bp.vars[pvid.0].ty.clone();
                 let pp = self.next_tmp();
                 self.emit_line(format!(
                     "{pp} = getelementptr inbounds {}, ptr {fsym}, i32 0, i32 {pgep}",
                     bp_layout.llvm_name
                 ));
-                self.emit_line(format!(
-                    "store {} {}, ptr {pp}, align 4",
-                    eval_args[i].ty, eval_args[i].repr
-                ));
+                if matches!(
+                    pty_mir,
+                    MirType::EndianInt {
+                        big_endian: true,
+                        ..
+                    }
+                ) {
+                    self.store_to_place_ptr(&pp, &pty_mir, false, eval_args[i].clone());
+                } else {
+                    self.emit_line(format!(
+                        "store {} {}, ptr {pp}, align 4",
+                        eval_args[i].ty, eval_args[i].repr
+                    ));
+                }
             }
         }
 
