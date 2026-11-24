@@ -18,6 +18,7 @@ pub struct RuntimeIrFeatures {
     pub uses_fmt: bool,
     pub uses_fmt_float_sci: bool,
     pub uses_fmt_pad: bool,
+    pub uses_fnptr: bool,
     pub uses_rv_irqs: bool,
     pub uses_sys_tick: bool,
     pub uses_clock_hook: bool,
@@ -31,6 +32,7 @@ impl RuntimeIrFeatures {
             uses_fmt: true,
             uses_fmt_float_sci: true,
             uses_fmt_pad: true,
+            uses_fnptr: true,
             uses_rv_irqs: false,
             uses_sys_tick: true,
             uses_clock_hook: false,
@@ -235,7 +237,7 @@ entry:
     if features.uses_floats || features.uses_fmt_float_sci {
         emit_freestanding_soft_float_ir(out, spec.isa);
     }
-    emit_portable_uart_format_ir(out, spec.isa, sz);
+    emit_portable_uart_format_ir(out, spec.isa, sz, features.uses_fnptr);
     if features.uses_fmt {
         emit_zero_heap_fmt_ir(
             out,
@@ -957,7 +959,7 @@ entry:
     );
 }
 
-fn emit_portable_uart_format_ir(out: &mut String, isa: CpuIsa, sz: &str) {
+fn emit_portable_uart_format_ir(out: &mut String, isa: CpuIsa, sz: &str, uses_fnptr: bool) {
     let fn_as = isa.fn_addrspace_attr();
     let call_kw = isa.call_kw();
     let _ = writeln!(
@@ -1114,7 +1116,32 @@ hex_done:
 @__syn_panic_mmio = private unnamed_addr constant [26 x i8] c"mmio index out of bounds\0A\00", align 1
 @__syn_panic_div = private unnamed_addr constant [18 x i8] c"division by zero\0A\00", align 1
 @__syn_panic_def = private unnamed_addr constant [14 x i8] c"runtime trap\0A\00", align 1
-
+"#
+    );
+    if uses_fnptr {
+        let _ = writeln!(
+            out,
+            "@__syn_panic_fnptr = private unnamed_addr constant [23 x i8] c\"null function pointer\\0A\\00\", align 1"
+        );
+    }
+    let fnptr_switch = if uses_fnptr {
+        "\n    i8 5, label %m_fnptr"
+    } else {
+        ""
+    };
+    let fnptr_bb = if uses_fnptr {
+        "\nm_fnptr:\n  br label %emit"
+    } else {
+        ""
+    };
+    let fnptr_phi = if uses_fnptr {
+        ", [ @__syn_panic_fnptr, %m_fnptr ]"
+    } else {
+        ""
+    };
+    let _ = writeln!(
+        out,
+        r#"
 define void @__syn_panic(i8 %reason){fn_as} noreturn nounwind noinline cold{sz} {{
 entry:
   {call_kw} void @__syn_uart_puts(ptr @__syn_panic_prefix)
@@ -1122,7 +1149,7 @@ entry:
     i8 1, label %m_idx
     i8 2, label %m_slc
     i8 3, label %m_mmio
-    i8 4, label %m_div
+    i8 4, label %m_div{fnptr_switch}
   ]
 m_idx:
   br label %emit
@@ -1131,11 +1158,11 @@ m_slc:
 m_mmio:
   br label %emit
 m_div:
-  br label %emit
+  br label %emit{fnptr_bb}
 m_def:
   br label %emit
 emit:
-  %msg = phi ptr [ @__syn_panic_idx, %m_idx ], [ @__syn_panic_slc, %m_slc ], [ @__syn_panic_mmio, %m_mmio ], [ @__syn_panic_div, %m_div ], [ @__syn_panic_def, %m_def ]
+  %msg = phi ptr [ @__syn_panic_idx, %m_idx ], [ @__syn_panic_slc, %m_slc ], [ @__syn_panic_mmio, %m_mmio ], [ @__syn_panic_div, %m_div ]{fnptr_phi}, [ @__syn_panic_def, %m_def ]
   {call_kw} void @__syn_uart_puts(ptr %msg)
   {call_kw} void @__syn_on_fault()
   {call_kw} void @__syn_platform_exit(i32 101)

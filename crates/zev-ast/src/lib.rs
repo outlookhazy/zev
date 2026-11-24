@@ -456,11 +456,12 @@ pub enum TypeKind {
     OsPrimitive(OsPrimitiveType),
     /// Linear, move-only buffer lease `Lease<T>` allocated from a `pool<T, K>`.
     Lease(Box<TypeExpr>),
-    /// Function pointer type `fn(T1, T2) [-> Ret] [error [E]]`.
+    /// Function pointer type `[noyield] fn(T1, T2) [-> Ret] [error [E]]`.
     FnPtr {
         params: Vec<TypeExpr>,
         ret: Box<TypeExpr>,
         error_spec: Option<Box<ErrorSpec>>,
+        is_noyield: bool,
     },
 }
 
@@ -745,7 +746,7 @@ pub struct GlobalVarDecl {
 /// Function declaration or `extern "C"` prototype.
 ///
 /// Supports both `fn main() { ... }` and explicit return-first syntax
-/// `u16 parse_setpoint([]u8 buf) error ParseErr { ... }`, as well as
+/// `fn parse_setpoint([]u8 buf) -> u16 error ParseErr { ... }`, as well as
 /// `extern "C" fn ...;` / `extern "C" RetType name(...);`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FnDecl {

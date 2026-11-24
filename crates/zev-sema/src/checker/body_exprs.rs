@@ -135,16 +135,70 @@ impl<'a> BodyChecker<'a> {
                     && ty_contains_byval_mmio(&target_ty).is_none()
                     && !is_valid_cast(&iv.ty, &target_ty)
                 {
-                    let kind = if iv.ty.contains_mmio() || target_ty.contains_mmio() {
-                        DiagnosticKind::MmioViolation
+                    if matches!(
+                        (&iv.ty, &target_ty),
+                        (
+                            Ty::FnPtr {
+                                kind: FnPtrKind::Plain,
+                                params: pa,
+                                ret: ra,
+                                error_spec: ea,
+                            },
+                            Ty::FnPtr {
+                                kind: FnPtrKind::NoYield,
+                                params: pb,
+                                ret: rb,
+                                error_spec: eb,
+                            },
+                        ) if ea == eb && pa == pb && ra == rb
+                    ) {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::YieldInNoYield,
+                                expr.span,
+                                format!(
+                                    "cannot cast plain '{}' pointer to '{}': plain `fn(...)` pointers may target yielding functions",
+                                    iv.ty, target_ty
+                                ),
+                            )
+                            .with_note("declare the pointer or callback as `noyield fn(...)` from the source"),
+                        );
+                    } else if matches!(
+                        (&iv.ty, &target_ty),
+                        (
+                            Ty::FnPtr {
+                                kind: FnPtrKind::Plain,
+                                error_spec,
+                                ..
+                            },
+                            Ty::Ptr(inner)
+                        ) if inner.is_void() && !error_spec.is_fallible()
+                    ) {
+                        self.sema.emit(
+                            Diagnostic::new(
+                                DiagnosticKind::YieldInNoYield,
+                                expr.span,
+                                format!(
+                                    "cannot cast plain '{}' pointer to '*void': plain `fn(...)` pointers may target yielding functions",
+                                    iv.ty
+                                ),
+                            )
+                            .with_note("declare the pointer as `noyield fn(...)` for C / opaque `*void` callbacks"),
+                        );
                     } else {
-                        DiagnosticKind::TypeMismatch
-                    };
-                    self.sema.emit(Diagnostic::new(
-                        kind,
-                        expr.span,
-                        format!("cannot cast value of type '{}' to '{}'", iv.ty, target_ty),
-                    ));
+                        let kind = if iv.ty.contains_mmio() || target_ty.contains_mmio() {
+                            DiagnosticKind::MmioViolation
+                        } else {
+                            DiagnosticKind::TypeMismatch
+                        };
+                        self.sema.emit(Diagnostic::new(
+                            kind,
+                            expr.span,
+                            format!("cannot cast value of type '{}' to '{}'", iv.ty, target_ty),
+                        ));
+                    }
+                } else {
+                    self.record_fn_ptr_coercion(inner, &target_ty);
                 }
                 let mut prov = iv.prov;
                 if !target_ty.contains_reference(&self.sema.structs)
@@ -527,6 +581,21 @@ impl<'a> BodyChecker<'a> {
                         {
                             elem_ty = Some(ev.ty.clone());
                         }
+                        Some(Ty::FnPtr { kind: ka, .. })
+                            if matches!(
+                                &ev.ty,
+                                Ty::FnPtr { kind: kb, .. }
+                                    if matches!(
+                                        (ka, kb),
+                                        (FnPtrKind::FnItem, FnPtrKind::NoYield | FnPtrKind::Plain)
+                                            | (FnPtrKind::NoYield, FnPtrKind::Plain)
+                                    )
+                            ) && elem_ty
+                                .as_ref()
+                                .is_some_and(|cur| cur.is_assignable_to(&ev.ty)) =>
+                        {
+                            elem_ty = Some(ev.ty.clone());
+                        }
                         Some(cur) => {
                             let _ = self.sema.check_assignable_or_emit(
                                 &ev.ty,
@@ -565,7 +634,16 @@ impl<'a> BodyChecker<'a> {
                     for e in elems {
                         self.validate_int_expr_at_type(e, None);
                     }
-                } else if matches!(final_elem, Ty::Array { .. } | Ty::Slice(_)) {
+                } else if matches!(final_elem, Ty::Array { .. } | Ty::Slice(_))
+                    || matches!(
+                        final_elem,
+                        Ty::FnPtr {
+                            kind: FnPtrKind::NoYield,
+                            ..
+                        }
+                    )
+                    || matches!(&final_elem, Ty::Ptr(inner) if inner.is_void())
+                {
                     for e in elems {
                         self.check_coerced_expr(e, &final_elem);
                     }
@@ -945,6 +1023,7 @@ impl<'a> BodyChecker<'a> {
                 params: fn_info.params.iter().map(|p| p.ty.clone()).collect(),
                 ret: Box::new(fn_info.ret_ty),
                 error_spec: Box::new(fn_info.error_spec),
+                kind: FnPtrKind::FnItem,
             };
             return ExprVal {
                 ty: fn_ty,
@@ -1023,6 +1102,7 @@ impl<'a> BodyChecker<'a> {
                             params: fn_info.params.iter().map(|p| p.ty.clone()).collect(),
                             ret: Box::new(fn_info.ret_ty),
                             error_spec: Box::new(fn_info.error_spec),
+                            kind: FnPtrKind::FnItem,
                         };
                         return ExprVal {
                             ty: fn_ty,
@@ -2471,6 +2551,7 @@ impl<'a> BodyChecker<'a> {
                 params,
                 ret,
                 error_spec,
+                kind,
             } => {
                 if args.len() != params.len() {
                     self.sema.emit(Diagnostic::new(
@@ -2521,14 +2602,44 @@ impl<'a> BodyChecker<'a> {
                         }
                     }
                 }
-                for cb_target in &cv.prov.fn_callbacks {
-                    self.sema.call_graph.add_edge(CallEdge {
-                        caller: self.caller_key.clone(),
-                        caller_kind: self.caller_kind,
-                        callee: cb_target.clone(),
-                        span,
-                        ctx: self.call_context(),
-                    });
+                match kind {
+                    FnPtrKind::Plain => {
+                        let sig_display = Ty::FnPtr {
+                            params: params.clone(),
+                            ret: ret.clone(),
+                            error_spec: error_spec.clone(),
+                            kind: FnPtrKind::Plain,
+                        }
+                        .to_string();
+                        self.sema
+                            .plain_indirect_call_sites
+                            .push(PlainIndirectCallSite {
+                                caller: self.caller_key.clone(),
+                                caller_kind: self.caller_kind,
+                                sig: (params, (*ret).clone(), (*error_spec).clone()),
+                                sig_display: sig_display.clone(),
+                                span,
+                                file: self.sema.current_file.clone(),
+                                ctx: self.call_context(),
+                            });
+                        self.sema.call_graph.mark_direct_plain_fnptr_call(
+                            &self.caller_key,
+                            span,
+                            sig_display,
+                        );
+                    }
+                    FnPtrKind::FnItem => {
+                        for cb_target in &cv.prov.fn_callbacks {
+                            self.sema.call_graph.add_edge(CallEdge {
+                                caller: self.caller_key.clone(),
+                                caller_kind: self.caller_kind,
+                                callee: cb_target.clone(),
+                                span,
+                                ctx: self.call_context(),
+                            });
+                        }
+                    }
+                    FnPtrKind::NoYield => {}
                 }
                 ExprVal {
                     ty: *ret,
@@ -3436,6 +3547,7 @@ impl<'a> BodyChecker<'a> {
                             params,
                             ret,
                             error_spec,
+                            kind,
                         },
                     ..
                 }) = self
@@ -3445,7 +3557,7 @@ impl<'a> BodyChecker<'a> {
                     .and_then(|s| s.field(&method.name))
                     .cloned()
                 {
-                    let field_prov = if let Some(root) = root_ident_of(receiver) {
+                    let _ = if let Some(root) = root_ident_of(receiver) {
                         if let Some(v) = self.lookup_local(&root) {
                             v.field_prov
                                 .get(&method.name)
@@ -3513,14 +3625,30 @@ impl<'a> BodyChecker<'a> {
                             }
                         }
                     }
-                    for cb_target in &field_prov.fn_callbacks {
-                        self.sema.call_graph.add_edge(CallEdge {
-                            caller: self.caller_key.clone(),
-                            caller_kind: self.caller_kind,
-                            callee: cb_target.clone(),
+                    if kind == FnPtrKind::Plain {
+                        let sig_display = Ty::FnPtr {
+                            params: params.clone(),
+                            ret: ret.clone(),
+                            error_spec: error_spec.clone(),
+                            kind: FnPtrKind::Plain,
+                        }
+                        .to_string();
+                        self.sema
+                            .plain_indirect_call_sites
+                            .push(PlainIndirectCallSite {
+                                caller: self.caller_key.clone(),
+                                caller_kind: self.caller_kind,
+                                sig: (params, (*ret).clone(), (*error_spec).clone()),
+                                sig_display: sig_display.clone(),
+                                span,
+                                file: self.sema.current_file.clone(),
+                                ctx: self.call_context(),
+                            });
+                        self.sema.call_graph.mark_direct_plain_fnptr_call(
+                            &self.caller_key,
                             span,
-                            ctx: self.call_context(),
-                        });
+                            sig_display,
+                        );
                     }
                     return ExprVal {
                         ty: *ret,
@@ -3732,13 +3860,14 @@ impl<'a> BodyChecker<'a> {
                     params: vec![Ty::u8()],
                     ret: Box::new(Ty::void()),
                     error_spec: Box::new(ResolvedErrorSpec::None),
+                    kind: FnPtrKind::NoYield,
                 };
                 if args.len() != 1 {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
                         format!(
-                            "'sys.set_putc(fn(u8))' expects 1 argument, found {}",
+                            "'sys.set_putc(noyield fn(u8))' expects 1 argument, found {}",
                             args.len()
                         ),
                     ));
@@ -3771,39 +3900,43 @@ impl<'a> BodyChecker<'a> {
                 }
                 let (sig_desc, role_desc, expected_ty) = match hook {
                     SysMethod::SetClockMs => (
-                        "fn() -> u32",
+                        "noyield fn() -> u32",
                         "clock-source",
                         Ty::FnPtr {
                             params: vec![],
                             ret: Box::new(Ty::u32()),
                             error_spec: Box::new(ResolvedErrorSpec::None),
+                            kind: FnPtrKind::NoYield,
                         },
                     ),
                     SysMethod::SetExit => (
-                        "fn(i32)",
+                        "noyield fn(i32)",
                         "exit-handler",
                         Ty::FnPtr {
                             params: vec![Ty::Prim(PrimType::I32)],
                             ret: Box::new(Ty::void()),
                             error_spec: Box::new(ResolvedErrorSpec::None),
+                            kind: FnPtrKind::NoYield,
                         },
                     ),
                     SysMethod::SetFaultHandler => (
-                        "fn()",
+                        "noyield fn()",
                         "fault-handler",
                         Ty::FnPtr {
                             params: vec![],
                             ret: Box::new(Ty::void()),
                             error_spec: Box::new(ResolvedErrorSpec::None),
+                            kind: FnPtrKind::NoYield,
                         },
                     ),
                     SysMethod::SetIdle => (
-                        "fn(u32, u32)",
+                        "noyield fn(u32, u32)",
                         "idle-hook",
                         Ty::FnPtr {
                             params: vec![Ty::u32(), Ty::u32()],
                             ret: Box::new(Ty::void()),
                             error_spec: Box::new(ResolvedErrorSpec::None),
+                            kind: FnPtrKind::NoYield,
                         },
                     ),
                     _ => unreachable!(),
@@ -3840,18 +3973,20 @@ impl<'a> BodyChecker<'a> {
                     params: vec![Ty::u32(), Ty::u32()],
                     ret: Box::new(Ty::void()),
                     error_spec: Box::new(ResolvedErrorSpec::None),
+                    kind: FnPtrKind::NoYield,
                 };
                 let ack_ty = Ty::FnPtr {
                     params: vec![Ty::u32()],
                     ret: Box::new(Ty::void()),
                     error_spec: Box::new(ResolvedErrorSpec::None),
+                    kind: FnPtrKind::NoYield,
                 };
                 if args.len() != 2 {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
                         span,
                         format!(
-                            "'sys.set_irq_router(fn(u32, u32), fn(u32))' expects 2 arguments, found {}",
+                            "'sys.set_irq_router(noyield fn(u32, u32), noyield fn(u32))' expects 2 arguments, found {}",
                             args.len()
                         ),
                     ));
@@ -4155,7 +4290,9 @@ impl<'a> BodyChecker<'a> {
             .extern_callback_arg_spans
             .insert((self.prog_idx, arg.span.start, arg.span.end));
         let av = self.check_expr_infallible(&arg.value);
-        if av.ty != *expected_ty && !av.ty.is_error() {
+        if av.ty.is_assignable_to(expected_ty) {
+            self.check_coerced_expr(&arg.value, expected_ty);
+        } else if !av.ty.is_error() {
             let msg = if method_name == "set_putc" {
                 format!(
                     "'sys.set_putc' expects callback of type '{}', found '{}'",
@@ -6008,8 +6145,86 @@ impl<'a> BodyChecker<'a> {
     }
 
     pub(super) fn check_coerced_expr(&mut self, expr: &Expr, target_ty: &Ty) {
+        self.record_fn_ptr_coercion(expr, target_ty);
         self.sema.check_f32_coercion_expr(expr, target_ty);
         self.validate_int_coercion(expr, target_ty);
+    }
+
+    pub(super) fn record_fn_ptr_coercion(&mut self, expr: &Expr, target_ty: &Ty) {
+        match target_ty {
+            Ty::FnPtr {
+                kind: FnPtrKind::NoYield,
+                ..
+            } => {
+                self.mark_expr_noyield_fn_ptr(expr);
+            }
+            Ty::Ptr(inner) if inner.is_void() => {
+                self.mark_expr_noyield_fn_ptr(expr);
+            }
+            Ty::Array { elem, .. } | Ty::Slice(elem) => {
+                if let ExprKind::ArrayLit(elems) = &expr.kind {
+                    for e in elems {
+                        self.record_fn_ptr_coercion(e, elem);
+                    }
+                }
+            }
+            Ty::Struct(sname) => {
+                if let ExprKind::StructLit { fields, .. } = &expr.kind {
+                    if let Some(st) = self.sema.structs.get(sname).cloned() {
+                        for fi in fields {
+                            if let Some(df) = st.field(&fi.name.name) {
+                                self.record_fn_ptr_coercion(&fi.value, &df.ty);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn mark_expr_noyield_fn_ptr(&mut self, expr: &Expr) {
+        match &expr.kind {
+            ExprKind::Ident(_) => {
+                self.sema.noyield_fn_ptr_spans.insert((
+                    self.prog_idx,
+                    expr.span.start,
+                    expr.span.end,
+                ));
+            }
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                expr: inner,
+            } => {
+                self.sema.noyield_fn_ptr_spans.insert((
+                    self.prog_idx,
+                    expr.span.start,
+                    expr.span.end,
+                ));
+                self.mark_expr_noyield_fn_ptr(inner);
+            }
+            ExprKind::Or {
+                expr: inner,
+                fallback,
+            } => {
+                self.mark_expr_noyield_fn_ptr(inner);
+                self.mark_expr_noyield_fn_ptr(fallback);
+            }
+            ExprKind::Catch {
+                expr: inner,
+                clause,
+            } => {
+                self.mark_expr_noyield_fn_ptr(inner);
+                if let Some(Stmt {
+                    kind: StmtKind::Expr(last_expr),
+                    ..
+                }) = clause.body.stmts.last()
+                {
+                    self.mark_expr_noyield_fn_ptr(last_expr);
+                }
+            }
+            _ => {}
+        }
     }
 
     pub(super) fn validate_int_coercion(&mut self, expr: &Expr, target_ty: &Ty) {

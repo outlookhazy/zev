@@ -2099,14 +2099,16 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let call_kw = self.call_kw();
         // Indirect call through a local/parameter/temp `MirVar` of `MirType::FnPtr`
         if callee != "assert" {
-            if let Some((vid, params, ret, error_spec)) =
+            if let Some((vid, is_noyield, params, ret, error_spec)) =
                 self.vars.iter().rev().find_map(|v| match &v.ty {
                     MirType::FnPtr {
+                        is_noyield,
                         params,
                         ret,
                         error_spec,
                     } if v.name == callee => Some((
                         v.id,
+                        *is_noyield,
                         params.clone(),
                         (**ret).clone(),
                         (**error_spec).clone(),
@@ -2115,6 +2117,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 })
             {
                 let fp_ty = MirType::FnPtr {
+                    is_noyield,
                     params: params.clone(),
                     ret: Box::new(ret.clone()),
                     error_spec: Box::new(error_spec.clone()),
@@ -2148,6 +2151,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     }
                 }
                 let joined = call_args.join(", ");
+                let non_null = self.next_tmp();
+                self.emit_line(format!(
+                    "{non_null} = icmp ne {} {}, null",
+                    fp_ptr.ty, fp_ptr.repr
+                ));
+                self.emit_bounds_check(&non_null, 5);
                 if env_mir.is_void() || ret_lty == "void" {
                     self.emit_line(format!("{call_kw} void {}({joined})", fp_ptr.repr));
                     return Ok(SsaVal::new("void", "0"));
@@ -2592,79 +2601,22 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         rhs: &MirExpr,
         elem_ty: &MirType,
     ) -> Result<SsaVal, CodegenError> {
+        let call_kw = self.ctx.call_kw();
         let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
         let ety = self.ctx.llvm_ty(&elem_ty.host_value_type());
         let (pa, la) = self.emit_seq_ptr_and_len(lhs)?;
         let (pb, lb) = self.emit_seq_ptr_and_len(rhs)?;
-
-        let (idx_p, idx_al) = self.emit_temp_alloca(&usize_ty);
-        self.emit_line(format!("store {usize_ty} 0, ptr {idx_p}, align {idx_al}"));
-
-        let len_eq = self.next_tmp();
-        self.emit_line(format!("{len_eq} = icmp eq {usize_ty} {la}, {lb}"));
-        let len_chk_lbl = self.cur_label.clone();
-
-        let hdr_lbl = self.next_label("seqeq_hdr");
-        let body_lbl = self.next_label("seqeq_body");
-        let step_lbl = self.next_label("seqeq_step");
-        let done_lbl = self.next_label("seqeq_done");
-        self.emit_term(format!(
-            "br i1 {len_eq}, label %{hdr_lbl}, label %{done_lbl}"
-        ));
-
-        self.start_block(&hdr_lbl);
-        let i_val = self.next_tmp();
-        let more = self.next_tmp();
+        let res8 = self.next_tmp();
         self.emit_line(format!(
-            "{i_val} = load {usize_ty}, ptr {idx_p}, align {idx_al}"
+            "{res8} = {call_kw} i8 @__syn_seq_eq_{ety}(ptr {pa}, {usize_ty} {la}, ptr {pb}, {usize_ty} {lb})"
         ));
-        self.emit_line(format!("{more} = icmp ult {usize_ty} {i_val}, {la}"));
-        self.emit_term(format!(
-            "br i1 {more}, label %{body_lbl}, label %{done_lbl}"
-        ));
-
-        self.start_block(&body_lbl);
-        let ep_a = self.next_tmp();
-        let ep_b = self.next_tmp();
-        let va = self.next_tmp();
-        let vb = self.next_tmp();
-        let el_eq = self.next_tmp();
-        self.emit_line(format!(
-            "{ep_a} = getelementptr {ety}, ptr {pa}, {usize_ty} {i_val}"
-        ));
-        self.emit_line(format!(
-            "{ep_b} = getelementptr {ety}, ptr {pb}, {usize_ty} {i_val}"
-        ));
-        self.emit_line(format!("{va} = load {ety}, ptr {ep_a}, align 1"));
-        self.emit_line(format!("{vb} = load {ety}, ptr {ep_b}, align 1"));
-        self.emit_line(format!("{el_eq} = icmp eq {ety} {va}, {vb}"));
-        self.emit_term(format!(
-            "br i1 {el_eq}, label %{step_lbl}, label %{done_lbl}"
-        ));
-
-        self.start_block(&step_lbl);
-        let next_i = self.next_tmp();
-        self.emit_line(format!("{next_i} = add {usize_ty} {i_val}, 1"));
-        self.emit_line(format!(
-            "store {usize_ty} {next_i}, ptr {idx_p}, align {idx_al}"
-        ));
-        self.emit_term(format!("br label %{hdr_lbl}"));
-
-        self.start_block(&done_lbl);
-        let eq1 = self.next_tmp();
-        self.emit_line(format!(
-            "{eq1} = phi i1 [ false, %{len_chk_lbl} ], [ true, %{hdr_lbl} ], [ false, %{body_lbl} ]"
-        ));
-        let final1 = if eq {
-            eq1
+        if eq {
+            Ok(SsaVal::new("i8", res8))
         } else {
-            let neq1 = self.next_tmp();
-            self.emit_line(format!("{neq1} = xor i1 {eq1}, true"));
-            neq1
-        };
-        let b8 = self.next_tmp();
-        self.emit_line(format!("{b8} = zext i1 {final1} to i8"));
-        Ok(SsaVal::new("i8", b8))
+            let ne8 = self.next_tmp();
+            self.emit_line(format!("{ne8} = xor i8 {res8}, 1"));
+            Ok(SsaVal::new("i8", ne8))
+        }
     }
 }
 

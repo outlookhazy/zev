@@ -1141,11 +1141,40 @@ fn walk_worst_stack(
 
 type FnPtrSigKey = (Vec<MirType>, MirType, MirErrorSpec);
 
+fn canonical_stack_fnptr_ty(ty: &MirType) -> MirType {
+    match ty.host_value_type() {
+        MirType::Ptr(inner) => MirType::Ptr(Box::new(canonical_stack_fnptr_ty(&inner))),
+        MirType::Slice(inner) => MirType::Slice(Box::new(canonical_stack_fnptr_ty(&inner))),
+        MirType::Array { elem, len } => MirType::Array {
+            elem: Box::new(canonical_stack_fnptr_ty(&elem)),
+            len,
+        },
+        MirType::FnPtr {
+            params,
+            ret,
+            error_spec,
+            ..
+        } => MirType::FnPtr {
+            is_noyield: false,
+            params: params.iter().map(canonical_stack_fnptr_ty).collect(),
+            ret: Box::new(canonical_stack_fnptr_ty(&ret)),
+            error_spec: Box::new(match *error_spec {
+                MirErrorSpec::Typed(e) => MirErrorSpec::Typed(canonical_stack_fnptr_ty(&e)),
+                other => other,
+            }),
+        },
+        other => other,
+    }
+}
+
 fn fnptr_sig_key(params: &[MirType], ret: &MirType, error_spec: &MirErrorSpec) -> FnPtrSigKey {
     (
-        params.iter().map(MirType::host_value_type).collect(),
-        ret.host_value_type(),
-        error_spec.clone(),
+        params.iter().map(canonical_stack_fnptr_ty).collect(),
+        canonical_stack_fnptr_ty(ret),
+        match error_spec {
+            MirErrorSpec::Typed(e) => MirErrorSpec::Typed(canonical_stack_fnptr_ty(e)),
+            other => other.clone(),
+        },
     )
 }
 
@@ -1161,14 +1190,15 @@ struct MirIndirectScan<'a> {
     fn_sigs: HashMap<&'a str, (String, FnPtrSigKey)>,
     ext_sigs: HashMap<&'a str, (String, FnPtrSigKey)>,
     elf_or_frame_syms: &'a BTreeSet<String>,
-    sig_to_targets: HashMap<FnPtrSigKey, BTreeSet<String>>,
+    sig_to_plain_targets: HashMap<FnPtrSigKey, BTreeSet<String>>,
+    sig_to_restricted_targets: HashMap<FnPtrSigKey, BTreeSet<String>>,
     all_addr_taken: BTreeSet<String>,
     direct_callees: BTreeMap<MirNodeKey, BTreeSet<String>>,
-    direct_sig_calls: BTreeMap<MirNodeKey, HashSet<FnPtrSigKey>>,
+    direct_sig_calls: BTreeMap<MirNodeKey, HashSet<(FnPtrSigKey, bool)>>,
 }
 
 impl<'a> MirIndirectScan<'a> {
-    fn record_fn_addr(&mut self, name: &str) {
+    fn record_fn_addr(&mut self, name: &str, expr_ty: &MirType) {
         let entry = self.fn_sigs.get(name).or_else(|| self.ext_sigs.get(name));
         let Some((elf_sym, sig)) = entry else {
             return;
@@ -1177,10 +1207,22 @@ impl<'a> MirIndirectScan<'a> {
             return;
         }
         self.all_addr_taken.insert(elf_sym.clone());
-        self.sig_to_targets
+        self.sig_to_plain_targets
             .entry(sig.clone())
             .or_default()
             .insert(elf_sym.clone());
+        if !matches!(
+            expr_ty,
+            MirType::FnPtr {
+                is_noyield: false,
+                ..
+            }
+        ) {
+            self.sig_to_restricted_targets
+                .entry(sig.clone())
+                .or_default()
+                .insert(elf_sym.clone());
+        }
     }
 
     fn scan_prim_target(
@@ -1219,11 +1261,13 @@ impl<'a> MirIndirectScan<'a> {
                 MirFmtChunk::Int { value, .. }
                 | MirFmtChunk::Float { value, .. }
                 | MirFmtChunk::Bool(value)
+                | MirFmtChunk::PaddedBool { value, .. }
                 | MirFmtChunk::Str(value)
                 | MirFmtChunk::PaddedStr { cstr: value, .. }
                 | MirFmtChunk::Bytes(value)
                 | MirFmtChunk::PaddedBytes { slice: value, .. }
                 | MirFmtChunk::EnumName { value, .. }
+                | MirFmtChunk::PaddedEnumName { value, .. }
                 | MirFmtChunk::DebugSlice { slice: value, .. } => {
                     self.scan_expr(value, caller, vars);
                 }
@@ -1250,7 +1294,7 @@ impl<'a> MirIndirectScan<'a> {
             | MirExprKind::ResultVal(_)
             | MirExprKind::NowTicks
             | MirExprKind::SysQuery(_) => {}
-            MirExprKind::FnAddr(name) => self.record_fn_addr(name),
+            MirExprKind::FnAddr(name) => self.record_fn_addr(name, &expr.ty),
             MirExprKind::MakePrimView { ptr, .. } => self.scan_expr(ptr, caller, vars),
             MirExprKind::MmioRead { base, index, .. } => {
                 self.scan_expr(base, caller, vars);
@@ -1399,18 +1443,23 @@ impl<'a> MirIndirectScan<'a> {
                             .or_default()
                             .insert(callee.clone());
                     } else if callee != "assert" {
-                        if let Some(sig) = vars.iter().rev().find_map(|v| match &v.ty {
-                            MirType::FnPtr {
-                                params,
-                                ret,
-                                error_spec,
-                            } if v.name == *callee => Some(fnptr_sig_key(params, ret, error_spec)),
-                            _ => None,
-                        }) {
+                        if let Some((sig, is_restricted)) =
+                            vars.iter().rev().find_map(|v| match &v.ty {
+                                MirType::FnPtr {
+                                    is_noyield,
+                                    params,
+                                    ret,
+                                    error_spec,
+                                } if v.name == *callee => {
+                                    Some((fnptr_sig_key(params, ret, error_spec), *is_noyield))
+                                }
+                                _ => None,
+                            })
+                        {
                             self.direct_sig_calls
                                 .entry(cnode.clone())
                                 .or_default()
-                                .insert(sig);
+                                .insert((sig, is_restricted));
                         }
                     }
                 }
@@ -1637,11 +1686,11 @@ fn collect_mir_indirect_targets_by_caller(
 ) -> (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>) {
     let mut fn_sigs = HashMap::new();
     for f in &mir.functions {
-        let sym = if f.is_yielding {
-            format!("__syn_fn_step_{}", sanitize_ident(&f.name))
-        } else {
-            format!("__syn_fn_{}", sanitize_ident(&f.name))
-        };
+        if f.is_yielding {
+            // Coroutine step functions are invoked via direct step calls, never LLVM indirect call instructions.
+            continue;
+        }
+        let sym = format!("__syn_fn_{}", sanitize_ident(&f.name));
         let params: Vec<MirType> = f
             .params
             .iter()
@@ -1666,7 +1715,8 @@ fn collect_mir_indirect_targets_by_caller(
         fn_sigs,
         ext_sigs,
         elf_or_frame_syms,
-        sig_to_targets: HashMap::new(),
+        sig_to_plain_targets: HashMap::new(),
+        sig_to_restricted_targets: HashMap::new(),
         all_addr_taken: BTreeSet::new(),
         direct_callees: BTreeMap::new(),
         direct_sig_calls: BTreeMap::new(),
@@ -1757,7 +1807,7 @@ fn collect_mir_indirect_targets_by_caller(
 
     // Fixed-point propagation of indirect FnPtr call signatures over direct MIR call edges
     // so `/bin/opt` cross-function inlining preserves every caller's possible indirect targets.
-    let mut node_sigs: BTreeMap<MirNodeKey, HashSet<FnPtrSigKey>> = scan.direct_sig_calls;
+    let mut node_sigs: BTreeMap<MirNodeKey, HashSet<(FnPtrSigKey, bool)>> = scan.direct_sig_calls;
     let mut all_nodes: BTreeSet<MirNodeKey> = BTreeSet::new();
     all_nodes.extend(scan.direct_callees.keys().cloned());
     all_nodes.extend(node_sigs.keys().cloned());
@@ -1786,10 +1836,15 @@ fn collect_mir_indirect_targets_by_caller(
         }
     }
 
-    let targets_for_sigs = |sigs: &HashSet<FnPtrSigKey>| -> BTreeSet<String> {
+    let targets_for_sigs = |sigs: &HashSet<(FnPtrSigKey, bool)>| -> BTreeSet<String> {
         let mut out = BTreeSet::new();
-        for sig in sigs {
-            if let Some(cands) = scan.sig_to_targets.get(sig) {
+        for (sig, is_restricted) in sigs {
+            let map = if *is_restricted {
+                &scan.sig_to_restricted_targets
+            } else {
+                &scan.sig_to_plain_targets
+            };
+            if let Some(cands) = map.get(sig) {
                 out.extend(cands.iter().cloned());
             }
         }
@@ -1895,7 +1950,7 @@ fn collect_mir_indirect_targets_by_caller(
         ),
     ];
     for (wsym, sig) in hook_wrappers {
-        if let Some(cands) = scan.sig_to_targets.get(&sig) {
+        if let Some(cands) = scan.sig_to_restricted_targets.get(&sig) {
             per_caller_targets.insert(wsym.to_string(), cands.clone());
         }
     }

@@ -1,27 +1,28 @@
 //! Lowering pass from `zev_ast::Program` into Coroutine State-Machine & Kernel MIR (`MirModule`).
 
-pub(super) use std::collections::{BTreeMap, BTreeSet, VecDeque};
+pub(super) use std::cell::RefCell;
+pub(super) use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 pub(super) use std::fmt;
 
 pub(super) use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, BuiltinFn, CallArg, CatchClause,
     DurationLit, ErrorSpec, Expr, ExprKind, FnDecl, FormatAlign, FormatPadBase, FormatPart,
-    FormatSpec, GenericArg, IsrDecl, ItemKind, Literal, MmioAccess, MmioDeclKind, MmioRegDecl,
-    OsPrimitiveType, PrimType, Priority, Program, Span, SpawnStmt, Stmt, StmtKind, SwitchPat,
-    SysMethod, TaskDecl, TypeExpr, TypeKind, UnaryOp, SYS_NAMESPACE,
+    FormatSpec, GenericArg, Ident, IsrDecl, ItemKind, Literal, MmioAccess, MmioDeclKind,
+    MmioRegDecl, OsPrimitiveType, PrimType, Priority, Program, Span, SpawnStmt, Stmt, StmtKind,
+    SwitchPat, SysMethod, TaskDecl, TypeExpr, TypeKind, UnaryOp, SYS_NAMESPACE,
 };
 
 pub(super) use crate::ir::{
-    BlockId, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootSequence, MirBootStep,
-    MirCallDst, MirChildCallSlot, MirConst, MirEnum, MirErrorSpec, MirExpr, MirExprKind,
-    MirExternFn, MirField, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction, MirImport, MirIntFmt,
-    MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl, MirIsrStateVar,
-    MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule, MirPadSpec, MirPlace,
-    MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirPrimitive,
-    MirPriority, MirSpawnInstance, MirStmt, MirStruct, MirSubsystemGlobal, MirSwitchPattern,
-    MirSysQuery, MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm,
-    MirWaitArmOp, MirWaitTimer, MirYieldKind, MonomorphizedItemKind, MonomorphizedMirItem, VarId,
-    VarRole,
+    BlockId, IndirectCallSiteMir, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootSequence,
+    MirBootStep, MirCallDst, MirChildCallSlot, MirConst, MirEnum, MirErrorSpec, MirExpr,
+    MirExprKind, MirExternFn, MirField, MirFloatFmt, MirFmtChunk, MirFnBody, MirFunction,
+    MirImport, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl,
+    MirIsrStateVar, MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirModule,
+    MirPadSpec, MirPlace, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget,
+    MirPrimViewKind, MirPrimitive, MirPriority, MirSpawnInstance, MirStmt, MirStruct,
+    MirSubsystemGlobal, MirSwitchPattern, MirSysQuery, MirTaskBlueprint, MirTerminator, MirType,
+    MirUnaryOp, MirVar, MirWaitArm, MirWaitArmOp, MirWaitTimer, MirYieldKind,
+    MonomorphizedItemKind, MonomorphizedMirItem, VarId, VarRole,
 };
 pub(super) use crate::liveness::{analyze_fn_frame, analyze_isr_frame, analyze_task_frame};
 pub(super) use crate::ram::{populate_module_ram_report, RamReport};
@@ -79,6 +80,49 @@ pub(super) enum ConstVal {
     Bool(bool),
 }
 
+pub(super) type MirFnPtrSigKey = (Vec<MirType>, MirType, MirErrorSpec);
+
+pub(super) fn canonical_mir_fnptr_ty(ty: &MirType) -> MirType {
+    match ty.host_value_type() {
+        MirType::Ptr(inner) => MirType::Ptr(Box::new(canonical_mir_fnptr_ty(&inner))),
+        MirType::Slice(inner) => MirType::Slice(Box::new(canonical_mir_fnptr_ty(&inner))),
+        MirType::Array { elem, len } => MirType::Array {
+            elem: Box::new(canonical_mir_fnptr_ty(&elem)),
+            len,
+        },
+        MirType::FnPtr {
+            params,
+            ret,
+            error_spec,
+            ..
+        } => MirType::FnPtr {
+            is_noyield: false,
+            params: params.iter().map(canonical_mir_fnptr_ty).collect(),
+            ret: Box::new(canonical_mir_fnptr_ty(&ret)),
+            error_spec: Box::new(match *error_spec {
+                MirErrorSpec::Typed(e) => MirErrorSpec::Typed(canonical_mir_fnptr_ty(&e)),
+                other => other,
+            }),
+        },
+        other => other,
+    }
+}
+
+pub(super) fn canonical_mir_fnptr_sig(
+    params: &[MirType],
+    ret: &MirType,
+    error_spec: &MirErrorSpec,
+) -> MirFnPtrSigKey {
+    (
+        params.iter().map(canonical_mir_fnptr_ty).collect(),
+        canonical_mir_fnptr_ty(ret),
+        match error_spec {
+            MirErrorSpec::Typed(e) => MirErrorSpec::Typed(canonical_mir_fnptr_ty(e)),
+            other => other.clone(),
+        },
+    )
+}
+
 /// Global module symbol table used during lowering.
 pub(super) struct ModuleSymbols {
     pub(super) tick_period_us: u64,
@@ -101,9 +145,40 @@ pub(super) struct ModuleSymbols {
     pub(super) soft_yielding_in_noyield: BTreeSet<String>,
     pub(super) dual_specialized_fns: BTreeSet<String>,
     pub(super) boost_capable_fns: BTreeSet<String>,
+    pub(super) plain_direct_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
+    pub(super) noyield_fnptr_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
+    pub(super) sig_has_noyield_widening: HashSet<MirFnPtrSigKey>,
+    pub(super) lowered_plain_candidates: RefCell<HashMap<MirFnPtrSigKey, BTreeSet<String>>>,
+    pub(super) lowered_noyield_candidates: RefCell<HashMap<MirFnPtrSigKey, BTreeSet<String>>>,
+    pub(super) lowered_noyield_widenings: RefCell<HashSet<MirFnPtrSigKey>>,
+    pub(super) raw_indirect_call_sites: Vec<(String, Span, MirFnPtrSigKey, String, bool)>,
 }
 
 impl ModuleSymbols {
+    pub(super) fn record_lowered_plain_candidate(&self, sig_key: MirFnPtrSigKey, fn_name: String) {
+        self.lowered_plain_candidates
+            .borrow_mut()
+            .entry(sig_key)
+            .or_default()
+            .insert(fn_name);
+    }
+
+    pub(super) fn record_lowered_noyield_candidate(
+        &self,
+        sig_key: MirFnPtrSigKey,
+        fn_name: String,
+    ) {
+        self.lowered_noyield_candidates
+            .borrow_mut()
+            .entry(sig_key)
+            .or_default()
+            .insert(fn_name);
+    }
+
+    pub(super) fn record_lowered_noyield_widening(&self, sig_key: MirFnPtrSigKey) {
+        self.lowered_noyield_widenings.borrow_mut().insert(sig_key);
+    }
+
     pub(super) fn candidate_module_names(&self, alias_or_mod: &str, item: &str) -> Vec<String> {
         let mut out = Vec::new();
         if let Some(path) = self.import_aliases.get(alias_or_mod) {
@@ -287,10 +362,12 @@ impl ModuleSymbols {
             }
             TypeKind::OsPrimitive(op) => MirType::Primitive(self.resolve_os_prim_type(op)),
             TypeKind::FnPtr {
+                is_noyield,
                 params,
                 ret,
                 error_spec,
             } => MirType::FnPtr {
+                is_noyield: *is_noyield,
                 params: params.iter().map(|p| self.resolve_type(p)).collect(),
                 ret: Box::new(self.resolve_type(ret)),
                 error_spec: Box::new(match error_spec.as_deref() {
@@ -491,6 +568,13 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         soft_yielding_in_noyield: BTreeSet::new(),
         dual_specialized_fns: BTreeSet::new(),
         boost_capable_fns: BTreeSet::new(),
+        plain_direct_candidates: HashMap::new(),
+        noyield_fnptr_candidates: HashMap::new(),
+        sig_has_noyield_widening: HashSet::new(),
+        lowered_plain_candidates: RefCell::new(HashMap::new()),
+        lowered_noyield_candidates: RefCell::new(HashMap::new()),
+        lowered_noyield_widenings: RefCell::new(HashSet::new()),
+        raw_indirect_call_sites: Vec::new(),
     };
 
     let mut mir_imports = Vec::new();
@@ -1133,6 +1217,97 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
 
     let dual_specialized_fns: Vec<String> = syms.dual_specialized_fns.iter().cloned().collect();
     let monomorphized_instances: Vec<MonomorphizedMirItem> = mono_map.into_values().collect();
+    let lowered_plain = syms.lowered_plain_candidates.borrow();
+    let lowered_noyield = syms.lowered_noyield_candidates.borrow();
+    let lowered_widenings = syms.lowered_noyield_widenings.borrow();
+
+    let mut indirect_call_sites = Vec::with_capacity(syms.raw_indirect_call_sites.len());
+    for (caller, span, sig_key, signature, is_noyield) in &syms.raw_indirect_call_sites {
+        let mut cands = BTreeSet::new();
+        let mut yielding_cands = Vec::new();
+        if *is_noyield {
+            if let Some(ny_set) = lowered_noyield.get(sig_key) {
+                for c in ny_set {
+                    let is_soft = syms
+                        .fns
+                        .get(c)
+                        .is_some_and(|s| s.effect == MirFnEffect::SoftYielding);
+                    if is_soft && syms.soft_yielding_in_noyield.contains(c) {
+                        cands.insert(format!("{c}__noyield"));
+                    } else {
+                        cands.insert(c.clone());
+                    }
+                }
+            }
+        } else {
+            if let Some(plain_set) = lowered_plain.get(sig_key) {
+                for c in plain_set {
+                    cands.insert(c.clone());
+                    let is_yielding = syms.fns.get(c).is_some_and(|s| s.is_yielding);
+                    if is_yielding
+                        && syms
+                            .plain_direct_candidates
+                            .get(sig_key)
+                            .is_some_and(|ps| ps.contains(c))
+                    {
+                        yielding_cands.push(c.clone());
+                    }
+                }
+            }
+            if lowered_widenings.contains(sig_key)
+                || syms.sig_has_noyield_widening.contains(sig_key)
+            {
+                if let Some(ny_set) = lowered_noyield.get(sig_key) {
+                    for c in ny_set {
+                        let is_soft = syms
+                            .fns
+                            .get(c)
+                            .is_some_and(|s| s.effect == MirFnEffect::SoftYielding);
+                        if is_soft && syms.soft_yielding_in_noyield.contains(c) {
+                            cands.insert(format!("{c}__noyield"));
+                        } else {
+                            cands.insert(c.clone());
+                        }
+                    }
+                }
+            }
+        }
+        indirect_call_sites.push(IndirectCallSiteMir {
+            caller: caller.clone(),
+            span: *span,
+            signature: signature.clone(),
+            is_noyield: *is_noyield,
+            candidates: cands.into_iter().collect(),
+            yielding_candidates: yielding_cands,
+        });
+    }
+
+    let mut plain_fnptr_candidates: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (sig_key, set) in lowered_plain.iter() {
+        let sig_str = MirType::FnPtr {
+            is_noyield: false,
+            params: sig_key.0.clone(),
+            ret: Box::new(sig_key.1.clone()),
+            error_spec: Box::new(sig_key.2.clone()),
+        }
+        .display_name();
+        let entry = plain_fnptr_candidates.entry(sig_str).or_default();
+        for c in set {
+            let is_yielding = syms.fns.get(c).is_some_and(|s| s.is_yielding);
+            if !is_yielding
+                || syms
+                    .plain_direct_candidates
+                    .get(sig_key)
+                    .is_some_and(|ps| ps.contains(c))
+            {
+                entry.insert(c.clone());
+            }
+        }
+    }
+    drop(lowered_plain);
+    drop(lowered_noyield);
+    drop(lowered_widenings);
+
     let formatted_enums =
         collect_formatted_enums(&mir_isrs, &mir_functions, &mir_blueprints, &boot);
 
@@ -1155,12 +1330,15 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         spawned_tasks,
         dual_specialized_fns,
         monomorphized_instances,
+        indirect_call_sites,
+        plain_fnptr_candidates,
         formatted_enums,
         boot,
         visibility: crate::opt::VisibilityReport::default(),
         ram_report: RamReport::default(),
     };
 
+    verify_yielding_fn_addr_candidates(&module)?;
     crate::opt::prune_unreachable_functions(&mut module);
     module.formatted_enums = collect_formatted_enums(
         &module.isrs,
@@ -1169,6 +1347,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         &module.boot,
     );
     crate::opt::fold_singletons(&mut module);
+    verify_yielding_fn_addr_candidates(&module)?;
     let vis = crate::opt::analyze_visibility(&module);
     for p in &mut module.primitives {
         p.dead_stripped = vis.can_strip_bss(&p.name);
@@ -1224,6 +1403,523 @@ pub(super) fn lower_coroutine_fn_decl(
             child_slots: cctx.child_slots,
         },
     })
+}
+
+/// Verifies that every `MirExprKind::FnAddr` of a yielding function emitted with a plain
+/// `MirType::FnPtr { is_noyield: false, .. }` type is present in the candidate set for its signature.
+pub fn verify_yielding_fn_addr_candidates(module: &MirModule) -> Result<(), MirLowerError> {
+    let mut yielding_fns: BTreeSet<&str> = module
+        .functions
+        .iter()
+        .filter(|f| f.is_yielding)
+        .map(|f| f.name.as_str())
+        .collect();
+    for callee in &module.boot.boot_yielding_callees {
+        yielding_fns.insert(callee.as_str());
+    }
+
+    fn visit_place<'a>(place: &'a MirPlace, out: &mut Vec<&'a MirExpr>) {
+        match place {
+            MirPlace::Var(_) => {}
+            MirPlace::Deref(inner, _) => visit_expr(inner, out),
+            MirPlace::Field { base, .. } => visit_place(base, out),
+            MirPlace::Index { base, index, .. } => {
+                visit_place(base, out);
+                visit_expr(index, out);
+            }
+        }
+    }
+
+    fn visit_prim_target<'a>(target: &'a MirPrimTarget, out: &mut Vec<&'a MirExpr>) {
+        match target {
+            MirPrimTarget::Global(_) => {}
+            MirPrimTarget::PtrExpr(expr) => visit_expr(expr, out),
+        }
+    }
+
+    fn visit_fmt_chunk<'a>(chunk: &'a MirFmtChunk, out: &mut Vec<&'a MirExpr>) {
+        match chunk {
+            MirFmtChunk::Literal(_) => {}
+            MirFmtChunk::Int { value, .. }
+            | MirFmtChunk::Float { value, .. }
+            | MirFmtChunk::Bool(value)
+            | MirFmtChunk::PaddedBool { value, .. }
+            | MirFmtChunk::Str(value)
+            | MirFmtChunk::PaddedStr { cstr: value, .. }
+            | MirFmtChunk::Bytes(value)
+            | MirFmtChunk::PaddedBytes { slice: value, .. }
+            | MirFmtChunk::EnumName { value, .. }
+            | MirFmtChunk::PaddedEnumName { value, .. }
+            | MirFmtChunk::DebugSlice { slice: value, .. } => visit_expr(value, out),
+        }
+    }
+
+    fn visit_expr<'a>(expr: &'a MirExpr, out: &mut Vec<&'a MirExpr>) {
+        out.push(expr);
+        match &expr.kind {
+            MirExprKind::IntLit(_)
+            | MirExprKind::FloatLit(_)
+            | MirExprKind::BoolLit(_)
+            | MirExprKind::StringLit(_)
+            | MirExprKind::TicksLit(_)
+            | MirExprKind::EnumVariant { .. }
+            | MirExprKind::ConstRef(_)
+            | MirExprKind::GlobalPrimAddr(_)
+            | MirExprKind::SubsystemAddr(_)
+            | MirExprKind::MmioAddr(_)
+            | MirExprKind::FnAddr(_)
+            | MirExprKind::Var(_)
+            | MirExprKind::ArrayLen(_)
+            | MirExprKind::ResultIsErr(_)
+            | MirExprKind::ResultErr(_)
+            | MirExprKind::ResultVal(_)
+            | MirExprKind::NowTicks
+            | MirExprKind::SysQuery(_) => {}
+            MirExprKind::MakePrimView { ptr, .. } => visit_expr(ptr, out),
+            MirExprKind::MmioRead { base, index, .. } => {
+                visit_expr(base, out);
+                if let Some(idx) = index {
+                    visit_expr(idx, out);
+                }
+            }
+            MirExprKind::AddrOfPlace(place)
+            | MirExprKind::ArrayToSlice {
+                array_place: place, ..
+            } => visit_place(place, out),
+            MirExprKind::Unary { expr: inner, .. }
+            | MirExprKind::CStrToSlice(inner)
+            | MirExprKind::Cast { expr: inner, .. }
+            | MirExprKind::FieldAccess { base: inner, .. }
+            | MirExprKind::SliceLen(inner)
+            | MirExprKind::FromBytes { slice: inner, .. }
+            | MirExprKind::LeaseGet { lease: inner, .. }
+            | MirExprKind::LeaseAddr { lease: inner, .. } => visit_expr(inner, out),
+            MirExprKind::Binary { lhs, rhs, .. }
+            | MirExprKind::SeqEq { lhs, rhs, .. }
+            | MirExprKind::Index {
+                base: lhs,
+                index: rhs,
+                ..
+            } => {
+                visit_expr(lhs, out);
+                visit_expr(rhs, out);
+            }
+            MirExprKind::SubSlice {
+                base, start, end, ..
+            } => {
+                visit_expr(base, out);
+                visit_expr(start, out);
+                visit_expr(end, out);
+            }
+            MirExprKind::StructLit { fields, .. } => {
+                for (_, val, _) in fields {
+                    visit_expr(val, out);
+                }
+            }
+            MirExprKind::ArrayLit { elems, .. } => {
+                for el in elems {
+                    visit_expr(el, out);
+                }
+            }
+            MirExprKind::PrimRead(op) => match op.as_ref() {
+                MirPrimReadOp::WatchRead { target, .. }
+                | MirPrimReadOp::GuardedGet { target, .. }
+                | MirPrimReadOp::WatchGen { target, .. }
+                | MirPrimReadOp::InboxTryRecv { target, .. }
+                | MirPrimReadOp::InboxLen { target, .. }
+                | MirPrimReadOp::InboxIsEmpty { target, .. }
+                | MirPrimReadOp::InboxIsFull { target, .. }
+                | MirPrimReadOp::SignalIsSet { target }
+                | MirPrimReadOp::SignalTryWait { target }
+                | MirPrimReadOp::WaitQueueWakeOne { target, .. }
+                | MirPrimReadOp::PingPongDmaBuf { target, .. }
+                | MirPrimReadOp::PingPongBaseAddr { target, .. }
+                | MirPrimReadOp::PoolTryAlloc { target, .. }
+                | MirPrimReadOp::PoolAvail { target, .. }
+                | MirPrimReadOp::PoolInUse { target, .. }
+                | MirPrimReadOp::PoolIsExhausted { target, .. }
+                | MirPrimReadOp::PoolCap { target, .. }
+                | MirPrimReadOp::DmaSlotTake { target, .. }
+                | MirPrimReadOp::DmaSlotRelease { target, .. }
+                | MirPrimReadOp::DmaSlotIsBusy { target, .. }
+                | MirPrimReadOp::DmaSlotIsEmpty { target, .. }
+                | MirPrimReadOp::DmaSlotAddr { target, .. }
+                | MirPrimReadOp::ByteRingReadSlice { target, .. }
+                | MirPrimReadOp::ByteRingTryPopByte { target, .. }
+                | MirPrimReadOp::ByteRingLen { target, .. }
+                | MirPrimReadOp::ByteRingFreeSpace { target, .. }
+                | MirPrimReadOp::ByteRingIsEmpty { target, .. }
+                | MirPrimReadOp::ByteRingIsFull { target, .. } => visit_prim_target(target, out),
+                MirPrimReadOp::InboxTrySend { target, value, .. }
+                | MirPrimReadOp::DmaSlotPark {
+                    target,
+                    lease: value,
+                    ..
+                }
+                | MirPrimReadOp::ByteRingPush {
+                    target, src: value, ..
+                }
+                | MirPrimReadOp::ByteRingPushByte {
+                    target,
+                    byte: value,
+                    ..
+                }
+                | MirPrimReadOp::ByteRingGrantWrite {
+                    target, len: value, ..
+                }
+                | MirPrimReadOp::ByteRingPop {
+                    target, dst: value, ..
+                } => {
+                    visit_prim_target(target, out);
+                    visit_expr(value, out);
+                }
+                MirPrimReadOp::InboxViewTryRecv { view, .. }
+                | MirPrimReadOp::InboxViewLen { view, .. }
+                | MirPrimReadOp::InboxViewCap { view, .. }
+                | MirPrimReadOp::InboxViewIsEmpty { view, .. }
+                | MirPrimReadOp::InboxViewIsFull { view, .. }
+                | MirPrimReadOp::ByteRingViewReadSlice { view }
+                | MirPrimReadOp::ByteRingViewTryPopByte { view }
+                | MirPrimReadOp::ByteRingViewLen { view }
+                | MirPrimReadOp::ByteRingViewCap { view }
+                | MirPrimReadOp::ByteRingViewFreeSpace { view }
+                | MirPrimReadOp::ByteRingViewIsEmpty { view }
+                | MirPrimReadOp::ByteRingViewIsFull { view } => visit_expr(view, out),
+                MirPrimReadOp::InboxViewTrySend { view, value, .. }
+                | MirPrimReadOp::ByteRingViewPush {
+                    view, src: value, ..
+                }
+                | MirPrimReadOp::ByteRingViewPushByte {
+                    view, byte: value, ..
+                }
+                | MirPrimReadOp::ByteRingViewGrantWrite { view, len: value }
+                | MirPrimReadOp::ByteRingViewPop { view, dst: value } => {
+                    visit_expr(view, out);
+                    visit_expr(value, out);
+                }
+            },
+            MirExprKind::CallDirect { args, .. } => {
+                for a in args {
+                    visit_expr(a, out);
+                }
+            }
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                visit_expr(addr, out);
+                for a in args {
+                    visit_expr(a, out);
+                }
+            }
+        }
+    }
+
+    fn visit_stmt<'a>(stmt: &'a MirStmt, out: &mut Vec<&'a MirExpr>) {
+        match stmt {
+            MirStmt::Assign { target, value, .. } => {
+                visit_place(target, out);
+                visit_expr(value, out);
+            }
+            MirStmt::Expr(expr) => visit_expr(expr, out),
+            MirStmt::PrimOp(op) => match op {
+                MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+                | MirPrimNonBlockingOp::GuardedSet { target, value, .. }
+                | MirPrimNonBlockingOp::InboxPost { target, value, .. }
+                | MirPrimNonBlockingOp::PingPongCompleteHalf {
+                    target,
+                    half: value,
+                    ..
+                }
+                | MirPrimNonBlockingOp::ByteRingConsume {
+                    target, len: value, ..
+                }
+                | MirPrimNonBlockingOp::ByteRingCommitWrite {
+                    target, len: value, ..
+                } => {
+                    visit_prim_target(target, out);
+                    visit_expr(value, out);
+                }
+                MirPrimNonBlockingOp::SignalNotify { target, .. }
+                | MirPrimNonBlockingOp::SignalClear { target }
+                | MirPrimNonBlockingOp::WaitQueuePrepare { target }
+                | MirPrimNonBlockingOp::WaitQueueCancel { target }
+                | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. }
+                | MirPrimNonBlockingOp::PingPongFlip { target, .. }
+                | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
+                | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
+                    visit_prim_target(target, out);
+                }
+                MirPrimNonBlockingOp::LeaseRelease { value, .. } => visit_expr(value, out),
+                MirPrimNonBlockingOp::LeaseNullify { target, .. } => visit_place(target, out),
+                MirPrimNonBlockingOp::InboxViewPost { view, value, .. }
+                | MirPrimNonBlockingOp::ByteRingViewConsume { view, len: value }
+                | MirPrimNonBlockingOp::ByteRingViewCommitWrite {
+                    view, len: value, ..
+                } => {
+                    visit_expr(view, out);
+                    visit_expr(value, out);
+                }
+                MirPrimNonBlockingOp::ByteRingViewClear { view } => visit_expr(view, out),
+            },
+            MirStmt::Intrinsic(op) => match op {
+                MirIntrinsicOp::UseSystick { hz } => visit_expr(hz, out),
+                MirIntrinsicOp::SetPriority { .. } => {}
+                MirIntrinsicOp::SysOp { args, .. } => {
+                    for a in args {
+                        visit_expr(a, out);
+                    }
+                }
+            },
+            MirStmt::EnterCritical
+            | MirStmt::ExitCritical
+            | MirStmt::EndInboxTurn
+            | MirStmt::Break
+            | MirStmt::Continue
+            | MirStmt::SetIrqSelector { .. }
+            | MirStmt::BoundedForLatch
+            | MirStmt::ZeroTaskLocals => {}
+            MirStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                visit_expr(cond, out);
+                for s in then_body {
+                    visit_stmt(s, out);
+                }
+                for s in else_body {
+                    visit_stmt(s, out);
+                }
+            }
+            MirStmt::While { cond, body } => {
+                visit_expr(cond, out);
+                for s in body {
+                    visit_stmt(s, out);
+                }
+            }
+            MirStmt::Switch {
+                discr,
+                arms,
+                default,
+            } => {
+                visit_expr(discr, out);
+                for (_, body) in arms {
+                    for s in body {
+                        visit_stmt(s, out);
+                    }
+                }
+                for s in default {
+                    visit_stmt(s, out);
+                }
+            }
+            MirStmt::Return(expr_opt) => {
+                if let Some(e) = expr_opt {
+                    visit_expr(e, out);
+                }
+            }
+            MirStmt::Error { reason, partial } => {
+                if let Some(r) = reason {
+                    visit_expr(r, out);
+                }
+                if let Some(p) = partial {
+                    visit_expr(p, out);
+                }
+            }
+            MirStmt::SpawnActivate { args, .. } => {
+                for a in args {
+                    visit_expr(a, out);
+                }
+            }
+            MirStmt::PrintFmt { chunks, .. } => {
+                for ch in chunks {
+                    visit_fmt_chunk(ch, out);
+                }
+            }
+            MirStmt::FmtBuf { buf, chunks, .. } => {
+                visit_expr(buf, out);
+                for ch in chunks {
+                    visit_fmt_chunk(ch, out);
+                }
+            }
+            MirStmt::FmtRing { ring, chunks, .. } => {
+                visit_expr(ring, out);
+                for ch in chunks {
+                    visit_fmt_chunk(ch, out);
+                }
+            }
+            MirStmt::MmioWrite {
+                base, index, value, ..
+            } => {
+                visit_expr(base, out);
+                if let Some(idx) = index {
+                    visit_expr(idx, out);
+                }
+                visit_expr(value, out);
+            }
+        }
+    }
+
+    fn visit_term<'a>(term: &'a MirTerminator, out: &mut Vec<&'a MirExpr>) {
+        match term {
+            MirTerminator::Goto(_) => {}
+            MirTerminator::Branch { cond, .. } => visit_expr(cond, out),
+            MirTerminator::Switch { discr, .. } => visit_expr(discr, out),
+            MirTerminator::Return(expr_opt) => {
+                if let Some(e) = expr_opt {
+                    visit_expr(e, out);
+                }
+            }
+            MirTerminator::Error { reason, partial } => {
+                if let Some(r) = reason {
+                    visit_expr(r, out);
+                }
+                if let Some(p) = partial {
+                    visit_expr(p, out);
+                }
+            }
+            MirTerminator::Yield(yk) => match yk {
+                MirYieldKind::EveryLatch { .. }
+                | MirYieldKind::DelayPoll { .. }
+                | MirYieldKind::ShareCheckpoint { .. }
+                | MirYieldKind::PollChild { .. } => {}
+                MirYieldKind::Wait { arms, .. } => {
+                    for arm in arms {
+                        match &arm.op {
+                            MirWaitArmOp::InboxRecv { target, .. }
+                            | MirWaitArmOp::InboxSend { target, .. }
+                            | MirWaitArmOp::SignalWait { target, .. }
+                            | MirWaitArmOp::WaitQueueCommit { target, .. }
+                            | MirWaitArmOp::WatchWaitChange { target, .. }
+                            | MirWaitArmOp::PingPongWaitChunk { target, .. }
+                            | MirWaitArmOp::PoolAlloc { target, .. }
+                            | MirWaitArmOp::ByteRingWaitRead { target, .. }
+                            | MirWaitArmOp::ByteRingWaitWrite { target, .. } => {
+                                visit_prim_target(target, out);
+                            }
+                            MirWaitArmOp::InboxViewRecv { view, .. }
+                            | MirWaitArmOp::InboxViewSend { view, .. }
+                            | MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                            | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
+                                visit_expr(view, out);
+                            }
+                        }
+                    }
+                }
+                MirYieldKind::CallYielding { args, .. } => {
+                    for a in args {
+                        visit_expr(a, out);
+                    }
+                }
+            },
+        }
+    }
+
+    let mut all_exprs: Vec<&MirExpr> = Vec::new();
+    for c in &module.consts {
+        visit_expr(&c.init, &mut all_exprs);
+    }
+    for p in &module.primitives {
+        if let Some(init) = &p.init {
+            visit_expr(init, &mut all_exprs);
+        }
+    }
+    for isr in &module.isrs {
+        for sv in &isr.state_vars {
+            visit_expr(&sv.init, &mut all_exprs);
+        }
+        for s in &isr.body {
+            visit_stmt(s, &mut all_exprs);
+        }
+    }
+    for f in &module.functions {
+        match &f.body {
+            MirFnBody::Direct(stmts) => {
+                for s in stmts {
+                    visit_stmt(s, &mut all_exprs);
+                }
+            }
+            MirFnBody::Coroutine { blocks, .. } => {
+                for blk in blocks {
+                    for s in &blk.stmts {
+                        visit_stmt(s, &mut all_exprs);
+                    }
+                    visit_term(&blk.terminator, &mut all_exprs);
+                }
+            }
+        }
+    }
+    for bp in &module.task_blueprints {
+        for blk in &bp.blocks {
+            for s in &blk.stmts {
+                visit_stmt(s, &mut all_exprs);
+            }
+            visit_term(&blk.terminator, &mut all_exprs);
+        }
+    }
+    for sp in &module.spawned_tasks {
+        for a in &sp.init_args {
+            visit_expr(a, &mut all_exprs);
+        }
+    }
+    for step in &module.boot.steps {
+        match step {
+            MirBootStep::Stmt(s) => visit_stmt(s, &mut all_exprs),
+            MirBootStep::RunYieldingFn { args, .. } | MirBootStep::SpawnActivate { args, .. } => {
+                for a in args {
+                    visit_expr(a, &mut all_exprs);
+                }
+            }
+        }
+    }
+
+    for expr in all_exprs {
+        let MirExprKind::FnAddr(fname) = &expr.kind else {
+            continue;
+        };
+        let MirType::FnPtr {
+            is_noyield: false,
+            params,
+            ret,
+            error_spec,
+        } = &expr.ty
+        else {
+            continue;
+        };
+        if !yielding_fns.contains(fname.as_str()) {
+            continue;
+        }
+        let raw_sig_str = expr.ty.display_name();
+        let (cp, cr, ce) = canonical_mir_fnptr_sig(params, ret, error_spec);
+        let canon_sig_str = MirType::FnPtr {
+            is_noyield: false,
+            params: cp,
+            ret: Box::new(cr),
+            error_spec: Box::new(ce),
+        }
+        .display_name();
+        let in_plain_map = module
+            .plain_fnptr_candidates
+            .get(&canon_sig_str)
+            .is_some_and(|cands| cands.contains(fname));
+        let missing_at_site = module
+            .indirect_call_sites
+            .iter()
+            .filter(|site| {
+                !site.is_noyield
+                    && (site.signature == canon_sig_str || site.signature == raw_sig_str)
+            })
+            .any(|site| {
+                !site.candidates.contains(fname) || !site.yielding_candidates.contains(fname)
+            });
+        if !in_plain_map || missing_at_site {
+            return Err(MirLowerError {
+                message: format!(
+                    "internal compiler error: yielding function `{fname}` emitted with plain pointer type `{raw_sig_str}` is missing from the candidate set for its signature"
+                ),
+                span: Span::dummy(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 mod coroutine;

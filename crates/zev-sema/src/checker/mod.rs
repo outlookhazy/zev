@@ -1,6 +1,6 @@
 //! Multi-pass semantic analyzer and static verifier for the Zev Language-OS.
 
-pub(super) use std::collections::{BTreeMap, BTreeSet};
+pub(super) use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub(super) use std::path::PathBuf;
 
 pub(super) use zev_ast::{
@@ -28,8 +28,8 @@ pub(super) use crate::suggest::{
     advise_primitive_method, closest_match, suggest_foreign_type_name,
 };
 pub(super) use crate::types::{
-    EnumInfo, FieldInfo, NamespaceKind, PrimitiveKind, ResolvedErrorSpec, ResolvedOsPrimitive,
-    StructInfo, Ty,
+    EnumInfo, FieldInfo, FnPtrKind, NamespaceKind, PrimitiveKind, ResolvedErrorSpec,
+    ResolvedOsPrimitive, StructInfo, Ty,
 };
 
 /// Configuration options for semantic analysis.
@@ -270,12 +270,25 @@ pub(super) enum IrqBootNode {
     },
 }
 
+pub(super) type FnPtrSigKey = (Vec<Ty>, Ty, ResolvedErrorSpec);
+
 #[derive(Clone, Debug)]
 pub(super) struct FnPtrValueSite {
     pub(super) fn_name: String,
     pub(super) span: Span,
     pub(super) prog_idx: usize,
     pub(super) file: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct PlainIndirectCallSite {
+    pub(super) caller: String,
+    pub(super) caller_kind: CallableKind,
+    pub(super) sig: FnPtrSigKey,
+    pub(super) sig_display: String,
+    pub(super) span: Span,
+    pub(super) file: Option<String>,
+    pub(super) ctx: CallContext,
 }
 
 #[derive(Clone, Debug)]
@@ -324,6 +337,8 @@ pub(crate) struct Analyzer {
     pub(super) recorded_byte_ring_ops: Vec<RecordedByteRingOp>,
     pub(super) recorded_watch_writes: Vec<RecordedWatchWrite>,
     pub(super) fn_ptr_value_sites: Vec<FnPtrValueSite>,
+    pub(super) noyield_fn_ptr_spans: BTreeSet<(usize, u32, u32)>,
+    pub(super) plain_indirect_call_sites: Vec<PlainIndirectCallSite>,
     pub(super) extern_callback_arg_spans: BTreeSet<(usize, u32, u32)>,
     pub(super) spawned_task_field_endpoints: BTreeMap<usize, Vec<BTreeMap<String, String>>>,
     pub(super) prim_escaping_ref_params: BTreeMap<String, BTreeSet<usize>>,

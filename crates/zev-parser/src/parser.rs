@@ -672,7 +672,7 @@ impl<'a> Parser<'a> {
         .with_code("P0007")
         .with_doc_topic("errors")
         .with_hint(
-            "declare fallible functions with `u16 parse([]u8 buf) error ParseErr { ... }`, fail via `error BadCrc;` (or `error;` / `error Timeout, count;`), and handle with `catch (ParseErr err) { ... }` or `or fallback`",
+            "declare fallible functions with `fn parse([]u8 buf) -> u16 error ParseErr { ... }`, fail via `error BadCrc;` (or `error;` / `error Timeout, count;`), and handle with `catch (ParseErr err) { ... }` or `or fallback`",
         )
     }
 
@@ -2631,75 +2631,17 @@ impl<'a> Parser<'a> {
                     )
                 }
             }
-            TokenKind::LParen if self.peek_n_kind(1) == TokenKind::KwFn => {
+            TokenKind::LParen if self.starts_with_fn_ptr_type(1) => {
                 self.bump();
                 let inner = self.parse_type_with_mode(false)?;
                 let rp = self.expect(&TokenKind::RParen)?;
                 TypeExpr::new(inner.kind, start.merge(rp.span))
             }
-            TokenKind::KwFn => {
-                // Note: function-pointer types `fn(T1, T2) [-> Ret] [error [E]]` KEEP `-> Ret`!
+            TokenKind::KwNoYield if self.peek_n_kind(1) == TokenKind::KwFn => {
                 self.bump();
-                let fn_params = self.parse_fn_ptr_param_types()?;
-                let (ret, mut end_span) = if self.eat(&TokenKind::Arrow) {
-                    let r = self.parse_type_with_mode(in_declarator)?;
-                    let s = r.span;
-                    (r, s)
-                } else {
-                    let s = self.prev_span();
-                    (TypeExpr::void(s), s)
-                };
-                let error_spec = if self.at(&TokenKind::KwError) {
-                    let err_tok = self.bump();
-                    let err_span = err_tok.span;
-                    if in_declarator {
-                        let cp = self.save();
-                        if let Ok(err_ty) = self.parse_type() {
-                            if matches!(self.peek_kind(), TokenKind::Ident(_) | TokenKind::KwMut)
-                                || (self.at(&TokenKind::LParen)
-                                    && self.peek_n_kind(1) == TokenKind::Star)
-                            {
-                                end_span = err_ty.span;
-                                Some(Box::new(ErrorSpec::Typed(err_ty)))
-                            } else {
-                                self.restore(cp);
-                                end_span = err_span;
-                                Some(Box::new(ErrorSpec::Bare(err_span)))
-                            }
-                        } else {
-                            self.restore(cp);
-                            end_span = err_span;
-                            Some(Box::new(ErrorSpec::Bare(err_span)))
-                        }
-                    } else if matches!(
-                        self.peek_kind(),
-                        TokenKind::Ident(_)
-                            | TokenKind::KwFn
-                            | TokenKind::Star
-                            | TokenKind::LBracket
-                            | TokenKind::KwConst
-                    ) || (self.at(&TokenKind::LParen)
-                        && self.peek_n_kind(1) == TokenKind::KwFn)
-                    {
-                        let err_ty = self.parse_type()?;
-                        end_span = err_ty.span;
-                        Some(Box::new(ErrorSpec::Typed(err_ty)))
-                    } else {
-                        end_span = err_span;
-                        Some(Box::new(ErrorSpec::Bare(err_span)))
-                    }
-                } else {
-                    None
-                };
-                TypeExpr::new(
-                    TypeKind::FnPtr {
-                        params: fn_params,
-                        ret: Box::new(ret),
-                        error_spec,
-                    },
-                    start.merge(end_span),
-                )
+                self.parse_fn_ptr_type(start, true, in_declarator)?
             }
+            TokenKind::KwFn => self.parse_fn_ptr_type(start, false, in_declarator)?,
             TokenKind::Ident(ref s) => {
                 let s_clone = s.clone();
                 // Trap Zig `ErrType!PayloadType`
@@ -2980,6 +2922,81 @@ impl<'a> Parser<'a> {
         Ok(ty)
     }
 
+    fn starts_with_fn_ptr_type(&self, offset: usize) -> bool {
+        self.peek_n_kind(offset) == TokenKind::KwFn
+            || (self.peek_n_kind(offset) == TokenKind::KwNoYield
+                && self.peek_n_kind(offset + 1) == TokenKind::KwFn)
+    }
+
+    fn parse_fn_ptr_type(
+        &mut self,
+        start: Span,
+        is_noyield: bool,
+        in_declarator: bool,
+    ) -> Result<TypeExpr, ParseError> {
+        // Function-pointer types `[noyield] fn(T1, T2) [-> Ret] [error [E]]` KEEP `-> Ret`.
+        self.expect(&TokenKind::KwFn)?;
+        let fn_params = self.parse_fn_ptr_param_types()?;
+        let (ret, mut end_span) = if self.eat(&TokenKind::Arrow) {
+            let r = self.parse_type_with_mode(in_declarator)?;
+            let s = r.span;
+            (r, s)
+        } else {
+            let s = self.prev_span();
+            (TypeExpr::void(s), s)
+        };
+        let error_spec = if self.at(&TokenKind::KwError) {
+            let err_tok = self.bump();
+            let err_span = err_tok.span;
+            if in_declarator {
+                let cp = self.save();
+                if let Ok(err_ty) = self.parse_type() {
+                    if matches!(self.peek_kind(), TokenKind::Ident(_) | TokenKind::KwMut)
+                        || (self.at(&TokenKind::LParen) && self.peek_n_kind(1) == TokenKind::Star)
+                    {
+                        end_span = err_ty.span;
+                        Some(Box::new(ErrorSpec::Typed(err_ty)))
+                    } else {
+                        self.restore(cp);
+                        end_span = err_span;
+                        Some(Box::new(ErrorSpec::Bare(err_span)))
+                    }
+                } else {
+                    self.restore(cp);
+                    end_span = err_span;
+                    Some(Box::new(ErrorSpec::Bare(err_span)))
+                }
+            } else if matches!(
+                self.peek_kind(),
+                TokenKind::Ident(_)
+                    | TokenKind::KwFn
+                    | TokenKind::Star
+                    | TokenKind::LBracket
+                    | TokenKind::KwConst
+            ) || self.starts_with_fn_ptr_type(0)
+                || (self.at(&TokenKind::LParen) && self.starts_with_fn_ptr_type(1))
+            {
+                let err_ty = self.parse_type()?;
+                end_span = err_ty.span;
+                Some(Box::new(ErrorSpec::Typed(err_ty)))
+            } else {
+                end_span = err_span;
+                Some(Box::new(ErrorSpec::Bare(err_span)))
+            }
+        } else {
+            None
+        };
+        Ok(TypeExpr::new(
+            TypeKind::FnPtr {
+                params: fn_params,
+                ret: Box::new(ret),
+                error_spec,
+                is_noyield,
+            },
+            start.merge(end_span),
+        ))
+    }
+
     fn parse_fn_ptr_param_types(&mut self) -> Result<Vec<TypeExpr>, ParseError> {
         self.expect(&TokenKind::LParen)?;
         let mut params = Vec::new();
@@ -3258,7 +3275,7 @@ impl<'a> Parser<'a> {
             TokenKind::KwFor => self.parse_for_stmt(attrs, start),
             TokenKind::KwLoop => self.parse_loop_stmt(attrs, start),
             TokenKind::KwDefer => self.parse_defer_stmt(attrs, start),
-            TokenKind::KwNoYield => {
+            TokenKind::KwNoYield if self.peek_n_kind(1) != TokenKind::KwFn => {
                 self.bump();
                 let body = self.parse_block()?;
                 let span = start.merge(body.span);
@@ -3603,6 +3620,8 @@ impl<'a> Parser<'a> {
         }
         let starts_like_type = match self.peek_n_kind(1) {
             TokenKind::KwConst | TokenKind::KwFn | TokenKind::Star | TokenKind::LBracket => true,
+            TokenKind::KwNoYield if self.peek_n_kind(2) == TokenKind::KwFn => true,
+            TokenKind::LParen if self.starts_with_fn_ptr_type(2) => true,
             TokenKind::Ident(ref t) => {
                 (PrimType::from_name(t).is_some()
                     && self.peek_n_kind(2) != TokenKind::Dot
@@ -3636,7 +3655,10 @@ impl<'a> Parser<'a> {
             TokenKind::KwConst | TokenKind::KwFn => {
                 starts_with_known_type = true;
             }
-            TokenKind::LParen if self.peek_n_kind(1) == TokenKind::KwFn => {
+            TokenKind::KwNoYield if self.peek_n_kind(1) == TokenKind::KwFn => {
+                starts_with_known_type = true;
+            }
+            TokenKind::LParen if self.starts_with_fn_ptr_type(1) => {
                 starts_with_known_type = true;
             }
             TokenKind::Star | TokenKind::LBracket => {}
