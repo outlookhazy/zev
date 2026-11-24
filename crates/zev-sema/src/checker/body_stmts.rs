@@ -1546,29 +1546,21 @@ impl<'a> BodyChecker<'a> {
             StmtKind::LoopEvery { period, body } => {
                 let pv = self.check_expr_infallible(period);
                 if pv.ty.is_integer() {
-                    let is_zero = match &period.kind {
-                        ExprKind::Literal(Literal::Int { value: 0, .. }) => true,
-                        ExprKind::Ident(id) => self
-                            .sema
-                            .consts
-                            .get(&id.name)
-                            .is_some_and(|c| c.int_value == Some(0)),
-                        _ => false,
-                    };
-                    let const_ticks = match &period.kind {
-                        ExprKind::Literal(Literal::Int { value, .. }) => Some(*value),
-                        ExprKind::Ident(id) => {
-                            self.sema.consts.get(&id.name).and_then(|c| c.int_value)
-                        }
-                        _ => None,
-                    };
-                    if is_zero {
+                    let shadowed = self.active_local_names();
+                    let const_ticks = self.sema.eval_const_expr_i128_shadowed(
+                        period,
+                        &mut BTreeSet::new(),
+                        &shadowed,
+                    );
+                    if const_ticks.is_some_and(|t| t <= 0) {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::InvalidDurationResolution,
                             period.span,
                             "periodic 'loop every' interval must be greater than 0",
                         ));
-                    } else if const_ticks.is_some_and(|t| t > zev_ast::MAX_DURATION_TICKS) {
+                    } else if const_ticks
+                        .is_some_and(|t| t > zev_ast::MAX_DURATION_TICKS as i128)
+                    {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::InvalidDurationResolution,
                             period.span,

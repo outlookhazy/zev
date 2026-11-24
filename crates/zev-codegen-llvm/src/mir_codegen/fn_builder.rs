@@ -344,15 +344,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             // Resync while-sleeping overruns at `loop every` body entry (`wdiff >= eff_p`)
             if let Some(&(dv_id, pv_id)) = every_resume_map.get(&b.id) {
                 let dl_ptr = self.var_ptr(dv_id);
-                let pv_ptr = self.var_ptr(pv_id);
-                let pv_lty = self.ctx.llvm_ty(&self.vars[pv_id.0].ty);
-                let pv_raw = self.next_tmp();
-                self.emit_line(format!("{pv_raw} = load {pv_lty}, ptr {pv_ptr}, align 4"));
-                let pv32 = self.coerce(SsaVal::new(pv_lty, pv_raw), "i32", false);
-                let p_zero = self.next_tmp();
-                let eff_p = self.next_tmp();
-                self.emit_line(format!("{p_zero} = icmp eq i32 {}, 0", pv32.repr));
-                self.emit_line(format!("{eff_p} = select i1 {p_zero}, i32 1, i32 {}", pv32.repr));
+                let eff_p = self.emit_clamped_every_period(pv_id);
                 let call_kw = self.call_kw();
                 let dv = self.next_tmp();
                 let now = self.next_tmp();
@@ -499,6 +491,95 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok(())
     }
 
+    fn emit_clamped_every_period(&mut self, pv_id: VarId) -> String {
+        let pv_ptr = self.var_ptr(pv_id);
+        let vty = self.vars[pv_id.0].ty.host_value_type();
+        let pv = self.load_from_place_ptr(&pv_ptr, &vty, false);
+        let ptr_bits = self.ctx.spec.isa.ptr_bits();
+        let (is_signed, bits) = match vty {
+            MirType::I8 => (true, 8),
+            MirType::I16 => (true, 16),
+            MirType::I32 | MirType::Enum(_) => (true, 32),
+            MirType::I64 => (true, 64),
+            MirType::Isize => (true, ptr_bits),
+            MirType::U8 => (false, 8),
+            MirType::U16 => (false, 16),
+            MirType::U32 => (false, 32),
+            MirType::U64 => (false, 64),
+            MirType::Usize => (false, ptr_bits),
+            _ => (!vty.is_unsigned(), 32),
+        };
+        let lty = pv.ty;
+        if bits < 32 {
+            let ext32 = self.coerce(SsaVal::new(lty, pv.repr), "i32", is_signed).repr;
+            let low = self.next_tmp();
+            let clamped = self.next_tmp();
+            if is_signed {
+                self.emit_line(format!("{low} = icmp sle i32 {ext32}, 0"));
+            } else {
+                self.emit_line(format!("{low} = icmp eq i32 {ext32}, 0"));
+            }
+            self.emit_line(format!("{clamped} = select i1 {low}, i32 1, i32 {ext32}"));
+            return clamped;
+        }
+        if bits == 64 || lty == "i64" {
+            let low = self.next_tmp();
+            let c1 = self.next_tmp();
+            let high = self.next_tmp();
+            let c2 = self.next_tmp();
+            let tr = self.next_tmp();
+            if is_signed {
+                self.emit_line(format!("{low} = icmp sle i64 {}, 0", pv.repr));
+                self.emit_line(format!("{c1} = select i1 {low}, i64 1, i64 {}", pv.repr));
+                self.emit_line(format!(
+                    "{high} = icmp sgt i64 {c1}, {}",
+                    zev_ast::MAX_DURATION_TICKS
+                ));
+            } else {
+                self.emit_line(format!("{low} = icmp eq i64 {}, 0", pv.repr));
+                self.emit_line(format!("{c1} = select i1 {low}, i64 1, i64 {}", pv.repr));
+                self.emit_line(format!(
+                    "{high} = icmp ugt i64 {c1}, {}",
+                    zev_ast::MAX_DURATION_TICKS
+                ));
+            }
+            self.emit_line(format!(
+                "{c2} = select i1 {high}, i64 {}, i64 {c1}",
+                zev_ast::MAX_DURATION_TICKS
+            ));
+            self.emit_line(format!("{tr} = trunc i64 {c2} to i32"));
+            return tr;
+        }
+        // 32-bit (`i32` / `u32`): extend/normalize in case `Enum`/`Bool`, then clamp `[1, i32::MAX]`.
+        let pv32 = if lty == "i32" {
+            pv.repr
+        } else {
+            self.coerce(SsaVal::new(lty, pv.repr), "i32", is_signed)
+                .repr
+        };
+        let low = self.next_tmp();
+        let c1 = self.next_tmp();
+        if is_signed {
+            self.emit_line(format!("{low} = icmp sle i32 {pv32}, 0"));
+            self.emit_line(format!("{c1} = select i1 {low}, i32 1, i32 {pv32}"));
+            c1
+        } else {
+            self.emit_line(format!("{low} = icmp eq i32 {pv32}, 0"));
+            self.emit_line(format!("{c1} = select i1 {low}, i32 1, i32 {pv32}"));
+            let high = self.next_tmp();
+            let c2 = self.next_tmp();
+            self.emit_line(format!(
+                "{high} = icmp ugt i32 {c1}, {}",
+                zev_ast::MAX_DURATION_TICKS
+            ));
+            self.emit_line(format!(
+                "{c2} = select i1 {high}, i32 {}, i32 {c1}",
+                zev_ast::MAX_DURATION_TICKS
+            ));
+            c2
+        }
+    }
+
     pub(super) fn emit_yield(&mut self, yk: &MirYieldKind) -> Result<(), CodegenError> {
         match yk {
             MirYieldKind::EveryLatch {
@@ -507,15 +588,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 resume_bb,
             } => {
                 let dl_ptr = self.var_ptr(*next_deadline_var);
-                let pv_ptr = self.var_ptr(*period_var);
-                let pv_lty = self.ctx.llvm_ty(&self.vars[period_var.0].ty);
-                let pv_raw = self.next_tmp();
-                self.emit_line(format!("{pv_raw} = load {pv_lty}, ptr {pv_ptr}, align 4"));
-                let pv32 = self.coerce(SsaVal::new(pv_lty, pv_raw), "i32", false);
-                let p_zero = self.next_tmp();
-                let eff_p = self.next_tmp();
-                self.emit_line(format!("{p_zero} = icmp eq i32 {}, 0", pv32.repr));
-                self.emit_line(format!("{eff_p} = select i1 {p_zero}, i32 1, i32 {}", pv32.repr));
+                let eff_p = self.emit_clamped_every_period(*period_var);
 
                 let cur_dl = self.next_tmp();
                 self.emit_line(format!("{cur_dl} = load i32, ptr {dl_ptr}, align 4"));

@@ -2085,7 +2085,7 @@ fn loop_every_runtime_period_and_unified_inbox_methods() {
     assert_eq!(model.fn_effect("consumer"), FnEffect::HardBlocking);
     assert_eq!(model.primitives["cmd_q"].kind, PrimitiveKind::Inbox);
 
-    // Reject `loop every 0` -> E0013 (`InvalidDurationResolution`)
+    // Reject `loop every 0`, negative constants/literals, and > MAX_DURATION_TICKS constants -> E0013
     expect_err_kind(
         r#"
         task bad_zero() {
@@ -2094,6 +2094,41 @@ fn loop_every_runtime_period_and_unified_inbox_methods() {
             }
         }
         fn main() { spawn bad_zero(); }
+        "#,
+        DiagnosticKind::InvalidDurationResolution,
+    );
+    expect_err_kind(
+        r#"
+        task bad_neg_lit() {
+            loop every -5 {
+                checkpoint();
+            }
+        }
+        fn main() { spawn bad_neg_lit(); }
+        "#,
+        DiagnosticKind::InvalidDurationResolution,
+    );
+    expect_err_kind(
+        r#"
+        const i32 NEG_PERIOD = -10;
+        task bad_neg_const() {
+            loop every NEG_PERIOD {
+                checkpoint();
+            }
+        }
+        fn main() { spawn bad_neg_const(); }
+        "#,
+        DiagnosticKind::InvalidDurationResolution,
+    );
+    expect_err_kind(
+        r#"
+        const u64 HUGE_PERIOD = 3000000000;
+        task bad_huge_const() {
+            loop every HUGE_PERIOD {
+                checkpoint();
+            }
+        }
+        fn main() { spawn bad_huge_const(); }
         "#,
         DiagnosticKind::InvalidDurationResolution,
     );
