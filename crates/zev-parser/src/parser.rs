@@ -2,7 +2,8 @@ use crate::error::ParseError;
 use crate::token::{LexedFormatPart, Token, TokenKind};
 use zev_ast::*;
 
-const MAX_PARSER_RECURSION_DEPTH: usize = 24;
+const MAX_PARSER_RECURSION_DEPTH: usize = 42;
+const MAX_RECOVERED_PARSE_ERRORS: usize = 32;
 
 #[derive(Copy, Clone)]
 struct Checkpoint {
@@ -721,6 +722,116 @@ impl<'a> Parser<'a> {
             start_span.merge(self.prev_span())
         };
         Ok(Program::new(items, end_span))
+    }
+
+    /// Parse a top-level program while synchronizing at item boundaries after syntax errors so
+    /// multiple parse errors can be reported in a single compiler invocation.
+    pub fn parse_program_recovering(&mut self) -> (Program, Vec<ParseError>) {
+        let start_span = self.peek_span();
+        let mut items = Vec::new();
+        let mut errors = Vec::new();
+
+        while !self.at(&TokenKind::Eof) {
+            let pos_before = self.pos;
+            match self.parse_top_level_items(&mut items) {
+                Ok(()) => {
+                    // Safety invariant: top-level item parsing must consume at least one token on Ok.
+                    if self.pos == pos_before {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    errors.push(err);
+                    if errors.len() >= MAX_RECOVERED_PARSE_ERRORS {
+                        break;
+                    }
+                    self.recursion_depth = 0;
+                    self.pending_gt = None;
+                    self.allow_struct_lit = true;
+                    self.synchronize_to_next_item(pos_before);
+                }
+            }
+        }
+
+        let end_span = if items.is_empty() {
+            start_span
+        } else {
+            start_span.merge(self.prev_span())
+        };
+        (Program::new(items, end_span), errors)
+    }
+
+    fn is_top_level_sync_starter(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            TokenKind::At
+                | TokenKind::KwPub
+                | TokenKind::KwImport
+                | TokenKind::KwFn
+                | TokenKind::KwTask
+                | TokenKind::KwIsr
+                | TokenKind::KwStruct
+                | TokenKind::KwPacked
+                | TokenKind::KwEnum
+                | TokenKind::KwConst
+                | TokenKind::KwImpl
+                | TokenKind::KwExtern
+                | TokenKind::KwStatic
+        ) || self.is_mmio_decl_start()
+            || self.is_irq_decl_start()
+    }
+
+    fn synchronize_to_next_item(&mut self, pos_before: usize) {
+        let mut brace_depth = 0usize;
+        let mut paren_depth = 0usize;
+        for tok in &self.tokens[pos_before..self.pos.min(self.tokens.len())] {
+            match tok.kind {
+                TokenKind::LBrace => brace_depth += 1,
+                TokenKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
+                TokenKind::LParen => paren_depth += 1,
+                TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+
+        if self.pos == pos_before && !self.at(&TokenKind::Eof) {
+            match self.peek_kind() {
+                TokenKind::LBrace => brace_depth += 1,
+                TokenKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
+                TokenKind::LParen => paren_depth += 1,
+                TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+                _ => {}
+            }
+            self.bump();
+        }
+
+        while !self.at(&TokenKind::Eof) {
+            if brace_depth == 0 && paren_depth == 0 {
+                if self.eat(&TokenKind::Semi) || self.eat(&TokenKind::RBrace) {
+                    return;
+                }
+                if self.is_top_level_sync_starter() {
+                    return;
+                }
+            }
+            let kind = self.bump().kind;
+            match kind {
+                TokenKind::LBrace => brace_depth += 1,
+                TokenKind::RBrace => {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                        if brace_depth == 0 && paren_depth == 0 {
+                            return;
+                        }
+                    } else if paren_depth == 0 {
+                        return;
+                    }
+                }
+                TokenKind::LParen => paren_depth += 1,
+                TokenKind::RParen => paren_depth = paren_depth.saturating_sub(1),
+                _ => {}
+            }
+        }
     }
 
     fn is_mmio_decl_start(&self) -> bool {
@@ -2807,46 +2918,76 @@ impl<'a> Parser<'a> {
         let cur_span = self.peek_span();
 
         match self.peek_kind() {
-            // ── Foreign-idiom statement traps (`P0001`..`P0010`) ──
-            TokenKind::KwLet => return Err(self.trap_p0001("let", cur_span)),
-            TokenKind::KwVar => return Err(self.trap_p0001("var", cur_span)),
-            TokenKind::KwMut => return Err(self.trap_p0001("mut", cur_span)),
-            TokenKind::KwAsync => return Err(self.trap_p0003("async", cur_span)),
-            TokenKind::KwAwait => return Err(self.trap_p0003("await", cur_span)),
-            TokenKind::KwSelect => return Err(self.trap_p0004(cur_span)),
-            TokenKind::KwMatch => return Err(self.trap_p0005(cur_span)),
-            TokenKind::KwTry => return Err(self.trap_p0007("`try`", cur_span)),
-            TokenKind::KwStatic => return Err(self.trap_p0010(cur_span)),
-            TokenKind::KwPub => {
-                return Err(self
-                    .err_at(
-                        "`pub` visibility modifier is only allowed on top-level declarations, not inside blocks",
-                        cur_span,
-                    )
-                    .with_doc_topic("syntax"));
-            }
-            TokenKind::KwConst => {
-                return Err(self
-                    .err_at(
-                        "block-local `const` declarations are not supported; declare `const` items at module top level",
-                        cur_span,
-                    )
-                    .with_doc_topic("syntax")
-                    .with_hint(
-                        "move `const Type NAME = ...;` to module top level, or omit `const` for a local variable (`Type name = ...;`)",
-                    ));
-            }
-            TokenKind::Lifetime(ref lt) => return Err(self.trap_p0009_lifetime(lt, cur_span)),
-
-            // ── Standard Zev statements ──
             TokenKind::LBrace => {
                 let b = self.parse_block()?;
                 let span = start.merge(b.span);
                 Ok(Stmt::with_attrs(attrs, StmtKind::Block(b), span))
             }
+            TokenKind::KwIf => self.parse_if_stmt(attrs, start),
+            TokenKind::KwWhile => self.parse_while_stmt(attrs, start),
+            TokenKind::KwFor => self.parse_for_stmt(attrs, start),
+            TokenKind::KwLoop => self.parse_loop_stmt(attrs, start),
+            TokenKind::KwDefer => self.parse_defer_stmt(attrs, start),
+            TokenKind::KwNoYield => {
+                self.bump();
+                let body = self.parse_block()?;
+                let span = start.merge(body.span);
+                Ok(Stmt::with_attrs(attrs, StmtKind::NoYield { body }, span))
+            }
+            TokenKind::KwCritical => {
+                self.bump();
+                let body = self.parse_block()?;
+                let span = start.merge(body.span);
+                Ok(Stmt::with_attrs(attrs, StmtKind::Critical { body }, span))
+            }
+            TokenKind::KwSwitch => self.parse_switch_stmt(attrs, start),
+            TokenKind::Ident(ref s)
+                if s == "wait" && self.peek_n_kind(1) == TokenKind::LBrace =>
+            {
+                self.parse_wait_stmt(attrs, start)
+            }
+            _ => self.parse_non_block_stmt(attrs, start, cur_span, allow_tail_expr),
+        }
+    }
+
+    #[inline(never)]
+    fn parse_non_block_stmt(
+        &mut self,
+        attrs: Vec<Attr>,
+        start: Span,
+        cur_span: Span,
+        allow_tail_expr: bool,
+    ) -> Result<Stmt, ParseError> {
+        match self.peek_kind() {
+            // ── Foreign-idiom statement traps (`P0001`..`P0011`) ──
+            TokenKind::KwLet => Err(self.trap_p0001("let", cur_span)),
+            TokenKind::KwVar => Err(self.trap_p0001("var", cur_span)),
+            TokenKind::KwMut => Err(self.trap_p0001("mut", cur_span)),
+            TokenKind::KwAsync => Err(self.trap_p0003("async", cur_span)),
+            TokenKind::KwAwait => Err(self.trap_p0003("await", cur_span)),
+            TokenKind::KwSelect => Err(self.trap_p0004(cur_span)),
+            TokenKind::KwMatch => Err(self.trap_p0005(cur_span)),
+            TokenKind::KwTry => Err(self.trap_p0007("`try`", cur_span)),
+            TokenKind::KwStatic => Err(self.trap_p0010(cur_span)),
+            TokenKind::KwEvery => self.parse_bare_every_trap(),
+            TokenKind::KwPub => Err(self
+                .err_at(
+                    "`pub` visibility modifier is only allowed on top-level declarations, not inside blocks",
+                    cur_span,
+                )
+                .with_doc_topic("syntax")),
+            TokenKind::KwConst => Err(self
+                .err_at(
+                    "block-local `const` declarations are not supported; declare `const` items at module top level",
+                    cur_span,
+                )
+                .with_doc_topic("syntax")
+                .with_hint(
+                    "move `const Type NAME = ...;` to module top level, or omit `const` for a local variable (`Type name = ...;`)",
+                )),
+            TokenKind::Lifetime(ref lt) => Err(self.trap_p0009_lifetime(lt, cur_span)),
             TokenKind::KwReturn => {
                 let ret_tok = self.bump();
-                // Trap `return error.BadCrc;` (`P0007`)
                 if self.at(&TokenKind::KwError) {
                     let err_kw = self.bump();
                     return Err(self.trap_p0007(
@@ -2854,7 +2995,6 @@ impl<'a> Parser<'a> {
                         ret_tok.span.merge(err_kw.span),
                     ));
                 }
-                // Trap `return Err(...);` (`P0007`)
                 if matches!(self.peek_kind(), TokenKind::Ident(ref s) if s == "Err")
                     && self.peek_n_kind(1) == TokenKind::LParen
                 {
@@ -2906,30 +3046,6 @@ impl<'a> Parser<'a> {
                     start.merge(semi.span),
                 ))
             }
-            TokenKind::KwIf => self.parse_if_stmt(attrs, start),
-            TokenKind::KwWhile => self.parse_while_stmt(attrs, start),
-            TokenKind::KwFor => self.parse_for_stmt(attrs, start),
-            TokenKind::KwLoop => self.parse_loop_stmt(attrs, start),
-            TokenKind::KwEvery => self.parse_bare_every_trap(),
-            TokenKind::KwDefer => self.parse_defer_stmt(attrs, start),
-            TokenKind::KwNoYield => {
-                self.bump();
-                let body = self.parse_block()?;
-                let span = start.merge(body.span);
-                Ok(Stmt::with_attrs(attrs, StmtKind::NoYield { body }, span))
-            }
-            TokenKind::KwCritical => {
-                self.bump();
-                let body = self.parse_block()?;
-                let span = start.merge(body.span);
-                Ok(Stmt::with_attrs(attrs, StmtKind::Critical { body }, span))
-            }
-            TokenKind::KwSwitch => self.parse_switch_stmt(attrs, start),
-            TokenKind::Ident(ref s)
-                if s == "wait" && self.peek_n_kind(1) == TokenKind::LBrace =>
-            {
-                self.parse_wait_stmt(attrs, start)
-            }
             TokenKind::KwSpawn => self.parse_spawn_stmt(attrs, start),
             TokenKind::KwContinue => {
                 self.bump();
@@ -2975,14 +3091,12 @@ impl<'a> Parser<'a> {
                 ))
             }
             _ => {
-                // Trap `x: u16 = 42;` in statement position (`P0002` or `P0009`)
                 if matches!(self.peek_kind(), TokenKind::Ident(_))
                     && self.peek_n_kind(1) == TokenKind::Colon
                 {
                     let (_, _) = self.parse_field_or_param("variable declaration")?;
                 }
 
-                // Trap `!u16 x = ...;` or `ParseErr!u16 x = ...;` in statement position (`P0007`)
                 if self.at(&TokenKind::Bang) {
                     if let TokenKind::Ident(ref tname) = self.peek_n_kind(1) {
                         if PrimType::from_name(tname).is_some()
@@ -4005,6 +4119,29 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unary_expr(&mut self) -> Result<Expr, ParseError> {
+        let can_prefix = matches!(
+            self.peek_kind(),
+            TokenKind::KwTry
+                | TokenKind::KwAwait
+                | TokenKind::KwAsync
+                | TokenKind::KwMatch
+                | TokenKind::KwSelect
+                | TokenKind::Amp
+                | TokenKind::Star
+                | TokenKind::Bang
+                | TokenKind::Tilde
+                | TokenKind::Minus
+        ) || (self.at(&TokenKind::LParen) && self.peek_n_kind(1) != TokenKind::LParen);
+
+        if can_prefix {
+            self.parse_prefix_unary_or_trap()
+        } else {
+            self.parse_postfix_expr()
+        }
+    }
+
+    #[inline(never)]
+    fn parse_prefix_unary_or_trap(&mut self) -> Result<Expr, ParseError> {
         let start = self.peek_span();
 
         // Foreign-idiom traps in prefix/unary expression position:
@@ -4167,7 +4304,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_postfix_expr(&mut self) -> Result<Expr, ParseError> {
-        let mut expr = self.parse_primary_expr()?;
+        let expr = self.parse_primary_expr()?;
+        if matches!(
+            self.peek_kind(),
+            TokenKind::Arrow
+                | TokenKind::ColonColon
+                | TokenKind::Dot
+                | TokenKind::LParen
+                | TokenKind::LBracket
+                | TokenKind::KwCatch
+                | TokenKind::Question
+        ) {
+            self.parse_postfix_tail(expr)
+        } else {
+            Ok(expr)
+        }
+    }
+
+    #[inline(never)]
+    fn parse_postfix_tail(&mut self, mut expr: Expr) -> Result<Expr, ParseError> {
 
         loop {
             if self.at(&TokenKind::Arrow) {
@@ -4451,6 +4606,20 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
+        if self.at(&TokenKind::LParen) {
+            let open_span = self.bump().span;
+            let prev_allow = self.allow_struct_lit;
+            self.allow_struct_lit = true;
+            let inner = self.parse_expr()?;
+            self.allow_struct_lit = prev_allow;
+            let rp = self.expect(&TokenKind::RParen)?;
+            return Ok(Expr::new(inner.kind, open_span.merge(rp.span)));
+        }
+        self.parse_non_paren_primary_expr()
+    }
+
+    #[inline(never)]
+    fn parse_non_paren_primary_expr(&mut self) -> Result<Expr, ParseError> {
         let tok = self.peek_token();
         match tok.kind {
             TokenKind::Int { value, suffix } => {
@@ -4512,15 +4681,6 @@ impl<'a> Parser<'a> {
                         )
                         .with_doc_topic("tasks")),
                 }
-            }
-            TokenKind::LParen => {
-                self.bump();
-                let prev_allow = self.allow_struct_lit;
-                self.allow_struct_lit = true;
-                let inner = self.parse_expr()?;
-                self.allow_struct_lit = prev_allow;
-                let rp = self.expect(&TokenKind::RParen)?;
-                Ok(Expr::new(inner.kind, tok.span.merge(rp.span)))
             }
             TokenKind::LBracket => {
                 self.bump();

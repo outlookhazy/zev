@@ -633,9 +633,9 @@ impl ModuleLinker {
             (None, None) => return false,
         };
 
-        let parsed = match zev_parser::parse_str_named(&source, &file_display) {
-            Ok(p) => p,
-            Err(pe) => {
+        let (parsed, parse_errs) = zev_parser::parse_str_named_recovering(&source, &file_display);
+        if !parse_errs.is_empty() {
+            for pe in parse_errs {
                 let mut d = Diagnostic::new(
                     DiagnosticKind::ModuleError,
                     pe.span,
@@ -646,9 +646,9 @@ impl ModuleLinker {
                     d = d.with_note(hint);
                 }
                 self.diagnostics.push(d);
-                return false;
             }
-        };
+            return false;
+        }
 
         let desugared = desugar_inline_mmios(&parsed);
         let prefix = self.alloc_prefix(segments);

@@ -75,15 +75,17 @@ fn load_and_check_detailed_with_includes_and_targets(
 
     let mut loaded: Vec<(String, SourceFile, Program)> = Vec::with_capacity(source_files.len());
     let mut by_name: HashMap<String, usize> = HashMap::with_capacity(source_files.len());
+    let mut parse_humans: Vec<String> = Vec::new();
+    let mut parse_json_diags: Vec<JsonDiag> = Vec::new();
 
     for (display, _, sf) in source_files {
-        match zev_parser::parse_str_named(&sf.src, &display) {
-            Ok(prog) => {
-                let idx = loaded.len();
-                by_name.insert(display.clone(), idx);
-                loaded.push((display, sf, prog));
-            }
-            Err(pe) => {
+        let (prog, parse_errs) = zev_parser::parse_str_named_recovering(&sf.src, &display);
+        if parse_errs.is_empty() {
+            let idx = loaded.len();
+            by_name.insert(display.clone(), idx);
+            loaded.push((display, sf, prog));
+        } else {
+            for pe in parse_errs {
                 let (line, col) = sf.line_col(pe.span.start as usize);
                 let topic = pe.doc_topic.unwrap_or("syntax");
                 let doc_cmd = pe.doc_command();
@@ -94,7 +96,8 @@ fn load_and_check_detailed_with_includes_and_targets(
                     pe.hint.as_deref(),
                     Some(topic),
                 );
-                let json_diags = vec![JsonDiag {
+                parse_humans.push(human.trim_end().to_string());
+                parse_json_diags.push(JsonDiag {
                     code: pe.code.map(str::to_string),
                     file: display.clone(),
                     line,
@@ -102,13 +105,15 @@ fn load_and_check_detailed_with_includes_and_targets(
                     message: pe.message,
                     help: pe.hint,
                     doc_cmd,
-                }];
-                return Err(CheckFailure {
-                    human: human.trim_end().to_string(),
-                    json_diags,
                 });
             }
         }
+    }
+    if !parse_json_diags.is_empty() {
+        return Err(CheckFailure {
+            human: parse_humans.join("\n\n"),
+            json_diags: parse_json_diags,
+        });
     }
 
     let named_refs: Vec<(&Program, Option<&str>)> = loaded
@@ -3635,5 +3640,42 @@ fn main() {
         assert_eq!(json_res.exit_code, ExitCode::FAILURE);
         let json_out = json_res.stdout.expect("json check MIR error on stdout");
         assert!(json_out.contains("attach_shared"), "json={json_out}");
+    }
+
+    #[test]
+    fn cli_check_reports_multiple_parse_errors_across_items() {
+        let temp = TempWorkDir::create("zevc-multi-parse-err").unwrap();
+        let path = temp.dir.join("multi_bad.zev");
+        std::fs::write(
+            &path,
+            "\
+fn bad1() {
+    let x = 1;
+}
+
+task bad2() {
+    every 5ms { checkpoint(); }
+}
+
+u32 bad3(u32 x) {
+    return x;
+}
+",
+        )
+        .unwrap();
+
+        let plain_res = execute_check_command(std::slice::from_ref(&path), &[], None, None, false);
+        assert_eq!(plain_res.exit_code, ExitCode::FAILURE);
+        let stderr = plain_res.stderr.expect("human parse errors");
+        assert!(stderr.contains("P0001"), "stderr={stderr}");
+        assert!(stderr.contains("P0011"), "stderr={stderr}");
+        assert!(stderr.contains("P0018"), "stderr={stderr}");
+
+        let json_res = execute_check_command(std::slice::from_ref(&path), &[], None, None, true);
+        assert_eq!(json_res.exit_code, ExitCode::FAILURE);
+        let json = json_res.stdout.expect("json parse errors");
+        assert!(json.contains("\"code\": \"P0001\""), "json={json}");
+        assert!(json.contains("\"code\": \"P0011\""), "json={json}");
+        assert!(json.contains("\"code\": \"P0018\""), "json={json}");
     }
 }
