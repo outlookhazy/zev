@@ -308,29 +308,6 @@ impl Analyzer {
             }
         }
         self.evaluate_all_const_int_values();
-        for (item, file, prog_idx) in &all_items {
-            self.current_file = file.clone();
-            self.current_prog_idx = *prog_idx;
-            if let ItemKind::Const(c) = &item.kind {
-                if !self.is_compile_time_const_expr_with_shadowed(
-                    &c.value,
-                    &BTreeSet::new(),
-                    *prog_idx,
-                ) {
-                    self.emit(Diagnostic::new(
-                        DiagnosticKind::InvalidOperation,
-                        c.value.span,
-                        format!(
-                            "`const` '{}' initializer must be a compile-time constant expression",
-                            c.name.name
-                        ),
-                    ));
-                } else {
-                    self.validate_const_target_range(c);
-                }
-            }
-        }
-
         // Collect `mmio`, `irq`, OS primitives, illegal mutable globals, and callable signatures.
         for (item, file, prog_idx) in &all_items {
             self.current_file = file.clone();
@@ -349,6 +326,16 @@ impl Analyzer {
                 ItemKind::Task(t) => self.collect_task_sig(&item.attrs, t),
                 ItemKind::Isr(i) => self.collect_isr_sig(&item.attrs, i),
                 _ => {}
+            }
+        }
+
+        // Pass 1e: Type-check and validate `const` initializers once all function signatures
+        // are collected so `const` function pointers and dispatch tables can reference forward fns.
+        for (item, file, prog_idx) in &all_items {
+            self.current_file = file.clone();
+            self.current_prog_idx = *prog_idx;
+            if let ItemKind::Const(c) = &item.kind {
+                self.check_const_decl(c, *prog_idx);
             }
         }
 
@@ -578,6 +565,21 @@ impl Analyzer {
                     actual
                 ),
             ));
+        } else if matches!(
+            (actual, expected),
+            (
+                Ty::FnPtr { error_spec: ea, .. },
+                Ty::FnPtr { error_spec: eb, .. }
+            ) if ea != eb
+        ) || matches!(
+            (actual, expected),
+            (Ty::FnPtr { error_spec, .. }, Ty::Ptr(inner))
+                if inner.is_void() && error_spec.is_fallible()
+        ) {
+            self.emit(
+                Diagnostic::new(DiagnosticKind::ErrorSpecMismatch, span, default_msg())
+                    .with_note("function pointer error specifications must match exactly"),
+            );
         } else {
             self.emit(Diagnostic::new(default_kind, span, default_msg()));
         }
@@ -1210,6 +1212,26 @@ impl Analyzer {
             ExprKind::Literal(Literal::Int { value, .. }) => Some(*value),
             _ => None,
         };
+        self.consts.insert(
+            c.name.name.clone(),
+            ConstInfo {
+                name: c.name.name.clone(),
+                ty,
+                int_value,
+                span: c.span,
+            },
+        );
+    }
+
+    pub(super) fn check_const_decl(&mut self, c: &ConstDecl, prog_idx: usize) {
+        let Some(ty) = self
+            .consts
+            .get(&c.name.name)
+            .filter(|info| info.span == c.span)
+            .map(|info| info.ty.clone())
+        else {
+            return;
+        };
         let mut body_checker = BodyChecker::new(
             self,
             "<const>",
@@ -1220,28 +1242,32 @@ impl Analyzer {
             },
         );
         let val = body_checker.check_expr_infallible(&c.value);
-        if !val.ty.is_assignable_to(&ty) {
-            self.emit(Diagnostic::new(
-                DiagnosticKind::TypeMismatch,
-                c.value.span,
+        if body_checker.sema.check_assignable_or_emit(
+            &val.ty,
+            &ty,
+            c.value.span,
+            DiagnosticKind::TypeMismatch,
+            || {
                 format!(
                     "const '{}' expected initializer of type '{}', found '{}'",
                     c.name.name, ty, val.ty
+                )
+            },
+        ) {
+            body_checker.check_coerced_expr(&c.value, &ty);
+        }
+        if !self.is_compile_time_const_expr_with_shadowed(&c.value, &BTreeSet::new(), prog_idx) {
+            self.emit(Diagnostic::new(
+                DiagnosticKind::InvalidOperation,
+                c.value.span,
+                format!(
+                    "`const` '{}' initializer must be a compile-time constant expression",
+                    c.name.name
                 ),
             ));
         } else {
-            body_checker.check_coerced_expr(&c.value, &ty);
+            self.validate_const_target_range(c);
         }
-
-        self.consts.insert(
-            c.name.name.clone(),
-            ConstInfo {
-                name: c.name.name.clone(),
-                ty,
-                int_value,
-                span: c.span,
-            },
-        );
     }
 
     pub(super) fn evaluate_all_const_int_values(&mut self) {
@@ -2153,13 +2179,43 @@ impl Analyzer {
                 let elem = self.resolve_non_void_elem(inner);
                 Ty::Lease(Box::new(elem))
             }
-            TypeKind::FnPtr { params, ret } => {
+            TypeKind::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
                 let ps = params.iter().map(|p| self.resolve_type(p)).collect();
                 let r = self.resolve_type(ret);
+                let resolved_err = match error_spec.as_deref() {
+                    None => ResolvedErrorSpec::None,
+                    Some(ErrorSpec::Bare(_)) => ResolvedErrorSpec::Untyped,
+                    Some(ErrorSpec::Typed(err_ty_expr)) => {
+                        let err_ty = self.resolve_type(err_ty_expr);
+                        self.check_type_no_byval_mmio(
+                            &err_ty,
+                            err_ty_expr.span,
+                            "error specification of function pointer type",
+                        );
+                        self.check_disallowed_lease_type(
+                            &err_ty,
+                            err_ty_expr.span,
+                            "error specification of function pointer type",
+                            false,
+                        );
+                        if err_ty.is_void() {
+                            self.emit(Diagnostic::new(
+                                DiagnosticKind::ErrorSpecMismatch,
+                                err_ty_expr.span,
+                                "typed 'error' specification cannot use 'void'; use bare 'error' instead",
+                            ));
+                        }
+                        ResolvedErrorSpec::Typed(err_ty)
+                    }
+                };
                 Ty::FnPtr {
                     params: ps,
                     ret: Box::new(r),
-                    error_spec: Box::new(ResolvedErrorSpec::None),
+                    error_spec: Box::new(resolved_err),
                 }
             }
         }
@@ -4672,6 +4728,8 @@ impl Analyzer {
                         }
                     }
                     true
+                } else if self.functions.contains_key(&id.name) {
+                    true
                 } else {
                     self.visible_enums_for_variant(prog_idx, &id.name).len() == 1
                 }
@@ -4693,7 +4751,14 @@ impl Analyzer {
                 UnaryOp::Neg | UnaryOp::Not | UnaryOp::BitNot => {
                     self.is_const_expr_inner(inner, visiting, shadowed, prog_idx)
                 }
-                UnaryOp::AddrOf | UnaryOp::Deref => false,
+                UnaryOp::AddrOf => {
+                    matches!(
+                        &inner.kind,
+                        ExprKind::Ident(id)
+                            if !shadowed.contains(&id.name) && self.functions.contains_key(&id.name)
+                    )
+                }
+                UnaryOp::Deref => false,
             },
             ExprKind::Binary { lhs, rhs, .. } => {
                 self.is_const_expr_inner(lhs, visiting, shadowed, prog_idx)

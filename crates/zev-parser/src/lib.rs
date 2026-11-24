@@ -2969,4 +2969,78 @@ u32 broken_three(u32 v) {
             prog.items
         );
     }
+
+    #[test]
+    fn item3_parses_fallible_fn_ptr_types_in_declarators_and_signatures() {
+        let src = r#"
+enum Err { Bad }
+struct Cmd {
+    fn(u8) error run_bare;
+    fn(u8) -> u32 error Err run_typed;
+}
+const fn(u8) error BARE_CONST = a;
+const fn(u8) -> u16 error Err TYPED_CONST = b;
+fn take(fn(fn(u8) error) cb) -> fn() -> fn(u8) error Err {
+    [2]fn(u8) error tbl = [a, a];
+    fn(u8) error fp = a;
+    fn(u8) error Err fp_e = b;
+    return c;
+}
+"#;
+        let prog = parse_str(src).expect("fallible fn-ptr syntax must parse");
+        match &prog.items[1].kind {
+            ItemKind::Struct(st) => {
+                assert!(matches!(
+                    &st.fields[0].ty.kind,
+                    TypeKind::FnPtr { error_spec: Some(es), .. } if matches!(**es, ErrorSpec::Bare(_))
+                ));
+                assert!(matches!(
+                    &st.fields[1].ty.kind,
+                    TypeKind::FnPtr { error_spec: Some(es), .. } if matches!(**es, ErrorSpec::Typed(_))
+                ));
+            }
+            other => panic!("expected Struct, got {other:?}"),
+        }
+        match &prog.items[2].kind {
+            ItemKind::Const(c) => {
+                assert_eq!(c.name.name, "BARE_CONST");
+                assert!(matches!(
+                    &c.ty.kind,
+                    TypeKind::FnPtr { error_spec: Some(es), .. } if matches!(**es, ErrorSpec::Bare(_))
+                ));
+            }
+            other => panic!("expected Const, got {other:?}"),
+        }
+        match &prog.items[3].kind {
+            ItemKind::Const(c) => {
+                assert_eq!(c.name.name, "TYPED_CONST");
+                assert!(matches!(
+                    &c.ty.kind,
+                    TypeKind::FnPtr { error_spec: Some(es), .. } if matches!(**es, ErrorSpec::Typed(_))
+                ));
+            }
+            other => panic!("expected Const, got {other:?}"),
+        }
+        match &prog.items[4].kind {
+            ItemKind::Fn(f) => {
+                assert!(matches!(
+                    &f.params[0].ty.kind,
+                    TypeKind::FnPtr { params, error_spec: None, .. }
+                        if matches!(
+                            &params[0].kind,
+                            TypeKind::FnPtr { error_spec: Some(es), .. } if matches!(**es, ErrorSpec::Bare(_))
+                        )
+                ));
+                assert!(matches!(
+                    &f.ret_type.kind,
+                    TypeKind::FnPtr { ret, error_spec: None, .. }
+                        if matches!(
+                            &ret.kind,
+                            TypeKind::FnPtr { error_spec: Some(es), .. } if matches!(**es, ErrorSpec::Typed(_))
+                        )
+                ));
+            }
+            other => panic!("expected Fn, got {other:?}"),
+        }
+    }
 }

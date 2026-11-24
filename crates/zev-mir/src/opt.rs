@@ -17,10 +17,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use crate::ir::{
-    MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootStep, MirCallDst, MirExpr, MirExprKind,
-    MirFmtChunk, MirFnBody, MirFunction, MirIntrinsicOp, MirModule, MirPlace, MirPrimKind,
-    MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirStmt, MirStruct,
-    MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArmOp, MirYieldKind, VarId, VarRole,
+    MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootStep, MirCallDst, MirErrorSpec, MirExpr,
+    MirExprKind, MirFmtChunk, MirFnBody, MirFunction, MirIntrinsicOp, MirModule, MirPlace,
+    MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirStmt,
+    MirStruct, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArmOp, MirYieldKind, VarId,
+    VarRole,
 };
 
 /// Whole-program primitive contention, dead-watch, and singleton folding analysis report.
@@ -436,7 +437,7 @@ struct ScanAcc {
     referenced_subsystems: BTreeSet<String>,
     isr_contended_globals: BTreeSet<String>,
     isr_contended_prim_mangles: BTreeSet<String>,
-    isr_fnptr_sigs: Vec<(Vec<MirType>, MirType)>,
+    isr_fnptr_sigs: Vec<(Vec<MirType>, MirType, MirErrorSpec)>,
     isr_calls_real_extern_c: bool,
     sys_isr_callbacks: BTreeSet<String>,
 }
@@ -492,7 +493,7 @@ impl<'a> ScanCtx<'a> {
         if let MirExprKind::FnAddr(name) = &expr.kind {
             self.acc.sys_isr_callbacks.insert(name.clone());
         } else {
-            let sig = (params.to_vec(), ret.clone());
+            let sig = (params.to_vec(), ret.clone(), MirErrorSpec::None);
             if !self.acc.isr_fnptr_sigs.contains(&sig) {
                 self.acc.isr_fnptr_sigs.push(sig);
             }
@@ -516,11 +517,18 @@ impl<'a> ScanCtx<'a> {
                     .insert(format!("lease_release_{}", inner.mangle_name()));
                 self.record_prim_types_in_ty(inner, seen_structs);
             }
-            MirType::FnPtr { params, ret } => {
+            MirType::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
                 for p in params {
                     self.record_prim_types_in_ty(p, seen_structs);
                 }
                 self.record_prim_types_in_ty(ret, seen_structs);
+                if let Some(et) = error_spec.err_type() {
+                    self.record_prim_types_in_ty(&et, seen_structs);
+                }
             }
             MirType::Result { ok, err } => {
                 self.record_prim_types_in_ty(ok, seen_structs);
@@ -744,8 +752,12 @@ impl<'a> ScanCtx<'a> {
                             .rev()
                             .find(|v| v.name == *callee && matches!(v.ty, MirType::FnPtr { .. }))
                             .and_then(|v| match &v.ty {
-                                MirType::FnPtr { params, ret } => {
-                                    Some((params.clone(), (**ret).clone()))
+                                MirType::FnPtr {
+                                    params,
+                                    ret,
+                                    error_spec,
+                                } => {
+                                    Some((params.clone(), (**ret).clone(), (**error_spec).clone()))
                                 }
                                 _ => None,
                             })
@@ -1572,12 +1584,25 @@ impl<'a> ScanCtx<'a> {
     }
 }
 
-fn fnptr_sig_matches(func: &MirFunction, params: &[MirType], ret: &MirType) -> bool {
+fn fnptr_sig_matches(
+    func: &MirFunction,
+    params: &[MirType],
+    ret: &MirType,
+    error_spec: &MirErrorSpec,
+) -> bool {
     if func.is_yielding || func.params.len() != params.len() {
         return false;
     }
+    let expected_env = if error_spec.has_error() {
+        MirType::Result {
+            ok: Box::new(ret.clone()),
+            err: error_spec.err_type().map(Box::new),
+        }
+    } else {
+        ret.clone()
+    };
     let env_ret = func.envelope_return_type();
-    if env_ret != *ret && env_ret.host_value_type() != ret.host_value_type() {
+    if env_ret != expected_env && env_ret.host_value_type() != expected_env.host_value_type() {
         return false;
     }
     func.params.iter().zip(params.iter()).all(|(&vid, pty)| {
@@ -1634,13 +1659,13 @@ pub fn analyze_visibility(module: &MirModule) -> VisibilityReport {
          processed_fnptr_sigs: &mut usize,
          seeded_real_extern_c: &mut bool| {
             while *processed_fnptr_sigs < ctx.acc.isr_fnptr_sigs.len() {
-                let (params, ret) = &ctx.acc.isr_fnptr_sigs[*processed_fnptr_sigs];
+                let (params, ret, error_spec) = &ctx.acc.isr_fnptr_sigs[*processed_fnptr_sigs];
                 *processed_fnptr_sigs += 1;
                 for fname in &addr_taken_fns {
                     if !visited_isr_fns.contains(fname)
                         && fn_map
                             .get(fname.as_str())
-                            .is_some_and(|f| fnptr_sig_matches(f, params, ret))
+                            .is_some_and(|f| fnptr_sig_matches(f, params, ret, error_spec))
                     {
                         isr_queue.push_back(fname.clone());
                     }
@@ -7116,6 +7141,7 @@ mod tests {
         let fn_ptr_ty = MirType::FnPtr {
             params: vec![],
             ret: Box::new(MirType::Void),
+            error_spec: Box::new(MirErrorSpec::None),
         };
         mir.structs.push(MirStruct {
             name: "SerialPort".to_string(),
@@ -7315,6 +7341,7 @@ mod tests {
                             MirType::FnPtr {
                                 params: vec![port_ptr.clone()],
                                 ret: Box::new(MirType::Void),
+                                error_spec: Box::new(MirErrorSpec::None),
                             },
                         )),
                         MirStmt::Expr(MirExpr::new(
@@ -7675,10 +7702,12 @@ mod tests {
         let fn_void_ty = MirType::FnPtr {
             params: vec![MirType::U32],
             ret: Box::new(MirType::Void),
+            error_spec: Box::new(MirErrorSpec::None),
         };
         let fn_other_ty = MirType::FnPtr {
             params: vec![MirType::U8, MirType::U8],
             ret: Box::new(MirType::Void),
+            error_spec: Box::new(MirErrorSpec::None),
         };
 
         mir.primitives = vec![

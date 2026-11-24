@@ -2181,13 +2181,6 @@ impl<'a> BodyChecker<'a> {
                 ret,
                 error_spec,
             } => {
-                if error_spec.is_fallible() {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        callee.span,
-                        "indirect calls to fallible functions are not yet supported",
-                    ));
-                }
                 if args.len() != params.len() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -2237,7 +2230,14 @@ impl<'a> BodyChecker<'a> {
                         ctx: self.call_context(),
                     });
                 }
-                ExprVal::scalar(*ret, span)
+                ExprVal {
+                    ty: *ret,
+                    error_spec: *error_spec,
+                    prov: Provenance::pure_static(),
+                    endpoint_name: None,
+                    field_endpoints: BTreeMap::new(),
+                    span,
+                }
             }
             Ty::Error => {
                 for a in args {
@@ -2937,10 +2937,12 @@ impl<'a> BodyChecker<'a> {
                             );
                         }
                         if let Some(expected) = params.get(i) {
-                            if !av.ty.is_assignable_to(expected) {
-                                self.sema.emit(Diagnostic::new(
-                                    DiagnosticKind::TypeMismatch,
-                                    arg.span,
+                            if self.sema.check_assignable_or_emit(
+                                &av.ty,
+                                expected,
+                                arg.span,
+                                DiagnosticKind::TypeMismatch,
+                                || {
                                     format!(
                                         "argument {} to '{}.{}' has type '{}', expected '{}'",
                                         i + 1,
@@ -2948,9 +2950,9 @@ impl<'a> BodyChecker<'a> {
                                         method.name,
                                         av.ty,
                                         expected
-                                    ),
-                                ));
-                            } else {
+                                    )
+                                },
+                            ) {
                                 self.check_coerced_expr(&arg.value, expected);
                             }
                         }
@@ -2964,8 +2966,14 @@ impl<'a> BodyChecker<'a> {
                             ctx: self.call_context(),
                         });
                     }
-                    let _ = error_spec;
-                    return ExprVal::scalar(*ret, span);
+                    return ExprVal {
+                        ty: *ret,
+                        error_spec: *error_spec,
+                        prov: Provenance::pure_static(),
+                        endpoint_name: None,
+                        field_endpoints: BTreeMap::new(),
+                        span,
+                    };
                 }
 
                 self.sema.emit(Diagnostic::new(

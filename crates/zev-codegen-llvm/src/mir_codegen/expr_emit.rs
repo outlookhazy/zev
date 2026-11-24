@@ -435,6 +435,15 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirExprKind::ConstRef(name) => {
                 if let Some((sym, mir_ty)) = self.ctx.rodata_consts.get(name).cloned() {
                     Ok(self.load_from_place_ptr(&sym, &mir_ty, false))
+                } else if let Some(fname) = self.ctx.fnptr_consts.get(name) {
+                    let fn_ptr_ty = self.ctx.spec.isa.fn_ptr_llvm_ty();
+                    let sym = self
+                        .ctx
+                        .fn_sigs
+                        .get(fname)
+                        .map(|sig| sig.symbol.clone())
+                        .unwrap_or_else(|| format!("@{}", sanitize_ident(fname)));
+                    Ok(SsaVal::new(fn_ptr_ty, sym))
                 } else if expr.ty.is_float() || dst_lty == "float" || dst_lty == "double" {
                     let raw = self
                         .ctx
@@ -1970,21 +1979,43 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let call_kw = self.call_kw();
         // Indirect call through a local/parameter/temp `MirVar` of `MirType::FnPtr`
         if callee != "assert" {
-            if let Some((vid, params, ret)) = self.vars.iter().rev().find_map(|v| match &v.ty {
-                MirType::FnPtr { params, ret } if v.name == callee => {
-                    Some((v.id, params.clone(), (**ret).clone()))
-                }
-                _ => None,
-            }) {
+            if let Some((vid, params, ret, error_spec)) =
+                self.vars.iter().rev().find_map(|v| match &v.ty {
+                    MirType::FnPtr {
+                        params,
+                        ret,
+                        error_spec,
+                    } if v.name == callee => Some((
+                        v.id,
+                        params.clone(),
+                        (**ret).clone(),
+                        (**error_spec).clone(),
+                    )),
+                    _ => None,
+                })
+            {
                 let fp_ty = MirType::FnPtr {
                     params: params.clone(),
                     ret: Box::new(ret.clone()),
+                    error_spec: Box::new(error_spec.clone()),
                 };
                 let fp_addr = self.var_ptr(vid);
                 let fp_val = self.load_from_place_ptr(&fp_addr, &fp_ty, false);
                 let fn_ptr_ty = self.ctx.spec.isa.fn_ptr_llvm_ty();
                 let fp_ptr = self.coerce(fp_val, fn_ptr_ty, false);
-                let ret_lty = self.ctx.llvm_ty(&ret.host_value_type());
+                let env_mir = if error_spec.has_error() {
+                    MirType::Result {
+                        ok: Box::new(ret.clone()),
+                        err: error_spec.err_type().map(Box::new),
+                    }
+                } else {
+                    ret.clone()
+                };
+                let ret_lty = if env_mir.is_void() {
+                    "void".to_string()
+                } else {
+                    self.ctx.llvm_ty(&env_mir)
+                };
                 let mut call_args = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     let av = self.emit_expr(a)?;
@@ -1997,7 +2028,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     }
                 }
                 let joined = call_args.join(", ");
-                if ret.is_void() || ret_lty == "void" {
+                if env_mir.is_void() || ret_lty == "void" {
                     self.emit_line(format!("{call_kw} void {}({joined})", fp_ptr.repr));
                     return Ok(SsaVal::new("void", "0"));
                 } else {

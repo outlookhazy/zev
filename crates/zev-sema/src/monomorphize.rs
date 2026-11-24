@@ -1767,12 +1767,22 @@ impl<'a> Monomorphizer<'a> {
             TypeKind::Ptr(inner) => TypeKind::Ptr(Box::new(self.rewrite_type_expr(inner, env))),
             TypeKind::OsPrimitive(os) => TypeKind::OsPrimitive(self.rewrite_os_prim_type(os, env)),
             TypeKind::Lease(inner) => TypeKind::Lease(Box::new(self.rewrite_type_expr(inner, env))),
-            TypeKind::FnPtr { params, ret } => TypeKind::FnPtr {
+            TypeKind::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => TypeKind::FnPtr {
                 params: params
                     .iter()
                     .map(|p| self.rewrite_type_expr(p, env))
                     .collect(),
                 ret: Box::new(self.rewrite_type_expr(ret, env)),
+                error_spec: error_spec.as_ref().map(|es| {
+                    Box::new(match es.as_ref() {
+                        ErrorSpec::Bare(s) => ErrorSpec::Bare(*s),
+                        ErrorSpec::Typed(et) => ErrorSpec::Typed(self.rewrite_type_expr(et, env)),
+                    })
+                }),
             },
         };
         TypeExpr::new(kind, te.span)
@@ -1879,13 +1889,25 @@ impl<'a> Monomorphizer<'a> {
                 }
                 OsPrimitiveType::ByteRingUnsized => "byte_ring".to_string(),
             },
-            TypeKind::FnPtr { params, ret } => {
+            TypeKind::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
                 let ps: Vec<String> = params.iter().map(|p| self.format_mangled_type(p)).collect();
+                let es = match error_spec.as_deref() {
+                    None => String::new(),
+                    Some(ErrorSpec::Bare(_)) => "_E_bare".to_string(),
+                    Some(ErrorSpec::Typed(et)) => {
+                        format!("_E_{}", self.format_mangled_type(et))
+                    }
+                };
                 format!(
-                    "_F{}_{}_T_{}",
+                    "_F{}_{}_T_{}{}",
                     params.len(),
                     ps.join("__"),
-                    self.format_mangled_type(ret)
+                    self.format_mangled_type(ret),
+                    es
                 )
             }
             _ => mangle_type_expr(te),
@@ -1955,9 +1977,25 @@ impl<'a> Monomorphizer<'a> {
                 }
                 OsPrimitiveType::ByteRingUnsized => "byte_ring".to_string(),
             },
-            TypeKind::FnPtr { params, ret } => {
+            TypeKind::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
                 let ps: Vec<String> = params.iter().map(|p| self.format_human_type(p)).collect();
-                format!("fn({}) -> {}", ps.join(", "), self.format_human_type(ret))
+                let es = match error_spec.as_deref() {
+                    None => String::new(),
+                    Some(ErrorSpec::Bare(_)) => " error".to_string(),
+                    Some(ErrorSpec::Typed(et)) => {
+                        format!(" error {}", self.format_human_type(et))
+                    }
+                };
+                format!(
+                    "fn({}) -> {}{}",
+                    ps.join(", "),
+                    self.format_human_type(ret),
+                    es
+                )
             }
             TypeKind::Generic { base, .. } => base.name.clone(),
             TypeKind::GenericPath { path, .. } => path
@@ -5172,13 +5210,23 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             }
             OsPrimitiveType::ByteRingUnsized => "byte_ring".to_string(),
         },
-        TypeKind::FnPtr { params, ret } => {
+        TypeKind::FnPtr {
+            params,
+            ret,
+            error_spec,
+        } => {
             let ps: Vec<String> = params.iter().map(mangle_type_expr).collect();
+            let es = match error_spec.as_deref() {
+                None => String::new(),
+                Some(ErrorSpec::Bare(_)) => "_E_bare".to_string(),
+                Some(ErrorSpec::Typed(et)) => format!("_E_{}", mangle_type_expr(et)),
+            };
             format!(
-                "_F{}_{}_T_{}",
+                "_F{}_{}_T_{}{}",
                 params.len(),
                 ps.join("__"),
-                mangle_type_expr(ret)
+                mangle_type_expr(ret),
+                es
             )
         }
         TypeKind::Generic { base, args } => {
@@ -5286,11 +5334,18 @@ fn type_mentions_generic_param(te: &TypeExpr, gp_names: &BTreeSet<String>) -> bo
             | OsPrimitiveType::PingPong { elem, .. }
             | OsPrimitiveType::Pool { elem, .. } => type_mentions_generic_param(elem, gp_names),
         },
-        TypeKind::FnPtr { params, ret } => {
+        TypeKind::FnPtr {
+            params,
+            ret,
+            error_spec,
+        } => {
             params
                 .iter()
                 .any(|p| type_mentions_generic_param(p, gp_names))
                 || type_mentions_generic_param(ret, gp_names)
+                || error_spec
+                    .as_deref()
+                    .is_some_and(|es| matches!(es, ErrorSpec::Typed(et) if type_mentions_generic_param(et, gp_names)))
         }
     }
 }

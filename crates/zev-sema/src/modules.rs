@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use zev_ast::{
-    ArrayLen, Block, CallArg, CatchClause, CatchParam, Expr, ExprKind, FieldInit, FnDecl,
-    FormatPart, GenericArg, GenericParamKind, Ident, IsrDecl, Item, ItemKind, MmioDecl,
+    ArrayLen, Block, CallArg, CatchClause, CatchParam, ErrorSpec, Expr, ExprKind, FieldInit,
+    FnDecl, FormatPart, GenericArg, GenericParamKind, Ident, IsrDecl, Item, ItemKind, MmioDecl,
     MmioDeclKind, OsPrimitiveType, Param, Program, Span, SpawnStmt, Stmt, StmtKind, SwitchArm,
     SwitchPat, TaskDecl, TypeExpr, TypeKind, WaitArm, WaitTimerArm,
 };
@@ -1349,9 +1349,19 @@ impl<'a> AstRewriter<'a> {
             TypeKind::Ptr(inner) => TypeKind::Ptr(Box::new(self.rewrite_type(inner))),
             TypeKind::OsPrimitive(op) => TypeKind::OsPrimitive(self.rewrite_os_primitive(op)),
             TypeKind::Lease(inner) => TypeKind::Lease(Box::new(self.rewrite_type(inner))),
-            TypeKind::FnPtr { params, ret } => TypeKind::FnPtr {
+            TypeKind::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => TypeKind::FnPtr {
                 params: params.iter().map(|p| self.rewrite_type(p)).collect(),
                 ret: Box::new(self.rewrite_type(ret)),
+                error_spec: error_spec.as_ref().map(|es| {
+                    Box::new(match es.as_ref() {
+                        ErrorSpec::Bare(s) => ErrorSpec::Bare(*s),
+                        ErrorSpec::Typed(et) => ErrorSpec::Typed(self.rewrite_type(et)),
+                    })
+                }),
             },
         };
         TypeExpr::new(kind, span)
@@ -2072,11 +2082,26 @@ fn check_pub_surface_type(
                 rw,
             );
         }
-        TypeKind::FnPtr { params, ret } => {
+        TypeKind::FnPtr {
+            params,
+            ret,
+            error_spec,
+        } => {
             for p in params {
                 check_pub_surface_type(p, generic_type_params, local_type_is_pub, item_desc, rw);
             }
             check_pub_surface_type(ret, generic_type_params, local_type_is_pub, item_desc, rw);
+            if let Some(es) = error_spec {
+                if let ErrorSpec::Typed(et) = es.as_ref() {
+                    check_pub_surface_type(
+                        et,
+                        generic_type_params,
+                        local_type_is_pub,
+                        item_desc,
+                        rw,
+                    );
+                }
+            }
         }
     }
 }
@@ -2661,10 +2686,12 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
             TypeKind::FnPtr {
                 params: px,
                 ret: rx,
+                error_spec: ex,
             },
             TypeKind::FnPtr {
                 params: py,
                 ret: ry,
+                error_spec: ey,
             },
         ) => {
             px.len() == py.len()
@@ -2673,6 +2700,14 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
                     .zip(py.iter())
                     .all(|(l, r)| types_structurally_equal(l, r))
                 && types_structurally_equal(rx, ry)
+                && match (ex.as_deref(), ey.as_deref()) {
+                    (None, None) => true,
+                    (Some(ErrorSpec::Bare(_)), Some(ErrorSpec::Bare(_))) => true,
+                    (Some(ErrorSpec::Typed(a)), Some(ErrorSpec::Typed(b))) => {
+                        types_structurally_equal(a, b)
+                    }
+                    _ => false,
+                }
         }
         _ => a.kind == b.kind,
     }

@@ -4902,4 +4902,142 @@ fn main() {
             "busy_out={busy_out:?}"
         );
     }
+
+    #[test]
+    fn item3_const_fnptr_rodata_table_and_fallible_indirect_calls_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-item3-fnptr").unwrap();
+        let app_path = temp.dir.join("item3_app.zev");
+        let src = r#"
+import board;
+
+enum CmdErr {
+    BadArg,
+    Denied,
+}
+
+struct Ctx {
+    u32 acc;
+}
+
+struct Cmd {
+    []u8 name;
+    fn(*Ctx, u32) -> u32 error CmdErr run;
+}
+
+const fn(u32) -> u32 FWD_INC = forward_inc;
+const fn(u32) -> u32 FWD_INC_ADDR = &forward_inc;
+const fn(*Ctx, u32) -> u32 error CmdErr DIRECT_CMD = cmd_add;
+const [2]Cmd COMMANDS = [
+    Cmd { name: "add", run: cmd_add },
+    Cmd { name: "soft", run: cmd_soft_mul },
+];
+
+fn forward_inc(u32 x) -> u32 {
+    return x + 10u32;
+}
+
+fn cmd_add(*Ctx c, u32 v) -> u32 error CmdErr {
+    if (v == 0u32) {
+        error CmdErr.BadArg;
+    }
+    c.acc += v;
+    return c.acc;
+}
+
+fn cmd_soft_mul(*Ctx c, u32 v) -> u32 error CmdErr {
+    u32 i = 0u32;
+    while (i < v) {
+        c.acc += 2u32;
+        i += 1u32;
+    }
+    if (v == 99u32) {
+        error CmdErr.Denied;
+    }
+    return c.acc;
+}
+
+fn bare_check(u8 v) error {
+    if (v == 0u8) {
+        error;
+    }
+}
+
+fn main() {
+    board.init();
+    Ctx ctx = Ctx { acc: 0u32 };
+
+    u32 f1 = FWD_INC(5u32);
+    u32 f2 = FWD_INC_ADDR(6u32);
+    u32 f3 = DIRECT_CMD(&ctx, 7u32) or 999u32;
+    u32 f4 = COMMANDS[0].run(&ctx, 3u32) or 999u32;
+    u32 f5 = COMMANDS[1].run(&ctx, 4u32) or 999u32;
+
+    u32 err_code = 0u32;
+    u32 _bad = COMMANDS[0].run(&ctx, 0u32) catch (CmdErr e) {
+        if (e == CmdErr.BadArg) { err_code = 101u32; }
+        0u32
+    };
+    u32 denied_code = 0u32;
+    u32 _den = COMMANDS[1].run(&ctx, 99u32) catch (CmdErr e) {
+        if (e == CmdErr.Denied) { denied_code = 202u32; }
+        0u32
+    };
+
+    fn(u8) error bf = bare_check;
+    u32 bare_hit = 0u32;
+    bf(1u8) catch { bare_hit = 999u32; };
+    bf(0u8) catch { bare_hit = 303u32; };
+
+    println(
+        f"item3 f1={f1} f2={f2} f3={f3} f4={f4} f5={f5} e1={err_code} e2={denied_code} b={bare_hit}"
+    );
+    sys.exit(0);
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let expected = "item3 f1=15 f2=16 f3=7 f4=10 f5=18 e1=101 e2=202 b=303";
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "host failed: {stdout}");
+        assert!(stdout.contains(expected), "host stdout={stdout:?}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("item3_qemu.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout.contains(expected),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
 }
