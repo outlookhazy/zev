@@ -96,6 +96,26 @@ pub fn compile_and_run_host_llvm(
 }
 
 #[cfg(test)]
+pub fn compile_and_run_host_llvm_output(
+    ll_source: &str,
+    sanitize: bool,
+    run_args: &[String],
+) -> Result<(i32, String), String> {
+    let temp = TempWorkDir::create("zevc-run-out")?;
+    let bin_path = compile_host_llvm_binary(&temp, ll_source, sanitize)?;
+
+    let out = Command::new(&bin_path)
+        .args(run_args)
+        .output()
+        .map_err(|e| format!("failed to execute compiled simulation binary: {e}"))?;
+
+    Ok((
+        out.status.code().unwrap_or(1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
