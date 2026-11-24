@@ -14,7 +14,7 @@ pub mod opt;
 pub mod ram;
 
 pub use ir::*;
-pub use lower::{lower_program, lower_programs, MirLowerError};
+pub use lower::{lower_program, lower_programs, try_mir_expr_to_place, MirLowerError};
 pub use ram::{
     collect_dma_layout_structs, compute_ram_report, populate_module_ram_report, ArchRamTotals,
     ChildSlotRamInfo, DualSpecializedFnRam, FrameLayoutReport, PrimitiveRam, RamReport, SizeAlign,

@@ -1230,6 +1230,7 @@ mod coroutine;
 mod direct;
 mod effects;
 mod exprs;
+pub use exprs::try_mir_expr_to_place;
 mod scopes;
 
 pub(in crate::lower) use coroutine::*;

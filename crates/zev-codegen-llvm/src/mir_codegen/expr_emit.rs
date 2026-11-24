@@ -262,6 +262,17 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
                 let iv = self.emit_expr(index)?;
                 let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
+                // This element is itself indexed or projected by the caller, so its own index
+                // is checked here; the caller only checks the outermost one.
+                if let MirType::Array { len, .. } = &bty {
+                    if *len == 0 {
+                        self.emit_bounds_check("false", 1);
+                    } else {
+                        let inb = self.next_tmp();
+                        self.emit_line(format!("{inb} = icmp ult {usize_ty} {}, {len}", ic.repr));
+                        self.emit_bounds_check(&inb, 1);
+                    }
+                }
                 let blty = self.ctx.llvm_ty(&bty);
                 let ep = self.next_tmp();
                 self.emit_line(format!(
@@ -837,13 +848,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 raw_elem_ty,
                 is_slice,
             } => {
+                // Operands evaluate left to right (base, then index), matching indexed writes.
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
-                let iv = self.emit_expr(index)?;
-                let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
                 let ety = self.ctx.llvm_ty(raw_elem_ty);
                 if *is_slice {
                     let sl_ty = format!("{{ ptr, {usize_ty} }}");
                     let bv = self.emit_expr(base)?;
+                    let iv = self.emit_expr(index)?;
+                    let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
                     let dp = self.next_tmp();
                     let sl_len = self.next_tmp();
                     let inb = self.next_tmp();
@@ -857,8 +869,34 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         ic.repr
                     ));
                     Ok(self.load_from_place_ptr(&ep, raw_elem_ty, false))
-                } else if let Some((bp, bty, packed)) = self.try_emit_rodata_const_ptr(base)? {
-                    if let MirType::Array { len, .. } = &bty {
+                } else {
+                    // Address the array where it already lives (`.rodata`, a local, a frame slot,
+                    // or behind a pointer) and load only the element. Copying the array into a
+                    // temporary is the fallback for a base that names no storage, such as a call
+                    // result: a by-value array load costs code and stack proportional to its
+                    // length at every read.
+                    let (bp, aty, packed) =
+                        if let Some(found) = self.try_emit_rodata_const_ptr(base)? {
+                            found
+                        } else if let Some(place) = zev_mir::try_mir_expr_to_place(base) {
+                            self.emit_place_ptr(&place)?
+                        } else {
+                            let bv = self.emit_expr(base)?;
+                            let (tmp, al) = self.emit_temp_alloca(&bv.ty);
+                            self.emit_line(format!(
+                                "store {} {}, ptr {tmp}, align {al}",
+                                bv.ty, bv.repr
+                            ));
+                            (tmp, base.ty.clone(), false)
+                        };
+                    let aty = if matches!(aty, MirType::Array { .. }) {
+                        aty
+                    } else {
+                        base.ty.clone()
+                    };
+                    let iv = self.emit_expr(index)?;
+                    let ic = self.coerce(iv, &usize_ty, !index.ty.is_unsigned());
+                    if let MirType::Array { len, .. } = &aty {
                         if *len == 0 {
                             self.emit_bounds_check("false", 1);
                         } else {
@@ -870,38 +908,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             self.emit_bounds_check(&inb, 1);
                         }
                     }
-                    let blty = self.ctx.llvm_ty(&bty);
+                    let alty = self.ctx.llvm_ty(&aty);
                     let ep = self.next_tmp();
                     self.emit_line(format!(
-                        "{ep} = getelementptr inbounds {blty}, ptr {bp}, {usize_ty} 0, {usize_ty} {}",
+                        "{ep} = getelementptr inbounds {alty}, ptr {bp}, {usize_ty} 0, {usize_ty} {}",
                         ic.repr
                     ));
                     Ok(self.load_from_place_ptr(&ep, raw_elem_ty, packed))
-                } else {
-                    if let MirType::Array { len, .. } = &base.ty {
-                        if *len == 0 {
-                            self.emit_bounds_check("false", 1);
-                        } else {
-                            let inb = self.next_tmp();
-                            self.emit_line(format!(
-                                "{inb} = icmp ult {usize_ty} {}, {len}",
-                                ic.repr
-                            ));
-                            self.emit_bounds_check(&inb, 1);
-                        }
-                    }
-                    let bv = self.emit_expr(base)?;
-                    let (tmp, al) = self.emit_temp_alloca(&bv.ty);
-                    let ep = self.next_tmp();
-                    self.emit_line(format!(
-                        "store {} {}, ptr {tmp}, align {al}",
-                        bv.ty, bv.repr
-                    ));
-                    self.emit_line(format!(
-                        "{ep} = getelementptr inbounds {}, ptr {tmp}, {usize_ty} 0, {usize_ty} {}",
-                        bv.ty, ic.repr
-                    ));
-                    Ok(self.load_from_place_ptr(&ep, raw_elem_ty, false))
                 }
             }
             MirExprKind::SubSlice {
@@ -941,6 +954,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                                 "{gp} = getelementptr inbounds {aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
                             ));
                         gp
+                    } else if let Some(place) = zev_mir::try_mir_expr_to_place(base) {
+                        self.emit_place_ptr(&place)?.0
                     } else {
                         let bv = self.emit_expr(base)?;
                         let (tmp, al) = self.emit_temp_alloca(&bv.ty);
@@ -2545,6 +2560,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         "{gp} = getelementptr inbounds {ro_aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
                     ));
                     gp
+                } else if let Some(place) = zev_mir::try_mir_expr_to_place(side) {
+                    self.emit_place_ptr(&place)?.0
                 } else {
                     let bv = self.emit_expr(side)?;
                     let (tmp, al) = self.emit_temp_alloca(&bv.ty);

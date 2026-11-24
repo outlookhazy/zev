@@ -819,7 +819,10 @@ fn unwrap_result_var_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
     expr
 }
 
-pub(super) fn try_mir_expr_to_place(expr: &MirExpr) -> Option<MirPlace> {
+/// The storage an rvalue names, when it names storage at all (a variable, a pointer dereference,
+/// or a field/element chain rooted at one). Backends use this to read a field or element in place
+/// instead of first loading the whole enclosing aggregate.
+pub fn try_mir_expr_to_place(expr: &MirExpr) -> Option<MirPlace> {
     match &expr.kind {
         MirExprKind::Var(vid) => Some(MirPlace::Var(*vid)),
         MirExprKind::Unary {
