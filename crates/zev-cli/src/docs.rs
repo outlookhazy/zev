@@ -119,9 +119,14 @@ read-only slicing (`LUT_DUTY[0..2]`); taking `&CONST.field` or calling a `*self`
 value is rejected at compile time.
 
 ## 3. Same-Module `impl` Blocks, `Ret name(...)` Signatures & `<T, usize N>` Generics
-- Value-returning functions/methods put the return type first; `fn` is `void`. User `struct`s and `fn`s
-  support compile-time monomorphized `<T>` and `<T, usize N>` parameters (`zevc ram` and `zevc check --json`
-  report concrete Flash instantiations; `E0029` on misuse):
+- User `struct`s and `fn`s support compile-time monomorphized `<T>` and `<T, usize N>` parameters (`zevc ram`
+  and `zevc check --json` report concrete Flash instantiations; `E0029` on misuse).
+- `<...>` disambiguation is purely syntactic: after `ident` or `module.ident` in expression position, `<...>`
+  parses as generic arguments only when immediately followed by `(` or `{` (where struct literals are allowed);
+  otherwise it parses as `<` comparison (parenthesize multi-arg comparisons such as `f((a < b), (c > (d)))`).
+  Constant-generic arguments in expression position accept literals (`4`, `true`), identifiers (`N`), or
+  parenthesized expressions (`(N + 1)`); type position accepts full constant expressions (`[N + 1]T`,
+  `FixedVec<u32, N + 1>`). At statement start, `Name<...> ident` is always a variable declaration.
 - Same-module `impl` blocks attach methods (including partial specializations like `impl<usize N> FixedVec<f32, N>`)
   to types declared in the same file (`pub` goes on individual methods, never `pub impl`):
   - `self`: pass-by-value receiver (valid on both variables and `.rodata` `const` descriptors)

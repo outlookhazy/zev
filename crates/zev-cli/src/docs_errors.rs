@@ -400,9 +400,9 @@ fn main() {
     },
     ErrorDoc {
         code: "P0016",
-        summary: "Retired `::` path separator used instead of `.`",
+        summary: "Retired `::` path separator or `::<...>` turbofish",
         topic: "syntax",
-        why: "Zev uses `.` uniformly for module paths (`mod.Item`), enum variants (`Mode.Active` or unqualified `Active`), and type names (`mod.Packet`). Double-colon `::` path syntax is trapped and rejected.",
+        why: "Zev uses `.` uniformly for module paths (`mod.Item`), enum variants (`Mode.Active` or unqualified `Active`), and type names (`mod.Packet`), and uses plain `<...>` for generic arguments (`clamp<f32>(...)`). Double-colon `::` path and `::<...>` turbofish syntax are trapped and rejected.",
         bad_zev: "\
 enum Mode { Idle, Active }
 fn main() {

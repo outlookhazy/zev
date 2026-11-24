@@ -31,9 +31,8 @@ pub use model::{
     SemanticModel, SpawnedTaskInstance, SubsystemInfo, TaskInfo,
 };
 pub use modules::{
-    LinkedModulesOutput, collect_import_aware_generic_names,
-    collect_import_aware_generic_names_with_hal, collect_import_aware_generic_names_with_targets,
-    load_and_link_modules, load_and_link_modules_with_hal, load_and_link_modules_with_targets,
+    LinkedModulesOutput, load_and_link_modules, load_and_link_modules_with_hal,
+    load_and_link_modules_with_targets,
 };
 pub use monomorphize::{
     MAX_GENERIC_DEPTH, MAX_MONOMORPHIZED_INSTANCES, MonomorphizeOutput, mangle_type_expr,

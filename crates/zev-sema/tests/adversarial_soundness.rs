@@ -11,8 +11,7 @@ fn check_src(src: &str) -> Result<SemanticModel, Vec<Diagnostic>> {
 }
 
 fn check_mono_src(src: &str) -> Result<SemanticModel, Vec<Diagnostic>> {
-    let generics = zev_parser::collect_declared_generic_names(src);
-    let prog = zev_parser::parse_str_named_with_generics(src, "<adversarial>", Some(&generics))
+    let prog = zev_parser::parse_str_named(src, "<adversarial>")
         .unwrap_or_else(|e| panic!("test source failed to parse:\n{:?}\n---\n{}", e, src));
     analyze_and_monomorphize_programs(&[prog], &AnalyzeOptions::default())
         .into_result()

@@ -11,7 +11,6 @@ mod lexer;
 mod parser;
 mod token;
 
-use std::collections::BTreeSet;
 use std::path::Path;
 
 pub use error::ParseError;
@@ -24,20 +23,6 @@ pub fn lex(source: &str) -> Result<Vec<Token>, ParseError> {
     lexer::lex(source, None)
 }
 
-/// Pre-scan `.zev` source text at brace-depth `0` and return all top-level generic `struct` and
-/// `fn` names declared in `src`.
-pub fn collect_declared_generic_names(src: &str) -> BTreeSet<String> {
-    let tokens = lexer::lex_prefix_best_effort(src);
-    parser::Parser::collect_declared_generics(src, tokens)
-}
-
-/// Pre-scan `.zev` source text at brace-depth `0` and return all `pub` top-level generic `struct`
-/// and `fn` names declared in `src`.
-pub fn collect_pub_declared_generic_names(src: &str) -> BTreeSet<String> {
-    let tokens = lexer::lex_prefix_best_effort(src);
-    parser::Parser::collect_pub_declared_generics(src, tokens)
-}
-
 /// Parse an in-memory `.zev` source string into a [`Program`].
 pub fn parse_str(source: &str) -> Result<Program, ParseError> {
     parse_str_named(source, "<input>")
@@ -48,20 +33,6 @@ pub fn parse_str_named(source: &str, filename: &str) -> Result<Program, ParseErr
     let tokens = lexer::lex(source, Some(filename))?;
     let mut parser = parser::Parser::new(source, Some(filename), tokens);
     parser.parse_program()
-}
-
-/// Parse an in-memory `.zev` source string with an optional whole-program set of declared generic
-/// `struct` / `fn` names (used to disambiguate bare `f<T>(...)` calls from multi-argument `<` / `>`
-/// relational comparisons across multi-file builds).
-pub fn parse_str_named_with_generics(
-    src: &str,
-    file_name: &str,
-    known_generics: Option<&BTreeSet<String>>,
-) -> Result<Program, Vec<ParseError>> {
-    let tokens = lexer::lex(src, Some(file_name)).map_err(|e| vec![e])?;
-    let mut parser =
-        parser::Parser::new_with_generics(src, Some(file_name), tokens, known_generics);
-    parser.parse_program().map_err(|e| vec![e])
 }
 
 /// Read and parse a `.zev` source file from disk.
@@ -983,8 +954,23 @@ mod tests {
             "use `.`",
         );
 
-        // P0016: `::` module/enum/path/import/spawn/switch separator (keeping `::<` until turbofish item)
+        // P0016: `::` module/enum/path/import/spawn/switch separator and `::<...>` turbofish
         assert_trap("import hal::gpio;", "P0016", "use `.`");
+        assert_trap(
+            "fn f() { f32 x = clamp::<f32>(1.0, 0.0, 2.0); }",
+            "P0016",
+            "clamp<f32>",
+        );
+        assert_trap(
+            "fn f() { f32 x = mod.clamp::<f32>(1.0, 0.0, 2.0); }",
+            "P0016",
+            "clamp<f32>",
+        );
+        assert_trap(
+            "fn f() { FixedVec<u32, 4> x = FixedVec::<u32, 4> { data: [1, 2, 3, 4], len: 4 }; }",
+            "P0016",
+            "FixedVec<u32, 4>",
+        );
         assert_trap(
             "enum Mode { Idle, Active }\nfn f() { Mode m = Mode::Idle; }",
             "P0016",
@@ -1552,7 +1538,7 @@ pub import chip.stm32f3.{rcc, tim};
                 };
 
                 f32 c1 = clamp<f32>(1.5, 0.0, 1.0);
-                f32 c2 = clamp::<f32>(-0.5, 0.0, 1.0);
+                f32 c2 = clamp<f32>(-0.5, 0.0, 1.0);
                 reset_vec<u32, 4>(&v);
 
                 // Ensure `<`, `>`, `&&`, and `>>` comparisons NEVER collide with generic lookahead!
@@ -1605,7 +1591,7 @@ pub import chip.stm32f3.{rcc, tim};
             other => panic!("expected generic Fn clamp, got {other:?}"),
         }
 
-        // 3. Verify `main` statements: `[16]u8`, `FixedVec<u32, 4> { ... }`, `Boxed<Boxed<u32>>`, `clamp<f32>`, `clamp::<f32>`, `x < y && (z > 0)`
+        // 3. Verify `main` statements: `[16]u8`, `FixedVec<u32, 4> { ... }`, `Boxed<Boxed<u32>>`, `clamp<f32>`, `x < y && (z > 0)`
         let main_fn = match &prog.items[4].kind {
             ItemKind::Fn(f) => f,
             other => panic!("expected main Fn, got {other:?}"),
@@ -1651,7 +1637,7 @@ pub import chip.stm32f3.{rcc, tim};
             other => panic!("expected Boxed<Boxed<u32>> VarDecl, got {other:?}"),
         }
 
-        // `clamp<f32>(...)` & `clamp::<f32>(...)`
+        // `clamp<f32>(...)` calls
         for idx in [5, 6] {
             match &stmts[idx].kind {
                 StmtKind::VarDecl {
@@ -1877,20 +1863,6 @@ fn main() {
 
     #[test]
     fn review_r1_generic_calls_never_hijack_multi_arg_relational_comparisons() {
-        let lib_src = r#"
-struct Pair {
-    u32 a;
-    u32 b;
-}
-
-struct FixedVec<T, usize N> {
-    [N]T data;
-}
-
-T clamp<T>(T val, T lo, T hi) {
-    return val;
-}
-"#;
         let app_src = r#"
 import math.dsp as dsp;
 
@@ -1907,31 +1879,29 @@ fn main() {
     u32 d = 4;
     Pair s = Pair { a: 3, b: 10 };
 
-    // 1. Multi-arg comparisons with parenthesized RHS after `>` MUST parse as 2 boolean args!
-    check_window(a < b, c > (d + 1));
-    check_window(GLOBAL_LO < b, c > (d + 1));
-    check_window(s.a < b, c > (d + 1));
-    [2]bool flags = [a < 10, c > (d + 1)];
+    // 1. Unambiguous comparisons (after `>` is NOT `(` or allowed `{`, or parenthesized, or binary rhs):
+    check_window(a < b, c > d + 1);
+    check_window((GLOBAL_LO < b), (c > (d + 1)));
+    check_window(s.a < b, c > d + 1);
+    [2]bool flags = [(a < 10), (c > (d + 1))];
+    [2]bool flags2 = [a < 10, c > d + 1];
 
-    // 2. Real generic calls (local/cross-file `clamp<f32>`, module alias `dsp.clamp<f32>`, turbofish `::<f32>`) still parse!
+    // 2. Real generic calls (`clamp<f32>`, `dsp.clamp<f32>`, parenthesized const expr):
     f32 x1 = clamp<f32>(1.5f32, 0.0f32, 2.0f32);
-    f32 x2 = clamp::<f32>(x1, 0.0f32, 1.0f32);
-    f32 x3 = dsp.clamp<f32>(x2, 0.0f32, 1.0f32);
+    f32 x2 = dsp.clamp<f32>(x1, 0.0f32, 1.0f32);
 
-    // 3. Undeclared value identifier `unk < b, c > (d + 1)` also skips speculation when `known_generics` is supplied!
-    check_window(unk < b, c > (d + 1));
-    println(f"{flags[0]} {x3}");
+    // 3. Control-flow headers disallow `{` struct literals, so `if x < y { ... }` never hijacks `{`:
+    if a < b {
+        a += 1;
+    }
+
+    // 4. `f(a < b, c > (d + 1))` syntactically commits as a generic call `a<b, c>(d + 1)`
+    //    (rejected in sema with the parenthesization help):
+    check_window(a < b, c > (d + 1));
+    println(f"{flags[0]} {flags2[0]} {x2}");
 }
 "#;
-        let mut generics = collect_declared_generic_names(lib_src);
-        generics.extend(collect_declared_generic_names(app_src));
-        assert!(generics.contains("FixedVec"));
-        assert!(generics.contains("clamp"));
-        assert!(!generics.contains("Pair"));
-        assert!(!generics.contains("check_window"));
-
-        let prog = parse_str_named_with_generics(app_src, "app.zev", Some(&generics))
-            .expect("parse app.zev with known_generics");
+        let prog = parse_str_named(app_src, "app.zev").expect("pure syntactic parse app.zev");
 
         let main_fn = prog
             .items
@@ -1943,33 +1913,37 @@ fn main() {
             .unwrap();
         let stmts = &main_fn.body.as_ref().unwrap().stmts;
 
-        // Verify `check_window(a < b, c > (d + 1))`, `check_window(GLOBAL_LO < b, ...)`, and `check_window(s.a < b, ...)`
-        // each parsed with `args.len() == 2`!
-        for idx in [5usize, 6, 7, 12] {
+        // Verify comparisons in `check_window(...)` remain 2-arg calls:
+        for idx in [5usize, 6, 7] {
             match &stmts[idx].kind {
                 StmtKind::Expr(Expr {
-                    kind: ExprKind::Call { args, .. },
+                    kind: ExprKind::Call { args, generic_args, .. },
                     ..
-                }) => assert_eq!(args.len(), 2, "stmt {idx} should have 2 comparison args"),
+                }) => {
+                    assert!(generic_args.is_empty());
+                    assert_eq!(args.len(), 2, "stmt {idx} should have 2 comparison args");
+                }
                 other => panic!("expected 2-arg Call at stmt {idx}, got {other:?}"),
             }
         }
 
-        // Verify `[a < 10, c > (d + 1)]` parsed as 2-element `ArrayLit`
-        match &stmts[8].kind {
-            StmtKind::VarDecl {
-                init:
-                    Some(Expr {
-                        kind: ExprKind::ArrayLit(elems),
-                        ..
-                    }),
-                ..
-            } => assert_eq!(elems.len(), 2),
-            other => panic!("expected 2-element ArrayLit, got {other:?}"),
+        // Verify `[ (a < 10), (c > (d + 1)) ]` and `[a < 10, c > d + 1]` parsed as 2-element `ArrayLit`
+        for idx in [8usize, 9] {
+            match &stmts[idx].kind {
+                StmtKind::VarDecl {
+                    init:
+                        Some(Expr {
+                            kind: ExprKind::ArrayLit(elems),
+                            ..
+                        }),
+                    ..
+                } => assert_eq!(elems.len(), 2, "stmt {idx} should have 2 array elements"),
+                other => panic!("expected 2-element ArrayLit at stmt {idx}, got {other:?}"),
+            }
         }
 
-        // Verify `clamp<f32>`, `clamp::<f32>`, and `dsp.clamp<f32>` parsed with 1 generic arg & 3 call args
-        for idx in [9usize, 10, 11] {
+        // Verify `clamp<f32>` and `dsp.clamp<f32>` parsed with 1 generic arg & 3 call args
+        for idx in [10usize, 11] {
             match &stmts[idx].kind {
                 StmtKind::VarDecl {
                     init:
@@ -1987,6 +1961,30 @@ fn main() {
                 }
                 other => panic!("expected generic Call at stmt {idx}, got {other:?}"),
             }
+        }
+
+        // Verify `if a < b { ... }` kept `a < b` as Binary comparison
+        assert!(matches!(
+            &stmts[12].kind,
+            StmtKind::If {
+                cond: Expr { kind: ExprKind::Binary { op: BinaryOp::Lt, .. }, .. },
+                ..
+            }
+        ));
+
+        // Verify `check_window(a < b, c > (d + 1))` syntactically parsed its inner arg as `a<b, c>(d + 1)`
+        match &stmts[13].kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { args, .. },
+                ..
+            }) => {
+                assert_eq!(args.len(), 1);
+                assert!(matches!(
+                    &args[0].value.kind,
+                    ExprKind::Call { generic_args, .. } if generic_args.len() == 2
+                ));
+            }
+            other => panic!("expected Call wrapping syntactic a<b, c>(d + 1), got {other:?}"),
         }
     }
 
@@ -2173,7 +2171,7 @@ fn main() {
     let_free: {
         drv.Config c = drv.Config { baud: 115200, .stop_bits = 1 };
         drv.Box<u32, 4> b1 = drv.Box<u32, 4> { val: 7 };
-        drv.Box<u32, 4> b2 = drv.Box::<u32, 4> { val: 8 };
+        drv.Box<u32, 4> b2 = drv.Box<u32, (2 + 2)> { val: 8 };
         if (b1.val < b2.val) {
             spawn drv.worker(c.baud) @high;
         }
@@ -2316,7 +2314,8 @@ fn take2(bool x, bool y) {}
 fn main() {
     u32 b = 2;
     u32 d = 3;
-    take2(m.A < b, m.C > (d + 1));
+    take2((m.A < b), (m.C > (d + 1)));
+    take2(m.A < b, m.C > d + 1);
 
     u32 k = 0;
     switch (k) {
@@ -2336,11 +2335,13 @@ fn main() {
             })
             .unwrap();
         let stmts = &main_fn.body.as_ref().unwrap().stmts;
-        assert!(matches!(
-            &stmts[2].kind,
-            StmtKind::Expr(Expr { kind: ExprKind::Call { args, .. }, .. }) if args.len() == 2
-        ));
-        if let StmtKind::Switch { arms, .. } = &stmts[4].kind {
+        for idx in [2usize, 3] {
+            assert!(matches!(
+                &stmts[idx].kind,
+                StmtKind::Expr(Expr { kind: ExprKind::Call { args, .. }, .. }) if args.len() == 2
+            ));
+        }
+        if let StmtKind::Switch { arms, .. } = &stmts[5].kind {
             assert!(matches!(
                 &arms[0].pat,
                 SwitchPat::Qualified { path, .. }
@@ -2452,35 +2453,11 @@ fn main() {
 
     #[test]
     fn regression_s_m6_scoped_generics_and_non_usize_top_level_values() {
-        let mod_src = r#"
-pub struct Box<T, usize N> {
-    [N]T data;
-}
-
-pub T clamp<T>(T x, T lo, T hi) {
-    return x;
-}
-
-T private_gen<T>(T x) {
-    return x;
-}
-"#;
-        let pub_gens = collect_pub_declared_generic_names(mod_src);
-        assert!(pub_gens.contains("Box"));
-        assert!(pub_gens.contains("clamp"));
-        assert!(!pub_gens.contains("private_gen"));
-
         let app_src = r#"
 import math.mod as m;
 
 const u32 HI = 10;
 const usize CAP = 4;
-mmio Regs {
-    @rw u32 cr @ 0x00;
-}
-mmio REGS : Regs @ 0x4000_0000;
-irq IRQ0 = 5;
-watch<u32> FLAG = 0;
 
 struct FixedVec<T, usize N> {
     [N]T items;
@@ -2491,7 +2468,7 @@ struct Holder {
 }
 
 FixedVec<u32, N + 1> grow_n<usize N>(FixedVec<u32, N> v) {
-    return FixedVec<u32, N + 1> { items: [0] };
+    return FixedVec<u32, (N + 1)> { items: [0] };
 }
 
 fn check_pair(bool a, bool b) {
@@ -2499,34 +2476,25 @@ fn check_pair(bool a, bool b) {
 }
 
 fn use_n<usize N>(u32 cmp, FixedVec<u32, N> v) {
-    // Generic type/fn instantiations with usize CAP and N + 1 must parse as generic args:
+    // Generic type/fn instantiations with usize CAP, (N + 1), and local Name<T> var decls:
     FixedVec<u32, CAP> fixed = FixedVec<u32, CAP> { items: [1, 2, 3, 4] };
     FixedVec<u32, N + 1> grown = grow_n<N>(v);
     u32 c = m.clamp<u32>(cmp, 0, HI);
+    m.Pair<u8, u16> mod_var;
 
-    // Module-scoped `m.clamp` must NOT hijack `b.clamp < 2, HI > (0)`:
+    // Parenthesized comparisons remain two arguments; unparenthesized binary `+` inside `<...>`
+    // in expression position restores as comparisons!
     Holder b = Holder { clamp: 1 };
-    check_pair(b.clamp < 2, HI > (0));
-
-    // Non-usize top-level `const` / `mmio` / `irq` / `OsPrimitive` must NOT trigger generic speculation
-    // even when LHS `unk` is undeclared:
-    check_pair(unk < HI, c > (0));
-    check_pair(unk < REGS, c > (0));
-    check_pair(unk < IRQ0, c > (0));
-    check_pair(unk < FLAG, c > (0));
-    println(f"{fixed.items[0]} {grown.items[0]}");
+    check_pair((b.clamp < 2), (HI > (0)));
+    check_pair(b.clamp < 2 + 1, HI > (0));
+    if cmp < HI {
+        c = 1;
+    }
+    println(f"{fixed.items[0]} {grown.items[0]} {c} {mod_var}");
 }
 "#;
-        // Also verify standalone parse WITHOUT known_generics protects non-usize top-level values:
-        assert!(parse_str(app_src).is_ok());
-
-        let mut known = collect_declared_generic_names(app_src);
-        known.insert("#import_scoped".to_string());
-        known.insert("m.clamp".to_string());
-        known.insert("m.Box".to_string());
-
-        let prog = parse_str_named_with_generics(app_src, "app.zev", Some(&known))
-            .expect("parse app with scoped generics and non-usize guards");
+        let prog = parse_str_named(app_src, "app.zev")
+            .expect("parse app with purely syntactic generics and declarations");
         let use_n_fn = prog
             .items
             .iter()
@@ -2558,8 +2526,17 @@ fn use_n<usize N>(u32 cmp, FixedVec<u32, N> v) {
                 ..
             } if generic_args.len() == 1 && args.len() == 3
         ));
-        // stmts 4..=8: all 5 `check_pair(...)` calls stay 2-arg relational comparisons!
-        for idx in [4usize, 5, 6, 7, 8] {
+        // stmt 3: m.Pair<u8, u16> mod_var; declaration at statement start
+        assert!(matches!(
+            &stmts[3].kind,
+            StmtKind::VarDecl {
+                name,
+                ty: TypeExpr { kind: TypeKind::GenericPath { args, .. }, .. },
+                ..
+            } if name.name == "mod_var" && args.len() == 2
+        ));
+        // stmts 5..=6: both `check_pair(...)` calls stay 2-arg relational comparisons
+        for idx in [5usize, 6] {
             match &stmts[idx].kind {
                 StmtKind::Expr(Expr {
                     kind: ExprKind::Call { args, generic_args, .. },
@@ -2571,6 +2548,14 @@ fn use_n<usize N>(u32 cmp, FixedVec<u32, N> v) {
                 other => panic!("expected 2-arg Call at stmt {idx}, got {other:?}"),
             }
         }
+        // stmt 7: `if cmp < HI { ... }` keeps comparison
+        assert!(matches!(
+            &stmts[7].kind,
+            StmtKind::If {
+                cond: Expr { kind: ExprKind::Binary { op: BinaryOp::Lt, .. }, .. },
+                ..
+            }
+        ));
     }
 
     #[test]

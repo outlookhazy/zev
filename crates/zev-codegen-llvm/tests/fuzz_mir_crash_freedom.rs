@@ -3,7 +3,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use zev_codegen_llvm::{CodegenOptions, emit_llvm_ir_with_options};
 use zev_mir::lower_programs;
-use zev_parser::{collect_declared_generic_names, parse_str_named_with_generics};
+use zev_parser::parse_str_named;
 use zev_sema::analyze_and_monomorphize_programs;
 use zev_sema::checker::AnalyzeOptions;
 
@@ -65,8 +65,7 @@ fn load_example_sources() -> Vec<(String, String)> {
 fn exercise_full_llvm_pipeline(label: &str, src: &str) -> bool {
     let opts = AnalyzeOptions::default();
     let res = catch_unwind(AssertUnwindSafe(|| {
-        let generics = collect_declared_generic_names(src);
-        let Ok(prog) = parse_str_named_with_generics(src, "<fuzz_mir>", Some(&generics)) else {
+        let Ok(prog) = parse_str_named(src, "<fuzz_mir>") else {
             return false;
         };
         let mono = analyze_and_monomorphize_programs(&[prog], &opts);

@@ -218,15 +218,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("failed to read {}: {}", path.display(), e));
             sources.push((path.clone(), path.display().to_string(), raw));
         }
-        let roots: Vec<(&str, Option<&Path>)> = sources
-            .iter()
-            .map(|(p, _, raw)| (raw.as_str(), Some(p.as_path())))
-            .collect();
-        let all_generics = zev_sema::collect_import_aware_generic_names(&roots, &[]);
         let mut named_progs = Vec::with_capacity(sources.len());
         for (_, name, src) in &sources {
-            let prog = zev_parser::parse_str_named_with_generics(src, name, Some(&all_generics))
-                .unwrap_or_else(|errs| panic!("failed to parse {name}: {errs:#?}"));
+            let prog = zev_parser::parse_str_named(src, name)
+                .unwrap_or_else(|err| panic!("failed to parse {name}: {err:#?}"));
             named_progs.push((prog, name.as_str()));
         }
         let pairs: Vec<(&zev_ast::Program, Option<&str>)> = named_progs
@@ -2306,7 +2301,7 @@ mod tests {
                     len: 2,
                 };
                 f32 cf = clamp(v.data[3] * 3.0f32, 0.0f32, 9.5f32);
-                i32 ci = clamp::<i32>(iv.data[0], -20, 20);
+                i32 ci = clamp<i32>(iv.data[0], -20, 20);
                 println(f"MONO:len={v.len} cf={cf:.2} ci={ci}");
                 sys.exit(0);
             }
@@ -7031,18 +7026,8 @@ fn main() {
 
         let compile_for_board = |board: &str| {
             let spec = TargetSpec::resolve(None, Some(board)).expect("resolve target spec");
-            let generics = zev_sema::collect_import_aware_generic_names_with_targets(
-                &[(demo_src.as_str(), Some(demo_path.as_path()))],
-                std::slice::from_ref(&root),
-                spec.hal_dir.as_deref(),
-                spec.board_module.as_deref(),
-            );
-            let prog = zev_parser::parse_str_named_with_generics(
-                &demo_src,
-                &demo_label,
-                Some(&generics),
-            )
-            .unwrap_or_else(|e| panic!("parse failed for {board}: {e:#?}"));
+            let prog = zev_parser::parse_str_named(&demo_src, &demo_label)
+                .unwrap_or_else(|e| panic!("parse failed for {board}: {e:#?}"));
             let aopts = zev_sema::AnalyzeOptions {
                 include_dirs: vec![root.clone()],
                 hal_dir: spec.hal_dir.clone(),

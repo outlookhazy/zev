@@ -8,22 +8,6 @@ pub fn lex(source: &str, filename: Option<&str>) -> Result<Vec<Token>, ParseErro
     lexer.tokenize()
 }
 
-/// Best-effort lexing used by [`crate::collect_declared_generic_names`] so top-level generic
-/// `struct` / `fn` names are still discovered even if a later token in the file is malformed.
-pub(crate) fn lex_prefix_best_effort(source: &str) -> Vec<Token> {
-    let mut lexer = Lexer::new(source, None);
-    let mut tokens = Vec::new();
-    let _ = lexer.tokenize_into(&mut tokens);
-    let eof_span = Span::new(
-        lexer.pos as u32,
-        lexer.pos as u32,
-        lexer.line,
-        lexer.col,
-    );
-    tokens.push(Token::new(TokenKind::Eof, eof_span));
-    tokens
-}
-
 struct Lexer<'a> {
     source: &'a str,
     filename: Option<&'a str>,
