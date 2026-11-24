@@ -35,6 +35,24 @@ pub fn parse_str_named(source: &str, filename: &str) -> Result<Program, ParseErr
     parser.parse_program()
 }
 
+/// Parse an in-memory `.zev` source string while recovering at item boundaries to collect multiple
+/// syntax errors in a single pass.
+pub fn parse_str_recovering(source: &str) -> (Program, Vec<ParseError>) {
+    parse_str_named_recovering(source, "<input>")
+}
+
+/// Parse an in-memory `.zev` source string with an explicit filename while recovering at item
+/// boundaries to collect multiple syntax errors in a single pass.
+pub fn parse_str_named_recovering(source: &str, filename: &str) -> (Program, Vec<ParseError>) {
+    match lexer::lex(source, Some(filename)) {
+        Ok(tokens) => {
+            let mut parser = parser::Parser::new(source, Some(filename), tokens);
+            parser.parse_program_recovering()
+        }
+        Err(err) => (Program::new(Vec::new(), err.span), vec![err]),
+    }
+}
+
 /// Read and parse a `.zev` source file from disk.
 pub fn parse_file(path: impl AsRef<Path>) -> Result<Program, ParseError> {
     let path_ref = path.as_ref();
@@ -2863,5 +2881,70 @@ fn main() {
         ] {
             parse_str(bad).expect_err("C integer suffix must be rejected");
         }
+    }
+
+    #[test]
+    fn parser_depth_limit_and_item_recovery() {
+        let handle = std::thread::Builder::new()
+            .name("parser-depth-test".to_string())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                // 40 nested parens and 40 nested `if` blocks exceed the old 24 cap and now succeed.
+                let open_parens = "(".repeat(40);
+                let close_parens = ")".repeat(40);
+                let src_parens = format!("fn f() -> u32 {{ return {open_parens}1u32{close_parens}; }}\n");
+                parse_str(&src_parens).expect("40 nested parens must parse");
+
+                let mut src_ifs = String::from("fn f(bool c) {\n");
+                for _ in 0..40 {
+                    src_ifs.push_str("if (c) {\n");
+                }
+                src_ifs.push_str("u32 _x = 1;\n");
+                for _ in 0..40 {
+                    src_ifs.push_str("}\n");
+                }
+                src_ifs.push_str("}\n");
+                parse_str(&src_ifs).expect("40 nested if blocks must parse");
+
+                // 300-deep inputs fail gracefully on a 2 MiB debug thread stack without overflowing.
+                let deep_open = "(".repeat(300);
+                let deep_close = ")".repeat(300);
+                let err_p = parse_str(&format!("fn f() -> u32 {{ return {deep_open}1{deep_close}; }}"))
+                    .expect_err("300 nested parens must error cleanly");
+                assert!(err_p.message.contains("depth"), "{err_p}");
+
+                let deep_blocks_open = "{ ".repeat(300);
+                let deep_blocks_close = "} ".repeat(300);
+                let err_b = parse_str(&format!("fn f() {{ {deep_blocks_open}u32 x = 1;{deep_blocks_close} }}"))
+                    .expect_err("300 nested blocks must error cleanly");
+                assert!(err_b.message.contains("depth"), "{err_b}");
+            })
+            .expect("spawn depth test thread");
+        handle.join().expect("depth test thread must not overflow stack");
+
+        // Item-boundary error recovery collects errors from multiple broken top-level items while keeping valid ones.
+        let src_multi = "\
+fn broken_one() {
+    let x = 1;
+}
+
+fn valid_mid(u32 a) -> u32 {
+    return a + 1u32;
+}
+
+task broken_two() {
+    every 5ms { checkpoint(); }
+}
+
+u32 broken_three(u32 v) {
+    return v;
+}
+";
+        let (prog, errs) = parse_str_recovering(src_multi);
+        assert_eq!(errs.len(), 3, "expected 3 recovered parse errors, got {errs:#?}");
+        assert_eq!(errs[0].code, Some("P0001"));
+        assert_eq!(errs[1].code, Some("P0011"));
+        assert_eq!(errs[2].code, Some("P0018"));
+        assert_eq!(prog.items.len(), 1, "expected 1 surviving valid item, got {:?}", prog.items);
     }
 }
