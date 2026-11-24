@@ -9290,4 +9290,159 @@ fn main() {
             assert!(built.sizes.text > 0);
         }
     }
+
+    const INDEXED_READ_SRC: &str = r#"
+struct P { u32 a; [37]u8 name; u32 c; }
+struct Q { P inner; [2]P pair; }
+const [2][3]u8 TABLE = [[1u8, 2u8, 3u8], [4u8, 5u8, 6u8]];
+
+fn tick(u8 tag, usize v) -> usize { println(f"eval {tag}"); return v; }
+fn make() -> [4]u8 { return [10u8, 11u8, 12u8, 13u8]; }
+fn sum(*P p) -> u32 {
+    u32 t = 0;
+    for (usize i in 0..37) { t += p.name[i] as u32; }
+    return t;
+}
+
+task worker() {
+    [41]u16 buf;
+    Q q;
+    for (usize i in 0..41) { buf[i] = (i * 3) as u16; }
+    delay(1ms);
+    u32 t = 0;
+    for (usize i in 0..41) { t += buf[i] as u32; delay(1ms); }
+    q.pair[1].name[2] = 77u8;
+    delay(1ms);
+    println(f"task sum={t} nested={q.pair[1].name[2]} zero={q.pair[0].name[2]}");
+    sys.exit(0);
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    [2][2][2]u8 a;
+    a[1][0][1] = 42u8;
+    u8 r = a[tick(1u8, 1)][tick(2u8, 0)][tick(3u8, 1)];
+    println(f"read {r}");
+    P p;
+    for (usize i in 0..37) { p.name[i] = (i + 1) as u8; }
+    println(f"sum {sum(&p)} direct {p.name[36]} table {TABLE[1][2]} call {make()[2]}");
+    Q q;
+    q.inner.name[3] = 9u8;
+    q.pair[1].c = 5u32;
+    *Q qp = &q;
+    println(f"nested {q.inner.name[3]} {qp.inner.name[3]} {qp.pair[1].c} {q.pair[1].c}");
+    [4]u8 x = [1u8, 2u8, 3u8, 4u8];
+    println(f"eq {p.name[0..4] == x} {q.inner.name == p.name}");
+    u8 v = x[0];
+    x[0] = 99u8;
+    println(f"copy {v} now {x[0]}");
+    spawn worker() @normal;
+}
+"#;
+
+    #[test]
+    fn array_element_reads_address_storage_in_place() {
+        // Reading `arr[i]` must index the array where it lives. Loading the whole array by value
+        // first costs flash and stack proportional to its length at every read.
+        let mir = compile_src_mir(INDEXED_READ_SRC);
+        let ll = emit_llvm_ir_with_options(&mir, &CodegenOptions::default())
+            .expect("emit LLVM IR for indexed reads");
+        for arr in [
+            "[37 x i8]",
+            "[41 x i16]",
+            "[2 x [2 x i8]]",
+            "[2 x %struct.P]",
+        ] {
+            assert!(
+                !ll.contains(&format!("= load {arr},")),
+                "indexed read loads a whole {arr} by value"
+            );
+            assert!(
+                !ll.lines()
+                    .any(|l| l.contains("%__a") && l.contains(&format!("alloca {arr},"))),
+                "indexed read copies {arr} into a temporary"
+            );
+        }
+        // A base that names no storage (a call result) still goes through a temporary.
+        assert!(ll
+            .lines()
+            .any(|l| l.contains("%__a") && l.contains("alloca [4 x i8],")));
+    }
+
+    #[test]
+    fn indexed_reads_evaluate_left_to_right_and_check_const_tables_in_qemu() {
+        let (_mir, _ll, res) = run_zev_cortex_m_qemu("indexed_reads", INDEXED_READ_SRC);
+        assert_eq!(res.exec.exit_code, 0, "stderr={}", res.exec.stderr);
+        let out = res.exec.stdout.replace('\r', "");
+        for expected in [
+            // Index operands evaluate in source order, as they do for an indexed write.
+            "eval 1\neval 2\neval 3\nread 42\n",
+            "sum 703 direct 37 table 6 call 12\n",
+            "nested 9 9 5 5\n",
+            "eq true false\n",
+            "copy 1 now 99\n",
+            "task sum=2460 nested=77 zero=0\n",
+        ] {
+            assert!(
+                out.contains(expected),
+                "missing {expected:?} in stdout={out}"
+            );
+        }
+
+        // Every index of a nested `const` table read is bounds-checked, not only the last one.
+        let cases: [(&str, &str); 3] = [
+            (
+                "trap_const_table_outer",
+                r#"
+const [2][3]u8 TABLE = [[1u8, 2u8, 3u8], [4u8, 5u8, 6u8]];
+watch<usize> wi = 2;
+fn main() {
+    u8 x = TABLE[wi.read()][0];
+    println(f"x={x}");
+}
+"#,
+            ),
+            (
+                "trap_const_struct_table_field",
+                r#"
+struct P { u32 a; [4]u8 name; }
+const [2]P PS = [P { a: 1, name: [1u8, 2u8, 3u8, 4u8] }, P { a: 2, name: [5u8, 6u8, 7u8, 8u8] }];
+watch<usize> wi = 2;
+fn main() {
+    u32 x = PS[wi.read()].a;
+    println(f"x={x}");
+}
+"#,
+            ),
+            (
+                "trap_const_table_row_slice",
+                r#"
+const [2][3]u8 TABLE = [[1u8, 2u8, 3u8], [4u8, 5u8, 6u8]];
+watch<usize> wi = 2;
+fn main() {
+    []u8 row = TABLE[wi.read()][0..2];
+    println(f"len={row.len}");
+}
+"#,
+            ),
+        ];
+        for (tag, src) in cases {
+            let mir = compile_src_mir(src);
+            let elf = test_out_dir().join(format!("{tag}.elf"));
+            let res = run_qemu_cortex_m(
+                &mir,
+                &elf,
+                &CodegenOptions::default(),
+                &QemuRunOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("run {tag} QEMU: {e}"));
+            // QEMU semihosting reports the trap as a non-zero exit rather than the host's 101.
+            assert_ne!(res.exec.exit_code, 0, "{tag} stdout={}", res.exec.stdout);
+            assert!(
+                res.exec.stdout.contains("[PANIC] index out of bounds"),
+                "{tag} stdout={}",
+                res.exec.stdout
+            );
+        }
+    }
 }
