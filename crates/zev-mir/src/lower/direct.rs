@@ -882,7 +882,7 @@ impl<'a> DirectLowerCtx<'a> {
     ) -> Result<MirExpr, MirLowerError> {
         if let Some(ce) = code_arg_opt {
             let raw = self.lower_expr_with_stmts(ce, Some(&MirType::I32), out)?;
-            let coerced = coerce_or_cast_int(raw, &MirType::I32);
+            let coerced = coerce_expr_if_needed(raw, &MirType::I32);
             if self.has_active_defers_from(0) {
                 let tmp = self.alloc_temp("exit_code", MirType::I32);
                 out.push(MirStmt::Assign {
@@ -1138,38 +1138,10 @@ impl<'a> DirectLowerCtx<'a> {
             }
             let expected = sig.params.get(idx);
             let me = self.lower_expr_with_stmts(&a.value, expected, out)?;
-            let coerced = match (&me.ty, expected, &me.kind) {
-                (MirType::Array { elem, len }, Some(MirType::Slice(_)), MirExprKind::Var(vid)) => {
-                    MirExpr::new(
-                        MirExprKind::ArrayToSlice {
-                            array_place: Box::new(MirPlace::Var(*vid)),
-                            len: *len,
-                            elem_ty: *elem.clone(),
-                        },
-                        sig.params[idx].clone(),
-                    )
-                }
-                (MirType::Array { elem, len }, Some(MirType::Slice(_)), _)
-                    if is_rodata_const_mir_expr(&me) =>
-                {
-                    let e_ty = *elem.clone();
-                    let n = *len;
-                    MirExpr::new(
-                        MirExprKind::SubSlice {
-                            base: Box::new(me),
-                            start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
-                            end: Box::new(MirExpr::new(
-                                MirExprKind::IntLit(n as i128),
-                                MirType::Usize,
-                            )),
-                            elem_ty: e_ty,
-                            base_is_array: true,
-                        },
-                        sig.params[idx].clone(),
-                    )
-                }
-                (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
-                _ => me,
+            let coerced = if let Some(pty) = expected {
+                coerce_call_arg_expr(me, pty)
+            } else {
+                me
             };
             let mut be = DirectBackend {
                 ctx: self,

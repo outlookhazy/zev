@@ -1549,6 +1549,16 @@ impl<'a> BodyChecker<'a> {
             StmtKind::LoopEvery { period, body } => {
                 let pv = self.check_expr_infallible(period);
                 if pv.ty.is_integer() {
+                    let dest_prim = match pv.ty {
+                        Ty::Prim(PrimType::U8 | PrimType::U16 | PrimType::U32) => {
+                            Some(PrimType::U32)
+                        }
+                        Ty::Prim(PrimType::I8 | PrimType::I16 | PrimType::I32) => {
+                            Some(PrimType::I32)
+                        }
+                        _ => None,
+                    };
+                    self.validate_int_expr_at_type(period, dest_prim);
                     let shadowed = self.active_local_names();
                     let const_ticks = self.sema.eval_const_expr_i128_shadowed(
                         period,
@@ -3300,6 +3310,7 @@ impl<'a> BodyChecker<'a> {
 
                 let sv = self.check_expr_infallible(seq_expr);
                 let iv = self.check_expr_infallible(index);
+                self.validate_int_expr_at_type(index, Some(PrimType::Usize));
                 if !iv.ty.is_integer() && !iv.ty.is_error() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,

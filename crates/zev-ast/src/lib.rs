@@ -467,21 +467,47 @@ pub enum TypeKind {
 // Program & Top-Level Items
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Syntactic `<...>(...)` sequence where `<...>` failed speculative generic arg parsing
+/// (e.g. an unparenthesized constant expression like `lim<K + 1>(1)`). Purely syntactic:
+/// sema checks whether the callee actually names a generic function before diagnosing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BareGenericCallCandidate {
+    pub callee_name: String,
+    pub display_callee: String,
+    pub callee_span: Span,
+    pub full_span: Span,
+    pub rewrite: String,
+}
+
 /// A parsed `.zev` compilation unit (or merged multi-file AST).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
     pub items: Vec<Item>,
+    pub bare_generic_call_candidates: Vec<BareGenericCallCandidate>,
     pub span: Span,
 }
 
 impl Program {
     pub fn new(items: Vec<Item>, span: Span) -> Self {
-        Self { items, span }
+        Self {
+            items,
+            bare_generic_call_candidates: Vec::new(),
+            span,
+        }
+    }
+
+    pub fn with_bare_generic_call_candidates(
+        mut self,
+        candidates: Vec<BareGenericCallCandidate>,
+    ) -> Self {
+        self.bare_generic_call_candidates = candidates;
+        self
     }
 
     /// Merge multiple parsed files into a single `Program`.
     pub fn merge_all(programs: impl IntoIterator<Item = Program>) -> Self {
         let mut items = Vec::new();
+        let mut bare_generic_call_candidates = Vec::new();
         let mut first_span: Option<Span> = None;
         let mut last_span = Span::dummy();
         for prog in programs {
@@ -490,9 +516,14 @@ impl Program {
             }
             last_span = prog.span;
             items.extend(prog.items);
+            bare_generic_call_candidates.extend(prog.bare_generic_call_candidates);
         }
         let span = first_span.map_or_else(Span::dummy, |s| s.merge(last_span));
-        Self { items, span }
+        Self {
+            items,
+            bare_generic_call_candidates,
+            span,
+        }
     }
 }
 

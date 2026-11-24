@@ -124,9 +124,11 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
         .map(|(p, f)| (p, f.as_deref()))
         .collect();
 
-    let mono_out = monomorphize::monomorphize_named_programs_with_non_root_count(
+    let mono_out = monomorphize::monomorphize_named_programs_with_target(
         &linked_pairs,
         linked.non_root_program_count,
+        opts.target_ptr_bits,
+        &opts.target_name,
     );
     if !mono_out.diagnostics.is_empty() {
         let mut diagnostics = mono_out.diagnostics;
@@ -161,6 +163,7 @@ pub fn analyze_and_monomorphize_named_programs<'a>(
 
     let mut sema_out = checker::Analyzer::new(opts)
         .with_linked_context(&linked)
+        .with_defaulted_generic_calls(mono_out.defaulted_calls)
         .run(&mono_pairs);
 
     // Ensure `model.monomorphized_instances` includes all deduplicated & sorted instances.

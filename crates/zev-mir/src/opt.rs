@@ -1977,9 +1977,8 @@ fn int_lit_fits_mir_type(v: i128, target: &MirType) -> bool {
         MirType::U32 | MirType::I32 | MirType::Enum(_) => {
             (i128::from(i32::MIN)..=i128::from(u32::MAX)).contains(&v)
         }
-        MirType::U64 | MirType::I64 => (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&v),
-        MirType::Usize | MirType::Isize => {
-            (i128::from(i16::MIN)..=i128::from(u16::MAX)).contains(&v)
+        MirType::U64 | MirType::I64 | MirType::Usize | MirType::Isize => {
+            (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&v)
         }
         _ => false,
     }

@@ -14,12 +14,13 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use zev_ast::{
-    ArrayLen, Attr, AttrKind, BinaryOp, Block, CallArg, CatchClause, CatchParam, ConstDecl,
-    ErrorSpec, Expr, ExprKind, FieldInit, FnDecl, FormatPart, GenericArg, GenericParam,
-    GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item, ItemKind, Literal, MethodDecl,
-    MmioDecl, MmioDeclKind, MmioRegDecl, OsPrimitiveDecl, OsPrimitiveType, Param, PrimType,
-    Program, SelfReceiver, Span, SpawnStmt, Stmt, StmtKind, StructDecl, StructField, SwitchArm,
-    SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp, WaitArm, WaitTimerArm,
+    ArrayLen, AssignOp, Attr, AttrKind, BareGenericCallCandidate, BinaryOp, Block, CallArg,
+    CatchClause, CatchParam, ConstDecl, ErrorSpec, Expr, ExprKind, FieldInit, FnDecl, FormatPart,
+    GenericArg, GenericParam, GenericParamKind, GlobalVarDecl, Ident, IrqDecl, IsrDecl, Item,
+    ItemKind, Literal, MethodDecl, MmioDecl, MmioDeclKind, MmioRegDecl, OsPrimitiveDecl,
+    OsPrimitiveType, Param, PrimType, Program, SelfReceiver, Span, SpawnStmt, Stmt, StmtKind,
+    StructDecl, StructField, SwitchArm, SwitchPat, TaskDecl, TypeExpr, TypeKind, UnaryOp, WaitArm,
+    WaitTimerArm,
 };
 
 use crate::diag::{Diagnostic, DiagnosticKind};
@@ -31,11 +32,22 @@ pub const MAX_GENERIC_DEPTH: usize = 32;
 /// Maximum total number of unique monomorphized `struct` + `fn` instantiations per compilation (`E0029`).
 pub const MAX_MONOMORPHIZED_INSTANCES: usize = 1024;
 
+#[derive(Clone, Debug)]
+pub(crate) struct DefaultedGenericCall {
+    pub prog_idx: usize,
+    pub call_span: Span,
+    pub fn_name: String,
+    pub resolved_arg_strs: Vec<String>,
+    pub defaulted_params: Vec<(usize, String, PrimType)>,
+    pub call_args_preview: String,
+}
+
 /// Output of monomorphizing one or more parsed [`Program`]s.
 #[derive(Clone, Debug)]
 pub struct MonomorphizeOutput {
     pub programs: Vec<Program>,
     pub instances: Vec<MonomorphizedInstance>,
+    pub(crate) defaulted_calls: Vec<DefaultedGenericCall>,
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -77,7 +89,16 @@ pub(crate) fn monomorphize_named_programs_with_non_root_count<'a>(
     programs: &[(&'a Program, Option<&'a str>)],
     non_root_prog_count: usize,
 ) -> MonomorphizeOutput {
-    Monomorphizer::new(programs, non_root_prog_count).run()
+    monomorphize_named_programs_with_target(programs, non_root_prog_count, 64, "host")
+}
+
+pub(crate) fn monomorphize_named_programs_with_target<'a>(
+    programs: &[(&'a Program, Option<&'a str>)],
+    non_root_prog_count: usize,
+    target_ptr_bits: u32,
+    target_name: &str,
+) -> MonomorphizeOutput {
+    Monomorphizer::new(programs, non_root_prog_count, target_ptr_bits, target_name).run()
 }
 
 #[derive(Clone, Debug)]
@@ -150,8 +171,17 @@ struct GenericImplMethodEntry {
     pattern_key: String,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum EvalUsizeResult {
+    Ok(usize),
+    OutOfRange(i128),
+    Invalid,
+}
+
 struct Monomorphizer<'a> {
     inputs: &'a [(&'a Program, Option<&'a str>)],
+    target_ptr_bits: u32,
+    target_name: String,
     raw_consts: BTreeMap<String, (Expr, Option<String>)>,
     eval_consts: BTreeMap<String, usize>,
     const_types: BTreeMap<String, TypeExpr>,
@@ -165,6 +195,7 @@ struct Monomorphizer<'a> {
     mmio_layouts: BTreeMap<String, BTreeMap<String, TypeExpr>>,
     mmio_instances: BTreeMap<String, TypeExpr>,
     non_generic_fn_rets: BTreeMap<String, TypeExpr>,
+    non_generic_fn_params: BTreeMap<String, Vec<TypeExpr>>,
     struct_templates: BTreeMap<String, TemplateEntry<StructDecl>>,
     fn_templates: BTreeMap<String, TemplateEntry<FnDecl>>,
     concrete_methods: BTreeMap<(String, String), ConcreteMethodInfo>,
@@ -176,6 +207,11 @@ struct Monomorphizer<'a> {
     instantiated_structs: BTreeSet<String>,
     /// Mangled fn name -> concrete return `TypeExpr`.
     instantiated_fns: BTreeMap<String, TypeExpr>,
+    current_ret_ty: Option<TypeExpr>,
+    defaulted_calls: Vec<DefaultedGenericCall>,
+    /// `(prog_idx, callee_span.start, callee_span.end)` -> bare unparenthesized `<...>(...)` candidate.
+    bare_cand_by_callee: BTreeMap<(usize, u32, u32), BareGenericCallCandidate>,
+    reported_bare_generic_callees: BTreeSet<(usize, u32, u32)>,
     cap_exceeded_emitted: bool,
     synth_structs_by_prog: Vec<Vec<Item>>,
     synth_fns_by_prog: Vec<Vec<Item>>,
@@ -193,14 +229,30 @@ type ImplMethodMatch = (
 type ResolvedImplMethod = (String, Option<SelfReceiver>, TypeExpr, bool, Option<usize>);
 
 impl<'a> Monomorphizer<'a> {
-    fn new(inputs: &'a [(&'a Program, Option<&'a str>)], non_root_prog_count: usize) -> Self {
+    fn new(
+        inputs: &'a [(&'a Program, Option<&'a str>)],
+        non_root_prog_count: usize,
+        target_ptr_bits: u32,
+        target_name: &str,
+    ) -> Self {
         let n = inputs.len().max(1);
         let mut known_enums = BTreeMap::new();
         known_enums.insert("FmtErr".to_string(), vec!["Truncated".to_string()]);
         let mut enum_prog_idx = BTreeMap::new();
         enum_prog_idx.insert("FmtErr".to_string(), None);
+        let mut bare_cand_by_callee = BTreeMap::new();
+        for (prog_idx, (prog, _)) in inputs.iter().enumerate() {
+            for cand in &prog.bare_generic_call_candidates {
+                bare_cand_by_callee.insert(
+                    (prog_idx, cand.callee_span.start, cand.callee_span.end),
+                    cand.clone(),
+                );
+            }
+        }
         Self {
             inputs,
+            target_ptr_bits,
+            target_name: target_name.to_string(),
             raw_consts: BTreeMap::new(),
             eval_consts: BTreeMap::new(),
             const_types: BTreeMap::new(),
@@ -214,6 +266,7 @@ impl<'a> Monomorphizer<'a> {
             mmio_layouts: BTreeMap::new(),
             mmio_instances: BTreeMap::new(),
             non_generic_fn_rets: BTreeMap::new(),
+            non_generic_fn_params: BTreeMap::new(),
             struct_templates: BTreeMap::new(),
             fn_templates: BTreeMap::new(),
             concrete_methods: BTreeMap::new(),
@@ -222,6 +275,10 @@ impl<'a> Monomorphizer<'a> {
             instantiated_struct_args: BTreeMap::new(),
             instantiated_structs: BTreeSet::new(),
             instantiated_fns: BTreeMap::new(),
+            current_ret_ty: None,
+            defaulted_calls: Vec::new(),
+            bare_cand_by_callee,
+            reported_bare_generic_callees: BTreeSet::new(),
             cap_exceeded_emitted: false,
             synth_structs_by_prog: vec![Vec::new(); n],
             synth_fns_by_prog: vec![Vec::new(); n],
@@ -415,6 +472,7 @@ impl<'a> Monomorphizer<'a> {
         let mut rewritten_global_tys: BTreeMap<(usize, usize), TypeExpr> = BTreeMap::new();
         let mut rewritten_prim_tys: BTreeMap<(usize, usize), OsPrimitiveType> = BTreeMap::new();
         let mut rewritten_fn_rets: BTreeMap<(usize, usize), TypeExpr> = BTreeMap::new();
+        let mut rewritten_fn_params: BTreeMap<(usize, usize), Vec<Param>> = BTreeMap::new();
 
         for (prog_idx, (prog, file_opt)) in self.inputs.iter().enumerate() {
             let env = SubstEnv {
@@ -465,6 +523,18 @@ impl<'a> Monomorphizer<'a> {
                         let rrt = self.rewrite_type_expr(&f.ret_type, &env);
                         self.non_generic_fn_rets
                             .insert(f.name.name.clone(), rrt.clone());
+                        let r_params: Vec<Param> = f
+                            .params
+                            .iter()
+                            .map(|p| Param {
+                                ty: self.rewrite_type_expr(&p.ty, &env),
+                                name: p.name.clone(),
+                                span: p.span,
+                            })
+                            .collect();
+                        let rps: Vec<TypeExpr> = r_params.iter().map(|p| p.ty.clone()).collect();
+                        self.non_generic_fn_params.insert(f.name.name.clone(), rps);
+                        rewritten_fn_params.insert((prog_idx, item_idx), r_params);
                         rewritten_fn_rets.insert((prog_idx, item_idx), rrt);
                     }
                     _ => {}
@@ -473,7 +543,8 @@ impl<'a> Monomorphizer<'a> {
         }
 
         // Pass 1.6: Collect concrete and generic `impl` method signatures before Pass 2 body rewriting.
-        let mut concrete_impl_fns_by_prog: Vec<Vec<(Span, FnDecl, TypeExpr)>> =
+        type ConcreteImplMethodDecl = (Span, FnDecl, Vec<Param>, TypeExpr);
+        let mut concrete_impl_fns_by_prog: Vec<Vec<ConcreteImplMethodDecl>> =
             vec![Vec::new(); self.inputs.len()];
         for (prog_idx, (prog, file_opt)) in self.inputs.iter().enumerate() {
             let file = file_opt.map(str::to_string);
@@ -594,8 +665,21 @@ impl<'a> Monomorphizer<'a> {
                                 owner_scope,
                             },
                         );
-                        self.non_generic_fn_rets.insert(fn_name, ret_ty.clone());
-                        concrete_impl_fns_by_prog[prog_idx].push((m.span, synth_fn, ret_ty));
+                        self.non_generic_fn_rets
+                            .insert(fn_name.clone(), ret_ty.clone());
+                        let r_params: Vec<Param> = synth_fn
+                            .params
+                            .iter()
+                            .map(|p| Param {
+                                ty: self.rewrite_type_expr(&p.ty, &env),
+                                name: p.name.clone(),
+                                span: p.span,
+                            })
+                            .collect();
+                        let rps: Vec<TypeExpr> = r_params.iter().map(|p| p.ty.clone()).collect();
+                        self.non_generic_fn_params.insert(fn_name, rps);
+                        concrete_impl_fns_by_prog[prog_idx]
+                            .push((m.span, synth_fn, r_params, ret_ty));
                     }
                 } else {
                     self.validate_generic_params(&imp.target_name.name, &imp.generic_params, &file);
@@ -809,10 +893,16 @@ impl<'a> Monomorphizer<'a> {
                             .remove(&(prog_idx, item_idx))
                             .unwrap_or_else(|| p.ty.clone());
                         let mut scopes = vec![BTreeMap::new()];
+                        let elem_hint = match &ty {
+                            OsPrimitiveType::Watch { elem } | OsPrimitiveType::Guarded { elem } => {
+                                Some(elem.as_ref())
+                            }
+                            _ => None,
+                        };
                         let init = p
                             .init
                             .as_ref()
-                            .map(|e| self.rewrite_expr(e, &env, &mut scopes, None).0);
+                            .map(|e| self.rewrite_expr(e, &env, &mut scopes, elem_hint).0);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
                             is_pub: item.is_pub,
@@ -852,8 +942,9 @@ impl<'a> Monomorphizer<'a> {
                             // Strip template fn declaration.
                             continue;
                         }
+                        let pre_params = rewritten_fn_params.remove(&(prog_idx, item_idx));
                         let pre_ret = rewritten_fn_rets.remove(&(prog_idx, item_idx));
-                        let rewritten_fn = self.rewrite_fn_decl(f, pre_ret, &env);
+                        let rewritten_fn = self.rewrite_fn_decl(f, pre_params, pre_ret, &env);
                         out_items.push(Item {
                             attrs: item.attrs.clone(),
                             is_pub: item.is_pub,
@@ -919,8 +1010,10 @@ impl<'a> Monomorphizer<'a> {
                     }
                 }
             }
-            for (m_span, m_fn, m_ret) in std::mem::take(&mut concrete_impl_fns_by_prog[prog_idx]) {
-                let rewritten_fn = self.rewrite_fn_decl(&m_fn, Some(m_ret), &env);
+            for (m_span, m_fn, m_params, m_ret) in
+                std::mem::take(&mut concrete_impl_fns_by_prog[prog_idx])
+            {
+                let rewritten_fn = self.rewrite_fn_decl(&m_fn, Some(m_params), Some(m_ret), &env);
                 out_items.push(Item {
                     attrs: rewritten_fn.attrs.clone(),
                     is_pub: false,
@@ -933,6 +1026,7 @@ impl<'a> Monomorphizer<'a> {
 
         // Iteratively drain queued generic function bodies in O(1) stack depth.
         while let Some(job) = self.pending_fn_bodies.pop_front() {
+            let prev_ret = self.current_ret_ty.replace(job.ret_type.clone());
             let body = job.raw_body.as_ref().map(|b| {
                 let mut scopes = vec![BTreeMap::new()];
                 for p in &job.params {
@@ -940,6 +1034,7 @@ impl<'a> Monomorphizer<'a> {
                 }
                 self.rewrite_block(b, &job.child_env, &mut scopes)
             });
+            self.current_ret_ty = prev_ret;
 
             let synth_fn = FnDecl {
                 attrs: job.fn_attrs,
@@ -1005,7 +1100,11 @@ impl<'a> Monomorphizer<'a> {
                 combined.extend(synth_structs);
             }
             combined.extend(synth_fns);
-            out_programs.push(Program::new(combined, orig_prog.span));
+            out_programs.push(
+                Program::new(combined, orig_prog.span).with_bare_generic_call_candidates(
+                    orig_prog.bare_generic_call_candidates.clone(),
+                ),
+            );
         }
 
         let mut instances: Vec<MonomorphizedInstance> = self.instances.into_values().collect();
@@ -1015,6 +1114,7 @@ impl<'a> Monomorphizer<'a> {
         MonomorphizeOutput {
             programs: out_programs,
             instances,
+            defaulted_calls: self.defaulted_calls,
             diagnostics: self.diagnostics,
         }
     }
@@ -1047,6 +1147,80 @@ impl<'a> Monomorphizer<'a> {
     // Constant `usize` Evaluation
     // ─────────────────────────────────────────────────────────────────────────
 
+    fn resolve_candidate_generic_fn(
+        &self,
+        expr: &Expr,
+        env: &SubstEnv,
+        scopes: &[BTreeMap<String, TypeExpr>],
+    ) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(id) => {
+                if !scopes_contain(scopes, &id.name) && self.fn_templates.contains_key(&id.name) {
+                    Some(id.name.clone())
+                } else {
+                    None
+                }
+            }
+            ExprKind::Field { target, field } => {
+                if let ExprKind::Ident(base_id) = &target.kind {
+                    if matches!(
+                        self.lookup_scope_ty(&base_id.name, env, scopes),
+                        InferTy::Unknown
+                    ) && self.fn_templates.contains_key(&field.name)
+                    {
+                        Some(field.name.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn emit_bare_generic_call_error(
+        &mut self,
+        env: &SubstEnv,
+        cand: &BareGenericCallCandidate,
+    ) -> (Expr, InferTy) {
+        if self.reported_bare_generic_callees.insert((
+            env.prog_idx,
+            cand.callee_span.start,
+            cand.callee_span.end,
+        )) {
+            self.emit(
+                &env.file,
+                Diagnostic::new(
+                    DiagnosticKind::GenericInstantiationError,
+                    cand.full_span,
+                    format!(
+                        "constant expressions in generic arguments for '{}' must be parenthesized; write `{}`",
+                        cand.display_callee, cand.rewrite
+                    ),
+                )
+                .with_note("parenthesize non-trivial constant expressions inside `<...>`, e.g. `foo<(N + 1)>(x)`"),
+            );
+        }
+        (
+            Expr::new(
+                ExprKind::Literal(Literal::Int {
+                    value: 0,
+                    suffix: Some(PrimType::I32),
+                }),
+                cand.full_span,
+            ),
+            InferTy::Unknown,
+        )
+    }
+
+    fn target_usize_max(&self) -> i128 {
+        crate::types::Ty::int_prim_range_for_ptr_bits(PrimType::Usize, self.target_ptr_bits)
+            .map(|(_, hi)| hi)
+            .unwrap_or(u64::MAX as i128)
+    }
+
     fn eval_named_const(&self, name: &str, visiting: &mut BTreeSet<String>) -> Option<i128> {
         if let Some(&v) = self.eval_consts.get(name) {
             return Some(v as i128);
@@ -1055,16 +1229,17 @@ impl<'a> Monomorphizer<'a> {
         if !visiting.insert(name.to_string()) {
             return None;
         }
-        let raw = self.eval_const_expr_i128(expr, &BTreeMap::new(), visiting);
+        let dest_prim = match self.const_types.get(name).map(|t| &t.kind) {
+            Some(TypeKind::Prim(p)) if p.is_integer() => Some(*p),
+            Some(TypeKind::Named(id)) => PrimType::from_name(&id.name).filter(|p| p.is_integer()),
+            _ => None,
+        };
+        let raw = self.eval_const_expr_with_dest_i128(expr, dest_prim, &BTreeMap::new(), visiting);
         visiting.remove(name);
         let val = raw?;
-        if let Some(TypeExpr {
-            kind: TypeKind::Prim(p),
-            ..
-        }) = self.const_types.get(name)
-        {
-            if p.is_integer() {
-                return Some(truncate_int_prim(val, *p));
+        if let Some(p) = dest_prim {
+            if !matches!(p, PrimType::Usize | PrimType::Isize) {
+                return Some(truncate_int_prim_bits(val, p, self.target_ptr_bits));
             }
         }
         Some(val)
@@ -1076,21 +1251,25 @@ impl<'a> Monomorphizer<'a> {
         local_consts: &BTreeMap<String, usize>,
     ) -> Option<PrimType> {
         match &expr.kind {
+            ExprKind::Literal(Literal::Int {
+                suffix: Some(p), ..
+            }) if p.is_integer() => Some(*p),
             ExprKind::Ident(id) => {
                 if local_consts.contains_key(&id.name) {
                     Some(PrimType::Usize)
-                } else if let Some(TypeExpr {
-                    kind: TypeKind::Prim(p),
-                    ..
-                }) = self.const_types.get(&id.name)
-                {
-                    p.is_integer().then_some(*p)
                 } else {
-                    None
+                    match self.const_types.get(&id.name).map(|t| &t.kind) {
+                        Some(TypeKind::Prim(p)) if p.is_integer() => Some(*p),
+                        Some(TypeKind::Named(tid)) => {
+                            PrimType::from_name(&tid.name).filter(|p| p.is_integer())
+                        }
+                        _ => None,
+                    }
                 }
             }
             ExprKind::Cast { ty, .. } => match &ty.kind {
                 TypeKind::Prim(p) if p.is_integer() => Some(*p),
+                TypeKind::Named(tid) => PrimType::from_name(&tid.name).filter(|p| p.is_integer()),
                 _ => None,
             },
             ExprKind::Unary { expr: inner, .. } => self.infer_const_prim_type(inner, local_consts),
@@ -1101,9 +1280,10 @@ impl<'a> Monomorphizer<'a> {
         }
     }
 
-    fn eval_const_expr_i128(
+    fn eval_const_expr_with_dest_i128(
         &self,
         expr: &Expr,
+        dest_prim: Option<PrimType>,
         local_consts: &BTreeMap<String, usize>,
         visiting: &mut BTreeSet<String>,
     ) -> Option<i128> {
@@ -1117,30 +1297,35 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
             ExprKind::Cast { expr: inner, ty } => {
-                let v = self.eval_const_expr_i128(inner, local_consts, visiting)?;
+                let v =
+                    self.eval_const_expr_with_dest_i128(inner, dest_prim, local_consts, visiting)?;
                 let target_prim = match &ty.kind {
                     TypeKind::Prim(p) if p.is_integer() => Some(*p),
                     TypeKind::Named(id) => PrimType::from_name(&id.name).filter(|p| p.is_integer()),
                     _ => None,
                 }?;
-                Some(truncate_int_prim(v, target_prim))
+                Some(truncate_int_prim_bits(v, target_prim, self.target_ptr_bits))
             }
             ExprKind::Unary { op, expr: inner } => {
-                let v = self.eval_const_expr_i128(inner, local_consts, visiting)?;
+                let v =
+                    self.eval_const_expr_with_dest_i128(inner, dest_prim, local_consts, visiting)?;
                 match op {
                     UnaryOp::Neg => {
                         let neg = v.checked_neg()?;
                         if let Some(p) = self.infer_const_prim_type(inner, local_consts) {
-                            if p.is_signed() {
-                                return Some(truncate_int_prim(neg, p));
+                            if p.is_signed() && !matches!(p, PrimType::Usize | PrimType::Isize) {
+                                return Some(truncate_int_prim_bits(neg, p, self.target_ptr_bits));
                             }
                         }
                         Some(neg)
                     }
                     UnaryOp::BitNot => {
                         let inv = !v;
-                        if let Some(p) = self.infer_const_prim_type(inner, local_consts) {
-                            Some(truncate_int_prim(inv, p))
+                        if let Some(p) = self
+                            .infer_const_prim_type(inner, local_consts)
+                            .or(dest_prim)
+                        {
+                            Some(truncate_int_prim_bits(inv, p, self.target_ptr_bits))
                         } else {
                             Some(inv)
                         }
@@ -1149,8 +1334,10 @@ impl<'a> Monomorphizer<'a> {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.eval_const_expr_i128(lhs, local_consts, visiting)?;
-                let r = self.eval_const_expr_i128(rhs, local_consts, visiting)?;
+                let l =
+                    self.eval_const_expr_with_dest_i128(lhs, dest_prim, local_consts, visiting)?;
+                let r =
+                    self.eval_const_expr_with_dest_i128(rhs, dest_prim, local_consts, visiting)?;
                 match op {
                     BinaryOp::Add => l.checked_add(r),
                     BinaryOp::Sub => l.checked_sub(r),
@@ -1181,10 +1368,34 @@ impl<'a> Monomorphizer<'a> {
         }
     }
 
-    fn eval_usize_in_env(&self, expr: &Expr, env: &SubstEnv) -> Option<usize> {
+    fn eval_usize_in_env_checked(&self, expr: &Expr, env: &SubstEnv) -> EvalUsizeResult {
         let mut visiting = BTreeSet::new();
-        let val = self.eval_const_expr_i128(expr, &env.consts, &mut visiting)?;
-        usize::try_from(val).ok()
+        let Some(val) = self.eval_const_expr_with_dest_i128(
+            expr,
+            Some(PrimType::Usize),
+            &env.consts,
+            &mut visiting,
+        ) else {
+            return EvalUsizeResult::Invalid;
+        };
+        if val < 0 {
+            return EvalUsizeResult::Invalid;
+        }
+        let max_u = self.target_usize_max();
+        if val > max_u {
+            return EvalUsizeResult::OutOfRange(val);
+        }
+        match usize::try_from(val) {
+            Ok(u) => EvalUsizeResult::Ok(u),
+            Err(_) => EvalUsizeResult::OutOfRange(val),
+        }
+    }
+
+    fn eval_usize_in_env(&self, expr: &Expr, env: &SubstEnv) -> Option<usize> {
+        match self.eval_usize_in_env_checked(expr, env) {
+            EvalUsizeResult::Ok(u) => Some(u),
+            EvalUsizeResult::OutOfRange(_) | EvalUsizeResult::Invalid => None,
+        }
     }
 
     fn is_known_type_ident(&self, name: &str, env: &SubstEnv) -> bool {
@@ -1283,57 +1494,106 @@ impl<'a> Monomorphizer<'a> {
                     return None;
                 }
                 (GenericParamKind::ConstUsize, GenericArg::Const(expr)) => {
-                    if let Some(n) = self.eval_usize_in_env(expr, env) {
-                        out.push(ResolvedGenArg::Const(n));
-                    } else {
-                        self.emit(
-                            &env.file,
-                            Diagnostic::new(
-                                DiagnosticKind::GenericInstantiationError,
-                                expr.span,
-                                format!(
-                                    "generic parameter 'usize {}' of '{}' requires a non-negative compile-time constant expression",
-                                    gp.name.name, target_name
-                                ),
-                            )
-                            .with_note(PAREN_CMP_NOTE),
-                        );
-                        return None;
+                    match self.eval_usize_in_env_checked(expr, env) {
+                        EvalUsizeResult::Ok(n) => out.push(ResolvedGenArg::Const(n)),
+                        EvalUsizeResult::OutOfRange(val) => {
+                            let max_u = self.target_usize_max();
+                            self.emit(
+                                &env.file,
+                                Diagnostic::new(
+                                    DiagnosticKind::GenericInstantiationError,
+                                    expr.span,
+                                    format!(
+                                        "generic parameter 'usize {}' of '{}' value {} is out of range for {}-bit target '{}' (0..={max_u})",
+                                        gp.name.name,
+                                        target_name,
+                                        val,
+                                        self.target_ptr_bits,
+                                        self.target_name,
+                                    ),
+                                )
+                                .with_note(format!(
+                                    "'usize' has {}-bit pointer width (0..={max_u}) on target '{}'",
+                                    self.target_ptr_bits, self.target_name
+                                )),
+                            );
+                            return None;
+                        }
+                        EvalUsizeResult::Invalid => {
+                            self.emit(
+                                &env.file,
+                                Diagnostic::new(
+                                    DiagnosticKind::GenericInstantiationError,
+                                    expr.span,
+                                    format!(
+                                        "generic parameter 'usize {}' of '{}' requires a non-negative compile-time constant expression",
+                                        gp.name.name, target_name
+                                    ),
+                                )
+                                .with_note(PAREN_CMP_NOTE),
+                            );
+                            return None;
+                        }
                     }
                 }
                 // Per `#104`: bare identifiers like `N` or `CAP` inside `<T, N>` parse as `GenericArg::Type(Named(ident))`.
                 (GenericParamKind::ConstUsize, GenericArg::Type(te)) => match &te.kind {
                     TypeKind::Named(id) => {
                         let synth_expr = Expr::new(ExprKind::Ident(id.clone()), id.span);
-                        if let Some(n) = self.eval_usize_in_env(&synth_expr, env) {
-                            out.push(ResolvedGenArg::Const(n));
-                        } else if self.is_known_type_ident(&id.name, env) {
-                            self.emit(
-                                &env.file,
-                                Diagnostic::new(
-                                    DiagnosticKind::GenericInstantiationError,
-                                    te.span,
-                                    format!(
-                                        "expected constant 'usize' argument for generic parameter '{}' of '{}', found type '{}'",
-                                        gp.name.name, target_name, id.name
+                        match self.eval_usize_in_env_checked(&synth_expr, env) {
+                            EvalUsizeResult::Ok(n) => out.push(ResolvedGenArg::Const(n)),
+                            EvalUsizeResult::OutOfRange(val) => {
+                                let max_u = self.target_usize_max();
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::GenericInstantiationError,
+                                        te.span,
+                                        format!(
+                                            "generic parameter 'usize {}' of '{}' value {} is out of range for {}-bit target '{}' (0..={max_u})",
+                                            gp.name.name,
+                                            target_name,
+                                            val,
+                                            self.target_ptr_bits,
+                                            self.target_name,
+                                        ),
+                                    )
+                                    .with_note(format!(
+                                        "'usize' has {}-bit pointer width (0..={max_u}) on target '{}'",
+                                        self.target_ptr_bits, self.target_name
+                                    )),
+                                );
+                                return None;
+                            }
+                            EvalUsizeResult::Invalid if self.is_known_type_ident(&id.name, env) => {
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::GenericInstantiationError,
+                                        te.span,
+                                        format!(
+                                            "expected constant 'usize' argument for generic parameter '{}' of '{}', found type '{}'",
+                                            gp.name.name, target_name, id.name
+                                        ),
                                     ),
-                                ),
-                            );
-                            return None;
-                        } else {
-                            self.emit(
-                                &env.file,
-                                Diagnostic::new(
-                                    DiagnosticKind::GenericInstantiationError,
-                                    te.span,
-                                    format!(
-                                        "non-constant or unknown 'usize' generic argument '{}' for parameter '{}' of '{}'",
-                                        id.name, gp.name.name, target_name
-                                    ),
-                                )
-                                .with_note(PAREN_CMP_NOTE),
-                            );
-                            return None;
+                                );
+                                return None;
+                            }
+                            EvalUsizeResult::Invalid => {
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::GenericInstantiationError,
+                                        te.span,
+                                        format!(
+                                            "non-constant or unknown 'usize' generic argument '{}' for parameter '{}' of '{}'",
+                                            id.name, gp.name.name, target_name
+                                        ),
+                                    )
+                                    .with_note(PAREN_CMP_NOTE),
+                                );
+                                return None;
+                            }
                         }
                     }
                     _ => {
@@ -1464,18 +1724,38 @@ impl<'a> Monomorphizer<'a> {
                 let fixed_len = match len {
                     ArrayLen::Fixed(n) => *n,
                     ArrayLen::Expr(len_expr) => {
-                        if let Some(n) = self.eval_usize_in_env(len_expr, env) {
-                            n
-                        } else {
-                            self.emit(
-                                &env.file,
-                                Diagnostic::new(
-                                    DiagnosticKind::GenericInstantiationError,
-                                    len_expr.span,
-                                    "array length must be a compile-time constant 'usize' expression",
-                                ),
-                            );
-                            1
+                        match self.eval_usize_in_env_checked(len_expr, env) {
+                            EvalUsizeResult::Ok(n) => n,
+                            EvalUsizeResult::OutOfRange(val) => {
+                                let max_u = self.target_usize_max();
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::GenericInstantiationError,
+                                        len_expr.span,
+                                        format!(
+                                            "array length {} out of range for 'usize' on {}-bit target '{}' (0..={max_u})",
+                                            val, self.target_ptr_bits, self.target_name
+                                        ),
+                                    )
+                                    .with_note(format!(
+                                        "'usize' has {}-bit pointer width (0..={max_u}) on target '{}'",
+                                        self.target_ptr_bits, self.target_name
+                                    )),
+                                );
+                                1
+                            }
+                            EvalUsizeResult::Invalid => {
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::GenericInstantiationError,
+                                        len_expr.span,
+                                        "array length must be a compile-time constant 'usize' expression",
+                                    ),
+                                );
+                                1
+                            }
                         }
                     }
                 };
@@ -2513,27 +2793,37 @@ impl<'a> Monomorphizer<'a> {
         ))
     }
 
-    fn rewrite_fn_decl(&mut self, f: &FnDecl, pre_ret: Option<TypeExpr>, env: &SubstEnv) -> FnDecl {
-        let params: Vec<Param> = f
-            .params
-            .iter()
-            .map(|p| Param {
-                ty: self.rewrite_type_expr(&p.ty, env),
-                name: p.name.clone(),
-                span: p.span,
-            })
-            .collect();
+    fn rewrite_fn_decl(
+        &mut self,
+        f: &FnDecl,
+        pre_params: Option<Vec<Param>>,
+        pre_ret: Option<TypeExpr>,
+        env: &SubstEnv,
+    ) -> FnDecl {
+        let params: Vec<Param> = pre_params.unwrap_or_else(|| {
+            f.params
+                .iter()
+                .map(|p| Param {
+                    ty: self.rewrite_type_expr(&p.ty, env),
+                    name: p.name.clone(),
+                    span: p.span,
+                })
+                .collect()
+        });
         let ret_type = pre_ret.unwrap_or_else(|| self.rewrite_type_expr(&f.ret_type, env));
         let error_spec = f.error_spec.as_ref().map(|es| match es {
             ErrorSpec::Bare(sp) => ErrorSpec::Bare(*sp),
             ErrorSpec::Typed(te) => ErrorSpec::Typed(self.rewrite_type_expr(te, env)),
         });
         let body = f.body.as_ref().map(|b| {
+            let prev_ret = self.current_ret_ty.replace(ret_type.clone());
             let mut scopes = vec![BTreeMap::new()];
             for p in &params {
                 scopes[0].insert(p.name.name.clone(), p.ty.clone());
             }
-            self.rewrite_block(b, env, &mut scopes)
+            let rb = self.rewrite_block(b, env, &mut scopes);
+            self.current_ret_ty = prev_ret;
+            rb
         });
         FnDecl {
             attrs: f.attrs.clone(),
@@ -2602,7 +2892,11 @@ impl<'a> Monomorphizer<'a> {
             StmtKind::Assign { target, op, value } => {
                 let (rt, lhs_ty) = self.rewrite_expr(target, env, scopes, None);
                 let hint = match lhs_ty {
-                    InferTy::Concrete(ref t) => Some(t),
+                    InferTy::Concrete(ref t)
+                        if !matches!(op, AssignOp::ShlAssign | AssignOp::ShrAssign) =>
+                    {
+                        Some(t)
+                    }
                     _ => None,
                 };
                 let rv = self.rewrite_expr(value, env, scopes, hint).0;
@@ -2612,10 +2906,13 @@ impl<'a> Monomorphizer<'a> {
                     value: rv,
                 }
             }
-            StmtKind::Return(opt) => StmtKind::Return(
-                opt.as_ref()
-                    .map(|e| self.rewrite_expr(e, env, scopes, None).0),
-            ),
+            StmtKind::Return(opt) => {
+                let ret_hint = self.current_ret_ty.clone();
+                StmtKind::Return(
+                    opt.as_ref()
+                        .map(|e| self.rewrite_expr(e, env, scopes, ret_hint.as_ref()).0),
+                )
+            }
             StmtKind::Error { reason, partial } => StmtKind::Error {
                 reason: reason
                     .as_ref()
@@ -2915,6 +3212,13 @@ impl<'a> Monomorphizer<'a> {
                 // Likewise a local shadows a same-named generic `fn` template, so only a bare
                 // reference that actually resolves to the template is an `E0029`.
                 if !scopes_contain(scopes, &id.name) && self.fn_templates.contains_key(&id.name) {
+                    if let Some(cand) = self
+                        .bare_cand_by_callee
+                        .get(&(env.prog_idx, expr.span.start, expr.span.end))
+                        .cloned()
+                    {
+                        return self.emit_bare_generic_call_error(env, &cand);
+                    }
                     self.emit(
                         &env.file,
                         Diagnostic::new(
@@ -2934,7 +3238,12 @@ impl<'a> Monomorphizer<'a> {
             ExprKind::Priority(_) => (expr.clone(), InferTy::Unknown),
 
             ExprKind::Unary { op, expr: inner } => {
-                let (ri, inner_ty) = self.rewrite_expr(inner, env, scopes, None);
+                let inner_hint = if matches!(op, UnaryOp::Neg | UnaryOp::BitNot) {
+                    expected_ty.filter(|t| is_int_type_expr(t) || is_float_type_expr(t))
+                } else {
+                    None
+                };
+                let (ri, inner_ty) = self.rewrite_expr(inner, env, scopes, inner_hint);
                 let out_ty = match op {
                     UnaryOp::AddrOf => match inner_ty {
                         InferTy::Concrete(ct) => {
@@ -2967,8 +3276,48 @@ impl<'a> Monomorphizer<'a> {
             }
 
             ExprKind::Binary { op, lhs, rhs } => {
-                let (rl, lt) = self.rewrite_expr(lhs, env, scopes, None);
-                let (rr, rt) = self.rewrite_expr(rhs, env, scopes, None);
+                if *op == BinaryOp::Gt {
+                    let mut cur: &Expr = lhs;
+                    while let ExprKind::Binary { lhs: inner_lhs, .. } = &cur.kind {
+                        cur = inner_lhs;
+                    }
+                    if let Some(cand) = self
+                        .bare_cand_by_callee
+                        .get(&(env.prog_idx, cur.span.start, cur.span.end))
+                        .cloned()
+                    {
+                        if lhs.span.end < cand.full_span.end
+                            && self
+                                .resolve_candidate_generic_fn(cur, env, scopes)
+                                .is_some()
+                        {
+                            return self.emit_bare_generic_call_error(env, &cand);
+                        }
+                    }
+                }
+                let scalar_dest =
+                    expected_ty.filter(|t| is_int_type_expr(t) || is_float_type_expr(t));
+                let (lhs_hint, rhs_hint) = match op {
+                    BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Rem
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitXor => (scalar_dest, scalar_dest),
+                    BinaryOp::Shl | BinaryOp::Shr => (scalar_dest, None),
+                    BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::And
+                    | BinaryOp::Or => (None, None),
+                };
+                let (rl, lt) = self.rewrite_expr(lhs, env, scopes, lhs_hint);
+                let (rr, rt) = self.rewrite_expr(rhs, env, scopes, rhs_hint);
                 let out_ty = match op {
                     BinaryOp::Eq
                     | BinaryOp::Ne
@@ -3017,6 +3366,18 @@ impl<'a> Monomorphizer<'a> {
             }
 
             ExprKind::Field { target, field } => {
+                if let Some(cand) = self
+                    .bare_cand_by_callee
+                    .get(&(env.prog_idx, expr.span.start, expr.span.end))
+                    .cloned()
+                {
+                    if self
+                        .resolve_candidate_generic_fn(expr, env, scopes)
+                        .is_some()
+                    {
+                        return self.emit_bare_generic_call_error(env, &cand);
+                    }
+                }
                 // Note: If `target` is a generic type name `TypeName` in `TypeName.from_bytes` or `Enum::Variant`:
                 let (rt, base_ty) = self.rewrite_expr(target, env, scopes, None);
                 let mut out_ty = InferTy::Unknown;
@@ -3069,7 +3430,8 @@ impl<'a> Monomorphizer<'a> {
 
             ExprKind::Index { target, index } => {
                 let (rt, bt) = self.rewrite_expr(target, env, scopes, None);
-                let (ri, _) = self.rewrite_expr(index, env, scopes, None);
+                let usize_ty = TypeExpr::new(TypeKind::Prim(PrimType::Usize), index.span);
+                let (ri, _) = self.rewrite_expr(index, env, scopes, Some(&usize_ty));
                 let out_ty = match bt {
                     InferTy::Concrete(TypeExpr {
                         kind: TypeKind::Slice(elem) | TypeKind::Array { elem, .. },
@@ -3091,12 +3453,13 @@ impl<'a> Monomorphizer<'a> {
 
             ExprKind::Slice { target, start, end } => {
                 let (rt, bt) = self.rewrite_expr(target, env, scopes, None);
+                let usize_ty = TypeExpr::new(TypeKind::Prim(PrimType::Usize), expr.span);
                 let rs = start
                     .as_ref()
-                    .map(|s| Box::new(self.rewrite_expr(s, env, scopes, None).0));
+                    .map(|s| Box::new(self.rewrite_expr(s, env, scopes, Some(&usize_ty)).0));
                 let re = end
                     .as_ref()
-                    .map(|e| Box::new(self.rewrite_expr(e, env, scopes, None).0));
+                    .map(|e| Box::new(self.rewrite_expr(e, env, scopes, Some(&usize_ty)).0));
                 let out_ty = match bt {
                     InferTy::Concrete(ct) => {
                         let inner_deref: &TypeExpr = match &ct.kind {
@@ -3147,19 +3510,7 @@ impl<'a> Monomorphizer<'a> {
 
                 let mut resolved_struct_name = eff_name.name.clone();
                 if let Some(tmpl) = self.struct_templates.get(&eff_name.name).cloned() {
-                    let mut rewritten_fields = Vec::with_capacity(fields.len());
-                    let mut field_tys = BTreeMap::new();
-                    for fi in fields {
-                        let (rv, fty) = self.rewrite_expr(&fi.value, env, scopes, None);
-                        field_tys.insert(fi.name.name.clone(), fty);
-                        rewritten_fields.push(FieldInit {
-                            name: fi.name.clone(),
-                            value: rv,
-                            span: fi.span,
-                        });
-                    }
-
-                    let resolved_gargs = if !generic_args.is_empty() {
+                    let pre_explicit_gargs = if !generic_args.is_empty() {
                         self.resolve_explicit_generic_args(
                             &eff_name.name,
                             &tmpl.decl.generic_params,
@@ -3172,17 +3523,56 @@ impl<'a> Monomorphizer<'a> {
                         ..
                     }) = expected_ty
                     {
-                        if let Some((orig, inst_args)) =
-                            self.instantiated_struct_args.get(&exp_id.name).cloned()
-                        {
-                            if orig == eff_name.name {
-                                Some(inst_args)
-                            } else {
-                                self.infer_struct_lit_args(&tmpl.decl, &field_tys, env, expr.span)
+                        self.instantiated_struct_args
+                            .get(&exp_id.name)
+                            .filter(|(orig, _)| orig == &eff_name.name)
+                            .map(|(_, inst_args)| inst_args.clone())
+                    } else {
+                        None
+                    };
+
+                    let mut field_hints: BTreeMap<String, TypeExpr> = BTreeMap::new();
+                    if let Some(ref pre_args) = pre_explicit_gargs {
+                        let mut f_env = SubstEnv {
+                            types: BTreeMap::new(),
+                            consts: BTreeMap::new(),
+                            depth: env.depth,
+                            prog_idx: tmpl.prog_idx,
+                            file: tmpl.file.clone(),
+                        };
+                        for (gp, ra) in tmpl.decl.generic_params.iter().zip(pre_args.iter()) {
+                            match (gp.kind, ra) {
+                                (GenericParamKind::Type, ResolvedGenArg::Type(te)) => {
+                                    f_env.types.insert(gp.name.name.clone(), te.clone());
+                                }
+                                (GenericParamKind::ConstUsize, ResolvedGenArg::Const(n)) => {
+                                    f_env.consts.insert(gp.name.name.clone(), *n);
+                                }
+                                _ => {}
                             }
-                        } else {
-                            self.infer_struct_lit_args(&tmpl.decl, &field_tys, env, expr.span)
                         }
+                        for sf in &tmpl.decl.fields {
+                            let ft = self.rewrite_type_expr(&sf.ty, &f_env);
+                            field_hints.insert(sf.name.name.clone(), ft);
+                        }
+                    }
+
+                    let mut rewritten_fields = Vec::with_capacity(fields.len());
+                    let mut field_tys = BTreeMap::new();
+                    for fi in fields {
+                        let f_hint = field_hints.get(&fi.name.name);
+                        let (rv, fty) = self.rewrite_expr(&fi.value, env, scopes, f_hint);
+                        field_tys.insert(fi.name.name.clone(), fty);
+                        rewritten_fields.push(FieldInit {
+                            name: fi.name.clone(),
+                            value: rv,
+                            span: fi.span,
+                        });
+                    }
+
+                    let resolved_gargs = if !generic_args.is_empty() || pre_explicit_gargs.is_some()
+                    {
+                        pre_explicit_gargs
                     } else {
                         self.infer_struct_lit_args(&tmpl.decl, &field_tys, env, expr.span)
                     };
@@ -3312,7 +3702,15 @@ impl<'a> Monomorphizer<'a> {
                 callee,
                 generic_args,
                 args,
-            } => self.rewrite_call_expr(callee, generic_args, args, expr.span, env, scopes),
+            } => self.rewrite_call_expr(
+                callee,
+                generic_args,
+                args,
+                expr.span,
+                env,
+                scopes,
+                expected_ty,
+            ),
 
             ExprKind::MethodCall {
                 receiver,
@@ -3337,11 +3735,69 @@ impl<'a> Monomorphizer<'a> {
                     self.rewrite_expr(receiver, env, scopes, None)
                 };
 
+                let mut pos_param_hints: Vec<Option<TypeExpr>> = Vec::new();
+                if let ExprKind::Ident(id) = &rr.kind {
+                    if !scopes_contain(scopes, &id.name) {
+                        if let Some(info) = self
+                            .concrete_methods
+                            .get(&(id.name.clone(), method.name.clone()))
+                        {
+                            if info.receiver.is_none() {
+                                if let Some(ps) = self.non_generic_fn_params.get(&info.fn_name) {
+                                    pos_param_hints = ps.iter().cloned().map(Some).collect();
+                                }
+                            }
+                        }
+                    }
+                } else if let InferTy::Concrete(ct) = &r_ty {
+                    let deref = match &ct.kind {
+                        TypeKind::Ptr(inner) => inner.as_ref(),
+                        _ => ct,
+                    };
+                    match &deref.kind {
+                        TypeKind::Named(s) => {
+                            if let Some(info) = self
+                                .concrete_methods
+                                .get(&(s.name.clone(), method.name.clone()))
+                            {
+                                if let Some(ps) = self.non_generic_fn_params.get(&info.fn_name) {
+                                    let skip = usize::from(info.receiver.is_some());
+                                    pos_param_hints =
+                                        ps.iter().skip(skip).cloned().map(Some).collect();
+                                }
+                            }
+                        }
+                        TypeKind::OsPrimitive(os) => match (os, method.name.as_str()) {
+                            (
+                                OsPrimitiveType::Watch { elem } | OsPrimitiveType::Guarded { elem },
+                                "publish" | "set",
+                            )
+                            | (
+                                OsPrimitiveType::Inbox { elem, .. }
+                                | OsPrimitiveType::InboxUnsized { elem },
+                                "post" | "send",
+                            ) => {
+                                pos_param_hints.push(Some((**elem).clone()));
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+
                 let mut r_args = Vec::with_capacity(args.len());
+                let mut pos_idx = 0usize;
                 for a in args {
+                    let arg_hint = if a.name.is_none() {
+                        let h = pos_param_hints.get(pos_idx).and_then(|o| o.as_ref());
+                        pos_idx += 1;
+                        h
+                    } else {
+                        None
+                    };
                     r_args.push(CallArg {
                         name: a.name.clone(),
-                        value: self.rewrite_expr(&a.value, env, scopes, None).0,
+                        value: self.rewrite_expr(&a.value, env, scopes, arg_hint).0,
                         span: a.span,
                     });
                 }
@@ -3763,6 +4219,7 @@ impl<'a> Monomorphizer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn rewrite_call_expr(
         &mut self,
         callee: &Expr,
@@ -3771,25 +4228,12 @@ impl<'a> Monomorphizer<'a> {
         span: Span,
         env: &SubstEnv,
         scopes: &mut Vec<BTreeMap<String, TypeExpr>>,
+        expected_ty: Option<&TypeExpr>,
     ) -> (Expr, InferTy) {
-        let mut r_args = Vec::with_capacity(args.len());
-        let mut pos_arg_tys = Vec::new();
-        for a in args {
-            let (rv, aty) = self.rewrite_expr(&a.value, env, scopes, None);
-            if a.name.is_none() {
-                pos_arg_tys.push(aty);
-            }
-            r_args.push(CallArg {
-                name: a.name.clone(),
-                value: rv,
-                span: a.span,
-            });
-        }
-
         const PAREN_CMP_NOTE: &str = "if `<` and `>` were intended as comparisons rather than generic arguments, parenthesize them: e.g. `f((a < b), (c > (d)))`";
 
-        // Extract target generic function name (`clamp(...)` or `mod.clamp<f32>(...)`).
-        // A local (e.g. a `fn(...)` pointer) shadowing a generic template is an indirect call.
+        // Extract target generic or concrete function name (`clamp(...)` or `mod.clamp<f32>(...)`)
+        // before rewriting arguments so parameter destination hints flow into `args`.
         let direct_fn_ident: Option<Ident> = match &callee.kind {
             ExprKind::Ident(id) if !scopes_contain(scopes, &id.name) => Some(id.clone()),
             ExprKind::Field { target, field } => {
@@ -3797,7 +4241,8 @@ impl<'a> Monomorphizer<'a> {
                     if matches!(
                         self.lookup_scope_ty(&base_id.name, env, scopes),
                         InferTy::Unknown
-                    ) && self.fn_templates.contains_key(&field.name)
+                    ) && (self.fn_templates.contains_key(&field.name)
+                        || self.non_generic_fn_params.contains_key(&field.name))
                     {
                         Some(field.clone())
                     } else {
@@ -3810,18 +4255,116 @@ impl<'a> Monomorphizer<'a> {
             _ => None,
         };
 
+        let tmpl_opt = direct_fn_ident
+            .as_ref()
+            .and_then(|fn_id| self.fn_templates.get(&fn_id.name).cloned());
+
+        let pre_explicit_gargs = if let (Some(fn_id), Some(tmpl)) = (&direct_fn_ident, &tmpl_opt) {
+            if !generic_args.is_empty() {
+                self.resolve_explicit_generic_args(
+                    &fn_id.name,
+                    &tmpl.decl.generic_params,
+                    generic_args,
+                    env,
+                    span,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let pos_param_hints: Vec<Option<TypeExpr>> = if let Some(tmpl) = &tmpl_opt {
+            if let Some(ref r_gargs) = pre_explicit_gargs {
+                let mut p_env = SubstEnv {
+                    types: BTreeMap::new(),
+                    consts: BTreeMap::new(),
+                    depth: env.depth,
+                    prog_idx: tmpl.prog_idx,
+                    file: tmpl.file.clone(),
+                };
+                for (gp, ra) in tmpl.decl.generic_params.iter().zip(r_gargs.iter()) {
+                    match (gp.kind, ra) {
+                        (GenericParamKind::Type, ResolvedGenArg::Type(te)) => {
+                            p_env.types.insert(gp.name.name.clone(), te.clone());
+                        }
+                        (GenericParamKind::ConstUsize, ResolvedGenArg::Const(n)) => {
+                            p_env.consts.insert(gp.name.name.clone(), *n);
+                        }
+                        _ => {}
+                    }
+                }
+                tmpl.decl
+                    .params
+                    .iter()
+                    .map(|p| Some(self.rewrite_type_expr(&p.ty, &p_env)))
+                    .collect()
+            } else if generic_args.is_empty() {
+                let gp_names: BTreeSet<String> = tmpl
+                    .decl
+                    .generic_params
+                    .iter()
+                    .map(|g| g.name.name.clone())
+                    .collect();
+                tmpl.decl
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if type_mentions_generic_param(&p.ty, &gp_names) {
+                            None
+                        } else {
+                            Some(self.rewrite_type_expr(&p.ty, env))
+                        }
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else if let Some(fn_id) = &direct_fn_ident {
+            self.non_generic_fn_params
+                .get(&fn_id.name)
+                .map(|ps| ps.iter().cloned().map(Some).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let mut r_args = Vec::with_capacity(args.len());
+        let mut pos_arg_tys = Vec::new();
+        let mut pos_idx = 0usize;
+        for a in args {
+            let arg_hint = if a.name.is_none() {
+                let h = pos_param_hints.get(pos_idx).and_then(|o| o.as_ref());
+                pos_idx += 1;
+                h
+            } else {
+                None
+            };
+            let (rv, aty) = self.rewrite_expr(&a.value, env, scopes, arg_hint);
+            if a.name.is_none() {
+                pos_arg_tys.push(aty);
+            }
+            r_args.push(CallArg {
+                name: a.name.clone(),
+                value: rv,
+                span: a.span,
+            });
+        }
+
         if let Some(fn_id) = direct_fn_ident {
-            if let Some(tmpl) = self.fn_templates.get(&fn_id.name).cloned() {
+            if let Some(tmpl) = tmpl_opt {
                 let resolved_gargs = if !generic_args.is_empty() {
-                    self.resolve_explicit_generic_args(
-                        &fn_id.name,
-                        &tmpl.decl.generic_params,
-                        generic_args,
+                    pre_explicit_gargs
+                } else {
+                    self.infer_fn_generic_args(
+                        &tmpl.decl,
+                        &r_args,
+                        &pos_arg_tys,
+                        expected_ty,
                         env,
                         span,
                     )
-                } else {
-                    self.infer_fn_generic_args(&tmpl.decl, &pos_arg_tys, env, span)
                 };
 
                 if let Some(r_gargs) = resolved_gargs {
@@ -3971,10 +4514,13 @@ impl<'a> Monomorphizer<'a> {
     // Generic Argument Unification / Inference (`clamp(x, 0.0, 1.0)`, `push(&vec, 42)`)
     // ─────────────────────────────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     fn infer_fn_generic_args(
         &mut self,
         f: &FnDecl,
+        r_args: &[CallArg],
         arg_tys: &[InferTy],
+        expected_ty: Option<&TypeExpr>,
         env: &SubstEnv,
         call_span: Span,
     ) -> Option<Vec<ResolvedGenArg>> {
@@ -4010,14 +4556,129 @@ impl<'a> Monomorphizer<'a> {
             return None;
         }
 
-        self.materialize_inferred_args(
+        if let Some(exp_te) = expected_ty {
+            self.refine_literal_type_params_from_ret(
+                &f.ret_type,
+                exp_te,
+                &param_kinds,
+                &mut inferred_types,
+            );
+        }
+
+        let mut defaulted_params = Vec::new();
+        for (idx, gp) in f.generic_params.iter().enumerate() {
+            if gp.kind == GenericParamKind::Type {
+                match inferred_types.get(&gp.name.name) {
+                    Some(InferTy::IntLit) => {
+                        defaulted_params.push((idx, gp.name.name.clone(), PrimType::I32));
+                    }
+                    Some(InferTy::FloatLit) => {
+                        defaulted_params.push((idx, gp.name.name.clone(), PrimType::F64));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let out = self.materialize_inferred_args(
             &f.name.name,
             &f.generic_params,
             &inferred_types,
             &inferred_consts,
             env,
             call_span,
-        )
+        )?;
+
+        if !defaulted_params.is_empty() {
+            let resolved_arg_strs = out.iter().map(|a| self.format_human_arg(a)).collect();
+            self.defaulted_calls.push(DefaultedGenericCall {
+                prog_idx: env.prog_idx,
+                call_span,
+                fn_name: f.name.name.clone(),
+                resolved_arg_strs,
+                defaulted_params,
+                call_args_preview: format_call_args_preview(r_args),
+            });
+        }
+
+        Some(out)
+    }
+
+    fn refine_literal_type_params_from_ret(
+        &self,
+        ret_pat: &TypeExpr,
+        exp_te: &TypeExpr,
+        param_kinds: &BTreeMap<String, GenericParamKind>,
+        inferred_types: &mut BTreeMap<String, InferTy>,
+    ) {
+        match (&ret_pat.kind, &exp_te.kind) {
+            (TypeKind::Named(tp), _)
+                if param_kinds.get(&tp.name) == Some(&GenericParamKind::Type) =>
+            {
+                match inferred_types.get(&tp.name) {
+                    Some(InferTy::IntLit) if is_int_type_expr(exp_te) => {
+                        inferred_types.insert(tp.name.clone(), InferTy::Concrete(exp_te.clone()));
+                    }
+                    Some(InferTy::FloatLit) if is_float_type_expr(exp_te) => {
+                        inferred_types.insert(tp.name.clone(), InferTy::Concrete(exp_te.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            (TypeKind::Ptr(p_in), TypeKind::Ptr(e_in))
+            | (TypeKind::Slice(p_in), TypeKind::Slice(e_in))
+            | (TypeKind::Lease(p_in), TypeKind::Lease(e_in)) => {
+                self.refine_literal_type_params_from_ret(p_in, e_in, param_kinds, inferred_types);
+            }
+            (TypeKind::Array { elem: pe, .. }, TypeKind::Array { elem: ee, .. }) => {
+                self.refine_literal_type_params_from_ret(pe, ee, param_kinds, inferred_types);
+            }
+            (TypeKind::Generic { base, args }, TypeKind::Named(mangled)) => {
+                if let Some((orig, inst_args)) = self.instantiated_struct_args.get(&mangled.name) {
+                    if orig == &base.name && args.len() == inst_args.len() {
+                        for (pa, ea) in args.iter().zip(inst_args.iter()) {
+                            if let (GenericArg::Type(pt), ResolvedGenArg::Type(et)) = (pa, ea) {
+                                self.refine_literal_type_params_from_ret(
+                                    pt,
+                                    et,
+                                    param_kinds,
+                                    inferred_types,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            (TypeKind::OsPrimitive(po), TypeKind::OsPrimitive(eo)) => match (po, eo) {
+                (OsPrimitiveType::Watch { elem: pe }, OsPrimitiveType::Watch { elem: ee })
+                | (OsPrimitiveType::Guarded { elem: pe }, OsPrimitiveType::Guarded { elem: ee })
+                | (OsPrimitiveType::DmaSlot { elem: pe }, OsPrimitiveType::DmaSlot { elem: ee })
+                | (
+                    OsPrimitiveType::InboxUnsized { elem: pe },
+                    OsPrimitiveType::InboxUnsized { elem: ee },
+                )
+                | (
+                    OsPrimitiveType::InboxUnsized { elem: pe },
+                    OsPrimitiveType::Inbox { elem: ee, .. },
+                )
+                | (
+                    OsPrimitiveType::Inbox { elem: pe, .. },
+                    OsPrimitiveType::Inbox { elem: ee, .. },
+                )
+                | (
+                    OsPrimitiveType::PingPong { elem: pe, .. },
+                    OsPrimitiveType::PingPong { elem: ee, .. },
+                )
+                | (
+                    OsPrimitiveType::Pool { elem: pe, .. },
+                    OsPrimitiveType::Pool { elem: ee, .. },
+                ) => {
+                    self.refine_literal_type_params_from_ret(pe, ee, param_kinds, inferred_types);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
     }
 
     fn infer_struct_lit_args(
@@ -4546,7 +5207,7 @@ fn scopes_contain(scopes: &[BTreeMap<String, TypeExpr>], name: &str) -> bool {
     scopes.iter().any(|sc| sc.contains_key(name))
 }
 
-pub(crate) const fn truncate_int_prim(v: i128, p: PrimType) -> i128 {
+pub(crate) const fn truncate_int_prim_bits(v: i128, p: PrimType, ptr_bits: u32) -> i128 {
     match p {
         PrimType::U8 => (v as u8) as i128,
         PrimType::I8 => (v as i8) as i128,
@@ -4554,8 +5215,26 @@ pub(crate) const fn truncate_int_prim(v: i128, p: PrimType) -> i128 {
         PrimType::I16 => (v as i16) as i128,
         PrimType::U32 | PrimType::U32Be | PrimType::U32Le => (v as u32) as i128,
         PrimType::I32 => (v as i32) as i128,
-        PrimType::U64 | PrimType::U64Be | PrimType::U64Le | PrimType::Usize => (v as u64) as i128,
-        PrimType::I64 | PrimType::Isize => (v as i64) as i128,
+        PrimType::U64 | PrimType::U64Be | PrimType::U64Le => (v as u64) as i128,
+        PrimType::I64 => (v as i64) as i128,
+        PrimType::Usize => {
+            if ptr_bits <= 16 {
+                (v as u16) as i128
+            } else if ptr_bits <= 32 {
+                (v as u32) as i128
+            } else {
+                (v as u64) as i128
+            }
+        }
+        PrimType::Isize => {
+            if ptr_bits <= 16 {
+                (v as i16) as i128
+            } else if ptr_bits <= 32 {
+                (v as i32) as i128
+            } else {
+                (v as i64) as i128
+            }
+        }
         PrimType::Bool => (v != 0) as i128,
         PrimType::F32 | PrimType::F64 | PrimType::Void => v,
     }
@@ -4574,4 +5253,101 @@ fn int_type_rank(te: &TypeExpr) -> usize {
         TypeKind::Prim(p) => p.byte_size(4),
         _ => 0,
     }
+}
+
+fn type_mentions_generic_param(te: &TypeExpr, gp_names: &BTreeSet<String>) -> bool {
+    match &te.kind {
+        TypeKind::Prim(_) => false,
+        TypeKind::Named(id) => gp_names.contains(&id.name),
+        TypeKind::Path(_) => false,
+        TypeKind::Ptr(in_t) | TypeKind::Slice(in_t) | TypeKind::Lease(in_t) => {
+            type_mentions_generic_param(in_t, gp_names)
+        }
+        TypeKind::Array { elem, len } => {
+            type_mentions_generic_param(elem, gp_names)
+                || matches!(len, ArrayLen::Expr(e) if expr_mentions_generic_param(e, gp_names))
+        }
+        TypeKind::Generic { args, .. } | TypeKind::GenericPath { args, .. } => {
+            args.iter().any(|a| match a {
+                GenericArg::Type(t) => type_mentions_generic_param(t, gp_names),
+                GenericArg::Const(e) => expr_mentions_generic_param(e, gp_names),
+            })
+        }
+        TypeKind::OsPrimitive(os) => match os {
+            OsPrimitiveType::Signal
+            | OsPrimitiveType::WaitQueue
+            | OsPrimitiveType::ByteRing { .. }
+            | OsPrimitiveType::ByteRingUnsized => false,
+            OsPrimitiveType::Watch { elem }
+            | OsPrimitiveType::Guarded { elem }
+            | OsPrimitiveType::InboxUnsized { elem }
+            | OsPrimitiveType::DmaSlot { elem }
+            | OsPrimitiveType::Inbox { elem, .. }
+            | OsPrimitiveType::PingPong { elem, .. }
+            | OsPrimitiveType::Pool { elem, .. } => type_mentions_generic_param(elem, gp_names),
+        },
+        TypeKind::FnPtr { params, ret } => {
+            params
+                .iter()
+                .any(|p| type_mentions_generic_param(p, gp_names))
+                || type_mentions_generic_param(ret, gp_names)
+        }
+    }
+}
+
+fn expr_mentions_generic_param(e: &Expr, gp_names: &BTreeSet<String>) -> bool {
+    match &e.kind {
+        ExprKind::Ident(id) => gp_names.contains(&id.name),
+        ExprKind::Unary { expr: inner, .. } | ExprKind::Cast { expr: inner, .. } => {
+            expr_mentions_generic_param(inner, gp_names)
+        }
+        ExprKind::Binary { lhs, rhs, .. } => {
+            expr_mentions_generic_param(lhs, gp_names) || expr_mentions_generic_param(rhs, gp_names)
+        }
+        _ => false,
+    }
+}
+
+fn format_expr_preview(e: &Expr) -> String {
+    match &e.kind {
+        ExprKind::Literal(Literal::Int { value, suffix }) => {
+            suffix.map_or_else(|| value.to_string(), |p| format!("{value}{}", p.as_str()))
+        }
+        ExprKind::Literal(Literal::Float { bits, suffix }) => {
+            let v = f64::from_bits(*bits);
+            suffix.map_or_else(|| format!("{v}"), |p| format!("{v}{}", p.as_str()))
+        }
+        ExprKind::Literal(Literal::Bool(b)) => b.to_string(),
+        ExprKind::Ident(id) => id.name.clone(),
+        ExprKind::Unary { op, expr } => {
+            let s = match op {
+                UnaryOp::Neg => "-",
+                UnaryOp::Not => "!",
+                UnaryOp::BitNot => "~",
+                UnaryOp::AddrOf => "&",
+                UnaryOp::Deref => "*",
+            };
+            format!("{s}{}", format_expr_preview(expr))
+        }
+        ExprKind::Binary { op, lhs, rhs } => format!(
+            "{} {} {}",
+            format_expr_preview(lhs),
+            op.as_str(),
+            format_expr_preview(rhs)
+        ),
+        _ => "...".to_string(),
+    }
+}
+
+fn format_call_args_preview(args: &[CallArg]) -> String {
+    args.iter()
+        .map(|a| {
+            let val = format_expr_preview(&a.value);
+            match &a.name {
+                Some(n) => format!("{}: {val}", n.name),
+                None => val,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }

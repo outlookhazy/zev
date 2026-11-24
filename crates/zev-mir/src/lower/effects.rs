@@ -1563,11 +1563,14 @@ pub(super) fn lower_main_entry<'a>(
                     let mut pre_stmts = Vec::new();
                     let mut largs = Vec::new();
                     for (i, a) in args.iter().enumerate() {
-                        largs.push(dctx.lower_expr_with_stmts(
-                            &a.value,
-                            fn_sig.params.get(i),
-                            &mut pre_stmts,
-                        )?);
+                        let exp = fn_sig.params.get(i);
+                        let raw = dctx.lower_expr_with_stmts(&a.value, exp, &mut pre_stmts)?;
+                        let coerced = if let Some(pty) = exp {
+                            coerce_call_arg_expr(raw, pty)
+                        } else {
+                            raw
+                        };
+                        largs.push(coerced);
                     }
                     for ps in pre_stmts {
                         boot_steps.push(MirBootStep::Stmt(Box::new(ps)));
@@ -1601,11 +1604,14 @@ pub(super) fn lower_main_entry<'a>(
                     let mut pre_stmts = Vec::new();
                     let mut largs = Vec::new();
                     for (i, a) in args.iter().enumerate() {
-                        largs.push(dctx.lower_expr_with_stmts(
-                            &a.value,
-                            fn_sig.params.get(i),
-                            &mut pre_stmts,
-                        )?);
+                        let exp = fn_sig.params.get(i);
+                        let raw = dctx.lower_expr_with_stmts(&a.value, exp, &mut pre_stmts)?;
+                        let coerced = if let Some(pty) = exp {
+                            coerce_call_arg_expr(raw, pty)
+                        } else {
+                            raw
+                        };
+                        largs.push(coerced);
                     }
                     for ps in pre_stmts {
                         boot_steps.push(MirBootStep::Stmt(Box::new(ps)));

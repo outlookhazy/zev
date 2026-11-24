@@ -315,7 +315,8 @@ pub(super) fn resolve_mmio_lvalue_be<B: LowerBackend>(
                     span: target.span,
                 });
             }
-            let idx = be.lower_sub(idx_ast, Some(&MirType::Usize))?;
+            let raw_idx = be.lower_sub(idx_ast, Some(&MirType::Usize))?;
+            let idx = coerce_expr_if_needed(raw_idx, &MirType::Usize);
             Ok(Some((base, reg, Some(idx))))
         }
         _ => Ok(None),
@@ -909,6 +910,105 @@ pub(super) fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirEx
     }
 }
 
+pub(super) fn coerce_call_arg_expr(arg: MirExpr, param_ty: &MirType) -> MirExpr {
+    if let (MirType::Array { elem, len }, MirType::Slice(_), MirExprKind::Var(vid)) =
+        (&arg.ty, param_ty, &arg.kind)
+    {
+        return MirExpr::new(
+            MirExprKind::ArrayToSlice {
+                array_place: Box::new(MirPlace::Var(*vid)),
+                len: *len,
+                elem_ty: *elem.clone(),
+            },
+            param_ty.clone(),
+        );
+    }
+    if let (MirType::Array { elem, len }, MirType::Slice(_)) = (&arg.ty, param_ty) {
+        if is_rodata_const_mir_expr(&arg) {
+            let e_ty = *elem.clone();
+            let n = *len;
+            return MirExpr::new(
+                MirExprKind::SubSlice {
+                    base: Box::new(arg),
+                    start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                    end: Box::new(MirExpr::new(MirExprKind::IntLit(n as i128), MirType::Usize)),
+                    elem_ty: e_ty,
+                    base_is_array: true,
+                },
+                param_ty.clone(),
+            );
+        }
+    }
+    coerce_expr_if_needed(arg, param_ty)
+}
+
+fn is_pure_untyped_int_ast(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(Literal::Int { suffix: None, .. }) => true,
+        ExprKind::Unary {
+            op: UnaryOp::Neg | UnaryOp::BitNot,
+            expr: inner,
+        } => is_pure_untyped_int_ast(inner),
+        ExprKind::Binary { op, lhs, rhs } => {
+            if matches!(op, BinaryOp::Shl | BinaryOp::Shr) {
+                is_pure_untyped_int_ast(lhs) && is_pure_untyped_int_ast(rhs)
+            } else {
+                !matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Ne
+                        | BinaryOp::Lt
+                        | BinaryOp::Le
+                        | BinaryOp::Gt
+                        | BinaryOp::Ge
+                        | BinaryOp::And
+                        | BinaryOp::Or
+                ) && is_pure_untyped_int_ast(lhs)
+                    && is_pure_untyped_int_ast(rhs)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn is_pure_untyped_float_ast(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Literal(Literal::Float { suffix: None, .. }) => true,
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            expr: inner,
+        } => is_pure_untyped_float_ast(inner),
+        ExprKind::Binary { op, lhs, rhs } => {
+            !matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::Ne
+                    | BinaryOp::Lt
+                    | BinaryOp::Le
+                    | BinaryOp::Gt
+                    | BinaryOp::Ge
+                    | BinaryOp::And
+                    | BinaryOp::Or
+            ) && is_pure_untyped_float_ast(lhs)
+                && is_pure_untyped_float_ast(rhs)
+        }
+        _ => false,
+    }
+}
+
+fn unify_array_mir_types(lhs: &MirType, rhs: &MirType) -> MirType {
+    if is_scalar_int_mir_type(lhs) && is_scalar_int_mir_type(rhs) {
+        unify_mir_int_types(lhs, rhs)
+    } else if matches!(
+        (lhs.host_value_type(), rhs.host_value_type()),
+        (MirType::F32, MirType::F64) | (MirType::F64, MirType::F32)
+    ) {
+        MirType::F64
+    } else {
+        lhs.host_value_type()
+    }
+}
+
 pub(super) fn lower_leaf_expr(
     expr: &Expr,
     expected: Option<&MirType>,
@@ -1246,18 +1346,21 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                 ));
             }
             let base = be.lower_sub(target, None)?;
-            let idx = be.lower_sub(index, Some(&MirType::Usize))?;
+            let raw_idx = be.lower_sub(index, Some(&MirType::Usize))?;
+            let idx = coerce_expr_if_needed(raw_idx, &MirType::Usize);
             finish_index(base, idx, expr.span)
         }
         ExprKind::Slice { target, start, end } => {
             let s = if let Some(se) = start {
-                be.lower_sub(se, Some(&MirType::Usize))?
+                let raw_s = be.lower_sub(se, Some(&MirType::Usize))?;
+                coerce_expr_if_needed(raw_s, &MirType::Usize)
             } else {
                 MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)
             };
             if let Ok((place, MirType::Array { elem, len })) = be.lower_place_be(target) {
                 let e = if let Some(ee) = end {
-                    be.lower_sub(ee, Some(&MirType::Usize))?
+                    let raw_e = be.lower_sub(ee, Some(&MirType::Usize))?;
+                    coerce_expr_if_needed(raw_e, &MirType::Usize)
                 } else {
                     MirExpr::new(MirExprKind::IntLit(len as i128), MirType::Usize)
                 };
@@ -1288,7 +1391,8 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             };
             let base_is_array = array_len.is_some();
             let e = if let Some(ee) = end {
-                be.lower_sub(ee, Some(&MirType::Usize))?
+                let raw_e = be.lower_sub(ee, Some(&MirType::Usize))?;
+                coerce_expr_if_needed(raw_e, &MirType::Usize)
             } else if let Some(len) = array_len {
                 MirExpr::new(MirExprKind::IntLit(len as i128), MirType::Usize)
             } else {
@@ -1349,15 +1453,56 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             ))
         }
         ExprKind::ArrayLit(elems) => {
-            let elem_ty = match expected {
-                Some(MirType::Array { elem, .. }) | Some(MirType::Slice(elem)) => *elem.clone(),
-                _ => MirType::U8,
-            };
-            let mut melems = Vec::new();
-            for el in elems {
-                let me = be.lower_sub(el, Some(&elem_ty))?;
-                melems.push(coerce_expr_if_needed(me, &elem_ty));
-            }
+            let (elem_ty, melems) =
+                if let Some(MirType::Array { elem, .. } | MirType::Slice(elem)) = expected {
+                    let elem_ty = *elem.clone();
+                    let mut out = Vec::with_capacity(elems.len());
+                    for el in elems {
+                        let me = be.lower_sub(el, Some(&elem_ty))?;
+                        out.push(coerce_expr_if_needed(me, &elem_ty));
+                    }
+                    (elem_ty, out)
+                } else if elems.is_empty() {
+                    (MirType::U8, Vec::new())
+                } else {
+                    let mut raw_elems = Vec::with_capacity(elems.len());
+                    let mut inferred: Option<MirType> = None;
+                    for el in elems {
+                        let me = be.lower_sub(el, None)?;
+                        if !is_pure_untyped_int_ast(el) && !is_pure_untyped_float_ast(el) {
+                            let hty = me.ty.host_value_type();
+                            inferred = Some(match &inferred {
+                                None => hty,
+                                Some(cur) => unify_array_mir_types(cur, &hty),
+                            });
+                        }
+                        raw_elems.push(me);
+                    }
+                    if inferred.is_none() {
+                        for (el, me) in elems.iter().zip(raw_elems.iter()) {
+                            if is_pure_untyped_float_ast(el) {
+                                inferred = Some(MirType::F64);
+                                break;
+                            }
+                            let hty = me.ty.host_value_type();
+                            inferred = Some(match &inferred {
+                                None => hty,
+                                Some(cur) => unify_array_mir_types(cur, &hty),
+                            });
+                        }
+                    }
+                    let elem_ty = inferred.unwrap_or(MirType::U8);
+                    let mut out = Vec::with_capacity(elems.len());
+                    for (el, me) in elems.iter().zip(raw_elems) {
+                        if is_pure_untyped_int_ast(el) {
+                            let re = be.lower_sub(el, Some(&elem_ty))?;
+                            out.push(coerce_expr_if_needed(re, &elem_ty));
+                        } else {
+                            out.push(coerce_expr_if_needed(me, &elem_ty));
+                        }
+                    }
+                    (elem_ty, out)
+                };
             let len = melems.len();
             Ok(MirExpr::new(
                 MirExprKind::ArrayLit {
@@ -1409,21 +1554,10 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                     }
                     for (idx, a) in args.iter().enumerate() {
                         let me = be.lower_sub(&a.value, sig.params.get(idx))?;
-                        let coerced = match (&me.ty, sig.params.get(idx), &me.kind) {
-                            (
-                                MirType::Array { elem, len },
-                                Some(MirType::Slice(_)),
-                                MirExprKind::Var(vid),
-                            ) => MirExpr::new(
-                                MirExprKind::ArrayToSlice {
-                                    array_place: Box::new(MirPlace::Var(*vid)),
-                                    len: *len,
-                                    elem_ty: *elem.clone(),
-                                },
-                                sig.params[idx].clone(),
-                            ),
-                            (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
-                            _ => me,
+                        let coerced = if let Some(pty) = sig.params.get(idx) {
+                            coerce_call_arg_expr(me, pty)
+                        } else {
+                            me
                         };
                         largs.push(consume_moved_lease_be(coerced, be));
                     }
@@ -1789,9 +1923,8 @@ pub(super) fn int_lit_fits_mir_type(v: i128, target: &MirType) -> bool {
         MirType::U32 | MirType::I32 | MirType::Enum(_) => {
             (i128::from(i32::MIN)..=i128::from(u32::MAX)).contains(&v)
         }
-        MirType::U64 | MirType::I64 => (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&v),
-        MirType::Usize | MirType::Isize => {
-            (i128::from(i16::MIN)..=i128::from(u16::MAX)).contains(&v)
+        MirType::U64 | MirType::I64 | MirType::Usize | MirType::Isize => {
+            (i128::from(i64::MIN)..=i128::from(u64::MAX)).contains(&v)
         }
         _ => false,
     }
@@ -2895,7 +3028,8 @@ pub(super) fn lower_place_common<B: LowerBackend>(
         }
         ExprKind::Index { target, index } => {
             let (base_place, base_ty) = lower_place_common(target, be)?;
-            let idx = be.lower_sub(index, Some(&MirType::Usize))?;
+            let raw_idx = be.lower_sub(index, Some(&MirType::Usize))?;
+            let idx = coerce_expr_if_needed(raw_idx, &MirType::Usize);
             match base_ty {
                 MirType::Slice(elem) => Ok((
                     MirPlace::Index {
@@ -2978,7 +3112,8 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                     match sys_method {
                         Some(SysMethod::UseSystick) => {
                             let hz = if let Some(first) = first_positional_arg(args) {
-                                be.lower_sub(first, Some(&MirType::U32))?
+                                let raw = be.lower_sub(first, Some(&MirType::U32))?;
+                                coerce_expr_if_needed(raw, &MirType::U32)
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(1_000_000), MirType::U32)
                             };

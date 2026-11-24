@@ -19,8 +19,9 @@ enum SupEvent { Overcurrent, BadPacket, IdleCheck }
 @dma_safe ping_pong<u8, 64> uart1_dma;
 @dma_safe ping_pong<u8, 64> uart2_dma;
 
-guarded<u16>                motor1_rpm = 0;
-guarded<u16>                motor2_rpm = 0;
+watch<u16>                  motor1_rpm = 0;
+watch<u16>                  motor2_rpm = 0;
+watch<bool>                 fault_latched = false;
 inbox<SupEvent, 8>          sup_inbox;
 
 // ── Parameterized Hardware Interrupt Handlers (zero RAM vector table) ──────
@@ -53,13 +54,13 @@ fn parse_setpoint([]u8 buf) -> u16 error ParseErr {
 }
 
 // ── Reusable Task Blueprints (do nothing until spawned; 100% static RAM) ────
-task motor_control(*guarded<u16> target_rpm, u8 pwm_ch) {
+task motor_control(*watch<u16> target_rpm, *watch<bool> fault, u8 pwm_ch) {
     i32 integral = 0;                                  // Persists across yields in static frame
 
     loop every 1ms {                                   // Drift-free periodic deadline
         u16 target = 0;
-        critical {
-            target = target_rpm.get();
+        if (!fault.read()) {
+            target = target_rpm.read();
         }
         u16 actual = adc_read_rpm(pwm_ch);             // Yields automatically until conversion done
 
@@ -70,7 +71,7 @@ task motor_control(*guarded<u16> target_rpm, u8 pwm_ch) {
     }
 }
 
-task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *guarded<u16> out_rpm) {
+task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
     loop {
         []u8 half = rx_dma.wait_chunk();               // Yields; compiler prevents DMA buffer clash
 
@@ -80,9 +81,7 @@ task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *guarded<u16> out_rpm) {
             continue;
         };
 
-        critical {
-            out_rpm.set(rpm);
-        }
+        out_rpm.publish(rpm);
     }
 }
 
@@ -103,8 +102,8 @@ fn main() {
     run_power_on_self_test();
 
     // 4. Static task instantiation (compiler allocates exact static frames per spawn):
-    spawn motor_control(&motor1_rpm, 1) @critical;
-    spawn motor_control(&motor2_rpm, 2) @critical;
+    spawn motor_control(&motor1_rpm, &fault_latched, 1) @critical;
+    spawn motor_control(&motor2_rpm, &fault_latched, 2) @critical;
     spawn fieldbus_listener(&uart1_dma, &motor1_rpm) @normal;
     spawn fieldbus_listener(&uart2_dma, &motor2_rpm) @normal;
 
@@ -118,10 +117,7 @@ fn main() {
 
         switch (ev) {
             Overcurrent => {
-                critical {
-                    motor1_rpm.set(0);
-                    motor2_rpm.set(0);
-                }
+                fault_latched.publish(true);
                 save_fault_record(bad_packets);        // Nested yielding flash write; runs @critical
             }                                          // Priority restores to @low at end of turn
             BadPacket => {

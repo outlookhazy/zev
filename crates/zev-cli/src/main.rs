@@ -41,11 +41,23 @@ fn load_and_check_detailed_with_includes(
     load_and_check_detailed_with_includes_and_targets(files, include_dirs, None, None)
 }
 
+#[cfg(test)]
 fn load_and_check_detailed_with_includes_and_targets(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
     hal_dir: Option<&str>,
     board_module: Option<&str>,
+) -> Result<CheckedBundle, CheckFailure> {
+    load_and_check_detailed_with_target(files, include_dirs, hal_dir, board_module, 64, "host")
+}
+
+fn load_and_check_detailed_with_target(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+    hal_dir: Option<&str>,
+    board_module: Option<&str>,
+    target_ptr_bits: u32,
+    target_name: &str,
 ) -> Result<CheckedBundle, CheckFailure> {
     let mut source_files: Vec<(String, PathBuf, SourceFile)> = Vec::with_capacity(files.len());
     let mut seen_canon: HashSet<PathBuf> = HashSet::with_capacity(files.len());
@@ -125,6 +137,8 @@ fn load_and_check_detailed_with_includes_and_targets(
         include_dirs: include_dirs.to_vec(),
         hal_dir: hal_dir.map(str::to_string),
         board_module: board_module.map(str::to_string),
+        target_ptr_bits,
+        target_name: target_name.to_string(),
         ..Default::default()
     };
     let out = analyze_and_monomorphize_named_programs(&named_refs, &opts);
@@ -201,6 +215,7 @@ fn load_and_check_detailed_with_includes_and_targets(
     })
 }
 
+#[cfg(test)]
 fn compile_to_mir_with_includes(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
@@ -208,22 +223,57 @@ fn compile_to_mir_with_includes(
     compile_to_mir_with_includes_and_targets(files, include_dirs, None, None)
 }
 
+#[cfg(test)]
 fn compile_to_mir_with_includes_and_targets(
     files: &[PathBuf],
     include_dirs: &[PathBuf],
     hal_dir: Option<&str>,
     board_module: Option<&str>,
 ) -> Result<(CheckedBundle, MirModule), String> {
-    let bundle = load_and_check_detailed_with_includes_and_targets(
+    compile_to_mir_with_target(files, include_dirs, hal_dir, board_module, 64, "host")
+}
+
+fn compile_to_mir_with_target(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+    hal_dir: Option<&str>,
+    board_module: Option<&str>,
+    target_ptr_bits: u32,
+    target_name: &str,
+) -> Result<(CheckedBundle, MirModule), String> {
+    let bundle = load_and_check_detailed_with_target(
         files,
         include_dirs,
         hal_dir,
         board_module,
+        target_ptr_bits,
+        target_name,
     )
     .map_err(|f| f.human)?;
     let mir = zev_mir::lower_programs(&bundle.programs)
         .map_err(|e| format!("error: {e}\n  = docs: run 'zevc doc tasks'"))?;
     Ok((bundle, mir))
+}
+
+fn target_info_from_llvm_opts(opts: Option<&zev_codegen_llvm::CodegenOptions>) -> (u32, String) {
+    let Some(o) = opts else {
+        return (64, "host".to_string());
+    };
+    if let Some(ref spec) = o.spec {
+        let name = spec
+            .board_name
+            .clone()
+            .unwrap_or_else(|| spec.chip_name.clone());
+        return (spec.ptr_bits, name);
+    }
+    match o.target {
+        zev_codegen_llvm::TargetArch::HostX86_64Linux => (64, "host".to_string()),
+        zev_codegen_llvm::TargetArch::Thumbv7mNoneEabi => (32, "cortex-m3".to_string()),
+        zev_codegen_llvm::TargetArch::Thumbv6mRp2040 => (32, "rp2040".to_string()),
+        zev_codegen_llvm::TargetArch::Riscv32Esp32C6 => (32, "esp32c6".to_string()),
+        zev_codegen_llvm::TargetArch::AvrAtmega328p => (16, "atmega328p".to_string()),
+        zev_codegen_llvm::TargetArch::AvrAtmega4809 => (16, "atmega4809".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -375,44 +425,51 @@ fn execute_check_command(
     json: bool,
 ) -> CheckExecOutcome {
     let mut eff_includes = include_dirs.to_vec();
-    let (hal_dir, board_module): (Option<String>, Option<String>) =
-        if board.is_some() || chip.is_some() {
-            let manifest = match discover_manifest_for_inputs(files) {
-                Ok(m) => m,
-                Err(err) => {
-                    return CheckExecOutcome {
-                        exit_code: ExitCode::from(2),
-                        stdout: None,
-                        stderr: Some(format!("error: {err}")),
-                    };
-                }
-            };
-            let mdir = manifest.as_ref().map(|(d, _)| d.as_path());
-            let spec = match resolve_target_spec_for_inputs(files, mdir, chip, board) {
-                Ok(s) => s,
-                Err(err) => {
-                    return CheckExecOutcome {
-                        exit_code: ExitCode::from(2),
-                        stdout: None,
-                        stderr: Some(format!("error: {err}")),
-                    };
-                }
-            };
-            if let Some(ref root) = spec.root_dir {
-                if !eff_includes.contains(root) {
-                    eff_includes.push(root.clone());
-                }
+    let (hal_dir, board_module, target_ptr_bits, target_name): (
+        Option<String>,
+        Option<String>,
+        u32,
+        String,
+    ) = if board.is_some() || chip.is_some() {
+        let manifest = match discover_manifest_for_inputs(files) {
+            Ok(m) => m,
+            Err(err) => {
+                return CheckExecOutcome {
+                    exit_code: ExitCode::from(2),
+                    stdout: None,
+                    stderr: Some(format!("error: {err}")),
+                };
             }
-            (spec.hal_dir, spec.board_module)
-        } else {
-            (None, None)
         };
+        let mdir = manifest.as_ref().map(|(d, _)| d.as_path());
+        let spec = match resolve_target_spec_for_inputs(files, mdir, chip, board) {
+            Ok(s) => s,
+            Err(err) => {
+                return CheckExecOutcome {
+                    exit_code: ExitCode::from(2),
+                    stdout: None,
+                    stderr: Some(format!("error: {err}")),
+                };
+            }
+        };
+        if let Some(ref root) = spec.root_dir {
+            if !eff_includes.contains(root) {
+                eff_includes.push(root.clone());
+            }
+        }
+        let target_name = spec.board_name.unwrap_or(spec.chip_name);
+        (spec.hal_dir, spec.board_module, spec.ptr_bits, target_name)
+    } else {
+        (None, None, 64, "host".to_string())
+    };
 
-    let bundle = match load_and_check_detailed_with_includes_and_targets(
+    let bundle = match load_and_check_detailed_with_target(
         files,
         &eff_includes,
         hal_dir.as_deref(),
         board_module.as_deref(),
+        target_ptr_bits,
+        &target_name,
     ) {
         Ok(b) => b,
         Err(fail) => {
@@ -780,12 +837,18 @@ fn run_ram_analysis(
     }
     let hal_dir = llvm_opts.as_ref().and_then(|o| o.hal_dir.as_deref());
     let board_module = llvm_opts.as_ref().and_then(|o| o.board_module.as_deref());
-    let (_, mir) =
-        match compile_to_mir_with_includes_and_targets(files, &eff_includes, hal_dir, board_module)
-        {
-            Ok(res) => res,
-            Err(err) => return RamExecOutcome::CompileErr(err),
-        };
+    let (target_ptr_bits, target_name) = target_info_from_llvm_opts(llvm_opts.as_ref());
+    let (_, mir) = match compile_to_mir_with_target(
+        files,
+        &eff_includes,
+        hal_dir,
+        board_module,
+        target_ptr_bits,
+        &target_name,
+    ) {
+        Ok(res) => res,
+        Err(err) => return RamExecOutcome::CompileErr(err),
+    };
     let mut text = mir.ram_report.format_table();
     if let Some(opts) = llvm_opts {
         match zev_codegen_llvm::analyze_hardware_stack_high_water(&mir, &opts) {
@@ -951,11 +1014,14 @@ fn main() -> ExitCode {
             if let Some(ticks) = max_ticks {
                 opts.max_ticks = ticks.min(i32::MAX as u64) as u32;
             }
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
+            match compile_to_mir_with_target(
                 &files,
                 &include_dirs,
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => match zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &opts) {
                     Ok(ll_src) => {
@@ -1009,11 +1075,14 @@ fn main() -> ExitCode {
                     eff_includes.push(root.clone());
                 }
             }
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
+            match compile_to_mir_with_target(
                 &files,
                 &eff_includes,
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => match zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &opts) {
                     Ok(raw_ll) => {
@@ -1088,11 +1157,14 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&built.opts));
+            match compile_to_mir_with_target(
                 &built.files,
                 &built.include_dirs,
                 built.spec.hal_dir.as_deref(),
                 built.spec.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => {
                     let default_ext = match built.spec.image {
@@ -1155,11 +1227,14 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&built.opts));
+            match compile_to_mir_with_target(
                 &built.files,
                 &built.include_dirs,
                 built.spec.hal_dir.as_deref(),
                 built.spec.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => {
                     let ext = match built.spec.image {
@@ -1230,7 +1305,7 @@ fn main() -> ExitCode {
             include_dirs,
             opt_level,
             output,
-        } => match compile_to_mir_with_includes(&files, &include_dirs) {
+        } => match compile_to_mir_with_target(&files, &include_dirs, None, None, 32, "cortex-m3") {
             Ok((_, mir)) => {
                 let out_elf = output.unwrap_or_else(|| default_output_with_ext(&files, "elf"));
                 let opts = zev_codegen_llvm::CodegenOptions {
@@ -1274,11 +1349,14 @@ fn main() -> ExitCode {
             if let Some(ticks) = max_ticks {
                 opts.max_ticks = ticks.min(u32::MAX as u64) as u32;
             }
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
+            match compile_to_mir_with_target(
                 &files,
                 &include_dirs,
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => {
                     let temp = match TempWorkDir::create("zevc-qemu") {
@@ -1324,11 +1402,14 @@ fn main() -> ExitCode {
         } => {
             let mut opts = zev_codegen_llvm::CodegenOptions::esp32c6();
             opts.opt_level = opt_level;
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
+            match compile_to_mir_with_target(
                 &files,
                 &include_dirs,
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => {
                     let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
@@ -1361,11 +1442,14 @@ fn main() -> ExitCode {
         } => {
             let mut opts = zev_codegen_llvm::CodegenOptions::esp32c6();
             opts.opt_level = opt_level;
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
+            match compile_to_mir_with_target(
                 &files,
                 &include_dirs,
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => {
                     let mut temp_holder: Option<TempWorkDir> = None;
@@ -1419,169 +1503,179 @@ fn main() -> ExitCode {
             include_dirs,
             opt_level,
             output,
-        } => match compile_to_mir_with_includes(&files, &include_dirs) {
-            Ok((_, mir)) => {
-                let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
-                let out_elf = out_bin.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::avr_uno();
-                opts.opt_level = opt_level;
-                match zev_codegen_llvm::build_avr_uno_image_with_options(
-                    &mir, &out_elf, &out_bin, &opts,
-                ) {
-                    Ok(res) => {
-                        print_avr_summary(&res);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+        } => {
+            match compile_to_mir_with_target(&files, &include_dirs, None, None, 16, "atmega328p") {
+                Ok((_, mir)) => {
+                    let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
+                    let out_elf = out_bin.with_extension("elf");
+                    let mut opts = zev_codegen_llvm::CodegenOptions::avr_uno();
+                    opts.opt_level = opt_level;
+                    match zev_codegen_llvm::build_avr_uno_image_with_options(
+                        &mir, &out_elf, &out_bin, &opts,
+                    ) {
+                        Ok(res) => {
+                            print_avr_summary(&res);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Command::FlashAvr {
             files,
             include_dirs,
             port,
             opt_level,
             output,
-        } => match compile_to_mir_with_includes(&files, &include_dirs) {
-            Ok((_, mir)) => {
-                let mut temp_holder: Option<TempWorkDir> = None;
-                let out_bin = match output {
-                    Some(p) => p,
-                    None => {
-                        let temp = match TempWorkDir::create("zevc-avr") {
-                            Ok(t) => t,
-                            Err(err) => {
-                                eprintln!("error: {err}");
-                                return ExitCode::FAILURE;
-                            }
-                        };
-                        let p = temp.dir.join("firmware.bin");
-                        temp_holder = Some(temp);
-                        p
-                    }
-                };
-                let out_elf = out_bin.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::avr_uno();
-                opts.opt_level = opt_level;
-                let res = match zev_codegen_llvm::build_avr_uno_image_with_options(
-                    &mir, &out_elf, &out_bin, &opts,
-                ) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                print_avr_summary(&res);
-                println!("Flashing Arduino Uno (ATmega328P) on `{port}` via STK500v1...");
-                match zev_codegen_llvm::flash_avr_uno_bin(&res.bin_path, &port) {
-                    Ok(flash_out) => {
-                        print!("{flash_out}");
-                        drop(temp_holder);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+        } => {
+            match compile_to_mir_with_target(&files, &include_dirs, None, None, 16, "atmega328p") {
+                Ok((_, mir)) => {
+                    let mut temp_holder: Option<TempWorkDir> = None;
+                    let out_bin = match output {
+                        Some(p) => p,
+                        None => {
+                            let temp = match TempWorkDir::create("zevc-avr") {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                            let p = temp.dir.join("firmware.bin");
+                            temp_holder = Some(temp);
+                            p
+                        }
+                    };
+                    let out_elf = out_bin.with_extension("elf");
+                    let mut opts = zev_codegen_llvm::CodegenOptions::avr_uno();
+                    opts.opt_level = opt_level;
+                    let res = match zev_codegen_llvm::build_avr_uno_image_with_options(
+                        &mir, &out_elf, &out_bin, &opts,
+                    ) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    print_avr_summary(&res);
+                    println!("Flashing Arduino Uno (ATmega328P) on `{port}` via STK500v1...");
+                    match zev_codegen_llvm::flash_avr_uno_bin(&res.bin_path, &port) {
+                        Ok(flash_out) => {
+                            print!("{flash_out}");
+                            drop(temp_holder);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Command::BuildAvrNanoEvery {
             files,
             include_dirs,
             opt_level,
             output,
-        } => match compile_to_mir_with_includes(&files, &include_dirs) {
-            Ok((_, mir)) => {
-                let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
-                let out_elf = out_bin.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::avr_nano_every();
-                opts.opt_level = opt_level;
-                match zev_codegen_llvm::build_avr_nano_every_image_with_options(
-                    &mir, &out_elf, &out_bin, &opts,
-                ) {
-                    Ok(res) => {
-                        print_avr_nano_every_summary(&res);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+        } => {
+            match compile_to_mir_with_target(&files, &include_dirs, None, None, 16, "atmega4809") {
+                Ok((_, mir)) => {
+                    let out_bin = output.unwrap_or_else(|| default_output_with_ext(&files, "bin"));
+                    let out_elf = out_bin.with_extension("elf");
+                    let mut opts = zev_codegen_llvm::CodegenOptions::avr_nano_every();
+                    opts.opt_level = opt_level;
+                    match zev_codegen_llvm::build_avr_nano_every_image_with_options(
+                        &mir, &out_elf, &out_bin, &opts,
+                    ) {
+                        Ok(res) => {
+                            print_avr_nano_every_summary(&res);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Command::FlashAvrNanoEvery {
             files,
             include_dirs,
             port,
             opt_level,
             output,
-        } => match compile_to_mir_with_includes(&files, &include_dirs) {
-            Ok((_, mir)) => {
-                let mut temp_holder: Option<TempWorkDir> = None;
-                let out_bin = match output {
-                    Some(p) => p,
-                    None => {
-                        let temp = match TempWorkDir::create("zevc-nano-every") {
-                            Ok(t) => t,
-                            Err(err) => {
-                                eprintln!("error: {err}");
-                                return ExitCode::FAILURE;
-                            }
-                        };
-                        let p = temp.dir.join("firmware.bin");
-                        temp_holder = Some(temp);
-                        p
-                    }
-                };
-                let out_elf = out_bin.with_extension("elf");
-                let mut opts = zev_codegen_llvm::CodegenOptions::avr_nano_every();
-                opts.opt_level = opt_level;
-                let res = match zev_codegen_llvm::build_avr_nano_every_image_with_options(
-                    &mir, &out_elf, &out_bin, &opts,
-                ) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        return ExitCode::FAILURE;
-                    }
-                };
-                print_avr_nano_every_summary(&res);
-                println!("Flashing Arduino Nano Every (ATmega4809) on `{port}` via MuxTO UPDI...");
-                match zev_codegen_llvm::flash_avr_nano_every_bin(&res.bin_path, &port) {
-                    Ok(flash_out) => {
-                        print!("{flash_out}");
-                        drop(temp_holder);
-                        ExitCode::SUCCESS
-                    }
-                    Err(err) => {
-                        eprintln!("error: {err}");
-                        ExitCode::FAILURE
+        } => {
+            match compile_to_mir_with_target(&files, &include_dirs, None, None, 16, "atmega4809") {
+                Ok((_, mir)) => {
+                    let mut temp_holder: Option<TempWorkDir> = None;
+                    let out_bin = match output {
+                        Some(p) => p,
+                        None => {
+                            let temp = match TempWorkDir::create("zevc-nano-every") {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                            let p = temp.dir.join("firmware.bin");
+                            temp_holder = Some(temp);
+                            p
+                        }
+                    };
+                    let out_elf = out_bin.with_extension("elf");
+                    let mut opts = zev_codegen_llvm::CodegenOptions::avr_nano_every();
+                    opts.opt_level = opt_level;
+                    let res = match zev_codegen_llvm::build_avr_nano_every_image_with_options(
+                        &mir, &out_elf, &out_bin, &opts,
+                    ) {
+                        Ok(r) => r,
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            return ExitCode::FAILURE;
+                        }
+                    };
+                    print_avr_nano_every_summary(&res);
+                    println!(
+                        "Flashing Arduino Nano Every (ATmega4809) on `{port}` via MuxTO UPDI..."
+                    );
+                    match zev_codegen_llvm::flash_avr_nano_every_bin(&res.bin_path, &port) {
+                        Ok(flash_out) => {
+                            print!("{flash_out}");
+                            drop(temp_holder);
+                            ExitCode::SUCCESS
+                        }
+                        Err(err) => {
+                            eprintln!("error: {err}");
+                            ExitCode::FAILURE
+                        }
                     }
                 }
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(err) => {
-                eprintln!("{err}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Command::BuildRp2040 {
             files,
             include_dirs,
@@ -1590,11 +1684,14 @@ fn main() -> ExitCode {
         } => {
             let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
             opts.opt_level = opt_level;
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
+            match compile_to_mir_with_target(
                 &files,
                 &include_dirs,
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => {
                     let out_uf2 = output.unwrap_or_else(|| default_output_with_ext(&files, "uf2"));
@@ -1627,11 +1724,14 @@ fn main() -> ExitCode {
         } => {
             let mut opts = zev_codegen_llvm::CodegenOptions::rp2040();
             opts.opt_level = opt_level;
-            match compile_to_mir_with_includes_and_targets(
+            let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
+            match compile_to_mir_with_target(
                 &files,
                 &include_dirs,
                 opts.hal_dir.as_deref(),
                 opts.board_module.as_deref(),
+                target_ptr_bits,
+                &target_name,
             ) {
                 Ok((_, mir)) => {
                     let mut temp_holder: Option<TempWorkDir> = None;
@@ -3785,5 +3885,240 @@ u32 bad3(u32 x) {
         assert!(json.contains("\"code\": \"P0001\""), "json={json}");
         assert!(json.contains("\"code\": \"P0011\""), "json={json}");
         assert!(json.contains("\"code\": \"P0018\""), "json={json}");
+    }
+
+    #[test]
+    fn review_fixes_a_b_c_d_work_end_to_end() {
+        let temp = TempWorkDir::create("zevc-review-fixes").unwrap();
+
+        // Fix A: destination-typed index, slice bounds, untyped array literal, and `loop every` widening.
+        let fix_a_src = "\
+fn idx([400]u32 t, u8 a, u8 b) -> u32 { return t[a + b]; }
+fn set_idx(*[400]u32 t, u8 a, u8 b, u32 val) { (*t)[a + b] = val; }
+fn sl([]u8 s, u8 a, u8 b) -> usize { []u8 v = s[0..a + b]; return v.len; }
+fn sl_lo([]u8 s, u8 a, u8 b) -> usize { []u8 v = s[a + b..350]; return v.len; }
+task per_check(u8 a, u8 b) {
+    u32 iter = 0;
+    loop every a + b {
+        println(f\"tick_ms={sys.now_ms()}\");
+        if (iter == 1) {
+            sys.exit(0);
+        }
+        iter += 1;
+    }
+}
+fn main() {
+    [400]u32 t;
+    t[300] = 777u32;
+    u32 v1 = idx(t, 200u8, 100u8);
+    set_idx(&t, 200u8, 100u8, 888u32);
+    u32 v2 = t[300];
+    [400]u8 buf;
+    usize n1 = sl(buf, 200u8, 100u8);
+    usize n2 = sl_lo(buf, 200u8, 100u8);
+    i32 u_arr = [1, 300][1];
+    println(f\"v1={v1} v2={v2} n1={n1} n2={n2} arr={u_arr}\");
+    spawn per_check(200u8, 100u8) @normal;
+}
+";
+        let fix_a_path = temp.dir.join("fix_a.zev");
+        std::fs::write(&fix_a_path, fix_a_src).unwrap();
+        let (_, fix_a_mir) = compile_to_mir(&[fix_a_path]).unwrap();
+        let mut fix_a_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        fix_a_opts.max_ticks = 350;
+        let fix_a_ll =
+            zev_codegen_llvm::emit_llvm_ir_with_options(&fix_a_mir, &fix_a_opts).unwrap();
+        let (exit_a, out_a) =
+            runner::compile_and_run_host_llvm_output(&fix_a_ll, true, &[]).unwrap();
+        assert_eq!(exit_a, 0);
+        assert!(
+            out_a.contains("v1=777 v2=888 n1=300 n2=50 arr=300"),
+            "Fix A runtime mismatch:\n{out_a}"
+        );
+        assert!(
+            out_a.contains("tick_ms=300"),
+            "Fix A loop every widening mismatch (expected tick_ms=300):\n{out_a}"
+        );
+
+        // Fix B: host accepts 100000 and 5_000_000_000 across locals, const, generic `<usize N>`
+        // and runs on host; 32-bit board accepts 100000 & rejects 5_000_000_000; AVR accepts 65535
+        // and rejects 70000.
+        let fix_b_host = "\
+const usize CAP = 100000;
+const usize BIG = 5_000_000_000;
+fn id_u<usize N>() -> usize { return N; }
+fn main() {
+    usize n = 100000;
+    usize b = 5_000_000_000;
+    println(f\"n={n} cap={CAP} g={id_u<100000>()} big={b} gbig={id_u<BIG>()}\");
+    sys.exit(0);
+}
+";
+        let fix_b_host_path = temp.dir.join("fix_b_host.zev");
+        std::fs::write(&fix_b_host_path, fix_b_host).unwrap();
+        let host_chk = execute_check_command(
+            std::slice::from_ref(&fix_b_host_path),
+            &[],
+            None,
+            None,
+            false,
+        );
+        assert_eq!(
+            host_chk.exit_code,
+            ExitCode::SUCCESS,
+            "{:?}",
+            host_chk.stderr
+        );
+        let (_, mir_b) = compile_to_mir(&[fix_b_host_path]).unwrap();
+        let ll_b = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir_b,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        let (exit_b, out_b) = runner::compile_and_run_host_llvm_output(&ll_b, true, &[]).unwrap();
+        assert_eq!(exit_b, 0);
+        assert!(
+            out_b.contains("n=100000 cap=100000 g=100000 big=5000000000 gbig=5000000000"),
+            "out_b={out_b}"
+        );
+
+        let fix_b_32_ok_path = temp.dir.join("fix_b_32_ok.zev");
+        std::fs::write(
+            &fix_b_32_ok_path,
+            "const usize CAP = 100000;\nfn id_u<usize N>() -> usize { return N; }\nfn main() { usize n = 100000; usize _s = n + CAP + id_u<100000>(); }\n",
+        )
+        .unwrap();
+        let ok_32 =
+            execute_check_command(&[fix_b_32_ok_path], &[], Some("nucleo_f334r8"), None, false);
+        assert_eq!(ok_32.exit_code, ExitCode::SUCCESS, "{:?}", ok_32.stderr);
+
+        let fix_b_16_ok_path = temp.dir.join("fix_b_16_ok.zev");
+        std::fs::write(
+            &fix_b_16_ok_path,
+            "const usize CAP = 65535;\nfn id_u<usize N>() -> usize { return N; }\nfn main() { usize n = 65535; usize _s = n + CAP + id_u<65535>(); }\n",
+        )
+        .unwrap();
+        let ok_16 =
+            execute_check_command(&[fix_b_16_ok_path], &[], Some("arduino_uno"), None, false);
+        assert_eq!(ok_16.exit_code, ExitCode::SUCCESS, "{:?}", ok_16.stderr);
+
+        for (board, bits_str, src) in [
+            (
+                "nucleo_f334r8",
+                "32-bit",
+                "fn main() { usize n = 5_000_000_000; }\n",
+            ),
+            (
+                "nucleo_f334r8",
+                "32-bit",
+                "const usize CAP = 5_000_000_000;\nfn main() {}\n",
+            ),
+            (
+                "nucleo_f334r8",
+                "32-bit",
+                "fn id_u<usize N>() -> usize { return N; }\nfn main() { usize _x = id_u<5_000_000_000>(); }\n",
+            ),
+            ("arduino_uno", "16-bit", "fn main() { usize n = 70000; }\n"),
+            (
+                "arduino_uno",
+                "16-bit",
+                "const usize CAP = 70000;\nfn main() {}\n",
+            ),
+            (
+                "arduino_uno",
+                "16-bit",
+                "fn id_u<usize N>() -> usize { return N; }\nfn main() { usize _x = id_u<70000>(); }\n",
+            ),
+        ] {
+            let p = temp.dir.join("fix_b_bad.zev");
+            std::fs::write(&p, src).unwrap();
+            let res = execute_check_command(&[p], &[], Some(board), None, false);
+            assert_eq!(res.exit_code, ExitCode::FAILURE, "expected failure for {board}: {src}");
+            let stderr = res.stderr.unwrap_or_default();
+            assert!(
+                stderr.contains(board) && stderr.contains(bits_str),
+                "expected target `{board}` and `{bits_str}` in:\n{stderr}"
+            );
+        }
+
+        // Fix C: bare const expression in generic call args explains parenthesization + rewrite.
+        let fix_c_bad_path = temp.dir.join("fix_c_bad.zev");
+        std::fs::write(
+            &fix_c_bad_path,
+            "const usize K = 3;\nfn lim<usize N>(u32 x) -> u32 { return x + (N as u32); }\nfn main() { u32 _y = lim<K + 1>(1); }\n",
+        )
+        .unwrap();
+        let res_c = execute_check_command(&[fix_c_bad_path], &[], None, None, false);
+        assert_eq!(res_c.exit_code, ExitCode::FAILURE);
+        let stderr_c = res_c.stderr.unwrap_or_default();
+        assert!(
+            stderr_c.contains("error[E0029]")
+                && stderr_c.contains("lim<(K + 1)>(1)")
+                && stderr_c.contains("parenthes"),
+            "Fix C diagnostic mismatch:\n{stderr_c}"
+        );
+        assert!(
+            !stderr_c.contains("cannot be referenced without concrete call arguments"),
+            "Fix C should not show bare-ref error:\n{stderr_c}"
+        );
+
+        let fix_c_ok_path = temp.dir.join("fix_c_ok.zev");
+        std::fs::write(
+            &fix_c_ok_path,
+            "fn f(bool x, bool y) -> bool { return x && y; }\nfn main() { u32 a = 1; u32 b = 2; u32 c = 3; u32 d = 4; bool _r = f(a < b + 1, c > (d)); }\n",
+        )
+        .unwrap();
+        let res_c_ok = execute_check_command(&[fix_c_ok_path], &[], None, None, false);
+        assert_eq!(
+            res_c_ok.exit_code,
+            ExitCode::SUCCESS,
+            "{:?}",
+            res_c_ok.stderr
+        );
+
+        // Fix D: all-literal generic calls infer from destination, keep `i32` without destination,
+        // and explain defaulted type + `pick<u32>(3, 4)` when still failing.
+        let fix_d_ok_src = "\
+fn pick<T>(T a, T b) -> T { return a; }
+fn ret_u16() -> u16 { return pick(7, 8); }
+fn takes_u8(u8 v) -> u8 { return v; }
+fn main() {
+    u32 b = pick(3, 4);
+    u32 c = 0;
+    c = pick(5, 6);
+    u16 r = ret_u16();
+    u8 u = takes_u8(pick(9, 10));
+    println(f\"b={b} c={c} r={r} u={u} def={pick(-3, 4)}\");
+    sys.exit(0);
+}
+";
+        let fix_d_ok_path = temp.dir.join("fix_d_ok.zev");
+        std::fs::write(&fix_d_ok_path, fix_d_ok_src).unwrap();
+        let (_, mir_d) = compile_to_mir(&[fix_d_ok_path]).unwrap();
+        let ll_d = zev_codegen_llvm::emit_llvm_ir_with_options(
+            &mir_d,
+            &zev_codegen_llvm::CodegenOptions::host_linux(),
+        )
+        .unwrap();
+        let (exit_d, out_d) = runner::compile_and_run_host_llvm_output(&ll_d, true, &[]).unwrap();
+        assert_eq!(exit_d, 0);
+        assert!(
+            out_d.contains("b=3 c=5 r=7 u=9 def=-3"),
+            "Fix D runtime mismatch:\n{out_d}"
+        );
+
+        let fix_d_bad_path = temp.dir.join("fix_d_bad.zev");
+        std::fs::write(
+            &fix_d_bad_path,
+            "fn pick<T>(T a, T b) -> T { return a; }\nfn main() { bool _eq = pick(3, 4) == 5u32; }\n",
+        )
+        .unwrap();
+        let res_d_bad = execute_check_command(&[fix_d_bad_path], &[], None, None, false);
+        assert_eq!(res_d_bad.exit_code, ExitCode::FAILURE);
+        let stderr_d = res_d_bad.stderr.unwrap_or_default();
+        assert!(
+            stderr_d.contains("defaulted to 'i32'") && stderr_d.contains("pick<u32>(3, 4)"),
+            "Fix D defaulted diagnostic mismatch:\n{stderr_d}"
+        );
     }
 }

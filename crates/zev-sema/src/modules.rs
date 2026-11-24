@@ -930,6 +930,7 @@ fn desugar_inline_mmios(prog: &Program) -> Program {
         items.push(item.clone());
     }
     Program::new(items, prog.span)
+        .with_bare_generic_call_candidates(prog.bare_generic_call_candidates.clone())
 }
 
 fn collect_declared_extern_c(prog: &Program) -> BTreeSet<String> {
@@ -2621,6 +2622,7 @@ fn rewrite_program(
     }
 
     Program::new(out_items, prog.span)
+        .with_bare_generic_call_candidates(prog.bare_generic_call_candidates.clone())
 }
 
 fn extern_signatures_match(a: &FnDecl, b: &FnDecl) -> bool {

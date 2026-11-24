@@ -419,23 +419,35 @@ impl Ty {
         }
     }
 
-    /// Inclusive mathematical `[min, max]` literal range for each integer primitive.
-    /// Pointer-sized `usize`/`isize` use portable 16-bit safe bounds (`0..=65535` / `-32768..=32767`)
-    /// so programs behave identically across 16-bit AVR, 32-bit MCU, and 64-bit host targets.
-    pub const fn int_prim_range(p: PrimType) -> Option<(i128, i128)> {
+    /// Inclusive mathematical `[min, max]` literal range for each integer primitive,
+    /// using `ptr_bits` (`16`, `32`, or `64`) for pointer-sized `usize`/`isize`.
+    pub const fn int_prim_range_for_ptr_bits(p: PrimType, ptr_bits: u32) -> Option<(i128, i128)> {
         match p {
             PrimType::U8 => Some((0, u8::MAX as i128)),
             PrimType::U16 | PrimType::U16Be | PrimType::U16Le => Some((0, u16::MAX as i128)),
             PrimType::U32 | PrimType::U32Be | PrimType::U32Le => Some((0, u32::MAX as i128)),
             PrimType::U64 | PrimType::U64Be | PrimType::U64Le => Some((0, u64::MAX as i128)),
-            PrimType::Usize => Some((0, u16::MAX as i128)),
+            PrimType::Usize => match ptr_bits {
+                16 => Some((0, u16::MAX as i128)),
+                32 => Some((0, u32::MAX as i128)),
+                _ => Some((0, u64::MAX as i128)),
+            },
             PrimType::I8 => Some((i8::MIN as i128, i8::MAX as i128)),
             PrimType::I16 => Some((i16::MIN as i128, i16::MAX as i128)),
             PrimType::I32 => Some((i32::MIN as i128, i32::MAX as i128)),
             PrimType::I64 => Some((i64::MIN as i128, i64::MAX as i128)),
-            PrimType::Isize => Some((i16::MIN as i128, i16::MAX as i128)),
+            PrimType::Isize => match ptr_bits {
+                16 => Some((i16::MIN as i128, i16::MAX as i128)),
+                32 => Some((i32::MIN as i128, i32::MAX as i128)),
+                _ => Some((i64::MIN as i128, i64::MAX as i128)),
+            },
             _ => None,
         }
+    }
+
+    /// Inclusive mathematical `[min, max]` literal range for each integer primitive on 64-bit host.
+    pub const fn int_prim_range(p: PrimType) -> Option<(i128, i128)> {
+        Self::int_prim_range_for_ptr_bits(p, 64)
     }
 
     /// Returns `true` iff `src` converts implicitly and losslessly to `dst` across all targets.

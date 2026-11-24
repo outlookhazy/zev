@@ -6,6 +6,8 @@ impl Analyzer {
             tick_period_us: opts.default_tick_period_us.max(1),
             tick_configured_explicitly: false,
             systick_hz: None,
+            target_ptr_bits: opts.target_ptr_bits,
+            target_name: opts.target_name.clone(),
             display_names: BTreeMap::new(),
             program_extern_c_scopes: Vec::new(),
             rewritten_pub_extern_sites: BTreeSet::new(),
@@ -48,6 +50,7 @@ impl Analyzer {
             current_prog_idx: 0,
             current_instantiation_note: None,
             mono_instantiation_notes: BTreeMap::new(),
+            defaulted_generic_calls: Vec::new(),
             f32_overflow_reported_spans: BTreeSet::new(),
             node_files: BTreeMap::new(),
             diagnostics: Vec::new(),
@@ -63,7 +66,97 @@ impl Analyzer {
         self
     }
 
+    pub(crate) fn with_defaulted_generic_calls(
+        mut self,
+        calls: Vec<crate::monomorphize::DefaultedGenericCall>,
+    ) -> Self {
+        self.defaulted_generic_calls = calls;
+        self
+    }
+
+    fn suggest_defaulted_generic_call_msg(&self, diag: &Diagnostic) -> Option<String> {
+        if !matches!(
+            diag.kind,
+            DiagnosticKind::TypeMismatch | DiagnosticKind::ReturnMismatch
+        ) || self.current_instantiation_note.is_some()
+            || diag.message.contains("defaulted to '")
+        {
+            return None;
+        }
+        let dc = self.defaulted_generic_calls.iter().find(|c| {
+            c.prog_idx == self.current_prog_idx
+                && ((diag.span.start >= c.call_span.start && diag.span.end <= c.call_span.end)
+                    || (diag.span.start <= c.call_span.start && diag.span.end >= c.call_span.end))
+        })?;
+        let &(param_idx, ref p_name, def_prim) = dc.defaulted_params.first()?;
+
+        // Pick a concrete suggested type from quoted type names in `diag.message` (e.g. `'u32'`),
+        // or infer `i64`/`u64` if an integer literal overflowed defaulted `i32`.
+        let mut suggested_prim_str: Option<String> = None;
+        let parts: Vec<&str> = diag.message.split('\'').collect();
+        for tok in parts.iter().skip(1).step_by(2) {
+            if let Some(p) = PrimType::from_name(tok) {
+                let same_family = (def_prim.is_integer() && p.is_integer())
+                    || (def_prim.is_float() && p.is_float());
+                if p != def_prim
+                    && p != PrimType::Void
+                    && (same_family || suggested_prim_str.is_none())
+                {
+                    suggested_prim_str = Some(p.as_str().to_string());
+                    if same_family {
+                        break;
+                    }
+                }
+            }
+        }
+        if suggested_prim_str.is_none() && def_prim == PrimType::I32 {
+            if let Some(num_tok) = diag
+                .message
+                .strip_prefix("integer literal ")
+                .and_then(|r| r.split_whitespace().next())
+            {
+                if let Ok(v) = num_tok.parse::<i128>() {
+                    let s = if v >= (i64::MIN as i128) && v <= (i64::MAX as i128) {
+                        "i64"
+                    } else {
+                        "u64"
+                    };
+                    suggested_prim_str = Some(s.to_string());
+                }
+            }
+        }
+        let sugg = suggested_prim_str.unwrap_or_else(|| {
+            if def_prim == PrimType::F64 {
+                "f32".to_string()
+            } else {
+                "u32".to_string()
+            }
+        });
+
+        let disp_fn = self
+            .display_names
+            .get(&dc.fn_name)
+            .cloned()
+            .unwrap_or_else(|| dc.fn_name.clone());
+        let mut sugg_args = dc.resolved_arg_strs.clone();
+        if let Some(slot) = sugg_args.get_mut(param_idx) {
+            *slot = sugg;
+        }
+        Some(format!(
+            " (generic type parameter '{}' of '{}' was defaulted to '{}'; specify explicit type arguments such as `{}<{}>({})`)",
+            p_name,
+            disp_fn,
+            def_prim.as_str(),
+            disp_fn,
+            sugg_args.join(", "),
+            dc.call_args_preview
+        ))
+    }
+
     pub(super) fn emit(&mut self, mut diag: Diagnostic) {
+        if let Some(extra) = self.suggest_defaulted_generic_call_msg(&diag) {
+            diag.message.push_str(&extra);
+        }
         if diag.file.is_none() {
             diag.file = self.current_file.clone();
         }
@@ -230,6 +323,8 @@ impl Analyzer {
                             c.name.name
                         ),
                     ));
+                } else {
+                    self.validate_const_target_range(c);
                 }
             }
         }
@@ -1174,8 +1269,12 @@ impl Analyzer {
         visiting.remove(name);
         let val = raw?;
         if let Ty::Prim(p) = ty {
-            if p.is_integer() {
-                return Some(crate::monomorphize::truncate_int_prim(val, *p));
+            if p.is_integer() && !matches!(p, PrimType::Usize | PrimType::Isize) {
+                return Some(crate::monomorphize::truncate_int_prim_bits(
+                    val,
+                    *p,
+                    self.target_ptr_bits,
+                ));
             }
         }
         Some(val)
@@ -1183,6 +1282,9 @@ impl Analyzer {
 
     pub(super) fn infer_const_prim_ty(&self, expr: &Expr) -> Option<PrimType> {
         match &expr.kind {
+            ExprKind::Literal(Literal::Int {
+                suffix: Some(p), ..
+            }) if p.is_integer() => Some(*p),
             ExprKind::Ident(id) => match self.consts.get(&id.name).map(|c| &c.ty) {
                 Some(Ty::Prim(p)) if p.is_integer() => Some(*p),
                 _ => None,
@@ -1214,6 +1316,16 @@ impl Analyzer {
         visiting: &mut BTreeSet<String>,
         shadowed: &BTreeSet<String>,
     ) -> Option<i128> {
+        self.eval_const_expr_with_dest_i128(expr, None, visiting, shadowed)
+    }
+
+    pub(super) fn eval_const_expr_with_dest_i128(
+        &self,
+        expr: &Expr,
+        dest_prim: Option<PrimType>,
+        visiting: &mut BTreeSet<String>,
+        shadowed: &BTreeSet<String>,
+    ) -> Option<i128> {
         match &expr.kind {
             ExprKind::Literal(Literal::Int { value, .. }) => Some(*value as i128),
             ExprKind::Ident(id) => {
@@ -1228,30 +1340,44 @@ impl Analyzer {
                 })
             }
             ExprKind::Cast { expr: inner, ty } => {
-                let v = self.eval_const_expr_i128_shadowed(inner, visiting, shadowed)?;
+                let v =
+                    self.eval_const_expr_with_dest_i128(inner, dest_prim, visiting, shadowed)?;
                 let target_prim = match &ty.kind {
                     TypeKind::Prim(p) if p.is_integer() => Some(*p),
                     TypeKind::Named(id) => PrimType::from_name(&id.name).filter(|p| p.is_integer()),
                     _ => None,
                 }?;
-                Some(crate::monomorphize::truncate_int_prim(v, target_prim))
+                Some(crate::monomorphize::truncate_int_prim_bits(
+                    v,
+                    target_prim,
+                    self.target_ptr_bits,
+                ))
             }
             ExprKind::Unary { op, expr: inner } => {
-                let v = self.eval_const_expr_i128_shadowed(inner, visiting, shadowed)?;
+                let v =
+                    self.eval_const_expr_with_dest_i128(inner, dest_prim, visiting, shadowed)?;
                 match op {
                     UnaryOp::Neg => {
                         let neg = v.checked_neg()?;
                         if let Some(p) = self.infer_const_prim_ty(inner) {
-                            if p.is_signed() {
-                                return Some(crate::monomorphize::truncate_int_prim(neg, p));
+                            if p.is_signed() && !matches!(p, PrimType::Usize | PrimType::Isize) {
+                                return Some(crate::monomorphize::truncate_int_prim_bits(
+                                    neg,
+                                    p,
+                                    self.target_ptr_bits,
+                                ));
                             }
                         }
                         Some(neg)
                     }
                     UnaryOp::BitNot => {
                         let inv = !v;
-                        if let Some(p) = self.infer_const_prim_ty(inner) {
-                            Some(crate::monomorphize::truncate_int_prim(inv, p))
+                        if let Some(p) = self.infer_const_prim_ty(inner).or(dest_prim) {
+                            Some(crate::monomorphize::truncate_int_prim_bits(
+                                inv,
+                                p,
+                                self.target_ptr_bits,
+                            ))
                         } else {
                             Some(inv)
                         }
@@ -1260,8 +1386,8 @@ impl Analyzer {
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
-                let l = self.eval_const_expr_i128_shadowed(lhs, visiting, shadowed)?;
-                let r = self.eval_const_expr_i128_shadowed(rhs, visiting, shadowed)?;
+                let l = self.eval_const_expr_with_dest_i128(lhs, dest_prim, visiting, shadowed)?;
+                let r = self.eval_const_expr_with_dest_i128(rhs, dest_prim, visiting, shadowed)?;
                 match op {
                     BinaryOp::Add => l.checked_add(r),
                     BinaryOp::Sub => l.checked_sub(r),
@@ -1277,6 +1403,61 @@ impl Analyzer {
                 }
             }
             _ => None,
+        }
+    }
+
+    pub(super) fn has_reported_span_within(&self, span: Span) -> bool {
+        self.f32_overflow_reported_spans
+            .iter()
+            .any(|&(s, e)| s >= span.start && e <= span.end)
+    }
+
+    pub(super) fn validate_const_target_range(&mut self, c: &ConstDecl) {
+        let Some(Ty::Prim(p)) = self.consts.get(&c.name.name).map(|info| info.ty.clone()) else {
+            return;
+        };
+        if !matches!(p, PrimType::Usize | PrimType::Isize) {
+            return;
+        }
+        if matches!(&c.value.kind, ExprKind::Cast { .. })
+            || self.has_reported_span_within(c.value.span)
+        {
+            return;
+        }
+        let Some((min_v, max_v)) = Ty::int_prim_range_for_ptr_bits(p, self.target_ptr_bits) else {
+            return;
+        };
+        if let Some(val) = self.eval_const_expr_with_dest_i128(
+            &c.value,
+            Some(p),
+            &mut BTreeSet::new(),
+            &BTreeSet::new(),
+        ) {
+            if (val < min_v || val > max_v)
+                && self
+                    .f32_overflow_reported_spans
+                    .insert((c.value.span.start, c.value.span.end))
+            {
+                self.emit(
+                    Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        c.value.span,
+                        format!(
+                            "constant expression {} out of range for '{}' on {}-bit target '{}' ({min_v}..={max_v})",
+                            val,
+                            p.as_str(),
+                            self.target_ptr_bits,
+                            self.target_name
+                        ),
+                    )
+                    .with_note(format!(
+                        "'{}' has {}-bit pointer width ({min_v}..={max_v}) on target '{}'",
+                        p.as_str(),
+                        self.target_ptr_bits,
+                        self.target_name
+                    )),
+                );
+            }
         }
     }
 
@@ -1888,19 +2069,58 @@ impl Analyzer {
             }
             TypeKind::Slice(elem) => Ty::Slice(Box::new(self.resolve_type(elem))),
             TypeKind::Array { elem, len } => {
+                let (_, max_usize) =
+                    Ty::int_prim_range_for_ptr_bits(PrimType::Usize, self.target_ptr_bits)
+                        .unwrap_or((0, u64::MAX as i128));
                 let resolved_len = match len {
-                    ArrayLen::Fixed(n) => *n,
+                    ArrayLen::Fixed(n) => {
+                        if (*n as i128) > max_usize {
+                            self.emit(
+                                Diagnostic::new(
+                                    DiagnosticKind::TypeMismatch,
+                                    te.span,
+                                    format!(
+                                        "array length {} out of range for 'usize' on {}-bit target '{}' (0..={max_usize})",
+                                        n, self.target_ptr_bits, self.target_name
+                                    ),
+                                )
+                                .with_note(format!(
+                                    "'usize' has {}-bit pointer width (0..={max_usize}) on target '{}'",
+                                    self.target_ptr_bits, self.target_name
+                                )),
+                            );
+                        }
+                        *n
+                    }
                     ArrayLen::Expr(expr) => {
                         let mut visiting = BTreeSet::new();
                         if let Some(v) = self.eval_const_expr_i128(expr, &mut visiting) {
-                            usize::try_from(v).unwrap_or_else(|_| {
+                            if v < 0 {
                                 self.emit(Diagnostic::new(
                                     DiagnosticKind::GenericInstantiationError,
                                     expr.span,
                                     "array length must be a non-negative compile-time constant 'usize'",
                                 ));
                                 1
-                            })
+                            } else if v > max_usize {
+                                self.emit(
+                                    Diagnostic::new(
+                                        DiagnosticKind::TypeMismatch,
+                                        expr.span,
+                                        format!(
+                                            "array length {} out of range for 'usize' on {}-bit target '{}' (0..={max_usize})",
+                                            v, self.target_ptr_bits, self.target_name
+                                        ),
+                                    )
+                                    .with_note(format!(
+                                        "'usize' has {}-bit pointer width (0..={max_usize}) on target '{}'",
+                                        self.target_ptr_bits, self.target_name
+                                    )),
+                                );
+                                1
+                            } else {
+                                usize::try_from(v).unwrap_or(1)
+                            }
                         } else {
                             self.emit(Diagnostic::new(
                                 DiagnosticKind::GenericInstantiationError,
