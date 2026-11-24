@@ -301,7 +301,7 @@ fn main() {
    - In normal `task` flow, runs as a union-packed coroutine sharing the CPU smoothly.
    - Inside `noyield { ... }`, **auto-specializes a direct `0 B`-`.bss` stack clone** (`{fn}__noyield`,
      checkpoints stripped) reported transparently in `zevc ram` and `zevc check --json`!
-   - Still **forbidden** inside `critical`, `isr`, `defer`, and `extern \"C\"` callbacks (`E0004`–`E0006`).
+   - Still **forbidden** inside `critical`, `isr`, `defer`, and `extern \"C\"` callbacks (`E0003`–`E0006`).
 3. **`HardBlocking`**: Awaits external events or time (`delay`, `wait { ... }`, `inbox.recv`/`send`,
    `watch.wait_change`, `signal.wait`, `ping_pong.wait_chunk`, `byte_ring.wait_read`, `pool.alloc`,
    `wait_queue.commit_wait`, `loop every`, or unbounded `loop`); forbidden inside `noyield`,

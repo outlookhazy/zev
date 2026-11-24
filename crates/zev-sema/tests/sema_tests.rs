@@ -2980,6 +2980,45 @@ fn wave2_generic_instantiation_errors_e0029() {
 }
 
 #[test]
+fn local_bindings_shadow_same_named_generic_fn_templates() {
+    // Locals, parameters, `for` bindings, and `fn(...)` pointer locals shadow a generic `fn`
+    // template of the same name instead of tripping `E0029` in the monomorphizer.
+    let model = expect_ok(
+        r#"
+        u32 lim<usize N>(u32 x) { return x + (N as u32); }
+        u32 inc(u32 x) { return x + 1u32; }
+        u32 use_param(u32 lim) { return lim * 2u32; }
+        u32 via_ptr() {
+            fn(u32) -> u32 lim = inc;
+            return lim(3u32);
+        }
+        fn main() {
+            u32 a = lim<4>(1u32);
+            u32 lim = 7u32;
+            u32 y = lim + 1u32;
+            bool below = lim < 9u32;
+            for (u32 lim in 0..3) { y += lim; }
+            y += use_param(a) + via_ptr();
+        }
+        "#,
+    );
+    assert!(
+        model.monomorphized_instances.iter().any(|i| i.signature == "lim<4>"),
+        "template call before the shadowing local must still instantiate: {:?}",
+        model.monomorphized_instances
+    );
+
+    // A bare reference that really does resolve to the template is still rejected.
+    expect_err_kind(
+        r#"
+        u32 lim<usize N>(u32 x) { return x + (N as u32); }
+        fn main() { u32 y = lim + 1u32; }
+        "#,
+        DiagnosticKind::GenericInstantiationError,
+    );
+}
+
+#[test]
 fn wave2_zero_heap_format_strings_fmt_buf_and_e0028() {
     // 1. Valid `print(f"...")`, `println(f"...")`, and `fmt_buf(dst, f"...")` across all format
     //    specifiers + exact static-fit boundaries!

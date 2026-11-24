@@ -31,7 +31,7 @@ pub enum DiagnosticKind {
     StaleDmaLease,
     /// Cycle in the call graph containing at least one yielding function (`E0012`).
     YieldingRecursion,
-    /// Duration literal is zero, sub-tick (truncates to 0), or not an exact multiple of the tick period (`E0013`).
+    /// Duration literal is zero, sub-tick (truncates to 0), not an exact multiple of the tick period, or beyond the `i32::MAX`-tick deadline horizon (`E0013`).
     InvalidDurationResolution,
     /// `return` value missing or incompatible with function signature (`E0014`).
     ReturnMismatch,
@@ -244,7 +244,7 @@ impl DiagnosticKind {
                 "static coroutine frame packing forbids recursion across yielding functions; rewrite the recursive cycle as a `loop { ... }` or `while` state machine"
             }
             Self::InvalidDurationResolution => {
-                "use a duration that is an exact non-zero multiple of the tick period (default `1ms` = `1000us`), or set a finer tick via `sys.use_systick(hz, 500us);`"
+                "use a duration that is an exact non-zero multiple of the tick period (default `1ms` = `1000us`) and at most `2147483647` ticks, or set a finer tick via `sys.use_systick(hz, 500us);`"
             }
             Self::ReturnMismatch => {
                 "use `return expr;` matching the declared return type (`Ret name(...)`), or `fn name(...)` + `return;` for `void` functions"

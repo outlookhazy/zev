@@ -1189,6 +1189,13 @@ pub fn decoded_string_byte_len(s: &str) -> usize {
     len
 }
 
+/// Largest scheduler deadline distance, in ticks (`i32::MAX`).
+///
+/// Scheduler deadlines are 32-bit tick counts compared with wrap-safe signed
+/// subtraction (`now - deadline >= 0`), so a deadline `2^31` or more ticks ahead
+/// is indistinguishable from one that has already expired.
+pub const MAX_DURATION_TICKS: u64 = i32::MAX as u64;
+
 /// Hardware/scheduler duration literal (`500us`, `1ms`, `5s`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DurationLit {

@@ -339,7 +339,17 @@ impl ModuleSymbols {
                 span: dur.span,
             });
         }
-        Ok(us / self.tick_period_us)
+        let ticks = us / self.tick_period_us;
+        if ticks > zev_ast::MAX_DURATION_TICKS {
+            return Err(MirLowerError {
+                message: format!(
+                    "duration `{dur}` ({ticks} ticks) exceeds the scheduler deadline horizon of {} ticks",
+                    zev_ast::MAX_DURATION_TICKS
+                ),
+                span: dur.span,
+            });
+        }
+        Ok(ticks)
     }
 }
 
