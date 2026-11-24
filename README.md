@@ -67,6 +67,8 @@ Board and chip definitions live declaratively in `boards/*.toml` and `chips/*.to
 
 Additional board-specific hardware demos in `examples/` exercise board peripherals directly on `nucleo_f334r8`, `esp32c6_pico`, `rpi_pico_w`, `arduino_uno` (ATmega328P `avr`, Optiboot), and `arduino_nano_every` (ATmega4809 `avrxmega3`, `MuxTO` UPDI).
 
+**Bring-up in progress:** `yd_ch32v307` (WCH CH32V307VCT6, QingKe V4F `riscv32imac` soft-float, flashed over the chip's USB bootloader with `wchisp`). [`examples/ch32v307_blink.zev`](examples/ch32v307_blink.zev) and [`examples/ch32v307_demo.zev`](examples/ch32v307_demo.zev) build and pass image audits, and `board.console_open()` lets [`examples/portable_shell_demo.zev`](examples/portable_shell_demo.zev) build for it unchanged, but none of this has run on hardware yet; the portable `hal.*` modules beyond `gpio` and `time` are not written yet.
+
 ---
 
 ## Compiler Pipeline

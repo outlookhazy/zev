@@ -157,7 +157,7 @@ Where traditional embedded C relies on Duff's-device protothreads, manual state 
   - **Outside `zevc` (Plain `.zev` Modules & Declarative Target Configs):**
     - `chips/*.toml` & `boards/*.toml` — declarative target triples, memory layouts, flash recipes, and HAL mappings.
     - `chip/*.zev` — SVD-generated `mmio` + `irq` register/interrupt maps.
-    - `bsp/*.zev` & `hal/{sim,lm3s6965,stm32f3,esp32c6,rp2040}/*.zev` — board pinmux, clock trees, DMA setup, and portable `board`/`hal` drivers.
+    - `bsp/*.zev` & `hal/{sim,lm3s6965,stm32f3,esp32c6,rp2040,ch32v3}/*.zev` — board pinmux, clock trees, DMA setup, and portable `board`/`hal` drivers.
     - `std/{bus,fmt,io,math,str,sync}.zev` — standard library helpers and synchronization primitives (`Semaphore`, `EventFlags`, `Latch`, `Barrier<N>`, `SerialPort`, `StatusCell`, fixed/float math, string/number parsers) written in plain `.zev`.
 - **Explicit Static-Compilation Trade-Offs:**
   - **Whole-program Zev source compilation:** All `.zev` modules compile together for global isolation proofs, coroutine frame union-packing, and Flash vector synthesis; external binary libraries link via `noyield`-verified `extern "C"`.

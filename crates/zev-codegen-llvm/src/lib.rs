@@ -236,6 +236,291 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to lower examples {paths:?} to MIR: {e:?}"))
     }
 
+    /// Compile one example for a board from `boards/*.toml`, with its HAL and board module.
+    fn compile_example_for_board(
+        example: &str,
+        board: &str,
+    ) -> (TargetSpec, CodegenOptions, zev_mir::MirModule) {
+        let root = repo_root();
+        let path = root.join(example);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+        let label = path.display().to_string();
+        let spec = TargetSpec::resolve(None, Some(board)).expect("resolve board spec");
+        let prog = zev_parser::parse_str_named(&src, &label)
+            .unwrap_or_else(|e| panic!("parse failed for {example}: {e:#?}"));
+        let aopts = zev_sema::AnalyzeOptions {
+            include_dirs: vec![root.clone()],
+            hal_dir: spec.hal_dir.clone(),
+            board_module: spec.board_module.clone(),
+            ..zev_sema::AnalyzeOptions::default()
+        };
+        let analyzed = zev_sema::analyze_and_monomorphize_named_programs(
+            &[(&prog, Some(label.as_str()))],
+            &aopts,
+        );
+        assert!(
+            analyzed.diagnostics.is_empty(),
+            "sema diagnostics for {example} on {board}: {:?}",
+            analyzed.diagnostics
+        );
+        let mir = zev_mir::lower_programs(&analyzed.programs)
+            .unwrap_or_else(|e| panic!("lower failed for {example} on {board}: {e:?}"));
+        let opts = CodegenOptions::from_spec(spec.clone());
+        (spec, opts, mir)
+    }
+
+    #[test]
+    fn riscv_identity_irq_routing_and_spec_validation() {
+        let mk_vec = |irq_num: u32| zev_mir::MirIrqVector {
+            irq_name: format!("IRQ_{irq_num}"),
+            irq_num,
+            is_shared: false,
+            selector_symbol: None,
+            bindings: vec![],
+        };
+
+        // Identity routing: the vector slot is the interrupt number, in ascending order,
+        // regardless of how many sources are attached or how far past slot 31 they sit.
+        let routes = riscv32::assign_rv_identity_irq_routes(
+            &[mk_vec(53), mk_vec(12), mk_vec(103), mk_vec(25)],
+            103,
+            104,
+            &[0, 1, 4, 6, 7, 10, 11, 13, 15],
+            &[2, 3, 5, 8, 9],
+        )
+        .expect("identity routes");
+        let pairs: Vec<(u32, u8)> = routes.iter().map(|r| (r.src_id, r.cpu_slot)).collect();
+        assert_eq!(pairs, vec![(12, 12), (25, 25), (53, 53), (103, 103)]);
+
+        for (bad, why) in [
+            (3u32, "exception slot"),
+            (4, "reserved slot"),
+            (104, "past the vector table"),
+        ] {
+            assert!(
+                riscv32::assign_rv_identity_irq_routes(
+                    &[mk_vec(bad)],
+                    103,
+                    104,
+                    &[0, 1, 4, 6, 7, 10, 11, 13, 15],
+                    &[2, 3, 5, 8, 9],
+                )
+                .is_err(),
+                "attaching IRQ {bad} ({why}) must be rejected"
+            );
+        }
+
+        // The shipped CH32V307 spec selects that model and never writes `mie`.
+        let spec = TargetSpec::load_from_root(&repo_root(), Some("ch32v307"), None).unwrap();
+        match &spec.irq {
+            crate::target_spec::IrqModel::RiscvVectored {
+                vector_slots,
+                max_irq_source,
+                identity_routing,
+                write_mie,
+                exception_slots,
+                ..
+            } => {
+                assert_eq!((*vector_slots, *max_irq_source), (104, 103));
+                assert!(*identity_routing && !*write_mie);
+                assert_eq!(exception_slots, &vec![2, 3, 5, 8, 9]);
+            }
+            other => panic!("unexpected CH32V307 irq model: {other:?}"),
+        }
+        assert!(
+            !spec.allow_wfi,
+            "CH32V307 idle must poll until wfi is verified"
+        );
+
+        // The ESP32-C6 spec keeps the original behavior by default.
+        let esp = TargetSpec::load_from_root(&repo_root(), Some("esp32c6"), None).unwrap();
+        match &esp.irq {
+            crate::target_spec::IrqModel::RiscvVectored {
+                identity_routing,
+                write_mie,
+                exception_slots,
+                ..
+            } => {
+                assert!(!*identity_routing && *write_mie);
+                assert_eq!(exception_slots, &vec![0]);
+            }
+            other => panic!("unexpected ESP32-C6 irq model: {other:?}"),
+        }
+        assert!(esp.allow_wfi);
+
+        // Invalid combinations are rejected when the spec is loaded.
+        let root = test_out_dir().join("rv_irq_spec_validation");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("chips")).unwrap();
+        let chip = |name: &str, irq: &str| {
+            std::fs::write(
+                root.join(format!("chips/{name}.toml")),
+                format!(
+                    "[chip]\nname = \"{name}\"\nisa = \"riscv32\"\ncpu = \"generic-rv32\"\nfeatures = \"+m,+a,+c\"\ntriple = \"riscv32-unknown-none-elf\"\ndatalayout = \"e-m:e-p:32:32-i64:64-n32-S128\"\n\n[memory]\nflash_base = 0x0800_0000\nflash_size = 65536\nram_base = 0x2000_0000\nram_size = 8192\n\n[irq]\nmodel = \"riscv-vectored\"\nmax_irq_source = 103\n{irq}\n"
+                ),
+            )
+            .unwrap();
+        };
+        chip("mie_too_wide", "vector_slots = 104");
+        chip("bad_routing", "vector_slots = 32\nrouting = \"sideways\"");
+        chip("bad_enable", "vector_slots = 32\nenable_csr = \"plic\"");
+        chip(
+            "bad_exc",
+            "vector_slots = 16\nenable_csr = \"none\"\nexception_slots = [20]",
+        );
+        for name in ["mie_too_wide", "bad_routing", "bad_enable", "bad_exc"] {
+            assert!(
+                TargetSpec::load_from_root(&root, Some(name), None).is_err(),
+                "chip spec `{name}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn ch32v307_emits_pfic_vector_table_without_mie_or_wfi() {
+        // 1. A program that attaches no interrupt never installs a vector table.
+        let (blink_spec, blink_opts, blink_mir) =
+            compile_example_for_board("examples/ch32v307_blink.zev", "yd_ch32v307");
+        assert_eq!(blink_spec.hal_dir.as_deref(), Some("hal/ch32v3"));
+        assert_eq!(blink_spec.board_module.as_deref(), Some("bsp/yd_ch32v307"));
+        assert_eq!(blink_mir.ram_report.mcu32.heap_bytes, 0);
+        let blink_ll = emit_llvm_ir_with_options(&blink_mir, &blink_opts).expect("blink IR");
+        assert!(blink_ll.contains("li sp, 0x20010000"), "64 KB RAM top");
+        // The idle counter symbol is named `__syn_wfi_count`, so match the instruction itself.
+        let wfi_insn = "asm sideeffect \"wfi";
+        for forbidden in ["csrw mtvec", "csrw mie", "__syn_rv_vector_table", wfi_insn] {
+            assert!(
+                !blink_ll.contains(forbidden),
+                "interrupt-free CH32V307 image must not contain `{forbidden}`"
+            );
+        }
+
+        // 2. With the button interrupt attached, the table is indexed by interrupt number.
+        let (_, demo_opts, demo_mir) =
+            compile_example_for_board("examples/ch32v307_demo.zev", "yd_ch32v307");
+        let demo_ll = emit_llvm_ir_with_options(&demo_mir, &demo_opts).expect("demo IR");
+        let table: Vec<&str> = demo_ll
+            .lines()
+            .skip_while(|l| !l.contains("module asm \"__syn_rv_vector_table:\""))
+            .filter_map(|l| l.strip_prefix("module asm \"  j "))
+            .map(|l| l.trim_end_matches('"'))
+            .take_while(|l| l.starts_with("__syn_rv_"))
+            .collect();
+        assert_eq!(
+            table.len(),
+            104,
+            "one 4-byte jump per PFIC interrupt number"
+        );
+        for (slot, target) in table.iter().enumerate() {
+            let expected = match slot {
+                2 | 3 | 5 | 8 | 9 => "__syn_rv_exc_tramp",
+                25 => "__syn_rv_irq_tramp_25",
+                _ => "__syn_rv_unhandled_irq",
+            };
+            assert_eq!(*target, expected, "vector slot {slot}");
+        }
+        // EXTI3 is interrupt 25 and keeps slot 25: the route hook enables that PFIC line.
+        assert!(demo_ll.contains("call void @__syn_on_rv_irq_route(i32 25, i32 25)"));
+        assert!(demo_ll.contains("csrw mtvec"));
+        // QingKe V4 has no `mie` CSR, and idle polls instead of sleeping.
+        assert!(
+            !demo_ll.contains("csrw mie"),
+            "`mie` write would fault on QingKe V4"
+        );
+
+        // 3. The portable shell demo runs unchanged: `board.console_open()` attaches the
+        //    USART1 interrupt (number 53) and nothing else.
+        let (_, shell_opts, shell_mir) =
+            compile_example_for_board("examples/portable_shell_demo.zev", "yd_ch32v307");
+        let shell_ll = emit_llvm_ir_with_options(&shell_mir, &shell_opts).expect("shell IR");
+        assert!(shell_ll.contains("module asm \"  j __syn_rv_irq_tramp_53\""));
+        assert!(shell_ll.contains("call void @__syn_on_rv_irq_route(i32 53, i32 53)"));
+        assert_eq!(
+            shell_ll
+                .matches("module asm \"  j __syn_rv_irq_tramp_")
+                .count(),
+            1,
+            "only the console interrupt is attached"
+        );
+        assert!(!shell_ll.contains("csrw mie"));
+        // A program that never opens the console carries none of it.
+        for console_sym in ["console_rx", "console_tx", "usart1_console_isr"] {
+            assert!(
+                !blink_ll.contains(console_sym),
+                "blink must not contain `{console_sym}` when `console_open()` is never called"
+            );
+        }
+        assert!(
+            !demo_ll.contains(wfi_insn),
+            "idle must poll while `allow_wfi = false`"
+        );
+    }
+
+    #[test]
+    fn ch32v307_examples_build_raw_bin_and_pass_disasm_audit() {
+        let dir = test_out_dir().join("ch32v307");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (example, irq_slot) in [
+            ("examples/ch32v307_blink.zev", None),
+            ("examples/ch32v307_demo.zev", Some(25u32)),
+            ("examples/portable_shell_demo.zev", Some(53u32)),
+        ] {
+            let (spec, opts, mir) = compile_example_for_board(example, "yd_ch32v307");
+            let stem = Path::new(example).file_stem().unwrap().to_string_lossy();
+            let art = build_target_image(&mir, &opts, &dir.join(format!("{stem}.bin")))
+                .unwrap_or_else(|e| panic!("CH32V307 build of {example} failed: {e}"));
+            verify_ll_with_opt(&art.elf.ll_path).expect("opt -passes=verify on CH32V307 IR");
+            assert!(art.elf.audit.is_zero_heap_freestanding());
+
+            let bin = std::fs::read(art.bin_path.as_ref().expect("raw .bin")).unwrap();
+            assert!(
+                bin.len() > 512 && bin.len() < spec.flash_size as usize,
+                "{example}: unexpected image size {}",
+                bin.len()
+            );
+
+            let objdump = Command::new(crate::toolchain::find_tool(
+                "/bin/llvm-objdump",
+                "llvm-objdump",
+            ))
+            .arg("-d")
+            .arg(&art.elf.elf_path)
+            .output()
+            .expect("invoke llvm-objdump");
+            assert!(objdump.status.success());
+            let disasm = String::from_utf8_lossy(&objdump.stdout);
+
+            // The core starts executing at the first word of flash.
+            assert!(
+                disasm.contains("08000000 <_start>:"),
+                "{example}: `_start` must be the first instruction in flash:\n{disasm}"
+            );
+            assert!(!disasm.contains("\tmie"), "{example}: `mie` CSR access");
+            assert!(
+                !disasm.contains("wfi"),
+                "{example}: `wfi` while allow_wfi = false"
+            );
+            assert_eq!(
+                disasm.contains("mtvec"),
+                irq_slot.is_some(),
+                "{example}: mtvec is written only when an interrupt is attached"
+            );
+            if let Some(slot) = irq_slot {
+                assert!(
+                    disasm.contains(&format!("<__syn_rv_irq_tramp_{slot}>:")),
+                    "{example}: missing trampoline for interrupt {slot}"
+                );
+            }
+
+            let proof = analyze_hardware_stack_high_water(&mir, &opts)
+                .unwrap_or_else(|e| panic!("stack proof for {example}: {e}"));
+            assert!(proof.within_budget, "{example}: stack proof {proof:?}");
+        }
+    }
+
     #[test]
     fn esp32c6_demo_builds_direct_boot_bin_and_passes_disasm_audit() {
         let demo_path = repo_root().join("examples/esp32c6_demo.zev");

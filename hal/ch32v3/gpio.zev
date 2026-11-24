@@ -1,0 +1,158 @@
+// Portable HAL digital GPIO interface (CH32V30x GPIOA..GPIOE; debug pins PA13/PA14 guarded)
+
+import chip.ch32v30x as hw;
+
+pub enum Mode {
+    Input  = 0,
+    Output = 1,
+    Analog = 2,
+}
+
+pub enum Pull {
+    None = 0,
+    Up   = 1,
+    Down = 2,
+}
+
+pub struct Pin {
+    u8   port;
+    u8   pin;
+    bool active_low;
+}
+
+pub fn make_pin(u8 port, u8 pin, bool active_low) -> Pin {
+    return Pin {
+        port: port,
+        pin: pin,
+        active_low: active_low,
+    };
+}
+
+// PA13 (SWDIO) and PA14 (SWCLK) carry the two-wire debug interface.
+fn is_debug_pin(u8 port, u8 pin) -> bool {
+    return port == hw.PORT_A && (pin == 13u8 || pin == 14u8);
+}
+
+fn clock_bit(u8 port) -> u32 {
+    if (port == hw.PORT_A) { return hw.RCC_APB2_IOPA; }
+    if (port == hw.PORT_B) { return hw.RCC_APB2_IOPB; }
+    if (port == hw.PORT_C) { return hw.RCC_APB2_IOPC; }
+    if (port == hw.PORT_D) { return hw.RCC_APB2_IOPD; }
+    if (port == hw.PORT_E) { return hw.RCC_APB2_IOPE; }
+    return 0u32;
+}
+
+fn configure_port(u8 port, u32 pin, u32 cfg) {
+    if (port == hw.PORT_A) { hw.gpio_configure(hw.GPIOA, pin, cfg); }
+    else if (port == hw.PORT_B) { hw.gpio_configure(hw.GPIOB, pin, cfg); }
+    else if (port == hw.PORT_C) { hw.gpio_configure(hw.GPIOC, pin, cfg); }
+    else if (port == hw.PORT_D) { hw.gpio_configure(hw.GPIOD, pin, cfg); }
+    else if (port == hw.PORT_E) { hw.gpio_configure(hw.GPIOE, pin, cfg); }
+}
+
+fn read_input(u8 port) -> u32 {
+    if (port == hw.PORT_A) { return hw.GPIOA.indr; }
+    if (port == hw.PORT_B) { return hw.GPIOB.indr; }
+    if (port == hw.PORT_C) { return hw.GPIOC.indr; }
+    if (port == hw.PORT_D) { return hw.GPIOD.indr; }
+    if (port == hw.PORT_E) { return hw.GPIOE.indr; }
+    return 0u32;
+}
+
+fn read_output(u8 port) -> u32 {
+    if (port == hw.PORT_A) { return hw.GPIOA.outdr; }
+    if (port == hw.PORT_B) { return hw.GPIOB.outdr; }
+    if (port == hw.PORT_C) { return hw.GPIOC.outdr; }
+    if (port == hw.PORT_D) { return hw.GPIOD.outdr; }
+    if (port == hw.PORT_E) { return hw.GPIOE.outdr; }
+    return 0u32;
+}
+
+// BSHR sets and BCR clears the selected bits atomically, with no read-modify-write.
+fn write_raw_port(u8 port, u8 pin, bool high) {
+    if (pin >= 16u8 || is_debug_pin(port, pin)) {
+        return;
+    }
+    u32 bit = 1u32 << (pin as u32);
+    if (port == hw.PORT_A) {
+        if (high) { hw.GPIOA.bshr = bit; } else { hw.GPIOA.bcr = bit; }
+    } else if (port == hw.PORT_B) {
+        if (high) { hw.GPIOB.bshr = bit; } else { hw.GPIOB.bcr = bit; }
+    } else if (port == hw.PORT_C) {
+        if (high) { hw.GPIOC.bshr = bit; } else { hw.GPIOC.bcr = bit; }
+    } else if (port == hw.PORT_D) {
+        if (high) { hw.GPIOD.bshr = bit; } else { hw.GPIOD.bcr = bit; }
+    } else if (port == hw.PORT_E) {
+        if (high) { hw.GPIOE.bshr = bit; } else { hw.GPIOE.bcr = bit; }
+    }
+}
+
+impl Pin {
+    pub fn set_mode(self, Mode mode, Pull pull) {
+        if (self.pin >= 16u8 || self.port > hw.PORT_E || is_debug_pin(self.port, self.pin)) {
+            return;
+        }
+        hw.RCC.apb2pcenr = hw.RCC.apb2pcenr | clock_bit(self.port);
+        u32 _stab = hw.RCC.apb2pcenr;
+        u32 pin_u = self.pin as u32;
+        switch (mode) {
+            Mode.Output => {
+                configure_port(self.port, pin_u, hw.GPIO_CFG_OUT_PP_2MHZ);
+            }
+            Mode.Analog => {
+                configure_port(self.port, pin_u, hw.GPIO_CFG_ANALOG_IN);
+            }
+            Mode.Input => {
+                switch (pull) {
+                    Pull.None => {
+                        configure_port(self.port, pin_u, hw.GPIO_CFG_FLOATING_IN);
+                    }
+                    Pull.Up => {
+                        // In pull-input mode the output data bit selects the pull direction.
+                        write_raw_port(self.port, self.pin, true);
+                        configure_port(self.port, pin_u, hw.GPIO_CFG_PULL_IN);
+                    }
+                    Pull.Down => {
+                        write_raw_port(self.port, self.pin, false);
+                        configure_port(self.port, pin_u, hw.GPIO_CFG_PULL_IN);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn read(self) -> bool {
+        if (self.pin >= 16u8) {
+            return false;
+        }
+        bool raw = (read_input(self.port) & (1u32 << (self.pin as u32))) != 0u32;
+        if (self.active_low) {
+            return !raw;
+        }
+        return raw;
+    }
+
+    pub fn write(self, bool high) {
+        bool hw_lvl = high;
+        if (self.active_low) {
+            hw_lvl = !high;
+        }
+        write_raw_port(self.port, self.pin, hw_lvl);
+    }
+
+    pub fn set_high(self) {
+        self.write(true);
+    }
+
+    pub fn set_low(self) {
+        self.write(false);
+    }
+
+    pub fn toggle(self) {
+        if (self.pin >= 16u8) {
+            return;
+        }
+        bool cur = (read_output(self.port) & (1u32 << (self.pin as u32))) != 0u32;
+        write_raw_port(self.port, self.pin, !cur);
+    }
+}

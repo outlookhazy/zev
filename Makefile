@@ -3,7 +3,7 @@ PORT  ?= /dev/ttyACM0
 BUILD_DIR ?= $(or $(TMPDIR),/tmp)/zev-build
 ZEVC  := $(CARGO) run --quiet --bin zevc --
 
-.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every pico flash-pico nucleo-f334r8 flash-nucleo-f334r8
+.PHONY: all build doc check test ram demo qemu esp32c6 flash-esp32c6 uno flash-uno nano-every flash-nano-every pico flash-pico nucleo-f334r8 flash-nucleo-f334r8 ch32v307 flash-ch32v307
 
 all: test
 
@@ -46,6 +46,9 @@ check:
 	$(ZEVC) check examples/portable_shell_demo.zev
 	$(ZEVC) check --board lm3s6965_evb examples/portable_shell_demo.zev
 	$(ZEVC) check --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
+	$(ZEVC) check --board yd_ch32v307 examples/ch32v307_blink.zev
+	$(ZEVC) check --board yd_ch32v307 examples/ch32v307_demo.zev
+	$(ZEVC) check --board yd_ch32v307 examples/portable_shell_demo.zev
 
 ram:
 	$(ZEVC) ram examples/motor_controller.zev examples/motor_support.zev
@@ -87,6 +90,15 @@ nucleo-f334r8:
 
 flash-nucleo-f334r8:
 	$(ZEVC) flash --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev --port $(PORT)
+
+ch32v307:
+	$(ZEVC) build --board yd_ch32v307 examples/ch32v307_blink.zev -o $(BUILD_DIR)/ch32v307/ch32v307_blink.bin
+	$(ZEVC) build --board yd_ch32v307 examples/ch32v307_demo.zev -o $(BUILD_DIR)/ch32v307/ch32v307_demo.bin
+	$(ZEVC) build --board yd_ch32v307 examples/portable_shell_demo.zev -o $(BUILD_DIR)/ch32v307/portable_shell_demo.bin
+
+# Hold BOOT0, tap RST, release, then run this (USB bootloader 4348:55e0, via `wchisp`).
+flash-ch32v307:
+	$(ZEVC) flash --board yd_ch32v307 examples/ch32v307_blink.zev
 
 # Cap test parallelism at 4 to bound concurrent clang/ld.lld/qemu subprocesses and peak RAM.
 test:

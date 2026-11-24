@@ -1,0 +1,30 @@
+// CH32V307 First Light: Blink Both LEDs (zero interrupts)
+//
+// The smallest program that proves the toolchain, startup code, clock and GPIO on a
+// YD-CH32V307VCT6. It attaches no interrupt handlers, so the vector table and the interrupt
+// controller are never touched. LED1 and LED2 alternate twice a second, and a line is printed
+// on USART1 (PA9, 115200 8N1) once a second.
+//
+//   zevc build --board yd_ch32v307 examples/ch32v307_blink.zev -o blink.bin
+//   hold BOOT0, tap RST, release, then:
+//   zevc flash --board yd_ch32v307 examples/ch32v307_blink.zev
+
+import board;
+
+fn main() {
+    board.init();
+    println(f"[BLINK board={board.BOARD_NAME}] boot");
+
+    u32 beat = 0;
+    bool phase = false;
+    loop {
+        phase = !phase;
+        board.set_led(phase);
+        board.set_led2(!phase);
+        if (phase) {
+            beat += 1;
+            println(f"[BLINK] beat={beat} t={sys.now_ms()}ms button={board.read_button()}");
+        }
+        delay(250ms);
+    }
+}

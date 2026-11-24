@@ -1,0 +1,12 @@
+# VCC-GND Studio YD-CH32V307VCT6 (CH32V307VCT6, dual USB-C, RJ45, microSD)
+#
+# Flashing uses the chip's built-in USB bootloader: hold BOOT0, tap RST, release, then flash.
+# The bootloader enumerates as USB 4348:55e0; no serial port is involved.
+
+[board]
+name = "yd_ch32v307"
+chip = "ch32v307"
+board_module = "bsp/yd_ch32v307"
+
+[run]
+flash_cmd = ["wchisp", "flash", "{image}"]
