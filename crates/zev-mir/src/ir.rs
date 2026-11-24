@@ -1149,6 +1149,7 @@ pub enum MirExprKind {
     Index {
         base: Box<MirExpr>,
         index: Box<MirExpr>,
+        raw_elem_ty: MirType,
         is_slice: bool,
     },
     SubSlice {

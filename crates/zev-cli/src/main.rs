@@ -5813,4 +5813,436 @@ task verifier() {
             qres.stdout
         );
     }
+
+    #[test]
+    fn pr22_implicit_array_to_slice_every_site_host_and_qemu() {
+        let temp = TempWorkDir::create("pr22_arr_to_slice").unwrap();
+        let app_path = temp.dir.join("app.zev");
+        let src = r#"
+import board;
+
+const [3]u8 K_BYTES = [11, 22, 33];
+const []u8 K_SLICE = K_BYTES;
+const []u8 K_LIT_SLICE = [7, 8, 9];
+
+enum E { Fail }
+
+struct Wrap {
+    []u8 s;
+}
+
+byte_ring<32> ring;
+inbox<[]u8, 4> sl_inbox;
+inbox<[3]u8, 4> arr_inbox;
+signal spawn_done;
+
+fn sum_u8([]u8 s) -> u32 {
+    u32 acc = 0;
+    for (u8 x in s) {
+        acc += x;
+    }
+    return acc;
+}
+
+fn sum_u16([]u16 s) -> u32 {
+    u32 acc = 0;
+    for (u16 x in s) {
+        acc += x;
+    }
+    return acc;
+}
+
+fn sum_u32([]u32 s) -> u32 {
+    u32 acc = 0;
+    for (u32 x in s) {
+        acc += x;
+    }
+    return acc;
+}
+
+fn check_param_arr([3]u8 p, [2]u16 p16) -> u32 {
+    []u8 sp = p;
+    []u16 sp16 = p16;
+    Wrap w = Wrap { s: p };
+    fn([]u8) -> u32 cb = sum_u8;
+    u32 a = sum_u8(p);
+    u32 b = cb(w.s);
+    u32 c = sum_u16(sp16);
+    assert(sp.len == 3 && w.s.len == 3 && sp16.len == 2);
+    return a + b + c;
+}
+
+fn ret_ptr_slice(*[3]u8 p) -> []u8 {
+    return *p;
+}
+
+fn ret_const_slice() -> []u8 {
+    return K_BYTES;
+}
+
+fn fail_slice() -> []u8 error E {
+    error E.Fail;
+}
+
+fn ok_arr() -> [3]u8 error E {
+    [3]u8 a = [4, 5, 6];
+    return a;
+}
+
+fn fail_partial(*[3]u8 p) -> []u8 error E {
+    error E.Fail, *p;
+}
+
+task spawned_worker([]u8 init_s) {
+    assert(init_s.len == 3 && init_s[0] == 11 && init_s[2] == 33);
+    spawn_done.notify();
+    loop {
+        delay(50ms);
+    }
+}
+
+task main_task() {
+    [3]u8 local = [10, 20, 30];
+    [2]u16 l16 = [300, 400];
+    [2]u32 l32 = [100000, 200000];
+
+    // Local init & storage aliasing
+    []u8 s_init = local;
+    assert(s_init.len == 3 && s_init[0] == 10 && s_init[2] == 30);
+    local[1] = 25;
+    assert(s_init[1] == 25);
+    local[1] = 20;
+
+    // Assignment
+    []u8 s_ass = "x";
+    s_ass = local;
+    assert(s_ass.len == 3 && s_ass[2] == 30);
+
+    // Struct literal & field assignment
+    Wrap w = Wrap { s: local };
+    assert(w.s.len == 3 && w.s[0] == 10);
+    [3]u8 local2 = [1, 2, 3];
+    w.s = local2;
+    assert(w.s.len == 3 && w.s[0] == 1 && w.s[2] == 3);
+
+    // Array of slices (explicit & inferred with str)
+    [2][]u8 arr2 = [local, local2];
+    assert(arr2[0].len == 3 && arr2[1][1] == 2);
+    [2][]u8 arr_mix = [local, "ok"];
+    assert(arr_mix[0].len == 3 && arr_mix[1].len == 2);
+
+    // Nested 2D array -> array of slices & aliasing
+    [2][3]u8 grid = [[1, 2, 3], [4, 5, 6]];
+    [2][]u8 rows = grid;
+    assert(rows[0].len == 3 && rows[1][2] == 6);
+    grid[1][0] = 40;
+    assert(rows[1][0] == 40);
+    grid[1][0] = 4;
+
+    // Param array & u16/u32 elements
+    assert(check_param_arr(local, l16) == 820);
+    assert(sum_u32(l32) == 300000);
+
+    // Return via *[N]T, const, and error partial
+    []u8 rp = ret_ptr_slice(&local);
+    assert(rp.len == 3 && rp[1] == 20);
+    []u8 rc = ret_const_slice();
+    assert(rc.len == 3 && rc[1] == 22 && K_SLICE.len == 3 && K_LIT_SLICE.len == 3);
+    []u8 ep = "zz";
+    []u8 fp_v = fail_partial(&local) catch (E err, []u8 part) { part };
+    assert(fp_v.len == 3 && fp_v[0] == 10);
+    ep = fp_v;
+    assert(ep[2] == 30);
+
+    // `or` and `catch`
+    []u8 o1 = fail_slice() or local;
+    assert(o1.len == 3 && o1[0] == 10);
+    []u8 o2 = ok_arr() or local2;
+    assert(o2.len == 3 && o2[2] == 6);
+    []u8 c1 = fail_slice() catch (E e) { local2 };
+    assert(c1.len == 3 && c1[1] == 2);
+
+    // OS-primitive push/pop and inbox
+    [3]u8 tx_b = [65, 66, 67];
+    [3]u8 rx_b = [0, 0, 0];
+    usize pushed = ring.push(tx_b);
+    assert(pushed == 3);
+    usize popped = ring.pop(rx_b);
+    assert(popped == 3 && rx_b[0] == 65 && rx_b[2] == 67);
+    sl_inbox.post(K_BYTES);
+    []u8 sl_got = sl_inbox.recv();
+    assert(sl_got.len == 3 && sl_got[1] == 22);
+    arr_inbox.post(local2);
+    []u8 arr_got = arr_inbox.recv();
+    assert(arr_got.len == 3 && arr_got[2] == 3);
+
+    // Direct, indirect, and rvalue calls
+    fn([]u8) -> u32 fp = sum_u8;
+    assert(fp(local) == 60);
+    assert(fp(w.s) == 6);
+    assert(fp(grid[1]) == 15);
+    assert(fp(*(&local)) == 60);
+    assert(fp([5, 6, 7]) == 18);
+
+    // Yield across delay while slice aliases local array on coroutine frame
+    []u8 across = local;
+    delay(1ms);
+    local[0] = 99;
+    assert(across.len == 3 && across[0] == 99 && across[2] == 30);
+
+    spawn_done.wait();
+    println("PR22_ARR_TO_SLICE_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    board.init();
+    spawn spawned_worker(K_BYTES);
+    spawn main_task();
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "host failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("PR22_ARR_TO_SLICE_OK"),
+            "host stdout={stdout:?}"
+        );
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("pr22_arr_slice.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout.contains("PR22_ARR_TO_SLICE_OK"),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
+
+    #[test]
+    fn pr22_comprehensive_implicit_conversions_corpus() {
+        let temp = TempWorkDir::create("pr22_conv_corpus").unwrap();
+        let app_path = temp.dir.join("app.zev");
+        let src = r#"
+import board;
+
+const [3]u8 C_U8 = [10, 200, 255];
+const [3]u16 C_WIDE = C_U8;
+const [2]u16be C_BE = [0x1234, 0xabcd];
+const [2]u32 C_BE_WIDE = C_BE;
+const u8 C_V8 = 200;
+const u16be C_V16BE = C_V8;
+const u32 C_V32 = C_V16BE;
+
+byte_ring<16> br;
+inbox<u32, 4> ibx;
+
+mmio TestRegs {
+    @rw u32 cr @ 0x00;
+}
+mmio TEST_INST : TestRegs @ 0x4000_0000;
+
+struct EndianBox {
+    u16be port;
+    u32le seq;
+    [2]u16 nums;
+}
+
+fn take_u32(u32 v) -> u32 { return v; }
+fn take_i64(i64 v) -> i64 { return v; }
+fn take_u16be(u16be v) -> u16 { return v; }
+fn take_u32_arr([3]u32 a) -> u32 { return a[0] + a[1] + a[2]; }
+fn take_ring(*byte_ring r) -> usize { return r.cap(); }
+fn take_inbox(*inbox<u32> i) -> usize { return i.cap(); }
+fn take_void(*void p) -> bool { return p != (0 as *void); }
+fn take_mmio(*TestRegs r, *TestRegs s) -> bool { return r == s; }
+fn take_c_u8(*u8 p) -> u8 { return *p; }
+fn take_c_i8(*i8 p) -> i8 { return *p; }
+fn id_fn(u8 x) -> u8 { return x; }
+
+fn yield_u8() -> u8 {
+    delay(1ms);
+    return 250;
+}
+
+fn yield_arr_u8() -> [3]u8 {
+    delay(1ms);
+    [3]u8 out = [5, 6, 7];
+    return out;
+}
+
+task main_task() {
+    // 1. IntLit -> all 16 int types
+    u8 a_u8 = 255;
+    u16 a_u16 = 65535;
+    u32 a_u32 = 4000000000;
+    u64 a_u64 = 9000000000;
+    usize a_us = 1234;
+    i8 a_i8 = -128;
+    i16 a_i16 = -32768;
+    i32 a_i32 = -2000000000;
+    i64 a_i64 = -5000000000;
+    isize a_is = -999;
+    u16be a_16be = 0x1234;
+    u16le a_16le = 0x1234;
+    u32be a_32be = 0x12345678;
+    u32le a_32le = 0x12345678;
+    u64be a_64be = 0x0102030405060708;
+    u64le a_64le = 0x0102030405060708;
+    assert(a_u8 == 255 && a_u16 == 65535 && a_u32 == 4000000000 && a_u64 == 9000000000 && a_us == 1234);
+    assert(a_i8 == -128 && a_i16 == -32768 && a_i32 == -2000000000 && a_i64 == -5000000000 && a_is == -999);
+    assert(a_16be == 0x1234 && a_16le == 0x1234 && a_32be == 0x12345678 && a_32le == 0x12345678);
+    assert(a_64be == 0x0102030405060708 && a_64le == 0x0102030405060708);
+
+    // 2. FloatLit -> f32 / f64
+    f32 f32v = 1.5;
+    f64 f64v = 2.25;
+    assert(f32v > 1.0f32 && f64v > 2.0f64);
+
+    // 3. Lossless integer widening at boundary values (unsigned and signed)
+    u16 w_u8_u16 = a_u8;
+    u32 w_u8_u32 = a_u8;
+    u64 w_u8_u64 = a_u8;
+    i16 w_u8_i16 = a_u8;
+    i32 w_u8_i32 = a_u8;
+    i64 w_u8_i64 = a_u8;
+    u32 w_u16_u32 = a_u16;
+    i32 w_u16_i32 = a_u16;
+    u64 w_u32_u64 = a_u32;
+    i64 w_u32_i64 = a_u32;
+    i16 w_i8_i16 = a_i8;
+    i32 w_i16_i32 = a_i16;
+    i64 w_i32_i64 = a_i32;
+    assert(w_u8_u16 == 255 && w_u8_u32 == 255 && w_u8_u64 == 255);
+    assert(w_u8_i16 == 255 && w_u8_i32 == 255 && w_u8_i64 == 255);
+    assert(w_u16_u32 == 65535 && w_u16_i32 == 65535 && w_u32_u64 == 4000000000 && w_u32_i64 == 4000000000);
+    assert(w_i8_i16 == -128 && w_i16_i32 == -32768 && w_i32_i64 == -2000000000);
+    assert(take_u32(a_u16) == 65535 && take_i64(a_i32) == -2000000000);
+
+    // 4. Endian conversions & chains (u8 -> u16be -> u32 in locals/structs/arrays/consts/params/yield)
+    u16be eb = a_u8;
+    u32 ew = eb;
+    assert(eb == 255 && ew == 255 && C_V32 == 200 && take_u16be(a_u8) == 255);
+    [2]u8 pair8 = [10, 20];
+    EndianBox box = EndianBox { port: a_u8, seq: a_u16, nums: pair8 };
+    assert(box.port == 255 && box.seq == 65535 && box.nums[0] == 10 && box.nums[1] == 20);
+    [2]u16be be_arr = pair8;
+    assert(be_arr[0] == 10 && be_arr[1] == 20);
+    assert(C_WIDE[0] == 10 && C_WIDE[2] == 255 && C_BE_WIDE[0] == 0x1234 && C_BE_WIDE[1] == 0xabcd);
+
+    // 5. Elementwise array widening & yielding returns
+    [3]u8 src3 = [1, 2, 250];
+    [3]u16 dst16 = src3;
+    [3]u32 dst32 = dst16;
+    assert(dst32[0] == 1 && dst32[2] == 250 && take_u32_arr(src3) == 253);
+
+    u32 yu = yield_u8();
+    []u8 ys = yield_arr_u8();
+    [3]u16 ya16 = yield_arr_u8();
+    assert(yu == 250 && ys.len == 3 && ys[2] == 7 && ya16[0] == 5 && ya16[2] == 7);
+
+    // 6. Primitive views, opaque *void, str, mmio, fn pointers
+    assert(take_ring(&br) == 16 && take_inbox(&ibx) == 4);
+    u32 val = 99;
+    assert(take_void(&val) && take_void(id_fn) && take_void("abc"));
+    []u8 str_sl = "abc";
+    assert(str_sl.len == 3 && take_c_u8("abc") == 97 && take_c_i8("abc") == 97);
+    fn(u8) -> u8 fptr = id_fn;
+    assert(fptr(42) == 42);
+    assert(take_mmio(TEST_INST, TEST_INST));
+
+    println("PR22_CORPUS_ALL_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    board.init();
+    spawn main_task();
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "host failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("PR22_CORPUS_ALL_OK"),
+            "host stdout={stdout:?}"
+        );
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("pr22_corpus.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout.contains("PR22_CORPUS_ALL_OK"),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
 }

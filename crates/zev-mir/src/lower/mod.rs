@@ -903,8 +903,14 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             ItemKind::Const(cd) => {
                 let ty = syms.resolve_type(&cd.ty);
                 let mut dummy_ctx = DirectLowerCtx::new(&syms, MirType::Void, MirErrorSpec::None);
-                let init =
-                    coerce_expr_if_needed(dummy_ctx.lower_pure_expr(&cd.value, Some(&ty))?, &ty);
+                let raw = dummy_ctx.lower_pure_expr(&cd.value, Some(&ty))?;
+                dummy_ctx.in_const_eval = true;
+                let mut dummy_stmts = Vec::new();
+                let mut be = DirectBackend {
+                    ctx: &mut dummy_ctx,
+                    stmts: &mut dummy_stmts,
+                };
+                let init = coerce_expr_be(raw, &ty, &mut be);
                 mir_consts.push(MirConst {
                     name: cd.name.name.clone(),
                     ty,
@@ -932,7 +938,18 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                     };
                     let mut dummy_ctx =
                         DirectLowerCtx::new(&syms, MirType::Void, MirErrorSpec::None);
-                    Some(dummy_ctx.lower_pure_expr(ie, elem_ty)?)
+                    let raw = dummy_ctx.lower_pure_expr(ie, elem_ty)?;
+                    if let Some(ety) = elem_ty {
+                        dummy_ctx.in_const_eval = true;
+                        let mut dummy_stmts = Vec::new();
+                        let mut be = DirectBackend {
+                            ctx: &mut dummy_ctx,
+                            stmts: &mut dummy_stmts,
+                        };
+                        Some(coerce_expr_be(raw, ety, &mut be))
+                    } else {
+                        Some(raw)
+                    }
                 } else {
                     None
                 };

@@ -8288,3 +8288,130 @@ fn main() {
         );
     }
 }
+
+#[test]
+fn pr22_e0008_e0009_e0010_implicit_array_to_slice_escape_checks() {
+    for (label, src) in [
+        (
+            "assign_outer",
+            "fn main() { []u8 s = \"x\"; { [3]u8 b = [1, 2, 3]; s = b; } }",
+        ),
+        (
+            "struct_lit",
+            "struct W { []u8 s; } fn main() { W w = W { s: \"x\" }; { [3]u8 b = [1, 2, 3]; w = W { s: b }; } }",
+        ),
+        (
+            "struct_field_assign",
+            "struct W { []u8 s; } fn main() { W w = W { s: \"x\" }; { [3]u8 b = [1, 2, 3]; w.s = b; } }",
+        ),
+        (
+            "array_of_slices",
+            "fn main() { [2][]u8 p = [\"a\", \"b\"]; { [3]u8 b = [1, 2, 3]; p = [b, \"ok\"]; } }",
+        ),
+        (
+            "index_assign",
+            "fn main() { [2][]u8 p = [\"a\", \"b\"]; { [3]u8 b = [1, 2, 3]; p[0] = b; } }",
+        ),
+        (
+            "or_fallback",
+            "enum E { Fail } fn f() -> []u8 error E { error E.Fail; } fn main() { []u8 s = \"x\"; { [3]u8 b = [1, 2, 3]; s = f() or b; } }",
+        ),
+        (
+            "catch_fallback",
+            "enum E { Fail } fn f() -> []u8 error E { error E.Fail; } fn main() { []u8 s = \"x\"; { [3]u8 b = [1, 2, 3]; s = f() catch (E e) { b }; } }",
+        ),
+    ] {
+        let res = analyze_and_monomorphize_programs(
+            &[zev_parser::parse_str(src).unwrap()],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::ScopeDepthEscape),
+            "{label}: expected E0008 ScopeDepthEscape, got {:?}",
+            res.diagnostics
+        );
+    }
+
+    for (label, src) in [
+        ("return_direct", "fn bad() -> []u8 { [3]u8 b = [1, 2, 3]; return b; } fn main() { []u8 _s = bad(); }"),
+        ("return_struct", "struct W { []u8 s; } fn bad() -> W { [3]u8 b = [1, 2, 3]; return W { s: b }; } fn main() { W _w = bad(); }"),
+        ("return_array_of_slices", "fn bad() -> [2][]u8 { [3]u8 b = [1, 2, 3]; return [b, \"ok\"]; } fn main() { [2][]u8 _p = bad(); }"),
+    ] {
+        let res = analyze_and_monomorphize_programs(
+            &[zev_parser::parse_str(src).unwrap()],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::ReturnLocalReference),
+            "{label}: expected E0009 ReturnLocalReference, got {:?}",
+            res.diagnostics
+        );
+    }
+
+    let spawn_res = analyze_and_monomorphize_programs(
+        &[zev_parser::parse_str(
+            "task worker([]u8 s) { loop { delay(10ms); } } fn main() { [3]u8 buf = [1, 2, 3]; spawn worker(buf); }",
+        )
+        .unwrap()],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        spawn_res
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::SpawnNonStaticReference),
+        "expected E0010 SpawnNonStaticReference, got {:?}",
+        spawn_res.diagnostics
+    );
+}
+
+#[test]
+fn pr22_fnptr_invariance_rejects_mismatched_signatures() {
+    for (label, src) in [
+        (
+            "widen_param_and_ret",
+            "fn f(u8 x) -> u8 { return x; } fn main() { fn(u32) -> u32 cb = f; u32 r = cb(1); }",
+        ),
+        (
+            "widen_ret_only",
+            "fn f(u32 x) -> u8 { return (x & 0xff) as u8; } fn main() { fn(u32) -> u32 cb = f; u32 r = cb(1); }",
+        ),
+        (
+            "array_vs_slice_param",
+            "fn f([]u8 s) -> usize { return s.len; } fn main() { fn([3]u8) -> usize cb = f; [3]u8 a = [1, 2, 3]; usize r = cb(a); }",
+        ),
+    ] {
+        let res = analyze_and_monomorphize_programs(
+            &[zev_parser::parse_str(src).unwrap()],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::TypeMismatch)
+                && !res
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.kind == DiagnosticKind::UndefinedSymbol),
+            "{label}: expected only TypeMismatch on mismatched fn ptr signature, got {:?}",
+            res.diagnostics
+        );
+    }
+
+    let exact = analyze_and_monomorphize_programs(
+        &[zev_parser::parse_str(
+            "fn f(u8 x) -> u16 { return x; } fn main() { fn(u8) -> u16 cb = f; u16 r = cb(7); }",
+        )
+        .unwrap()],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        exact.diagnostics.is_empty(),
+        "exact fn ptr match should pass, got {:?}",
+        exact.diagnostics
+    );
+}

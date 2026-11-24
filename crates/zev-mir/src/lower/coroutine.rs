@@ -213,7 +213,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                 if let Some(ie) = init {
                     if !self.try_lower_yielding_into_var(ie, vid, &vty)? {
                         let val = self.lower_expr(ie, Some(&vty))?;
-                        let moved = consume_moved_lease_be(coerce_expr_if_needed(val, &vty), self);
+                        let coerced = coerce_expr_be(val, &vty, self);
+                        let moved = consume_moved_lease_be(coerced, self);
                         self.cur_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(vid),
                             op: MirAssignOp::Assign,
@@ -247,10 +248,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                 }
                 let (place, pty) = self.lower_place(target)?;
                 let rhs = self.lower_expr(value, Some(&pty.host_value_type()))?;
-                let moved = consume_moved_lease_be(
-                    coerce_expr_if_needed(rhs, &pty.host_value_type()),
-                    self,
-                );
+                let coerced = coerce_expr_be(rhs, &pty.host_value_type(), self);
+                let moved = consume_moved_lease_be(coerced, self);
                 self.cur_stmts.push(MirStmt::Assign {
                     target: place,
                     op: convert_assign_op(*op),
@@ -267,7 +266,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let has_defers = self.has_active_defers_from(0);
                 let val = if let Some(e) = expr_opt {
                     let raw = self.lower_expr(e, Some(&ret_ty))?;
-                    let coerced = consume_moved_lease_be(coerce_expr_if_needed(raw, &ret_ty), self);
+                    let coerced_val = coerce_expr_be(raw, &ret_ty, self);
+                    let coerced = consume_moved_lease_be(coerced_val, self);
                     if has_defers && !ret_ty.is_void() {
                         let tmp = self.alloc_temp("ret_val", ret_ty.clone());
                         self.cur_stmts.push(MirStmt::Assign {
@@ -292,32 +292,39 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let has_defers = self.has_active_defers_from(0);
                 let r = if let Some(re) = reason {
                     let raw = self.lower_expr(re, err_ty.as_ref())?;
+                    let coerced = if let Some(ety) = &err_ty {
+                        coerce_expr_be(raw, ety, self)
+                    } else {
+                        raw
+                    };
                     if let (true, Some(ety)) = (has_defers, err_ty.clone()) {
                         let tmp = self.alloc_temp("err_reason", ety.clone());
                         self.cur_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(tmp),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(raw, &ety),
+                            value: coerced,
                         });
                         Some(MirExpr::new(MirExprKind::Var(tmp), ety))
                     } else {
-                        Some(raw)
+                        Some(coerced)
                     }
                 } else {
                     None
                 };
                 let p = if let Some(pe) = partial {
                     let raw = self.lower_expr(pe, Some(&ret_ty))?;
+                    let coerced_val = coerce_expr_be(raw, &ret_ty, self);
+                    let coerced = consume_moved_lease_be(coerced_val, self);
                     if has_defers && !ret_ty.is_void() {
                         let tmp = self.alloc_temp("err_partial", ret_ty.clone());
                         self.cur_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(tmp),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(raw, &ret_ty),
+                            value: coerced,
                         });
                         Some(MirExpr::new(MirExprKind::Var(tmp), ret_ty))
                     } else {
-                        Some(raw)
+                        Some(coerced)
                     }
                 } else {
                     None
@@ -871,6 +878,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                     MirExprKind::Index {
                         base: Box::new(MirExpr::new(MirExprKind::Var(slice_tmp), slice_ty)),
                         index: Box::new(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize)),
+                        raw_elem_ty: seq_elem_ty.clone(),
                         is_slice: true,
                     },
                     seq_elem_ty.host_value_type(),
@@ -1622,7 +1630,10 @@ impl<'a> CoroutineLowerCtx<'a> {
                         }
                         let yields_here = sig.is_yielding
                             && !(self.in_noyield && sig.effect == MirFnEffect::SoftYielding);
-                        if yields_here && !sig.error_spec.has_error() {
+                        if yields_here
+                            && !sig.error_spec.has_error()
+                            && (sig.ret_ty == *dst_ty || dst_ty.is_void())
+                        {
                             self.emit_yielding_fn_call(
                                 &id.name,
                                 &sig,
@@ -1643,7 +1654,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                 if let Some(recv_kind) = resolve_prim_receiver_kind_be(receiver, self)? {
                     match recv_kind {
                         LoweredPrimReceiver::ByteRingView(view)
-                            if m == "wait_read" && find_named_arg(args, "timeout").is_none() =>
+                            if m == "wait_read"
+                                && find_named_arg(args, "timeout").is_none()
+                                && (*dst_ty == MirType::U8 || dst_ty.is_void()) =>
                         {
                             self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
@@ -1662,7 +1675,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                             return Ok(true);
                         }
                         LoweredPrimReceiver::ByteRingView(view)
-                            if m == "wait_write" && find_named_arg(args, "timeout").is_none() =>
+                            if m == "wait_write"
+                                && find_named_arg(args, "timeout").is_none()
+                                && (*dst_ty == MirType::Usize || dst_ty.is_void()) =>
                         {
                             self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
@@ -1680,7 +1695,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                             return Ok(true);
                         }
                         LoweredPrimReceiver::InboxView(view, elem)
-                            if m == "recv" && find_named_arg(args, "timeout").is_none() =>
+                            if m == "recv"
+                                && find_named_arg(args, "timeout").is_none()
+                                && (*dst_ty == elem || dst_ty.is_void()) =>
                         {
                             self.emit_end_inbox_turn();
                             let poll_bb = self.alloc_bb();
@@ -1700,7 +1717,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                             return Ok(true);
                         }
                         LoweredPrimReceiver::Sized(target, pkind) => match (m, pkind) {
-                            ("wait_chunk", MirPrimKind::PingPong { elem, cap }) => {
+                            ("wait_chunk", MirPrimKind::PingPong { elem, cap })
+                                if *dst_ty == MirType::Slice(elem.clone()) || dst_ty.is_void() =>
+                            {
                                 self.emit_end_inbox_turn();
                                 let poll_bb = self.alloc_bb();
                                 let resume_bb = self.alloc_bb();
@@ -1718,7 +1737,9 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 return Ok(true);
                             }
                             ("alloc", MirPrimKind::Pool { elem, cap })
-                                if find_named_arg(args, "timeout").is_none() =>
+                                if find_named_arg(args, "timeout").is_none()
+                                    && (*dst_ty == MirType::Lease(elem.clone())
+                                        || dst_ty.is_void()) =>
                             {
                                 self.emit_end_inbox_turn();
                                 let poll_bb = self.alloc_bb();
@@ -1739,7 +1760,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 return Ok(true);
                             }
                             ("recv", MirPrimKind::Inbox { elem, cap })
-                                if find_named_arg(args, "timeout").is_none() =>
+                                if find_named_arg(args, "timeout").is_none()
+                                    && (*dst_ty == *elem || dst_ty.is_void()) =>
                             {
                                 self.emit_end_inbox_turn();
                                 let poll_bb = self.alloc_bb();
@@ -1760,7 +1782,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 return Ok(true);
                             }
                             ("wait_read", MirPrimKind::ByteRing { cap })
-                                if find_named_arg(args, "timeout").is_none() =>
+                                if find_named_arg(args, "timeout").is_none()
+                                    && (*dst_ty == MirType::U8 || dst_ty.is_void()) =>
                             {
                                 self.emit_end_inbox_turn();
                                 let poll_bb = self.alloc_bb();
@@ -1780,7 +1803,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 return Ok(true);
                             }
                             ("wait_write", MirPrimKind::ByteRing { cap })
-                                if find_named_arg(args, "timeout").is_none() =>
+                                if find_named_arg(args, "timeout").is_none()
+                                    && (*dst_ty == MirType::Usize || dst_ty.is_void()) =>
                             {
                                 self.emit_end_inbox_turn();
                                 let poll_bb = self.alloc_bb();
@@ -1799,7 +1823,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 return Ok(true);
                             }
                             ("wait_change", MirPrimKind::Watch { elem })
-                                if find_named_arg(args, "timeout").is_none() =>
+                                if find_named_arg(args, "timeout").is_none()
+                                    && (*dst_ty == *elem || dst_ty.is_void()) =>
                             {
                                 self.emit_end_inbox_turn();
                                 let (last_gen_var, seeded_var) =
@@ -1971,7 +1996,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                         {
                             let vexpr = if let Some(first) = first_positional_arg(args) {
                                 let raw = self.lower_expr(first, Some(&elem))?;
-                                coerce_expr_if_needed(raw, &elem)
+                                coerce_expr_be(raw, &elem, self)
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(0), elem.clone())
                             };
@@ -2003,7 +2028,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             {
                                 let vexpr = if let Some(first) = first_positional_arg(args) {
                                     let raw = self.lower_expr(first, Some(&elem))?;
-                                    coerce_expr_if_needed(raw, &elem)
+                                    coerce_expr_be(raw, &elem, self)
                                 } else {
                                     MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                                 };
@@ -2340,6 +2365,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 MirExprKind::Var(idx_var),
                                 MirType::Usize,
                             )),
+                            raw_elem_ty: raw_el_ty.clone(),
                             is_slice: true,
                         },
                         raw_el_ty,
@@ -2728,7 +2754,15 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let heads = &or_chain[..or_chain.len() - 1];
                 let tail = or_chain[or_chain.len() - 1];
 
-                let (first_res_vid, ok_ty, _) = self.lower_into_result_var(heads[0])?;
+                let (first_res_vid, first_ok_ty, _) = self.lower_into_result_var(heads[0])?;
+                let ok_ty = resolve_or_result_ty(
+                    first_ok_ty.clone(),
+                    expected,
+                    tail,
+                    self.syms,
+                    &self.scopes,
+                    &self.vars,
+                );
                 let out_vid_opt = if ok_ty.is_void() {
                     None
                 } else {
@@ -2737,10 +2771,12 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let join_bb = self.alloc_bb();
 
                 let mut cur_res_vid = first_res_vid;
+                let mut cur_ok_ty = first_ok_ty;
                 for (i, _) in heads.iter().enumerate() {
                     if i > 0 {
-                        let (next_vid, _, _) = self.lower_into_result_var(heads[i])?;
+                        let (next_vid, next_ok_ty, _) = self.lower_into_result_var(heads[i])?;
                         cur_res_vid = next_vid;
+                        cur_ok_ty = next_ok_ty;
                     }
                     let err_bb = self.alloc_bb();
                     let ok_bb = self.alloc_bb();
@@ -2757,13 +2793,15 @@ impl<'a> CoroutineLowerCtx<'a> {
                         false,
                     );
                     if let Some(out_vid) = out_vid_opt {
+                        let val = coerce_expr_be(
+                            MirExpr::new(MirExprKind::ResultVal(cur_res_vid), cur_ok_ty.clone()),
+                            &ok_ty,
+                            self,
+                        );
                         self.cur_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(out_vid),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(
-                                MirExpr::new(MirExprKind::ResultVal(cur_res_vid), ok_ty.clone()),
-                                &ok_ty,
-                            ),
+                            value: val,
                         });
                     }
                     self.seal_bb(MirTerminator::Goto(join_bb), err_bb, false);
@@ -2771,8 +2809,8 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 let fb_val = self.lower_expr(tail, Some(&ok_ty))?;
                 if let Some(out_vid) = out_vid_opt {
-                    let fb_val =
-                        consume_moved_lease_be(coerce_expr_if_needed(fb_val, &ok_ty), self);
+                    let coerced = coerce_expr_be(fb_val, &ok_ty, self);
+                    let fb_val = consume_moved_lease_be(coerced, self);
                     self.cur_stmts.push(MirStmt::Assign {
                         target: MirPlace::Var(out_vid),
                         op: MirAssignOp::Assign,
@@ -2831,13 +2869,15 @@ impl<'a> CoroutineLowerCtx<'a> {
                         false,
                     );
                     if let Some(out_vid) = out_vid_opt {
+                        let val = coerce_expr_be(
+                            MirExpr::new(MirExprKind::ResultVal(h_vid), ok_ty_ref.clone()),
+                            &ok_ty_ref,
+                            self,
+                        );
                         self.cur_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(out_vid),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(
-                                MirExpr::new(MirExprKind::ResultVal(h_vid), ok_ty_ref.clone()),
-                                &ok_ty_ref,
-                            ),
+                            value: val,
                         });
                     }
                     self.seal_bb(MirTerminator::Goto(join_bb), next_try_bb, false);
@@ -2913,10 +2953,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     self.cur_stmts.push(MirStmt::Expr(tail_val));
                                 }
                             } else {
-                                let tail_val = consume_moved_lease_be(
-                                    coerce_expr_if_needed(tail_val, &ok_ty),
-                                    self,
-                                );
+                                let coerced = coerce_expr_be(tail_val, &ok_ty, self);
+                                let tail_val = consume_moved_lease_be(coerced, self);
                                 self.cur_stmts.push(MirStmt::Assign {
                                     target: MirPlace::Var(out_vid),
                                     op: MirAssignOp::Assign,
@@ -3013,7 +3051,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             "send" => {
                                 let vexpr = if let Some(first) = first_positional_arg(args) {
                                     let raw = self.lower_expr(first, Some(&elem))?;
-                                    coerce_expr_if_needed(raw, &elem)
+                                    coerce_expr_be(raw, &elem, self)
                                 } else {
                                     MirExpr::new(MirExprKind::IntLit(0), elem.clone())
                                 };
@@ -3289,7 +3327,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                             ("send", MirPrimKind::Inbox { elem, cap }) => {
                                 let vexpr = if let Some(first) = first_positional_arg(args) {
                                     let raw = self.lower_expr(first, Some(&elem))?;
-                                    coerce_expr_if_needed(raw, &elem)
+                                    coerce_expr_be(raw, &elem, self)
                                 } else {
                                     MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                                 };
@@ -3664,7 +3702,7 @@ impl<'a> CoroutineLowerCtx<'a> {
     }
 
     pub(super) fn coerce_arg_for_param(&mut self, arg: MirExpr, param_ty: &MirType) -> MirExpr {
-        coerce_call_arg_expr(arg, param_ty)
+        coerce_expr_be(arg, param_ty, self)
     }
 
     pub(super) fn lower_place(

@@ -20,6 +20,7 @@ pub(super) struct DirectLowerCtx<'a> {
     pub(super) inlined_helper_stack: Vec<InlinedHelperFrame>,
     pub(super) in_noyield: bool,
     pub(super) in_isr: bool,
+    pub(super) in_const_eval: bool,
     pub(super) isr_state_vars: Vec<MirIsrStateDecl>,
     pub(super) pending_stmts: Vec<MirStmt>,
 }
@@ -39,6 +40,7 @@ impl<'a> DirectLowerCtx<'a> {
             inlined_helper_stack: Vec::new(),
             in_noyield: false,
             in_isr: false,
+            in_const_eval: false,
             isr_state_vars: Vec::new(),
             pending_stmts: Vec::new(),
         }
@@ -63,6 +65,7 @@ impl<'a> DirectLowerCtx<'a> {
             inlined_helper_stack: Vec::new(),
             in_noyield: false,
             in_isr: false,
+            in_const_eval: false,
             isr_state_vars: Vec::new(),
             pending_stmts: Vec::new(),
         }
@@ -226,7 +229,8 @@ impl<'a> DirectLowerCtx<'a> {
                         ctx: self,
                         stmts: &mut out,
                     };
-                    let coerced = consume_moved_lease_be(coerce_expr_if_needed(val, &vty), &mut be);
+                    let coerced =
+                        consume_moved_lease_be(coerce_expr_be(val, &vty, &mut be), &mut be);
                     if self.boot_state.is_some() {
                         let resolved = resolve_boot_const_expr(&coerced, &self.boot_const_env);
                         if is_const_mir_expr(&resolved) {
@@ -298,7 +302,7 @@ impl<'a> DirectLowerCtx<'a> {
                         stmts: &mut out,
                     };
                     let rhs_moved = consume_moved_lease_be(
-                        coerce_expr_if_needed(rhs, &pty.host_value_type()),
+                        coerce_expr_be(rhs, &pty.host_value_type(), &mut be),
                         &mut be,
                     );
                     out.push(MirStmt::Assign {
@@ -326,7 +330,7 @@ impl<'a> DirectLowerCtx<'a> {
                             stmts: &mut out,
                         };
                         let v_moved =
-                            consume_moved_lease_be(coerce_expr_if_needed(v, &h_ret_ty), &mut be);
+                            consume_moved_lease_be(coerce_expr_be(v, &h_ret_ty, &mut be), &mut be);
                         if let Some(rv) = h_ret_val {
                             out.push(MirStmt::Assign {
                                 target: MirPlace::Var(rv),
@@ -355,7 +359,7 @@ impl<'a> DirectLowerCtx<'a> {
                         stmts: &mut out,
                     };
                     let coerced =
-                        consume_moved_lease_be(coerce_expr_if_needed(raw, &ret_ty), &mut be);
+                        consume_moved_lease_be(coerce_expr_be(raw, &ret_ty, &mut be), &mut be);
                     if has_defers && !ret_ty.is_void() {
                         // Evaluate return expression into a temp BEFORE running `defer` statements!
                         let tmp = self.alloc_temp("ret_val", ret_ty.clone());
@@ -380,32 +384,47 @@ impl<'a> DirectLowerCtx<'a> {
                 let has_defers = self.has_active_defers_from(0);
                 let r = if let Some(re) = reason {
                     let raw = self.lower_expr_with_stmts(re, err_ty.as_ref(), &mut out)?;
+                    let coerced = if let Some(ety) = &err_ty {
+                        let mut be = DirectBackend {
+                            ctx: self,
+                            stmts: &mut out,
+                        };
+                        coerce_expr_be(raw, ety, &mut be)
+                    } else {
+                        raw
+                    };
                     if let (true, Some(ety)) = (has_defers, err_ty.clone()) {
                         let tmp = self.alloc_temp("err_reason", ety.clone());
                         out.push(MirStmt::Assign {
                             target: MirPlace::Var(tmp),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(raw, &ety),
+                            value: coerced,
                         });
                         Some(MirExpr::new(MirExprKind::Var(tmp), ety))
                     } else {
-                        Some(raw)
+                        Some(coerced)
                     }
                 } else {
                     None
                 };
                 let p = if let Some(pe) = partial {
                     let raw = self.lower_expr_with_stmts(pe, Some(&ret_ty), &mut out)?;
+                    let mut be = DirectBackend {
+                        ctx: self,
+                        stmts: &mut out,
+                    };
+                    let coerced =
+                        consume_moved_lease_be(coerce_expr_be(raw, &ret_ty, &mut be), &mut be);
                     if has_defers && !ret_ty.is_void() {
                         let tmp = self.alloc_temp("err_partial", ret_ty.clone());
                         out.push(MirStmt::Assign {
                             target: MirPlace::Var(tmp),
                             op: MirAssignOp::Assign,
-                            value: coerce_expr_if_needed(raw, &ret_ty),
+                            value: coerced,
                         });
                         Some(MirExpr::new(MirExprKind::Var(tmp), ret_ty))
                     } else {
-                        Some(raw)
+                        Some(coerced)
                     }
                 } else {
                     None
@@ -669,6 +688,7 @@ impl<'a> DirectLowerCtx<'a> {
                     MirExprKind::Index {
                         base: Box::new(MirExpr::new(MirExprKind::Var(slice_tmp), slice_ty)),
                         index: Box::new(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize)),
+                        raw_elem_ty: seq_elem_ty.clone(),
                         is_slice: true,
                     },
                     seq_elem_ty.host_value_type(),
@@ -1051,7 +1071,11 @@ impl<'a> DirectLowerCtx<'a> {
             let expected = param_tys.get(idx);
             let val = self.lower_expr_with_stmts(&arg.value, expected, out)?;
             let coerced = if let Some(ety) = expected {
-                coerce_expr_if_needed(val, ety)
+                let mut be = DirectBackend {
+                    ctx: self,
+                    stmts: out,
+                };
+                coerce_expr_be(val, ety, &mut be)
             } else {
                 val
             };
@@ -1138,14 +1162,14 @@ impl<'a> DirectLowerCtx<'a> {
             }
             let expected = sig.params.get(idx);
             let me = self.lower_expr_with_stmts(&a.value, expected, out)?;
-            let coerced = if let Some(pty) = expected {
-                coerce_call_arg_expr(me, pty)
-            } else {
-                me
-            };
             let mut be = DirectBackend {
                 ctx: self,
                 stmts: out,
+            };
+            let coerced = if let Some(pty) = expected {
+                coerce_expr_be(me, pty, &mut be)
+            } else {
+                me
             };
             lowered_args.push(consume_moved_lease_be(coerced, &mut be));
         }
@@ -1250,8 +1274,12 @@ impl<'a> DirectLowerCtx<'a> {
         expr: &Expr,
         expected: Option<&MirType>,
     ) -> Result<MirExpr, MirLowerError> {
+        let prev = self.in_const_eval;
+        self.in_const_eval = true;
         let mut sink = Vec::new();
-        self.lower_expr_with_stmts(expr, expected, &mut sink)
+        let res = self.lower_expr_with_stmts(expr, expected, &mut sink);
+        self.in_const_eval = prev;
+        res
     }
 
     pub(super) fn lower_expr_with_stmts(
@@ -1264,8 +1292,17 @@ impl<'a> DirectLowerCtx<'a> {
             ExprKind::Or { .. } => {
                 let mut or_chain = Vec::new();
                 flatten_or_operands(expr, &mut or_chain);
+                let tail = or_chain[or_chain.len() - 1];
                 let first_res = self.lower_failable_expr(or_chain[0], stmts)?;
-                let (ok_ty, first_res_ty) = extract_result_types(&first_res.ty);
+                let (src_ok_ty, first_res_ty) = extract_result_types(&first_res.ty);
+                let ok_ty = resolve_or_result_ty(
+                    src_ok_ty,
+                    expected,
+                    tail,
+                    self.syms,
+                    &self.scopes,
+                    &self.vars,
+                );
                 let first_vid = self.alloc_temp("or_res", first_res_ty);
                 stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(first_vid),
@@ -1329,7 +1366,7 @@ impl<'a> DirectLowerCtx<'a> {
                     stmts: &mut fb_stmts,
                 };
                 let fb_val =
-                    consume_moved_lease_be(coerce_expr_if_needed(fb_val, ok_ty), &mut fb_be);
+                    consume_moved_lease_be(coerce_expr_be(fb_val, ok_ty, &mut fb_be), &mut fb_be);
                 fb_stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(out_vid),
                     op: MirAssignOp::Assign,
@@ -1355,18 +1392,24 @@ impl<'a> DirectLowerCtx<'a> {
             self.lower_or_tail_direct(&rem[1..], next_vid, out_vid_opt, ok_ty, &mut fb_stmts)?;
         }
 
-        let ok_stmts = if let Some(out_vid) = out_vid_opt {
-            vec![MirStmt::Assign {
+        let mut ok_stmts = Vec::new();
+        if let Some(out_vid) = out_vid_opt {
+            let prev_ok_ty = extract_result_types(&self.vars[prev_res_vid.0].ty).0;
+            let mut ok_be = DirectBackend {
+                ctx: self,
+                stmts: &mut ok_stmts,
+            };
+            let val = coerce_expr_be(
+                MirExpr::new(MirExprKind::ResultVal(prev_res_vid), prev_ok_ty),
+                ok_ty,
+                &mut ok_be,
+            );
+            ok_stmts.push(MirStmt::Assign {
                 target: MirPlace::Var(out_vid),
                 op: MirAssignOp::Assign,
-                value: coerce_expr_if_needed(
-                    MirExpr::new(MirExprKind::ResultVal(prev_res_vid), ok_ty.clone()),
-                    ok_ty,
-                ),
-            }]
-        } else {
-            Vec::new()
-        };
+                value: val,
+            });
+        }
 
         stmts.push(MirStmt::If {
             cond: MirExpr::new(MirExprKind::ResultIsErr(prev_res_vid), MirType::Bool),
@@ -1410,18 +1453,23 @@ impl<'a> DirectLowerCtx<'a> {
                 clause,
                 &mut next_stmts,
             )?;
-            let ok_stmts = if let Some(out_vid) = out_vid_opt {
-                vec![MirStmt::Assign {
+            let mut ok_stmts = Vec::new();
+            if let Some(out_vid) = out_vid_opt {
+                let mut ok_be = DirectBackend {
+                    ctx: self,
+                    stmts: &mut ok_stmts,
+                };
+                let val = coerce_expr_be(
+                    MirExpr::new(MirExprKind::ResultVal(head_vid), ok_ty.clone()),
+                    &ok_ty,
+                    &mut ok_be,
+                );
+                ok_stmts.push(MirStmt::Assign {
                     target: MirPlace::Var(out_vid),
                     op: MirAssignOp::Assign,
-                    value: coerce_expr_if_needed(
-                        MirExpr::new(MirExprKind::ResultVal(head_vid), ok_ty.clone()),
-                        &ok_ty,
-                    ),
-                }]
-            } else {
-                Vec::new()
-            };
+                    value: val,
+                });
+            }
             stmts.push(MirStmt::If {
                 cond: MirExpr::new(MirExprKind::ResultIsErr(head_vid), MirType::Bool),
                 then_body: next_stmts,
@@ -1502,7 +1550,7 @@ impl<'a> DirectLowerCtx<'a> {
                             stmts: &mut err_stmts,
                         };
                         let tail_val = consume_moved_lease_be(
-                            coerce_expr_if_needed(tail_val, &ok_ty),
+                            coerce_expr_be(tail_val, &ok_ty, &mut err_be),
                             &mut err_be,
                         );
                         err_stmts.push(MirStmt::Assign {
@@ -1526,14 +1574,21 @@ impl<'a> DirectLowerCtx<'a> {
         self.scopes.pop();
 
         if let Some(out_vid) = out_vid_opt {
-            let ok_stmts = vec![MirStmt::Assign {
+            let mut ok_stmts = Vec::new();
+            let mut ok_be = DirectBackend {
+                ctx: self,
+                stmts: &mut ok_stmts,
+            };
+            let val = coerce_expr_be(
+                MirExpr::new(MirExprKind::ResultVal(res_vid), ok_ty.clone()),
+                &ok_ty,
+                &mut ok_be,
+            );
+            ok_stmts.push(MirStmt::Assign {
                 target: MirPlace::Var(out_vid),
                 op: MirAssignOp::Assign,
-                value: coerce_expr_if_needed(
-                    MirExpr::new(MirExprKind::ResultVal(res_vid), ok_ty.clone()),
-                    &ok_ty,
-                ),
-            }];
+                value: val,
+            });
             stmts.push(MirStmt::If {
                 cond: MirExpr::new(MirExprKind::ResultIsErr(res_vid), MirType::Bool),
                 then_body: err_stmts,

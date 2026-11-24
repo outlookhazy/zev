@@ -465,6 +465,7 @@ impl<'a> BodyChecker<'a> {
                     return ExprVal::error(expr.span);
                 }
                 let mut elem_ty: Option<Ty> = None;
+                let mut elem_vals: Vec<(&Expr, ExprVal)> = Vec::with_capacity(elems.len());
                 let mut combined_prov = Provenance::pure_static();
                 for e in elems {
                     let ev = self.check_expr_infallible(e);
@@ -481,12 +482,12 @@ impl<'a> BodyChecker<'a> {
                         combined_prov = combined_prov.merge(&ev.prov);
                     }
                     match &elem_ty {
-                        None => elem_ty = Some(ev.ty),
+                        None => elem_ty = Some(ev.ty.clone()),
                         Some(cur) if matches!(cur, Ty::IntLit) && ev.ty.is_integer() => {
-                            elem_ty = Some(ev.ty);
+                            elem_ty = Some(ev.ty.clone());
                         }
                         Some(cur) if matches!(cur, Ty::FloatLit) && ev.ty.is_float() => {
-                            elem_ty = Some(ev.ty);
+                            elem_ty = Some(ev.ty.clone());
                         }
                         Some(cur) if cur.is_integer() && ev.ty.is_integer() => {
                             if let Some(unified) = try_unify_integer(cur, &ev.ty) {
@@ -501,6 +502,30 @@ impl<'a> BodyChecker<'a> {
                                     ),
                                 ));
                             }
+                        }
+                        Some(Ty::Array { elem: a, .. }) if matches!(&ev.ty, Ty::Slice(b) if a == b) =>
+                        {
+                            elem_ty = Some(ev.ty.clone());
+                        }
+                        Some(Ty::Array { elem: a, .. })
+                            if **a == Ty::u8() && matches!(&ev.ty, Ty::Str) =>
+                        {
+                            elem_ty = Some(Ty::Slice(Box::new(Ty::u8())));
+                        }
+                        Some(Ty::Str) if matches!(&ev.ty, Ty::Array { elem: b, .. } if **b == Ty::u8()) =>
+                        {
+                            elem_ty = Some(Ty::Slice(Box::new(Ty::u8())));
+                        }
+                        Some(Ty::Str) if matches!(&ev.ty, Ty::Slice(b) if **b == Ty::u8()) => {
+                            elem_ty = Some(ev.ty.clone());
+                        }
+                        Some(Ty::Array { elem: a, len: la })
+                            if matches!(
+                                &ev.ty,
+                                Ty::Array { elem: b, len: lb } if *la == *lb && a != b && a.is_assignable_to(b)
+                            ) =>
+                        {
+                            elem_ty = Some(ev.ty.clone());
                         }
                         Some(cur) => {
                             let _ = self.sema.check_assignable_or_emit(
@@ -517,8 +542,15 @@ impl<'a> BodyChecker<'a> {
                             );
                         }
                     }
+                    elem_vals.push((e, ev));
                 }
                 let final_elem = elem_ty.unwrap_or(Ty::Error);
+                if final_elem.contains_reference(&self.sema.structs) {
+                    for (e, ev) in &elem_vals {
+                        let p = self.coerce_array_to_slice_prov(e, &ev.ty, &final_elem, &ev.prov);
+                        combined_prov = combined_prov.merge(&p);
+                    }
+                }
                 if final_elem == Ty::f32() {
                     for e in elems {
                         self.sema.check_f32_coercion_expr(e, &final_elem);
@@ -532,6 +564,10 @@ impl<'a> BodyChecker<'a> {
                 } else if matches!(final_elem, Ty::IntLit) {
                     for e in elems {
                         self.validate_int_expr_at_type(e, None);
+                    }
+                } else if matches!(final_elem, Ty::Array { .. } | Ty::Slice(_)) {
+                    for e in elems {
+                        self.check_coerced_expr(e, &final_elem);
                     }
                 }
                 ExprVal {
@@ -618,7 +654,10 @@ impl<'a> BodyChecker<'a> {
                 self.check_coerced_expr(inner, &res_ty);
                 self.check_coerced_expr(fallback, &res_ty);
                 let prov = if res_ty.contains_reference(&self.sema.structs) {
-                    iv.prov.merge(&fv.prov)
+                    let iv_prov = self.coerce_array_to_slice_prov(inner, &iv.ty, &res_ty, &iv.prov);
+                    let fv_prov =
+                        self.coerce_array_to_slice_prov(fallback, &fv.ty, &res_ty, &fv.prov);
+                    iv_prov.merge(&fv_prov)
                 } else {
                     Provenance::pure_static()
                 };
@@ -1744,11 +1783,26 @@ impl<'a> BodyChecker<'a> {
         expected_ty: &Ty,
         val_prov: &Provenance,
     ) -> Provenance {
-        if !matches!(actual_ty, Ty::Array { .. }) || !matches!(expected_ty, Ty::Slice(_)) {
-            return val_prov.clone();
+        match (actual_ty, expected_ty) {
+            (Ty::Array { .. }, Ty::Slice(_)) => self
+                .place_provenance_readonly(expr)
+                .merge_place_with_val_origins(val_prov),
+            (Ty::Array { elem: a, .. }, Ty::Array { elem: b, .. })
+                if a != b && b.contains_reference(&self.sema.structs) =>
+            {
+                if let ExprKind::ArrayLit(elems) = &expr.kind {
+                    let mut out = Provenance::pure_static();
+                    for el in elems {
+                        out = out.merge(&self.coerce_array_to_slice_prov(el, a, b, val_prov));
+                    }
+                    out
+                } else {
+                    self.place_provenance_readonly(expr)
+                        .merge_place_with_val_origins(val_prov)
+                }
+            }
+            _ => val_prov.clone(),
         }
-        self.place_provenance_readonly(expr)
-            .merge_place_with_val_origins(val_prov)
     }
 
     pub(super) fn place_provenance_readonly(&self, place: &Expr) -> Provenance {
@@ -1800,6 +1854,26 @@ impl<'a> BodyChecker<'a> {
                     }
                 }
                 self.place_provenance_readonly(target)
+            }
+            ExprKind::Or {
+                expr: lhs,
+                fallback: rhs,
+            } => self
+                .place_provenance_readonly(lhs)
+                .merge(&self.place_provenance_readonly(rhs)),
+            ExprKind::Catch {
+                expr: inner,
+                clause,
+            } => {
+                let mut prov = self.place_provenance_readonly(inner);
+                if let Some(Stmt {
+                    kind: StmtKind::Expr(last_expr),
+                    ..
+                }) = clause.body.stmts.last()
+                {
+                    prov = prov.merge(&self.place_provenance_readonly(last_expr));
+                }
+                prov
             }
             _ => Provenance::addr_of_local("<temp>", self.current_depth()),
         }
@@ -2435,6 +2509,15 @@ impl<'a> BodyChecker<'a> {
                             },
                         ) {
                             self.check_coerced_expr(&arg.value, expected);
+                        }
+                        let arg_prov =
+                            self.coerce_array_to_slice_prov(&arg.value, &av.ty, expected, &av.prov);
+                        if !arg_prov.isr_state_origins.is_empty() {
+                            self.sema.emit(Diagnostic::new(
+                                DiagnosticKind::InvalidIsrState,
+                                arg.span,
+                                "cannot pass `&` of ISR `state` variable to indirect function call",
+                            ));
                         }
                     }
                 }
@@ -3415,6 +3498,18 @@ impl<'a> BodyChecker<'a> {
                                 },
                             ) {
                                 self.check_coerced_expr(&arg.value, expected);
+                            }
+                            let arg_prov = self
+                                .coerce_array_to_slice_prov(&arg.value, &av.ty, expected, &av.prov);
+                            if !arg_prov.isr_state_origins.is_empty() {
+                                self.sema.emit(Diagnostic::new(
+                                    DiagnosticKind::InvalidIsrState,
+                                    arg.span,
+                                    format!(
+                                        "cannot pass `&` of ISR `state` variable to '{}.{}'",
+                                        struct_name, method.name
+                                    ),
+                                ));
                             }
                         }
                     }
@@ -5297,8 +5392,12 @@ impl<'a> BodyChecker<'a> {
                     }) = clause.body.stmts.last()
                     {
                         self.check_coerced_expr(last_expr, &iv.ty);
+                        let tv_prov =
+                            self.coerce_array_to_slice_prov(last_expr, &tv.ty, &iv.ty, &tv.prov);
+                        merged_prov = merged_prov.merge(&tv_prov);
+                    } else {
+                        merged_prov = merged_prov.merge(&tv.prov);
                     }
-                    merged_prov = merged_prov.merge(&tv.prov);
                 } else {
                     self.sema.emit(
                         Diagnostic::new(

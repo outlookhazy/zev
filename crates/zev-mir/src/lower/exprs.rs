@@ -5,6 +5,9 @@ pub(super) trait LowerBackend {
     fn vars(&self) -> &[MirVar];
     fn scopes(&self) -> &VarScopes;
     fn in_noyield(&self) -> bool;
+    fn in_const_eval(&self) -> bool {
+        false
+    }
     fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId;
     fn emit_stmt_be(&mut self, stmt: MirStmt);
     fn invalidate_boot_const(&mut self, _vid: VarId) {}
@@ -34,6 +37,9 @@ impl<'b, 'a> LowerBackend for DirectBackend<'b, 'a> {
     }
     fn in_noyield(&self) -> bool {
         self.ctx.in_noyield
+    }
+    fn in_const_eval(&self) -> bool {
+        self.ctx.in_const_eval
     }
     fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId {
         self.ctx.alloc_temp(prefix, ty)
@@ -804,7 +810,79 @@ pub(super) fn is_rodata_const_mir_expr(expr: &MirExpr) -> bool {
     }
 }
 
+fn unwrap_result_var_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
+    if let (MirType::Result { ok, .. }, MirExprKind::Var(vid)) = (&expr.ty, &expr.kind) {
+        if !matches!(target_ty, MirType::Result { .. }) && !ok.is_void() {
+            return MirExpr::new(MirExprKind::ResultVal(*vid), ok.as_ref().clone());
+        }
+    }
+    expr
+}
+
+pub(super) fn try_mir_expr_to_place(expr: &MirExpr) -> Option<MirPlace> {
+    match &expr.kind {
+        MirExprKind::Var(vid) => Some(MirPlace::Var(*vid)),
+        MirExprKind::Unary {
+            op: MirUnaryOp::Deref,
+            expr: ptr_expr,
+        } => Some(MirPlace::Deref(ptr_expr.clone(), expr.ty.clone())),
+        MirExprKind::FieldAccess {
+            base,
+            struct_name,
+            packed,
+            is_ptr,
+            field,
+            raw_field_ty,
+        } => {
+            let base_place = if *is_ptr {
+                let pointee_ty = match &base.ty {
+                    MirType::Ptr(inner) => *inner.clone(),
+                    _ => MirType::Struct(struct_name.clone()),
+                };
+                MirPlace::Deref(base.clone(), pointee_ty)
+            } else {
+                try_mir_expr_to_place(base)?
+            };
+            Some(MirPlace::Field {
+                base: Box::new(base_place),
+                struct_name: struct_name.clone(),
+                packed: *packed,
+                field: field.clone(),
+                field_ty: raw_field_ty.clone(),
+            })
+        }
+        MirExprKind::Index {
+            base,
+            index,
+            raw_elem_ty,
+            is_slice,
+        } => {
+            let base_place = try_mir_expr_to_place(base)?;
+            Some(MirPlace::Index {
+                base: Box::new(base_place),
+                index: index.clone(),
+                elem_ty: raw_elem_ty.clone(),
+                is_slice: *is_slice,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn is_pure_reuse_base(expr: &MirExpr) -> bool {
+    match &expr.kind {
+        MirExprKind::Var(_) | MirExprKind::ConstRef(_) => true,
+        MirExprKind::FieldAccess {
+            base,
+            is_ptr: false,
+            ..
+        } => is_pure_reuse_base(base),
+        _ => false,
+    }
+}
+
 pub(super) fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirExpr {
+    let expr = unwrap_result_var_if_needed(expr, target_ty);
     if &expr.ty == target_ty || target_ty.is_void() {
         return expr;
     }
@@ -815,11 +893,6 @@ pub(super) fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirEx
         && expr.ty.host_value_type() != host_target
     {
         return widen_arith_mir_expr(expr, &host_target);
-    }
-    if let (MirType::Result { ok, .. }, MirExprKind::Var(vid)) = (&expr.ty, &expr.kind) {
-        if **ok == *target_ty || ok.host_value_type() == host_target {
-            return MirExpr::new(MirExprKind::ResultVal(*vid), ok.as_ref().clone());
-        }
     }
     match (&expr.ty, target_ty) {
         (MirType::Ptr(inner), MirType::PrimView(MirPrimViewKind::ByteRing))
@@ -868,6 +941,18 @@ pub(super) fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirEx
                 target_ty.clone(),
             );
         }
+        (MirType::Array { elem, len }, MirType::Slice(dst_elem)) if **elem == **dst_elem => {
+            if let Some(place) = try_mir_expr_to_place(&expr) {
+                return MirExpr::new(
+                    MirExprKind::ArrayToSlice {
+                        array_place: Box::new(place),
+                        len: *len,
+                        elem_ty: *dst_elem.clone(),
+                    },
+                    target_ty.clone(),
+                );
+            }
+        }
         _ => {}
     }
     match expr.kind {
@@ -910,36 +995,150 @@ pub(super) fn coerce_expr_if_needed(expr: MirExpr, target_ty: &MirType) -> MirEx
     }
 }
 
-pub(super) fn coerce_call_arg_expr(arg: MirExpr, param_ty: &MirType) -> MirExpr {
-    if let (MirType::Array { elem, len }, MirType::Slice(_), MirExprKind::Var(vid)) =
-        (&arg.ty, param_ty, &arg.kind)
-    {
-        return MirExpr::new(
-            MirExprKind::ArrayToSlice {
-                array_place: Box::new(MirPlace::Var(*vid)),
-                len: *len,
-                elem_ty: *elem.clone(),
-            },
-            param_ty.clone(),
-        );
+pub(super) fn coerce_expr_be<B: LowerBackend>(
+    expr: MirExpr,
+    target_ty: &MirType,
+    be: &mut B,
+) -> MirExpr {
+    let expr = unwrap_result_var_if_needed(expr, target_ty);
+    if &expr.ty == target_ty || target_ty.is_void() {
+        return expr;
     }
-    if let (MirType::Array { elem, len }, MirType::Slice(_)) = (&arg.ty, param_ty) {
-        if is_rodata_const_mir_expr(&arg) {
-            let e_ty = *elem.clone();
-            let n = *len;
+    match (&expr.ty, target_ty) {
+        (MirType::Array { elem, len }, MirType::Slice(dst_elem)) => {
+            let elem = *elem.clone();
+            let len = *len;
+            if is_rodata_const_mir_expr(&expr) && elem == **dst_elem {
+                return MirExpr::new(
+                    MirExprKind::SubSlice {
+                        base: Box::new(expr),
+                        start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                        end: Box::new(MirExpr::new(
+                            MirExprKind::IntLit(len as i128),
+                            MirType::Usize,
+                        )),
+                        elem_ty: elem,
+                        base_is_array: true,
+                    },
+                    target_ty.clone(),
+                );
+            }
+            if elem == **dst_elem {
+                if let Some(place) = try_mir_expr_to_place(&expr) {
+                    return MirExpr::new(
+                        MirExprKind::ArrayToSlice {
+                            array_place: Box::new(place),
+                            len,
+                            elem_ty: *dst_elem.clone(),
+                        },
+                        target_ty.clone(),
+                    );
+                }
+            }
+            let arr_expr = if let MirExprKind::ArrayLit { elems, .. } = expr.kind {
+                let coerced_elems: Vec<MirExpr> = if elem != **dst_elem {
+                    elems
+                        .into_iter()
+                        .map(|el| coerce_expr_be(el, dst_elem, be))
+                        .collect()
+                } else {
+                    elems
+                };
+                MirExpr::new(
+                    MirExprKind::ArrayLit {
+                        elems: coerced_elems,
+                        elem_ty: *dst_elem.clone(),
+                    },
+                    MirType::Array {
+                        elem: dst_elem.clone(),
+                        len,
+                    },
+                )
+            } else {
+                expr
+            };
+            if be.in_const_eval() && matches!(&arr_expr.kind, MirExprKind::ArrayLit { .. }) {
+                return MirExpr::new(
+                    MirExprKind::SubSlice {
+                        base: Box::new(arr_expr),
+                        start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                        end: Box::new(MirExpr::new(
+                            MirExprKind::IntLit(len as i128),
+                            MirType::Usize,
+                        )),
+                        elem_ty: *dst_elem.clone(),
+                        base_is_array: true,
+                    },
+                    target_ty.clone(),
+                );
+            }
+            return array_expr_to_slice_be(arr_expr, *dst_elem.clone(), len, be);
+        }
+        (MirType::Array { elem: a, len }, MirType::Array { elem: b, len: lb })
+            if a != b && len == lb =>
+        {
+            let len = *len;
+            let dst_elem = *b.clone();
+            if let MirExprKind::ArrayLit { elems, .. } = expr.kind {
+                let coerced_elems = elems
+                    .into_iter()
+                    .map(|el| coerce_expr_be(el, &dst_elem, be))
+                    .collect();
+                return MirExpr::new(
+                    MirExprKind::ArrayLit {
+                        elems: coerced_elems,
+                        elem_ty: dst_elem.clone(),
+                    },
+                    MirType::Array {
+                        elem: Box::new(dst_elem),
+                        len,
+                    },
+                );
+            }
+            let src_arr_ty = expr.ty.clone();
+            let raw_src_elem = *a.clone();
+            let host_src_elem = raw_src_elem.host_value_type();
+            let base_expr = if !be.in_const_eval() && !is_pure_reuse_base(&expr) {
+                let tmp = be.alloc_temp_be("arr_conv_tmp", src_arr_ty.clone());
+                be.emit_stmt_be(MirStmt::Assign {
+                    target: MirPlace::Var(tmp),
+                    op: MirAssignOp::Assign,
+                    value: expr,
+                });
+                MirExpr::new(MirExprKind::Var(tmp), src_arr_ty)
+            } else {
+                expr
+            };
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                let elem_expr = MirExpr::new(
+                    MirExprKind::Index {
+                        base: Box::new(base_expr.clone()),
+                        index: Box::new(MirExpr::new(
+                            MirExprKind::IntLit(i as i128),
+                            MirType::Usize,
+                        )),
+                        raw_elem_ty: raw_src_elem.clone(),
+                        is_slice: false,
+                    },
+                    host_src_elem.clone(),
+                );
+                out.push(coerce_expr_be(elem_expr, &dst_elem, be));
+            }
             return MirExpr::new(
-                MirExprKind::SubSlice {
-                    base: Box::new(arg),
-                    start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
-                    end: Box::new(MirExpr::new(MirExprKind::IntLit(n as i128), MirType::Usize)),
-                    elem_ty: e_ty,
-                    base_is_array: true,
+                MirExprKind::ArrayLit {
+                    elems: out,
+                    elem_ty: dst_elem.clone(),
                 },
-                param_ty.clone(),
+                MirType::Array {
+                    elem: Box::new(dst_elem),
+                    len,
+                },
             );
         }
+        _ => {}
     }
-    coerce_expr_if_needed(arg, param_ty)
+    coerce_expr_if_needed(expr, target_ty)
 }
 
 fn is_pure_untyped_int_ast(expr: &Expr) -> bool {
@@ -1004,16 +1203,92 @@ fn is_seq_mir_ty(ty: &MirType) -> bool {
     matches!(ty, MirType::Slice(_) | MirType::Array { .. } | MirType::Str)
 }
 
+pub(super) fn resolve_or_result_ty(
+    first_ok_ty: MirType,
+    expected: Option<&MirType>,
+    tail: &Expr,
+    syms: &ModuleSymbols,
+    scopes: &VarScopes,
+    vars: &[MirVar],
+) -> MirType {
+    if let Some(exp) = expected {
+        if !exp.is_void() && !matches!(exp, MirType::Result { .. }) {
+            let host_exp = exp.host_value_type();
+            if host_exp != first_ok_ty {
+                return host_exp;
+            }
+        }
+    }
+    if matches!(&first_ok_ty, MirType::Array { elem, .. } if **elem == MirType::U8)
+        && matches!(&tail.kind, ExprKind::Literal(Literal::String(_)))
+    {
+        return MirType::Slice(Box::new(MirType::U8));
+    }
+    if let MirType::Array { elem: arr_elem, .. } = &first_ok_ty {
+        let tail_ty = match &tail.kind {
+            ExprKind::Ident(id) => scopes.lookup(&id.name).map(|v| vars[v.0].ty.clone()),
+            ExprKind::Call { callee, .. } => {
+                if let ExprKind::Ident(id) = &callee.kind {
+                    syms.fns.get(&id.name).map(|s| s.ret_ty.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+        if let Some(MirType::Slice(s_elem)) = tail_ty {
+            if &s_elem == arr_elem {
+                return MirType::Slice(arr_elem.clone());
+            }
+        }
+    }
+    first_ok_ty
+}
+
 fn unify_array_mir_types(lhs: &MirType, rhs: &MirType) -> MirType {
-    if is_scalar_int_mir_type(lhs) && is_scalar_int_mir_type(rhs) {
-        unify_mir_int_types(lhs, rhs)
-    } else if matches!(
-        (lhs.host_value_type(), rhs.host_value_type()),
-        (MirType::F32, MirType::F64) | (MirType::F64, MirType::F32)
-    ) {
-        MirType::F64
-    } else {
-        lhs.host_value_type()
+    match (lhs, rhs) {
+        (MirType::Array { elem: a, len: la }, MirType::Array { elem: b, len: lb }) => {
+            if la == lb && a == b {
+                lhs.clone()
+            } else if la == lb && is_scalar_int_mir_type(a) && is_scalar_int_mir_type(b) {
+                MirType::Array {
+                    elem: Box::new(unify_mir_int_types(a, b)),
+                    len: *la,
+                }
+            } else if a == b {
+                MirType::Slice(a.clone())
+            } else {
+                lhs.host_value_type()
+            }
+        }
+        (MirType::Array { elem, .. }, MirType::Slice(s))
+        | (MirType::Slice(s), MirType::Array { elem, .. })
+            if elem == s =>
+        {
+            MirType::Slice(elem.clone())
+        }
+        (MirType::Array { elem, .. }, MirType::Str)
+        | (MirType::Str, MirType::Array { elem, .. })
+            if **elem == MirType::U8 =>
+        {
+            MirType::Slice(Box::new(MirType::U8))
+        }
+        (MirType::Slice(elem), MirType::Str) | (MirType::Str, MirType::Slice(elem))
+            if **elem == MirType::U8 =>
+        {
+            MirType::Slice(Box::new(MirType::U8))
+        }
+        _ if is_scalar_int_mir_type(lhs) && is_scalar_int_mir_type(rhs) => {
+            unify_mir_int_types(lhs, rhs)
+        }
+        _ if matches!(
+            (lhs.host_value_type(), rhs.host_value_type()),
+            (MirType::F32, MirType::F64) | (MirType::F64, MirType::F32)
+        ) =>
+        {
+            MirType::F64
+        }
+        _ => lhs.host_value_type(),
     }
 }
 
@@ -1497,7 +1772,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                 let fv = be.lower_sub(&fi.value, Some(&fty.host_value_type()))?;
                 mfields.push((
                     fi.name.name.clone(),
-                    coerce_expr_if_needed(fv, &fty.host_value_type()),
+                    coerce_expr_be(fv, &fty.host_value_type(), be),
                     fty,
                 ));
             }
@@ -1517,7 +1792,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                     let mut out = Vec::with_capacity(elems.len());
                     for el in elems {
                         let me = be.lower_sub(el, Some(&elem_ty))?;
-                        out.push(coerce_expr_if_needed(me, &elem_ty));
+                        out.push(coerce_expr_be(me, &elem_ty, be));
                     }
                     (elem_ty, out)
                 } else if elems.is_empty() {
@@ -1554,9 +1829,9 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                     for (el, me) in elems.iter().zip(raw_elems) {
                         if is_pure_untyped_int_ast(el) {
                             let re = be.lower_sub(el, Some(&elem_ty))?;
-                            out.push(coerce_expr_if_needed(re, &elem_ty));
+                            out.push(coerce_expr_be(re, &elem_ty, be));
                         } else {
-                            out.push(coerce_expr_if_needed(me, &elem_ty));
+                            out.push(coerce_expr_be(me, &elem_ty, be));
                         }
                     }
                     (elem_ty, out)
@@ -1621,7 +1896,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                     for (idx, a) in args.iter().enumerate() {
                         let me = be.lower_sub(&a.value, sig.params.get(idx))?;
                         let coerced = if let Some(pty) = sig.params.get(idx) {
-                            coerce_call_arg_expr(me, pty)
+                            coerce_expr_be(me, pty, be)
                         } else {
                             me
                         };
@@ -1735,18 +2010,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                         span: expr.span,
                     })?;
                     let slice_ty = MirType::Slice(Box::new(MirType::U8));
-                    let s = coerce_expr_if_needed(be.lower_sub(sarg, Some(&slice_ty))?, &slice_ty);
-                    let s = match (&s.ty, &s.kind) {
-                        (MirType::Array { elem, len }, MirExprKind::Var(vid)) => MirExpr::new(
-                            MirExprKind::ArrayToSlice {
-                                array_place: Box::new(MirPlace::Var(*vid)),
-                                len: *len,
-                                elem_ty: *elem.clone(),
-                            },
-                            slice_ty,
-                        ),
-                        _ => s,
-                    };
+                    let s = coerce_expr_be(be.lower_sub(sarg, Some(&slice_ty))?, &slice_ty, be);
                     return Ok(MirExpr::new(
                         MirExprKind::FromBytes {
                             struct_name: id.name.clone(),
@@ -1905,19 +2169,10 @@ pub(super) fn lower_indirect_fnptr_call_be<B: LowerBackend>(
     let mut largs = Vec::with_capacity(args.len());
     for (idx, a) in args.iter().enumerate() {
         let me = be.lower_sub(&a.value, params.get(idx))?;
-        let coerced = match (&me.ty, params.get(idx), &me.kind) {
-            (MirType::Array { elem, len }, Some(MirType::Slice(_)), MirExprKind::Var(avid)) => {
-                MirExpr::new(
-                    MirExprKind::ArrayToSlice {
-                        array_place: Box::new(MirPlace::Var(*avid)),
-                        len: *len,
-                        elem_ty: *elem.clone(),
-                    },
-                    params[idx].clone(),
-                )
-            }
-            (_, Some(pty), _) => coerce_expr_if_needed(me, pty),
-            _ => unwrap_ok_result_expr(me),
+        let coerced = if let Some(pty) = params.get(idx) {
+            coerce_expr_be(me, pty, be)
+        } else {
+            unwrap_ok_result_expr(me)
         };
         largs.push(consume_moved_lease_be(coerced, be));
     }
@@ -2351,13 +2606,14 @@ pub(super) fn finish_index(
     span: Span,
 ) -> Result<MirExpr, MirLowerError> {
     let base = unwrap_ok_result_expr(base);
-    match &base.ty {
+    match base.ty.clone() {
         MirType::Slice(elem) => {
             let et = elem.host_value_type();
             Ok(MirExpr::new(
                 MirExprKind::Index {
                     base: Box::new(base),
                     index: Box::new(idx),
+                    raw_elem_ty: *elem,
                     is_slice: true,
                 },
                 et,
@@ -2369,6 +2625,7 @@ pub(super) fn finish_index(
                 MirExprKind::Index {
                     base: Box::new(base),
                     index: Box::new(idx),
+                    raw_elem_ty: *elem,
                     is_slice: false,
                 },
                 et,
@@ -2588,7 +2845,7 @@ pub(super) fn finish_prim_read_method<B: LowerBackend>(
         ("try_send", MirPrimKind::Inbox { elem, cap }) => {
             let v = if let Some(first) = first_positional_arg(args) {
                 let raw = be.lower_sub(first, Some(&elem))?;
-                coerce_expr_if_needed(raw, &elem)
+                coerce_expr_be(raw, &elem, be)
             } else {
                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
             };
@@ -2927,7 +3184,7 @@ pub(super) fn finish_inbox_view_read_method<B: LowerBackend>(
         "try_send" => {
             let v = if let Some(first) = first_positional_arg(args) {
                 let raw = be.lower_sub(first, Some(&elem_ty))?;
-                coerce_expr_if_needed(raw, &elem_ty)
+                coerce_expr_be(raw, &elem_ty, be)
             } else {
                 MirExpr::new(MirExprKind::IntLit(0), elem_ty.clone())
             };
@@ -3346,7 +3603,7 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                                 MirExpr::new(MirExprKind::IntLit(0), elem.clone())
                             };
                             let boost = extract_boost_arg(args);
-                            let v = consume_moved_lease_be(coerce_expr_if_needed(v, &elem), be);
+                            let v = consume_moved_lease_be(coerce_expr_be(v, &elem, be), be);
                             return Ok(Some(MirStmt::PrimOp(
                                 MirPrimNonBlockingOp::InboxViewPost {
                                     view,
@@ -3395,10 +3652,11 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                             };
+                            let coerced = coerce_expr_be(v, &elem, be);
                             return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
                                 target,
                                 elem_ty: *elem.clone(),
-                                value: coerce_expr_if_needed(v, &elem),
+                                value: coerced,
                             })));
                         }
                         ("set", MirPrimKind::Guarded { elem }) => {
@@ -3407,10 +3665,11 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             } else {
                                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                             };
+                            let coerced = coerce_expr_be(v, &elem, be);
                             return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::GuardedSet {
                                 target,
                                 elem_ty: *elem.clone(),
-                                value: coerce_expr_if_needed(v, &elem),
+                                value: coerced,
                             })));
                         }
                         ("post", MirPrimKind::Inbox { elem, cap }) => {
@@ -3420,7 +3679,7 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                                 MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                             };
                             let boost = extract_boost_arg(args);
-                            let v = consume_moved_lease_be(coerce_expr_if_needed(v, &elem), be);
+                            let v = consume_moved_lease_be(coerce_expr_be(v, &elem, be), be);
                             return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::InboxPost {
                                 target,
                                 elem_ty: *elem.clone(),
@@ -4279,6 +4538,7 @@ pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
                                 MirExprKind::Var(idx_var),
                                 MirType::Usize,
                             )),
+                            raw_elem_ty: raw_el_ty.clone(),
                             is_slice: true,
                         },
                         raw_el_ty,
@@ -5033,6 +5293,7 @@ pub(super) fn expand_array_debug_be<B: LowerBackend>(
                     MirExprKind::IntLit(idx as i128),
                     MirType::Usize,
                 )),
+                raw_elem_ty: elem_ty.clone(),
                 is_slice: false,
             },
             elem_ty.host_value_type(),

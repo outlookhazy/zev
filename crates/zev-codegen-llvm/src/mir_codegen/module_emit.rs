@@ -947,6 +947,7 @@ impl<'a> ModuleCtx<'a> {
                 FnLlvmSig {
                     symbol,
                     params,
+                    ret_mir_ty: f.ret_ty.clone(),
                     ret_llvm_ty,
                 },
             );
@@ -2791,6 +2792,14 @@ impl<'a> ModuleCtx<'a> {
                 }
                 mask_int_to_target_i128(self.eval_const_int(sub), target_ty, ptr_bits)
             }
+            MirExprKind::Index { base, index, .. } => {
+                if let Some(vals) = self.eval_const_seq_vals(base) {
+                    if let Ok(idx) = usize::try_from(self.eval_const_int(index)) {
+                        return vals.get(idx).copied().unwrap_or(0);
+                    }
+                }
+                0
+            }
             _ => 0,
         }
     }
@@ -3400,6 +3409,17 @@ impl<'a> ModuleCtx<'a> {
                 }
             }
             MirType::Array { elem, len } => {
+                if let MirExprKind::ConstRef(cname) = &expr.kind {
+                    if let Some(init) = self
+                        .module
+                        .consts
+                        .iter()
+                        .find(|c| c.name == *cname)
+                        .map(|c| c.init.clone())
+                    {
+                        return self.const_expr_to_llvm(&init, target_ty);
+                    }
+                }
                 let n = (*len).max(1);
                 if let MirExprKind::ArrayLit { elems, .. } = &expr.kind {
                     let ety = self.llvm_ty(elem);
@@ -3418,6 +3438,17 @@ impl<'a> ModuleCtx<'a> {
                 }
             }
             MirType::Struct(sname) => {
+                if let MirExprKind::ConstRef(cname) = &expr.kind {
+                    if let Some(init) = self
+                        .module
+                        .consts
+                        .iter()
+                        .find(|c| c.name == *cname)
+                        .map(|c| c.init.clone())
+                    {
+                        return self.const_expr_to_llvm(&init, target_ty);
+                    }
+                }
                 if let MirExprKind::StructLit { fields, .. } = &expr.kind {
                     if let Some(si) = self.structs.get(sname).cloned() {
                         if si.decl.fields.is_empty() {
