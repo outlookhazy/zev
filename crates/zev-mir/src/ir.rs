@@ -1096,6 +1096,13 @@ pub enum MirExprKind {
         lhs: Box<MirExpr>,
         rhs: Box<MirExpr>,
     },
+    /// Content equality (`==` / `!=`) on integer/`bool` slices, fixed arrays, or string literals.
+    SeqEq {
+        eq: bool,
+        lhs: Box<MirExpr>,
+        rhs: Box<MirExpr>,
+        elem_ty: MirType,
+    },
     Cast {
         expr: Box<MirExpr>,
         target_ty: MirType,

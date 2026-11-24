@@ -708,6 +708,7 @@ impl<'a> ScanCtx<'a> {
                 self.visit_place(place, in_isr, callees);
             }
             MirExprKind::Binary { lhs, rhs, .. }
+            | MirExprKind::SeqEq { lhs, rhs, .. }
             | MirExprKind::Index {
                 base: lhs,
                 index: rhs,
@@ -2117,6 +2118,7 @@ fn is_pure_static_immediate(
         | MirExprKind::SliceLen(_)
         | MirExprKind::Index { .. }
         | MirExprKind::SubSlice { .. }
+        | MirExprKind::SeqEq { .. }
         | MirExprKind::ArrayToSlice { .. }
         | MirExprKind::FromBytes { .. }
         | MirExprKind::PrimRead(_)
@@ -2572,6 +2574,7 @@ impl VarUsageInfo {
                 self.visit_place_exprs(place);
             }
             MirExprKind::Binary { lhs, rhs, .. }
+            | MirExprKind::SeqEq { lhs, rhs, .. }
             | MirExprKind::Index {
                 base: lhs,
                 index: rhs,
@@ -3138,6 +3141,7 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
             array_place: place, ..
         } => place_reads_var(place, target, true),
         MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::SeqEq { lhs, rhs, .. }
         | MirExprKind::Index {
             base: lhs,
             index: rhs,
@@ -3473,6 +3477,7 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
             subst_place(array_place, target, repl, false);
         }
         MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::SeqEq { lhs, rhs, .. }
         | MirExprKind::Index {
             base: lhs,
             index: rhs,
@@ -3870,6 +3875,7 @@ fn collect_fn_addrs_and_calls_expr(
             collect_fn_addrs_and_calls_place(p, addr_taken_fns, call_sites);
         }
         MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::SeqEq { lhs, rhs, .. }
         | MirExprKind::Index {
             base: lhs,
             index: rhs,

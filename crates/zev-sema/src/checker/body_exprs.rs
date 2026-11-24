@@ -603,7 +603,9 @@ impl<'a> BodyChecker<'a> {
                 }
                 let res_ty = if let Some(u) = int_unified {
                     u
-                } else if matches!(iv.ty, Ty::IntLit | Ty::FloatLit) {
+                } else if matches!(iv.ty, Ty::IntLit | Ty::FloatLit)
+                    || (!fv.ty.is_assignable_to(&iv.ty) && iv.ty.is_assignable_to(&fv.ty))
+                {
                     fv.ty.clone()
                 } else {
                     iv.ty.clone()
@@ -1011,6 +1013,24 @@ impl<'a> BodyChecker<'a> {
                     return ExprVal::error(span);
                 }
 
+                if !matches!(
+                    inner.kind,
+                    ExprKind::Ident(_)
+                        | ExprKind::Unary {
+                            op: UnaryOp::Deref,
+                            ..
+                        }
+                        | ExprKind::Field { .. }
+                        | ExprKind::Index { .. }
+                ) {
+                    let _ = self.check_expr_infallible(inner);
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::ImmutableAssignment,
+                        span,
+                        "cannot take address '&' of a temporary or non-place expression",
+                    ));
+                    return ExprVal::error(span);
+                }
                 let (iv, prov, endpoint_name) = self.check_addr_of_place(inner, span);
                 if iv.ty.is_error() {
                     return ExprVal::error(span);
@@ -1175,58 +1195,7 @@ impl<'a> BodyChecker<'a> {
         match op {
             BinaryOp::And | BinaryOp::Or => unreachable!(),
 
-            BinaryOp::Eq | BinaryOp::Ne => {
-                if lv.ty.is_linear_lease() || rv.ty.is_linear_lease() {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::LinearLeaseViolation,
-                        span,
-                        "linear Lease<T> values cannot be compared directly with `==` / `!=` (compare `.addr()` instead)",
-                    ));
-                    return ExprVal::error(span);
-                }
-                if lv.ty.is_integer() && rv.ty.is_integer() {
-                    if let Some(common) = try_unify_integer(&lv.ty, &rv.ty) {
-                        let dst = match common {
-                            Ty::Prim(p) => Some(p),
-                            _ => None,
-                        };
-                        self.validate_int_expr_at_type(lhs, dst);
-                        self.validate_int_expr_at_type(rhs, dst);
-                    } else {
-                        self.sema.emit(Diagnostic::new(
-                            DiagnosticKind::TypeMismatch,
-                            span,
-                            format!(
-                                "cannot compare incompatible types '{}' and '{}' with '{}' (use an explicit `as` cast)",
-                                lv.ty,
-                                rv.ty,
-                                op.as_str()
-                            ),
-                        ));
-                    }
-                    return ExprVal::scalar(Ty::bool(), span);
-                }
-                let unified_float = unify_float_arith(&lv.ty, &rv.ty);
-                let compat = lv.ty.is_assignable_to(&rv.ty)
-                    || rv.ty.is_assignable_to(&lv.ty)
-                    || unified_float.is_some();
-                if !compat {
-                    self.sema.emit(Diagnostic::new(
-                        DiagnosticKind::TypeMismatch,
-                        span,
-                        format!(
-                            "cannot compare incompatible types '{}' and '{}' with '{}'",
-                            lv.ty,
-                            rv.ty,
-                            op.as_str()
-                        ),
-                    ));
-                } else if unified_float == Some(Ty::f32()) {
-                    self.sema.check_f32_coercion_expr(lhs, &Ty::f32());
-                    self.sema.check_f32_coercion_expr(rhs, &Ty::f32());
-                }
-                ExprVal::scalar(Ty::bool(), span)
-            }
+            BinaryOp::Eq | BinaryOp::Ne => self.check_eq_ne_expr(op, lhs, rhs, &lv, &rv, span),
 
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                 if lv.ty.is_integer() && rv.ty.is_integer() {
@@ -1368,6 +1337,241 @@ impl<'a> BodyChecker<'a> {
         }
     }
 
+    pub(super) fn check_eq_ne_expr(
+        &mut self,
+        op: BinaryOp,
+        lhs: &Expr,
+        rhs: &Expr,
+        lv: &ExprVal,
+        rv: &ExprVal,
+        span: Span,
+    ) -> ExprVal {
+        if lv.ty.is_linear_lease() || rv.ty.is_linear_lease() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::LinearLeaseViolation,
+                span,
+                "linear Lease<T> values cannot be compared directly with `==` / `!=` (compare `.addr()` instead)",
+            ));
+            return ExprVal::error(span);
+        }
+        if lv.ty.is_void() || rv.ty.is_void() {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::InvalidOperation,
+                span,
+                format!("cannot compare 'void' expressions with '{}'", op.as_str()),
+            ));
+            return ExprVal::error(span);
+        }
+        if matches!(lv.ty, Ty::Namespace(_) | Ty::MmioLayout(_))
+            || matches!(rv.ty, Ty::Namespace(_) | Ty::MmioLayout(_))
+        {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                span,
+                format!(
+                    "cannot compare '{}' and '{}' with '{}'",
+                    lv.ty,
+                    rv.ty,
+                    op.as_str()
+                ),
+            ));
+            return ExprVal::error(span);
+        }
+        let is_unsized_prim_or_view = |ty: &Ty| -> bool {
+            matches!(ty, Ty::OsPrimitive(_))
+                || ty_contains_bare_unsized_prim(ty).is_some()
+                || matches!(
+                    ty,
+                    Ty::Ptr(inner) if matches!(&**inner, Ty::OsPrimitive(os) if os.is_unsized_view())
+                )
+        };
+        if is_unsized_prim_or_view(&lv.ty) || is_unsized_prim_or_view(&rv.ty) {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::InvalidOperation,
+                span,
+                format!(
+                    "cannot compare OS primitive handle '{}' with '{}' using '{}'",
+                    lv.ty,
+                    rv.ty,
+                    op.as_str()
+                ),
+            ));
+            return ExprVal::error(span);
+        }
+        if matches!(&lv.ty, Ty::Struct(_)) || matches!(&rv.ty, Ty::Struct(_)) {
+            let msg = if lv.ty == rv.ty {
+                format!(
+                    "cannot compare struct '{}' with '{}'; compare its fields individually (e.g. 'a.field {} b.field')",
+                    lv.ty,
+                    op.as_str(),
+                    op.as_str()
+                )
+            } else {
+                format!(
+                    "cannot compare struct '{}' with '{}' using '{}' (compare fields individually)",
+                    lv.ty,
+                    rv.ty,
+                    op.as_str()
+                )
+            };
+            self.sema
+                .emit(Diagnostic::new(DiagnosticKind::InvalidOperation, span, msg));
+            return ExprVal::error(span);
+        }
+
+        let is_seq_cmp = matches!(&lv.ty, Ty::Slice(_) | Ty::Array { .. })
+            || matches!(&rv.ty, Ty::Slice(_) | Ty::Array { .. })
+            || (matches!(lv.ty, Ty::Str) && matches!(rv.ty, Ty::Str));
+        if is_seq_cmp {
+            fn seq_parts(ty: &Ty) -> Option<(Option<usize>, Ty)> {
+                match ty {
+                    Ty::Slice(elem) => Some((None, (**elem).clone())),
+                    Ty::Array { elem, len } => Some((Some(*len), (**elem).clone())),
+                    Ty::Str => Some((None, Ty::u8())),
+                    _ => None,
+                }
+            }
+            let (Some((la_opt, elem_a)), Some((lb_opt, elem_b))) =
+                (seq_parts(&lv.ty), seq_parts(&rv.ty))
+            else {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!(
+                        "cannot compare incompatible types '{}' and '{}' with '{}'",
+                        lv.ty,
+                        rv.ty,
+                        op.as_str()
+                    ),
+                ));
+                return ExprVal::error(span);
+            };
+            if let (Some(la), Some(lb)) = (la_opt, lb_opt) {
+                if la != lb {
+                    self.sema.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::TypeMismatch,
+                            span,
+                            format!(
+                                "cannot compare fixed arrays of different lengths '{}' and '{}' with '{}'",
+                                lv.ty,
+                                rv.ty,
+                                op.as_str()
+                            ),
+                        )
+                        .with_note(
+                            "slice both arrays (e.g. `a[..] == b[..]`) to compare sequences of arbitrary length",
+                        ),
+                    );
+                    return ExprVal::error(span);
+                }
+            }
+
+            let resolved_elem = match (&elem_a, &elem_b) {
+                (a, b) if a == b => {
+                    if *a == Ty::IntLit {
+                        Ty::Prim(PrimType::I32)
+                    } else {
+                        a.clone()
+                    }
+                }
+                (Ty::IntLit, b) if b.is_integer() && Ty::IntLit.is_assignable_to(b) => b.clone(),
+                (a, Ty::IntLit) if a.is_integer() && Ty::IntLit.is_assignable_to(a) => a.clone(),
+                _ => {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        format!(
+                            "cannot compare sequences '{}' and '{}' of different element types with '{}'",
+                            lv.ty,
+                            rv.ty,
+                            op.as_str()
+                        ),
+                    ));
+                    return ExprVal::error(span);
+                }
+            };
+
+            if !resolved_elem.is_integer() && !resolved_elem.is_bool() {
+                let msg = match &resolved_elem {
+                    Ty::Struct(sname) => format!(
+                        "cannot compare '{}' with '{}': elements have struct type '{}' (compare elements' fields explicitly in a loop)",
+                        lv.ty,
+                        op.as_str(),
+                        sname
+                    ),
+                    _ if resolved_elem.is_float() => format!(
+                        "cannot compare '{}' with '{}': float elements '{}' are excluded from content equality for NaN/-0.0 semantics (compare elements explicitly in a loop)",
+                        lv.ty,
+                        op.as_str(),
+                        resolved_elem
+                    ),
+                    _ => format!(
+                        "cannot compare '{}' with '{}': aggregate content equality only supports integer or 'bool' elements (compare elements/fields explicitly in a loop)",
+                        lv.ty,
+                        op.as_str()
+                    ),
+                };
+                self.sema
+                    .emit(Diagnostic::new(DiagnosticKind::InvalidOperation, span, msg));
+                return ExprVal::error(span);
+            }
+
+            if elem_a == Ty::IntLit {
+                let target_slice = Ty::Slice(Box::new(resolved_elem.clone()));
+                self.check_coerced_expr(lhs, &target_slice);
+            }
+            if elem_b == Ty::IntLit {
+                let target_slice = Ty::Slice(Box::new(resolved_elem));
+                self.check_coerced_expr(rhs, &target_slice);
+            }
+            return ExprVal::scalar(Ty::bool(), span);
+        }
+
+        if lv.ty.is_integer() && rv.ty.is_integer() {
+            if let Some(common) = try_unify_integer(&lv.ty, &rv.ty) {
+                let dst = match common {
+                    Ty::Prim(p) => Some(p),
+                    _ => None,
+                };
+                self.validate_int_expr_at_type(lhs, dst);
+                self.validate_int_expr_at_type(rhs, dst);
+            } else {
+                self.sema.emit(Diagnostic::new(
+                    DiagnosticKind::TypeMismatch,
+                    span,
+                    format!(
+                        "cannot compare incompatible types '{}' and '{}' with '{}' (use an explicit `as` cast)",
+                        lv.ty,
+                        rv.ty,
+                        op.as_str()
+                    ),
+                ));
+            }
+            return ExprVal::scalar(Ty::bool(), span);
+        }
+        let unified_float = unify_float_arith(&lv.ty, &rv.ty);
+        let compat = lv.ty.is_assignable_to(&rv.ty)
+            || rv.ty.is_assignable_to(&lv.ty)
+            || unified_float.is_some();
+        if !compat {
+            self.sema.emit(Diagnostic::new(
+                DiagnosticKind::TypeMismatch,
+                span,
+                format!(
+                    "cannot compare incompatible types '{}' and '{}' with '{}'",
+                    lv.ty,
+                    rv.ty,
+                    op.as_str()
+                ),
+            ));
+        } else if unified_float == Some(Ty::f32()) {
+            self.sema.check_f32_coercion_expr(lhs, &Ty::f32());
+            self.sema.check_f32_coercion_expr(rhs, &Ty::f32());
+        }
+        ExprVal::scalar(Ty::bool(), span)
+    }
+
     pub(super) fn check_const_shift_amount(&mut self, op_str: &str, lhs_ty: &Ty, rhs_expr: &Expr) {
         let shadowed = self.active_local_names();
         let Some(sh) =
@@ -1406,6 +1610,14 @@ impl<'a> BodyChecker<'a> {
     ) -> ExprVal {
         match iv.ty {
             Ty::Ptr(pointee) => {
+                if pointee.is_void() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        span,
+                        "cannot dereference opaque '*void' pointer; cast it to a concrete pointer type first",
+                    ));
+                    return ExprVal::error(span);
+                }
                 if reject_byval {
                     if let Some(ln) = ty_contains_byval_mmio(&pointee) {
                         self.sema.emit(Diagnostic::new(

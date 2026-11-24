@@ -5227,4 +5227,153 @@ fn main() {
             qres.stdout
         );
     }
+
+    #[test]
+    fn pr19_aggregate_equality_runs_on_host_and_qemu() {
+        let temp = TempWorkDir::create("pr19_aggregate_eq").unwrap();
+        let app_path = temp.dir.join("app.zev");
+        let src = r#"import board;
+
+const []u8 C_CMD = "led";
+const [3]u8 C_ARR = ['l', 'e', 'd'];
+const bool C_LIT_EQ = ("led" == "led") && ("led" != "off");
+
+packed struct Wire {
+    u16be a;
+    u16be b;
+}
+
+struct Frame {
+    [4]u8 tag;
+    []u8 sub;
+}
+
+fn check_slices([]u8 lhs, []u8 rhs) -> bool {
+    return lhs == rhs;
+}
+
+fn main() {
+    board.init();
+
+    // 1. Slice vs string literal
+    []u8 a = "led";
+    assert(a == "led");
+    assert("led" == a);
+    assert(a != "off");
+    assert(!(a == "leds"));
+
+    // 2. Same bytes at provably different addresses on stack & .rodata
+    [8]u8 buf1 = [0u8, 0, 0, 0, 0, 0, 0, 0];
+    [8]u8 buf2 = [0u8, 0, 0, 0, 0, 0, 0, 0];
+    buf1[0] = 'l'; buf1[1] = 'e'; buf1[2] = 'd';
+    buf2[0] = 'l'; buf2[1] = 'e'; buf2[2] = 'd';
+    assert(((&buf1[0]) as usize) != ((&buf2[0]) as usize));
+    assert(check_slices(buf1[0..3], buf2[0..3]));
+    assert(!(buf1[0..3] != buf2[0..3]));
+    assert(buf1[0..3] == C_CMD);
+    assert(buf1[0..3] == C_ARR);
+    buf2[2] = 'x';
+    assert(buf1[0..3] != buf2[0..3]);
+    assert(!(buf1[0..3] == buf2[0..3]));
+
+    // 3. Different lengths & empty slices
+    assert(!(buf1[0..3] == buf1[0..2]));
+    assert(buf1[0..3] != buf1[0..2]);
+    []u8 uninit_empty;
+    assert(uninit_empty == "");
+    assert("" == uninit_empty);
+    assert(uninit_empty != "a");
+    assert(buf1[0..0] == buf2[5..5]);
+    assert(buf1[0..0] == "");
+    assert("" == "");
+    assert("a\x00b" == "a\x00b");
+    assert("a\x00b" != "a\x00c");
+
+    // 4. Fixed arrays, struct fields, mixed array vs slice, integer & bool sequences
+    [3]u8 fa = ['l', 'e', 'd'];
+    [3]u8 fb = ['l', 'e', 'd'];
+    assert(fa == fb);
+    assert(fa == "led");
+    assert("led" == fa);
+    assert(fa == buf1[0..3]);
+    assert(buf1[0..3] == fa);
+    assert(buf1[0..3] == [108, 101, 100]);
+    assert([108, 101, 100] == buf1[0..3]);
+    assert([-5, 2] == [-5, 2]);
+    assert([-5, 2] != [1, 2]);
+
+    Frame fr = Frame { tag: ['c', 'm', 'd', '!'], sub: "ok" };
+    assert(fr.tag == "cmd!");
+    assert(fr.sub == "ok");
+
+    [3]u16 u16_a = [100u16, 2000u16, 30000u16];
+    [3]u16 u16_b = [100u16, 2000u16, 30000u16];
+    [3]u16 u16_c = [100u16, 2001u16, 30000u16];
+    assert(u16_a == u16_b);
+    assert(u16_a == u16_b[..]);
+    assert(u16_b[..] != u16_c);
+
+    [3]bool ba = [true, false, true];
+    [3]bool bb = [true, false, true];
+    [3]bool bc = [true, true, true];
+    assert(ba == bb);
+    assert(ba == bb[..]);
+    assert(bb[..] != bc[..]);
+    assert(ba[0..2] != bb[0..3]);
+
+    Wire w1 = Wire { a: 0x1234, b: 0x5678 };
+    Wire w2 = Wire { a: 0x1234, b: 0x5678 };
+    [2]u16be wa = [w1.a, w1.b];
+    [2]u16be wb = [w2.a, w2.b];
+    assert(wa == wb);
+    assert(C_LIT_EQ);
+
+    println("AGG_EQ_ALL_OK");
+    sys.exit(0);
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "host failed: {stdout}");
+        assert!(stdout.contains("AGG_EQ_ALL_OK"), "host stdout={stdout:?}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("pr19_agg_eq.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout.contains("AGG_EQ_ALL_OK"),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
 }

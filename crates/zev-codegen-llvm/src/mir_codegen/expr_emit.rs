@@ -627,6 +627,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
             }
             MirExprKind::Binary { op, lhs, rhs } => self.emit_binary(*op, lhs, rhs, &expr.ty),
+            MirExprKind::SeqEq {
+                eq,
+                lhs,
+                rhs,
+                elem_ty,
+            } => self.emit_seq_eq(*eq, lhs, rhs, elem_ty),
             MirExprKind::Cast {
                 expr: sub,
                 target_ty,
@@ -2399,6 +2405,150 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.emit_line(format!("{t} = {inst} {common_ty} {}, {}", lc.repr, rc.repr));
         let dst_lty = self.ctx.llvm_ty(&res_ty.host_value_type());
         Ok(self.coerce(SsaVal::new(common_ty, t), &dst_lty, !res_ty.is_unsigned()))
+    }
+
+    pub(super) fn emit_seq_ptr_and_len(
+        &mut self,
+        side: &MirExpr,
+    ) -> Result<(String, String), CodegenError> {
+        let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
+        if let MirExprKind::StringLit(s) = &side.kind {
+            let idx = self.ctx.intern_string(s);
+            let slen = zev_ast::decoded_string_byte_len(s);
+            return Ok((format!("@.str.{idx}"), format!("{slen}")));
+        }
+        match &side.ty {
+            MirType::Slice(_) => {
+                let sl_ty = format!("{{ ptr, {usize_ty} }}");
+                let sv = self.emit_expr(side)?;
+                let dp = self.next_tmp();
+                let sl_len = self.next_tmp();
+                self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", sv.repr));
+                self.emit_line(format!("{sl_len} = extractvalue {sl_ty} {}, 1", sv.repr));
+                Ok((dp, sl_len))
+            }
+            MirType::Array { len, .. } => {
+                if *len == 0 {
+                    return Ok(("null".to_string(), "0".to_string()));
+                }
+                let aty = self.ctx.llvm_ty(&side.ty);
+                let base_ptr = if let MirExprKind::Var(vid) = &side.kind {
+                    let ap = self.var_ptr(*vid);
+                    let gp = self.next_tmp();
+                    self.emit_line(format!(
+                        "{gp} = getelementptr inbounds {aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
+                    ));
+                    gp
+                } else if let Some((ap, aty_mir, _)) = self.try_emit_rodata_const_ptr(side)? {
+                    let ro_aty = self.ctx.llvm_ty(&aty_mir);
+                    let gp = self.next_tmp();
+                    self.emit_line(format!(
+                        "{gp} = getelementptr inbounds {ro_aty}, ptr {ap}, {usize_ty} 0, {usize_ty} 0"
+                    ));
+                    gp
+                } else {
+                    let bv = self.emit_expr(side)?;
+                    let (tmp, al) = self.emit_temp_alloca(&bv.ty);
+                    self.emit_line(format!(
+                        "store {} {}, ptr {tmp}, align {al}",
+                        bv.ty, bv.repr
+                    ));
+                    let gp = self.next_tmp();
+                    self.emit_line(format!(
+                        "{gp} = getelementptr inbounds {}, ptr {tmp}, {usize_ty} 0, {usize_ty} 0",
+                        bv.ty
+                    ));
+                    gp
+                };
+                Ok((base_ptr, format!("{len}")))
+            }
+            _ => {
+                let sv = self.emit_expr(side)?;
+                Ok((sv.repr, "0".to_string()))
+            }
+        }
+    }
+
+    pub(super) fn emit_seq_eq(
+        &mut self,
+        eq: bool,
+        lhs: &MirExpr,
+        rhs: &MirExpr,
+        elem_ty: &MirType,
+    ) -> Result<SsaVal, CodegenError> {
+        let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
+        let ety = self.ctx.llvm_ty(&elem_ty.host_value_type());
+        let (pa, la) = self.emit_seq_ptr_and_len(lhs)?;
+        let (pb, lb) = self.emit_seq_ptr_and_len(rhs)?;
+
+        let (idx_p, idx_al) = self.emit_temp_alloca(&usize_ty);
+        self.emit_line(format!("store {usize_ty} 0, ptr {idx_p}, align {idx_al}"));
+
+        let len_eq = self.next_tmp();
+        self.emit_line(format!("{len_eq} = icmp eq {usize_ty} {la}, {lb}"));
+        let len_chk_lbl = self.cur_label.clone();
+
+        let hdr_lbl = self.next_label("seqeq_hdr");
+        let body_lbl = self.next_label("seqeq_body");
+        let step_lbl = self.next_label("seqeq_step");
+        let done_lbl = self.next_label("seqeq_done");
+        self.emit_term(format!(
+            "br i1 {len_eq}, label %{hdr_lbl}, label %{done_lbl}"
+        ));
+
+        self.start_block(&hdr_lbl);
+        let i_val = self.next_tmp();
+        let more = self.next_tmp();
+        self.emit_line(format!(
+            "{i_val} = load {usize_ty}, ptr {idx_p}, align {idx_al}"
+        ));
+        self.emit_line(format!("{more} = icmp ult {usize_ty} {i_val}, {la}"));
+        self.emit_term(format!(
+            "br i1 {more}, label %{body_lbl}, label %{done_lbl}"
+        ));
+
+        self.start_block(&body_lbl);
+        let ep_a = self.next_tmp();
+        let ep_b = self.next_tmp();
+        let va = self.next_tmp();
+        let vb = self.next_tmp();
+        let el_eq = self.next_tmp();
+        self.emit_line(format!(
+            "{ep_a} = getelementptr {ety}, ptr {pa}, {usize_ty} {i_val}"
+        ));
+        self.emit_line(format!(
+            "{ep_b} = getelementptr {ety}, ptr {pb}, {usize_ty} {i_val}"
+        ));
+        self.emit_line(format!("{va} = load {ety}, ptr {ep_a}, align 1"));
+        self.emit_line(format!("{vb} = load {ety}, ptr {ep_b}, align 1"));
+        self.emit_line(format!("{el_eq} = icmp eq {ety} {va}, {vb}"));
+        self.emit_term(format!(
+            "br i1 {el_eq}, label %{step_lbl}, label %{done_lbl}"
+        ));
+
+        self.start_block(&step_lbl);
+        let next_i = self.next_tmp();
+        self.emit_line(format!("{next_i} = add {usize_ty} {i_val}, 1"));
+        self.emit_line(format!(
+            "store {usize_ty} {next_i}, ptr {idx_p}, align {idx_al}"
+        ));
+        self.emit_term(format!("br label %{hdr_lbl}"));
+
+        self.start_block(&done_lbl);
+        let eq1 = self.next_tmp();
+        self.emit_line(format!(
+            "{eq1} = phi i1 [ false, %{len_chk_lbl} ], [ true, %{hdr_lbl} ], [ false, %{body_lbl} ]"
+        ));
+        let final1 = if eq {
+            eq1
+        } else {
+            let neq1 = self.next_tmp();
+            self.emit_line(format!("{neq1} = xor i1 {eq1}, true"));
+            neq1
+        };
+        let b8 = self.next_tmp();
+        self.emit_line(format!("{b8} = zext i1 {final1} to i8"));
+        Ok(SsaVal::new("i8", b8))
     }
 }
 

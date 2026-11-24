@@ -8244,4 +8244,165 @@ fn main() {
         // 'A' (65) + 'B' (66) = 131; 'C' (67) + 'D' (68) = 135; 10 + 32 = 42.
         assert_eq!(res.exec.stdout, "SOFT_PTR:131:135:42\n");
     }
+
+    #[test]
+    fn pr19_exhaustive_operator_type_pairs_build_to_valid_llvm_objects() {
+        let dir = test_out_dir().join("pr19_op_matrix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let host_opts = CodegenOptions::host_linux();
+        let cm3_opts = CodegenOptions::lm3s6965();
+        let avr_opts = CodegenOptions::avr_uno();
+
+        let prelude = r#"
+enum Mode { Idle, Run }
+struct Pair { u32 a; u16 b; }
+packed struct Wire { u16be be_v; u16le le_v; }
+mmio FakeRegs { @rw u32 cr @ 0; }
+mmio REG0 : FakeRegs @ 0x4000_0000;
+irq IRQ0 = 10;
+irq IRQ1 = 11;
+signal SIG0;
+byte_ring<8> RING0;
+inbox<u32, 4> Q0;
+fn helper(u8 x) -> u8 { return x + 1u8; }
+fn helper2(u8 x) -> u8 { return x + 2u8; }
+fn void_cb() {}
+"#;
+
+        let mut cases: Vec<(&'static str, String)> = Vec::new();
+        // Unary
+        cases.push(("unary_not_bool", format!("{prelude}\nfn f(bool b) -> bool {{ return !b; }}\nfn main() {{ bool r = f(true); sys.log_kv(\"r\", r as i32); }}")));
+        for ity in [
+            "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
+        ] {
+            cases.push((
+                match ity {
+                    "u8" => "unary_bitnot_u8",
+                    "u16" => "unary_bitnot_u16",
+                    "u32" => "unary_bitnot_u32",
+                    "u64" => "unary_bitnot_u64",
+                    "usize" => "unary_bitnot_usize",
+                    "i8" => "unary_bitnot_i8",
+                    "i16" => "unary_bitnot_i16",
+                    "i32" => "unary_bitnot_i32",
+                    "i64" => "unary_bitnot_i64",
+                    _ => "unary_bitnot_isize",
+                },
+                format!("{prelude}\nfn f({ity} x) -> {ity} {{ return ~x; }}\nfn main() {{ {ity} r = f(1); sys.log_kv(\"r\", r as i32); }}"),
+            ));
+            cases.push((
+                match ity {
+                    "u8" => "unary_neg_u8",
+                    "u16" => "unary_neg_u16",
+                    "u32" => "unary_neg_u32",
+                    "u64" => "unary_neg_u64",
+                    "usize" => "unary_neg_usize",
+                    "i8" => "unary_neg_i8",
+                    "i16" => "unary_neg_i16",
+                    "i32" => "unary_neg_i32",
+                    "i64" => "unary_neg_i64",
+                    _ => "unary_neg_isize",
+                },
+                format!("{prelude}\nfn f({ity} x) -> {ity} {{ return -x; }}\nfn main() {{ {ity} r = f(1); sys.log_kv(\"r\", r as i32); }}"),
+            ));
+        }
+        cases.push(("unary_bitnot_neg_u16be", format!("{prelude}\nfn main() {{ Wire w = Wire {{ be_v: 1, le_v: 2 }}; u16 a = ~w.be_v; u16 b = -w.be_v; sys.log_kv(\"r\", (a + b) as i32); }}")));
+        cases.push(("unary_neg_f32", format!("{prelude}\nfn f(f32 x) -> f32 {{ return -x; }}\nfn main() {{ f32 r = f(1.5f32); sys.log_kv(\"r\", r as i32); }}")));
+        cases.push(("unary_neg_f64", format!("{prelude}\nfn f(f64 x) -> f64 {{ return -x; }}\nfn main() {{ f64 r = f(1.5); sys.log_kv(\"r\", r as i32); }}")));
+        cases.push(("unary_deref_addr_u32_struct", format!("{prelude}\nfn main() {{ u32 x = 5; *u32 p = &x; u32 y = *p; Pair pr = Pair {{ a: y, b: 1 }}; *Pair pp = &pr; Pair cpy = *pp; sys.log_kv(\"r\", cpy.a as i32); }}")));
+        cases.push(("binary_logic_and_or", format!("{prelude}\nfn f(bool a, bool b) -> bool {{ return (a && b) || (!a && !b); }}\nfn main() {{ bool r = f(true, false); sys.log_kv(\"r\", r as i32); }}")));
+
+        // Integer ops: arith, cmp, bit, shift
+        for (tag, op) in [
+            ("add", "+"),
+            ("sub", "-"),
+            ("mul", "*"),
+            ("div", "/"),
+            ("rem", "%"),
+            ("bitand", "&"),
+            ("bitor", "|"),
+            ("bitxor", "^"),
+            ("eq", "=="),
+            ("ne", "!="),
+            ("lt", "<"),
+            ("le", "<="),
+            ("gt", ">"),
+            ("ge", ">="),
+            ("shl", "<<"),
+            ("shr", ">>"),
+        ] {
+            let rhs_cast = if matches!(op, "==" | "!=" | "<" | "<=" | ">" | ">=") {
+                "bool"
+            } else {
+                "same"
+            };
+            let body = if rhs_cast == "bool" {
+                format!("{prelude}\nfn cmp_u8(u8 a, u8 b) -> bool {{ return a {op} b; }}\nfn cmp_i64(i64 a, i64 b) -> bool {{ return a {op} b; }}\nfn cmp_usize(usize a, usize b) -> bool {{ return a {op} b; }}\nfn main() {{ bool x = cmp_u8(4, 2) && cmp_i64(-4, 2) && cmp_usize(3, 1); sys.log_kv(\"x\", x as i32); }}")
+            } else if matches!(op, "<<" | ">>") {
+                format!("{prelude}\nfn s1(u8 a, u32 b) -> u8 {{ return a {op} b; }}\nfn s2(i64 a, u8 b) -> i64 {{ return a {op} b; }}\nfn s3(usize a, u16 b) -> usize {{ return a {op} b; }}\nfn main() {{ u32 t = (s1(8, 1) as u32) + (s2(-8, 1) as u32) + (s3(8, 1) as u32); sys.log_kv(\"t\", t as i32); }}")
+            } else {
+                format!("{prelude}\nfn f1(u8 a, u8 b) -> u8 {{ return a {op} b; }}\nfn f2(i16 a, i16 b) -> i16 {{ return a {op} b; }}\nfn f3(u32 a, u32 b) -> u32 {{ return a {op} b; }}\nfn f4(i64 a, i64 b) -> i64 {{ return a {op} b; }}\nfn f5(usize a, u8 b) -> usize {{ return a {op} b; }}\nfn main() {{ u32 t = (f1(4,2) as u32) + (f2(-4,2) as u32) + f3(4,2) + (f4(4,2) as u32) + (f5(4,2) as u32); sys.log_kv(\"t\", t as i32); }}")
+            };
+            let _ = tag;
+            cases.push((tag, body));
+        }
+
+        // Float ops (+, -, *, /, %, ==, !=, <, <=, >, >=) and compound ops
+        cases.push(("float_arith_rem_cmp_compound", format!("{prelude}\nfn main() {{\n    f32 a = 5.5f32; f32 b = 2.0f32;\n    f32 s = (a + b) - (a * b) / b;\n    f32 rem32 = a % b;\n    a += 1.0; a -= 0.5; a *= 2.0; a /= 2.0; a %= 3.0;\n    f64 da = 7.5; f64 db = 2.5;\n    f64 ds = (da + db) - (da * db) / db;\n    f64 drem = da % db;\n    da += 1.0; da -= 0.5; da *= 2.0; da /= 2.0; da %= 3.0;\n    bool ok = (rem32 > 0.0f32) && (a >= 0.0f32) && (drem < 10.0) && (da <= 10.0) && (s == s) && (ds != 0.0);\n    sys.log_kv(\"ok\", ok as i32);\n}}")));
+
+        // Integer compound ops including u16be field and MMIO @rw
+        cases.push(("int_and_mmio_compound", format!("{prelude}\nfn main() {{\n    u32 x = 10; x += 2; x -= 1; x *= 3; x /= 2; x %= 5; x |= 4; x &= 7; x ^= 1; x <<= 1; x >>= 1;\n    Wire w = Wire {{ be_v: 10, le_v: 10 }};\n    w.be_v += 3; w.be_v -= 1; w.be_v &= 0xFF; w.be_v |= 1;\n    REG0.cr = 1; REG0.cr |= 2; REG0.cr &= 3;\n    sys.log_kv(\"x\", (x + (w.be_v as u32) + REG0.cr) as i32);\n}}")));
+
+        // Scalar & handle == / !=
+        cases.push(("eq_ne_scalars_handles_fnptr_irq", format!("{prelude}\nfn main() {{\n    Mode m = Mode.Idle;\n    *FakeRegs rp = REG0 as *FakeRegs;\n    *void vp = void_cb as *void;\n    fn(u8) -> u8 fp = helper;\n    *u32 up = 0 as *u32;\n    *signal sp = &SIG0;\n    bool ok = (m == Mode.Idle) && (m != Mode.Run)\n        && (1ms == 1ms) && (1ms != 2ms)\n        && (@low == @low) && (@low != @high)\n        && (IRQ0 == IRQ0) && (IRQ0 != IRQ1)\n        && (REG0 == rp) && (rp != rp)\n        && (up == (0 as *void)) && ((0 as *void) == up)\n        && (sp == &SIG0)\n        && (fp == helper) && (fp != helper2)\n        && (void_cb == vp) && (vp == void_cb);\n    sys.log_kv(\"ok\", ok as i32);\n}}")));
+
+        // Aggregate Eq / Ne: Slice vs lit, Array vs Array, Slice vs Slice, Array vs Slice across int types and bool
+        cases.push(("eq_ne_seq_int_types_and_bool", format!("{prelude}\nfn main() {{\n    []u8 s8 = \"led\";\n    [3]u8 a8 = [108u8, 101u8, 100u8];\n    [2]u16 a16 = [1u16, 2u16];\n    [2]i32 ai32 = [-1i32, 2i32];\n    [2]u64 a64 = [1u64, 2u64];\n    [2]usize aus = [1usize, 2usize];\n    [2]bool ab = [true, false];\n    Wire w = Wire {{ be_v: 1, le_v: 2 }};\n    [2]u16be abe = [w.be_v, 3 as u16be];\n    []u16 s16 = a16[..];\n    []bool sb = ab[..];\n    bool ok = (s8 == \"led\") && (\"led\" != s8[0..2]) && (\"abc\" == \"abc\")\n        && (a8 == \"led\") && (\"led\" == a8) && (a8 == a8) && (a8 == s8) && (s8 == a8)\n        && (s8 == [108, 101, 100]) && ([108, 101, 100] == s8)\n        && (a16 == s16) && (s16 != a16[0..1])\n        && (ai32 == ai32) && (a64 == a64) && (aus == aus)\n        && (ab == sb) && (sb != ab[0..1]) && (abe == abe);\n    sys.log_kv(\"ok\", ok as i32);\n}}")));
+
+        // Explicit `as` casts
+        cases.push(("casts_all_valid_pairs", format!("{prelude}\nfn use_view(*byte_ring r, *inbox<u32> q) -> usize {{ return r.cap() + q.cap(); }}\nfn main() {{\n    u8 a = 5; u32 b = a as u32; u8 c = b as u8;\n    f32 ff = c as f32; f64 fd = ff as f64; i32 fi = fd as i32; u64 fu = ff as u64;\n    u8 bf = (true as u8); f32 bfl = (true as f32); bool bb = (true as bool);\n    Mode m = Mode.Run; i32 mi = m as i32;\n    *void vp = void_cb as *void;\n    *u32 p1 = 0x1000 as *u32; *void pv = p1 as *void; *u8 pu8 = pv as *u8;\n    usize addr = pu8 as usize;\n    *FakeRegs rp = REG0 as *FakeRegs; usize ra = REG0 as usize;\n    *byte_ring br = (&RING0) as *byte_ring;\n    *inbox<u32> qi = (&Q0) as *inbox<u32>;\n    u32 iq = IRQ0 as u32;\n    *u8 s1 = \"hi\" as *u8; *i8 s2 = \"hi\" as *i8; *void s3 = \"hi\" as *void; []u8 s4 = \"hi\";\n    usize tot = addr + ra + use_view(br, qi) + (iq as usize) + s4.len + (fi as usize) + (fu as usize) + (bf as usize) + (bfl as usize) + (bb as usize) + (mi as usize) + (vp as usize) + (s1 as usize) + (s2 as usize) + (s3 as usize);\n    sys.log_kv(\"tot\", tot as i32);\n}}")));
+
+        // Switch over int, bool, enum, u16be
+        cases.push(("switch_int_bool_enum_endian", format!("{prelude}\nfn main() {{\n    u32 x = 2;\n    bool b = true;\n    Mode m = Mode.Run;\n    Wire w = Wire {{ be_v: 5, le_v: 1 }};\n    u32 acc = 0;\n    switch (x) {{ 1 => {{ acc += 1; }} 2 => {{ acc += 2; }} _ => {{}} }}\n    switch (b) {{ true => {{ acc += 4; }} false => {{}} }}\n    switch (m) {{ Idle => {{}} Run => {{ acc += 8; }} }}\n    switch (w.be_v) {{ 5 => {{ acc += 16; }} _ => {{}} }}\n    sys.log_kv(\"acc\", acc as i32);\n}}")));
+
+        for (i, (label, src)) in cases.iter().enumerate() {
+            let mir = compile_src_mir(src);
+            let ll = emit_llvm_ir_with_options(&mir, &host_opts)
+                .unwrap_or_else(|e| panic!("host IR emit failed for `{label}`: {e:?}"));
+            let ll_path = dir.join(format!("c{i}_{label}.ll"));
+            let obj_path = dir.join(format!("c{i}_{label}.o"));
+            std::fs::write(&ll_path, &ll).unwrap();
+            compile_ll_to_obj(&ll_path, &obj_path, &host_opts)
+                .unwrap_or_else(|e| panic!("host LLVM obj build failed for `{label}`: {e:?}"));
+        }
+
+        // Verify freestanding ARM & AVR LLVM object builds on FnPtr<->*void + SeqEq!
+        for (tname, topts) in [("cm3", &cm3_opts), ("avr_uno", &avr_opts)] {
+            let (_, src) = cases
+                .iter()
+                .find(|(l, _)| *l == "eq_ne_scalars_handles_fnptr_irq")
+                .unwrap();
+            let mir = compile_src_mir(src);
+            let ll = emit_llvm_ir_with_options(&mir, topts)
+                .unwrap_or_else(|e| panic!("{tname} IR emit failed: {e:?}"));
+            let ll_path = dir.join(format!("{tname}_fnptr_void.ll"));
+            let obj_path = dir.join(format!("{tname}_fnptr_void.o"));
+            std::fs::write(&ll_path, &ll).unwrap();
+            compile_ll_to_obj(&ll_path, &obj_path, topts)
+                .unwrap_or_else(|e| panic!("{tname} LLVM obj build failed: {e:?}"));
+
+            let (_, seq_src) = cases
+                .iter()
+                .find(|(l, _)| *l == "eq_ne_seq_int_types_and_bool")
+                .unwrap();
+            let mir2 = compile_src_mir(seq_src);
+            let ll2 = emit_llvm_ir_with_options(&mir2, topts)
+                .unwrap_or_else(|e| panic!("{tname} seq IR emit failed: {e:?}"));
+            let ll2_path = dir.join(format!("{tname}_seqeq.ll"));
+            let obj2_path = dir.join(format!("{tname}_seqeq.o"));
+            std::fs::write(&ll2_path, &ll2).unwrap();
+            compile_ll_to_obj(&ll2_path, &obj2_path, topts)
+                .unwrap_or_else(|e| panic!("{tname} seq LLVM obj build failed: {e:?}"));
+        }
+    }
 }

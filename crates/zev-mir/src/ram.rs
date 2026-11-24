@@ -1666,6 +1666,7 @@ fn fold_expr_run(
             fold_place_run(place, fn_map, cache, visiting, kind, extra_blocks);
         }
         MirExprKind::Binary { lhs, rhs, .. }
+        | MirExprKind::SeqEq { lhs, rhs, .. }
         | MirExprKind::Index {
             base: lhs,
             index: rhs,

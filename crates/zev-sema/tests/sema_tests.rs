@@ -7881,3 +7881,154 @@ fn main() { }
         );
     }
 }
+
+#[test]
+fn pr19_rejects_unsupported_aggregate_equality_and_invalid_operator_type_pairs() {
+    let cases = [
+        (
+            "struct_eq",
+            "Point",
+            "field",
+            "struct Point { u32 x; u32 y; }\nfn main() { Point a = Point { x: 1, y: 2 }; Point b = Point { x: 1, y: 2 }; bool e = a == b; }",
+        ),
+        (
+            "struct_slice_ne",
+            "Item",
+            "field",
+            "struct Item { u8 id; }\nfn cmp([]Item a, []Item b) -> bool { return a != b; }\nfn main() {}",
+        ),
+        (
+            "struct_array_eq",
+            "Item",
+            "field",
+            "struct Item { u8 id; }\nfn main() { [2]Item a = [Item { id: 1 }, Item { id: 2 }]; bool e = a == a; }",
+        ),
+        (
+            "float_slice_eq",
+            "[]f32",
+            "loop",
+            "fn cmp([]f32 a, []f32 b) -> bool { return a == b; }\nfn main() {}",
+        ),
+        (
+            "float_array_eq",
+            "[2]f64",
+            "loop",
+            "fn main() { [2]f64 a = [1.0, 2.0]; bool e = a == a; }",
+        ),
+        (
+            "nested_array_eq",
+            "[2][2]u8",
+            "loop",
+            "fn main() { [2][2]u8 a = [[1u8, 2u8], [3u8, 4u8]]; bool e = a == a; }",
+        ),
+        (
+            "ptr_slice_eq",
+            "[]*u8",
+            "loop",
+            "fn cmp([]*u8 a, []*u8 b) -> bool { return a == b; }\nfn main() {}",
+        ),
+        (
+            "enum_slice_eq",
+            "[]Err",
+            "loop",
+            "enum Err { A }\nfn cmp([]Err a, []Err b) -> bool { return a == b; }\nfn main() {}",
+        ),
+        (
+            "diff_len_array_eq",
+            "[2]u8",
+            "[3]u8",
+            "fn main() { [2]u8 a = [1, 2]; [3]u8 b = [1, 2, 3]; bool e = a == b; }",
+        ),
+        (
+            "diff_elem_slice_eq",
+            "[]u8",
+            "[]u16",
+            "fn cmp([]u8 a, []u16 b) -> bool { return a == b; }\nfn main() {}",
+        ),
+        (
+            "void_eq",
+            "void",
+            "compare",
+            "fn v() {}\nfn main() { bool e = v() == v(); }",
+        ),
+        (
+            "byte_ring_view_eq",
+            "*byte_ring",
+            "compare",
+            "fn cmp(*byte_ring a, *byte_ring b) -> bool { return a == b; }\nfn main() {}",
+        ),
+        (
+            "signal_val_eq",
+            "signal",
+            "compare",
+            "signal s;\nfn main() { bool e = s == s; }",
+        ),
+        (
+            "deref_void_rvalue",
+            "*void",
+            "dereference",
+            "fn f(*void vp) { *vp; }\nfn main() {}",
+        ),
+        (
+            "deref_void_lvalue",
+            "*void",
+            "dereference",
+            "fn f(*void a, *void b) { *a = *b; }\nfn main() {}",
+        ),
+        (
+            "switch_string",
+            "switch",
+            "str",
+            "fn main() { switch (\"abc\") { _ => {} } }",
+        ),
+        (
+            "switch_slice",
+            "switch",
+            "[]u8",
+            "fn f([]u8 s) { switch (s) { _ => {} } }\nfn main() {}",
+        ),
+        (
+            "switch_struct",
+            "switch",
+            "Point",
+            "struct Point { u32 x; }\nfn main() { Point p = Point { x: 1 }; switch (p) { _ => {} } }",
+        ),
+        (
+            "cast_struct_self",
+            "Point",
+            "cast",
+            "struct Point { u32 x; }\nfn main() { Point p = Point { x: 1 }; Point q = p as Point; }",
+        ),
+        (
+            "cast_slice_self",
+            "[]u8",
+            "cast",
+            "fn f([]u8 s) { []u8 x = s as []u8; }\nfn main() {}",
+        ),
+        (
+            "addr_of_rvalue",
+            "&",
+            "temporary",
+            "fn main() { *i32 p = &5; }",
+        ),
+    ];
+
+    for (label, needle1, needle2, src) in cases {
+        let p = zev_parser::parse_str(src).unwrap_or_else(|e| panic!("{label} parse failed: {e}"));
+        let out = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            !out.diagnostics.is_empty(),
+            "{label}: expected Sema error, got OK"
+        );
+        let joined = out
+            .diagnostics
+            .iter()
+            .map(|d| format!("{} {:?}", d.message, d.note))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains(needle1) && joined.contains(needle2),
+            "{label}: expected diagnostics mentioning {needle1:?} and {needle2:?}, got:\n{joined}"
+        );
+    }
+}
