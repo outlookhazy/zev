@@ -1142,7 +1142,33 @@ impl<'a> BodyChecker<'a> {
             }
 
             StmtKind::Error { reason, partial } => {
-                let r_val = reason.as_ref().map(|r| self.check_expr_infallible(r));
+                let mut bare_err_variant: Option<ExprVal> = None;
+                if let (
+                    Some(r_expr),
+                    ActiveBodyKind::Fn {
+                        error_spec: ResolvedErrorSpec::Typed(Ty::Enum(err_enum)),
+                        ..
+                    },
+                ) = (reason, &self.body_kind)
+                {
+                    if let ExprKind::Ident(id) = &r_expr.kind {
+                        if self.lookup_local(&id.name).is_none()
+                            && !self.sema.consts.contains_key(&id.name)
+                            && !self.sema.primitives.contains_key(&id.name)
+                            && !self.sema.subsystems.contains_key(&id.name)
+                            && self
+                                .sema
+                                .enums
+                                .get(err_enum)
+                                .is_some_and(|en| en.has_variant(&id.name))
+                        {
+                            bare_err_variant =
+                                Some(ExprVal::scalar(Ty::Enum(err_enum.clone()), r_expr.span));
+                        }
+                    }
+                }
+                let r_val = bare_err_variant
+                    .or_else(|| reason.as_ref().map(|r| self.check_expr_infallible(r)));
                 let p_val = partial.as_ref().map(|p| self.check_expr_infallible(p));
 
                 if self.in_defer() {
