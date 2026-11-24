@@ -581,7 +581,8 @@ fn collect_fmt_chunk_uses(chunk: &MirFmtChunk, uses: &mut BTreeSet<VarId>) {
 
 fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
     match &expr.kind {
-        MirExprKind::IntLit(_)
+        MirExprKind::ZeroValue
+        | MirExprKind::IntLit(_)
         | MirExprKind::FloatLit(_)
         | MirExprKind::BoolLit(_)
         | MirExprKind::StringLit(_)

@@ -9,6 +9,10 @@ pub(super) trait LowerBackend {
         false
     }
     fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId;
+    /// Scratch array of at least `cap` bytes, plus the `fmt_buf` result slot, for formatting one
+    /// scalar chunk of a sink print. Each use is transient (format, write, done), so a function
+    /// or coroutine hands out one shared pair instead of reserving a buffer per print site.
+    fn acquire_sink_fmt_scratch_be(&mut self, cap: usize) -> (VarId, VarId);
     fn emit_stmt_be(&mut self, stmt: MirStmt);
     fn invalidate_boot_const(&mut self, _vid: VarId) {}
     fn mark_may_hold_boost_be(&mut self) {}
@@ -43,6 +47,9 @@ impl<'b, 'a> LowerBackend for DirectBackend<'b, 'a> {
     }
     fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId {
         self.ctx.alloc_temp(prefix, ty)
+    }
+    fn acquire_sink_fmt_scratch_be(&mut self, cap: usize) -> (VarId, VarId) {
+        self.ctx.acquire_sink_fmt_scratch(cap)
     }
     fn emit_stmt_be(&mut self, stmt: MirStmt) {
         self.stmts.push(stmt);
@@ -79,6 +86,10 @@ impl<'a> LowerBackend for CoroutineLowerCtx<'a> {
     }
     fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId {
         self.alloc_temp(prefix, ty)
+    }
+    fn acquire_sink_fmt_scratch_be(&mut self, cap: usize) -> (VarId, VarId) {
+        let (buf, _) = self.acquire_sink_fmt_buf(cap);
+        (buf, self.acquire_sink_fmt_res())
     }
     fn emit_stmt_be(&mut self, stmt: MirStmt) {
         self.cur_stmts.push(stmt);
@@ -4012,7 +4023,8 @@ pub(super) fn try_lower_print_arg_be<B: LowerBackend>(
     be: &mut B,
 ) -> Result<Option<MirStmt>, MirLowerError> {
     if let ExprKind::FormatString(parts) = &arg.kind {
-        let chunks = lower_format_parts_be(parts, be)?;
+        let mut chunks = lower_format_parts_be(parts, be)?;
+        snapshot_fmt_chunk_values_be(&mut chunks, be);
         return Ok(Some(MirStmt::PrintFmt { chunks, newline }));
     }
     // Leave standard string literals and `*u8` C strings on the existing `print` / `sys.log` path,
@@ -4267,6 +4279,11 @@ pub(super) fn lower_user_sink_ptr_var_be<B: LowerBackend>(
     let sv = be.lower_sub(sink_expr, None)?;
     match &sv.ty {
         MirType::Ptr(inner) if matches!(&**inner, MirType::Struct(_)) => {
+            // A sink that is already a pointer variable (`self`, a pointer parameter or local)
+            // is used directly; copying it would add one more pointer per print site to the frame.
+            if let MirExprKind::Var(vid) = &sv.kind {
+                return Ok(*vid);
+            }
             let sink_ptr = be.alloc_temp_be("sink_ptr", sv.ty.clone());
             be.emit_stmt_be(MirStmt::Assign {
                 target: MirPlace::Var(sink_ptr),
@@ -4428,6 +4445,100 @@ pub(super) fn chunk_to_slice_or_scalar_be<B: LowerBackend>(
     }
 }
 
+pub(super) fn fmt_chunk_value_mut(ch: &mut MirFmtChunk) -> Option<&mut MirExpr> {
+    match ch {
+        MirFmtChunk::Literal(_) => None,
+        MirFmtChunk::Int { value, .. }
+        | MirFmtChunk::Float { value, .. }
+        | MirFmtChunk::Bool(value)
+        | MirFmtChunk::PaddedBool { value, .. }
+        | MirFmtChunk::Str(value)
+        | MirFmtChunk::PaddedStr { cstr: value, .. }
+        | MirFmtChunk::Bytes(value)
+        | MirFmtChunk::PaddedBytes { slice: value, .. }
+        | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::PaddedEnumName { value, .. }
+        | MirFmtChunk::DebugSlice { slice: value, .. } => Some(value),
+    }
+}
+
+fn place_addr_is_frame_stable(place: &MirPlace) -> bool {
+    match place {
+        MirPlace::Var(_) => true,
+        MirPlace::Deref(ptr, _) => expr_is_frame_stable(ptr),
+        MirPlace::Field { base, .. } => place_addr_is_frame_stable(base),
+        MirPlace::Index {
+            base,
+            index,
+            is_slice: false,
+            ..
+        } => place_addr_is_frame_stable(base) && expr_is_frame_stable(index),
+        MirPlace::Index { is_slice: true, .. } => false,
+    }
+}
+
+/// Whether evaluating `expr` again later, after this coroutine has yielded, is guaranteed to give
+/// the same value: it reads nothing but constants and this frame's own variables, which no other
+/// task can change while the coroutine is suspended.
+pub(super) fn expr_is_frame_stable(expr: &MirExpr) -> bool {
+    match &expr.kind {
+        MirExprKind::ZeroValue
+        | MirExprKind::IntLit(_)
+        | MirExprKind::FloatLit(_)
+        | MirExprKind::BoolLit(_)
+        | MirExprKind::StringLit(_)
+        | MirExprKind::TicksLit(_)
+        | MirExprKind::EnumVariant { .. }
+        | MirExprKind::ConstRef(_)
+        | MirExprKind::Var(_)
+        | MirExprKind::ResultIsErr(_)
+        | MirExprKind::ResultErr(_)
+        | MirExprKind::ResultVal(_)
+        | MirExprKind::ArrayLen(_) => true,
+        MirExprKind::Cast { expr: inner, .. } | MirExprKind::SliceLen(inner) => {
+            expr_is_frame_stable(inner)
+        }
+        MirExprKind::Unary { op, expr: inner } => {
+            !matches!(op, MirUnaryOp::Deref) && expr_is_frame_stable(inner)
+        }
+        MirExprKind::Binary { lhs, rhs, .. } => {
+            expr_is_frame_stable(lhs) && expr_is_frame_stable(rhs)
+        }
+        MirExprKind::FieldAccess {
+            base,
+            is_ptr: false,
+            ..
+        } => expr_is_frame_stable(base),
+        MirExprKind::ArrayToSlice { array_place, .. } => place_addr_is_frame_stable(array_place),
+        _ => false,
+    }
+}
+
+/// Reads every value a print will format into a temporary, in source order, before any output
+/// is produced, so argument side effects and reads never interleave with the bytes written.
+/// Values that are constants or this frame's own variables are left in place.
+pub(super) fn snapshot_fmt_chunk_values_be<B: LowerBackend>(
+    chunks: &mut [MirFmtChunk],
+    be: &mut B,
+) {
+    for ch in chunks.iter_mut() {
+        let Some(value) = fmt_chunk_value_mut(ch) else {
+            continue;
+        };
+        if expr_is_frame_stable(value) {
+            continue;
+        }
+        let ty = value.ty.clone();
+        let tmp = be.alloc_temp_be("fmt_arg", ty.clone());
+        let read = std::mem::replace(value, MirExpr::new(MirExprKind::Var(tmp), ty));
+        be.emit_stmt_be(MirStmt::Assign {
+            target: MirPlace::Var(tmp),
+            op: MirAssignOp::Assign,
+            value: read,
+        });
+    }
+}
+
 pub(super) fn fmt_chunk_static_max_bytes(ch: &MirFmtChunk, syms: &ModuleSymbols) -> Option<usize> {
     match ch {
         MirFmtChunk::Literal(s) => Some(s.len()),
@@ -4567,21 +4678,11 @@ pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
     }
 
     let sink_ptr_var = lower_user_sink_ptr_var_be(&args[0].value, be)?;
-    let chunks = lower_user_sink_chunks_be(&args[1].value, newline, be)?;
+    let mut chunks = lower_user_sink_chunks_be(&args[1].value, newline, be)?;
+    snapshot_fmt_chunk_values_be(&mut chunks, be);
     let scratch_cap = user_sink_scratch_cap(&chunks);
     let scratch = if scratch_cap > 0 {
-        let sv = be.alloc_temp_be(
-            "sink_fmt_buf",
-            MirType::Array {
-                elem: Box::new(MirType::U8),
-                len: scratch_cap,
-            },
-        );
-        let fmt_res_ty = MirType::Result {
-            ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
-            err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
-        };
-        let rv = be.alloc_temp_be("sink_fmt_res", fmt_res_ty);
+        let (sv, rv) = be.acquire_sink_fmt_scratch_be(scratch_cap);
         Some((sv, scratch_cap, rv))
     } else {
         None
@@ -4722,6 +4823,9 @@ pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
                         }
                         fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId {
                             self.inner.alloc_temp_be(prefix, ty)
+                        }
+                        fn acquire_sink_fmt_scratch_be(&mut self, cap: usize) -> (VarId, VarId) {
+                            self.inner.acquire_sink_fmt_scratch_be(cap)
                         }
                         fn emit_stmt_be(&mut self, stmt: MirStmt) {
                             self.stmts.push(stmt);

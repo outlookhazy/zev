@@ -31,6 +31,9 @@ pub(super) struct CoroutineLowerCtx<'a> {
     pub(super) loop_stack: Vec<LoopContext>,
     pub(super) shared_sink_fmt_buf: Option<(VarId, usize)>,
     pub(super) shared_sink_fmt_res: Option<VarId>,
+    /// Temporaries holding print arguments across a multi-write sink print, reused by every
+    /// print site in the coroutine (a site takes the first free one of each type it needs).
+    pub(super) shared_fmt_arg_temps: Vec<(MirType, Vec<VarId>)>,
 }
 
 impl<'a> CoroutineLowerCtx<'a> {
@@ -61,6 +64,7 @@ impl<'a> CoroutineLowerCtx<'a> {
             loop_stack: Vec::new(),
             shared_sink_fmt_buf: None,
             shared_sink_fmt_res: None,
+            shared_fmt_arg_temps: Vec::new(),
         }
     }
 
@@ -86,6 +90,54 @@ impl<'a> CoroutineLowerCtx<'a> {
             );
             self.shared_sink_fmt_buf = Some((vid, len));
             (vid, len)
+        }
+    }
+
+    /// Reads every value a multi-write sink print will format into a temporary, in source order,
+    /// before the first write. The writes yield, so a value read between them could come from a
+    /// later moment than the values already written. Values that cannot change while this
+    /// coroutine is suspended are left in place.
+    pub(super) fn snapshot_fmt_chunk_values(&mut self, chunks: &mut [MirFmtChunk]) {
+        let mut used: Vec<(MirType, usize)> = Vec::new();
+        for ch in chunks.iter_mut() {
+            let Some(value) = fmt_chunk_value_mut(ch) else {
+                continue;
+            };
+            if expr_is_frame_stable(value) {
+                continue;
+            }
+            let ty = value.ty.clone();
+            let nth = match used.iter_mut().find(|(t, _)| *t == ty) {
+                Some((_, n)) => {
+                    *n += 1;
+                    *n - 1
+                }
+                None => {
+                    used.push((ty.clone(), 1));
+                    0
+                }
+            };
+            let pool_idx = match self.shared_fmt_arg_temps.iter().position(|(t, _)| *t == ty) {
+                Some(i) => i,
+                None => {
+                    self.shared_fmt_arg_temps.push((ty.clone(), Vec::new()));
+                    self.shared_fmt_arg_temps.len() - 1
+                }
+            };
+            let tmp = match self.shared_fmt_arg_temps[pool_idx].1.get(nth) {
+                Some(&vid) => vid,
+                None => {
+                    let vid = self.alloc_temp("fmt_arg", ty.clone());
+                    self.shared_fmt_arg_temps[pool_idx].1.push(vid);
+                    vid
+                }
+            };
+            let read = std::mem::replace(value, MirExpr::new(MirExprKind::Var(tmp), ty));
+            self.cur_stmts.push(MirStmt::Assign {
+                target: MirPlace::Var(tmp),
+                op: MirAssignOp::Assign,
+                value: read,
+            });
         }
     }
 
@@ -266,6 +318,14 @@ impl<'a> CoroutineLowerCtx<'a> {
                             value: moved,
                         });
                     }
+                } else if !self.loop_stack.is_empty() {
+                    // Frame entry zeroes every local once. A declaration inside a loop body runs
+                    // again on each iteration and must start from zero each time.
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(vid),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(MirExprKind::ZeroValue, vty),
+                    });
                 }
             }
             StmtKind::StateVar { name, .. } => {
@@ -2376,6 +2436,8 @@ impl<'a> CoroutineLowerCtx<'a> {
         } else if let Some(total) = all_bounded_total {
             emit_coalesced_run(self, chunks, total);
         } else {
+            let mut chunks = chunks;
+            self.snapshot_fmt_chunk_values(&mut chunks);
             let scratch_cap = user_sink_scratch_cap(&chunks);
             let scratch = if scratch_cap > 0 {
                 let (sv, _) = self.acquire_sink_fmt_buf(scratch_cap);

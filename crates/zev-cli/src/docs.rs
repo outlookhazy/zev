@@ -216,7 +216,8 @@ Test the same commands deterministically across host (`zevc run --sanitize app.z
 - Compound: fat slices `[]u8` (`.len`, `buf[i]`, `buf[0..5]`), pointers `*i32 p` / `*u8`, arrays `[16]u8`
 - Defined Arithmetic & Conversions: integer `+`/`-`/`*` wrap in two's complement; constant shifts outside
   `0..bit_width` fail at compile time (`E0024`) while variable shifts mask by `(bit_width - 1)`; `/`/`%` by `0`
-  and out-of-bounds indexing/subslicing trap deterministically (`sys.set_fault_handler`); uninitialized locals zero-initialize.
+  and out-of-bounds indexing/subslicing trap deterministically (`sys.set_fault_handler`); uninitialized locals zero-initialize
+  (a declaration inside a loop body starts from zero on every iteration).
 - Lossless Integer Coercion & Destination-Typed Arithmetic: implicit integer conversions are strictly
   lossless (unsigned -> wider unsigned / strictly wider signed; signed -> wider signed; wire-endian
   `u16be`/`u32le`... <-> same-width native). Narrowing and signed<->unsigned require explicit `as`.
