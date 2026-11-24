@@ -16,7 +16,19 @@ doc:
 	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 P0013 P0014 P0015 P0016 P0017 P0018 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029 E0030 E0031 E0032 E0033 E0034; do \
 		$(ZEVC) doc $$q >/dev/null || exit 1; \
 	done
-	@echo "OK (zevc doc primer, 8 topics, and error explainers verified)"
+	@CARGO_BIN="$(CARGO)" python3 -c 'import os, shutil, subprocess, sys, tempfile; \
+fences = []; \
+[fences.extend((lambda ls: [(doc, idx + 1, "\n".join(ls[idx+1:end]) + "\n") if end != -1 else sys.exit(f"unclosed ```zev fence in {doc}:{idx+1}") for idx, ln in enumerate(ls) if ln.strip() == "```zev" for end in [next((j for j in range(idx + 1, len(ls)) if ls[j].strip() == "```"), -1)]])(open(doc).read().splitlines())) for doc in ("README.md", "DESIGN_V0.md")]; \
+td = tempfile.mkdtemp(prefix="zev-doc-fences-"); \
+cargo_bin = os.environ["CARGO_BIN"]; \
+(\
+  [(subprocess.run([cargo_bin, "run", "--quiet", "--bin", "zevc", "--", "check", "-I", ".", p]).returncode == 0 or sys.exit(f"markdown zev fence failed: {doc}:{st}")) \
+   for i, (doc, st, src) in enumerate(fences) \
+   for p in [os.path.join(td, f"f_{i}.zev")] \
+   if (open(p, "w").write(src if "fn main(" in src else src + "\nfn main() {}\n") or True)], \
+  shutil.rmtree(td, ignore_errors=True), \
+  print(f"OK (zevc doc primer, 8 topics, error explainers, and {len(fences)} markdown zev fences verified)")\
+)'
 
 check:
 	$(ZEVC) check examples/motor_controller.zev examples/motor_support.zev

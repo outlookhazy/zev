@@ -394,6 +394,7 @@ values or static scheduler-aware OS primitives at module scope and pass pointers
 | `signal s;` | Lightweight wakeup | `s.notify([boost: @prio])`, `s.try_wait() -> bool`, `s.clear()` | `s.wait([timeout: d])` |
 | `@dma_safe pool<T, K> p;` | Zero-copy `O(1)` slab (`K<=32`) | `p.try_alloc() -> Lease<T> error`, `p.avail()`, `p.in_use()` | `p.alloc([timeout: d]) -> Lease<T>` |
 | `dma_slot<T> s;` | Cross-IRQ `Lease<T>` slot | `s.park(l)`, `s.take() -> Lease<T> error`, `s.release([boost:])`, `s.addr()` | *(park across IRQ/DMA transfer)* |
+| `@dma_safe ping_pong<T, N> p;` | Circular `2 * N` DMA halves | `p.flip()`, `p.complete_half(h)`, `p.start()`, `p.stop()`, `p.release()`, `p.active_buf()`, `p.dma_buf()` | `p.wait_chunk([timeout: d]) -> []T` |
 | `wait_queue wq;` | Race-free waiter bitmask | `wq.wake_one([boost:]) -> bool`, `wq.wake_all([boost:])` | `wq.prepare_wait()` (`critical`) + `wq.commit_wait([timeout:])` |
 
 Standard library `import std.sync as sync;` builds **`Semaphore`**, **`EventFlags`**, **`Latch`**, and
@@ -565,10 +566,11 @@ format-string parser, zero global handler registry):
 - `sys.pend_irq(u32 irq);` — Triggers software/NVIC interrupt `irq` (fires `isr` safely on host & Cortex-M).
 - `sys.fuzz_irqs(u32 seed, u32 mask);` — Host simulation hook injecting pseudo-random IRQ deliveries at
   scheduler critical-section boundaries to stress-test ISR/task race freedom (`0` runtime overhead on MCUs).
-- `sys.sleep_depth() -> u32` / `sys.wfi_count() -> u32` — Inspect current idle clamp (`1=LIGHT`, `2=DEEP`)
-  and sleep transitions. Note: Cortex-M `allow_sleep_deep` defaults `false`, and `SLEEPDEEP` (`SCB->SCR` bit 2)
-  is suppressed whenever DMA locks OR pending timer deadlines exist; RISC-V uses `wfi` when IRQs are attached
-  and zero deadlines block a polled clock.
+- `sys.sleep_depth() -> u32` / `sys.wfi_count() -> u32` / `sys.trace_sleep(bool on)` — Inspect current
+  idle clamp (`1=LIGHT`, `2=DEEP`) and sleep transitions (`trace_sleep` is a zero-overhead compatibility
+  diagnostic flag alongside `sys.set_idle`). Note: Cortex-M `allow_sleep_deep` defaults `false`, and
+  `SLEEPDEEP` (`SCB->SCR` bit 2) is suppressed whenever DMA locks OR pending timer deadlines exist;
+  RISC-V uses `wfi` when IRQs are attached and zero deadlines block a polled clock.
 - `sys.exit(i32 code);` — Diverging termination call (runs active LIFO `defer`s, then invokes `sys.set_exit` handler or target exit).
 
 ## 3. Typed `mmio` Register Blocks & Boot-Tree `irq.attach(...)` / `attach_shared(...)`
@@ -1137,5 +1139,51 @@ mod tests {
             }
         }
         assert!(checked >= 15, "expected at least 15 fenced zev snippets, found {checked}");
+    }
+
+    #[test]
+    fn all_cited_error_codes_in_docs_exist() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let design = std::fs::read_to_string(root.join("DESIGN_V0.md")).expect("read DESIGN_V0.md");
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+
+        let mut corpus: Vec<(String, String)> = vec![
+            ("README.md".to_string(), readme),
+            ("DESIGN_V0.md".to_string(), design),
+            ("PRIMER_DOC".to_string(), PRIMER_DOC.to_string()),
+        ];
+        for t in TOPIC_DOCS {
+            corpus.push((format!("zevc doc {}", t.name), t.body.to_string()));
+        }
+
+        let valid_codes: std::collections::BTreeSet<&str> =
+            ERROR_DOCS.iter().map(|e| e.code).collect();
+        let mut total_cited = 0usize;
+        for (doc_name, text) in &corpus {
+            let b = text.as_bytes();
+            let mut i = 0usize;
+            while i + 5 <= b.len() {
+                if (b[i] == b'E' || b[i] == b'P')
+                    && b[i + 1] == b'0'
+                    && b[i + 2].is_ascii_digit()
+                    && b[i + 3].is_ascii_digit()
+                    && b[i + 4].is_ascii_digit()
+                {
+                    let prev_ok = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+                    let next_ok =
+                        i + 5 == b.len() || !(b[i + 5].is_ascii_alphanumeric() || b[i + 5] == b'_');
+                    if prev_ok && next_ok {
+                        let code = &text[i..i + 5];
+                        assert!(
+                            valid_codes.contains(code),
+                            "documented error code `{code}` in {doc_name} does not exist in ERROR_DOCS"
+                        );
+                        total_cited += 1;
+                    }
+                }
+                i += 1;
+            }
+        }
+        assert!(total_cited >= 40, "expected at least 40 cited codes, found {total_cited}");
     }
 }
