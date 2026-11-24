@@ -2136,6 +2136,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     }
                 }
                 let joined = call_args.join(", ");
+                let non_null = self.next_tmp();
+                self.emit_line(format!(
+                    "{non_null} = icmp ne {} {}, null",
+                    fp_ptr.ty, fp_ptr.repr
+                ));
+                self.emit_bounds_check(&non_null, 5);
                 if env_mir.is_void() || ret_lty == "void" {
                     self.emit_line(format!("{call_kw} void {}({joined})", fp_ptr.repr));
                     return Ok(SsaVal::new("void", "0"));

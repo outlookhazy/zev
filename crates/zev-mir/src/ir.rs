@@ -1,6 +1,8 @@
 //! Core MIR data structures for coroutine state-machine tasks, yielding functions,
 //! OS primitives, hardware ISRs, and static frame layout.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::ram::RamReport;
 use zev_ast::Span;
 
@@ -1755,6 +1757,8 @@ pub struct MirModule {
     pub dual_specialized_fns: Vec<String>,
     pub monomorphized_instances: Vec<MonomorphizedMirItem>,
     pub indirect_call_sites: Vec<IndirectCallSiteMir>,
+    /// Canonical plain `fn(...)` candidate sets derived from lowered `FnAddr` sites.
+    pub plain_fnptr_candidates: BTreeMap<String, BTreeSet<String>>,
     /// Sorted list of enum names referenced by `MirFmtChunk::EnumName` (for on-demand `.rodata` variant-name tables).
     pub formatted_enums: Vec<String>,
     pub boot: MirBootSequence,

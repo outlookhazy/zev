@@ -8743,3 +8743,82 @@ fn item9_yielding_indirect_calls_noyield_fn_widening_context_and_e0012_cycles() 
         );
     }
 }
+
+#[test]
+fn pr28_item4_calls_plain_fnptr_rejected_type_based_without_yielding_fns() {
+    // Program contains ZERO yielding functions; calling through a plain `fn(...)` pointer must
+    // still be rejected by type at `noyield fn` assignments, `*void` casts, `sys.set_*` hooks,
+    // and `extern "C"` callbacks (independently of what candidates exist in the program).
+    for (label, src, expected_kind) in [
+        (
+            "assign_noyield_var",
+            r#"
+            fn fast(u32 x) -> u32 { return x + 1u32; }
+            fn helper(fn(u32) -> u32 p) -> u32 { return p(1u32); }
+            fn wrap() -> u32 { return helper(fast); }
+            fn main() { noyield fn() -> u32 _cb = wrap; }
+            "#,
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "assign_noyield_param",
+            r#"
+            fn fast(u32 x) -> u32 { return x + 1u32; }
+            fn helper(fn(u32) -> u32 p) -> u32 { return p(1u32); }
+            fn wrap() { u32 _x = helper(fast); }
+            fn takes_ny(noyield fn() cb) { cb(); }
+            fn main() { takes_ny(wrap); }
+            "#,
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "cast_to_void_ptr",
+            r#"
+            fn fast() {}
+            fn calls_p(fn() p) { p(); }
+            fn wrap() { calls_p(fast); }
+            fn main() { *void _raw = (wrap as *void); }
+            "#,
+            DiagnosticKind::YieldInNoYield,
+        ),
+        (
+            "sys_set_putc",
+            r#"
+            fn fast(u8 b) {}
+            fn helper(fn(u8) p, u8 b) { p(b); }
+            fn my_putc(u8 b) { helper(fast, b); }
+            fn main() { sys.set_putc(my_putc); }
+            "#,
+            DiagnosticKind::YieldingCallbackToExternC,
+        ),
+        (
+            "sys_set_fault_handler",
+            r#"
+            fn fast() {}
+            fn helper(fn() p) { p(); }
+            fn my_fault() { helper(fast); }
+            fn main() { sys.set_fault_handler(my_fault); }
+            "#,
+            DiagnosticKind::YieldingCallbackToExternC,
+        ),
+        (
+            "extern_c_callback",
+            r#"
+            extern "C" fn register_cb(noyield fn(u32) -> u32 cb);
+            fn fast(u32 x) -> u32 { return x; }
+            fn helper(fn(u32) -> u32 p, u32 x) -> u32 { return p(x); }
+            fn cb_fn(u32 x) -> u32 { return helper(fast, x); }
+            fn main() { register_cb(cb_fn); }
+            "#,
+            DiagnosticKind::YieldingCallbackToExternC,
+        ),
+    ] {
+        let p = zev_parser::parse_str(src).unwrap();
+        let res = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            res.diagnostics.iter().any(|d| d.kind == expected_kind),
+            "{label}: expected {expected_kind:?}, got {:?}",
+            res.diagnostics
+        );
+    }
+}

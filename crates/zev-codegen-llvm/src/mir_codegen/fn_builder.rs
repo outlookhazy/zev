@@ -3845,6 +3845,20 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         self.emit_hook_registration(HookKind::IrqRoute, args.first())?;
                         return self.emit_hook_registration(HookKind::IrqAck, args.get(1));
                     }
+                    "__check_nonnull_fnptr" => {
+                        if let Some(fp_expr) = args.first() {
+                            let fn_ptr_ty = self.ctx.spec.isa.fn_ptr_llvm_ty();
+                            let v = self.emit_expr(fp_expr)?;
+                            let fp_ptr = self.coerce(v, fn_ptr_ty, false);
+                            let non_null = self.next_tmp();
+                            self.emit_line(format!(
+                                "{non_null} = icmp ne {} {}, null",
+                                fp_ptr.ty, fp_ptr.repr
+                            ));
+                            self.emit_bounds_check(&non_null, 5);
+                        }
+                        return Ok(());
+                    }
                     "rom_call_void" => {
                         if args.len() >= 2 {
                             let sb = u32::try_from(self.ctx.eval_const_int(&args[1]).max(0))

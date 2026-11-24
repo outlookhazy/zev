@@ -2178,6 +2178,14 @@ mod tests {
                 "missing error[{expected_code}] in:\n{}",
                 fail.human
             );
+            if expected_code == "P0007" {
+                assert!(
+                    fail.human
+                        .contains("fn parse([]u8 buf) -> u16 error ParseErr"),
+                    "expected updated P0007 declaration syntax in help text:\n{}",
+                    fail.human
+                );
+            }
             assert!(
                 fail.human.contains(&format!("zevc doc {expected_code}")),
                 "missing doc cmd in:\n{}",
@@ -7738,5 +7746,350 @@ fn main() {
             "{}",
             q_res.exec.stdout
         );
+    }
+
+    #[test]
+    fn pr28_item3_bare_yielding_fn_inbox_post_send_watch_publish_guarded_set_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-pr28-item3-cands").unwrap();
+
+        // 1. Exact repro from PR #28 review (`inbox.post(slow)`).
+        let repro_src = r#"
+fn slow(u32 n) -> u32 {
+    delay(2ms);
+    return n + 1u32;
+}
+inbox<fn(u32) -> u32, 2> q;
+task t() {
+    fn(u32) -> u32 p = q.recv();
+    println(f"r={p(4u32)}");
+    sys.exit(0);
+}
+fn main() {
+    q.post(slow);
+    spawn t() @normal;
+}
+"#;
+        let repro_path = temp.dir.join("repro.zev");
+        std::fs::write(&repro_path, repro_src).unwrap();
+
+        let repro_check = execute_check_command(
+            std::slice::from_ref(&repro_path),
+            &[],
+            Some("lm3s6965_evb"),
+            None,
+            true,
+        );
+        assert_eq!(repro_check.exit_code, ExitCode::SUCCESS);
+        let repro_json = repro_check.stdout.expect("repro check json");
+        assert!(
+            repro_json.contains("\"candidates\": [\"slow\"]")
+                && !repro_json.contains("\"candidates\": []"),
+            "expected slow in check json candidates:\n{repro_json}"
+        );
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, repro_h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&repro_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let repro_h_ll =
+            zev_codegen_llvm::emit_llvm_ir_with_options(&repro_h_mir, &host_opts).unwrap();
+        let (repro_h_code, repro_h_out) =
+            runner::compile_and_run_host_llvm_output(&repro_h_ll, true, &[]).unwrap();
+        assert_eq!(repro_h_code, 0, "host repro failed:\n{repro_h_out}");
+        assert!(repro_h_out.contains("r=5"), "host repro:\n{repro_h_out}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, repro_q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&repro_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let repro_q_res = zev_codegen_llvm::run_qemu_cortex_m(
+            &repro_q_mir,
+            &temp.dir.join("repro_qemu.elf"),
+            &qemu_opts,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            repro_q_res.exec.exit_code, 0,
+            "qemu repro failed:\n{}",
+            repro_q_res.exec.stdout
+        );
+        assert!(
+            repro_q_res.exec.stdout.contains("r=5"),
+            "qemu repro:\n{}",
+            repro_q_res.exec.stdout
+        );
+
+        // 2. All four bare-function primitive sites: `inbox.post`, `inbox.send`, `watch.publish`, `guarded.set`.
+        let all_four_src = r#"
+fn dummy_init(u32 n) -> u32 {
+    return n;
+}
+fn y_post(u32 n) -> u32 {
+    delay(2ms);
+    return n + 10u32;
+}
+fn y_send(u32 n) -> u32 {
+    delay(2ms);
+    return n + 20u32;
+}
+fn y_watch(u32 n) -> u32 {
+    delay(2ms);
+    return n + 30u32;
+}
+fn y_guard(u32 n) -> u32 {
+    delay(2ms);
+    return n + 40u32;
+}
+
+inbox<fn(u32) -> u32, 2> q_post;
+inbox<fn(u32) -> u32, 2> q_send;
+watch<fn(u32) -> u32> w_cb = dummy_init;
+guarded<fn(u32) -> u32> g_cb = dummy_init;
+signal published;
+
+task sender() {
+    q_send.send(y_send);
+    published.wait();
+    loop { delay(20ms); }
+}
+
+task consumer() {
+    fn(u32) -> u32 f_post = q_post.recv();
+    fn(u32) -> u32 f_send = q_send.recv();
+    w_cb.publish(y_watch);
+    critical {
+        g_cb.set(y_guard);
+    }
+    published.notify();
+    fn(u32) -> u32 f_watch = w_cb.read();
+    fn(u32) -> u32 f_guard = g_cb.get();
+    u32 a = f_post(1u32);
+    u32 b = f_send(2u32);
+    u32 c = f_watch(3u32);
+    u32 d = f_guard(4u32);
+    println(f"ALL4={a},{b},{c},{d}");
+    assert(a == 11u32 && b == 22u32 && c == 33u32 && d == 44u32);
+    println("PR28_BARE_YIELDING_FN_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    q_post.post(y_post);
+    spawn sender() @normal;
+    spawn consumer() @normal;
+}
+"#;
+        let all4_path = temp.dir.join("all4.zev");
+        std::fs::write(&all4_path, all_four_src).unwrap();
+
+        let all4_check = execute_check_command(
+            std::slice::from_ref(&all4_path),
+            &[],
+            Some("lm3s6965_evb"),
+            None,
+            true,
+        );
+        assert_eq!(all4_check.exit_code, ExitCode::SUCCESS);
+        let all4_json = all4_check.stdout.expect("all4 check json");
+        for sym in ["y_post", "y_send", "y_watch", "y_guard"] {
+            assert!(
+                all4_json.contains(sym),
+                "missing `{sym}` in all4 check json:\n{all4_json}"
+            );
+        }
+
+        let (_, all4_h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&all4_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let all4_h_ll =
+            zev_codegen_llvm::emit_llvm_ir_with_options(&all4_h_mir, &host_opts).unwrap();
+        let (all4_h_code, all4_h_out) =
+            runner::compile_and_run_host_llvm_output(&all4_h_ll, true, &[]).unwrap();
+        assert_eq!(all4_h_code, 0, "host all4 failed:\n{all4_h_out}");
+        assert!(all4_h_out.contains("ALL4=11,22,33,44"), "{all4_h_out}");
+        assert!(
+            all4_h_out.contains("PR28_BARE_YIELDING_FN_OK"),
+            "{all4_h_out}"
+        );
+
+        let (_, all4_q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&all4_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let all4_q_res = zev_codegen_llvm::run_qemu_cortex_m(
+            &all4_q_mir,
+            &temp.dir.join("all4_qemu.elf"),
+            &qemu_opts,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            all4_q_res.exec.exit_code, 0,
+            "qemu all4 failed:\n{}",
+            all4_q_res.exec.stdout
+        );
+        assert!(
+            all4_q_res.exec.stdout.contains("ALL4=11,22,33,44"),
+            "{}",
+            all4_q_res.exec.stdout
+        );
+        assert!(
+            all4_q_res.exec.stdout.contains("PR28_BARE_YIELDING_FN_OK"),
+            "{}",
+            all4_q_res.exec.stdout
+        );
+    }
+
+    #[test]
+    fn pr28_item5_null_fnptr_trap_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-pr28-null-fnptr").unwrap();
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+
+        let cases = [
+            (
+                "zero_cands_plain",
+                r#"
+fn main() {
+    fn() p;
+    p();
+}
+"#,
+            ),
+            (
+                "noyield_fnptr",
+                r#"
+fn main() {
+    noyield fn(u32) -> u32 p;
+    u32 _v = p(1u32);
+}
+"#,
+            ),
+            (
+                "yielding_only_cands",
+                r#"
+fn slow(u32 x) -> u32 {
+    delay(2ms);
+    return x + 1u32;
+}
+watch<bool> sel = false;
+task caller() {
+    fn(u32) -> u32 p;
+    if (sel.read()) {
+        p = slow;
+    }
+    u32 _v = p(2u32);
+    sys.exit(0);
+}
+fn main() {
+    spawn caller() @normal;
+}
+"#,
+            ),
+            (
+                "mixed_cands",
+                r#"
+fn slow(u32 x) -> u32 {
+    delay(2ms);
+    return x + 1u32;
+}
+fn fast(u32 x) -> u32 {
+    return x + 2u32;
+}
+watch<u8> mode = 0u8;
+task caller() {
+    fn(u32) -> u32 p;
+    if (mode.read() == 1u8) {
+        p = slow;
+    } else if (mode.read() == 2u8) {
+        p = fast;
+    }
+    u32 _v = p(3u32);
+    sys.exit(0);
+}
+fn main() {
+    spawn caller() @normal;
+}
+"#,
+            ),
+        ];
+
+        for (tag, src) in cases {
+            let p = temp.dir.join(format!("{tag}.zev"));
+            std::fs::write(&p, src).unwrap();
+
+            let (_, h_mir) = compile_to_mir_with_target(
+                std::slice::from_ref(&p),
+                &[],
+                host_opts.hal_dir.as_deref(),
+                host_opts.board_module.as_deref(),
+                h_bits,
+                &h_name,
+            )
+            .unwrap();
+            let h_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&h_mir, &host_opts).unwrap();
+            let (h_code, h_out) =
+                runner::compile_and_run_host_llvm_output(&h_ll, true, &[]).unwrap();
+            assert_eq!(h_code, 101, "host {tag} expected exit 101, got:\n{h_out}");
+            assert!(
+                h_out.contains("[PANIC] null function pointer"),
+                "host {tag} missing panic banner:\n{h_out}"
+            );
+
+            let (_, q_mir) = compile_to_mir_with_target(
+                std::slice::from_ref(&p),
+                &[],
+                qemu_opts.hal_dir.as_deref(),
+                qemu_opts.board_module.as_deref(),
+                q_bits,
+                &q_name,
+            )
+            .unwrap();
+            let q_res = zev_codegen_llvm::run_qemu_cortex_m(
+                &q_mir,
+                &temp.dir.join(format!("{tag}_qemu.elf")),
+                &qemu_opts,
+                &zev_codegen_llvm::QemuRunOptions::default(),
+            )
+            .unwrap();
+            assert_ne!(
+                q_res.exec.exit_code, 0,
+                "qemu {tag} expected non-zero exit:\n{}",
+                q_res.exec.stdout
+            );
+            assert!(
+                q_res.exec.stdout.contains("[PANIC] null function pointer"),
+                "qemu {tag} missing panic banner:\n{}",
+                q_res.exec.stdout
+            );
+        }
     }
 }

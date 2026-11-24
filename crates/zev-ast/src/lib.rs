@@ -746,7 +746,7 @@ pub struct GlobalVarDecl {
 /// Function declaration or `extern "C"` prototype.
 ///
 /// Supports both `fn main() { ... }` and explicit return-first syntax
-/// `u16 parse_setpoint([]u8 buf) error ParseErr { ... }`, as well as
+/// `fn parse_setpoint([]u8 buf) -> u16 error ParseErr { ... }`, as well as
 /// `extern "C" fn ...;` / `extern "C" RetType name(...);`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FnDecl {

@@ -765,7 +765,7 @@ mod tests {
             "!u16 read_reg() { return 0; }",
             "P0007",
             "errors",
-            "error ParseErr",
+            "fn parse([]u8 buf) -> u16 error ParseErr",
         );
         assert_trap(
             "ParseErr!u16 read_reg() { return 0; }",

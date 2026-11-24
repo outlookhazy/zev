@@ -291,10 +291,15 @@ pub(super) fn infer_effects_and_specializations(
     let mut soft_in_coro = BTreeSet::new();
     let mut soft_in_noyield = BTreeSet::new();
 
-    // Soft-yielding functions coerced to `noyield fn(...)` (or `*void` / bare) invoke their
-    // non-yielding clone (`__noyield`); those assigned directly to plain `fn(...)` invoke their
-    // coroutine step function (`@__syn_fn_step_*`).
-    for fname in fp_scan.noyield_fnptr_candidates.values().flatten() {
+    // Soft-yielding functions coerced to `noyield fn(...)` (or `*void`) invoke their
+    // non-yielding clone (`__noyield`); those in plain `fn(...)` or unknown contexts conservatively
+    // populate plain candidates and also prepare `__noyield` clones in case lowering narrows.
+    for fname in fp_scan
+        .noyield_fnptr_candidates
+        .values()
+        .flatten()
+        .chain(fp_scan.unknown_ctx_fnptr_candidates.iter())
+    {
         if syms
             .fns
             .get(fname)
@@ -388,6 +393,7 @@ pub(super) fn infer_effects_and_specializations(
 struct FnPtrAstScanAcc {
     plain_direct_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
     noyield_fnptr_candidates: HashMap<MirFnPtrSigKey, BTreeSet<String>>,
+    unknown_ctx_fnptr_candidates: BTreeSet<String>,
     sig_has_noyield_widening: HashSet<MirFnPtrSigKey>,
     raw_indirect_call_sites: Vec<(String, Span, MirFnPtrSigKey, String, bool)>,
     plain_indirect_call_edges: Vec<(String, MirFnPtrSigKey, bool, bool)>,
@@ -413,6 +419,7 @@ impl<'a> FnPtrAstScanner<'a> {
             acc: FnPtrAstScanAcc {
                 plain_direct_candidates: HashMap::new(),
                 noyield_fnptr_candidates: HashMap::new(),
+                unknown_ctx_fnptr_candidates: BTreeSet::new(),
                 sig_has_noyield_widening: HashSet::new(),
                 raw_indirect_call_sites: Vec::new(),
                 plain_indirect_call_edges: Vec::new(),
@@ -815,24 +822,43 @@ impl<'a> FnPtrAstScanner<'a> {
             if let Some(fn_sig) = self.syms.fns.get(fname) {
                 let sig_key =
                     canonical_mir_fnptr_sig(&fn_sig.params, &fn_sig.ret_ty, &fn_sig.error_spec);
-                if matches!(
-                    expected,
+                match expected {
                     Some(MirType::FnPtr {
-                        is_noyield: false,
-                        ..
-                    })
-                ) {
-                    self.acc
-                        .plain_direct_candidates
-                        .entry(sig_key)
-                        .or_default()
-                        .insert(fname.to_string());
-                } else {
-                    self.acc
-                        .noyield_fnptr_candidates
-                        .entry(sig_key)
-                        .or_default()
-                        .insert(fname.to_string());
+                        is_noyield: true, ..
+                    }) => {
+                        self.acc
+                            .noyield_fnptr_candidates
+                            .entry(sig_key)
+                            .or_default()
+                            .insert(fname.to_string());
+                    }
+                    Some(MirType::Ptr(inner)) if inner.is_void() => {
+                        self.acc
+                            .noyield_fnptr_candidates
+                            .entry(sig_key)
+                            .or_default()
+                            .insert(fname.to_string());
+                    }
+                    Some(MirType::FnPtr {
+                        is_noyield: false, ..
+                    }) => {
+                        self.acc
+                            .plain_direct_candidates
+                            .entry(sig_key)
+                            .or_default()
+                            .insert(fname.to_string());
+                    }
+                    _ => {
+                        // Conservative default for unknown context: treat as plain `fn(...)`, never `noyield`.
+                        self.acc
+                            .plain_direct_candidates
+                            .entry(sig_key)
+                            .or_default()
+                            .insert(fname.to_string());
+                        self.acc
+                            .unknown_ctx_fnptr_candidates
+                            .insert(fname.to_string());
+                    }
                 }
             }
             return;

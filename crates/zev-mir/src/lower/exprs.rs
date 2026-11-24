@@ -108,6 +108,37 @@ pub(super) fn resolve_irq_token_be<B: LowerBackend>(expr: &Expr, be: &B) -> Opti
     }
 }
 
+pub(super) fn lower_fn_addr_expr(
+    fn_name: &str,
+    sig: &FnSig,
+    expected: Option<&MirType>,
+    syms: &ModuleSymbols,
+) -> MirExpr {
+    let is_noyield_target = match expected {
+        Some(MirType::FnPtr { is_noyield, .. }) => *is_noyield,
+        Some(MirType::Ptr(inner)) if inner.is_void() => true,
+        _ => sig.is_extern_c,
+    };
+    let sig_key = canonical_mir_fnptr_sig(&sig.params, &sig.ret_ty, &sig.error_spec);
+    if is_noyield_target {
+        syms.record_lowered_noyield_candidate(sig_key, fn_name.to_string());
+    } else {
+        syms.record_lowered_plain_candidate(sig_key, fn_name.to_string());
+    }
+    let target = if sig.effect == MirFnEffect::SoftYielding && is_noyield_target {
+        format!("{fn_name}__noyield")
+    } else {
+        fn_name.to_string()
+    };
+    let out_ty = expected.cloned().unwrap_or_else(|| MirType::FnPtr {
+        is_noyield: is_noyield_target,
+        params: sig.params.clone(),
+        ret: Box::new(sig.ret_ty.clone()),
+        error_spec: Box::new(sig.error_spec.clone()),
+    });
+    MirExpr::new(MirExprKind::FnAddr(target), out_ty)
+}
+
 pub(super) fn lookup_mmio_reg<'s>(
     syms: &'s ModuleSymbols,
     layout_name: &str,
@@ -1006,13 +1037,18 @@ pub(super) fn coerce_expr_be<B: LowerBackend>(
     }
     if let (
         MirType::FnPtr {
-            is_noyield: true, ..
+            is_noyield: true,
+            params,
+            ret,
+            error_spec,
         },
         MirType::FnPtr {
             is_noyield: false, ..
         },
     ) = (&expr.ty, target_ty)
     {
+        be.syms()
+            .record_lowered_noyield_widening(canonical_mir_fnptr_sig(params, ret, error_spec));
         return MirExpr::new(expr.kind, target_ty.clone());
     }
     match (&expr.ty, target_ty) {
@@ -1450,22 +1486,7 @@ pub(super) fn lower_leaf_expr(
                 ));
             }
             if let Some(sig) = syms.fns.get(&id.name) {
-                let is_noyield_target = match expected {
-                    Some(MirType::FnPtr { is_noyield, .. }) => *is_noyield,
-                    _ => true,
-                };
-                let target = if sig.effect == MirFnEffect::SoftYielding && is_noyield_target {
-                    format!("{}__noyield", id.name)
-                } else {
-                    id.name.clone()
-                };
-                let out_ty = expected.cloned().unwrap_or_else(|| MirType::FnPtr {
-                    is_noyield: is_noyield_target,
-                    params: sig.params.clone(),
-                    ret: Box::new(sig.ret_ty.clone()),
-                    error_spec: Box::new(sig.error_spec.clone()),
-                });
-                return Ok(MirExpr::new(MirExprKind::FnAddr(target), out_ty));
+                return Ok(lower_fn_addr_expr(&id.name, sig, expected, syms));
             }
             Err(MirLowerError {
                 message: format!("unresolved identifier `{}`", id.name),
@@ -1510,23 +1531,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                         ));
                     }
                     if let Some(sig) = be.syms().fns.get(&id.name) {
-                        let is_noyield_target = match expected {
-                            Some(MirType::FnPtr { is_noyield, .. }) => *is_noyield,
-                            _ => true,
-                        };
-                        let target = if sig.effect == MirFnEffect::SoftYielding && is_noyield_target
-                        {
-                            format!("{}__noyield", id.name)
-                        } else {
-                            id.name.clone()
-                        };
-                        let out_ty = expected.cloned().unwrap_or_else(|| MirType::FnPtr {
-                            is_noyield: is_noyield_target,
-                            params: sig.params.clone(),
-                            ret: Box::new(sig.ret_ty.clone()),
-                            error_spec: Box::new(sig.error_spec.clone()),
-                        });
-                        return Ok(MirExpr::new(MirExprKind::FnAddr(target), out_ty));
+                        return Ok(lower_fn_addr_expr(&id.name, sig, expected, be.syms()));
                     }
                 }
             } else if let Some(inst_name) =

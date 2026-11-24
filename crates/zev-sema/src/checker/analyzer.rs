@@ -3076,6 +3076,29 @@ impl Analyzer {
                             .with_file(cb_file)
                             .with_note(note),
                     );
+                } else if cb_node.calls_plain_fnptr {
+                    let cb_file = self.node_files.get(&site.callback_fn).cloned();
+                    let msg = if site.extern_fn == "sys.set_putc" {
+                        format!(
+                            "cannot pass '{}' to 'sys.set_putc' because it invokes a plain function pointer",
+                            site.callback_fn
+                        )
+                    } else if is_sys_hook {
+                        format!(
+                            "cannot pass '{}' to '{}' because it invokes a plain function pointer",
+                            site.callback_fn, site.extern_fn
+                        )
+                    } else {
+                        format!(
+                            "cannot pass '{}' as callback to extern \"C\" function '{}' because it invokes a plain function pointer",
+                            site.callback_fn, site.extern_fn
+                        )
+                    };
+                    self.emit(
+                        Diagnostic::new(DiagnosticKind::YieldingCallbackToExternC, site.span, msg)
+                            .with_file(cb_file)
+                            .with_note("plain `fn(...)` pointers may invoke yielding functions; use `noyield fn(...)` instead"),
+                    );
                 }
                 if cb_node.spawns_in_boot {
                     let cb_file = self.node_files.get(&site.callback_fn).cloned();
@@ -3142,34 +3165,48 @@ impl Analyzer {
                 continue;
             };
             if is_noyield_target {
-                match node.effect {
-                    FnEffect::HardBlocking => {
-                        let disp = self
-                            .display_names
-                            .get(&site.fn_name)
-                            .cloned()
-                            .unwrap_or_else(|| site.fn_name.clone());
-                        let chain = self
-                            .call_graph
-                            .shortest_hard_yield_chain(&site.fn_name)
-                            .join(" -> ");
-                        self.emit(
-                            Diagnostic::new(
-                                DiagnosticKind::YieldInNoYield,
-                                site.span,
-                                format!(
-                                    "cannot assign hard-blocking function '{}' to 'noyield fn' pointer",
-                                    disp
-                                ),
-                            )
-                            .with_file(site.file.clone())
-                            .with_note(format!("shortest blocking chain: {}", chain)),
-                        );
-                    }
-                    FnEffect::SoftYielding => {
-                        soft_noyield_targets.insert(site.fn_name.clone());
-                    }
-                    FnEffect::NonYielding => {}
+                if node.effect == FnEffect::HardBlocking {
+                    let disp = self
+                        .display_names
+                        .get(&site.fn_name)
+                        .cloned()
+                        .unwrap_or_else(|| site.fn_name.clone());
+                    let chain = self
+                        .call_graph
+                        .shortest_hard_yield_chain(&site.fn_name)
+                        .join(" -> ");
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            site.span,
+                            format!(
+                                "cannot assign hard-blocking function '{}' to 'noyield fn' pointer",
+                                disp
+                            ),
+                        )
+                        .with_file(site.file.clone())
+                        .with_note(format!("shortest blocking chain: {}", chain)),
+                    );
+                } else if node.calls_plain_fnptr {
+                    let disp = self
+                        .display_names
+                        .get(&site.fn_name)
+                        .cloned()
+                        .unwrap_or_else(|| site.fn_name.clone());
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::YieldInNoYield,
+                            site.span,
+                            format!(
+                                "cannot assign '{}' to 'noyield fn' pointer because it invokes a plain function pointer",
+                                disp
+                            ),
+                        )
+                        .with_file(site.file.clone())
+                        .with_note("plain `fn(...)` pointers may target hard-blocking functions; use `noyield fn(...)` instead"),
+                    );
+                } else if node.effect == FnEffect::SoftYielding {
+                    soft_noyield_targets.insert(site.fn_name.clone());
                 }
             } else if node.effect == FnEffect::SoftYielding {
                 soft_coro_targets.insert(site.fn_name.clone());

@@ -672,7 +672,7 @@ impl<'a> Parser<'a> {
         .with_code("P0007")
         .with_doc_topic("errors")
         .with_hint(
-            "declare fallible functions with `u16 parse([]u8 buf) error ParseErr { ... }`, fail via `error BadCrc;` (or `error;` / `error Timeout, count;`), and handle with `catch (ParseErr err) { ... }` or `or fallback`",
+            "declare fallible functions with `fn parse([]u8 buf) -> u16 error ParseErr { ... }`, fail via `error BadCrc;` (or `error;` / `error Timeout, count;`), and handle with `catch (ParseErr err) { ... }` or `or fallback`",
         )
     }
 

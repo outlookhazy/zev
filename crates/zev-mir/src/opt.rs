@@ -5415,6 +5415,9 @@ pub fn prune_unreachable_functions(module: &mut MirModule) {
         site.yielding_candidates.retain(|c| reachable.contains(c));
         true
     });
+    for cands in module.plain_fnptr_candidates.values_mut() {
+        cands.retain(|c| reachable.contains(c) || extern_names.contains(c.as_str()));
+    }
     if module.boot.from_main_entry {
         prune_unused_imported_globals(module);
     }
@@ -5447,6 +5450,7 @@ mod tests {
             dual_specialized_fns: vec![],
             monomorphized_instances: vec![],
             indirect_call_sites: vec![],
+            plain_fnptr_candidates: BTreeMap::new(),
             formatted_enums: vec![],
             boot: MirBootSequence {
                 present: true,

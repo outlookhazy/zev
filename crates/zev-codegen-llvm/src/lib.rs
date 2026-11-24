@@ -8783,4 +8783,86 @@ fn main() {{
             assert!(proof.worst_isr_stack_bytes >= hw_oh);
         }
     }
+
+    #[test]
+    fn pr28_item3_safety_net_rejects_missing_yielding_fn_addr_candidate_before_codegen() {
+        let src = r#"
+fn slow(u32 n) -> u32 {
+    delay(2ms);
+    return n + 1u32;
+}
+inbox<fn(u32) -> u32, 2> q;
+task t() {
+    fn(u32) -> u32 p = q.recv();
+    println(f"r={p(4u32)}");
+    sys.exit(0);
+}
+fn main() {
+    q.post(slow);
+    spawn t() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str_named(src, "pr28_safety.zev").expect("parse");
+        let opts = CodegenOptions::lm3s6965();
+        let spec = opts.effective_spec().expect("spec");
+        let aopts = zev_sema::AnalyzeOptions {
+            hal_dir: spec.hal_dir.clone(),
+            board_module: spec.board_module.clone(),
+            target_ptr_bits: spec.isa.ptr_bits(),
+            target_name: spec.chip_name.clone(),
+            ..zev_sema::AnalyzeOptions::default()
+        };
+        let (mono_progs, _) =
+            zev_sema::analyze_and_monomorphize_named_programs(&[(&prog, None)], &aopts)
+                .into_result()
+                .expect("sema");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower MIR");
+        assert!(zev_mir::verify_yielding_fn_addr_candidates(&mir).is_ok());
+        assert!(emit_llvm_ir_with_options(&mir, &opts).is_ok());
+
+        // Trip 1: remove `slow` from canonical plain_fnptr_candidates -> MIR safety net and LLVM codegen refuse.
+        let mut missing_plain = mir.clone();
+        missing_plain.plain_fnptr_candidates.clear();
+        let mir_err1 = zev_mir::verify_yielding_fn_addr_candidates(&missing_plain)
+            .expect_err("safety net must reject missing plain candidate");
+        assert!(
+            mir_err1.message.contains("internal compiler error")
+                && mir_err1.message.contains("slow"),
+            "unexpected safety net error: {}",
+            mir_err1.message
+        );
+        let cg_err1 = emit_llvm_ir_with_options(&missing_plain, &opts)
+            .expect_err("codegen must refuse to emit IR when safety net fails");
+        assert!(
+            cg_err1.to_string().contains("internal compiler error"),
+            "unexpected codegen error: {cg_err1}"
+        );
+
+        // Trip 2: remove `slow` from site yielding_candidates -> MIR safety net and LLVM codegen refuse.
+        let mut missing_site = mir;
+        assert!(!missing_site.indirect_call_sites.is_empty());
+        for s in &mut missing_site.indirect_call_sites {
+            s.yielding_candidates.clear();
+        }
+        assert!(zev_mir::verify_yielding_fn_addr_candidates(&missing_site).is_err());
+        let cg_err2 = emit_llvm_ir_with_options(&missing_site, &opts)
+            .expect_err("codegen must refuse missing indirect call site yielding candidate");
+        assert!(
+            cg_err2.to_string().contains("internal compiler error"),
+            "unexpected codegen error: {cg_err2}"
+        );
+
+        // Zero-cost check: programs without fn pointers emit neither @__syn_panic_fnptr nor case 5.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let demo_path = root.join("examples/portable_controller_demo.zev");
+        let pc_mir = compile_example_mir(&[demo_path]);
+        let pc_ll = emit_llvm_ir(&pc_mir).expect("emit portable_controller_demo");
+        assert!(
+            !pc_ll.contains("@__syn_panic_fnptr"),
+            "non-fnptr program should not emit @__syn_panic_fnptr"
+        );
+    }
 }

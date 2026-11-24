@@ -304,6 +304,8 @@ pub fn emit_llvm_ir_with_options(
     module: &MirModule,
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
+    zev_mir::verify_yielding_fn_addr_candidates(module)
+        .map_err(|e| CodegenError::new("internal", e.message))?;
     let spec = opts.effective_spec()?;
     let nvic = if spec.isa == CpuIsa::ArmCortexM {
         build_nvic_map(&module.irq_vectors, &spec)?

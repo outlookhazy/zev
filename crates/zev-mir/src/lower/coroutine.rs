@@ -3867,6 +3867,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 message: "internal error: missing yielding indirect call signature".to_string(),
                 span: expr.span,
             })?;
+        let sig_key = canonical_mir_fnptr_sig(&params, &ret, &error_spec);
 
         let fp_tmp = self.alloc_temp("ind_fp", fp_ty.clone());
         self.cur_stmts.push(MirStmt::Assign {
@@ -3911,6 +3912,13 @@ impl<'a> CoroutineLowerCtx<'a> {
             (Some(vid), Some(cdst))
         };
 
+        if !has_direct_fallback {
+            self.cur_stmts
+                .push(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                    method: "__check_nonnull_fnptr".to_string(),
+                    args: vec![MirExpr::new(MirExprKind::Var(fp_tmp), fp_ty.clone())],
+                }));
+        }
         let join_bb = self.alloc_bb();
         for (idx, cand) in yielding_cands.iter().enumerate() {
             let is_last = idx + 1 == yielding_cands.len();
@@ -3920,6 +3928,8 @@ impl<'a> CoroutineLowerCtx<'a> {
             } else {
                 let call_bb = self.alloc_bb();
                 let next_bb = self.alloc_bb();
+                self.syms
+                    .record_lowered_plain_candidate(sig_key.clone(), cand.clone());
                 let cond = MirExpr::new(
                     MirExprKind::Binary {
                         op: MirBinOp::Eq,

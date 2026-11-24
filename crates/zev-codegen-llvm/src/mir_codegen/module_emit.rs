@@ -85,6 +85,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
         uses_fmt: false,
         uses_fmt_float_sci: false,
         uses_fmt_pad: false,
+        uses_fnptr: !module.indirect_call_sites.is_empty(),
         uses_rv_irqs: false,
         uses_sys_tick: false,
         uses_clock_hook: false,
@@ -545,6 +546,8 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                     MirIntrinsicOp::SysOp { method, args } => {
                         if matches!(method.as_str(), "tick" | "tick_ms" | "tick_by") {
                             feat.uses_sys_tick = true;
+                        } else if method == "__check_nonnull_fnptr" {
+                            feat.uses_fnptr = true;
                         }
                         for a in args {
                             scan_expr(a, feat);
@@ -754,6 +757,27 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 }
             }
         }
+    }
+    if !feat.uses_fnptr
+        && (module
+            .isrs
+            .iter()
+            .any(|i| i.vars.iter().any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+            || module
+                .functions
+                .iter()
+                .any(|f| f.vars.iter().any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+            || module
+                .task_blueprints
+                .iter()
+                .any(|b| b.vars.iter().any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+            || module
+                .boot
+                .vars
+                .iter()
+                .any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+    {
+        feat.uses_fnptr = true;
     }
     feat
 }
