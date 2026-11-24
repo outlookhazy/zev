@@ -355,6 +355,153 @@ enum RamExecOutcome {
     CompileErr(String),
 }
 
+struct CheckExecOutcome {
+    exit_code: ExitCode,
+    stdout: Option<String>,
+    stderr: Option<String>,
+}
+
+fn execute_check_command(
+    files: &[PathBuf],
+    include_dirs: &[PathBuf],
+    board: Option<&str>,
+    chip: Option<&str>,
+    json: bool,
+) -> CheckExecOutcome {
+    let mut eff_includes = include_dirs.to_vec();
+    let (hal_dir, board_module): (Option<String>, Option<String>) =
+        if board.is_some() || chip.is_some() {
+            let manifest = match discover_manifest_for_inputs(files) {
+                Ok(m) => m,
+                Err(err) => {
+                    return CheckExecOutcome {
+                        exit_code: ExitCode::from(2),
+                        stdout: None,
+                        stderr: Some(format!("error: {err}")),
+                    };
+                }
+            };
+            let mdir = manifest.as_ref().map(|(d, _)| d.as_path());
+            let spec = match resolve_target_spec_for_inputs(files, mdir, chip, board) {
+                Ok(s) => s,
+                Err(err) => {
+                    return CheckExecOutcome {
+                        exit_code: ExitCode::from(2),
+                        stdout: None,
+                        stderr: Some(format!("error: {err}")),
+                    };
+                }
+            };
+            if let Some(ref root) = spec.root_dir {
+                if !eff_includes.contains(root) {
+                    eff_includes.push(root.clone());
+                }
+            }
+            (spec.hal_dir, spec.board_module)
+        } else {
+            (None, None)
+        };
+
+    let bundle = match load_and_check_detailed_with_includes_and_targets(
+        files,
+        &eff_includes,
+        hal_dir.as_deref(),
+        board_module.as_deref(),
+    ) {
+        Ok(b) => b,
+        Err(fail) => {
+            return if json {
+                CheckExecOutcome {
+                    exit_code: ExitCode::FAILURE,
+                    stdout: Some(render_check_json_err(&fail.json_diags)),
+                    stderr: None,
+                }
+            } else {
+                CheckExecOutcome {
+                    exit_code: ExitCode::FAILURE,
+                    stdout: None,
+                    stderr: Some(fail.human),
+                }
+            };
+        }
+    };
+
+    let mir = match zev_mir::lower_programs(&bundle.programs) {
+        Ok(m) => m,
+        Err(err) => {
+            return if json {
+                let diag = JsonDiag {
+                    code: None,
+                    file: files
+                        .first()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                    line: err.span.line as usize,
+                    col: err.span.col as usize,
+                    message: err.message.clone(),
+                    help: Some("inspect lowering rules in `zevc doc tasks`".to_string()),
+                    doc_cmd: "zevc doc tasks".to_string(),
+                };
+                CheckExecOutcome {
+                    exit_code: ExitCode::FAILURE,
+                    stdout: Some(render_check_json_err(&[diag])),
+                    stderr: None,
+                }
+            } else {
+                CheckExecOutcome {
+                    exit_code: ExitCode::FAILURE,
+                    stdout: None,
+                    stderr: Some(format!("error: {err}\n  = docs: run 'zevc doc tasks'")),
+                }
+            };
+        }
+    };
+
+    let verified_files = bundle.programs.len();
+    let dual_vec: Vec<String> = bundle.sema.dual_specialized_fns.iter().cloned().collect();
+    if json {
+        let task_runs: Vec<TaskRunSummary> = mir
+            .ram_report
+            .spawned_tasks
+            .iter()
+            .map(|t| TaskRunSummary {
+                slot_id: t.slot_id,
+                instance: t.instance_name.clone(),
+                blueprint: t.blueprint_name.clone(),
+                priority: t.priority.label().to_string(),
+                max_run_kind: t.max_run_kind.as_str().to_string(),
+                max_run_blocks: t.max_run_blocks,
+            })
+            .collect();
+        CheckExecOutcome {
+            exit_code: ExitCode::SUCCESS,
+            stdout: Some(render_check_json_ok_with_tasks(
+                verified_files,
+                bundle.sema.spawned_tasks.len(),
+                bundle.sema.primitives.len(),
+                bundle.sema.tick_period_us,
+                &dual_vec,
+                &bundle.sema.monomorphized_instances,
+                &task_runs,
+            )),
+            stderr: None,
+        }
+    } else {
+        CheckExecOutcome {
+            exit_code: ExitCode::SUCCESS,
+            stdout: Some(format_check_human_ok(
+                verified_files,
+                bundle.sema.spawned_tasks.len(),
+                bundle.sema.primitives.len(),
+                bundle.sema.tick_period_us,
+                &dual_vec,
+                &bundle.sema.monomorphized_instances,
+            )),
+            stderr: None,
+        }
+    }
+}
+
 fn discover_manifest_for_inputs(
     files: &[PathBuf],
 ) -> Result<Option<(PathBuf, zev_codegen_llvm::ProjectManifest)>, String> {
@@ -734,101 +881,20 @@ fn main() -> ExitCode {
             chip,
             json,
         } => {
-            let mut eff_includes = include_dirs.clone();
-            let (hal_dir, board_module): (Option<String>, Option<String>) =
-                if board.is_some() || chip.is_some() {
-                    let manifest = match discover_manifest_for_inputs(&files) {
-                        Ok(m) => m,
-                        Err(err) => {
-                            eprintln!("error: {err}");
-                            return ExitCode::from(2);
-                        }
-                    };
-                    let mdir = manifest.as_ref().map(|(d, _)| d.as_path());
-                    let spec = match resolve_target_spec_for_inputs(
-                        &files,
-                        mdir,
-                        chip.as_deref(),
-                        board.as_deref(),
-                    ) {
-                        Ok(s) => s,
-                        Err(err) => {
-                            eprintln!("error: {err}");
-                            return ExitCode::from(2);
-                        }
-                    };
-                    if let Some(ref root) = spec.root_dir {
-                        if !eff_includes.contains(root) {
-                            eff_includes.push(root.clone());
-                        }
-                    }
-                    (spec.hal_dir, spec.board_module)
-                } else {
-                    (None, None)
-                };
-            match load_and_check_detailed_with_includes_and_targets(
+            let outcome = execute_check_command(
                 &files,
-                &eff_includes,
-                hal_dir.as_deref(),
-                board_module.as_deref(),
-            ) {
-            Ok(bundle) => {
-                let verified_files = bundle.programs.len();
-                let dual_vec: Vec<String> =
-                    bundle.sema.dual_specialized_fns.iter().cloned().collect();
-                if json {
-                    let task_runs: Vec<TaskRunSummary> = zev_mir::lower_programs(&bundle.programs)
-                        .map(|mir| {
-                            mir.ram_report
-                                .spawned_tasks
-                                .iter()
-                                .map(|t| TaskRunSummary {
-                                    slot_id: t.slot_id,
-                                    instance: t.instance_name.clone(),
-                                    blueprint: t.blueprint_name.clone(),
-                                    priority: t.priority.label().to_string(),
-                                    max_run_kind: t.max_run_kind.as_str().to_string(),
-                                    max_run_blocks: t.max_run_blocks,
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    println!(
-                        "{}",
-                        render_check_json_ok_with_tasks(
-                            verified_files,
-                            bundle.sema.spawned_tasks.len(),
-                            bundle.sema.primitives.len(),
-                            bundle.sema.tick_period_us,
-                            &dual_vec,
-                            &bundle.sema.monomorphized_instances,
-                            &task_runs,
-                        )
-                    );
-                } else {
-                    println!(
-                        "{}",
-                        format_check_human_ok(
-                            verified_files,
-                            bundle.sema.spawned_tasks.len(),
-                            bundle.sema.primitives.len(),
-                            bundle.sema.tick_period_us,
-                            &dual_vec,
-                            &bundle.sema.monomorphized_instances,
-                        )
-                    );
-                }
-                ExitCode::SUCCESS
+                &include_dirs,
+                board.as_deref(),
+                chip.as_deref(),
+                json,
+            );
+            if let Some(out) = outcome.stdout {
+                println!("{out}");
             }
-            Err(fail) => {
-                if json {
-                    println!("{}", render_check_json_err(&fail.json_diags));
-                } else {
-                    eprintln!("{}", fail.human);
-                }
-                ExitCode::FAILURE
+            if let Some(err) = outcome.stderr {
+                eprintln!("{err}");
             }
-            }
+            outcome.exit_code
         }
         Command::Ram {
             files,
@@ -3525,5 +3591,49 @@ fn main() {
             !stdout_mt.contains("pulse t=8000000c"),
             "max_ticks=16 from 0x7ffffffc must stop before 0x8000000c, got stdout={stdout_mt}"
         );
+    }
+
+    #[test]
+    fn plain_check_runs_mir_lowering_and_surfaces_mir_errors() {
+        let temp = TempWorkDir::create("zevc-check-mir").unwrap();
+
+        // 1. Valid program passes plain `zevc check` (through both sema and MIR lowering).
+        let ok_path = temp.dir.join("ok.zev");
+        std::fs::write(
+            &ok_path,
+            "task idle() { loop every 5ms { checkpoint(); } }\nfn main() { spawn idle() @normal; }\n",
+        )
+        .unwrap();
+        let ok_res = execute_check_command(std::slice::from_ref(&ok_path), &[], None, None, false);
+        assert_eq!(ok_res.exit_code, ExitCode::SUCCESS);
+        let ok_out = ok_res.stdout.expect("stdout on ok check");
+        assert!(ok_out.contains("OK (1 file(s) verified"), "stdout={ok_out}");
+
+        // 2. Program that passes zev-sema but hits a MIR lowering error (`conditional .attach_shared`)
+        //    must fail in BOTH plain and `--json` modes of `zevc check`!
+        let conflict_irq = "\
+irq IRQ_A = 3;
+isr h1() {}
+isr h2() {}
+fn read_pin(bool sel) -> bool { return sel; }
+fn main() {
+    if (read_pin(true)) { IRQ_A.attach_shared(h1); }
+    if (read_pin(false)) { IRQ_A.attach_shared(h2); }
+}
+";
+        let err_path = temp.dir.join("conflict_irq.zev");
+        std::fs::write(&err_path, conflict_irq).unwrap();
+
+        let plain_res =
+            execute_check_command(std::slice::from_ref(&err_path), &[], None, None, false);
+        assert_eq!(plain_res.exit_code, ExitCode::FAILURE);
+        let err_text = plain_res.stderr.expect("plain check MIR error on stderr");
+        assert!(err_text.contains("MIR lowering error"), "stderr={err_text}");
+
+        let json_res =
+            execute_check_command(std::slice::from_ref(&err_path), &[], None, None, true);
+        assert_eq!(json_res.exit_code, ExitCode::FAILURE);
+        let json_out = json_res.stdout.expect("json check MIR error on stdout");
+        assert!(json_out.contains("attach_shared"), "json={json_out}");
     }
 }
