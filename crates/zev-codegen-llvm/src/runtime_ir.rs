@@ -691,12 +691,10 @@ declare i32 @putchar(i32) nounwind
 declare i32 @fflush(ptr) nounwind
 declare i32 @poll(ptr, i64, i32) nounwind
 declare i64 @read(i32, ptr, i64) nounwind
-declare i32 @isatty(i32) nounwind
 declare void @exit(i32) noreturn nounwind
 
 @__syn_sim_stdin_eof = internal global i8 0, align 1
 @__syn_sim_console_irq = internal global i32 -1, align 4
-@__syn_sim_stdin_is_tty = internal global i8 0, align 1
 
 define i32 @__zev_sim_poll_stdin(i32 %timeout_ms) nounwind{sz} {{
 entry:
@@ -720,7 +718,7 @@ chk_rev:
   %ok_in = icmp ne i16 %has_in, 0
   br i1 %ok_in, label %ret1, label %chk_hup
 chk_hup:
-  %has_hup = and i16 %rev, 24
+  %has_hup = and i16 %rev, 56
   %is_hup = icmp ne i16 %has_hup, 0
   br i1 %is_hup, label %set_eof, label %ret0
 set_eof:
@@ -741,10 +739,10 @@ do_read:
   %buf = alloca i8, align 1
   %n = call i64 @read(i32 0, ptr %buf, i64 1)
   %got1 = icmp eq i64 %n, 1
-  br i1 %got1, label %ret_byte, label %chk_zero
-chk_zero:
-  %is_zero = icmp eq i64 %n, 0
-  br i1 %is_zero, label %mark_eof, label %ret_neg
+  br i1 %got1, label %ret_byte, label %chk_eof
+chk_eof:
+  %le_zero = icmp sle i64 %n, 0
+  br i1 %le_zero, label %mark_eof, label %ret_neg
 mark_eof:
   store i8 1, ptr @__syn_sim_stdin_eof, align 1
   br label %ret_neg
@@ -759,10 +757,6 @@ ret_neg:
 define void @__zev_sim_enable_console(i32 %irq) nounwind{sz} {{
 entry:
   store i32 %irq, ptr @__syn_sim_console_irq, align 4
-  %tty = call i32 @isatty(i32 0)
-  %is_tty = icmp eq i32 %tty, 1
-  %tty8 = zext i1 %is_tty to i8
-  store i8 %tty8, ptr @__syn_sim_stdin_is_tty, align 1
   ret void
 }}
 
@@ -949,16 +943,6 @@ entry:
   %wc1 = add i32 %wc, 1
   store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
   %got_in = call i32 @__syn_host_poll_console(i32 1)
-  %no_in = icmp eq i32 %got_in, 0
-  br i1 %no_in, label %chk_eof, label %do_idle_hook
-chk_eof:
-  %eof_exit = call i1 @__syn_host_console_rx_idle_eof()
-  br i1 %eof_exit, label %do_eof_exit, label %do_idle_hook
-do_eof_exit:
-  %rf = call i32 @fflush(ptr null)
-  call void @__syn_platform_exit(i32 0)
-  unreachable
-do_idle_hook:
   call void @__syn_on_idle(i32 1, i32 %depth)
   store i32 0, ptr @__syn_host_spin_polls, align 4
   %t = load volatile i32, ptr @__syn_tick_ms, align 4
