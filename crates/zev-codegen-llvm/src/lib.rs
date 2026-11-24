@@ -18,19 +18,19 @@ use std::path::Path;
 pub use arm_cortex_m::NvicMap;
 pub use mir_codegen::emit_llvm_ir_with_options;
 pub use riscv32::RvIrqRoute;
-pub use stack_sizes::{HardwareStackProof, analyze_hardware_stack_high_water};
+pub use stack_sizes::{analyze_hardware_stack_high_water, HardwareStackProof};
 pub use target_spec::{CpuIsa, ImageFormat, IrqModel, ProjectManifest, TargetSpec};
 pub use toolchain::{
-    AvrImageResult, CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
-    Esp32C6ImageResult, MIN_LLVM_MAJOR, QemuExecOutput, QemuRunOptions, QemuRunResult,
-    Rp2040ImageResult, TargetArch, TargetBuildArtifact, build_target_image,
-    check_llvm_tool_version, compile_ll_to_elf, compile_ll_to_obj, find_tool,
+    build_target_image, check_llvm_tool_version, compile_ll_to_elf, compile_ll_to_obj, find_tool,
     flash_avr_nano_every_bin, flash_avr_uno_bin, flash_esp32c6_bin, flash_rp2040_uf2,
     flash_target_image, inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf,
     objcopy_elf_to_avr_bin, objcopy_elf_to_avr_nano_every_bin, objcopy_elf_to_esp32c6_bin,
     objcopy_elf_to_rp2040_uf2, optimize_ll_with_opt, pack_rp2040_uf2, pack_uf2,
     parse_llvm_major_version, require_llvm_tool, run_elf_in_qemu, synthesize_linker_script,
-    synthesize_target_linker_script, verify_ll_with_opt,
+    synthesize_target_linker_script, verify_ll_with_opt, AvrImageResult, CodegenError,
+    CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit, Esp32C6ImageResult,
+    QemuExecOutput, QemuRunOptions, QemuRunResult, Rp2040ImageResult, TargetArch,
+    TargetBuildArtifact, MIN_LLVM_MAJOR,
 };
 
 /// Legacy constant retained for external integration test compatibility (values now live in `chips/esp32c6.toml`).
@@ -224,10 +224,8 @@ mod tests {
                 .unwrap_or_else(|err| panic!("failed to parse {name}: {err:#?}"));
             named_progs.push((prog, name.as_str()));
         }
-        let pairs: Vec<(&zev_ast::Program, Option<&str>)> = named_progs
-            .iter()
-            .map(|(p, n)| (p, Some(*n)))
-            .collect();
+        let pairs: Vec<(&zev_ast::Program, Option<&str>)> =
+            named_progs.iter().map(|(p, n)| (p, Some(*n))).collect();
         let (mono_progs, _) = zev_sema::analyze_and_monomorphize_named_programs(
             &pairs,
             &zev_sema::AnalyzeOptions::default(),
@@ -259,7 +257,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("ESP32-C6 image build failed: {e}"));
 
         // 1. Verify LLVM 23 `opt -passes=verify` passes cleanly on the generated RISC-V `.ll`
-        verify_ll_with_opt(&img.elf.ll_path).expect("LLVM 23 opt -passes=verify on esp32c6_demo.ll");
+        verify_ll_with_opt(&img.elf.ll_path)
+            .expect("LLVM 23 opt -passes=verify on esp32c6_demo.ll");
 
         // 2. Verify ELF32 freestanding zero-heap compliance and compact Direct-Boot `.bin`
         assert!(img.elf.audit.is_zero_heap_freestanding());
@@ -277,11 +276,14 @@ mod tests {
 
         // 3. Inspect RISC-V disassembly via `llvm-objdump -d` to verify `@_start` at `0x42000008`
         //    and `.iram1` WS2812B waveform driver at `0x40800000`!
-        let objdump = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
-            .arg("-d")
-            .arg(&img.elf.elf_path)
-            .output()
-            .expect("invoke llvm-objdump");
+        let objdump = Command::new(crate::toolchain::find_tool(
+            "/bin/llvm-objdump",
+            "llvm-objdump",
+        ))
+        .arg("-d")
+        .arg(&img.elf.elf_path)
+        .output()
+        .expect("invoke llvm-objdump");
         assert!(objdump.status.success());
         let disasm = String::from_utf8_lossy(&objdump.stdout);
         println!(
@@ -346,7 +348,10 @@ mod tests {
 
         let total_elapsed = t0.elapsed();
         println!("ELF sizes:\n{}", res.build.sizes.raw_output);
-        println!("QEMU UART0 output ({:?}):\n{}", res.exec.elapsed, res.exec.stdout);
+        println!(
+            "QEMU UART0 output ({:?}):\n{}",
+            res.exec.elapsed, res.exec.stdout
+        );
 
         assert_eq!(
             res.exec.exit_code, 0,
@@ -363,16 +368,28 @@ mod tests {
         assert!(res.build.sizes.bss > 0);
 
         let out = &res.exec.stdout;
-        assert!(out.contains("[BOOT] Cortex-M3 Language-OS booted"), "out={out}");
+        assert!(
+            out.contains("[BOOT] Cortex-M3 Language-OS booted"),
+            "out={out}"
+        );
         assert!(out.contains("[TELEM] motor1_rpm=1800"), "out={out}");
-        assert!(!out.contains("[TELEM] pwm_duty=0\n"), "expected non-zero PI duty, out={out}");
-        assert!(out.contains("[TELEM] sleep_depth_dma_active=1"), "out={out}");
+        assert!(
+            !out.contains("[TELEM] pwm_duty=0\n"),
+            "expected non-zero PI duty, out={out}"
+        );
+        assert!(
+            out.contains("[TELEM] sleep_depth_dma_active=1"),
+            "out={out}"
+        );
         assert!(out.contains("[TELEM] bad_packets=1"), "out={out}");
         assert!(out.contains("[TELEM] sleep_depth_dma_idle=2"), "out={out}");
         assert!(out.contains("[TELEM] sup_boosted_prio=0"), "out={out}");
         assert!(out.contains("[TELEM] gpio_safe_off=0"), "out={out}");
         assert!(out.contains("[TELEM] sup_restored_prio=3"), "out={out}");
-        assert!(out.contains("[PASS] CORTEX-M3 BARE-METAL DEMO OK"), "out={out}");
+        assert!(
+            out.contains("[PASS] CORTEX-M3 BARE-METAL DEMO OK"),
+            "out={out}"
+        );
     }
 
     #[test]
@@ -384,8 +401,10 @@ mod tests {
         ]);
 
         let out_elf = test_out_dir().join("motor_controller.elf");
-        let mut opts = CodegenOptions::default();
-        opts.max_ticks = 8;
+        let opts = CodegenOptions {
+            max_ticks: 8,
+            ..Default::default()
+        };
 
         let res = run_qemu_cortex_m(&mir, &out_elf, &opts, &QemuRunOptions::default())
             .expect("motor_controller Cortex-M3 ELF build + QEMU run");
@@ -394,27 +413,24 @@ mod tests {
         assert!(res.build.audit.is_zero_heap_freestanding());
         assert!(res.build.sizes.text > 0);
         assert!(res.build.sizes.bss > 0);
-        assert!(
-            res.build
-                .audit
-                .defined_symbols
-                .iter()
-                .any(|s| s == "__syn_vec_irq_6")
-        );
-        assert!(
-            res.build
-                .audit
-                .defined_symbols
-                .iter()
-                .any(|s| s == "__syn_vec_irq_15")
-        );
-        assert!(
-            res.build
-                .audit
-                .defined_symbols
-                .iter()
-                .any(|s| s == "__syn_vec_irq_16")
-        );
+        assert!(res
+            .build
+            .audit
+            .defined_symbols
+            .iter()
+            .any(|s| s == "__syn_vec_irq_6"));
+        assert!(res
+            .build
+            .audit
+            .defined_symbols
+            .iter()
+            .any(|s| s == "__syn_vec_irq_15"));
+        assert!(res
+            .build
+            .audit
+            .defined_symbols
+            .iter()
+            .any(|s| s == "__syn_vec_irq_16"));
     }
 
     #[test]
@@ -422,8 +438,10 @@ mod tests {
         let demo_path = repo_root().join("examples/cortex_m_demo.zev");
         let mir = compile_example_mir(&[demo_path]);
 
-        let mut host_opts = CodegenOptions::default();
-        host_opts.target = TargetArch::HostX86_64Linux;
+        let host_opts = CodegenOptions {
+            target: TargetArch::HostX86_64Linux,
+            ..Default::default()
+        };
         let ll = emit_llvm_ir_with_options(&mir, &host_opts).expect("emit x86_64 LLVM IR");
 
         let dir = test_out_dir();
@@ -477,10 +495,26 @@ mod tests {
         .expect("run partial error test in QEMU");
 
         assert_eq!(res.exec.exit_code, 0);
-        assert!(res.exec.stdout.contains("partial=4"), "out={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("ok_val=30"), "out={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("recov=104"), "out={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("fallback=77"), "out={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("partial=4"),
+            "out={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("ok_val=30"),
+            "out={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("recov=104"),
+            "out={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("fallback=77"),
+            "out={}",
+            res.exec.stdout
+        );
     }
 
     #[test]
@@ -701,8 +735,10 @@ mod tests {
         zev_sema::analyze_program(&prog).expect("sema yielding struct catch test");
         let mir = zev_mir::lower_program(&prog).expect("mir yielding struct catch test");
 
-        let mut opts = CodegenOptions::default();
-        opts.max_ticks = 20;
+        let opts = CodegenOptions {
+            max_ticks: 20,
+            ..Default::default()
+        };
         let out_elf = test_out_dir().join("yielding_struct_catch.elf");
         let res = run_qemu_cortex_m(&mir, &out_elf, &opts, &QemuRunOptions::default())
             .expect("run yielding struct catch test in QEMU");
@@ -737,8 +773,10 @@ mod tests {
         zev_sema::analyze_program(&p1).expect("sema every test");
         let m1 = zev_mir::lower_program(&p1).expect("mir every test");
 
-        let mut opts1 = CodegenOptions::default();
-        opts1.max_ticks = 35;
+        let opts1 = CodegenOptions {
+            max_ticks: 35,
+            ..Default::default()
+        };
         let r1 = run_qemu_cortex_m(
             &m1,
             &test_out_dir().join("every_max_ticks.elf"),
@@ -747,8 +785,16 @@ mod tests {
         )
         .expect("run infinite every 10ms with max_ticks=35");
         assert_eq!(r1.exec.exit_code, 0);
-        assert!(r1.exec.stdout.contains("beat=1\n"), "out={}", r1.exec.stdout);
-        assert!(r1.exec.stdout.contains("beat=3\n"), "out={}", r1.exec.stdout);
+        assert!(
+            r1.exec.stdout.contains("beat=1\n"),
+            "out={}",
+            r1.exec.stdout
+        );
+        assert!(
+            r1.exec.stdout.contains("beat=3\n"),
+            "out={}",
+            r1.exec.stdout
+        );
 
         // 2. Tight CPU-busy `loop { checkpoint(); }` WITHOUT peer tasks or `sys.use_systick`
         let spin_src = r#"
@@ -767,8 +813,10 @@ mod tests {
         zev_sema::analyze_program(&p2).expect("sema spin test");
         let m2 = zev_mir::lower_program(&p2).expect("mir spin test");
 
-        let mut opts2 = CodegenOptions::default();
-        opts2.max_ticks = 10;
+        let opts2 = CodegenOptions {
+            max_ticks: 10,
+            ..Default::default()
+        };
         let r2 = run_qemu_cortex_m(
             &m2,
             &test_out_dir().join("spin_max_ticks.elf"),
@@ -777,7 +825,11 @@ mod tests {
         )
         .expect("run busy checkpoint spinner with max_ticks=10");
         assert_eq!(r2.exec.exit_code, 0);
-        assert!(r2.exec.stdout.contains("spin_start\n"), "out={}", r2.exec.stdout);
+        assert!(
+            r2.exec.stdout.contains("spin_start\n"),
+            "out={}",
+            r2.exec.stdout
+        );
     }
 
     #[test]
@@ -837,8 +889,16 @@ mod tests {
         .expect("run signal+chan test in QEMU");
 
         assert_eq!(res.exec.exit_code, 0);
-        assert!(res.exec.stdout.contains("chan_sum=66"), "out={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("sig_boosted_prio=0"), "out={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("chan_sum=66"),
+            "out={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("sig_boosted_prio=0"),
+            "out={}",
+            res.exec.stdout
+        );
     }
 
     #[test]
@@ -857,8 +917,16 @@ mod tests {
 
         assert_eq!(res.exec.exit_code, 0);
         assert!(res.build.audit.is_zero_heap_freestanding());
-        assert!(res.exec.stdout.contains("milestone=2 a=2400 b=1800"), "out={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("milestone=4 a=0 b=0"), "out={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("milestone=2 a=2400 b=1800"),
+            "out={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("milestone=4 a=0 b=0"),
+            "out={}",
+            res.exec.stdout
+        );
     }
 
     #[test]
@@ -870,8 +938,10 @@ mod tests {
         let mut cm3_text_by_level = std::collections::BTreeMap::new();
 
         for level in ["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz"] {
-            let mut opts = CodegenOptions::default();
-            opts.opt_level = level.to_string();
+            let opts = CodegenOptions {
+                opt_level: level.to_string(),
+                ..Default::default()
+            };
             let tag = level.trim_start_matches('-');
             let out_elf = dir.join(format!("cm3_{tag}.elf"));
             let res = run_qemu_cortex_m(&cm3_mir, &out_elf, &opts, &QemuRunOptions::default())
@@ -884,7 +954,9 @@ mod tests {
                 res.build.audit
             );
             assert!(
-                res.exec.stdout.contains("[PASS] CORTEX-M3 BARE-METAL DEMO OK"),
+                res.exec
+                    .stdout
+                    .contains("[PASS] CORTEX-M3 BARE-METAL DEMO OK"),
                 "missing PASS banner at {level}: {}",
                 res.exec.stdout
             );
@@ -1021,7 +1093,9 @@ mod tests {
             let sym_line = nm_txt
                 .lines()
                 .find(|l| l.split_whitespace().last() == Some("__syn_select_next_task"))
-                .unwrap_or_else(|| panic!("missing __syn_select_next_task symbol under {level}:\n{nm_txt}"));
+                .unwrap_or_else(|| {
+                    panic!("missing __syn_select_next_task symbol under {level}:\n{nm_txt}")
+                });
             let parts: Vec<&str> = sym_line.split_whitespace().collect();
             let sym_size = u64::from_str_radix(parts[1], 16)
                 .unwrap_or_else(|_| panic!("expected hex size in llvm-nm line: {sym_line}"));
@@ -1034,12 +1108,12 @@ mod tests {
             let scan_line = nm_txt
                 .lines()
                 .find(|l| l.split_whitespace().last() == Some("__syn_scan_rank"))
-                .unwrap_or_else(|| panic!("missing __syn_scan_rank symbol under {level}:\n{nm_txt}"));
-            let scan_addr = u64::from_str_radix(
-                scan_line.split_whitespace().next().unwrap_or("0"),
-                16,
-            )
-            .unwrap_or(0);
+                .unwrap_or_else(|| {
+                    panic!("missing __syn_scan_rank symbol under {level}:\n{nm_txt}")
+                });
+            let scan_addr =
+                u64::from_str_radix(scan_line.split_whitespace().next().unwrap_or("0"), 16)
+                    .unwrap_or(0);
             let scan_target = format!("0x{scan_addr:x}");
 
             let dis_out = Command::new(&objdump_bin)
@@ -1047,11 +1121,16 @@ mod tests {
                 .arg(&uno_elf)
                 .output()
                 .expect("run llvm-objdump on __syn_select_next_task");
-            assert!(dis_out.status.success(), "llvm-objdump failed under {level}");
+            assert!(
+                dis_out.status.success(),
+                "llvm-objdump failed under {level}"
+            );
             let dis_txt = String::from_utf8_lossy(&dis_out.stdout);
             let scan_calls = dis_txt
                 .lines()
-                .filter(|l| (l.contains("\tcall\t") || l.contains("\trcall\t")) && l.contains(&scan_target))
+                .filter(|l| {
+                    (l.contains("\tcall\t") || l.contains("\trcall\t")) && l.contains(&scan_target)
+                })
                 .count();
             assert_eq!(
                 scan_calls, 2,
@@ -1814,8 +1893,14 @@ mod tests {
             .iter()
             .map(|d| d.name.as_str())
             .collect();
-        assert!(dual_names.contains(&"compute_crc_soft"), "dual_names: {dual_names:?}");
-        assert!(dual_names.contains(&"mix_byte"), "dual_names: {dual_names:?}");
+        assert!(
+            dual_names.contains(&"compute_crc_soft"),
+            "dual_names: {dual_names:?}"
+        );
+        assert!(
+            dual_names.contains(&"mix_byte"),
+            "dual_names: {dual_names:?}"
+        );
 
         let table = mir.ram_report.format_table();
         assert!(
@@ -1829,8 +1914,10 @@ mod tests {
         let mut text_o0 = 0u64;
         let mut text_oz = 0u64;
         for level in ["-O0", "-O2", "-Oz"] {
-            let mut opts = CodegenOptions::default();
-            opts.opt_level = level.to_string();
+            let opts = CodegenOptions {
+                opt_level: level.to_string(),
+                ..Default::default()
+            };
             let tag = level.trim_start_matches('-');
             let out_elf = dir.join(format!("wave1_soft_spec_{tag}.elf"));
             let res = run_qemu_cortex_m(&mir, &out_elf, &opts, &QemuRunOptions::default())
@@ -1838,9 +1925,21 @@ mod tests {
             verify_ll_with_opt(&res.build.ll_path)
                 .unwrap_or_else(|e| panic!("opt verify failed at {level}: {e}"));
             assert!(res.build.audit.is_zero_heap_freestanding());
-            assert_eq!(res.exec.exit_code, 0, "failed at {level}: {}", res.exec.stdout);
-            assert!(res.exec.stdout.contains("coro_crc="), "out={}", res.exec.stdout);
-            assert!(res.exec.stdout.contains("noyield_crc="), "out={}", res.exec.stdout);
+            assert_eq!(
+                res.exec.exit_code, 0,
+                "failed at {level}: {}",
+                res.exec.stdout
+            );
+            assert!(
+                res.exec.stdout.contains("coro_crc="),
+                "out={}",
+                res.exec.stdout
+            );
+            assert!(
+                res.exec.stdout.contains("noyield_crc="),
+                "out={}",
+                res.exec.stdout
+            );
             if level == "-O0" {
                 text_o0 = res.build.sizes.text;
             }
@@ -1932,8 +2031,10 @@ mod tests {
         zev_sema::analyze_program(&prog).expect("sema restart boost restore");
         let mir = zev_mir::lower_program(&prog).expect("mir restart boost restore");
 
-        let mut opts = CodegenOptions::default();
-        opts.max_ticks = 100;
+        let opts = CodegenOptions {
+            max_ticks: 100,
+            ..Default::default()
+        };
         let out_elf = test_out_dir().join("wave1_restart_boost_seq.elf");
         let res = run_qemu_cortex_m(&mir, &out_elf, &opts, &QemuRunOptions::default())
             .expect("run restart boost restore in QEMU");
@@ -2076,8 +2177,7 @@ mod tests {
             "Unformatted enum must NOT emit `.rodata` name table"
         );
         assert!(
-            !ll_no_sci.contains("@__syn_fmt_f64_sci")
-                && !ll_no_sci.contains("@__syn_fmt_f32_sci"),
+            !ll_no_sci.contains("@__syn_fmt_f64_sci") && !ll_no_sci.contains("@__syn_fmt_f32_sci"),
             "Fixed-only float formatting must not emit `:e` IR helpers"
         );
 
@@ -2202,12 +2302,22 @@ mod tests {
                 .any(|s| s == "__syn_fmt_f64_sci"),
             "expected `__syn_fmt_f64_sci` symbol present on Cortex-M3 when `:e` IS used"
         );
-        assert_eq!(res_full.exec.exit_code, 0, "stdout={}", res_full.exec.stdout);
+        assert_eq!(
+            res_full.exec.exit_code, 0,
+            "stdout={}",
+            res_full.exec.stdout
+        );
         let out = &res_full.exec.stdout;
         assert!(out.contains("FIXED:3.14:3:-3:2.00:0.00\n"), "out={out}");
         assert!(out.contains("EDGE:nan:inf:-inf:ovf:-ovf\n"), "out={out}");
-        assert!(out.contains("SCI:1.23e+03:-4.500e-03:1.00e+01:0.00e+00\n"), "out={out}");
-        assert!(out.contains("INT:0x00ab:0x00AB:0xff:0b00101101:true:false\n"), "out={out}");
+        assert!(
+            out.contains("SCI:1.23e+03:-4.500e-03:1.00e+01:0.00e+00\n"),
+            "out={out}"
+        );
+        assert!(
+            out.contains("INT:0x00ab:0x00AB:0xff:0b00101101:true:false\n"),
+            "out={out}"
+        );
         assert!(
             out.contains("DBG:TelemetryPkt { id: 7, mode: Armed, pos: Vec2 { x: 1.50, y: -2.25 } } arr=[-10, 0, 25]\n"),
             "out={out}"
@@ -2343,8 +2453,10 @@ mod tests {
         assert!(esp_img.elf.audit.is_zero_heap_freestanding());
 
         for level in ["-O2", "-Oz"] {
-            let mut opts = CodegenOptions::default();
-            opts.opt_level = level.to_string();
+            let opts = CodegenOptions {
+                opt_level: level.to_string(),
+                ..Default::default()
+            };
             let tag = level.trim_start_matches('-');
             let res = run_qemu_cortex_m(
                 &mir,
@@ -2474,8 +2586,10 @@ mod tests {
         assert!(esp_img.elf.audit.is_zero_heap_freestanding());
 
         for level in ["-O0", "-O2"] {
-            let mut opts = CodegenOptions::default();
-            opts.opt_level = level.to_string();
+            let opts = CodegenOptions {
+                opt_level: level.to_string(),
+                ..Default::default()
+            };
             let tag = level.trim_start_matches('-');
             let res = run_qemu_cortex_m(
                 &mir,
@@ -2486,7 +2600,11 @@ mod tests {
             .unwrap_or_else(|e| panic!("wave2 r2 failed at {level}: {e}"));
             verify_ll_with_opt(&res.build.ll_path).expect("opt verify Cortex-M3 wave2 r2");
             assert!(res.build.audit.is_zero_heap_freestanding());
-            assert_eq!(res.exec.exit_code, 0, "level={level} out={}", res.exec.stdout);
+            assert_eq!(
+                res.exec.exit_code, 0,
+                "level={level} out={}",
+                res.exec.stdout
+            );
 
             let out = &res.exec.stdout;
             assert!(
@@ -2505,14 +2623,8 @@ mod tests {
                 out.contains("H8:true:false:7:3000000000:9\n"),
                 "level={level} out={out}"
             );
-            assert!(
-                out.contains("H9:2:0xff:0xaa\n"),
-                "level={level} out={out}"
-            );
-            assert!(
-                out.contains("H13:Truncated:0\n"),
-                "level={level} out={out}"
-            );
+            assert!(out.contains("H9:2:0xff:0xaa\n"), "level={level} out={out}");
+            assert!(out.contains("H13:Truncated:0\n"), "level={level} out={out}");
             assert!(
                 out.contains("PTRS:[0x0, 0x200"),
                 "expected 0x-prefixed lowercase hex pointers in DebugSlice at {level}: {out}"
@@ -2609,8 +2721,10 @@ mod tests {
         assert!(esp_img.elf.audit.is_zero_heap_freestanding());
 
         for level in ["-O0", "-O2"] {
-            let mut opts = CodegenOptions::default();
-            opts.opt_level = level.to_string();
+            let opts = CodegenOptions {
+                opt_level: level.to_string(),
+                ..Default::default()
+            };
             let tag = level.trim_start_matches('-');
             let res = run_qemu_cortex_m(
                 &mir,
@@ -2621,18 +2735,22 @@ mod tests {
             .unwrap_or_else(|e| panic!("fnptr QEMU run failed at {level}: {e}"));
             verify_ll_with_opt(&res.build.ll_path).expect("opt verify fnptr .ll");
             assert!(res.build.audit.is_zero_heap_freestanding());
-            assert_eq!(res.exec.exit_code, 0, "level={level} out={}", res.exec.stdout);
+            assert_eq!(
+                res.exec.exit_code, 0,
+                "level={level} out={}",
+                res.exec.stdout
+            );
             assert_eq!(res.exec.stdout, "FNPTR:42:42:12:7.00\n", "level={level}");
         }
     }
 
     fn build_wave1_mmio_irq_test_module() -> zev_mir::MirModule {
         use zev_mir::{
-            MirBakedArg, MirBinOp, MirBootSequence, MirBootStep, MirExpr, MirExprKind,
-            MirFmtChunk, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
-            MirIsrStateDecl, MirIsrStateVar, MirMmioAccess, MirMmioInstance, MirMmioLayout,
-            MirMmioReg, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget,
-            MirPrimitive, MirStmt, MirType, MirVar, VarId, VarRole,
+            MirBakedArg, MirBinOp, MirBootSequence, MirBootStep, MirExpr, MirExprKind, MirFmtChunk,
+            MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirIsrStateDecl,
+            MirIsrStateVar, MirMmioAccess, MirMmioInstance, MirMmioLayout, MirMmioReg, MirPrimKind,
+            MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget, MirPrimitive, MirStmt, MirType,
+            MirVar, VarId, VarRole,
         };
 
         let scratch_layout = MirMmioLayout {
@@ -2762,8 +2880,18 @@ mod tests {
                 init: u32_expr(10),
             }],
             vars: vec![
-                mk_var(0, "regs", MirType::MmioPtr("ScratchRegs".to_string()), VarRole::Param),
-                mk_var(1, "uart", MirType::MmioPtr("Uart0Regs".to_string()), VarRole::Param),
+                mk_var(
+                    0,
+                    "regs",
+                    MirType::MmioPtr("ScratchRegs".to_string()),
+                    VarRole::Param,
+                ),
+                mk_var(
+                    1,
+                    "uart",
+                    MirType::MmioPtr("Uart0Regs".to_string()),
+                    VarRole::Param,
+                ),
                 mk_var(2, "tag", MirType::U32, VarRole::Param),
                 mk_var(3, "count", MirType::U32, VarRole::IsrState),
             ],
@@ -3093,23 +3221,24 @@ mod tests {
             MirType::MmioPtr("ScratchRegs".to_string()),
         );
 
-        let mmio_read = |base: MirExpr, offset: u32, elem_bits: u8, idx: Option<i128>, ty: MirType| {
-            MirExpr::new(
-                MirExprKind::MmioRead {
-                    base: Box::new(base),
-                    offset,
-                    elem_bits,
-                    index: idx.map(|i| Box::new(u32_expr(i))),
-                    array_len: idx.map(|_| 4),
-                },
-                ty,
-            )
-        };
+        let mmio_read =
+            |base: MirExpr, offset: u32, elem_bits: u8, idx: Option<i128>, ty: MirType| {
+                MirExpr::new(
+                    MirExprKind::MmioRead {
+                        base: Box::new(base),
+                        offset,
+                        elem_bits,
+                        index: idx.map(|i| Box::new(u32_expr(i))),
+                        array_len: idx.map(|_| 4),
+                    },
+                    ty,
+                )
+            };
         let pend = |irq: i128| {
-            MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+            MirBootStep::Stmt(Box::new(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
                 method: "pend_irq".to_string(),
                 args: vec![u32_expr(irq)],
-            }))
+            })))
         };
         let dec = |value: MirExpr| MirFmtChunk::Int {
             value,
@@ -3117,9 +3246,10 @@ mod tests {
             bits: 32,
             fmt: MirIntFmt::Dec,
         };
+        let bstmt = |s: MirStmt| MirBootStep::Stmt(Box::new(s));
 
         let boot_steps = vec![
-            MirBootStep::Stmt(MirStmt::SetIrqSelector {
+            bstmt(MirStmt::SetIrqSelector {
                 symbol: "__zev_irq_sel_19".to_string(),
                 value: 2,
             }),
@@ -3128,22 +3258,22 @@ mod tests {
             pend(37),
             pend(12),
             pend(19),
-            MirBootStep::Stmt(MirStmt::Assign {
+            bstmt(MirStmt::Assign {
                 target: zev_mir::MirPlace::Var(VarId(0)),
                 op: zev_mir::MirAssignOp::Assign,
                 value: try_recv_expr.clone(),
             }),
-            MirBootStep::Stmt(MirStmt::Assign {
+            bstmt(MirStmt::Assign {
                 target: zev_mir::MirPlace::Var(VarId(1)),
                 op: zev_mir::MirAssignOp::Assign,
                 value: try_recv_expr.clone(),
             }),
-            MirBootStep::Stmt(MirStmt::Assign {
+            bstmt(MirStmt::Assign {
                 target: zev_mir::MirPlace::Var(VarId(2)),
                 op: zev_mir::MirAssignOp::Assign,
                 value: try_recv_expr,
             }),
-            MirBootStep::Stmt(MirStmt::PrintFmt {
+            bstmt(MirStmt::PrintFmt {
                 chunks: vec![
                     MirFmtChunk::Literal("\nLOG=".to_string()),
                     dec(MirExpr::new(MirExprKind::ResultVal(VarId(0)), MirType::U32)),
@@ -3154,7 +3284,7 @@ mod tests {
                 ],
                 newline: true,
             }),
-            MirBootStep::Stmt(MirStmt::PrintFmt {
+            bstmt(MirStmt::PrintFmt {
                 chunks: vec![
                     MirFmtChunk::Literal("MMIO_A=".to_string()),
                     dec(mmio_read(mmio_a.clone(), 0, 32, None, MirType::U32)),
@@ -3179,7 +3309,7 @@ mod tests {
                 ],
                 newline: true,
             }),
-            MirBootStep::Stmt(MirStmt::PrintFmt {
+            bstmt(MirStmt::PrintFmt {
                 chunks: vec![
                     MirFmtChunk::Literal("MMIO_B=".to_string()),
                     dec(mmio_read(mmio_b.clone(), 0, 32, None, MirType::U32)),
@@ -3188,7 +3318,7 @@ mod tests {
                 ],
                 newline: true,
             }),
-            MirBootStep::Stmt(MirStmt::PrintFmt {
+            bstmt(MirStmt::PrintFmt {
                 chunks: vec![
                     MirFmtChunk::Literal("SHARED=".to_string()),
                     dec(MirExpr::new(
@@ -3209,7 +3339,7 @@ mod tests {
                 ],
                 newline: true,
             }),
-            MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+            bstmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
                 method: "exit".to_string(),
                 args: vec![u32_expr(0)],
             })),
@@ -3282,14 +3412,22 @@ mod tests {
             .split("\n}\n")
             .next()
             .unwrap();
-        assert!(!worker_ir.contains("%v_3 = alloca"), "worker_ir={worker_ir}");
-        assert!(worker_ir.contains("load i32, ptr %__state_0"), "worker_ir={worker_ir}");
+        assert!(
+            !worker_ir.contains("%v_3 = alloca"),
+            "worker_ir={worker_ir}"
+        );
+        assert!(
+            worker_ir.contains("load i32, ptr %__state_0"),
+            "worker_ir={worker_ir}"
+        );
         assert!(worker_ir.contains("store i32 "), "worker_ir={worker_ir}");
 
         // 2. Build & run live in QEMU Cortex-M3 (`lm3s6965evb`) at `-O0` and `-O2`!
         for level in ["-O0", "-O2"] {
-            let mut opts = CodegenOptions::default();
-            opts.opt_level = level.to_string();
+            let opts = CodegenOptions {
+                opt_level: level.to_string(),
+                ..Default::default()
+            };
             let tag = level.trim_start_matches('-');
             let res = run_qemu_cortex_m(
                 &mir,
@@ -3300,12 +3438,25 @@ mod tests {
             .unwrap_or_else(|e| panic!("Wave 1 MMIO/IRQ QEMU run failed at {level}: {e}"));
             verify_ll_with_opt(&res.build.ll_path).expect("opt -passes=verify on Wave 1 IR");
             assert!(res.build.audit.is_zero_heap_freestanding());
-            assert_eq!(res.exec.exit_code, 0, "level={level} out={}", res.exec.stdout);
+            assert_eq!(
+                res.exec.exit_code, 0,
+                "level={level} out={}",
+                res.exec.stdout
+            );
             let out = &res.exec.stdout;
-            assert!(out.contains("MMM\nLOG=10011,10012,20011\n"), "level={level} out={out}");
-            assert!(out.contains("MMIO_A=100:4660:90:111\n"), "level={level} out={out}");
+            assert!(
+                out.contains("MMM\nLOG=10011,10012,20011\n"),
+                "level={level} out={out}"
+            );
+            assert!(
+                out.contains("MMIO_A=100:4660:90:111\n"),
+                "level={level} out={out}"
+            );
             assert!(out.contains("MMIO_B=200:210\n"), "level={level} out={out}");
-            assert!(out.contains("SHARED=1011 SEL=222\n"), "level={level} out={out}");
+            assert!(
+                out.contains("SHARED=1011 SEL=222\n"),
+                "level={level} out={out}"
+            );
         }
     }
 
@@ -3348,20 +3499,18 @@ mod tests {
         verify_ll_with_opt(&img.elf.ll_path).expect("opt verify ESP32-C6 Wave 1 IR");
         assert!(img.elf.audit.is_zero_heap_freestanding());
         assert_eq!(img.magic_header, ESP32C6_DIRECT_BOOT_MAGIC);
-        assert!(
-            img.elf
-                .audit
-                .defined_symbols
-                .iter()
-                .any(|s| s == "__syn_rv_vector_table")
-        );
-        assert!(
-            img.elf
-                .audit
-                .defined_symbols
-                .iter()
-                .any(|s| s == "__syn_vec_irq_37")
-        );
+        assert!(img
+            .elf
+            .audit
+            .defined_symbols
+            .iter()
+            .any(|s| s == "__syn_rv_vector_table"));
+        assert!(img
+            .elf
+            .audit
+            .defined_symbols
+            .iter()
+            .any(|s| s == "__syn_vec_irq_37"));
 
         let nm = Command::new(crate::toolchain::find_tool("/bin/llvm-nm", "llvm-nm"))
             .arg(&img.elf.elf_path)
@@ -3385,15 +3534,21 @@ mod tests {
         );
 
         // 2. Host x86_64 LLVM IR (`@__zev_mmio_buf_*`, bounds clamping, `opt -passes=verify` & `llc`)
-        let mut host_opts = CodegenOptions::default();
-        host_opts.target = TargetArch::HostX86_64Linux;
+        let host_opts = CodegenOptions {
+            target: TargetArch::HostX86_64Linux,
+            ..Default::default()
+        };
         let host_ll = emit_llvm_ir_with_options(&mir, &host_opts).expect("emit Host Wave 1 IR");
         assert!(
-            host_ll.contains("@__zev_mmio_buf_SCRATCH_A = internal global [24 x i8] zeroinitializer, align 4"),
+            host_ll.contains(
+                "@__zev_mmio_buf_SCRATCH_A = internal global [24 x i8] zeroinitializer, align 4"
+            ),
             "host_ll={host_ll}"
         );
         assert!(
-            host_ll.contains("@__zev_mmio_buf_UART0 = internal global [4 x i8] zeroinitializer, align 4"),
+            host_ll.contains(
+                "@__zev_mmio_buf_UART0 = internal global [4 x i8] zeroinitializer, align 4"
+            ),
             "host_ll={host_ll}"
         );
         assert!(host_ll.contains("icmp ult i64 "));
@@ -3410,9 +3565,9 @@ mod tests {
     #[test]
     fn wave1_isr_prim_addr_and_state_addrof_in_qemu() {
         use zev_mir::{
-            MirAssignOp, MirBakedArg, MirBinOp, MirBootSequence, MirBootStep, MirExpr,
-            MirExprKind, MirFmtChunk, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector,
-            MirIsr, MirIsrStateDecl, MirIsrStateVar, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
+            MirAssignOp, MirBakedArg, MirBinOp, MirBootSequence, MirBootStep, MirExpr, MirExprKind,
+            MirFmtChunk, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
+            MirIsrStateDecl, MirIsrStateVar, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
             MirPrimReadOp, MirPrimTarget, MirPrimitive, MirStmt, MirType, MirUnaryOp, MirVar,
             VarId, VarRole,
         };
@@ -3542,25 +3697,25 @@ mod tests {
                 mk_var(1, "r1", try_recv_res_ty, VarRole::CompilerTemp),
             ],
             steps: vec![
-                MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                MirBootStep::Stmt(Box::new(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
                     method: "pend_irq".to_string(),
                     args: vec![u32_expr(3)],
-                })),
-                MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                }))),
+                MirBootStep::Stmt(Box::new(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
                     method: "pend_irq".to_string(),
                     args: vec![u32_expr(3)],
-                })),
-                MirBootStep::Stmt(MirStmt::Assign {
+                }))),
+                MirBootStep::Stmt(Box::new(MirStmt::Assign {
                     target: MirPlace::Var(VarId(0)),
                     op: MirAssignOp::Assign,
                     value: try_recv_expr.clone(),
-                }),
-                MirBootStep::Stmt(MirStmt::Assign {
+                })),
+                MirBootStep::Stmt(Box::new(MirStmt::Assign {
                     target: MirPlace::Var(VarId(1)),
                     op: MirAssignOp::Assign,
                     value: try_recv_expr,
-                }),
-                MirBootStep::Stmt(MirStmt::PrintFmt {
+                })),
+                MirBootStep::Stmt(Box::new(MirStmt::PrintFmt {
                     chunks: vec![
                         MirFmtChunk::Literal("PRIM_ADDR=".to_string()),
                         MirFmtChunk::Int {
@@ -3584,11 +3739,11 @@ mod tests {
                         },
                     ],
                     newline: true,
-                }),
-                MirBootStep::Stmt(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                })),
+                MirBootStep::Stmt(Box::new(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
                     method: "exit".to_string(),
                     args: vec![u32_expr(0)],
-                })),
+                }))),
             ],
             boot_yielding_callees: vec![],
         };
@@ -3629,8 +3784,13 @@ mod tests {
                 cond_selector: None,
             }],
         };
-        let six_routes = riscv32::assign_rv_irq_routes(&(0..6u32).map(mk_vec).collect::<Vec<_>>(), 76, 32, &[0, 3, 4, 7])
-            .expect("6 routes");
+        let six_routes = riscv32::assign_rv_irq_routes(
+            &(0..6u32).map(mk_vec).collect::<Vec<_>>(),
+            76,
+            32,
+            &[0, 3, 4, 7],
+        )
+        .expect("6 routes");
         let assigned_cpus: Vec<u8> = six_routes.iter().map(|r| r.cpu_slot).collect();
         assert_eq!(assigned_cpus, vec![1, 2, 5, 6, 8, 9]);
 
@@ -3704,7 +3864,10 @@ fn main() {
         let pos_3 = shared_ll
             .find("call void @__syn_isr_step_3()")
             .expect("step_3 call");
-        assert!(pos_1 < pos_2 && pos_2 < pos_3, "shared IRQ bindings out of order:\n{shared_ll}");
+        assert!(
+            pos_1 < pos_2 && pos_2 < pos_3,
+            "shared IRQ bindings out of order:\n{shared_ll}"
+        );
         assert_eq!(qres.exec.stdout, "ORDER=1,2,3\n");
 
         // 3. Host x86_64 64-bit dynamic MMIO index OOB check (`0x1_0000_0001` clamps to 0, not 1!).
@@ -3729,9 +3892,11 @@ fn main() {
 "#;
         let host_prog = zev_parser::parse_str(host_src).unwrap();
         let host_mir = zev_mir::lower_program(&host_prog).unwrap();
-        let mut h_opts = CodegenOptions::default();
-        h_opts.target = TargetArch::HostX86_64Linux;
-        h_opts.opt_level = "-O0".to_string();
+        let h_opts = CodegenOptions {
+            target: TargetArch::HostX86_64Linux,
+            opt_level: "-O0".to_string(),
+            ..Default::default()
+        };
         let host_ll_64 = emit_llvm_ir_with_options(&host_mir, &h_opts).expect("emit host 64 IR");
         let h_ll_path = dir.join("wave1_host_64idx.ll");
         let h_obj_path = dir.join("wave1_host_64idx.o");
@@ -3777,7 +3942,8 @@ fn main() {
         let img = build_avr_uno_image(&mir, &out_elf, &out_bin)
             .unwrap_or_else(|e| panic!("ATmega328P AVR image build failed: {e}"));
 
-        verify_ll_with_opt(&img.elf.ll_path).expect("LLVM 23 opt -passes=verify on arduino_uno_demo.ll");
+        verify_ll_with_opt(&img.elf.ll_path)
+            .expect("LLVM 23 opt -passes=verify on arduino_uno_demo.ll");
 
         assert!(img.elf.audit.is_zero_heap_freestanding());
         for req_sym in [
@@ -3815,7 +3981,10 @@ fn main() {
         assert!(objdump.status.success());
         let disasm = String::from_utf8_lossy(&objdump.stdout);
         assert!(disasm.contains("00000000 <_start>:"), "disasm:\n{disasm}");
-        assert!(disasm.contains("__syn_avr_reset") || disasm.contains("jmp"), "disasm:\n{disasm}");
+        assert!(
+            disasm.contains("__syn_avr_reset") || disasm.contains("jmp"),
+            "disasm:\n{disasm}"
+        );
 
         let full_objdump = Command::new(&objdump_bin)
             .arg("-d")
@@ -3832,7 +4001,9 @@ fn main() {
 
     #[test]
     fn avr_irq_vector_validation_rejects_reserved_and_out_of_range_slots() {
-        assert!(avr::validate_avr_irq_vectors(&[], 26).expect("empty ok").is_empty());
+        assert!(avr::validate_avr_irq_vectors(&[], 26)
+            .expect("empty ok")
+            .is_empty());
 
         let make_vec = |irq_num: u32, irq_name: &str| zev_mir::MirIrqVector {
             irq_name: irq_name.to_string(),
@@ -3848,10 +4019,13 @@ fn main() {
             }],
         };
 
-        let attached = avr::validate_avr_irq_vectors(&[
-            make_vec(11, "IRQ_TIMER1_COMPA"),
-            make_vec(14, "IRQ_TIMER0_COMPA"),
-        ], 26)
+        let attached = avr::validate_avr_irq_vectors(
+            &[
+                make_vec(11, "IRQ_TIMER1_COMPA"),
+                make_vec(14, "IRQ_TIMER0_COMPA"),
+            ],
+            26,
+        )
         .expect("slots 11 and 14 are valid user vectors on ATmega328P");
         assert!(attached.contains(&11) && attached.contains(&14));
 
@@ -3879,8 +4053,7 @@ fn main() {
         let img = build_rp2040_image(&mir, &out_elf, &out_uf2)
             .unwrap_or_else(|e| panic!("RP2040 SRAM UF2 build failed: {e}"));
 
-        verify_ll_with_opt(&img.elf.ll_path)
-            .expect("LLVM 23 opt -passes=verify on pico_w_demo.ll");
+        verify_ll_with_opt(&img.elf.ll_path).expect("LLVM 23 opt -passes=verify on pico_w_demo.ll");
 
         assert!(img.elf.audit.is_zero_heap_freestanding());
         for req_sym in [
@@ -3905,9 +4078,13 @@ fn main() {
         assert!(ll_src.contains("call void @__syn_fn_console_putc(i8 %c)"));
 
         let uf2 = std::fs::read(&img.uf2_path).expect("read generated UF2");
-        assert!(!uf2.is_empty() && uf2.len() % 512 == 0, "UF2 len={}", uf2.len());
+        assert!(
+            !uf2.is_empty() && uf2.len().is_multiple_of(512),
+            "UF2 len={}",
+            uf2.len()
+        );
         assert_eq!(uf2.len(), (img.uf2_blocks as usize) * 512);
-        for (idx, blk) in uf2.chunks_exact(512).enumerate() {
+        for (idx, blk) in uf2.as_chunks::<512>().0.iter().enumerate() {
             let m0 = u32::from_le_bytes(blk[0..4].try_into().unwrap());
             let m1 = u32::from_le_bytes(blk[4..8].try_into().unwrap());
             let flags = u32::from_le_bytes(blk[8..12].try_into().unwrap());
@@ -3928,11 +4105,18 @@ fn main() {
             assert_eq!(mend, 0x0AB1_6F30);
         }
 
-        let objdump = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
-            .args(["-d", "--start-address=0x20000000", "--stop-address=0x20000020"])
-            .arg(&img.elf.elf_path)
-            .output()
-            .expect("invoke llvm-objdump on RP2040 ELF");
+        let objdump = Command::new(crate::toolchain::find_tool(
+            "/bin/llvm-objdump",
+            "llvm-objdump",
+        ))
+        .args([
+            "-d",
+            "--start-address=0x20000000",
+            "--stop-address=0x20000020",
+        ])
+        .arg(&img.elf.elf_path)
+        .output()
+        .expect("invoke llvm-objdump on RP2040 ELF");
         assert!(objdump.status.success());
         let disasm = String::from_utf8_lossy(&objdump.stdout);
         assert!(disasm.contains("20000000 <_start>:"), "disasm:\n{disasm}");
@@ -3974,11 +4158,9 @@ fn main() {
 
     #[test]
     fn avr_mega0_irq_vector_validation_rejects_reserved_and_out_of_range_slots() {
-        assert!(
-            avr::validate_avr_irq_vectors(&[], 40)
-                .expect("empty ok")
-                .is_empty()
-        );
+        assert!(avr::validate_avr_irq_vectors(&[], 40)
+            .expect("empty ok")
+            .is_empty());
 
         let make_vec = |irq_num: u32, irq_name: &str| zev_mir::MirIrqVector {
             irq_name: irq_name.to_string(),
@@ -3994,12 +4176,15 @@ fn main() {
             }],
         };
 
-        let attached = avr::validate_avr_irq_vectors(&[
-            make_vec(12, "IRQ_TCB0_INT"),
-            make_vec(35, "IRQ_PORTE_PORT"),
-            make_vec(36, "IRQ_TCB3_INT"),
-            make_vec(39, "IRQ_USART3_TXC"),
-        ], 40)
+        let attached = avr::validate_avr_irq_vectors(
+            &[
+                make_vec(12, "IRQ_TCB0_INT"),
+                make_vec(35, "IRQ_PORTE_PORT"),
+                make_vec(36, "IRQ_TCB3_INT"),
+                make_vec(39, "IRQ_USART3_TXC"),
+            ],
+            40,
+        )
         .expect("slots 12, 35, 36, 39 are all valid on pure-ISA ATmega4809");
         assert!(
             attached.contains(&12)
@@ -4145,10 +4330,7 @@ fn main() {
             .expect("invoke llvm-objdump on ATmega4809 vector table");
         assert!(vec_objdump.status.success());
         let vec_disasm = String::from_utf8_lossy(&vec_objdump.stdout);
-        let jmp_count = vec_disasm
-            .lines()
-            .filter(|l| l.contains("\tjmp\t"))
-            .count();
+        let jmp_count = vec_disasm.lines().filter(|l| l.contains("\tjmp\t")).count();
         assert_eq!(
             jmp_count, 40,
             "expected 40 `jmp` vectors in 0x0000..0x00A0, got {jmp_count}:\n{vec_disasm}"
@@ -4186,9 +4368,19 @@ fn main() {
         let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::avr_nano_every())
             .expect("ATmega4809 hardware stack high-water proof");
         assert_eq!(proof.sram_budget_bytes, 6_144);
-        assert!(proof.within_budget, "proof table:\n{}", proof.format_table());
-        assert!(!proof.has_cycle, "unexpected cycle in ATmega4809 call graph");
-        assert!(proof.format_table().to_ascii_lowercase().contains("atmega4809"));
+        assert!(
+            proof.within_budget,
+            "proof table:\n{}",
+            proof.format_table()
+        );
+        assert!(
+            !proof.has_cycle,
+            "unexpected cycle in ATmega4809 call graph"
+        );
+        assert!(proof
+            .format_table()
+            .to_ascii_lowercase()
+            .contains("atmega4809"));
     }
 
     #[test]
@@ -4258,11 +4450,7 @@ fn main() {
         for ir in [&raw_ll, &opt_ll] {
             check_ll_fn_no_urem(ir, "define i32 @__syn_scan_rank");
             check_ll_fn_no_urem(ir, "define void @__syn_sched_loop");
-            for marker in [
-                "@__syn_isr_",
-                "@__syn_ring_",
-                "@__syn_q_",
-            ] {
+            for marker in ["@__syn_isr_", "@__syn_ring_", "@__syn_q_"] {
                 let mut search_from = 0;
                 while let Some(rel) = ir[search_from..].find(marker) {
                     let pos = search_from + rel;
@@ -4284,11 +4472,14 @@ fn main() {
             }
         }
 
-        let disasm_out = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
-            .args(["-d", "--symbolize-operands"])
-            .arg(&img.elf.elf_path)
-            .output()
-            .expect("invoke llvm-objdump on arduino_nano_every_demo.elf");
+        let disasm_out = Command::new(crate::toolchain::find_tool(
+            "/bin/llvm-objdump",
+            "llvm-objdump",
+        ))
+        .args(["-d", "--symbolize-operands"])
+        .arg(&img.elf.elf_path)
+        .output()
+        .expect("invoke llvm-objdump on arduino_nano_every_demo.elf");
         assert!(disasm_out.status.success());
         let disasm = String::from_utf8_lossy(&disasm_out.stdout);
         let mut div32_addrs = std::collections::BTreeSet::new();
@@ -4318,7 +4509,9 @@ fn main() {
                 let hits_div32 = line.contains("__udivmodsi4")
                     || line.contains("__divmodsi4")
                     || line.contains("__syn_avr_udivrem32")
-                    || div32_addrs.iter().any(|a| line.ends_with(a.as_str()) || line.contains(&format!("{a} ")));
+                    || div32_addrs
+                        .iter()
+                        .any(|a| line.ends_with(a.as_str()) || line.contains(&format!("{a} ")));
                 if hits_div32 {
                     let is_sched_or_isr = cur_sym == "__syn_scan_rank"
                         || cur_sym == "__syn_sched_loop"
@@ -4398,9 +4591,7 @@ fn main() {
                 {
                     saw_ccp_wdt = true;
                 }
-                if op1.starts_with("0x0061,")
-                    || op1.starts_with("0x61,")
-                    || op1.starts_with("97,")
+                if op1.starts_with("0x0061,") || op1.starts_with("0x61,") || op1.starts_with("97,")
                 {
                     saw_ccp_clk = true;
                 }
@@ -4414,7 +4605,11 @@ fn main() {
         let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::avr_nano_every())
             .expect("arduino_nano_every_demo stack high-water proof");
         assert_eq!(proof.sram_budget_bytes, 6_144);
-        assert!(proof.within_budget, "proof table:\n{}", proof.format_table());
+        assert!(
+            proof.within_budget,
+            "proof table:\n{}",
+            proof.format_table()
+        );
         assert!(!proof.has_cycle);
     }
 
@@ -4578,10 +4773,11 @@ fn main() {
         test_name: &str,
         src: &str,
     ) -> (zev_mir::MirModule, String, crate::QemuRunResult) {
-        let prog = zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {test_name}: {e:?}"));
-        zev_sema::analyze_program(&prog)
-            .unwrap_or_else(|e| panic!("sema {test_name}: {e:?}"));
-        let mir = zev_mir::lower_program(&prog).unwrap_or_else(|e| panic!("lower {test_name}: {e:?}"));
+        let prog =
+            zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {test_name}: {e:?}"));
+        zev_sema::analyze_program(&prog).unwrap_or_else(|e| panic!("sema {test_name}: {e:?}"));
+        let mir =
+            zev_mir::lower_program(&prog).unwrap_or_else(|e| panic!("lower {test_name}: {e:?}"));
         let dir = test_out_dir();
         let elf = dir.join(format!("{test_name}.elf"));
         let res = run_qemu_cortex_m(
@@ -4591,7 +4787,11 @@ fn main() {
             &QemuRunOptions::default(),
         )
         .unwrap_or_else(|e| panic!("run {test_name} QEMU: {e}"));
-        assert_eq!(res.exec.exit_code, 0, "{test_name} exit != 0; stdout={}", res.exec.stdout);
+        assert_eq!(
+            res.exec.exit_code, 0,
+            "{test_name} exit != 0; stdout={}",
+            res.exec.stdout
+        );
         assert!(res.build.audit.is_zero_heap_freestanding());
         let ll = std::fs::read_to_string(&res.build.ll_path).expect("read generated .ll");
         (mir, ll, res)
@@ -4732,8 +4932,7 @@ fn main() {
     spawn producer_task(&ring_a, &q_a) @normal;
 }
 "#;
-        let (mir, ll, res) =
-            run_zev_cortex_m_qemu("unsized_views_multi_cap_qemu", src);
+        let (mir, ll, res) = run_zev_cortex_m_qemu("unsized_views_multi_cap_qemu", src);
         assert_all_allocas_in_entry(&ll);
         assert!(
             res.exec.stdout.contains("QEMU_VIEW_RX len=2 b0=72 prio=0"),
@@ -4836,20 +5035,24 @@ fn main() {
     spawn irq_driver() @normal;
 }
 "#;
-        let (_mir, ll, res) =
-            run_zev_cortex_m_qemu("subsystem_structs_nested_isr_qemu", src);
+        let (_mir, ll, res) = run_zev_cortex_m_qemu("subsystem_structs_nested_isr_qemu", src);
         assert_all_allocas_in_entry(&ll);
         assert!(
             ll.contains("@__zev_subsys_uart0 = internal global %struct.UartSubsys zeroinitializer")
-                && ll.contains("@__zev_subsys_uart1 = internal global %struct.UartSubsys zeroinitializer"),
+                && ll.contains(
+                    "@__zev_subsys_uart1 = internal global %struct.UartSubsys zeroinitializer"
+                ),
             "expected static subsystem globals in LLVM IR"
         );
         assert!(
-            !ll.contains("@__syn_from_bytes_UartSubsys") && !ll.contains("@__syn_from_bytes_Channel"),
+            !ll.contains("@__syn_from_bytes_UartSubsys")
+                && !ll.contains("@__syn_from_bytes_Channel"),
             "subsystem structs must not emit from_bytes helpers"
         );
         assert!(
-            res.exec.stdout.contains("QEMU_SUBSYS_RX len=2 b0=65 prio=1")
+            res.exec
+                .stdout
+                .contains("QEMU_SUBSYS_RX len=2 b0=65 prio=1")
                 && res.exec.stdout.contains("QEMU_SUBSYS_Q code=1234")
                 && res.exec.stdout.contains("QEMU_SUBSYS_TX len=5 b0=116"),
             "stdout={}",
@@ -4925,13 +5128,15 @@ fn main() {
     spawn writer() @normal;
 }
 "#;
-        let (_mir, ll, res) =
-            run_zev_cortex_m_qemu("fmt_ring_wrap_trunc_qemu", src);
+        let (_mir, ll, res) = run_zev_cortex_m_qemu("fmt_ring_wrap_trunc_qemu", src);
         assert_all_allocas_in_entry(&ll);
         assert!(
             res.exec.stdout.contains("QEMU_FMT_WAKE len=8 b0=88 prio=1")
                 && res.exec.stdout.contains("QEMU_FMT_WRAP c1len=6 last=66")
-                && res.exec.stdout.contains("QEMU_FMT_TRUNC partial=4 total_len=16"),
+                && res
+                    .exec
+                    .stdout
+                    .contains("QEMU_FMT_TRUNC partial=4 total_len=16"),
             "stdout={}",
             res.exec.stdout
         );
@@ -4941,9 +5146,8 @@ fn main() {
     fn hardware_stack_high_water_proof_passes_on_cortex_m3_esp32c6_and_avr() {
         // 1. ARM Cortex-M3 (`examples/cortex_m_demo.zev`, 65,536 B SRAM, 32 B NVIC frame)
         let cm3_mir = compile_example_mir(&[repo_root().join("examples/cortex_m_demo.zev")]);
-        let cm3_proof =
-            analyze_hardware_stack_high_water(&cm3_mir, &CodegenOptions::default())
-                .expect("Cortex-M3 stack high-water proof");
+        let cm3_proof = analyze_hardware_stack_high_water(&cm3_mir, &CodegenOptions::default())
+            .expect("Cortex-M3 stack high-water proof");
         println!("{}", cm3_proof.format_table());
         assert_eq!(cm3_proof.sram_budget_bytes, 65_536);
         assert_eq!(cm3_proof.isr_hw_overhead_bytes, 32);
@@ -4954,7 +5158,9 @@ fn main() {
         assert!(cm3_proof.worst_isr_stack_bytes >= 32);
         assert_eq!(
             cm3_proof.peak_stack_bytes,
-            cm3_proof.boot_stack_bytes.max(cm3_proof.sched_task_stack_bytes)
+            cm3_proof
+                .boot_stack_bytes
+                .max(cm3_proof.sched_task_stack_bytes)
                 + cm3_proof.worst_isr_stack_bytes
         );
         assert_eq!(
@@ -4967,9 +5173,8 @@ fn main() {
 
         // 2. Espressif ESP32-C6 (`examples/esp32c6_demo.zev`, 524,288 B HP-SRAM, 64 B trap frame)
         let esp_mir = compile_example_mir(&[repo_root().join("examples/esp32c6_demo.zev")]);
-        let esp_proof =
-            analyze_hardware_stack_high_water(&esp_mir, &CodegenOptions::esp32c6())
-                .expect("ESP32-C6 stack high-water proof");
+        let esp_proof = analyze_hardware_stack_high_water(&esp_mir, &CodegenOptions::esp32c6())
+            .expect("ESP32-C6 stack high-water proof");
         println!("{}", esp_proof.format_table());
         assert_eq!(esp_proof.sram_budget_bytes, 524_288);
         assert_eq!(esp_proof.isr_hw_overhead_bytes, 64);
@@ -4988,9 +5193,8 @@ fn main() {
 
         // 3. Microchip ATmega328P AVR (`examples/arduino_uno_demo.zev`, 2,048 B SRAM, 2 B IRQ vector push)
         let uno_mir = compile_example_mir(&[repo_root().join("examples/arduino_uno_demo.zev")]);
-        let uno_proof =
-            analyze_hardware_stack_high_water(&uno_mir, &CodegenOptions::avr_uno())
-                .expect("ATmega328P AVR stack high-water proof");
+        let uno_proof = analyze_hardware_stack_high_water(&uno_mir, &CodegenOptions::avr_uno())
+            .expect("ATmega328P AVR stack high-water proof");
         println!("{}", uno_proof.format_table());
         assert_eq!(uno_proof.sram_budget_bytes, 2_048);
         assert_eq!(uno_proof.isr_hw_overhead_bytes, 2);
@@ -5028,8 +5232,10 @@ fn main() {
         assert!(pico_proof.format_table().contains("PASS"));
 
         // 5. Host target rejects hardware stack proof cleanly, and AVR >2048 B high-water fails `within_budget`
-        let mut host_opts = CodegenOptions::default();
-        host_opts.target = TargetArch::HostX86_64Linux;
+        let host_opts = CodegenOptions {
+            target: TargetArch::HostX86_64Linux,
+            ..Default::default()
+        };
         assert!(analyze_hardware_stack_high_water(&cm3_mir, &host_opts).is_err());
 
         let over_avr_src = r#"
@@ -5114,7 +5320,9 @@ fn main() {
         );
         assert!(!ll[u32_fn_start..u32_fn_end].contains("@__syn_crit_enter"));
 
-        let ring_fn_start = ll.find("define i8 @__syn_ring_push_byte_byte_ring_16").unwrap();
+        let ring_fn_start = ll
+            .find("define i8 @__syn_ring_push_byte_byte_ring_16")
+            .unwrap();
         let ring_fn_end = ll[ring_fn_start..].find("\n}\n").unwrap() + ring_fn_start;
         assert!(
             ll[ring_fn_start..ring_fn_end].contains("; irq-mask elided"),
@@ -5403,7 +5611,10 @@ fn main() {
         )
         .expect("run view_bundle Cortex-M3 QEMU");
         assert_eq!(cm_res.exec.exit_code, 0, "stdout={}", cm_res.exec.stdout);
-        assert!(cm_res.exec.stdout.contains("[PASS] VIEW_BUNDLE_CROSS_TARGET OK"));
+        assert!(cm_res
+            .exec
+            .stdout
+            .contains("[PASS] VIEW_BUNDLE_CROSS_TARGET OK"));
         let ll_cm = std::fs::read_to_string(&cm_res.build.ll_path).unwrap();
         assert_all_allocas_in_entry(&ll_cm);
         let rel_start = ll_cm.find("define void @__syn_pool_release(").unwrap();
@@ -5434,8 +5645,10 @@ fn main() {
         assert!(avr_img.elf.audit.is_zero_heap_freestanding());
 
         // 4. Host x86_64 LLVM IR + llc object compilation
-        let mut host_opts = CodegenOptions::default();
-        host_opts.target = TargetArch::HostX86_64Linux;
+        let host_opts = CodegenOptions {
+            target: TargetArch::HostX86_64Linux,
+            ..Default::default()
+        };
         let host_ll = emit_llvm_ir_with_options(&mir, &host_opts).expect("emit x86_64 IR");
         let host_ll_path = dir.join("view_bundle_host.ll");
         let host_obj_path = dir.join("view_bundle_host.o");
@@ -5491,8 +5704,7 @@ fn main() {
     spawn feeder(&usb_port.rx) @high;
 }
 "#;
-        let (arm_mir, arm_ll, arm_res) =
-            run_zev_cortex_m_qemu("singleton_fold_arm_qemu", arm_src);
+        let (arm_mir, arm_ll, arm_res) = run_zev_cortex_m_qemu("singleton_fold_arm_qemu", arm_src);
         assert_all_allocas_in_entry(&arm_ll);
         assert!(
             arm_mir.visibility.singleton_subsystems.contains("usb_port"),
@@ -5516,7 +5728,10 @@ fn main() {
 
         // 2. ESP32-C6 (`riscv32imac`): `usb_serial` & `usb_cmd_worker` fold cleanly and ELF/.bin build passes
         let esp_mir = compile_example_mir(&[repo_root().join("examples/esp32c6_demo.zev")]);
-        assert!(esp_mir.visibility.singleton_subsystems.contains("usb_serial"));
+        assert!(esp_mir
+            .visibility
+            .singleton_subsystems
+            .contains("usb_serial"));
         let esp_usb_folded = esp_mir
             .visibility
             .folded_task_vars
@@ -5538,7 +5753,10 @@ fn main() {
 
         // 3. ATmega328P AVR: `uart_port` & `serial_cmd_worker` fold cleanly and AVR ELF/.bin build passes
         let avr_mir = compile_example_mir(&[repo_root().join("examples/arduino_uno_demo.zev")]);
-        assert!(avr_mir.visibility.singleton_subsystems.contains("uart_port"));
+        assert!(avr_mir
+            .visibility
+            .singleton_subsystems
+            .contains("uart_port"));
         let avr_folded = avr_mir
             .visibility
             .folded_task_vars
@@ -5563,8 +5781,14 @@ fn main() {
             repo_root().join("examples/motor_controller.zev"),
             repo_root().join("examples/motor_support.zev"),
         ]);
-        assert!(!motor_mir.visibility.folded_task_vars.contains_key("motor_control"));
-        assert!(!motor_mir.visibility.folded_task_vars.contains_key("fieldbus_listener"));
+        assert!(!motor_mir
+            .visibility
+            .folded_task_vars
+            .contains_key("motor_control"));
+        assert!(!motor_mir
+            .visibility
+            .folded_task_vars
+            .contains_key("fieldbus_listener"));
         let motor_ll = emit_llvm_ir_with_options(&motor_mir, &CodegenOptions::default())
             .expect("emit LLVM IR for motor_controller");
         assert!(motor_ll.contains("motor_control"));
@@ -5621,7 +5845,10 @@ fn main() {
 "#;
         let (mir, ll, res) = run_zev_cortex_m_qemu("l_h1_mixed_shifts", src);
         verify_ll_with_opt(&res.build.ll_path).expect("opt verify L-H1 Cortex-M3");
-        assert!(ll.contains("ashr i8") && ll.contains("lshr i8"), "expected i8 shifts in IR");
+        assert!(
+            ll.contains("ashr i8") && ll.contains("lshr i8"),
+            "expected i8 shifts in IR"
+        );
         assert!(
             res.exec.stdout.contains("L_H1_SHIFT_OK"),
             "stdout={}",
@@ -5706,7 +5933,9 @@ fn main() {
         verify_ll_with_opt(&ll_path).expect("opt verify AVR L-H2 IR");
 
         // 1. `@__syn_should_share` wraps timer wakeup + task scan in AVR crit enter/exit.
-        let ss_start = ll.find("define i1 @__syn_should_share(").expect("@__syn_should_share present");
+        let ss_start = ll
+            .find("define i1 @__syn_should_share(")
+            .expect("@__syn_should_share present");
         let ss_end = ll[ss_start..].find("\n}\n").unwrap() + ss_start;
         let ss_body = &ll[ss_start..ss_end];
         assert!(ss_body.contains("@__syn_crit_enter()"), "{ss_body}");
@@ -5714,11 +5943,16 @@ fn main() {
 
         // 2. Worker mixes contended ISR primitives + sleep_depth + wfi_count (crit-wrapped)
         //    and uncontended task-only primitives (unwrapped `load volatile` + `; irq-mask elided`).
-        let w_start = ll.find("define i32 @__syn_task_step_worker(").expect("worker step present");
+        let w_start = ll
+            .find("define i32 @__syn_task_step_worker(")
+            .expect("worker step present");
         let w_end = ll[w_start..].find("\n}\n").unwrap() + w_start;
         let w_body = &ll[w_start..w_end];
         assert!(w_body.contains("@__syn_crit_enter()"), "{w_body}");
-        assert!(ll.contains("; irq-mask elided"), "expected elided helper in AVR IR");
+        assert!(
+            ll.contains("; irq-mask elided"),
+            "expected elided helper in AVR IR"
+        );
         let task_in_gep = w_body
             .find("getelementptr inbounds %prim.inbox_u16_4, ptr @__syn_prim_task_in")
             .expect("task_in gep present");
@@ -5729,10 +5963,14 @@ fn main() {
         );
 
         // 3. View helpers keep critical guards on AVR for contended views.
-        let qv_start = ll.find("define i16 @__syn_fn_inspect_q_view(").expect("q view present");
+        let qv_start = ll
+            .find("define i16 @__syn_fn_inspect_q_view(")
+            .expect("q view present");
         let qv_end = ll[qv_start..].find("\n}\n").unwrap() + qv_start;
         assert!(ll[qv_start..qv_end].contains("@__syn_crit_enter()"));
-        let rv_start = ll.find("define i16 @__syn_fn_inspect_r_view(").expect("r view present");
+        let rv_start = ll
+            .find("define i16 @__syn_fn_inspect_r_view(")
+            .expect("r view present");
         let rv_end = ll[rv_start..].find("\n}\n").unwrap() + rv_start;
         assert!(ll[rv_start..rv_end].contains("@__syn_crit_enter()"));
     }
@@ -5776,7 +6014,11 @@ fn main() {
 "#;
         let (mir, _ll, res) = run_zev_cortex_m_qemu("l_h3_watch_init", src);
         verify_ll_with_opt(&res.build.ll_path).expect("opt verify L-H3 Cortex-M3");
-        assert!(res.exec.stdout.contains("L_H3_WATCH_OK"), "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("L_H3_WATCH_OK"),
+            "stdout={}",
+            res.exec.stdout
+        );
 
         let avr_opts = CodegenOptions {
             target: TargetArch::AvrAtmega328p,
@@ -5834,26 +6076,43 @@ fn main() {
 "#;
         let (_mir, ll, res) = run_zev_cortex_m_qemu("l_m2_boot_primask", src);
         verify_ll_with_opt(&res.build.ll_path).expect("opt verify L-M2 Cortex-M3");
-        assert!(res.exec.stdout.contains("L_M2_IRQ boot=1 after=2"), "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("L_M2_IRQ boot=1 after=2"),
+            "stdout={}",
+            res.exec.stdout
+        );
 
         assert!(ll.contains("@__syn_cm_in_boot = internal global i8 1"));
-        let rh_start = ll.find("define void @Reset_Handler(").expect("Reset_Handler present");
+        let rh_start = ll
+            .find("define void @Reset_Handler(")
+            .expect("Reset_Handler present");
         let rh_end = ll[rh_start..].find("\n}\n").unwrap() + rh_start;
         let rh_body = &ll[rh_start..rh_end];
         let cpsid_pos = rh_body.find("cpsid i").expect("cpsid i in Reset_Handler");
-        let boot_pos = rh_body.find("@__syn_boot()").expect("@__syn_boot in Reset_Handler");
-        assert!(cpsid_pos < boot_pos, "Reset_Handler must set PRIMASK=1 before __syn_boot");
+        let boot_pos = rh_body
+            .find("@__syn_boot()")
+            .expect("@__syn_boot in Reset_Handler");
+        assert!(
+            cpsid_pos < boot_pos,
+            "Reset_Handler must set PRIMASK=1 before __syn_boot"
+        );
 
-        let idle_start = ll.find("define void @__syn_idle_sleep(").expect("idle sleep present");
+        let idle_start = ll
+            .find("define void @__syn_idle_sleep(")
+            .expect("idle sleep present");
         let idle_end = ll[idle_start..].find("\n}\n").unwrap() + idle_start;
         assert!(ll[idle_start..idle_end].contains("dsb\\0Awfi\\0Acpsie i\\0Aisb\\0Acpsid i"));
 
-        let sl_start = ll.find("define void @__syn_sched_loop(").expect("sched_loop present");
+        let sl_start = ll
+            .find("define void @__syn_sched_loop(")
+            .expect("sched_loop present");
         let sl_end = ll[sl_start..].find("\n}\n").unwrap() + sl_start;
         assert!(ll[sl_start..sl_end].contains("store volatile i8 0, ptr @__syn_cm_in_boot"));
         assert!(ll[sl_start..sl_end].contains("cpsie i"));
 
-        let pend_start = ll.find("define void @__syn_nvic_pend_irq(").expect("pend_irq present");
+        let pend_start = ll
+            .find("define void @__syn_nvic_pend_irq(")
+            .expect("pend_irq present");
         let pend_end = ll[pend_start..].find("\n}\n").unwrap() + pend_start;
         assert!(ll[pend_start..pend_end].contains("@__syn_cm_dispatch_irq("));
     }
@@ -5896,8 +6155,9 @@ fn main() {
 }
 "#;
         let mir = compile_src_mir(src);
-        let proof = stack_sizes::analyze_hardware_stack_high_water(&mir, &CodegenOptions::default())
-            .expect("Cortex-M3 L-M1 indirect stack proof");
+        let proof =
+            stack_sizes::analyze_hardware_stack_high_water(&mir, &CodegenOptions::default())
+                .expect("Cortex-M3 L-M1 indirect stack proof");
         assert!(!proof.has_cycle, "unexpected cycle: {proof:?}");
         assert!(
             proof.sched_task_stack_bytes >= 64,
@@ -6030,22 +6290,44 @@ fn main() {
 "#;
         let (mir, ll, res) = run_zev_cortex_m_qemu("b_h2_nested_dma", src);
         verify_ll_with_opt(&res.build.ll_path).expect("opt verify B-H2/B-L2 Cortex-M3");
-        assert!(res.exec.stdout.contains("B_H2_OK"), "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("B_H2_OK"),
+            "stdout={}",
+            res.exec.stdout
+        );
         // B-H2: `@full_dma_outer` has >= 16 byte align + `_dma` pool layout type
-        assert!(ll.contains("%prim.pool_arr_8_u8_2_dma ="), "missing _dma pool type in IR");
+        assert!(
+            ll.contains("%prim.pool_arr_8_u8_2_dma ="),
+            "missing _dma pool type in IR"
+        );
         let dma_global_line = ll
             .lines()
-            .find(|l| l.starts_with("@__zev_subsys_full_dma_outer =") || l.starts_with("@full_dma_outer ="))
+            .find(|l| {
+                l.starts_with("@__zev_subsys_full_dma_outer =")
+                    || l.starts_with("@full_dma_outer =")
+            })
             .expect("@full_dma_outer global present");
-        assert!(dma_global_line.contains("align 16") || dma_global_line.contains("align 32"), "{dma_global_line}");
+        assert!(
+            dma_global_line.contains("align 16") || dma_global_line.contains("align 32"),
+            "{dma_global_line}"
+        );
         // B-H2: non-zero-init struct globals (signal / ping_pong) get constant struct init + distinct pp bits
         assert!(ll.contains("global %struct.Outer {"));
-        assert!(dma_global_line.contains("i8 2, i32 0, [4 x i16]") && dma_global_line.contains("i8 3, i32 0, [4 x i16]"), "{dma_global_line}");
+        assert!(
+            dma_global_line.contains("i8 2, i32 0, [4 x i16]")
+                && dma_global_line.contains("i8 3, i32 0, [4 x i16]"),
+            "{dma_global_line}"
+        );
         // B-L2: folded singleton param `out` of `fold_worker` should NOT allocate dead `%p.out` alloca
-        let fw_start = ll.find("define i32 @__syn_task_step_fold_worker(").expect("fold_worker present");
+        let fw_start = ll
+            .find("define i32 @__syn_task_step_fold_worker(")
+            .expect("fold_worker present");
         let fw_end = ll[fw_start..].find("\n}\n").unwrap() + fw_start;
         assert!(mir.visibility.folded_task_vars.contains_key("fold_worker"));
-        assert!(!ll[fw_start..fw_end].contains("%p.out = alloca"), "dead folded Param alloca emitted");
+        assert!(
+            !ll[fw_start..fw_end].contains("%p.out = alloca"),
+            "dead folded Param alloca emitted"
+        );
 
         // B-M4: unconditional MMIO array bounds trap via `@__syn_panic(i8 3)` across targets
         let mmio_src = r#"
@@ -6178,14 +6460,20 @@ fn main() {
         assert!(out.contains("B_M2_PARTIAL=3"), "out={out}");
         let hi_pos = out.find("WAKE_HIGH").expect("WAKE_HIGH missing");
         let lo_pos = out.find("WAKE_LOW").expect("WAKE_LOW missing");
-        assert!(hi_pos < lo_pos, "expected high-priority waiter before low-priority waiter: {out}");
+        assert!(
+            hi_pos < lo_pos,
+            "expected high-priority waiter before low-priority waiter: {out}"
+        );
 
         // IR checks for @__syn_wake_all_mask, sticky trunc check, and end_inbox_turn on timeout
         assert!(ll.contains("define void @__syn_wake_all_mask("));
         assert!(ll.contains("@__syn_rr_idx"));
-        let putc_start = ll.find("define weak void @__syn_fmt_putc(").expect("@__syn_fmt_putc");
+        let putc_start = ll
+            .find("define weak void @__syn_fmt_putc(")
+            .expect("@__syn_fmt_putc");
         let putc_end = ll[putc_start..].find("\n}\n").unwrap() + putc_start;
-        assert!(ll[putc_start..putc_end].contains("getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3"));
+        assert!(ll[putc_start..putc_end]
+            .contains("getelementptr inbounds %SynFmtSink, ptr %sink, i32 0, i32 3"));
     }
 
     #[test]
@@ -6267,11 +6555,51 @@ fn main() {
     #[test]
     fn loads_all_builtin_chips_and_boards() {
         let expectations = [
-            ("lm3s6965_evb", "lm3s6965", CpuIsa::ArmCortexM, 65_536u32, 262_144u32, true, false),
-            ("rpi_pico_w", "rp2040", CpuIsa::ArmCortexM, 270_336, 270_336, false, true),
-            ("arduino_uno", "atmega328p", CpuIsa::Avr, 2_048, 32_256, false, true),
-            ("arduino_nano_every", "atmega4809", CpuIsa::Avr, 6_144, 49_152, false, true),
-            ("esp32c6_pico", "esp32c6", CpuIsa::Riscv32, 524_288, 4_194_304, false, true),
+            (
+                "lm3s6965_evb",
+                "lm3s6965",
+                CpuIsa::ArmCortexM,
+                65_536u32,
+                262_144u32,
+                true,
+                false,
+            ),
+            (
+                "rpi_pico_w",
+                "rp2040",
+                CpuIsa::ArmCortexM,
+                270_336,
+                270_336,
+                false,
+                true,
+            ),
+            (
+                "arduino_uno",
+                "atmega328p",
+                CpuIsa::Avr,
+                2_048,
+                32_256,
+                false,
+                true,
+            ),
+            (
+                "arduino_nano_every",
+                "atmega4809",
+                CpuIsa::Avr,
+                6_144,
+                49_152,
+                false,
+                true,
+            ),
+            (
+                "esp32c6_pico",
+                "esp32c6",
+                CpuIsa::Riscv32,
+                524_288,
+                4_194_304,
+                false,
+                true,
+            ),
         ];
         for (board, chip, isa, sram_budget, eff_flash, has_qemu, has_flash_cmd) in expectations {
             let bspec = TargetSpec::resolve(None, Some(board))
@@ -6566,8 +6894,7 @@ fn main() {
         let cm4_spec = TargetSpec::load_from_root(&root, None, Some("syn_cm4_uf2")).unwrap();
         let cm4_opts = CodegenOptions::from_spec(cm4_spec);
         let cm4_mir = compile_src_mir(&src_32(false));
-        let cm4_art =
-            build_target_image(&cm4_mir, &cm4_opts, &root.join("syn_cm4.uf2")).unwrap();
+        let cm4_art = build_target_image(&cm4_mir, &cm4_opts, &root.join("syn_cm4.uf2")).unwrap();
         assert!(cm4_art.uf2_path.as_ref().unwrap().is_file());
         assert!(cm4_art.uf2_blocks >= 1);
         assert!(cm4_art.elf.audit.is_zero_heap_freestanding());
@@ -6580,7 +6907,10 @@ fn main() {
         let rv32_art =
             build_target_image(&rv32_mir, &rv32_opts, &root.join("syn_rv32.bin")).unwrap();
         let rv32_bytes = std::fs::read(rv32_art.bin_path.as_ref().unwrap()).unwrap();
-        assert_eq!(&rv32_bytes[..8], &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]);
+        assert_eq!(
+            &rv32_bytes[..8],
+            &[0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55]
+        );
         assert!(rv32_art.elf.audit.is_zero_heap_freestanding());
         let rv32_proof = analyze_hardware_stack_high_water(&rv32_mir, &rv32_opts).unwrap();
         assert!(rv32_proof.within_budget);
@@ -6589,8 +6919,7 @@ fn main() {
         assert_eq!(avr_spec.effective_flash_size(), 61_440);
         let avr_opts = CodegenOptions::from_spec(avr_spec);
         let avr_mir = compile_src_mir(src_avr);
-        let avr_art =
-            build_target_image(&avr_mir, &avr_opts, &root.join("syn_avr64.bin")).unwrap();
+        let avr_art = build_target_image(&avr_mir, &avr_opts, &root.join("syn_avr64.bin")).unwrap();
         assert!(avr_art.bin_path.as_ref().unwrap().is_file());
         assert!(avr_art.bin_size > 0 && avr_art.bin_size <= 61_440);
         assert!(avr_art.elf.audit.is_zero_heap_freestanding());
@@ -6646,7 +6975,9 @@ fn main() {
         assert!(!direct_ll.contains("@__syn_hook_tag_clock_ms"));
         let putc_wrap_start = direct_ll.find("define void @__syn_on_putc(").unwrap();
         let putc_wrap_end = direct_ll[putc_wrap_start..].find("\n}\n").unwrap() + putc_wrap_start;
-        assert!(direct_ll[putc_wrap_start..putc_wrap_end].contains("call void @__syn_fn_uart_putc("));
+        assert!(
+            direct_ll[putc_wrap_start..putc_wrap_end].contains("call void @__syn_fn_uart_putc(")
+        );
         let clk_wrap_start = direct_ll.find("define i32 @__syn_now_ms(").unwrap();
         let clk_wrap_end = direct_ll[clk_wrap_start..].find("\n}\n").unwrap() + clk_wrap_start;
         assert!(direct_ll[clk_wrap_start..clk_wrap_end].contains("call i32 @__syn_fn_hw_ms()"));
@@ -6762,11 +7093,31 @@ fn main() {
         verify_ll_with_opt(&res.build.ll_path).expect("opt verify sys_hooks qemu test");
         assert!(ll.contains("@__syn_hook_tag_putc = internal global i8 0, align 1"));
         assert!(ll.contains("@__syn_rom_call_u32_a2_i32_i32_sb128"));
-        assert!(res.exec.stdout.contains("mode=plain"), "stdout:\n{}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("MODE=UPPER"), "stdout:\n{}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("SYS_HOOKS_OK now=777"), "stdout:\n{}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("rom=123"), "stdout:\n{}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("ON_EXIT_HOOK seen=1"), "stdout:\n{}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("mode=plain"),
+            "stdout:\n{}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("MODE=UPPER"),
+            "stdout:\n{}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("SYS_HOOKS_OK now=777"),
+            "stdout:\n{}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("rom=123"),
+            "stdout:\n{}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("ON_EXIT_HOOK seen=1"),
+            "stdout:\n{}",
+            res.exec.stdout
+        );
 
         let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::default()).unwrap();
         let table = proof.format_table();
@@ -6838,18 +7189,24 @@ fn main() {
         assert!(art.elf.audit.is_zero_heap_freestanding());
 
         let ll_src = std::fs::read_to_string(&art.elf.ll_path).unwrap();
-        assert!(ll_src.contains("arm_aapcscc"), "expected arm_aapcscc RTABI shims");
+        assert!(
+            ll_src.contains("arm_aapcscc"),
+            "expected arm_aapcscc RTABI shims"
+        );
         assert!(!ll_src.contains("@__syn_user_sleep_locks"));
         assert!(!ll_src.contains("@__syn_arch_delay_us"));
 
-        let dis = Command::new(crate::toolchain::find_tool("/bin/llvm-objdump", "llvm-objdump"))
-            .arg("--triple=thumbv7em-none-eabihf")
-            .arg("--mcpu=cortex-m4")
-            .arg("--mattr=+vfp4d16sp")
-            .arg("-d")
-            .arg(&art.elf.elf_path)
-            .output()
-            .expect("disassemble eabihf ELF");
+        let dis = Command::new(crate::toolchain::find_tool(
+            "/bin/llvm-objdump",
+            "llvm-objdump",
+        ))
+        .arg("--triple=thumbv7em-none-eabihf")
+        .arg("--mcpu=cortex-m4")
+        .arg("--mattr=+vfp4d16sp")
+        .arg("-d")
+        .arg(&art.elf.elf_path)
+        .output()
+        .expect("disassemble eabihf ELF");
         assert!(dis.status.success());
         let dis_txt = String::from_utf8_lossy(&dis.stdout);
         assert!(
@@ -6857,14 +7214,20 @@ fn main() {
             "expected CPACR enablement in Reset_Handler disassembly:\n{dis_txt}"
         );
         assert!(
-            dis_txt.contains("vmul.f32") || dis_txt.contains("vfma.f32") || dis_txt.contains("vadd.f32"),
+            dis_txt.contains("vmul.f32")
+                || dis_txt.contains("vfma.f32")
+                || dis_txt.contains("vadd.f32"),
             "expected hardware single-precision VFP instructions:\n{dis_txt}"
         );
 
         let proof = analyze_hardware_stack_high_water(&mir, &opts).unwrap();
         assert_eq!(proof.isr_hw_overhead_bytes, 104);
         assert!(proof.format_table().contains("104B NVIC FPU frame"));
-        assert!(proof.within_budget, "stack budget fail:\n{}", proof.format_table());
+        assert!(
+            proof.within_budget,
+            "stack budget fail:\n{}",
+            proof.format_table()
+        );
     }
 
     #[test]
@@ -7007,7 +7370,8 @@ fn main() {
             "expected direct GEP on @__zev_const_LUT without stack copy:\n{ll}"
         );
 
-        let out_dir = std::env::temp_dir().join(format!("zev_rodata_impl_llvm_{}", std::process::id()));
+        let out_dir =
+            std::env::temp_dir().join(format!("zev_rodata_impl_llvm_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out_dir);
         std::fs::create_dir_all(&out_dir).unwrap();
         let bin_path = out_dir.join("rodata_impl.bin");
@@ -7067,7 +7431,9 @@ fn main() {
             qres.exec.exit_code, qres.exec.stderr
         );
         assert!(
-            qres.exec.stdout.contains("[PORTABLE board=lm3s6965_evb step=0]"),
+            qres.exec
+                .stdout
+                .contains("[PORTABLE board=lm3s6965_evb step=0]"),
             "missing step=0 in QEMU stdout:\n{}",
             qres.exec.stdout
         );
@@ -7084,8 +7450,8 @@ fn main() {
         let f3_bin = out_dir.join("portable_nucleo_f334r8.bin");
         let f3_art = build_target_image(&f3_mir, &f3_opts, &f3_bin).expect("build nucleo_f334r8");
         assert!(f3_art.elf.audit.is_zero_heap_freestanding());
-        let f3_proof =
-            analyze_hardware_stack_high_water(&f3_mir, &f3_opts).expect("nucleo_f334r8 stack proof");
+        let f3_proof = analyze_hardware_stack_high_water(&f3_mir, &f3_opts)
+            .expect("nucleo_f334r8 stack proof");
         assert!(f3_proof.within_budget, "nucleo_f334r8 over SRAM budget");
 
         // 3. ESP32-C6-Pico (`esp32c6_pico`)
@@ -7096,17 +7462,19 @@ fn main() {
         let esp_art =
             build_target_image(&esp_mir, &esp_opts, &esp_bin).expect("build esp32c6_pico");
         assert!(esp_art.elf.audit.is_zero_heap_freestanding());
-        let esp_proof =
-            analyze_hardware_stack_high_water(&esp_mir, &esp_opts).expect("esp32c6_pico stack proof");
+        let esp_proof = analyze_hardware_stack_high_water(&esp_mir, &esp_opts)
+            .expect("esp32c6_pico stack proof");
         assert!(esp_proof.within_budget, "esp32c6_pico over SRAM budget");
 
         // 4. Raspberry Pi Pico W (`rpi_pico_w`)
         let (rp_spec, rp_opts, rp_mir) = compile_for_board("rpi_pico_w");
         assert_eq!(rp_spec.hal_dir.as_deref(), Some("hal/rp2040"));
-        assert_eq!(rp_spec.board_module.as_deref(), Some("bsp/rpi_pico_w_board"));
+        assert_eq!(
+            rp_spec.board_module.as_deref(),
+            Some("bsp/rpi_pico_w_board")
+        );
         let rp_uf2 = out_dir.join("portable_rpi_pico_w.uf2");
-        let rp_art =
-            build_target_image(&rp_mir, &rp_opts, &rp_uf2).expect("build rpi_pico_w");
+        let rp_art = build_target_image(&rp_mir, &rp_opts, &rp_uf2).expect("build rpi_pico_w");
         assert!(rp_art.elf.audit.is_zero_heap_freestanding());
         let rp_proof =
             analyze_hardware_stack_high_water(&rp_mir, &rp_opts).expect("rpi_pico_w stack proof");
@@ -7141,10 +7509,12 @@ fn main() {
 }
 "#;
         let prog = zev_parser::parse_str(src).expect("parse recursive fact");
-        let (mono_progs, _) =
-            zev_sema::analyze_and_monomorphize_programs(&[prog], &zev_sema::AnalyzeOptions::default())
-                .into_result()
-                .expect("non-yielding recursion passes sema");
+        let (mono_progs, _) = zev_sema::analyze_and_monomorphize_programs(
+            &[prog],
+            &zev_sema::AnalyzeOptions::default(),
+        )
+        .into_result()
+        .expect("non-yielding recursion passes sema");
         let mir = zev_mir::lower_programs(&mono_progs).expect("lower recursive fact to MIR");
         let proof = analyze_hardware_stack_high_water(&mir, &CodegenOptions::default())
             .expect("stack analysis for recursive fact");
@@ -7225,8 +7595,16 @@ fn main() {
 "#;
         let (_mir, _ll, res) = run_zev_cortex_m_qemu("wait_block_prio_dl", src);
         assert_eq!(res.exec.exit_code, 0, "stderr={}", res.exec.stderr);
-        assert!(res.exec.stdout.contains("order=111,222"), "stdout={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("beats=3"), "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("order=111,222"),
+            "stdout={}",
+            res.exec.stdout
+        );
+        assert!(
+            res.exec.stdout.contains("beats=3"),
+            "stdout={}",
+            res.exec.stdout
+        );
     }
 
     #[test]
@@ -7248,7 +7626,11 @@ fn main() {
 "#;
         let (_m0, _l0, res0) = run_zev_cortex_m_qemu("int_min_div", int_min_src);
         assert_eq!(res0.exec.exit_code, 0, "stderr={}", res0.exec.stderr);
-        assert!(res0.exec.stdout.contains("r=0"), "stdout={}", res0.exec.stdout);
+        assert!(
+            res0.exec.stdout.contains("r=0"),
+            "stdout={}",
+            res0.exec.stdout
+        );
 
         // 2. All four runtime trap classes exit with code 101 and `[PANIC] ...`
         let cases: [(&str, &str, &str); 5] = [
@@ -7316,10 +7698,10 @@ fn main() {
         ];
 
         for (tag, src, expected_msg) in cases {
-            let prog =
-                zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {tag}: {e:?}"));
+            let prog = zev_parser::parse_str(src).unwrap_or_else(|e| panic!("parse {tag}: {e:?}"));
             zev_sema::analyze_program(&prog).unwrap_or_else(|e| panic!("sema {tag}: {e:?}"));
-            let mir = zev_mir::lower_program(&prog).unwrap_or_else(|e| panic!("lower {tag}: {e:?}"));
+            let mir =
+                zev_mir::lower_program(&prog).unwrap_or_else(|e| panic!("lower {tag}: {e:?}"));
             let elf = test_out_dir().join(format!("{tag}.elf"));
             let res = run_qemu_cortex_m(
                 &mir,
@@ -7371,7 +7753,11 @@ fn main() {
 "#;
         let (_mir, _ll, res) = run_zev_cortex_m_qemu("while_cond_auto_checkpoint", src);
         assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
-        assert!(res.exec.stdout.contains("SPINS="), "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("SPINS="),
+            "stdout={}",
+            res.exec.stdout
+        );
     }
 
     #[test]
@@ -7417,16 +7803,24 @@ fn main() {
         let (_mir, _ll, res) = run_zev_cortex_m_qemu("restart_zero_locals", src);
         assert_eq!(res.exec.exit_code, 0, "stdout={}", res.exec.stdout);
         assert!(
-            res.exec.stdout.contains("ROUND=0 base=42 uninit=0 s2=0 init=7"),
+            res.exec
+                .stdout
+                .contains("ROUND=0 base=42 uninit=0 s2=0 init=7"),
             "stdout={}",
             res.exec.stdout
         );
         assert!(
-            res.exec.stdout.contains("ROUND=1 base=42 uninit=0 s2=0 init=7"),
+            res.exec
+                .stdout
+                .contains("ROUND=1 base=42 uninit=0 s2=0 init=7"),
             "stdout={}",
             res.exec.stdout
         );
-        assert!(res.exec.stdout.contains("[PASS] RESTART_ZERO_OK"), "stdout={}", res.exec.stdout);
+        assert!(
+            res.exec.stdout.contains("[PASS] RESTART_ZERO_OK"),
+            "stdout={}",
+            res.exec.stdout
+        );
     }
 
     #[test]
@@ -7464,13 +7858,18 @@ ram_size = 0x00010000
         assert!(zev_sema::analyze_program(&prog_no_irq).is_ok());
         let mir_no_irq = zev_mir::lower_program(&prog_no_irq).unwrap();
 
-        let mut opts_cm = CodegenOptions::default();
-        opts_cm.spec = Some(cm_deep_spec);
+        let opts_cm = CodegenOptions {
+            spec: Some(cm_deep_spec),
+            ..Default::default()
+        };
         let ll_cm = emit_llvm_ir_with_options(&mir_no_irq, &opts_cm).unwrap();
         let cm_idle_start = ll_cm.find("define void @__syn_idle_sleep()").unwrap();
         let cm_idle_end = ll_cm[cm_idle_start..].find("\n}\n").unwrap() + cm_idle_start;
         let cm_idle_fn = &ll_cm[cm_idle_start..cm_idle_end];
-        assert!(cm_idle_fn.contains("@__syn_has_deadline_waiter"), "cm_idle={cm_idle_fn}");
+        assert!(
+            cm_idle_fn.contains("@__syn_has_deadline_waiter"),
+            "cm_idle={cm_idle_fn}"
+        );
         assert!(cm_idle_fn.contains("-536810224"), "cm_idle={cm_idle_fn}");
 
         // Verify Cortex-M deep-sleep IR passes `opt -passes=verify`.
@@ -7482,14 +7881,22 @@ ram_size = 0x00010000
 
         // 3. RISC-V without attached IRQs uses lightweight 4-nop poll; with attached IRQs uses `wfi`.
         let esp_spec = TargetSpec::load_from_root(&repo_root(), Some("esp32c6"), None).unwrap();
-        let mut opts_rv = CodegenOptions::default();
-        opts_rv.spec = Some(esp_spec.clone());
+        let opts_rv = CodegenOptions {
+            spec: Some(esp_spec.clone()),
+            ..Default::default()
+        };
         let ll_rv_poll = emit_llvm_ir_with_options(&mir_no_irq, &opts_rv).unwrap();
         let p_start = ll_rv_poll.find("define void @__syn_idle_sleep()").unwrap();
         let p_end = ll_rv_poll[p_start..].find("\n}\n").unwrap() + p_start;
         let rv_poll_fn = &ll_rv_poll[p_start..p_end];
-        assert!(!rv_poll_fn.contains("\"wfi"), "expected 4-nop poll:\n{rv_poll_fn}");
-        assert!(rv_poll_fn.contains("nop\\0Anop\\0Anop\\0Anop"), "expected 4-nop poll:\n{rv_poll_fn}");
+        assert!(
+            !rv_poll_fn.contains("\"wfi"),
+            "expected 4-nop poll:\n{rv_poll_fn}"
+        );
+        assert!(
+            rv_poll_fn.contains("nop\\0Anop\\0Anop\\0Anop"),
+            "expected 4-nop poll:\n{rv_poll_fn}"
+        );
         let rv_poll_path = test_out_dir().join("rv_idle_poll.ll");
         std::fs::write(&rv_poll_path, &ll_rv_poll).unwrap();
         verify_ll_with_opt(&rv_poll_path).expect("opt verify rv poll");
@@ -7511,7 +7918,10 @@ fn main() {
         let w_start = ll_rv_wfi.find("define void @__syn_idle_sleep()").unwrap();
         let w_end = ll_rv_wfi[w_start..].find("\n}\n").unwrap() + w_start;
         let rv_wfi_fn = &ll_rv_wfi[w_start..w_end];
-        assert!(rv_wfi_fn.contains("wfi\\0Acsrsi mstatus, 8"), "expected wfi:\n{rv_wfi_fn}");
+        assert!(
+            rv_wfi_fn.contains("wfi\\0Acsrsi mstatus, 8"),
+            "expected wfi:\n{rv_wfi_fn}"
+        );
         let rv_wfi_path = test_out_dir().join("rv_idle_wfi.ll");
         std::fs::write(&rv_wfi_path, &ll_rv_wfi).unwrap();
         verify_ll_with_opt(&rv_wfi_path).expect("opt verify rv wfi");
@@ -7564,11 +7974,21 @@ fn main() {
         let mir = zev_mir::lower_program(&prog).unwrap();
         let ll = emit_llvm_ir_with_options(&mir, &CodegenOptions::default()).unwrap();
         // Constant shift (`s35 >> 4`) folds the shift count directly (`lshr i32 ..., 4`) without `and i32 4, 31`.
-        assert!(ll.contains(", 4\n"), "expected direct constant shift `, 4` in IR:\n{ll}");
-        assert!(!ll.contains("and i32 4, 31"), "unexpected mask on constant shift:\n{ll}");
+        assert!(
+            ll.contains(", 4\n"),
+            "expected direct constant shift `, 4` in IR:\n{ll}"
+        );
+        assert!(
+            !ll.contains("and i32 4, 31"),
+            "unexpected mask on constant shift:\n{ll}"
+        );
 
         let (_mir, _ll, qres) = run_zev_cortex_m_qemu("masked_variable_bit_shifts", src);
-        assert!(qres.exec.stdout.contains("SHIFT_MASK_OK"), "unexpected qemu output: {}", qres.exec.stdout);
+        assert!(
+            qres.exec.stdout.contains("SHIFT_MASK_OK"),
+            "unexpected qemu output: {}",
+            qres.exec.stdout
+        );
     }
 
     #[test]
@@ -7735,8 +8155,9 @@ fn main() {
         ] {
             let mut m = mir.clone();
             m.functions.push(mk_fn(label, ty, val));
-            let err = emit_llvm_ir_with_options(&m, &CodegenOptions::host_linux())
-                .expect_err(&format!("{label} must raise ICE instead of emitting invalid LLVM constant"));
+            let err = emit_llvm_ir_with_options(&m, &CodegenOptions::host_linux()).expect_err(
+                &format!("{label} must raise ICE instead of emitting invalid LLVM constant"),
+            );
             assert_eq!(err.stage, "ice", "{label}: {err:?}");
         }
 

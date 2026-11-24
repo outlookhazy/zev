@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use zev_ast::{
     ArrayLen, Block, CallArg, CatchClause, CatchParam, Expr, ExprKind, FieldInit, FnDecl,
     FormatPart, GenericArg, GenericParamKind, Ident, IsrDecl, Item, ItemKind, MmioDecl,
-    MmioDeclKind, OsPrimitiveType, Param, Program, SpawnStmt, Span, Stmt, StmtKind, SwitchArm,
+    MmioDeclKind, OsPrimitiveType, Param, Program, Span, SpawnStmt, Stmt, StmtKind, SwitchArm,
     SwitchPat, TaskDecl, TypeExpr, TypeKind, WaitArm, WaitTimerArm,
 };
 
@@ -44,10 +44,7 @@ struct ModuleExports {
 /// Resolution of a single `import` statement inside a file.
 #[derive(Clone, Debug)]
 enum ResolvedImport {
-    Module {
-        key: ModuleKey,
-        dot_path: String,
-    },
+    Module { key: ModuleKey, dot_path: String },
 }
 
 #[derive(Clone, Debug)]
@@ -330,11 +327,7 @@ impl ModuleLinker {
             Vec::with_capacity(root_programs.len());
         for (prog, fname) in root_programs {
             let importer_path = fname.and_then(real_file_path);
-            let res = self.resolve_imports_in_program(
-                prog,
-                importer_path.as_deref(),
-                *fname,
-            );
+            let res = self.resolve_imports_in_program(prog, importer_path.as_deref(), *fname);
             root_imports.push(res);
         }
 
@@ -429,10 +422,7 @@ impl ModuleLinker {
                 }
             }
         }
-        for (offset, ((prog, fname), imports)) in root_programs
-            .iter()
-            .zip(root_imports.into_iter())
-            .enumerate()
+        for (offset, ((prog, fname), imports)) in root_programs.iter().zip(root_imports).enumerate()
         {
             let prog_idx = order.len() + offset;
             let desugared = desugar_inline_mmios(prog);
@@ -506,7 +496,9 @@ impl ModuleLinker {
                     Diagnostic::new(
                         DiagnosticKind::ModuleError,
                         imp.span,
-                        format!("import alias `{alias}` collides with built-in namespace `{alias}`"),
+                        format!(
+                            "import alias `{alias}` collides with built-in namespace `{alias}`"
+                        ),
                     ),
                     importer_label,
                 );
@@ -524,7 +516,13 @@ impl ModuleLinker {
                 continue;
             }
 
-            match self.locate_module(&imp.path, &dot_path, importer_file, imp.span, importer_label) {
+            match self.locate_module(
+                &imp.path,
+                &dot_path,
+                importer_file,
+                imp.span,
+                importer_label,
+            ) {
                 LocateResult::FoundFile(path) => {
                     let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                     let key = ModuleKey::File(canon.clone());
@@ -583,6 +581,7 @@ impl ModuleLinker {
         imports
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn ensure_loaded(
         &mut self,
         key: ModuleKey,
@@ -594,7 +593,10 @@ impl ModuleLinker {
         importer_label: Option<&str>,
     ) -> bool {
         if let Some(pos) = self.visiting.iter().position(|(k, _)| k == &key) {
-            let mut chain: Vec<&str> = self.visiting[pos..].iter().map(|(_, p)| p.as_str()).collect();
+            let mut chain: Vec<&str> = self.visiting[pos..]
+                .iter()
+                .map(|(_, p)| p.as_str())
+                .collect();
             chain.push(dot_path);
             self.emit(
                 Diagnostic::new(
@@ -639,11 +641,14 @@ impl ModuleLinker {
                 let mut d = Diagnostic::new(
                     DiagnosticKind::ModuleError,
                     pe.span,
-                    format!("syntax error while parsing module `{dot_path}`: {}", pe.message),
+                    format!(
+                        "syntax error while parsing module `{dot_path}`: {}",
+                        pe.message
+                    ),
                 )
                 .with_file(Some(file_display.clone()));
                 if let Some(hint) = pe.hint {
-                    d = d.with_note(hint);
+                    d = d.with_note(String::from(hint));
                 }
                 self.diagnostics.push(d);
             }
@@ -656,8 +661,7 @@ impl ModuleLinker {
         let declared_extern_c = collect_declared_extern_c(&desugared);
 
         self.visiting.push((key.clone(), dot_path.to_owned()));
-        let imports =
-            self.resolve_imports_in_program(&desugared, disk_path, Some(&file_display));
+        let imports = self.resolve_imports_in_program(&desugared, disk_path, Some(&file_display));
         self.visiting.pop();
 
         // Merge public symbols re-exported via `pub import ...;` into `exports`.
@@ -720,8 +724,10 @@ impl ModuleLinker {
                     }
                     continue;
                 }
-                reexport_type_origins
-                    .insert(tname.clone(), (sym.canonical_name.clone(), child_dot.clone()));
+                reexport_type_origins.insert(
+                    tname.clone(),
+                    (sym.canonical_name.clone(), child_dot.clone()),
+                );
                 exports.types.insert(tname.clone(), sym.clone());
                 reexported_enum_canons.insert(sym.canonical_name.clone());
             }
@@ -756,8 +762,10 @@ impl ModuleLinker {
                     }
                     continue;
                 }
-                reexport_value_origins
-                    .insert(vname.clone(), (sym.canonical_name.clone(), child_dot.clone()));
+                reexport_value_origins.insert(
+                    vname.clone(),
+                    (sym.canonical_name.clone(), child_dot.clone()),
+                );
                 exports.values.insert(vname.clone(), sym.clone());
             }
         }
@@ -1157,13 +1165,9 @@ impl<'a> AstRewriter<'a> {
         preferred_ns: Option<ExportNs>,
         span: Span,
     ) -> Option<ExportedSymbol> {
-        let Some(res) = self.imports.get(alias) else {
-            return None;
-        };
+        let res = self.imports.get(alias)?;
         let ResolvedImport::Module { key, dot_path } = res;
-        let Some((_, exports)) = self.exports_by_key.get(key) else {
-            return None;
-        };
+        let (_, exports) = self.exports_by_key.get(key)?;
 
         let found = match preferred_ns {
             Some(ExportNs::Type) => exports.types.get(member),
@@ -1281,7 +1285,10 @@ impl<'a> AstRewriter<'a> {
                         if path.len() != 2 {
                             self.emit(
                                 span,
-                                format!("expected `<alias>.<GenericType><...>` after `{}`", first.name),
+                                format!(
+                                    "expected `<alias>.<GenericType><...>` after `{}`",
+                                    first.name
+                                ),
                             );
                             TypeKind::GenericPath {
                                 path: path.clone(),
@@ -1294,7 +1301,10 @@ impl<'a> AstRewriter<'a> {
                             span,
                         ) {
                             TypeKind::Generic {
-                                base: Ident::new(sym.canonical_name, first.span.merge(path[1].span)),
+                                base: Ident::new(
+                                    sym.canonical_name,
+                                    first.span.merge(path[1].span),
+                                ),
                                 args: new_args,
                             }
                         } else {
@@ -1376,7 +1386,7 @@ impl<'a> AstRewriter<'a> {
     fn rewrite_generic_arg(&mut self, arg: &GenericArg) -> GenericArg {
         match arg {
             GenericArg::Type(t) => GenericArg::Type(self.rewrite_type(t)),
-            GenericArg::Const(e) => GenericArg::Const(self.rewrite_expr(e)),
+            GenericArg::Const(e) => GenericArg::Const(Box::new(self.rewrite_expr(e))),
         }
     }
 
@@ -1635,8 +1645,7 @@ impl<'a> AstRewriter<'a> {
             }
             SwitchPat::Ident { prefix, name, span } => {
                 if let Some(pref) = prefix {
-                    if !self.in_local_scope(&pref.name)
-                        && self.is_resolved_module_alias(&pref.name)
+                    if !self.in_local_scope(&pref.name) && self.is_resolved_module_alias(&pref.name)
                     {
                         if let Some(sym) = self.lookup_imported_member(
                             &pref.name,
@@ -1757,7 +1766,8 @@ impl<'a> AstRewriter<'a> {
             },
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(alias) = &target.kind {
-                    if !self.in_local_scope(&alias.name) && self.is_resolved_module_alias(&alias.name)
+                    if !self.in_local_scope(&alias.name)
+                        && self.is_resolved_module_alias(&alias.name)
                     {
                         if let Some(sym) =
                             self.lookup_imported_member(&alias.name, &field.name, None, span)
@@ -1812,7 +1822,8 @@ impl<'a> AstRewriter<'a> {
             } => {
                 let new_args = self.rewrite_call_args(args);
                 if let ExprKind::Ident(alias) = &receiver.kind {
-                    if !self.in_local_scope(&alias.name) && self.is_resolved_module_alias(&alias.name)
+                    if !self.in_local_scope(&alias.name)
+                        && self.is_resolved_module_alias(&alias.name)
                     {
                         let callee_span = receiver.span.merge(method.span);
                         if let Some(sym) = self.lookup_imported_member(
@@ -1831,7 +1842,10 @@ impl<'a> AstRewriter<'a> {
                             return Expr::new(
                                 ExprKind::Call {
                                     callee: Box::new(Expr::new(
-                                        ExprKind::Ident(Ident::new(sym.canonical_name, callee_span)),
+                                        ExprKind::Ident(Ident::new(
+                                            sym.canonical_name,
+                                            callee_span,
+                                        )),
                                         callee_span,
                                     )),
                                     generic_args: Vec::new(),
@@ -1964,12 +1978,12 @@ impl<'a> AstRewriter<'a> {
                 self.pop_scope();
                 ExprKind::Catch {
                     expr: new_expr,
-                    clause: CatchClause {
+                    clause: Box::new(CatchClause {
                         err_param: new_err_param,
                         partial_param: new_partial_param,
                         body: new_body,
                         span: clause.span,
-                    },
+                    }),
                 }
             }
         };
@@ -2013,14 +2027,26 @@ fn check_pub_surface_type(
             }
             for a in args {
                 if let GenericArg::Type(t) = a {
-                    check_pub_surface_type(t, generic_type_params, local_type_is_pub, item_desc, rw);
+                    check_pub_surface_type(
+                        t,
+                        generic_type_params,
+                        local_type_is_pub,
+                        item_desc,
+                        rw,
+                    );
                 }
             }
         }
         TypeKind::GenericPath { args, .. } => {
             for a in args {
                 if let GenericArg::Type(t) = a {
-                    check_pub_surface_type(t, generic_type_params, local_type_is_pub, item_desc, rw);
+                    check_pub_surface_type(
+                        t,
+                        generic_type_params,
+                        local_type_is_pub,
+                        item_desc,
+                        rw,
+                    );
                 }
             }
         }
@@ -2213,11 +2239,18 @@ fn rewrite_program(
                 let mut new_methods = Vec::with_capacity(imp.methods.len());
                 for m in &imp.methods {
                     if m.is_pub {
-                        let desc = format!("method `{}.{}`", imp.target_name.name, m.func.name.name);
+                        let desc =
+                            format!("method `{}.{}`", imp.target_name.name, m.func.name.name);
                         for p in &m.func.params {
                             check_pub_surface_type(&p.ty, &gp, &local_type_is_pub, &desc, &mut rw);
                         }
-                        check_pub_surface_type(&m.func.ret_type, &gp, &local_type_is_pub, &desc, &mut rw);
+                        check_pub_surface_type(
+                            &m.func.ret_type,
+                            &gp,
+                            &local_type_is_pub,
+                            &desc,
+                            &mut rw,
+                        );
                         if let Some(zev_ast::ErrorSpec::Typed(err_ty)) = &m.func.error_spec {
                             check_pub_surface_type(err_ty, &gp, &local_type_is_pub, &desc, &mut rw);
                         }
@@ -2226,7 +2259,9 @@ fn rewrite_program(
                     let new_ret = rw.rewrite_type(&m.func.ret_type);
                     let new_err = m.func.error_spec.as_ref().map(|es| match es {
                         zev_ast::ErrorSpec::Bare(sp) => zev_ast::ErrorSpec::Bare(*sp),
-                        zev_ast::ErrorSpec::Typed(t) => zev_ast::ErrorSpec::Typed(rw.rewrite_type(t)),
+                        zev_ast::ErrorSpec::Typed(t) => {
+                            zev_ast::ErrorSpec::Typed(rw.rewrite_type(t))
+                        }
                     });
                     rw.push_scope();
                     if m.receiver.is_some() {
@@ -2504,14 +2539,25 @@ fn rewrite_program(
                     }
                 }
 
-                Item::with_pub(item.attrs.clone(), item.is_pub, ItemKind::Fn(new_decl), item.span)
+                Item::with_pub(
+                    item.attrs.clone(),
+                    item.is_pub,
+                    ItemKind::Fn(new_decl),
+                    item.span,
+                )
             }
             ItemKind::Task(t) => {
                 if item.is_pub {
                     let desc = format!("task `{}`", t.name.name);
                     let empty_gp = BTreeSet::new();
                     for p in &t.params {
-                        check_pub_surface_type(&p.ty, &empty_gp, &local_type_is_pub, &desc, &mut rw);
+                        check_pub_surface_type(
+                            &p.ty,
+                            &empty_gp,
+                            &local_type_is_pub,
+                            &desc,
+                            &mut rw,
+                        );
                     }
                 }
                 let new_params = rw.rewrite_params(&t.params);
@@ -2540,7 +2586,13 @@ fn rewrite_program(
                     let desc = format!("isr `{}`", i.vector.name);
                     let empty_gp = BTreeSet::new();
                     for p in &i.params {
-                        check_pub_surface_type(&p.ty, &empty_gp, &local_type_is_pub, &desc, &mut rw);
+                        check_pub_surface_type(
+                            &p.ty,
+                            &empty_gp,
+                            &local_type_is_pub,
+                            &desc,
+                            &mut rw,
+                        );
                     }
                 }
                 let new_params = rw.rewrite_params(&i.params);
@@ -2594,13 +2646,18 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
         (TypeKind::Slice(x), TypeKind::Slice(y))
         | (TypeKind::Ptr(x), TypeKind::Ptr(y))
         | (TypeKind::Lease(x), TypeKind::Lease(y)) => types_structurally_equal(x, y),
+        (TypeKind::Array { elem: ex, len: lx }, TypeKind::Array { elem: ey, len: ly }) => {
+            lx == ly && types_structurally_equal(ex, ey)
+        }
         (
-            TypeKind::Array { elem: ex, len: lx },
-            TypeKind::Array { elem: ey, len: ly },
-        ) => lx == ly && types_structurally_equal(ex, ey),
-        (
-            TypeKind::FnPtr { params: px, ret: rx },
-            TypeKind::FnPtr { params: py, ret: ry },
+            TypeKind::FnPtr {
+                params: px,
+                ret: rx,
+            },
+            TypeKind::FnPtr {
+                params: py,
+                ret: ry,
+            },
         ) => {
             px.len() == py.len()
                 && px
@@ -2615,7 +2672,7 @@ fn types_structurally_equal(a: &TypeExpr, b: &TypeExpr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ModuleKey, ModuleLinker, embedded_module_source};
+    use super::{embedded_module_source, ModuleKey, ModuleLinker};
     use crate::diag::DiagnosticKind;
 
     #[test]

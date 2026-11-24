@@ -1041,15 +1041,15 @@ mod tests {
         for n in 1..=18 {
             let code = format!("P{n:04}");
             let lower = code.to_ascii_lowercase();
-            let doc = lookup_doc(Some(&lower), false)
-                .unwrap_or_else(|e| panic!("missing {code}: {e}"));
+            let doc =
+                lookup_doc(Some(&lower), false).unwrap_or_else(|e| panic!("missing {code}: {e}"));
             assert!(doc.contains(&code));
         }
         for n in 1..=34 {
             let code = format!("E{n:04}");
             let lower = code.to_ascii_lowercase();
-            let doc = lookup_doc(Some(&lower), false)
-                .unwrap_or_else(|e| panic!("missing {code}: {e}"));
+            let doc =
+                lookup_doc(Some(&lower), false).unwrap_or_else(|e| panic!("missing {code}: {e}"));
             assert!(doc.contains(&code));
         }
 
@@ -1090,7 +1090,11 @@ mod tests {
                     e.code, le, e.good_zev
                 )
             });
-            assert!(!host_ll.is_empty(), "empty host LLVM IR output for {}", e.code);
+            assert!(
+                !host_ll.is_empty(),
+                "empty host LLVM IR output for {}",
+                e.code
+            );
 
             let ll_src = zev_codegen_llvm::emit_llvm_ir(&mir).unwrap_or_else(|le| {
                 panic!(
@@ -1156,7 +1160,10 @@ mod tests {
                 cur.push('\n');
             }
         }
-        assert!(!in_zev, "unclosed ```zev fence starting at line {start_line}");
+        assert!(
+            !in_zev,
+            "unclosed ```zev fence starting at line {start_line}"
+        );
         fences
     }
 
@@ -1233,7 +1240,10 @@ mod tests {
                 }
             }
         }
-        assert!(checked >= 15, "expected at least 15 fenced zev snippets, found {checked}");
+        assert!(
+            checked >= 15,
+            "expected at least 15 fenced zev snippets, found {checked}"
+        );
     }
 
     #[test]
@@ -1279,7 +1289,10 @@ mod tests {
                 i += 1;
             }
         }
-        assert!(total_cited >= 40, "expected at least 40 cited codes, found {total_cited}");
+        assert!(
+            total_cited >= 40,
+            "expected at least 40 cited codes, found {total_cited}"
+        );
     }
 
     #[test]

@@ -84,5 +84,6 @@ nucleo-f334r8:
 flash-nucleo-f334r8:
 	$(ZEVC) flash --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev --port $(PORT)
 
+# Cap test parallelism at 4 to bound concurrent clang/ld.lld/qemu subprocesses and peak RAM.
 test:
-	$(CARGO) test --workspace -- --test-threads=2
+	$(CARGO) test --workspace -- --test-threads=4

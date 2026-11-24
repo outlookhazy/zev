@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::target_spec::{CpuIsa, ImageFormat, IrqModel, TargetSpec, discover_spec_roots};
+use crate::target_spec::{discover_spec_roots, CpuIsa, ImageFormat, IrqModel, TargetSpec};
 
 /// Compatibility target alias mapping legacy hardcoded enum variants onto declarative `chips/` + `boards/` TOMLs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,9 +204,7 @@ impl CodegenOptions {
                 TargetArch::Thumbv6mRp2040 => TargetSpec::resolve(None, Some("rpi_pico_w"))?,
                 TargetArch::Riscv32Esp32C6 => TargetSpec::resolve(None, Some("esp32c6_pico"))?,
                 TargetArch::AvrAtmega328p => TargetSpec::resolve(None, Some("arduino_uno"))?,
-                TargetArch::AvrAtmega4809 => {
-                    TargetSpec::resolve(None, Some("arduino_nano_every"))?
-                }
+                TargetArch::AvrAtmega4809 => TargetSpec::resolve(None, Some("arduino_nano_every"))?,
             };
             let def = Self::default();
             if self.target == TargetArch::Thumbv7mNoneEabi
@@ -235,7 +233,7 @@ impl CodegenOptions {
                 target: TargetArch::Riscv32Esp32C6,
                 spec: None,
                 hal_dir: None,
-            board_module: None,
+                board_module: None,
                 flash_origin: 0x4200_0000,
                 flash_len: 4 * 1024 * 1024,
                 ram_origin: 0x4080_0000,
@@ -260,7 +258,7 @@ impl CodegenOptions {
                 target: TargetArch::AvrAtmega328p,
                 spec: None,
                 hal_dir: None,
-            board_module: None,
+                board_module: None,
                 flash_origin: 0x0000_0000,
                 flash_len: 32_256,
                 ram_origin: 0x0000_0100,
@@ -282,7 +280,7 @@ impl CodegenOptions {
                 target: TargetArch::AvrAtmega4809,
                 spec: None,
                 hal_dir: None,
-            board_module: None,
+                board_module: None,
                 flash_origin: 0x0000_0000,
                 flash_len: 49_152,
                 ram_origin: 0x0000_2800,
@@ -300,7 +298,7 @@ impl CodegenOptions {
                 target: TargetArch::Thumbv6mRp2040,
                 spec: None,
                 hal_dir: None,
-            board_module: None,
+                board_module: None,
                 flash_origin: 0x2000_0000,
                 flash_len: 264 * 1024,
                 ram_origin: 0x2000_0000,
@@ -811,8 +809,8 @@ pub fn parse_llvm_major_version(version_output: &str) -> Option<(u32, String)> {
 
 fn probe_llvm_version(bin: &Path) -> Option<(u32, String)> {
     type CacheKey = (PathBuf, Option<SystemTime>, Option<u64>);
-    static VERSION_CACHE: OnceLock<Mutex<HashMap<CacheKey, Option<(u32, String)>>>> =
-        OnceLock::new();
+    type VersionCache = Mutex<HashMap<CacheKey, Option<(u32, String)>>>;
+    static VERSION_CACHE: OnceLock<VersionCache> = OnceLock::new();
 
     let meta = fs::metadata(bin).ok();
     let key: CacheKey = (
@@ -1251,7 +1249,13 @@ pub fn inspect_elf_symbols(elf_path: &Path) -> Result<ElfSymbolAudit, CodegenErr
 
     let mut audit = ElfSymbolAudit::default();
     let forbidden = [
-        "malloc", "calloc", "realloc", "free", "_sbrk", "sbrk", "__libc_start_main",
+        "malloc",
+        "calloc",
+        "realloc",
+        "free",
+        "_sbrk",
+        "sbrk",
+        "__libc_start_main",
     ];
 
     for i in 0..e_shnum {
@@ -1541,12 +1545,15 @@ pub fn objcopy_elf_to_bin(elf_path: &Path, out_bin: &Path) -> Result<Vec<u8>, Co
             format!("llvm-objcopy exited with {}: {}", out.status, stderr.trim()),
         ));
     }
-    fs::read(out_bin).map_err(|e| {
-        CodegenError::new("io", format!("failed to read {}: {e}", out_bin.display()))
-    })
+    fs::read(out_bin)
+        .map_err(|e| CodegenError::new("io", format!("failed to read {}: {e}", out_bin.display())))
 }
 
-fn measure_static_sram(elf_path: &Path, spec: &TargetSpec, bin_len: usize) -> Result<u64, CodegenError> {
+fn measure_static_sram(
+    elf_path: &Path,
+    spec: &TargetSpec,
+    bin_len: usize,
+) -> Result<u64, CodegenError> {
     if spec.code_in_ram {
         let sizes = inspect_elf_sizes(elf_path)?;
         let padded_bin_len = (bin_len as u64).next_multiple_of(256);
@@ -1587,18 +1594,16 @@ fn validate_bin_against_spec(
         ));
     }
     let magic = spec.header_magic_bytes();
-    if !magic.is_empty() {
-        if bytes.len() < magic.len() || bytes[..magic.len()] != magic[..] {
-            let got_len = bytes.len().min(magic.len());
-            return Err(CodegenError::new(
-                "target-image",
-                format!(
-                    "`{target_label}` image header mismatch at offset 0: got {:02x?}, expected {:02x?}",
-                    &bytes[..got_len],
-                    magic
-                ),
-            ));
-        }
+    if !magic.is_empty() && (bytes.len() < magic.len() || bytes[..magic.len()] != magic[..]) {
+        let got_len = bytes.len().min(magic.len());
+        return Err(CodegenError::new(
+            "target-image",
+            format!(
+                "`{target_label}` image header mismatch at offset 0: got {:02x?}, expected {:02x?}",
+                &bytes[..got_len],
+                magic
+            ),
+        ));
     }
     if spec.reset_first_word_mask != 0 {
         if bytes.len() < 2 {
@@ -1619,7 +1624,10 @@ fn validate_bin_against_spec(
         }
     }
     let static_sram = measure_static_sram(elf_path, spec, bytes.len())?;
-    let max_static = u64::from(spec.sram_budget_bytes.saturating_sub(spec.stack_reserve_bytes));
+    let max_static = u64::from(
+        spec.sram_budget_bytes
+            .saturating_sub(spec.stack_reserve_bytes),
+    );
     if spec.stack_reserve_bytes > 0 && static_sram >= max_static && !spec.code_in_ram {
         return Err(CodegenError::new(
             "target-image",
@@ -1873,10 +1881,7 @@ pub(crate) fn read_elf32_sym_addr(elf_path: &Path, target_name: &str) -> Option<
 /// verifying reset `jmp` vector at `0x0000`, `<= 32,256 B` Optiboot Flash budget, and `< 1,792 B`
 /// static SRAM budget (reserving `>= 256 B` hardware call stack in the 2 KB SRAM).
 /// Legacy compatibility helper delegating via `arduino_uno` TOML spec.
-pub fn objcopy_elf_to_avr_bin(
-    elf_path: &Path,
-    out_bin: &Path,
-) -> Result<(u64, u64), CodegenError> {
+pub fn objcopy_elf_to_avr_bin(elf_path: &Path, out_bin: &Path) -> Result<(u64, u64), CodegenError> {
     let spec = TargetSpec::resolve(None, Some("arduino_uno"))?;
     let bytes = objcopy_elf_to_bin(elf_path, out_bin)?;
     let sram_static_bytes = validate_bin_against_spec(&spec, elf_path, &bytes)?;
@@ -1956,7 +1961,7 @@ pub fn flash_avr_nano_every_bin(bin_path: &Path, port: &str) -> Result<String, C
 #[cfg(test)]
 mod tests {
     use super::{
-        MIN_LLVM_MAJOR, check_llvm_tool_version, find_tool_in_dirs, parse_llvm_major_version,
+        check_llvm_tool_version, find_tool_in_dirs, parse_llvm_major_version, MIN_LLVM_MAJOR,
     };
 
     #[test]
@@ -1975,11 +1980,17 @@ mod tests {
         );
         assert_eq!(
             parse_llvm_major_version("Ubuntu LLD 18.1.3 (compatible with GNU linkers)"),
-            Some((18, "Ubuntu LLD 18.1.3 (compatible with GNU linkers)".to_string()))
+            Some((
+                18,
+                "Ubuntu LLD 18.1.3 (compatible with GNU linkers)".to_string()
+            ))
         );
         assert_eq!(
             parse_llvm_major_version("clang version 23.1.5 (Fedora 23.1.5-2.fc45)"),
-            Some((23, "clang version 23.1.5 (Fedora 23.1.5-2.fc45)".to_string()))
+            Some((
+                23,
+                "clang version 23.1.5 (Fedora 23.1.5-2.fc45)".to_string()
+            ))
         );
         // Apple Xcode clang versions must not be confused with upstream LLVM versions.
         assert_eq!(
@@ -1994,7 +2005,8 @@ mod tests {
     fn rejects_old_llvm_toolchain_and_prefers_llvm_23_candidate() {
         use std::os::unix::fs::PermissionsExt;
 
-        let base = std::env::temp_dir().join(format!("zev-toolchain-ver-test-{}", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("zev-toolchain-ver-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let dir_old = base.join("old_bin");
         let dir_new = base.join("new_bin");
@@ -2004,7 +2016,9 @@ mod tests {
         let write_mock = |path: &std::path::Path, banner: &str| {
             let script = format!("#!/bin/sh\necho \"{banner}\"\n");
             std::fs::write(path, script).expect("write mock tool");
-            let mut perms = std::fs::metadata(path).expect("stat mock tool").permissions();
+            let mut perms = std::fs::metadata(path)
+                .expect("stat mock tool")
+                .permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(path, perms).expect("chmod mock tool");
         };

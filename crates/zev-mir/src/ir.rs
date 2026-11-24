@@ -126,7 +126,12 @@ impl MirType {
     pub fn is_unsigned(&self) -> bool {
         matches!(
             self.host_value_type(),
-            MirType::Bool | MirType::U8 | MirType::U16 | MirType::U32 | MirType::U64 | MirType::Usize
+            MirType::Bool
+                | MirType::U8
+                | MirType::U16
+                | MirType::U32
+                | MirType::U64
+                | MirType::Usize
         )
     }
 
@@ -619,15 +624,9 @@ pub enum MirFmtChunk {
     /// Raw `[]u8` byte slice written verbatim (`{slice}`).
     Bytes(MirExpr),
     /// Enum variant name (`f"{err}"` -> `"BadCrc"`). `enum_name` is also recorded in `MirModule.formatted_enums`.
-    EnumName {
-        enum_name: String,
-        value: MirExpr,
-    },
+    EnumName { enum_name: String, value: MirExpr },
     /// Debug-formatted primitive slice `[e0, e1, ...]` (`{slice:?}` or `{arr:?}`).
-    DebugSlice {
-        elem_ty: MirType,
-        slice: MirExpr,
-    },
+    DebugSlice { elem_ty: MirType, slice: MirExpr },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -775,25 +774,15 @@ pub enum MirPrimNonBlockingOp {
 /// Built-in system, hardware SVD, and simulation intrinsics.
 #[derive(Debug, Clone)]
 pub enum MirIntrinsicOp {
-    UseSystick {
-        hz: MirExpr,
-    },
-    SetPriority {
-        prio: MirPriority,
-    },
-    SysOp {
-        method: String,
-        args: Vec<MirExpr>,
-    },
+    UseSystick { hz: MirExpr },
+    SetPriority { prio: MirPriority },
+    SysOp { method: String, args: Vec<MirExpr> },
 }
 
 /// Switch arm pattern (`Variant` or integer literal or wildcard `_`).
 #[derive(Debug, Clone)]
 pub enum MirSwitchPattern {
-    EnumVariant {
-        enum_name: String,
-        variant: String,
-    },
+    EnumVariant { enum_name: String, variant: String },
     Int(i128),
     Bool(bool),
 }
@@ -823,9 +812,7 @@ pub enum MirYieldKind {
         resume_bb: BlockId,
     },
     /// Demand-driven cooperative CPU share (`should_share()`) at unbounded loop back-edges, `checkpoint()`, or `restart;`.
-    ShareCheckpoint {
-        resume_bb: BlockId,
-    },
+    ShareCheckpoint { resume_bb: BlockId },
     /// Blocking receive on unified `inbox<T, N>`, optionally bounded by `timeout_deadline_var`.
     /// Single primitive arm inside a unified atomic `MirYieldKind::Wait`.
     Wait {
@@ -1597,7 +1584,7 @@ pub struct MirSpawnInstance {
 #[derive(Debug, Clone)]
 pub enum MirBootStep {
     /// Ordinary non-yielding statement executed during sequential boot.
-    Stmt(MirStmt),
+    Stmt(Box<MirStmt>),
     /// Sequential boot call to a yielding function (e.g. `run_power_on_self_test()`),
     /// driven to completion before spawned tasks begin!
     RunYieldingFn {
@@ -1606,10 +1593,7 @@ pub enum MirBootStep {
         dst: Option<MirCallDst>,
     },
     /// Activate static task slot `slot_id` with its spawn arguments.
-    SpawnActivate {
-        slot_id: usize,
-        args: Vec<MirExpr>,
-    },
+    SpawnActivate { slot_id: usize, args: Vec<MirExpr> },
 }
 
 /// Sequential entry point (`fn main()`) split into boot initialization + optional supervisor task.

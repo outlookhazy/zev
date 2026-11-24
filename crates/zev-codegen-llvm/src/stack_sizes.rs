@@ -28,8 +28,8 @@ use crate::arm_cortex_m::sanitize_ident;
 use crate::riscv32::assign_rv_irq_routes_for_spec;
 use crate::target_spec::{CpuIsa, TargetSpec};
 use crate::toolchain::{
-    CodegenError, CodegenOptions, inspect_elf_sizes, link_obj_to_elf, optimize_ll_with_opt,
-    require_llvm_tool, synthesize_target_linker_script,
+    inspect_elf_sizes, link_obj_to_elf, optimize_ll_with_opt, require_llvm_tool,
+    synthesize_target_linker_script, CodegenError, CodegenOptions,
 };
 
 fn parse_rom_call_stack_bound(sym: &str) -> Option<u64> {
@@ -98,14 +98,20 @@ impl HardwareStackProof {
         };
 
         let mut out = String::new();
-        out.push_str("\n================================================================================\n");
+        out.push_str(
+            "\n================================================================================\n",
+        );
         let _ = writeln!(out, "  HARDWARE SINGLE-STACK + .BSS HIGH-WATER PROOF");
         let _ = writeln!(out, "  Target   : {target_label} [{}]", self.opt_level);
         let _ = writeln!(out, "  Analyzer : {analyzer_label}");
-        out.push_str("================================================================================\n\n");
+        out.push_str(
+            "================================================================================\n\n",
+        );
 
         out.push_str("1. Linked ELF Section Footprint (llvm-size)\n");
-        out.push_str("--------------------------------------------------------------------------------\n");
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
         let text_label = if self.code_in_ram {
             "SRAM Code (.text + .rodata)"
         } else {
@@ -117,8 +123,16 @@ impl HardwareStackProof {
             "Static SRAM (.data + .bss)"
         };
         let _ = writeln!(out, "  {:<36} {:>10} B", text_label, self.text_bytes);
-        let _ = writeln!(out, "  {:<36} {:>10} B", "Initialized SRAM (.data)", self.data_bytes);
-        let _ = writeln!(out, "  {:<36} {:>10} B", "Zero-Init SRAM (.bss)", self.bss_bytes);
+        let _ = writeln!(
+            out,
+            "  {:<36} {:>10} B",
+            "Initialized SRAM (.data)", self.data_bytes
+        );
+        let _ = writeln!(
+            out,
+            "  {:<36} {:>10} B",
+            "Zero-Init SRAM (.bss)", self.bss_bytes
+        );
         let _ = writeln!(
             out,
             "  {:<36} {:>10} B",
@@ -127,7 +141,9 @@ impl HardwareStackProof {
         out.push('\n');
 
         out.push_str("2. Worst-Case Hardware Call Stack Proof\n");
-        out.push_str("--------------------------------------------------------------------------------\n");
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
         let _ = writeln!(
             out,
             "  {:<36} {:>10} B",
@@ -168,7 +184,9 @@ impl HardwareStackProof {
         out.push('\n');
 
         out.push_str("3. Total SRAM High-Water Budget Verdict\n");
-        out.push_str("--------------------------------------------------------------------------------\n");
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
         let static_sram_lbl = if self.code_in_ram {
             "Static SRAM (.text + .data + .bss)"
         } else {
@@ -184,7 +202,9 @@ impl HardwareStackProof {
             "  {:<36} {:>10} B",
             "Peak Hardware Stack", self.peak_stack_bytes
         );
-        out.push_str("  ------------------------------------------------------------------------------\n");
+        out.push_str(
+            "  ------------------------------------------------------------------------------\n",
+        );
         let _ = writeln!(
             out,
             "  {:<36} {:>10} B",
@@ -205,7 +225,9 @@ impl HardwareStackProof {
             format!("FAIL (exceeds SRAM budget by {} B!)", -margin)
         };
         let _ = writeln!(out, "  {:<36}   {verdict}", "Budget Status");
-        out.push_str("================================================================================\n");
+        out.push_str(
+            "================================================================================\n",
+        );
         out
     }
 }
@@ -335,10 +357,7 @@ fn run_readobj_stack_sizes(obj_path: &Path) -> Result<String, CodegenError> {
         .arg(obj_path)
         .output()
         .map_err(|e| {
-            CodegenError::new(
-                "llvm-readobj",
-                format!("failed to invoke `{readobj}`: {e}"),
-            )
+            CodegenError::new("llvm-readobj", format!("failed to invoke `{readobj}`: {e}"))
         })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -357,10 +376,7 @@ fn run_objdump_disasm(elf_path: &Path) -> Result<String, CodegenError> {
         .arg(elf_path)
         .output()
         .map_err(|e| {
-            CodegenError::new(
-                "llvm-objdump",
-                format!("failed to invoke `{objdump}`: {e}"),
-            )
+            CodegenError::new("llvm-objdump", format!("failed to invoke `{objdump}`: {e}"))
         })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -461,7 +477,10 @@ fn parse_objdump_disassembly(disasm: &str) -> DisasmData {
             continue;
         }
         let (mnemonic, operands) = match insn.find(|c: char| c.is_ascii_whitespace()) {
-            Some(pos) => (insn[..pos].to_ascii_lowercase(), insn[pos..].trim().to_string()),
+            Some(pos) => (
+                insn[..pos].to_ascii_lowercase(),
+                insn[pos..].trim().to_string(),
+            ),
             None => (insn.to_ascii_lowercase(), String::new()),
         };
         data.fn_insns
@@ -650,7 +669,7 @@ fn parse_imm_u64(tok: &str) -> Option<u64> {
 }
 
 fn parse_signed_rel_offset(tok: &str) -> Option<i64> {
-    let s = tok.trim().split_whitespace().next()?;
+    let s = tok.split_whitespace().next()?;
     if let Some(rest) = s.strip_prefix(".+") {
         if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
             i64::from_str_radix(hex, 16).ok()
@@ -699,10 +718,7 @@ fn avr_two_ops(ops: &str) -> Option<(&str, &str)> {
 
 fn is_riscv_ra_target(ops: &str) -> bool {
     let clean = ops.split(';').next().unwrap_or("").trim();
-    clean == "ra"
-        || clean == "x1"
-        || clean.ends_with("(ra)")
-        || clean.ends_with("(x1)")
+    clean == "ra" || clean == "x1" || clean.ends_with("(ra)") || clean.ends_with("(x1)")
 }
 
 fn analyze_avr_disasm(
@@ -750,14 +766,16 @@ fn analyze_avr_disasm(
                     }
                     "subi" if saw_sp_read && ops.starts_with("r28,") => {
                         if let Some(k_tok) = ops.split(',').nth(1) {
-                            if let Some(v) = parse_imm_u64(k_tok).and_then(|x| u8::try_from(x).ok()) {
+                            if let Some(v) = parse_imm_u64(k_tok).and_then(|x| u8::try_from(x).ok())
+                            {
                                 pending_subi_lo = Some(v);
                             }
                         }
                     }
                     "sbci" if saw_sp_read && ops.starts_with("r29,") => {
                         if let Some(k_tok) = ops.split(',').nth(1) {
-                            if let Some(v) = parse_imm_u64(k_tok).and_then(|x| u8::try_from(x).ok()) {
+                            if let Some(v) = parse_imm_u64(k_tok).and_then(|x| u8::try_from(x).ok())
+                            {
                                 pending_sbci_hi = Some(v);
                             }
                         }
@@ -949,8 +967,8 @@ fn analyze_avr_disasm(
         }
 
         if max_call_arg_bytes > max_recorded_call_arg_bytes {
-            frame_bytes = frame_bytes
-                .saturating_add(max_call_arg_bytes - max_recorded_call_arg_bytes);
+            frame_bytes =
+                frame_bytes.saturating_add(max_call_arg_bytes - max_recorded_call_arg_bytes);
         }
         frame_sizes.insert(fn_name.clone(), frame_bytes);
     }
@@ -1154,7 +1172,9 @@ pub fn analyze_hardware_stack_high_water(
 
     let (text_bytes, data_bytes, bss_bytes) = inspect_elf_text_data_bss(&elf_path)?;
     let static_sram_bytes = if spec.code_in_ram {
-        text_bytes.saturating_add(data_bytes).saturating_add(bss_bytes)
+        text_bytes
+            .saturating_add(data_bytes)
+            .saturating_add(bss_bytes)
     } else {
         data_bytes.saturating_add(bss_bytes)
     };
@@ -1184,13 +1204,8 @@ pub fn analyze_hardware_stack_high_water(
                 }
             }
         }
-        let (g, disasm_ind) = build_arm_or_rv_call_graph(
-            spec.isa,
-            &disasm,
-            &ll_text,
-            &frames,
-            &ll_indirect_callers,
-        );
+        let (g, disasm_ind) =
+            build_arm_or_rv_call_graph(spec.isa, &disasm, &ll_text, &frames, &ll_indirect_callers);
         let ind_map = disasm_ind.into_iter().map(|c| (c, 0u64)).collect();
         (frames, g, ind_map)
     };
@@ -1263,42 +1278,41 @@ pub fn analyze_hardware_stack_high_water(
     let empty_excl = BTreeSet::new();
 
     // 1. Boot phase worst-case stack (`__syn_boot` or fallback entry excluding `__syn_sched_loop`)
-    let (boot_stack_bytes, boot_worst_path) = if disasm.elf_symbols.contains("__syn_boot")
-        || frame_sizes.contains_key("__syn_boot")
-    {
-        walk_worst_stack(
-            "__syn_boot",
-            &frame_sizes,
-            &graph,
-            &empty_excl,
-            &mut visiting,
-            &mut memo,
-            &mut has_cycle,
-        )
-    } else {
-        let fallback_boot = [
-            "Reset_Handler",
-            "__syn_rv_reset",
-            "__syn_avr_entry",
-            "_start",
-        ]
-        .into_iter()
-        .find(|s| disasm.elf_symbols.contains(*s) || frame_sizes.contains_key(*s));
-        if let Some(root) = fallback_boot {
-            let excl = BTreeSet::from(["__syn_sched_loop".to_string()]);
+    let (boot_stack_bytes, boot_worst_path) =
+        if disasm.elf_symbols.contains("__syn_boot") || frame_sizes.contains_key("__syn_boot") {
             walk_worst_stack(
-                root,
+                "__syn_boot",
                 &frame_sizes,
                 &graph,
-                &excl,
+                &empty_excl,
                 &mut visiting,
                 &mut memo,
                 &mut has_cycle,
             )
         } else {
-            (0, Vec::new())
-        }
-    };
+            let fallback_boot = [
+                "Reset_Handler",
+                "__syn_rv_reset",
+                "__syn_avr_entry",
+                "_start",
+            ]
+            .into_iter()
+            .find(|s| disasm.elf_symbols.contains(*s) || frame_sizes.contains_key(*s));
+            if let Some(root) = fallback_boot {
+                let excl = BTreeSet::from(["__syn_sched_loop".to_string()]);
+                walk_worst_stack(
+                    root,
+                    &frame_sizes,
+                    &graph,
+                    &excl,
+                    &mut visiting,
+                    &mut memo,
+                    &mut has_cycle,
+                )
+            } else {
+                (0, Vec::new())
+            }
+        };
 
     // 2. Scheduler + spawned task-step worst-case stack
     let (sched_task_stack_bytes, sched_task_worst_path) =
@@ -1732,15 +1746,26 @@ entry:
         assert!(!ll_indirect.contains("__syn_sched_loop"));
         assert!(!ll_indirect.contains("__syn_rom_call_u32_a2_i32_i32_sb32"));
         assert!(!ll_indirect.contains("__syn_rom_noreturn_a2_i32_i32"));
-        assert_eq!(parse_rom_call_stack_bound("__syn_rom_call_u32_a2_i32_i32_sb32"), Some(32));
-        assert_eq!(parse_rom_call_stack_bound("__syn_rom_noreturn_a2_i32_i32"), None);
+        assert_eq!(
+            parse_rom_call_stack_bound("__syn_rom_call_u32_a2_i32_i32_sb32"),
+            Some(32)
+        );
+        assert_eq!(
+            parse_rom_call_stack_bound("__syn_rom_noreturn_a2_i32_i32"),
+            None
+        );
 
         let mut sb_frames = BTreeMap::from([("__syn_boot".to_string(), 8u64)]);
         if let Some(sb) = parse_rom_call_stack_bound("__syn_rom_call_u32_a2_i32_i32_sb32") {
             sb_frames.insert("__syn_rom_call_u32_a2_i32_i32_sb32".to_string(), sb);
         }
         let mut sb_graph = EdgeGraph::new();
-        add_edge(&mut sb_graph, "__syn_boot", "__syn_rom_call_u32_a2_i32_i32_sb32", 0);
+        add_edge(
+            &mut sb_graph,
+            "__syn_boot",
+            "__syn_rom_call_u32_a2_i32_i32_sb32",
+            0,
+        );
         let mut visiting = BTreeSet::new();
         let mut memo = BTreeMap::new();
         let mut has_cycle = false;
@@ -1754,7 +1779,9 @@ entry:
             &mut has_cycle,
         );
         assert_eq!(depth, 40);
-        assert!(path.iter().any(|p| p.contains("__syn_rom_call_u32_a2_i32_i32_sb32 (32B)")));
+        assert!(path
+            .iter()
+            .any(|p| p.contains("__syn_rom_call_u32_a2_i32_i32_sb32 (32B)")));
 
         let thumb_disasm = r#"
 00000100 <__syn_fn_dispatch>:

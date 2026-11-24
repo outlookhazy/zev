@@ -76,7 +76,13 @@ pub(super) fn convert_bin_op(op: BinaryOp) -> MirBinOp {
 
 pub(super) fn sanitize_ident(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -186,10 +192,12 @@ pub(super) fn lower_mmio_regs(
         };
         let offset = eval_const_u32(&r.offset, syms, "MMIO register offset", r.span)?;
         let reg_bytes = (elem_bits as usize / 8) * array_len.unwrap_or(1);
-        let end = (offset as usize).checked_add(reg_bytes).ok_or_else(|| MirLowerError {
-            message: format!("MMIO register `{}` offset overflow", r.name.name),
-            span: r.span,
-        })?;
+        let end = (offset as usize)
+            .checked_add(reg_bytes)
+            .ok_or_else(|| MirLowerError {
+                message: format!("MMIO register `{}` offset overflow", r.name.name),
+                span: r.span,
+            })?;
         if end > byte_size {
             byte_size = end;
         }
@@ -214,7 +222,7 @@ pub(super) fn mmio_elem_mir_type(elem_bits: u8) -> MirType {
 
 pub(super) fn find_named_arg<'a>(args: &'a [CallArg], name: &str) -> Option<&'a Expr> {
     args.iter()
-        .find(|a| a.name.as_ref().map_or(false, |n| n.name == name))
+        .find(|a| a.name.as_ref().is_some_and(|n| n.name == name))
         .map(|a| &a.value)
 }
 
@@ -294,24 +302,46 @@ pub(super) fn eval_const_expr(expr: &Expr, syms: &ModuleSymbols) -> Option<Const
             let l = eval_const_expr(lhs, syms)?;
             let r = eval_const_expr(rhs, syms)?;
             match (op, l, r) {
-                (BinaryOp::Add, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a.wrapping_add(b))),
-                (BinaryOp::Sub, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a.wrapping_sub(b))),
-                (BinaryOp::Mul, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a.wrapping_mul(b))),
-                (BinaryOp::Div, ConstVal::Int(a), ConstVal::Int(b)) if b != 0 => Some(ConstVal::Int(a / b)),
-                (BinaryOp::Rem, ConstVal::Int(a), ConstVal::Int(b)) if b != 0 => Some(ConstVal::Int(a % b)),
+                (BinaryOp::Add, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Some(ConstVal::Int(a.wrapping_add(b)))
+                }
+                (BinaryOp::Sub, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Some(ConstVal::Int(a.wrapping_sub(b)))
+                }
+                (BinaryOp::Mul, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Some(ConstVal::Int(a.wrapping_mul(b)))
+                }
+                (BinaryOp::Div, ConstVal::Int(a), ConstVal::Int(b)) if b != 0 => {
+                    Some(ConstVal::Int(a / b))
+                }
+                (BinaryOp::Rem, ConstVal::Int(a), ConstVal::Int(b)) if b != 0 => {
+                    Some(ConstVal::Int(a % b))
+                }
                 (BinaryOp::BitOr, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a | b)),
-                (BinaryOp::BitAnd, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a & b)),
-                (BinaryOp::BitXor, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a ^ b)),
-                (BinaryOp::Shl, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a.wrapping_shl(b as u32))),
-                (BinaryOp::Shr, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Int(a.wrapping_shr(b as u32))),
+                (BinaryOp::BitAnd, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Some(ConstVal::Int(a & b))
+                }
+                (BinaryOp::BitXor, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Some(ConstVal::Int(a ^ b))
+                }
+                (BinaryOp::Shl, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Some(ConstVal::Int(a.wrapping_shl(b as u32)))
+                }
+                (BinaryOp::Shr, ConstVal::Int(a), ConstVal::Int(b)) => {
+                    Some(ConstVal::Int(a.wrapping_shr(b as u32)))
+                }
                 (BinaryOp::Eq, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Bool(a == b)),
                 (BinaryOp::Ne, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Bool(a != b)),
                 (BinaryOp::Lt, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Bool(a < b)),
                 (BinaryOp::Le, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Bool(a <= b)),
                 (BinaryOp::Gt, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Bool(a > b)),
                 (BinaryOp::Ge, ConstVal::Int(a), ConstVal::Int(b)) => Some(ConstVal::Bool(a >= b)),
-                (BinaryOp::And, ConstVal::Bool(a), ConstVal::Bool(b)) => Some(ConstVal::Bool(a && b)),
-                (BinaryOp::Or, ConstVal::Bool(a), ConstVal::Bool(b)) => Some(ConstVal::Bool(a || b)),
+                (BinaryOp::And, ConstVal::Bool(a), ConstVal::Bool(b)) => {
+                    Some(ConstVal::Bool(a && b))
+                }
+                (BinaryOp::Or, ConstVal::Bool(a), ConstVal::Bool(b)) => {
+                    Some(ConstVal::Bool(a || b))
+                }
                 _ => None,
             }
         }
@@ -380,4 +410,3 @@ pub(super) fn convert_switch_pat(
         }
     }
 }
-

@@ -60,7 +60,7 @@ pub fn parse_file(path: impl AsRef<Path>) -> Result<Program, ParseError> {
     let source = std::fs::read_to_string(path_ref).map_err(|io_err| ParseError {
         message: format!("failed to read `{display}`: {io_err}"),
         span: zev_ast::Span::dummy(),
-        file: Some(display.clone()),
+        file: Some(display.clone().into_boxed_str()),
         source_line: None,
         hint: None,
         code: None,
@@ -315,10 +315,11 @@ mod tests {
                 let stmts = &f.body.as_ref().unwrap().stmts;
                 match &stmts[1].kind {
                     StmtKind::VarDecl {
-                        init: Some(Expr {
-                            kind: ExprKind::Catch { clause, .. },
-                            ..
-                        }),
+                        init:
+                            Some(Expr {
+                                kind: ExprKind::Catch { clause, .. },
+                                ..
+                            }),
                         ..
                     } => {
                         assert_eq!(clause.err_param.as_ref().unwrap().name.as_str(), "err");
@@ -426,7 +427,12 @@ mod tests {
         assert!(formatted.contains("= docs: run 'zevc doc tasks'"));
 
         // Verify fallback `zevc doc syntax` when neither code nor doc_topic is set
-        let bare = ParseError::new("custom syntax error", Span::new(0, 2, 1, 1), "??\n", Some("x.zev"));
+        let bare = ParseError::new(
+            "custom syntax error",
+            Span::new(0, 2, 1, 1),
+            "??\n",
+            Some("x.zev"),
+        );
         let bare_fmt = bare.to_string();
         assert!(bare_fmt.contains("x.zev:1:1: error: custom syntax error"));
         assert!(bare_fmt.contains("= docs: run 'zevc doc syntax'"));
@@ -638,12 +644,7 @@ mod tests {
             "syntax",
             "u16 x = 42;",
         );
-        assert_trap(
-            "fn main() { mut x = 1; }",
-            "P0001",
-            "syntax",
-            "u16 x = 42;",
-        );
+        assert_trap("fn main() { mut x = 1; }", "P0001", "syntax", "u16 x = 42;");
         assert_trap("let GLOBAL = 1;", "P0001", "syntax", "const");
     }
 
@@ -661,24 +662,9 @@ mod tests {
             "tasks",
             "remove `-> ...`",
         );
-        assert_trap(
-            "isr h() -> u16 { }",
-            "P0002",
-            "tasks",
-            "remove `-> ...`",
-        );
-        assert_trap(
-            "struct S { field: u32 }",
-            "P0002",
-            "syntax",
-            "u32 field",
-        );
-        assert_trap(
-            "const LIMIT: u32 = 10;",
-            "P0002",
-            "syntax",
-            "u32 LIMIT",
-        );
+        assert_trap("isr h() -> u16 { }", "P0002", "tasks", "remove `-> ...`");
+        assert_trap("struct S { field: u32 }", "P0002", "syntax", "u32 field");
+        assert_trap("const LIMIT: u32 = 10;", "P0002", "syntax", "u32 LIMIT");
         assert_trap(
             "fn read_button() bool { return true; }",
             "P0002",
@@ -865,24 +851,14 @@ mod tests {
 
     #[test]
     fn trap_p0013_retired_lease() {
-        assert_trap(
-            "lease<u8, 128> spi_buf;",
-            "P0013",
-            "dma",
-            "@dma_safe pool",
-        );
+        assert_trap("lease<u8, 128> spi_buf;", "P0013", "dma", "@dma_safe pool");
         assert_trap(
             "task worker(lease<u8, 8> *l) { loop { checkpoint(); } }",
             "P0013",
             "dma",
             "dma_slot",
         );
-        assert_trap(
-            "fn f() { lease<u8, 8> x; }",
-            "P0013",
-            "dma",
-            "Lease<",
-        );
+        assert_trap("fn f() { lease<u8, 8> x; }", "P0013", "dma", "Lease<");
         assert_trap(
             "fn f(*lease<u8, 8> l) -> u8 { return 0; }",
             "P0013",
@@ -893,42 +869,12 @@ mod tests {
 
     #[test]
     fn trap_p0014_c_style_pointers_arrays_and_casts() {
-        assert_trap(
-            "fn main() { u8 buf[16]; }",
-            "P0014",
-            "syntax",
-            "[16]u8 buf",
-        );
-        assert_trap(
-            "fn main() { u8 *p = 0; }",
-            "P0014",
-            "syntax",
-            "*u8",
-        );
-        assert_trap(
-            "fn f(watch<u16> *w) {}",
-            "P0014",
-            "syntax",
-            "*watch<u16>",
-        );
-        assert_trap(
-            "struct S { u8 data[]; }",
-            "P0014",
-            "syntax",
-            "[]u8 data",
-        );
-        assert_trap(
-            "fn f(u8[] s) {}",
-            "P0014",
-            "syntax",
-            "[]u8",
-        );
-        assert_trap(
-            "fn f(u8[4] a) {}",
-            "P0014",
-            "syntax",
-            "[4]u8",
-        );
+        assert_trap("fn main() { u8 buf[16]; }", "P0014", "syntax", "[16]u8 buf");
+        assert_trap("fn main() { u8 *p = 0; }", "P0014", "syntax", "*u8");
+        assert_trap("fn f(watch<u16> *w) {}", "P0014", "syntax", "*watch<u16>");
+        assert_trap("struct S { u8 data[]; }", "P0014", "syntax", "[]u8 data");
+        assert_trap("fn f(u8[] s) {}", "P0014", "syntax", "[]u8");
+        assert_trap("fn f(u8[4] a) {}", "P0014", "syntax", "[4]u8");
         assert_trap(
             "extern \"C\" fn reg_cb(void (*cb)(u8)) -> i32;",
             "P0014",
@@ -1000,21 +946,13 @@ mod tests {
             "P0016",
             "use `.`",
         );
-        assert_trap(
-            "impl hw::Gpio { fn set() {} }",
-            "P0016",
-            "use `.`",
-        );
+        assert_trap("impl hw::Gpio { fn set() {} }", "P0016", "use `.`");
         assert_trap(
             "fn f(Mode m) { switch (m) { Mode::Idle => {} _ => {} } }",
             "P0016",
             "use `.`",
         );
-        assert_trap(
-            "fn main() { spawn hw::worker(); }",
-            "P0016",
-            "use `.`",
-        );
+        assert_trap("fn main() { spawn hw::worker(); }", "P0016", "use `.`");
 
         // P0017: C-style casts (excluding `(Foo*)p`, which keeps P0014)
         assert_trap("fn f(u32 v) { u16 x = (u16)v; }", "P0017", "as");
@@ -1046,7 +984,10 @@ mod tests {
         let assert_p0018 = |src: &str, want_hint: &str| {
             let err = parse_str(src).expect_err(&format!("expected P0018 for:\n{src}"));
             let msg = format!("{err:?}");
-            assert!(msg.contains("P0018"), "expected P0018 for:\n{src}\ngot:\n{msg}");
+            assert!(
+                msg.contains("P0018"),
+                "expected P0018 for:\n{src}\ngot:\n{msg}"
+            );
             assert!(
                 msg.contains(want_hint),
                 "expected hint {want_hint:?} for:\n{src}\ngot:\n{msg}"
@@ -1055,12 +996,18 @@ mod tests {
 
         assert_p0018("u16 crc16([]u8 buf) { return 0; }", "fn crc16(...) -> u16");
         assert_p0018("void setup_clocks() {}", "fn setup_clocks(...)");
-        assert_p0018("fn u16 crc16([]u8 buf) { return 0; }", "fn crc16(...) -> u16");
+        assert_p0018(
+            "fn u16 crc16([]u8 buf) { return 0; }",
+            "fn crc16(...) -> u16",
+        );
         assert_p0018(
             "struct Foo { u32 x; }\nimpl Foo { u32 count(*self) { return self.x; } }",
             "fn count(...) -> u32",
         );
-        assert_p0018("extern \"C\" i32 c_add(i32 a, i32 b);", "fn c_add(...) -> i32");
+        assert_p0018(
+            "extern \"C\" i32 c_add(i32 a, i32 b);",
+            "fn c_add(...) -> i32",
+        );
         assert_p0018("extern \"C\" { void c_init(); }", "fn c_init(...)");
 
         // Function returning a function pointer type `fn pick() -> fn(u32) -> u32`
@@ -1245,7 +1192,10 @@ fn process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> buf) -> Lea
         };
         match &worker1.body.stmts[1].kind {
             StmtKind::LoopEvery { period, body } => {
-                assert!(matches!(period.kind, ExprKind::Literal(Literal::Duration(_))));
+                assert!(matches!(
+                    period.kind,
+                    ExprKind::Literal(Literal::Duration(_))
+                ));
                 match &body.stmts[0].kind {
                     StmtKind::If { then_block, .. } => {
                         assert!(matches!(then_block.stmts[0].kind, StmtKind::Restart));
@@ -1283,24 +1233,14 @@ fn process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> buf) -> Lea
             "dma",
             "[]u8",
         );
-        assert_trap(
-            "fn read(&'a []u8 buf) { }",
-            "P0009",
-            "dma",
-            "'a",
-        );
+        assert_trap("fn read(&'a []u8 buf) { }", "P0009", "dma", "'a");
         assert_trap(
             "fn step(acc: &mut i32) { *acc += 1; }",
             "P0009",
             "dma",
             "&x",
         );
-        assert_trap(
-            "fn step(&mut i32 acc) { *acc += 1; }",
-            "P0009",
-            "dma",
-            "*T",
-        );
+        assert_trap("fn step(&mut i32 acc) { *acc += 1; }", "P0009", "dma", "*T");
         assert_trap(
             "fn main() { pi_step(100, 90, &mut integral); }",
             "P0009",
@@ -1311,12 +1251,7 @@ fn process(*pool<[16]u8, 4> p, *dma_slot<[16]u8> slot, Lease<[16]u8> buf) -> Lea
 
     #[test]
     fn trap_p0010_static_and_pub_modifiers() {
-        assert_trap(
-            "static u32 counter = 0;",
-            "P0010",
-            "primitives",
-            "watch<T>",
-        );
+        assert_trap("static u32 counter = 0;", "P0010", "primitives", "watch<T>");
         assert_trap(
             "fn main() { static i32 integral = 0; }",
             "P0010",
@@ -1433,7 +1368,9 @@ pub import chip.stm32f3.{rcc, tim};
                             assert_eq!(name.as_str(), "DecodedPacket");
                             assert_eq!(fields.len(), 2);
                         }
-                        other => panic!("expected trailing StmtKind::Expr(StructLit), got {other:?}"),
+                        other => {
+                            panic!("expected trailing StmtKind::Expr(StructLit), got {other:?}")
+                        }
                     }
                 }
                 other => panic!("expected Catch VarDecl at {idx}, got {other:?}"),
@@ -1523,7 +1460,9 @@ pub import chip.stm32f3.{rcc, tim};
                     }),
                 ..
             } => {
-                assert_eq!(f64::from_bits(*bits), 3.141_592_f32 as f64);
+                #[allow(clippy::approx_constant)]
+                let expected_f32 = 3.141_592_f32 as f64;
+                assert_eq!(f64::from_bits(*bits), expected_f32);
                 assert_eq!(*suffix, Some(PrimType::F32));
             }
             other => panic!("expected suffixed f32 VarDecl, got {other:?}"),
@@ -1671,7 +1610,11 @@ pub import chip.stm32f3.{rcc, tim};
 
         // `Boxed<Boxed<u32>>` (`>>` split cleanly!)
         match &stmts[4].kind {
-            StmtKind::VarDecl { ty, init: Some(init), .. } => {
+            StmtKind::VarDecl {
+                ty,
+                init: Some(init),
+                ..
+            } => {
                 match &ty.kind {
                     TypeKind::Generic { base, args } => {
                         assert_eq!(base.as_str(), "Boxed");
@@ -1703,7 +1646,10 @@ pub import chip.stm32f3.{rcc, tim};
                 StmtKind::VarDecl {
                     init:
                         Some(Expr {
-                            kind: ExprKind::Call { generic_args, args, .. },
+                            kind:
+                                ExprKind::Call {
+                                    generic_args, args, ..
+                                },
                             ..
                         }),
                     ..
@@ -1909,10 +1855,11 @@ fn main() {
             StmtKind::VarDecl {
                 init:
                     Some(Expr {
-                        kind: ExprKind::Literal(Literal::Int {
-                            value: 255,
-                            suffix: None,
-                        }),
+                        kind:
+                            ExprKind::Literal(Literal::Int {
+                                value: 255,
+                                suffix: None,
+                            }),
                         ..
                     }),
                 ..
@@ -1977,7 +1924,10 @@ fn main() {
         for idx in [5usize, 6, 7] {
             match &stmts[idx].kind {
                 StmtKind::Expr(Expr {
-                    kind: ExprKind::Call { args, generic_args, .. },
+                    kind:
+                        ExprKind::Call {
+                            args, generic_args, ..
+                        },
                     ..
                 }) => {
                     assert!(generic_args.is_empty());
@@ -2027,7 +1977,13 @@ fn main() {
         assert!(matches!(
             &stmts[12].kind,
             StmtKind::If {
-                cond: Expr { kind: ExprKind::Binary { op: BinaryOp::Lt, .. }, .. },
+                cond: Expr {
+                    kind: ExprKind::Binary {
+                        op: BinaryOp::Lt,
+                        ..
+                    },
+                    ..
+                },
                 ..
             }
         ));
@@ -2054,7 +2010,8 @@ fn main() {
         // `1 + 2^-24 + 2^-54` = `1.000000059604644775390625 + ~5.55e-17`:
         // - `parse::<f64>()` rounds to even `1 + 2^-24`, and `(v64 as f32)` rounds to even `1.0f32` (`0x3f800000`).
         // - Direct `parse::<f32>()` sees the exact decimal > midpoint and rounds up to `0x3f800001`!
-        let f32_src = "fn main() { f32 x = 1.000000059604644830901776231257827021181583404541015625f32; }";
+        let f32_src =
+            "fn main() { f32 x = 1.000000059604644830901776231257827021181583404541015625f32; }";
         let f32_prog = parse_str(f32_src).expect("parse midpoint f32");
         if let ItemKind::Fn(f) = &f32_prog.items[0].kind {
             if let StmtKind::VarDecl {
@@ -2094,15 +2051,25 @@ fn main() {
             .expect_err("expected targeted error on escaped quote inside hole");
         assert!(
             esc_err.message.contains("unescaped")
-                && esc_err.hint.as_deref().unwrap_or("").contains("hdr={\"ok\"}"),
+                && esc_err
+                    .hint
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("hdr={\"ok\"}"),
             "unexpected error: {esc_err}"
         );
 
         // 4. M13: Reject `:4x`, `:8b`, `:0x`, `:0X`, `:0b`, `:00x` with actionable zero-pad / prefix hints!
         let e_4x = parse_str("fn main() { u16 v = 1; println(f\"{v:4x}\"); }").unwrap_err();
-        assert!(e_4x.hint.as_deref().unwrap_or("").contains(":04x"), "{e_4x}");
+        assert!(
+            e_4x.hint.as_deref().unwrap_or("").contains(":04x"),
+            "{e_4x}"
+        );
         let e_8b = parse_str("fn main() { u8 v = 1; println(f\"{v:8b}\"); }").unwrap_err();
-        assert!(e_8b.hint.as_deref().unwrap_or("").contains(":08b"), "{e_8b}");
+        assert!(
+            e_8b.hint.as_deref().unwrap_or("").contains(":08b"),
+            "{e_8b}"
+        );
         let e_0x = parse_str("fn main() { u16 v = 1; println(f\"{v:0x}\"); }").unwrap_err();
         assert!(
             e_0x.hint.as_deref().unwrap_or("").contains("0x{val:x}")
@@ -2110,14 +2077,21 @@ fn main() {
             "{e_0x}"
         );
         let e_0b = parse_str("fn main() { u8 v = 1; println(f\"{v:0b}\"); }").unwrap_err();
-        assert!(e_0b.hint.as_deref().unwrap_or("").contains("0b{val:b}"), "{e_0b}");
+        assert!(
+            e_0b.hint.as_deref().unwrap_or("").contains("0b{val:b}"),
+            "{e_0b}"
+        );
 
         // 5. Low #2: Reject block-local `const Type name = ...;` with clear top-level guidance!
         let e_local_const =
             parse_str("fn main() { const usize CAP = 8; }").expect_err("reject block-local const");
         assert!(
             e_local_const.message.contains("block-local `const`")
-                && e_local_const.hint.as_deref().unwrap_or("").contains("module top level"),
+                && e_local_const
+                    .hint
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("module top level"),
             "{e_local_const}"
         );
 
@@ -2167,9 +2141,16 @@ pub @dma_safe pool<u8, 16> pkt_pool;
         assert_eq!(prog.items.len(), 18);
         for (idx, item) in prog.items.iter().enumerate() {
             if idx == 8 {
-                assert!(!item.is_pub, "extern block item `ext_priv` should default to private");
+                assert!(
+                    !item.is_pub,
+                    "extern block item `ext_priv` should default to private"
+                );
             } else {
-                assert!(item.is_pub, "item #{idx} should be marked `pub`: {:?}", item.kind);
+                assert!(
+                    item.is_pub,
+                    "item #{idx} should be marked `pub`: {:?}",
+                    item.kind
+                );
             }
         }
     }
@@ -2299,13 +2280,11 @@ fn main() {
         assert_eq!(state_var_count, 4);
 
         // Verify contextual `state += irq;` did NOT become StateVar
-        assert!(
-            isrs[1]
-                .body
-                .stmts
-                .iter()
-                .all(|s| !matches!(s.kind, StmtKind::StateVar { .. }))
-        );
+        assert!(isrs[1]
+            .body
+            .stmts
+            .iter()
+            .all(|s| !matches!(s.kind, StmtKind::StateVar { .. })));
 
         // Check qualified StructLit and Spawn in main
         let main_fn = prog
@@ -2599,7 +2578,10 @@ fn use_n<usize N>(u32 cmp, FixedVec<u32, N> v) {
         for idx in [5usize, 6] {
             match &stmts[idx].kind {
                 StmtKind::Expr(Expr {
-                    kind: ExprKind::Call { args, generic_args, .. },
+                    kind:
+                        ExprKind::Call {
+                            args, generic_args, ..
+                        },
                     ..
                 }) => {
                     assert!(generic_args.is_empty(), "stmt {idx} hijacked generic args!");
@@ -2612,7 +2594,13 @@ fn use_n<usize N>(u32 cmp, FixedVec<u32, N> v) {
         assert!(matches!(
             &stmts[7].kind,
             StmtKind::If {
-                cond: Expr { kind: ExprKind::Binary { op: BinaryOp::Lt, .. }, .. },
+                cond: Expr {
+                    kind: ExprKind::Binary {
+                        op: BinaryOp::Lt,
+                        ..
+                    },
+                    ..
+                },
                 ..
             }
         ));
@@ -2647,12 +2635,15 @@ fn test(*void vp, *i32 a) {
             other => panic!("expected Fn, got {other:?}"),
         };
         let stmts = &f.body.as_ref().unwrap().stmts;
-        for idx in 0..3 {
+        for (idx, stmt) in stmts.iter().take(3).enumerate() {
             assert!(
                 matches!(
-                    &stmts[idx].kind,
+                    &stmt.kind,
                     StmtKind::VarDecl {
-                        init: Some(Expr { kind: ExprKind::Cast { .. }, .. }),
+                        init: Some(Expr {
+                            kind: ExprKind::Cast { .. },
+                            ..
+                        }),
                         ..
                     }
                 ),
@@ -2668,7 +2659,11 @@ fn test(*void vp, *i32 a) {
             let msg = format!("{err:?}");
             assert!(msg.contains("P0017"), "expected P0017, got:\n{msg}");
         }
-        for (idx, expected_op) in [(3usize, BinaryOp::Sub), (4, BinaryOp::Mul), (5, BinaryOp::Add)] {
+        for (idx, expected_op) in [
+            (3usize, BinaryOp::Sub),
+            (4, BinaryOp::Mul),
+            (5, BinaryOp::Add),
+        ] {
             assert!(
                 matches!(
                     &stmts[idx].kind,
@@ -2721,7 +2716,8 @@ impl<usize N> FixedVec<f32, N> {
     }
 }
 "#;
-        let prog = parse_str(src).expect("valid concrete, generic, and specialized impl blocks should parse");
+        let prog = parse_str(src)
+            .expect("valid concrete, generic, and specialized impl blocks should parse");
         assert_eq!(prog.items.len(), 5);
         let imp_pin = match &prog.items[2].kind {
             ItemKind::Impl(d) => d,
@@ -2892,7 +2888,8 @@ fn main() {
                 // 40 nested parens and 40 nested `if` blocks exceed the old 24 cap and now succeed.
                 let open_parens = "(".repeat(40);
                 let close_parens = ")".repeat(40);
-                let src_parens = format!("fn f() -> u32 {{ return {open_parens}1u32{close_parens}; }}\n");
+                let src_parens =
+                    format!("fn f() -> u32 {{ return {open_parens}1u32{close_parens}; }}\n");
                 parse_str(&src_parens).expect("40 nested parens must parse");
 
                 let mut src_ifs = String::from("fn f(bool c) {\n");
@@ -2909,18 +2906,24 @@ fn main() {
                 // 300-deep inputs fail gracefully on a 2 MiB debug thread stack without overflowing.
                 let deep_open = "(".repeat(300);
                 let deep_close = ")".repeat(300);
-                let err_p = parse_str(&format!("fn f() -> u32 {{ return {deep_open}1{deep_close}; }}"))
-                    .expect_err("300 nested parens must error cleanly");
+                let err_p = parse_str(&format!(
+                    "fn f() -> u32 {{ return {deep_open}1{deep_close}; }}"
+                ))
+                .expect_err("300 nested parens must error cleanly");
                 assert!(err_p.message.contains("depth"), "{err_p}");
 
                 let deep_blocks_open = "{ ".repeat(300);
                 let deep_blocks_close = "} ".repeat(300);
-                let err_b = parse_str(&format!("fn f() {{ {deep_blocks_open}u32 x = 1;{deep_blocks_close} }}"))
-                    .expect_err("300 nested blocks must error cleanly");
+                let err_b = parse_str(&format!(
+                    "fn f() {{ {deep_blocks_open}u32 x = 1;{deep_blocks_close} }}"
+                ))
+                .expect_err("300 nested blocks must error cleanly");
                 assert!(err_b.message.contains("depth"), "{err_b}");
             })
             .expect("spawn depth test thread");
-        handle.join().expect("depth test thread must not overflow stack");
+        handle
+            .join()
+            .expect("depth test thread must not overflow stack");
 
         // Item-boundary error recovery collects errors from multiple broken top-level items while keeping valid ones.
         let src_multi = "\
@@ -2941,10 +2944,19 @@ u32 broken_three(u32 v) {
 }
 ";
         let (prog, errs) = parse_str_recovering(src_multi);
-        assert_eq!(errs.len(), 3, "expected 3 recovered parse errors, got {errs:#?}");
+        assert_eq!(
+            errs.len(),
+            3,
+            "expected 3 recovered parse errors, got {errs:#?}"
+        );
         assert_eq!(errs[0].code, Some("P0001"));
         assert_eq!(errs[1].code, Some("P0011"));
         assert_eq!(errs[2].code, Some("P0018"));
-        assert_eq!(prog.items.len(), 1, "expected 1 surviving valid item, got {:?}", prog.items);
+        assert_eq!(
+            prog.items.len(),
+            1,
+            "expected 1 surviving valid item, got {:?}",
+            prog.items
+        );
     }
 }

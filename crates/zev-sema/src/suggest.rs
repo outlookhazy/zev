@@ -23,9 +23,7 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
         curr[0] = i;
         for j in 1..=n {
             let cost = usize::from(a_chars[i - 1] != b_chars[j - 1]);
-            curr[j] = (prev[j] + 1)
-                .min(curr[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -101,13 +99,18 @@ pub fn suggest_foreign_type_name(name: &str) -> Option<&'static str> {
 
 /// Produce targeted `"did you mean ...?"` + complete valid signature table when an unknown method
 /// is called on a Zev OS primitive (`signal`, `chan`, `inbox`, `watch`, `ping_pong`, `lease`).
-pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Option<String>, String) {
+pub fn advise_primitive_method(
+    prim: &ResolvedOsPrimitive,
+    method: &str,
+) -> (Option<String>, String) {
     match prim {
         ResolvedOsPrimitive::Signal => {
             let valid = ["notify", "wait", "try_wait", "is_set", "clear"];
             let direct = match method {
                 "set" | "send" | "post" | "trigger" | "pulse" | "wake" | "emit" | "fire"
-                | "signal" => Some("`.notify()` (or `.notify(boost: @critical)` from an ISR)".to_string()),
+                | "signal" => {
+                    Some("`.notify()` (or `.notify(boost: @critical)` from an ISR)".to_string())
+                }
                 "recv" | "acquire" | "pend" | "take" | "block" => {
                     Some("`.wait()` (or `.wait(timeout: 10ms) catch { ... }`)".to_string())
                 }
@@ -122,7 +125,13 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
         }
 
         ResolvedOsPrimitive::WaitQueue => {
-            let valid = ["prepare_wait", "cancel_wait", "commit_wait", "wake_one", "wake_all"];
+            let valid = [
+                "prepare_wait",
+                "cancel_wait",
+                "commit_wait",
+                "wake_one",
+                "wake_all",
+            ];
             let direct = match method {
                 "wait" | "block" | "park" => {
                     Some("`.prepare_wait()` inside `critical { ... }` followed by `.commit_wait([timeout: <dur>])`".to_string())
@@ -145,9 +154,10 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
                 "set" | "write" | "store" | "send" | "post" | "put" | "update" => {
                     Some(format!("`.publish({} val)`", elem))
                 }
-                "wait" | "changed" => {
-                    Some(format!("`.wait_change() -> {}` (or `.read()` for immediate non-blocking read)", elem))
-                }
+                "wait" | "changed" => Some(format!(
+                    "`.wait_change() -> {}` (or `.read()` for immediate non-blocking read)",
+                    elem
+                )),
                 _ => closest_match(method, valid, 2).map(|m| format!("`.{}(...)`", m)),
             };
             let table = format!(
@@ -181,8 +191,7 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
 
         ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => {
             let valid = [
-                "post", "send", "try_send", "recv", "try_recv", "len", "cap",
-                "is_empty", "is_full",
+                "post", "send", "try_send", "recv", "try_recv", "len", "cap", "is_empty", "is_full",
             ];
             let direct = match method {
                 "try_post" => Some(format!(
@@ -226,12 +235,11 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
             ];
             let direct = match method {
                 "recv" | "read" | "get" | "wait" | "next" | "next_chunk" | "acquire" | "pop"
-                | "read_chunk" | "try_recv" => {
-                    Some(format!("`.wait_chunk() -> []{}`", elem))
-                }
-                "swap" | "post" | "send" | "notify" | "complete" | "commit" | "publish" => {
-                    Some("`.flip()` or `.complete_half(u8 half)` (zero-copy buffer swap in DMA ISR)".to_string())
-                }
+                | "read_chunk" | "try_recv" => Some(format!("`.wait_chunk() -> []{}`", elem)),
+                "swap" | "post" | "send" | "notify" | "complete" | "commit" | "publish" => Some(
+                    "`.flip()` or `.complete_half(u8 half)` (zero-copy buffer swap in DMA ISR)"
+                        .to_string(),
+                ),
                 _ => closest_match(method, valid, 2).map(|m| format!("`.{}()`", m)),
             };
             let table = format!(
@@ -251,9 +259,10 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
                 "is_exhausted",
             ];
             let direct = match method {
-                "acquire" | "try_acquire" | "get" | "pop" | "take" | "wait_chunk" => {
-                    Some(format!("`.alloc()` or `.try_alloc() -> Lease<{}> error`", elem))
-                }
+                "acquire" | "try_acquire" | "get" | "pop" | "take" | "wait_chunk" => Some(format!(
+                    "`.alloc()` or `.try_alloc() -> Lease<{}> error`",
+                    elem
+                )),
                 "release" | "free" | "drop" | "put" => {
                     Some("`lease.release()` on the linear `Lease<T>` handle".to_string())
                 }

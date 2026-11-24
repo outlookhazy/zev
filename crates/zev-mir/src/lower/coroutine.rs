@@ -110,7 +110,10 @@ impl<'a> CoroutineLowerCtx<'a> {
             .any(|frame| !frame.is_empty())
     }
 
-    pub(super) fn lower_single_deferred_stmt(&mut self, deferred: &Stmt) -> Result<(), MirLowerError> {
+    pub(super) fn lower_single_deferred_stmt(
+        &mut self,
+        deferred: &Stmt,
+    ) -> Result<(), MirLowerError> {
         let prev_ny = self.in_noyield;
         self.in_noyield = true;
         self.scopes.push();
@@ -210,8 +213,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 if let Some(ie) = init {
                     if !self.try_lower_yielding_into_var(ie, vid, &vty)? {
                         let val = self.lower_expr(ie, Some(&vty))?;
-                        let moved =
-                            consume_moved_lease_be(coerce_expr_if_needed(val, &vty), self);
+                        let moved = consume_moved_lease_be(coerce_expr_if_needed(val, &vty), self);
                         self.cur_stmts.push(MirStmt::Assign {
                             target: MirPlace::Var(vid),
                             op: MirAssignOp::Assign,
@@ -265,8 +267,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                 let has_defers = self.has_active_defers_from(0);
                 let val = if let Some(e) = expr_opt {
                     let raw = self.lower_expr(e, Some(&ret_ty))?;
-                    let coerced =
-                        consume_moved_lease_be(coerce_expr_if_needed(raw, &ret_ty), self);
+                    let coerced = consume_moved_lease_be(coerce_expr_if_needed(raw, &ret_ty), self);
                     if has_defers && !ret_ty.is_void() {
                         let tmp = self.alloc_temp("ret_val", ret_ty.clone());
                         self.cur_stmts.push(MirStmt::Assign {
@@ -477,7 +478,10 @@ impl<'a> CoroutineLowerCtx<'a> {
                             });
                         }
                         let pv = self.alloc_temp("every_period", MirType::U32);
-                        (pv, Some(MirExpr::new(MirExprKind::TicksLit(ticks), MirType::U32)))
+                        (
+                            pv,
+                            Some(MirExpr::new(MirExprKind::TicksLit(ticks), MirType::U32)),
+                        )
                     } else {
                         let raw_p = self.lower_expr(period, None)?;
                         let host_ty = raw_p.ty.host_value_type();
@@ -494,7 +498,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                             let max_pre_u64 = (((zev_ast::MAX_DURATION_TICKS as u128)
                                 .saturating_mul(t_us as u128))
                             .div_ceil(1_000))
-                            .min((u64::MAX / 1_000) as u128) as u64;
+                            .min((u64::MAX / 1_000) as u128)
+                                as u64;
                             let pv = self.alloc_temp("every_period", MirType::U32);
                             let u_tmp = self.alloc_temp("every_u64", MirType::U64);
                             let scaled_var = MirExpr::new(
@@ -843,8 +848,14 @@ impl<'a> CoroutineLowerCtx<'a> {
                         cond: MirExpr::new(
                             MirExprKind::Binary {
                                 op: MirBinOp::Lt,
-                                lhs: Box::new(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize)),
-                                rhs: Box::new(MirExpr::new(MirExprKind::Var(len_tmp), MirType::Usize)),
+                                lhs: Box::new(MirExpr::new(
+                                    MirExprKind::Var(idx_tmp),
+                                    MirType::Usize,
+                                )),
+                                rhs: Box::new(MirExpr::new(
+                                    MirExprKind::Var(len_tmp),
+                                    MirType::Usize,
+                                )),
                             },
                             MirType::Bool,
                         ),
@@ -956,10 +967,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                     self.may_hold_boost = entry_boost;
                     self.lower_scoped_block(abody)?;
                     exit_boost |= self.may_hold_boost;
-                    let next_after = arm_bbs
-                        .get(idx + 1)
-                        .map(|(_, b, _)| *b)
-                        .unwrap_or(join_bb);
+                    let next_after = arm_bbs.get(idx + 1).map(|(_, b, _)| *b).unwrap_or(join_bb);
                     self.seal_bb(MirTerminator::Goto(join_bb), next_after, false);
                 }
                 self.may_hold_boost = exit_boost;
@@ -988,19 +996,21 @@ impl<'a> CoroutineLowerCtx<'a> {
                         } => (receiver, method.name.as_str()),
                         _ => {
                             return Err(MirLowerError {
-                                message: "`wait { ... }` arm must be a direct primitive method call"
-                                    .to_string(),
+                                message:
+                                    "`wait { ... }` arm must be a direct primitive method call"
+                                        .to_string(),
                                 span: arm.call.span,
                             });
                         }
                     };
-                    let recv_kind = resolve_prim_receiver_kind_be(receiver, self)?.ok_or_else(|| {
-                        MirLowerError {
-                            message: "`wait { ... }` arm receiver is not an OS primitive"
-                                .to_string(),
-                            span: receiver.span,
-                        }
-                    })?;
+                    let recv_kind =
+                        resolve_prim_receiver_kind_be(receiver, self)?.ok_or_else(|| {
+                            MirLowerError {
+                                message: "`wait { ... }` arm receiver is not an OS primitive"
+                                    .to_string(),
+                                span: receiver.span,
+                            }
+                        })?;
 
                     let alloc_arm_dst = |this: &mut Self,
                                          bind: &Option<(TypeExpr, zev_ast::Ident)>,
@@ -1027,7 +1037,8 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                     let (op, bound_var, sets_boost) = match recv_kind {
                         LoweredPrimReceiver::InboxView(view, elem) if method == "recv" => {
-                            let (vid, b) = alloc_arm_dst(self, &arm.bind, "wait_inbox", elem.clone());
+                            let (vid, b) =
+                                alloc_arm_dst(self, &arm.bind, "wait_inbox", elem.clone());
                             (
                                 MirWaitArmOp::InboxViewRecv {
                                     view,
@@ -1340,7 +1351,10 @@ impl<'a> CoroutineLowerCtx<'a> {
         Ok(())
     }
 
-    pub(super) fn emit_coroutine_sys_exit(&mut self, code_arg_opt: Option<&Expr>) -> Result<(), MirLowerError> {
+    pub(super) fn emit_coroutine_sys_exit(
+        &mut self,
+        code_arg_opt: Option<&Expr>,
+    ) -> Result<(), MirLowerError> {
         let code_expr = if let Some(ce) = code_arg_opt {
             let raw = self.lower_expr(ce, Some(&MirType::I32))?;
             let coerced = coerce_or_cast_int(raw, &MirType::I32);
@@ -1360,10 +1374,11 @@ impl<'a> CoroutineLowerCtx<'a> {
         };
         self.emit_defers_down_to(0)?;
         self.emit_end_inbox_turn();
-        self.cur_stmts.push(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
-            method: "exit".to_string(),
-            args: vec![code_expr],
-        }));
+        self.cur_stmts
+            .push(MirStmt::Intrinsic(MirIntrinsicOp::SysOp {
+                method: "exit".to_string(),
+                args: vec![code_expr],
+            }));
         let dead_bb = self.alloc_bb();
         self.seal_bb(MirTerminator::Return(None), dead_bb, false);
         Ok(())
@@ -1757,7 +1772,10 @@ impl<'a> CoroutineLowerCtx<'a> {
         match &expr.kind {
             ExprKind::Call { callee, .. } => {
                 if let ExprKind::Ident(id) = &callee.kind {
-                    if matches!(id.name.as_str(), "delay" | "delay_ms" | "sleep" | "checkpoint") {
+                    if matches!(
+                        id.name.as_str(),
+                        "delay" | "delay_ms" | "sleep" | "checkpoint"
+                    ) {
                         return true;
                     }
                     if let Some(sig) = self.syms.fns.get(&id.name) {
@@ -1788,7 +1806,10 @@ impl<'a> CoroutineLowerCtx<'a> {
         }
     }
 
-    pub(super) fn try_lower_yielding_stmt_expr(&mut self, expr: &Expr) -> Result<bool, MirLowerError> {
+    pub(super) fn try_lower_yielding_stmt_expr(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<bool, MirLowerError> {
         match &expr.kind {
             ExprKind::Call { callee, args, .. } => {
                 if let ExprKind::Ident(id) = &callee.kind {
@@ -2126,7 +2147,8 @@ impl<'a> CoroutineLowerCtx<'a> {
 
                 let fb_val = self.lower_expr(tail, Some(&ok_ty))?;
                 if let Some(out_vid) = out_vid_opt {
-                    let fb_val = consume_moved_lease_be(coerce_expr_if_needed(fb_val, &ok_ty), self);
+                    let fb_val =
+                        consume_moved_lease_be(coerce_expr_if_needed(fb_val, &ok_ty), self);
                     self.cur_stmts.push(MirStmt::Assign {
                         target: MirPlace::Var(out_vid),
                         op: MirAssignOp::Assign,
@@ -2262,14 +2284,15 @@ impl<'a> CoroutineLowerCtx<'a> {
                             if tail_val.ty.is_void() {
                                 if matches!(
                                     tail_val.kind,
-                                    MirExprKind::CallDirect { .. }
-                                        | MirExprKind::RomCallU32 { .. }
+                                    MirExprKind::CallDirect { .. } | MirExprKind::RomCallU32 { .. }
                                 ) {
                                     self.cur_stmts.push(MirStmt::Expr(tail_val));
                                 }
                             } else {
-                                let tail_val =
-                                    consume_moved_lease_be(coerce_expr_if_needed(tail_val, &ok_ty), self);
+                                let tail_val = consume_moved_lease_be(
+                                    coerce_expr_if_needed(tail_val, &ok_ty),
+                                    self,
+                                );
                                 self.cur_stmts.push(MirStmt::Assign {
                                     target: MirPlace::Var(out_vid),
                                     op: MirAssignOp::Assign,
@@ -2360,14 +2383,16 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     value: vexpr,
                                 });
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("inbox_tx_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("inbox_tx_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: Box::new(MirType::Void),
                                         err: None,
                                     };
                                     let dst_res = self.alloc_temp("inbox_tx_res", rty.clone());
                                     let release_lease_on_timeout =
-                                        matches!(&elem, MirType::Lease(_)).then(|| (val_var, elem.clone()));
+                                        matches!(&elem, MirType::Lease(_))
+                                            .then(|| (val_var, elem.clone()));
                                     let poll_bb = self.alloc_bb();
                                     let resume_bb = self.alloc_bb();
                                     self.emit_single_arm_wait(
@@ -2407,7 +2432,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                             "recv" => {
                                 self.emit_end_inbox_turn();
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("inbox_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("inbox_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: Box::new(elem.clone()),
                                         err: None,
@@ -2526,7 +2552,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 self.emit_end_inbox_turn();
                                 let lease_ty = MirType::Lease(elem.clone());
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("pool_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("pool_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: Box::new(lease_ty),
                                         err: None,
@@ -2588,7 +2615,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                     value: vexpr,
                                 });
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("inbox_tx_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("inbox_tx_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: Box::new(MirType::Void),
                                         err: None,
@@ -2638,7 +2666,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                             ("recv", MirPrimKind::Inbox { elem, cap }) => {
                                 self.emit_end_inbox_turn();
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("inbox_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("inbox_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: elem.clone(),
                                         err: None,
@@ -2689,7 +2718,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 self.emit_end_inbox_turn();
                                 let slice_ty = MirType::Slice(Box::new(MirType::U8));
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("ring_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("ring_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: Box::new(slice_ty),
                                         err: None,
@@ -2737,7 +2767,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                             ("wait", MirPrimKind::Signal) => {
                                 self.emit_end_inbox_turn();
                                 let timer = if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("sig_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("sig_deadline", texpr)?;
                                     Some(dl_var)
                                 } else {
                                     None
@@ -2770,7 +2801,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                             ("commit_wait", MirPrimKind::WaitQueue) => {
                                 self.emit_end_inbox_turn();
                                 let timer = if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("wq_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("wq_deadline", texpr)?;
                                     Some(dl_var)
                                 } else {
                                     None
@@ -2805,7 +2837,8 @@ impl<'a> CoroutineLowerCtx<'a> {
                                 let (last_gen_var, seeded_var) =
                                     self.prepare_watch_wait_change(&target, &elem);
                                 if let Some(texpr) = find_named_arg(args, "timeout") {
-                                    let dl_var = self.emit_wait_deadline_var("watch_deadline", texpr)?;
+                                    let dl_var =
+                                        self.emit_wait_deadline_var("watch_deadline", texpr)?;
                                     let rty = MirType::Result {
                                         ok: elem.clone(),
                                         err: None,
@@ -2895,11 +2928,8 @@ impl<'a> CoroutineLowerCtx<'a> {
     }
 
     pub(super) fn coerce_arg_for_param(&mut self, arg: MirExpr, param_ty: &MirType) -> MirExpr {
-        if let (
-            MirType::Array { elem, len },
-            MirType::Slice(_),
-            MirExprKind::Var(vid),
-        ) = (&arg.ty, param_ty, &arg.kind)
+        if let (MirType::Array { elem, len }, MirType::Slice(_), MirExprKind::Var(vid)) =
+            (&arg.ty, param_ty, &arg.kind)
         {
             return MirExpr::new(
                 MirExprKind::ArrayToSlice {
@@ -2918,10 +2948,7 @@ impl<'a> CoroutineLowerCtx<'a> {
                     MirExprKind::SubSlice {
                         base: Box::new(arg),
                         start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
-                        end: Box::new(MirExpr::new(
-                            MirExprKind::IntLit(n as i128),
-                            MirType::Usize,
-                        )),
+                        end: Box::new(MirExpr::new(MirExprKind::IntLit(n as i128), MirType::Usize)),
                         elem_ty: e_ty,
                         base_is_array: true,
                     },
@@ -2932,7 +2959,10 @@ impl<'a> CoroutineLowerCtx<'a> {
         coerce_expr_if_needed(arg, param_ty)
     }
 
-    pub(super) fn lower_place(&mut self, expr: &Expr) -> Result<(MirPlace, MirType), MirLowerError> {
+    pub(super) fn lower_place(
+        &mut self,
+        expr: &Expr,
+    ) -> Result<(MirPlace, MirType), MirLowerError> {
         lower_place_common(expr, self)
     }
 }

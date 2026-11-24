@@ -38,7 +38,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
     pub(super) fn require_coro(&self) -> Result<CoroutineFrameLayout, CodegenError> {
         self.coroutine.clone().ok_or_else(|| {
-            CodegenError::new("llvm-codegen", "coroutine state requested in non-coroutine function")
+            CodegenError::new(
+                "llvm-codegen",
+                "coroutine state requested in non-coroutine function",
+            )
         })
     }
 
@@ -119,12 +122,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let lty = self.ctx.llvm_ty(&v.ty);
             let al = self.stack_align(&lty);
             self.emit_line(format!("%v_{} = alloca {lty}, align {al}", v.id.0));
-            self.emit_line(format!("store {lty} zeroinitializer, ptr %v_{}, align {al}", v.id.0));
+            self.emit_line(format!(
+                "store {lty} zeroinitializer, ptr %v_{}, align {al}",
+                v.id.0
+            ));
         }
         for (idx, &vid) in param_vids.iter().enumerate() {
             let lty = self.ctx.llvm_ty(&self.vars[vid.0].ty);
             let al = self.stack_align(&lty);
-            self.emit_line(format!("store {lty} %arg{idx}, ptr %v_{}, align {al}", vid.0));
+            self.emit_line(format!(
+                "store {lty} %arg{idx}, ptr %v_{}, align {al}",
+                vid.0
+            ));
         }
     }
 
@@ -138,10 +147,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let call_kw = self.call_kw();
             let pm = self.next_tmp();
             self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
-            self.emit_line(format!("{val} = load volatile i32, ptr {ptr_repr}, align 4"));
+            self.emit_line(format!(
+                "{val} = load volatile i32, ptr {ptr_repr}, align 4"
+            ));
             self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
         } else {
-            self.emit_line(format!("{val} = load volatile i32, ptr {ptr_repr}, align 4"));
+            self.emit_line(format!(
+                "{val} = load volatile i32, ptr {ptr_repr}, align 4"
+            ));
         }
         val
     }
@@ -150,10 +163,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         if let Some(state_ptr) = self.isr_state_ptrs.get(&vid) {
             return state_ptr.clone();
         }
-        let hoisted_info = self
-            .coroutine
-            .as_ref()
-            .and_then(|coro| coro.hoisted_var_gep.get(&vid).map(|&idx| (coro.llvm_name.clone(), idx)));
+        let hoisted_info = self.coroutine.as_ref().and_then(|coro| {
+            coro.hoisted_var_gep
+                .get(&vid)
+                .map(|&idx| (coro.llvm_name.clone(), idx))
+        });
         if let Some((cname, gep_idx)) = hoisted_info {
             let p = self.next_tmp();
             self.emit_line(format!(
@@ -245,12 +259,18 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
         if (dst_ty == "ptr" || dst_ty == "ptr addrspace(1)") && val.ty.starts_with('i') {
             let t = self.next_tmp();
-            self.emit_line(format!("{t} = inttoptr {} {} to {dst_ty}", val.ty, val.repr));
+            self.emit_line(format!(
+                "{t} = inttoptr {} {} to {dst_ty}",
+                val.ty, val.repr
+            ));
             return SsaVal::new(dst_ty, t);
         }
         if (val.ty == "ptr" || val.ty == "ptr addrspace(1)") && dst_ty.starts_with('i') {
             let t = self.next_tmp();
-            self.emit_line(format!("{t} = ptrtoint {} {} to {dst_ty}", val.ty, val.repr));
+            self.emit_line(format!(
+                "{t} = ptrtoint {} {} to {dst_ty}",
+                val.ty, val.repr
+            ));
             return SsaVal::new(dst_ty, t);
         }
         if val.ty.starts_with('i') && dst_ty.starts_with('i') {
@@ -277,7 +297,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         val
     }
 
-    pub(super) fn to_i1(&mut self, val: SsaVal) -> String {
+    pub(super) fn coerce_to_i1(&mut self, val: SsaVal) -> String {
         if val.ty == "i1" {
             return val.repr;
         }
@@ -400,7 +420,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let park_lbl = self.next_label("park_dl");
         let after_lbl = self.next_label("after_dl");
         self.emit_line(format!("{is_null} = icmp eq ptr %__task, null"));
-        self.emit_term(format!("br i1 {is_null}, label %{after_lbl}, label %{park_lbl}"));
+        self.emit_term(format!(
+            "br i1 {is_null}, label %{after_lbl}, label %{park_lbl}"
+        ));
         self.start_block(&park_lbl);
         let pm = self.next_tmp();
         self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
@@ -408,22 +430,38 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let wt_p = self.next_tmp();
         let ht_p = self.next_tmp();
         let wo_p = self.next_tmp();
-        self.emit_line(format!("{st_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 2"));
-        self.emit_line(format!("{ht_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 7"));
-        self.emit_line(format!("{wt_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 11"));
-        self.emit_line(format!("{wo_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 12"));
+        self.emit_line(format!(
+            "{st_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 2"
+        ));
+        self.emit_line(format!(
+            "{ht_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 7"
+        ));
+        self.emit_line(format!(
+            "{wt_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 11"
+        ));
+        self.emit_line(format!(
+            "{wo_p} = getelementptr inbounds %SynTask, ptr %__task, i32 0, i32 12"
+        ));
         self.emit_line(format!("store i8 2, ptr {st_p}, align 1"));
         self.emit_line(format!("store i8 0, ptr {ht_p}, align 1"));
         self.emit_line(format!("store i32 {}, ptr {wt_p}, align 4", wt.repr));
         self.emit_line(format!("store ptr null, ptr {wo_p}, align 4"));
-        self.emit_line(format!("{call_kw} void @__syn_ready_clear_task(ptr %__task)"));
-        self.emit_line(format!("{call_kw} void @__syn_note_deadline(i32 {})", wt.repr));
+        self.emit_line(format!(
+            "{call_kw} void @__syn_ready_clear_task(ptr %__task)"
+        ));
+        self.emit_line(format!(
+            "{call_kw} void @__syn_note_deadline(i32 {})",
+            wt.repr
+        ));
         self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
         self.emit_term(format!("br label %{after_lbl}"));
         self.start_block(&after_lbl);
     }
 
-    pub(super) fn emit_coroutine_terminator(&mut self, term: &MirTerminator) -> Result<(), CodegenError> {
+    pub(super) fn emit_coroutine_terminator(
+        &mut self,
+        term: &MirTerminator,
+    ) -> Result<(), CodegenError> {
         if self.terminated {
             return Ok(());
         }
@@ -437,8 +475,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 else_bb,
             } => {
                 let cv = self.emit_expr(cond)?;
-                let b1 = self.to_i1(cv);
-                self.emit_term(format!("br i1 {b1}, label %bb_{}, label %bb_{}", then_bb.0, else_bb.0));
+                let b1 = self.coerce_to_i1(cv);
+                self.emit_term(format!(
+                    "br i1 {b1}, label %bb_{}, label %bb_{}",
+                    then_bb.0, else_bb.0
+                ));
             }
             MirTerminator::Switch {
                 discr,
@@ -446,7 +487,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 default_bb,
             } => {
                 let dv = self.emit_expr(discr)?;
-                let sw_ty = if llvm_int_bits(&dv.ty) > 32 { "i64" } else { "i32" };
+                let sw_ty = if llvm_int_bits(&dv.ty) > 32 {
+                    "i64"
+                } else {
+                    "i32"
+                };
                 let dc = self.coerce(dv, sw_ty, !discr.ty.is_unsigned());
                 let mut cases = String::new();
                 for (pat, bb) in arms {
@@ -511,7 +556,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         };
         let lty = pv.ty;
         if bits < 32 {
-            let ext32 = self.coerce(SsaVal::new(lty, pv.repr), "i32", is_signed).repr;
+            let ext32 = self
+                .coerce(SsaVal::new(lty, pv.repr), "i32", is_signed)
+                .repr;
             let low = self.next_tmp();
             let clamped = self.next_tmp();
             if is_signed {
@@ -606,7 +653,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
                 let due_lbl = self.next_label("every_due");
                 let sleep_lbl = self.next_label("every_wait");
-                self.emit_term(format!("br i1 {is_early}, label %{sleep_lbl}, label %{due_lbl}"));
+                self.emit_term(format!(
+                    "br i1 {is_early}, label %{sleep_lbl}, label %{due_lbl}"
+                ));
 
                 self.start_block(&due_lbl);
                 let q = self.next_tmp();
@@ -618,7 +667,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("store i32 {resync_dl}, ptr {dl_ptr}, align 4"));
 
                 let share = self.next_tmp();
-                self.emit_line(format!("{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"));
+                self.emit_line(format!(
+                    "{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"
+                ));
                 let yield_more = self.next_label("every_more");
                 self.emit_term(format!(
                     "br i1 {share}, label %{yield_more}, label %bb_{}",
@@ -664,7 +715,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirYieldKind::ShareCheckpoint { resume_bb } => {
                 let call_kw = self.call_kw();
                 let share = self.next_tmp();
-                self.emit_line(format!("{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"));
+                self.emit_line(format!(
+                    "{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"
+                ));
                 let yield_lbl = self.next_label("share_yield");
                 self.emit_term(format!(
                     "br i1 {share}, label %{yield_lbl}, label %bb_{}",
@@ -701,7 +754,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     .find(|f| &f.name == callee)
                     .cloned()
                     .ok_or_else(|| {
-                        CodegenError::new("llvm-codegen", format!("missing yielding callee `{callee}`"))
+                        CodegenError::new(
+                            "llvm-codegen",
+                            format!("missing yielding callee `{callee}`"),
+                        )
                     })?;
 
                 let mut eval_args = Vec::new();
@@ -779,7 +835,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let is_more = self.next_tmp();
                 self.emit_line(format!("{is_more} = icmp eq i32 {st}, 0"));
                 let share = self.next_tmp();
-                self.emit_line(format!("{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"));
+                self.emit_line(format!(
+                    "{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"
+                ));
                 let not_share = self.next_tmp();
                 self.emit_line(format!("{not_share} = xor i1 {share}, true"));
                 let keep_going = self.next_tmp();
@@ -811,11 +869,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let dp = self.var_ptr(dvid);
                         let dty = self.ctx.llvm_ty(&self.vars[dvid.0].ty);
                         let signed = !self.vars[dvid.0].ty.is_unsigned();
-                        let coerced = self.coerce(
-                            SsaVal::new(&child_layout.ret_llvm_ty, rv),
-                            &dty,
-                            signed,
-                        );
+                        let coerced =
+                            self.coerce(SsaVal::new(&child_layout.ret_llvm_ty, rv), &dty, signed);
                         self.emit_line(format!(
                             "store {} {}, ptr {dp}, align 4",
                             coerced.ty, coerced.repr
@@ -1615,9 +1670,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     ));
                     if let Some(vid) = dst_val {
                         let vp = self.var_ptr(*vid);
-                        self.emit_line(format!(
-                            "store {{ ptr, ptr, i8 }} {ls}, ptr {vp}, align 1"
-                        ));
+                        self.emit_line(format!("store {{ ptr, ptr, i8 }} {ls}, ptr {vp}, align 1"));
                     }
                     if let Some(rvid) = dst_res {
                         let rp = self.var_ptr(*rvid);
@@ -1746,7 +1799,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let rp = self.var_ptr(rvid);
                 let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
                 let e0 = self.next_tmp();
-                self.emit_line(format!("{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"));
+                self.emit_line(format!(
+                    "{e0} = insertvalue {rty} zeroinitializer, i32 1, 1"
+                ));
                 self.emit_line(format!("store {rty} {e0}, ptr {rp}, align 1"));
             }
             if let Some((lv, lty)) = &t.release_lease_on_timeout {
@@ -1814,7 +1869,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         ));
         self.emit_line(format!("store i8 3, ptr {st_p}, align 1"));
         self.emit_line(format!("store ptr null, ptr {wo_p}, align {ptr_al}"));
-        self.emit_line(format!("{call_kw} void @__syn_ready_clear_task(ptr %__task)"));
+        self.emit_line(format!(
+            "{call_kw} void @__syn_ready_clear_task(ptr %__task)"
+        ));
         if let Some(dl) = dl_ssa {
             let wt_p = self.next_tmp();
             self.emit_line(format!(
@@ -1856,7 +1913,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             .find(|f| f.name == callee)
             .cloned()
             .ok_or_else(|| {
-                CodegenError::new("llvm-codegen", format!("missing boot yielding callee `{callee}`"))
+                CodegenError::new(
+                    "llvm-codegen",
+                    format!("missing boot yielding callee `{callee}`"),
+                )
             })?;
         let fsym = format!("@__syn_boot_frame_{}", sanitize_ident(callee));
 
@@ -1901,7 +1961,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         ));
         let done = self.next_tmp();
         self.emit_line(format!("{done} = icmp eq i32 {st}, 2"));
-        self.emit_term(format!("br i1 {done}, label %{done_lbl}, label %{wait_lbl}"));
+        self.emit_term(format!(
+            "br i1 {done}, label %{done_lbl}, label %{wait_lbl}"
+        ));
 
         self.start_block(&wait_lbl);
         let is_wait = self.next_tmp();
@@ -1933,8 +1995,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let dp = self.var_ptr(dvid);
                 let dty = self.ctx.llvm_ty(&self.vars[dvid.0].ty);
                 let signed = !self.vars[dvid.0].ty.is_unsigned();
-                let coerced =
-                    self.coerce(SsaVal::new(&child_layout.ret_llvm_ty, rv), &dty, signed);
+                let coerced = self.coerce(SsaVal::new(&child_layout.ret_llvm_ty, rv), &dty, signed);
                 self.emit_line(format!(
                     "store {} {}, ptr {dp}, align 4",
                     coerced.ty, coerced.repr
@@ -1946,11 +2007,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
 
     pub(super) fn emit_store_pool_hdr(&mut self, hdr_ptr: &str, cap: usize, dma_flag: u8) {
         let c = cap.max(1);
-        let mask: u32 = if c >= 32 {
-            u32::MAX
-        } else {
-            (1u32 << c) - 1
-        };
+        let mask: u32 = if c >= 32 { u32::MAX } else { (1u32 << c) - 1 };
         let mask_i32 = mask as i32;
         let dma8 = dma_flag as i8;
         let cap8 = c as u8;
@@ -1982,7 +2039,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         self.emit_line(format!("store i8 {cap8}, ptr {f4}, align 1"));
     }
 
-    pub(super) fn emit_subsys_pool_inits(&mut self, struct_name: &str, base_ptr: &str, parent_dma_safe: bool) {
+    pub(super) fn emit_subsys_pool_inits(
+        &mut self,
+        struct_name: &str,
+        base_ptr: &str,
+        parent_dma_safe: bool,
+    ) {
         let Some(si) = self.ctx.structs.get(struct_name).cloned() else {
             return;
         };
@@ -2073,7 +2135,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             .find(|s| s.slot_id == slot_id)
             .cloned()
             .ok_or_else(|| {
-                CodegenError::new("llvm-codegen", format!("missing spawned task slot {slot_id}"))
+                CodegenError::new(
+                    "llvm-codegen",
+                    format!("missing spawned task slot {slot_id}"),
+                )
             })?;
         let bp = self
             .ctx
@@ -2156,7 +2221,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
     }
 
-    pub(super) fn build_return_envelope(&mut self, val_opt: Option<&MirExpr>) -> Result<SsaVal, CodegenError> {
+    pub(super) fn build_return_envelope(
+        &mut self,
+        val_opt: Option<&MirExpr>,
+    ) -> Result<SsaVal, CodegenError> {
         if self.error_spec.has_error() {
             let env_ty = MirType::Result {
                 ok: Box::new(self.ret_ty.clone()),
@@ -2324,7 +2392,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 else_body,
             } => {
                 let cv = self.emit_expr(cond)?;
-                let c1 = self.to_i1(cv);
+                let c1 = self.coerce_to_i1(cv);
                 let then_lbl = self.next_label("if_then");
                 let else_lbl = self.next_label("if_else");
                 let end_lbl = self.next_label("if_end");
@@ -2358,7 +2426,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_term(format!("br label %{cond_lbl}"));
                 self.start_block(&cond_lbl);
                 let cv = self.emit_expr(cond)?;
-                let c1 = self.to_i1(cv);
+                let c1 = self.coerce_to_i1(cv);
                 self.emit_term(format!("br i1 {c1}, label %{body_lbl}, label %{end_lbl}"));
                 self.start_block(&body_lbl);
                 self.loop_targets.push((cond_lbl.clone(), end_lbl.clone()));
@@ -2375,7 +2443,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 default,
             } => {
                 let dv = self.emit_expr(discr)?;
-                let sw_ty = if llvm_int_bits(&dv.ty) > 32 { "i64" } else { "i32" };
+                let sw_ty = if llvm_int_bits(&dv.ty) > 32 {
+                    "i64"
+                } else {
+                    "i32"
+                };
                 let dc = self.coerce(dv, sw_ty, !discr.ty.is_unsigned());
                 let def_lbl = self.next_label("sw_def");
                 let end_lbl = self.next_label("sw_end");
@@ -2432,12 +2504,16 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirStmt::PrintFmt { chunks, newline } => {
                 let call_kw = self.call_kw();
-                self.emit_line(format!("{call_kw} void @__syn_fmt_init_uart(ptr %__fmt_sink)"));
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_fmt_init_uart(ptr %__fmt_sink)"
+                ));
                 for ch in chunks {
                     self.emit_fmt_chunk("%__fmt_sink", ch)?;
                 }
                 if *newline {
-                    self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr %__fmt_sink, i8 10)"));
+                    self.emit_line(format!(
+                        "{call_kw} void @__syn_fmt_putc(ptr %__fmt_sink, i8 10)"
+                    ));
                 }
             }
             MirStmt::FmtBuf {
@@ -2529,7 +2605,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{has_w} = icmp sgt i32 {written}, 0"));
                 let wake_lbl = self.next_label("fring_wake");
                 let done_lbl = self.next_label("fring_done");
-                self.emit_term(format!("br i1 {has_w}, label %{wake_lbl}, label %{done_lbl}"));
+                self.emit_term(format!(
+                    "br i1 {has_w}, label %{wake_lbl}, label %{done_lbl}"
+                ));
                 self.start_block(&wake_lbl);
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
                 self.emit_line(format!(
@@ -2557,7 +2635,11 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok(())
     }
 
-    pub(super) fn emit_fmt_chunk(&mut self, sink: &str, ch: &MirFmtChunk) -> Result<(), CodegenError> {
+    pub(super) fn emit_fmt_chunk(
+        &mut self,
+        sink: &str,
+        ch: &MirFmtChunk,
+    ) -> Result<(), CodegenError> {
         let call_kw = self.call_kw();
         let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
         match ch {
@@ -2568,7 +2650,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
                 if bytes.len() == 1 {
                     let b = bytes[0] as i8;
-                    self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 {b})"));
+                    self.emit_line(format!(
+                        "{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 {b})"
+                    ));
                 } else {
                     let idx = self.ctx.intern_string(s);
                     let slen = bytes.len() as i32;
@@ -2586,8 +2670,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let vv = self.emit_expr(value)?;
                 match fmt {
                     MirIntFmt::Dec => {
-                        let is64 = *bits == 64
-                            || (*bits == 0 && self.ctx.spec.isa.ptr_bits() == 64);
+                        let is64 =
+                            *bits == 64 || (*bits == 0 && self.ctx.spec.isa.ptr_bits() == 64);
                         if is64 {
                             let v64 = self.coerce(vv, "i64", *signed);
                             let fn_sym = if *signed {
@@ -2703,10 +2787,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             }
             MirFmtChunk::Bool(value) => {
                 let vv = self.emit_expr(value)?;
-                let b1 = self.to_i1(vv);
+                let b1 = self.coerce_to_i1(vv);
                 let b8 = self.next_tmp();
                 self.emit_line(format!("{b8} = zext i1 {b1} to i8"));
-                self.emit_line(format!("{call_kw} void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_fmt_bool(ptr {sink}, i8 {b8})"
+                ));
             }
             MirFmtChunk::Str(value) => {
                 let vv = self.emit_expr(value)?;
@@ -2738,7 +2824,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{np} = {call_kw} ptr @__syn_enum_name_{eid}(i32 {})",
                     v32.repr
                 ));
-                self.emit_line(format!("{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {np})"
+                ));
             }
             MirFmtChunk::DebugSlice { elem_ty, slice } => {
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
@@ -2755,7 +2843,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 91)"));
 
                 let (idx_slot, idx_al) = self.emit_temp_alloca(&usize_ty);
-                self.emit_line(format!("store {usize_ty} 0, ptr {idx_slot}, align {idx_al}"));
+                self.emit_line(format!(
+                    "store {usize_ty} 0, ptr {idx_slot}, align {idx_al}"
+                ));
 
                 let cond_lbl = self.next_label("dsl_cond");
                 let body_lbl = self.next_label("dsl_body");
@@ -2768,7 +2858,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.start_block(&cond_lbl);
                 let idx_v = self.next_tmp();
                 let more = self.next_tmp();
-                self.emit_line(format!("{idx_v} = load {usize_ty}, ptr {idx_slot}, align {idx_al}"));
+                self.emit_line(format!(
+                    "{idx_v} = load {usize_ty}, ptr {idx_slot}, align {idx_al}"
+                ));
                 self.emit_line(format!("{more} = icmp ult {usize_ty} {idx_v}, {dl}"));
                 self.emit_term(format!("br i1 {more}, label %{body_lbl}, label %{end_lbl}"));
 
@@ -2791,10 +2883,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let ev = self.load_from_place_ptr(&ep, &raw_slice_elem_ty, false);
                 match elem_ty {
                     MirType::Bool => {
-                        let b1 = self.to_i1(ev);
+                        let b1 = self.coerce_to_i1(ev);
                         let b8 = self.next_tmp();
                         self.emit_line(format!("{b8} = zext i1 {b1} to i8"));
-                        self.emit_line(format!("{call_kw} void @__syn_fmt_bool(ptr {sink}, i8 {b8})"));
+                        self.emit_line(format!(
+                            "{call_kw} void @__syn_fmt_bool(ptr {sink}, i8 {b8})"
+                        ));
                     }
                     MirType::F32 => {
                         let fv = self.coerce(ev, "float", true);
@@ -2818,7 +2912,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             "{np} = {call_kw} ptr @__syn_enum_name_{eid}(i32 {})",
                             v32.repr
                         ));
-                        self.emit_line(format!("{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {np})"));
+                        self.emit_line(format!(
+                            "{call_kw} void @__syn_fmt_cstr(ptr {sink}, ptr {np})"
+                        ));
                     }
                     MirType::Str => {
                         let p = self.coerce_str_ptr(ev);
@@ -2828,8 +2924,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         ));
                     }
                     MirType::Ptr(_) => {
-                        self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 48)"));
-                        self.emit_line(format!("{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 120)"));
+                        self.emit_line(format!(
+                            "{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 48)"
+                        ));
+                        self.emit_line(format!(
+                            "{call_kw} void @__syn_fmt_putc(ptr {sink}, i8 120)"
+                        ));
                         if self.ctx.spec.isa.ptr_bits() == 64 {
                             let addr64 = self.coerce(ev, "i64", false);
                             self.emit_line(format!(
@@ -2874,9 +2974,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     | MirType::I32
                     | MirType::Isize
                     | MirType::EndianInt { signed: true, .. } => {
-                        if matches!(elem_ty, MirType::Isize)
-                            && self.ctx.spec.isa.ptr_bits() == 64
-                        {
+                        if matches!(elem_ty, MirType::Isize) && self.ctx.spec.isa.ptr_bits() == 64 {
                             let v64 = self.coerce(ev, "i64", true);
                             self.emit_line(format!(
                                 "{call_kw} void @__syn_fmt_i64_dec(ptr {sink}, i64 {})",
@@ -2891,9 +2989,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         }
                     }
                     _ => {
-                        if matches!(elem_ty, MirType::Usize)
-                            && self.ctx.spec.isa.ptr_bits() == 64
-                        {
+                        if matches!(elem_ty, MirType::Usize) && self.ctx.spec.isa.ptr_bits() == 64 {
                             let v64 = self.coerce(ev, "i64", false);
                             self.emit_line(format!(
                                 "{call_kw} void @__syn_fmt_u64_dec(ptr {sink}, i64 {})",
@@ -2910,7 +3006,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 }
                 let idx_next = self.next_tmp();
                 self.emit_line(format!("{idx_next} = add {usize_ty} {idx_v}, 1"));
-                self.emit_line(format!("store {usize_ty} {idx_next}, ptr {idx_slot}, align {idx_al}"));
+                self.emit_line(format!(
+                    "store {usize_ty} {idx_next}, ptr {idx_slot}, align {idx_al}"
+                ));
                 self.emit_term(format!("br label %{cond_lbl}"));
 
                 self.start_block(&end_lbl);
@@ -2989,7 +3087,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         let ok_lbl = self.next_label("chk_ok");
         let trap_lbl = self.next_label("chk_trap");
         let call_kw = self.call_kw();
-        self.emit_term(format!("br i1 {in_bounds_i1}, label %{ok_lbl}, label %{trap_lbl}"));
+        self.emit_term(format!(
+            "br i1 {in_bounds_i1}, label %{ok_lbl}, label %{trap_lbl}"
+        ));
         self.start_block(&trap_lbl);
         self.emit_line(format!("{call_kw} void @__syn_panic(i8 {reason})"));
         self.emit_term("unreachable");
@@ -3028,9 +3128,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             self.emit_line(format!("{is_min} = icmp eq {ty} {lhs}, {int_min}"));
             self.emit_line(format!("{is_neg1} = icmp eq {ty} {rhs}, -1"));
             self.emit_line(format!("{ovf} = and i1 {is_min}, {is_neg1}"));
-            self.emit_line(format!(
-                "{safe_rhs} = select i1 {ovf}, {ty} 1, {ty} {rhs}"
-            ));
+            self.emit_line(format!("{safe_rhs} = select i1 {ovf}, {ty} 1, {ty} {rhs}"));
             if is_rem {
                 let r0 = self.next_tmp();
                 self.emit_line(format!("{r0} = srem {ty} {lhs}, {safe_rhs}"));
@@ -3045,7 +3143,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         t
     }
 
-    pub(super) fn emit_byte_ring_view_parts(&mut self, view: &MirExpr) -> Result<(String, String), CodegenError> {
+    pub(super) fn emit_byte_ring_view_parts(
+        &mut self,
+        view: &MirExpr,
+    ) -> Result<(String, String), CodegenError> {
         let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
         let vty = format!("{{ ptr, {usize_ty} }}");
         let vv = self.emit_expr(view)?;
@@ -3074,7 +3175,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         Ok((hdr, items_base, cap32.repr))
     }
 
-    pub(super) fn resolve_prim_ptr(&mut self, target: &MirPrimTarget) -> Result<String, CodegenError> {
+    pub(super) fn resolve_prim_ptr(
+        &mut self,
+        target: &MirPrimTarget,
+    ) -> Result<String, CodegenError> {
         match target {
             MirPrimTarget::Global(name) => Ok(format!("@__syn_prim_{}", sanitize_ident(name))),
             MirPrimTarget::PtrExpr(e) => {
@@ -3085,7 +3189,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
     }
 
-    pub(super) fn emit_prim_nonblocking(&mut self, pop: &MirPrimNonBlockingOp) -> Result<(), CodegenError> {
+    pub(super) fn emit_prim_nonblocking(
+        &mut self,
+        pop: &MirPrimNonBlockingOp,
+    ) -> Result<(), CodegenError> {
         let call_kw = self.call_kw();
         match pop {
             MirPrimNonBlockingOp::WatchPublish {
@@ -3167,7 +3274,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let id = sanitize_ident(&MirPrimKind::Signal.mangle_name());
                 let sptr = self.resolve_prim_ptr(target)?;
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
-                self.emit_line(format!("{call_kw} void @__syn_sig_notify_{id}(ptr {sptr}, i32 {b})"));
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_sig_notify_{id}(ptr {sptr}, i32 {b})"
+                ));
             }
             MirPrimNonBlockingOp::SignalClear { target } => {
                 let sptr = self.resolve_prim_ptr(target)?;
@@ -3188,7 +3297,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirPrimNonBlockingOp::WaitQueueWakeAll { target, boost } => {
                 let wptr = self.resolve_prim_ptr(target)?;
                 let b = boost.map_or(-1i32, |p| p.as_u8() as i32);
-                self.emit_line(format!("{call_kw} void @__syn_wake_all_mask(ptr {wptr}, i32 {b})"));
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_wake_all_mask(ptr {wptr}, i32 {b})"
+                ));
             }
             MirPrimNonBlockingOp::PingPongFlip {
                 target,
@@ -3243,8 +3354,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let lv = self.emit_expr(value)?;
                 let ph = self.next_tmp();
                 let idx = self.next_tmp();
-                self.emit_line(format!("{ph} = extractvalue {{ ptr, ptr, i8 }} {}, 1", lv.repr));
-                self.emit_line(format!("{idx} = extractvalue {{ ptr, ptr, i8 }} {}, 2", lv.repr));
+                self.emit_line(format!(
+                    "{ph} = extractvalue {{ ptr, ptr, i8 }} {}, 1",
+                    lv.repr
+                ));
+                self.emit_line(format!(
+                    "{idx} = extractvalue {{ ptr, ptr, i8 }} {}, 2",
+                    lv.repr
+                ));
                 let b = boost.map_or(-1i8, |p| p.as_u8() as i8);
                 self.emit_line(format!(
                     "{call_kw} void @__syn_pool_release(ptr {ph}, i8 {idx}, i8 {b})"
@@ -3344,7 +3461,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             MirIntrinsicOp::UseSystick { hz } => {
                 let hv = self.emit_expr(hz)?;
                 let h32 = self.coerce(hv, "i32", false);
-                self.emit_line(format!("{call_kw} void @__syn_use_systick(i32 {})", h32.repr));
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_use_systick(i32 {})",
+                    h32.repr
+                ));
             }
             MirIntrinsicOp::SetPriority { prio } => {
                 let p = prio.as_u8() as i32;
@@ -3427,7 +3547,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "use_systick" => {
                         if let Some((hz, _)) = ev.first() {
                             let h32 = self.coerce(hz.clone(), "i32", false);
-                            self.emit_line(format!("{call_kw} void @__syn_use_systick(i32 {})", h32.repr));
+                            self.emit_line(format!(
+                                "{call_kw} void @__syn_use_systick(i32 {})",
+                                h32.repr
+                            ));
                         }
                     }
                     "now_ms" | "now_ticks" => {
@@ -3437,7 +3560,10 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "puts" | "print" => {
                         if let Some((s, _)) = ev.first() {
                             let p = self.coerce_str_ptr(s.clone());
-                            self.emit_line(format!("{call_kw} void @__syn_uart_puts(ptr {})", p.repr));
+                            self.emit_line(format!(
+                                "{call_kw} void @__syn_uart_puts(ptr {})",
+                                p.repr
+                            ));
                         }
                     }
                     "println" | "log" => {
@@ -3484,9 +3610,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         }
                     }
                     "nop" => {
-                        self.emit_line(
-                            "call void asm sideeffect \"nop\", \"~{memory}\"()".to_string(),
-                        );
+                        self.emit_line("call void asm sideeffect \"nop\", \"~{memory}\"()");
                     }
                     "assert" => {
                         if let Some((cond, _)) = ev.first() {

@@ -233,10 +233,18 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 MirPrimReadOp::WatchRead { target, elem_ty }
                 | MirPrimReadOp::WatchGen { target, elem_ty }
                 | MirPrimReadOp::GuardedGet { target, elem_ty }
-                | MirPrimReadOp::InboxTryRecv { target, elem_ty, .. }
-                | MirPrimReadOp::InboxLen { target, elem_ty, .. }
-                | MirPrimReadOp::InboxIsEmpty { target, elem_ty, .. }
-                | MirPrimReadOp::InboxIsFull { target, elem_ty, .. } => {
+                | MirPrimReadOp::InboxTryRecv {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::InboxLen {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::InboxIsEmpty {
+                    target, elem_ty, ..
+                }
+                | MirPrimReadOp::InboxIsFull {
+                    target, elem_ty, ..
+                } => {
                     scan_prim_target(target, feat);
                     scan_ty(elem_ty, feat);
                 }
@@ -346,7 +354,9 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 }
                 MirPrimReadOp::ByteRingViewPush { view, src: val, .. }
                 | MirPrimReadOp::ByteRingViewPop { view, dst: val }
-                | MirPrimReadOp::ByteRingViewPushByte { view, byte: val, .. }
+                | MirPrimReadOp::ByteRingViewPushByte {
+                    view, byte: val, ..
+                }
                 | MirPrimReadOp::ByteRingViewGrantWrite { view, len: val } => {
                     scan_expr(view, feat);
                     scan_expr(val, feat);
@@ -373,7 +383,8 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                     scan_expr(idx, feat);
                 }
             }
-            MirExprKind::LeaseGet { lease, elem_ty } | MirExprKind::LeaseAddr { lease, elem_ty } => {
+            MirExprKind::LeaseGet { lease, elem_ty }
+            | MirExprKind::LeaseAddr { lease, elem_ty } => {
                 scan_ty(elem_ty, feat);
                 scan_expr(lease, feat);
             }
@@ -472,9 +483,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                         scan_ty(elem_ty, feat);
                         scan_expr(half, feat);
                     }
-                    MirPrimNonBlockingOp::LeaseRelease {
-                        value, elem_ty, ..
-                    } => {
+                    MirPrimNonBlockingOp::LeaseRelease { value, elem_ty, .. } => {
                         scan_ty(elem_ty, feat);
                         scan_expr(value, feat);
                     }
@@ -706,7 +715,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
     }
     for step in &module.boot.steps {
         match step {
-            MirBootStep::Stmt(s) => scan_stmts(std::slice::from_ref(s), &mut feat),
+            MirBootStep::Stmt(s) => scan_stmts(std::slice::from_ref(s.as_ref()), &mut feat),
             MirBootStep::RunYieldingFn { args, .. } | MirBootStep::SpawnActivate { args, .. } => {
                 for a in args {
                     scan_expr(a, &mut feat);
@@ -765,14 +774,18 @@ impl<'a> ModuleCtx<'a> {
             if is_rodata_const_ty(&c.ty) {
                 self.rodata_consts.insert(
                     c.name.clone(),
-                    (format!("@__zev_const_{}", sanitize_ident(&c.name)), c.ty.clone()),
+                    (
+                        format!("@__zev_const_{}", sanitize_ident(&c.name)),
+                        c.ty.clone(),
+                    ),
                 );
             }
         }
 
         // MMIO layouts & peripheral instances
         for layout in &self.module.mmio_layouts {
-            self.mmio_layouts.insert(layout.name.clone(), layout.clone());
+            self.mmio_layouts
+                .insert(layout.name.clone(), layout.clone());
         }
         for inst in &self.module.mmio_instances {
             self.mmio_instances.insert(inst.name.clone(), inst.clone());
@@ -851,7 +864,8 @@ impl<'a> ModuleCtx<'a> {
         for step in &self.module.boot.steps {
             match step {
                 MirBootStep::Stmt(s) => self.scan_stmt_for_prims(s),
-                MirBootStep::RunYieldingFn { args, .. } | MirBootStep::SpawnActivate { args, .. } => {
+                MirBootStep::RunYieldingFn { args, .. }
+                | MirBootStep::SpawnActivate { args, .. } => {
                     for a in args {
                         self.scan_expr_for_prims(a);
                     }
@@ -861,7 +875,11 @@ impl<'a> ModuleCtx<'a> {
 
         // Function signatures
         for f in &self.module.functions {
-            let params: Vec<MirType> = f.params.iter().map(|vid| f.vars[vid.0].ty.clone()).collect();
+            let params: Vec<MirType> = f
+                .params
+                .iter()
+                .map(|vid| f.vars[vid.0].ty.clone())
+                .collect();
             let env_mir_ty = f.envelope_return_type();
             let ret_llvm_ty = if f.is_yielding {
                 "i32".to_string()
@@ -1041,12 +1059,11 @@ impl<'a> ModuleCtx<'a> {
                             return true;
                         }
                     }
-                    MirStmt::Switch { arms, default, .. } => {
+                    MirStmt::Switch { arms, default, .. }
                         if arms.iter().any(|(_, b)| stmts_may_return_or_exit(b))
-                            || stmts_may_return_or_exit(default)
-                        {
-                            return true;
-                        }
+                            || stmts_may_return_or_exit(default) =>
+                    {
+                        return true;
                     }
                     _ => {}
                 }
@@ -1283,14 +1300,16 @@ impl<'a> ModuleCtx<'a> {
             match self.hooks.mode(kind) {
                 StaticHookMode::TagSwitch { ref global_sym, .. } => {
                     if !any {
-                        let _ = writeln!(out, "; ── Explicit `sys.*` Hook Static Dispatch State ──");
+                        let _ =
+                            writeln!(out, "; ── Explicit `sys.*` Hook Static Dispatch State ──");
                         any = true;
                     }
                     let _ = writeln!(out, "{global_sym} = internal global i8 0, align 1");
                 }
                 StaticHookMode::Indirect { global_sym } => {
                     if !any {
-                        let _ = writeln!(out, "; ── Explicit `sys.*` Hook Static Dispatch State ──");
+                        let _ =
+                            writeln!(out, "; ── Explicit `sys.*` Hook Static Dispatch State ──");
                         any = true;
                     }
                     let _ = writeln!(
@@ -1306,6 +1325,7 @@ impl<'a> ModuleCtx<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn emit_hook_wrapper(
         &self,
         out: &mut String,
@@ -1375,10 +1395,16 @@ impl<'a> ModuleCtx<'a> {
     }
 
     pub(super) fn emit_sys_hooks_ir(&self, out: &mut String) {
-        let _ = writeln!(out, "; ── Explicit `sys.*` Hook Wrappers (Zero-RAM when Unconditional/Unset) ──");
+        let _ = writeln!(
+            out,
+            "; ── Explicit `sys.*` Hook Wrappers (Zero-RAM when Unconditional/Unset) ──"
+        );
         let putc_fallback = if self.spec.isa == CpuIsa::HostX86_64Linux {
             "  %z = zext i8 %c to i32\n  %r = call i32 @putchar(i32 %z)\n  ret void"
-        } else if self.spec.isa == CpuIsa::ArmCortexM && self.spec.semihosting && self.spec.has_thumb2 {
+        } else if self.spec.isa == CpuIsa::ArmCortexM
+            && self.spec.semihosting
+            && self.spec.has_thumb2
+        {
             "  %ch = alloca i8, align 1\n  store i8 %c, ptr %ch, align 1\n  call void asm sideeffect \"mov r0, #0x03\\0Abkpt #0xab\", \"{r1},~{r0},~{memory}\"(ptr %ch)\n  ret void"
         } else {
             "  ret void"
@@ -1538,8 +1564,8 @@ impl<'a> ModuleCtx<'a> {
         let struct_dma = self.dma_layout_structs.contains(&decl.name);
         for (idx, fld) in decl.fields.iter().enumerate() {
             let eff_fld_dma = fld.dma_safe || struct_dma;
-            let is_dma_pool = eff_fld_dma
-                && matches!(fld.ty, MirType::Primitive(MirPrimKind::Pool { .. }));
+            let is_dma_pool =
+                eff_fld_dma && matches!(fld.ty, MirType::Primitive(MirPrimKind::Pool { .. }));
             let (fsize, mut falign) = self.size_align(&fld.ty, ptr_bytes);
             let fsize = if is_dma_pool {
                 if let MirType::Primitive(MirPrimKind::Pool { elem, cap }) = &fld.ty {
@@ -1634,9 +1660,9 @@ impl<'a> ModuleCtx<'a> {
     pub(super) fn register_inbox_view(&mut self, elem: &MirType) {
         self.scan_mir_type_for_prims(elem);
         let key = sanitize_ident(&elem.mangle_name());
-        if !self.distinct_inbox_views.contains_key(&key) {
-            self.distinct_inbox_views.insert(key, elem.clone());
-        }
+        self.distinct_inbox_views
+            .entry(key)
+            .or_insert_with(|| elem.clone());
     }
 
     pub(super) fn register_prim_kind(&mut self, pk: &MirPrimKind) {
@@ -1653,9 +1679,7 @@ impl<'a> ModuleCtx<'a> {
             MirPrimKind::Signal | MirPrimKind::WaitQueue | MirPrimKind::ByteRing { .. } => {}
         }
         let key = pk.mangle_name();
-        if !self.distinct_prims.contains_key(&key) {
-            self.distinct_prims.insert(key, pk.clone());
-        }
+        self.distinct_prims.entry(key).or_insert_with(|| pk.clone());
     }
 
     pub(super) fn scan_prim_target_for_prims(&mut self, target: &MirPrimTarget) {
@@ -2270,7 +2294,7 @@ impl<'a> ModuleCtx<'a> {
 
         let mut union_group_gep = BTreeMap::new();
         for (ug, max_b) in group_max_bytes {
-            let words_i64 = ((max_b + 7) / 8).max(1);
+            let words_i64 = max_b.div_ceil(8).max(1);
             let gep_idx = field_llvm_tys.len();
             offset = align_up(offset, 8);
             offset += words_i64 * 8;
@@ -2571,15 +2595,13 @@ impl<'a> ModuleCtx<'a> {
             MirExprKind::IntLit(v) => *v,
             MirExprKind::BoolLit(b) => i128::from(*b),
             MirExprKind::TicksLit(t) => *t as i128,
-            MirExprKind::EnumVariant {
-                enum_name,
-                variant,
-            } => self
-                .enum_variants
-                .get(&(enum_name.clone(), variant.clone()))
-                .or_else(|| self.bare_variants.get(variant))
-                .copied()
-                .unwrap_or(0) as i128,
+            MirExprKind::EnumVariant { enum_name, variant } => {
+                self.enum_variants
+                    .get(&(enum_name.clone(), variant.clone()))
+                    .or_else(|| self.bare_variants.get(variant))
+                    .copied()
+                    .unwrap_or(0) as i128
+            }
             MirExprKind::ConstRef(name) => self.consts.get(name).copied().unwrap_or(1),
             MirExprKind::Unary { op, expr: sub } => {
                 let v = self.eval_const_int(sub);
@@ -2629,15 +2651,15 @@ impl<'a> ModuleCtx<'a> {
                     MirBinOp::BitXor => l ^ r,
                     MirBinOp::Shl => {
                         let ptr_bits = self.spec.isa.ptr_bits();
-                        let width = target_int_signed_and_bits(&lhs.ty, ptr_bits)
-                            .map_or(64, |(_, b)| b);
+                        let width =
+                            target_int_signed_and_bits(&lhs.ty, ptr_bits).map_or(64, |(_, b)| b);
                         let sh = (r as u32) & width.saturating_sub(1);
                         l << sh
                     }
                     MirBinOp::Shr => {
                         let ptr_bits = self.spec.isa.ptr_bits();
-                        let width = target_int_signed_and_bits(&lhs.ty, ptr_bits)
-                            .map_or(64, |(_, b)| b);
+                        let width =
+                            target_int_signed_and_bits(&lhs.ty, ptr_bits).map_or(64, |(_, b)| b);
                         let sh = (r as u32) & width.saturating_sub(1);
                         if lhs.ty.is_unsigned() {
                             let masked = if lhs.ty == MirType::Bool {
@@ -2863,7 +2885,10 @@ impl<'a> ModuleCtx<'a> {
         }
 
         if !state_lines.is_empty() || !selector_syms.is_empty() {
-            let _ = writeln!(out, "; ── Per-Binding ISR Static State & Conditional IRQ Selectors ──");
+            let _ = writeln!(
+                out,
+                "; ── Per-Binding ISR Static State & Conditional IRQ Selectors ──"
+            );
             for line in state_lines {
                 let _ = writeln!(out, "{line}");
             }
@@ -2926,12 +2951,14 @@ impl<'a> ModuleCtx<'a> {
                     "0".to_string()
                 }
             }
-            MirType::U8 => {
-                super::format_checked_llvm_int_const("i8", i128::from(self.eval_const_int(expr) as u8))?
-            }
-            MirType::I8 => {
-                super::format_checked_llvm_int_const("i8", i128::from(self.eval_const_int(expr) as i8))?
-            }
+            MirType::U8 => super::format_checked_llvm_int_const(
+                "i8",
+                i128::from(self.eval_const_int(expr) as u8),
+            )?,
+            MirType::I8 => super::format_checked_llvm_int_const(
+                "i8",
+                i128::from(self.eval_const_int(expr) as i8),
+            )?,
             MirType::U16
             | MirType::EndianInt {
                 bits: 16,
@@ -3043,20 +3070,38 @@ impl<'a> ModuleCtx<'a> {
             }
             MirType::Usize => {
                 if ptr_bits == 64 {
-                    super::format_checked_llvm_int_const("i64", i128::from(self.eval_const_int(expr) as u64))?
+                    super::format_checked_llvm_int_const(
+                        "i64",
+                        i128::from(self.eval_const_int(expr) as u64),
+                    )?
                 } else if ptr_bits == 16 {
-                    super::format_checked_llvm_int_const("i16", i128::from(self.eval_const_int(expr) as u16))?
+                    super::format_checked_llvm_int_const(
+                        "i16",
+                        i128::from(self.eval_const_int(expr) as u16),
+                    )?
                 } else {
-                    super::format_checked_llvm_int_const("i32", i128::from(self.eval_const_int(expr) as u32))?
+                    super::format_checked_llvm_int_const(
+                        "i32",
+                        i128::from(self.eval_const_int(expr) as u32),
+                    )?
                 }
             }
             MirType::Isize => {
                 if ptr_bits == 64 {
-                    super::format_checked_llvm_int_const("i64", i128::from(self.eval_const_int(expr) as i64))?
+                    super::format_checked_llvm_int_const(
+                        "i64",
+                        i128::from(self.eval_const_int(expr) as i64),
+                    )?
                 } else if ptr_bits == 16 {
-                    super::format_checked_llvm_int_const("i16", i128::from(self.eval_const_int(expr) as i16))?
+                    super::format_checked_llvm_int_const(
+                        "i16",
+                        i128::from(self.eval_const_int(expr) as i16),
+                    )?
                 } else {
-                    super::format_checked_llvm_int_const("i32", i128::from(self.eval_const_int(expr) as i32))?
+                    super::format_checked_llvm_int_const(
+                        "i32",
+                        i128::from(self.eval_const_int(expr) as i32),
+                    )?
                 }
             }
             MirType::F32 => {
@@ -3095,9 +3140,9 @@ impl<'a> ModuleCtx<'a> {
                     MirExprKind::SubsystemAddr(name) => {
                         format!("@__zev_subsys_{}", sanitize_ident(name))
                     }
-                    MirExprKind::AddrOfPlace(place) => {
-                        self.const_place_to_llvm_ptr(place).unwrap_or_else(|| "null".to_string())
-                    }
+                    MirExprKind::AddrOfPlace(place) => self
+                        .const_place_to_llvm_ptr(place)
+                        .unwrap_or_else(|| "null".to_string()),
                     MirExprKind::MmioAddr(inst) => {
                         if self.spec.isa == CpuIsa::HostX86_64Linux {
                             format!("@__zev_mmio_buf_{}", sanitize_ident(inst))
@@ -3128,13 +3173,16 @@ impl<'a> ModuleCtx<'a> {
                             "ptr"
                         };
                         if ptr_bits == 64 {
-                            let s = super::format_checked_llvm_int_const("i64", i128::from(*v as i64))?;
+                            let s =
+                                super::format_checked_llvm_int_const("i64", i128::from(*v as i64))?;
                             format!("inttoptr (i64 {s} to {dst_ptr})")
                         } else if ptr_bits == 16 {
-                            let s = super::format_checked_llvm_int_const("i16", i128::from(*v as i16))?;
+                            let s =
+                                super::format_checked_llvm_int_const("i16", i128::from(*v as i16))?;
                             format!("inttoptr (i16 {s} to {dst_ptr})")
                         } else {
-                            let s = super::format_checked_llvm_int_const("i32", i128::from(*v as i32))?;
+                            let s =
+                                super::format_checked_llvm_int_const("i32", i128::from(*v as i32))?;
                             format!("inttoptr (i32 {s} to {dst_ptr})")
                         }
                     }
@@ -3377,7 +3425,11 @@ impl<'a> ModuleCtx<'a> {
         })
     }
 
-    pub(super) fn subsystem_zero_init_const(&self, struct_name: &str, next_pp_bit: &mut u8) -> String {
+    pub(super) fn subsystem_zero_init_const(
+        &self,
+        struct_name: &str,
+        next_pp_bit: &mut u8,
+    ) -> String {
         if !self.struct_needs_const_init(struct_name) {
             return "zeroinitializer".to_string();
         }
@@ -3423,7 +3475,9 @@ impl<'a> ModuleCtx<'a> {
         match pk {
             MirPrimKind::ByteRing { cap } => {
                 let n = (*cap).max(1);
-                Some(format!("{{ ptr, {usize_ty} }} {{ ptr {raw_ptr}, {usize_ty} {n} }}"))
+                Some(format!(
+                    "{{ ptr, {usize_ty} }} {{ ptr {raw_ptr}, {usize_ty} {n} }}"
+                ))
             }
             MirPrimKind::Inbox { elem, cap } => {
                 let n = (*cap).max(1);
@@ -3452,11 +3506,7 @@ impl<'a> ModuleCtx<'a> {
         let usize_ty = self.spec.isa.usize_llvm_ty();
         let fn_sz = self.opts.fn_size_attrs();
         let fn_as = self.fn_as();
-        let tmp_al = if self.spec.isa.is_avr() {
-            1
-        } else {
-            4
-        };
+        let tmp_al = if self.spec.isa.is_avr() { 1 } else { 4 };
         for name in &self.struct_order {
             let si = &self.structs[name];
             if si.decl.is_subsystem {
@@ -3495,7 +3545,10 @@ ok_bb:
         let fn_sz = self.opts.fn_size_attrs().to_string();
         let fn_as = self.fn_as();
         let formatted: Vec<String> = self.module.formatted_enums.clone();
-        let _ = writeln!(out, "; ── On-Demand Enum Variant-Name `.rodata` Lookup Helpers ──");
+        let _ = writeln!(
+            out,
+            "; ── On-Demand Enum Variant-Name `.rodata` Lookup Helpers ──"
+        );
         for ename in &formatted {
             let Some(en) = self.module.enums.iter().find(|e| &e.name == ename).cloned() else {
                 continue;
@@ -3588,10 +3641,8 @@ ok_bb:
                     let stride = align_up(esz.max(1), eal.max(32));
                     let pad = stride.saturating_sub(esz);
                     if pad > 0 {
-                        let _ = writeln!(
-                            out,
-                            "%prim.{id}_dma_slot = type {{ {ety}, [{pad} x i8] }}"
-                        );
+                        let _ =
+                            writeln!(out, "%prim.{id}_dma_slot = type {{ {ety}, [{pad} x i8] }}");
                     } else {
                         let _ = writeln!(out, "%prim.{id}_dma_slot = type {{ {ety} }}");
                     }
@@ -3627,7 +3678,10 @@ ok_bb:
             );
         }
         if !self.distinct_inbox_views.is_empty() {
-            let _ = writeln!(out, "%prim.inbox_hdr = type {{ i32, i32, i32, i32, i32, [0 x i8] }}");
+            let _ = writeln!(
+                out,
+                "%prim.inbox_hdr = type {{ i32, i32, i32, i32, i32, [0 x i8] }}"
+            );
         }
         for name in &self.struct_order {
             let si = &self.structs[name];
@@ -3675,7 +3729,11 @@ ok_bb:
         let prims = self.module.primitives.clone();
         for p in &prims {
             if p.dead_stripped {
-                let _ = writeln!(out, "; dead watch stripped: @__syn_prim_{}", sanitize_ident(&p.name));
+                let _ = writeln!(
+                    out,
+                    "; dead watch stripped: @__syn_prim_{}",
+                    sanitize_ident(&p.name)
+                );
                 continue;
             }
             let gsym = format!("@__syn_prim_{}", sanitize_ident(&p.name));
@@ -3691,7 +3749,10 @@ ok_bb:
             };
             match &p.kind {
                 MirPrimKind::Signal => {
-                    let _ = writeln!(out, "{gsym} = global {pty} {{ i8 0, i8 127, i32 0 }}, align {align}");
+                    let _ = writeln!(
+                        out,
+                        "{gsym} = global {pty} {{ i8 0, i8 127, i32 0 }}, align {align}"
+                    );
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);
@@ -3742,7 +3803,11 @@ ok_bb:
                     );
                 }
                 MirPrimKind::Pool { .. } => {
-                    let gty = if p.dma_safe { format!("{pty}_dma") } else { pty };
+                    let gty = if p.dma_safe {
+                        format!("{pty}_dma")
+                    } else {
+                        pty
+                    };
                     let _ = writeln!(out, "{gsym} = global {gty} zeroinitializer, align {align}");
                 }
                 MirPrimKind::DmaSlot { .. } => {
@@ -5544,7 +5609,11 @@ entry:
         for callee in &self.module.boot.boot_yielding_callees {
             if let Some(layout) = self.fn_frames.get(callee) {
                 let sym = format!("@__syn_boot_frame_{}", sanitize_ident(callee));
-                let _ = writeln!(out, "{sym} = global {} zeroinitializer, align 8", layout.llvm_name);
+                let _ = writeln!(
+                    out,
+                    "{sym} = global {} zeroinitializer, align 8",
+                    layout.llvm_name
+                );
             }
         }
         for sp in &self.module.spawned_tasks {
@@ -5568,8 +5637,7 @@ entry:
         let _ = writeln!(out, "; ── Genuine External \"C\" FFI Declarations ──");
         for ext in &self.module.extern_fns {
             let ret = self.llvm_ty(&ext.ret_ty);
-            let mut ps: Vec<String> =
-                ext.params.iter().map(|(_, t)| self.llvm_ty(t)).collect();
+            let mut ps: Vec<String> = ext.params.iter().map(|(_, t)| self.llvm_ty(t)).collect();
             if ext.variadic {
                 ps.push("...".to_string());
             }
@@ -5583,7 +5651,11 @@ entry:
         let _ = writeln!(out);
     }
 
-    pub(super) fn emit_isr_ir(&mut self, out: &mut String, isr: &MirIsr) -> Result<(), CodegenError> {
+    pub(super) fn emit_isr_ir(
+        &mut self,
+        out: &mut String,
+        isr: &MirIsr,
+    ) -> Result<(), CodegenError> {
         let sym = format!("@__syn_isr_{}", sanitize_ident(&isr.name));
         let fn_sz = self.opts.fn_size_attrs();
         let fn_as = self.fn_as();
@@ -5616,7 +5688,10 @@ entry:
         Ok(())
     }
 
-    pub(super) fn format_irq_binding_call(&mut self, binding: &MirIrqBinding) -> Result<String, CodegenError> {
+    pub(super) fn format_irq_binding_call(
+        &mut self,
+        binding: &MirIrqBinding,
+    ) -> Result<String, CodegenError> {
         let isr_opt = self
             .module
             .isrs
@@ -5702,7 +5777,10 @@ entry:
         Ok(format!("{call_kw} void {isr_sym}({})", args.join(", ")))
     }
 
-    pub(super) fn emit_irq_vector_dispatchers_ir(&mut self, out: &mut String) -> Result<(), CodegenError> {
+    pub(super) fn emit_irq_vector_dispatchers_ir(
+        &mut self,
+        out: &mut String,
+    ) -> Result<(), CodegenError> {
         if self.module.irq_vectors.is_empty() {
             return Ok(());
         }
@@ -5802,13 +5880,8 @@ entry:
                     let pty = self.llvm_ty(&func.vars[vid.0].ty);
                     param_sig.push(format!("{pty} %arg{idx}"));
                 }
-                let mut fb = FnIrBuilder::new(
-                    self,
-                    &func.vars,
-                    None,
-                    &func.ret_ty,
-                    &func.error_spec,
-                );
+                let mut fb =
+                    FnIrBuilder::new(self, &func.vars, None, &func.ret_ty, &func.error_spec);
                 fb.emit_entry_allocas(&func.params);
                 for stmt in stmts {
                     fb.emit_stmt(stmt)?;
@@ -5875,13 +5948,7 @@ entry:
         let steps = self.module.boot.steps.clone();
         let fn_sz = self.opts.fn_size_attrs();
         let fn_as = self.fn_as();
-        let mut fb = FnIrBuilder::new(
-            self,
-            &boot_vars,
-            None,
-            &MirType::Void,
-            &MirErrorSpec::None,
-        );
+        let mut fb = FnIrBuilder::new(self, &boot_vars, None, &MirType::Void, &MirErrorSpec::None);
         fb.emit_entry_allocas(&[]);
         fb.emit_pool_boot_inits();
 
@@ -5913,7 +5980,10 @@ entry:
             return Ok(());
         }
         let ptr_bytes = (self.spec.isa.ptr_bits() / 8) as usize;
-        let _ = writeln!(out, "; ── Immutable Aggregate / Slice / String Constants (Flash .rodata) ──");
+        let _ = writeln!(
+            out,
+            "; ── Immutable Aggregate / Slice / String Constants (Flash .rodata) ──"
+        );
         for i in 0..self.module.consts.len() {
             let cname = self.module.consts[i].name.clone();
             let Some((sym, _)) = self.rodata_consts.get(&cname).cloned() else {
@@ -5938,7 +6008,10 @@ entry:
         if self.strings.is_empty() && self.const_blobs.is_empty() {
             return;
         }
-        let _ = writeln!(out, "; ── Pooled String & Slice Constants (Flash .rodata) ──");
+        let _ = writeln!(
+            out,
+            "; ── Pooled String & Slice Constants (Flash .rodata) ──"
+        );
         for (idx, s) in self.strings.iter().enumerate() {
             let bytes = zev_ast::decoded_string_bytes(s);
             let len = bytes.len() + 1;

@@ -46,16 +46,18 @@ fn compile_host_llvm_binary(
     let ll_path = temp.dir.join("program.ll");
     let bin_path = temp.dir.join("program");
 
-    std::fs::write(&ll_path, ll_source)
-        .map_err(|e| format!("failed to write generated LLVM IR to `{}`: {e}", ll_path.display()))?;
+    std::fs::write(&ll_path, ll_source).map_err(|e| {
+        format!(
+            "failed to write generated LLVM IR to `{}`: {e}",
+            ll_path.display()
+        )
+    })?;
 
     let clang = find_clang();
     let mut cc = Command::new(&clang);
     cc.arg("-Wno-override-module").arg("-no-pie");
     if sanitize {
-        cc.arg("-O1")
-            .arg("-g")
-            .arg("-fsanitize=address,undefined");
+        cc.arg("-O1").arg("-g").arg("-fsanitize=address,undefined");
     } else {
         cc.arg("-O2");
     }

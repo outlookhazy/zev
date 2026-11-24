@@ -38,14 +38,14 @@ impl RuntimeIrFeatures {
 
 /// Emit target header, LLVM intrinsics, `%SynTask` layout, kernel globals, bare-metal HAL,
 /// and cooperative scheduler functions into `out` (with all runtime features enabled).
-    #[allow(dead_code)]
-    pub fn emit_kernel_runtime_ir(
-        out: &mut String,
-        task_slots: usize,
-        opts: &CodegenOptions,
-    ) -> Result<(), crate::CodegenError> {
-        emit_kernel_runtime_ir_with_features(out, task_slots, opts, &RuntimeIrFeatures::all())
-    }
+#[allow(dead_code)]
+pub fn emit_kernel_runtime_ir(
+    out: &mut String,
+    task_slots: usize,
+    opts: &CodegenOptions,
+) -> Result<(), crate::CodegenError> {
+    emit_kernel_runtime_ir_with_features(out, task_slots, opts, &RuntimeIrFeatures::all())
+}
 
 /// Emit target header, LLVM intrinsics, `%SynTask` layout, kernel globals, bare-metal HAL,
 /// cooperative scheduler, and only the soft-float / formatting IR helpers required by `features`.
@@ -83,10 +83,7 @@ pub fn emit_kernel_runtime_ir_with_features(
         out,
         "declare i32 @llvm.cttz.i32(i32, i1 immarg) nounwind readnone"
     );
-    let _ = writeln!(
-        out,
-        "declare i32 @llvm.ctpop.i32(i32) nounwind readnone"
-    );
+    let _ = writeln!(out, "declare i32 @llvm.ctpop.i32(i32) nounwind readnone");
     let _ = writeln!(
         out,
         "declare void @llvm.memcpy.p0.p0.i32(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i32, i1 immarg) nounwind"
@@ -245,10 +242,22 @@ entry:
             features.uses_fmt_float_sci,
         );
     }
-    emit_scheduler_core_ir(out, spec.isa, sz, features.uses_rv_irqs, features.uses_clock_hook);
+    emit_scheduler_core_ir(
+        out,
+        spec.isa,
+        sz,
+        features.uses_rv_irqs,
+        features.uses_clock_hook,
+    );
 
-    let _ = writeln!(out, "attributes #97 = {{ noreturn nounwind \"no-builtins\" \"no-implicit-float\" }}");
-    let _ = writeln!(out, "attributes #98 = {{ noreturn nounwind \"no-builtins\" }}");
+    let _ = writeln!(
+        out,
+        "attributes #97 = {{ noreturn nounwind \"no-builtins\" \"no-implicit-float\" }}"
+    );
+    let _ = writeln!(
+        out,
+        "attributes #98 = {{ noreturn nounwind \"no-builtins\" }}"
+    );
     let _ = writeln!(out, "attributes #99 = {{ nounwind \"no-builtins\" }}");
     let _ = writeln!(out);
     Ok(())
@@ -3656,7 +3665,12 @@ entry:
 // Freestanding Zero-Heap Stream & Bounded-Buffer (`fmt_buf`) Formatters
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn emit_zero_heap_fmt_ir(out: &mut String, isa: CpuIsa, emit_float_fixed: bool, emit_float_sci: bool) {
+fn emit_zero_heap_fmt_ir(
+    out: &mut String,
+    isa: CpuIsa,
+    emit_float_fixed: bool,
+    emit_float_sci: bool,
+) {
     let fn_as = isa.fn_addrspace_attr();
     let call_kw = isa.call_kw();
     let _ = write!(
@@ -4082,8 +4096,8 @@ entry:
 
     if emit_float_fixed || emit_float_sci {
         let _ = write!(
-        out,
-        r#"; ── AVR-Compatible Fixed-Decimal Float Formatter (Pure Integer/Bit Math, Zero Soft-Float/Libm) ──
+            out,
+            r#"; ── AVR-Compatible Fixed-Decimal Float Formatter (Pure Integer/Bit Math, Zero Soft-Float/Libm) ──
 define weak void @__syn_fmt_f64_fixed(ptr %sink, double %val, i32 %prec){fn_as} noinline #99 {{
 entry:
   %rem_slot = alloca i64, align 8
@@ -4187,13 +4201,13 @@ entry:
   ret void
 }}
 "#,
-    );
+        );
     }
 
     if emit_float_sci {
         let _ = write!(
-        out,
-        r#"; ── Standalone Scientific `:e` Float Formatters (Pure 64-Bit Mantissa Math, Dead-Stripped by --gc-sections) ──
+            out,
+            r#"; ── Standalone Scientific `:e` Float Formatters (Pure 64-Bit Mantissa Math, Dead-Stripped by --gc-sections) ──
 define weak void @__syn_sci_mul_u32(ptr %pm, ptr %pe2, i32 %k){fn_as} noinline #99 {{
 entry:
   %m = load i64, ptr %pm, align 8
@@ -4455,6 +4469,6 @@ entry:
   ret void
 }}
 "#,
-    );
+        );
     }
 }

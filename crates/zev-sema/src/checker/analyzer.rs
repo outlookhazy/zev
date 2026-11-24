@@ -125,8 +125,7 @@ impl Analyzer {
                         self.mono_instantiation_notes
                             .insert(st.name.name.clone(), orig);
                     }
-                    self.struct_files
-                        .insert(st.name.name.clone(), file.clone());
+                    self.struct_files.insert(st.name.name.clone(), file.clone());
                     self.register_struct_header(st);
                 }
                 ItemKind::Enum(en) => self.collect_enum(en),
@@ -268,8 +267,7 @@ impl Analyzer {
                 ) {
                     if let Some(inst) = self.mmio_instances.get(&mm.name.name) {
                         if let Some(layout_info) = self.mmio_layouts.get(&inst.layout) {
-                            let size_u32 =
-                                u32::try_from(layout_info.byte_size).unwrap_or(u32::MAX);
+                            let size_u32 = u32::try_from(layout_info.byte_size).unwrap_or(u32::MAX);
                             if inst.base_addr.checked_add(size_u32).is_none() {
                                 self.emit(Diagnostic::new(
                                     DiagnosticKind::MmioViolation,
@@ -322,10 +320,7 @@ impl Analyzer {
         });
         self.check_task_slot_limit(main_decl_opt);
 
-        let main_can_yield = self
-            .functions
-            .get("main")
-            .is_some_and(|m| m.can_yield);
+        let main_can_yield = self.functions.get("main").is_some_and(|m| m.can_yield);
 
         let mut monomorphized_instances: Vec<MonomorphizedInstance> =
             mono_instances_from_attrs.into_iter().collect();
@@ -591,8 +586,7 @@ impl Analyzer {
             if self.has_value_cycle(&name, &name, &mut visiting) {
                 let span = self.structs[&name].span;
                 let file = self.struct_files.get(&name).cloned().flatten();
-                self.current_instantiation_note =
-                    self.mono_instantiation_notes.get(&name).cloned();
+                self.current_instantiation_note = self.mono_instantiation_notes.get(&name).cloned();
                 self.emit(
                     Diagnostic::new(
                         DiagnosticKind::InvalidOperation,
@@ -1075,7 +1069,12 @@ impl Analyzer {
         );
     }
 
-    pub(super) fn eval_u32_const(&mut self, expr: &Expr, diag_kind: DiagnosticKind, what: &str) -> u32 {
+    pub(super) fn eval_u32_const(
+        &mut self,
+        expr: &Expr,
+        diag_kind: DiagnosticKind,
+        what: &str,
+    ) -> u32 {
         let mut visiting = BTreeSet::new();
         match self.eval_const_expr_i128(expr, &mut visiting) {
             Some(v) => match u32::try_from(v) {
@@ -1106,8 +1105,10 @@ impl Analyzer {
         }
 
         let ty = self.resolve_type(&c.ty);
-        self.raw_const_exprs
-            .insert(c.name.name.clone(), (c.value.clone(), ty.clone(), self.current_prog_idx));
+        self.raw_const_exprs.insert(
+            c.name.name.clone(),
+            (c.value.clone(), ty.clone(), self.current_prog_idx),
+        );
         let int_value = match &c.value.kind {
             ExprKind::Literal(Literal::Int { value, .. }) => Some(*value),
             _ => None,
@@ -1306,11 +1307,7 @@ impl Analyzer {
                 } => self.check_f32_coercion_expr(inner, target_ty),
                 ExprKind::Binary {
                     op:
-                        BinaryOp::Add
-                        | BinaryOp::Sub
-                        | BinaryOp::Mul
-                        | BinaryOp::Div
-                        | BinaryOp::Rem,
+                        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Rem,
                     lhs,
                     rhs,
                 } => {
@@ -1384,7 +1381,10 @@ impl Analyzer {
                             init_expr.span,
                             format!(
                                 "{} '{}' initializer has type '{}', expected '{}'",
-                                resolved.kind(), p.name.name, val.ty, elem
+                                resolved.kind(),
+                                p.name.name,
+                                val.ty,
+                                elem
                             ),
                         ));
                     } else {
@@ -1415,11 +1415,7 @@ impl Analyzer {
             );
             match &resolved {
                 ResolvedOsPrimitive::Pool { .. } => {
-                    self.validate_pool_slot_elem(
-                        et,
-                        p.span,
-                        &format!("pool '{}'", p.name.name),
-                    );
+                    self.validate_pool_slot_elem(et, p.span, &format!("pool '{}'", p.name.name));
                 }
                 ResolvedOsPrimitive::DmaSlot { .. } => {
                     self.validate_pool_slot_elem(
@@ -1428,9 +1424,7 @@ impl Analyzer {
                         &format!("dma_slot '{}'", p.name.name),
                     );
                 }
-                ResolvedOsPrimitive::Inbox { elem, .. }
-                    if matches!(&**elem, Ty::Lease(_)) =>
-                {
+                ResolvedOsPrimitive::Inbox { elem, .. } if matches!(&**elem, Ty::Lease(_)) => {
                     if let Ty::Lease(inner) = &**elem {
                         self.validate_pool_slot_elem(
                             inner,
@@ -1487,7 +1481,11 @@ impl Analyzer {
         }
         let ty = self.resolve_type(&g.ty);
         if let Ty::Struct(struct_name) = &ty {
-            if self.structs.get(struct_name).is_some_and(|s| s.is_subsystem) {
+            if self
+                .structs
+                .get(struct_name)
+                .is_some_and(|s| s.is_subsystem)
+            {
                 if let Some(init_expr) = &g.init {
                     self.emit(Diagnostic::new(
                         DiagnosticKind::InvalidOperation,
@@ -1722,7 +1720,10 @@ impl Analyzer {
                 self.emit(Diagnostic::new(
                     DiagnosticKind::InvalidOperation,
                     p.ty.span,
-                    format!("parameter '{}' in '{}' cannot have type 'void'", p.name.name, owner),
+                    format!(
+                        "parameter '{}' in '{}' cannot have type 'void'",
+                        p.name.name, owner
+                    ),
                 ));
             }
             self.check_type_no_byval_mmio(
@@ -1760,7 +1761,12 @@ impl Analyzer {
         out
     }
 
-    pub(super) fn check_type_no_byval_mmio_or_unsized(&mut self, ty: &Ty, span: Span, context: &str) {
+    pub(super) fn check_type_no_byval_mmio_or_unsized(
+        &mut self,
+        ty: &Ty,
+        span: Span,
+        context: &str,
+    ) {
         if let Some(layout_name) = ty_contains_byval_mmio(ty) {
             self.emit(Diagnostic::new(
                 DiagnosticKind::MmioViolation,
@@ -1823,8 +1829,8 @@ impl Analyzer {
                 } else {
                     let prim_names = [
                         "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize",
-                        "f32", "f64", "u16be", "u16le", "u32be", "u32le", "u64be", "u64le",
-                        "bool", "void",
+                        "f32", "f64", "u16be", "u16le", "u32be", "u32le", "u64be", "u64le", "bool",
+                        "void",
                     ];
                     let candidates = prim_names
                         .into_iter()
@@ -1934,7 +1940,11 @@ impl Analyzer {
         }
     }
 
-    pub(super) fn resolve_os_primitive(&mut self, os: &OsPrimitiveType, span: Span) -> ResolvedOsPrimitive {
+    pub(super) fn resolve_os_primitive(
+        &mut self,
+        os: &OsPrimitiveType,
+        span: Span,
+    ) -> ResolvedOsPrimitive {
         match os {
             OsPrimitiveType::Signal => ResolvedOsPrimitive::Signal,
             OsPrimitiveType::WaitQueue => ResolvedOsPrimitive::WaitQueue,
@@ -2071,7 +2081,7 @@ impl Analyzer {
             );
             return;
         }
-        if us % self.tick_period_us != 0 {
+        if !us.is_multiple_of(self.tick_period_us) {
             self.emit(
                 Diagnostic::new(
                     DiagnosticKind::InvalidDurationResolution,
@@ -2101,14 +2111,17 @@ impl Analyzer {
             return;
         };
         let prev_note = self.current_instantiation_note.take();
-        self.current_instantiation_note =
-            self.mono_instantiation_notes.get(&f.name.name).cloned();
+        self.current_instantiation_note = self.mono_instantiation_notes.get(&f.name.name).cloned();
         let force_noyield = has_attr_noyield(item_attrs) || has_attr_noyield(&f.attrs);
-        let mut checker =
-            BodyChecker::new(self, &f.name.name, CallableKind::Fn, ActiveBodyKind::Fn {
+        let mut checker = BodyChecker::new(
+            self,
+            &f.name.name,
+            CallableKind::Fn,
+            ActiveBodyKind::Fn {
                 ret_ty: fn_info.ret_ty.clone(),
                 error_spec: fn_info.error_spec.clone(),
-            });
+            },
+        );
         if force_noyield {
             checker.noyield_depth += 1;
         }
@@ -2176,8 +2189,7 @@ impl Analyzer {
             return;
         };
         let node_key = format!("isr::{}", i.vector.name);
-        let mut checker =
-            BodyChecker::new(self, &node_key, CallableKind::Isr, ActiveBodyKind::Isr);
+        let mut checker = BodyChecker::new(self, &node_key, CallableKind::Isr, ActiveBodyKind::Isr);
         checker.bind_params(&isr_info.params);
         let diverges = checker.check_block_stmts(&i.body.stmts);
         if !diverges {
@@ -2231,10 +2243,7 @@ impl Analyzer {
                 }
             } else if edge.ctx.in_critical {
                 if callee_node.any_yield_effect.can_yield() {
-                    let caller_disp = edge
-                        .caller
-                        .strip_prefix("task::")
-                        .unwrap_or(&edge.caller);
+                    let caller_disp = edge.caller.strip_prefix("task::").unwrap_or(&edge.caller);
                     let sub_chain = self
                         .call_graph
                         .shortest_any_yield_chain(&edge.callee)
@@ -2258,10 +2267,7 @@ impl Analyzer {
                 }
             } else if edge.ctx.in_defer {
                 if callee_node.any_yield_effect.can_yield() {
-                    let caller_disp = edge
-                        .caller
-                        .strip_prefix("task::")
-                        .unwrap_or(&edge.caller);
+                    let caller_disp = edge.caller.strip_prefix("task::").unwrap_or(&edge.caller);
                     let sub_chain = self
                         .call_graph
                         .shortest_any_yield_chain(&edge.callee)
@@ -2284,10 +2290,7 @@ impl Analyzer {
                     );
                 }
             } else if edge.ctx.in_noyield && callee_node.effect == FnEffect::HardBlocking {
-                let caller_disp = edge
-                    .caller
-                    .strip_prefix("task::")
-                    .unwrap_or(&edge.caller);
+                let caller_disp = edge.caller.strip_prefix("task::").unwrap_or(&edge.caller);
                 let sub_chain = self
                     .call_graph
                     .shortest_hard_yield_chain(&edge.callee)
@@ -2556,13 +2559,9 @@ impl Analyzer {
                         )
                     };
                     self.emit(
-                        Diagnostic::new(
-                            DiagnosticKind::YieldingCallbackToExternC,
-                            site.span,
-                            msg,
-                        )
-                        .with_file(cb_file)
-                        .with_note(note),
+                        Diagnostic::new(DiagnosticKind::YieldingCallbackToExternC, site.span, msg)
+                            .with_file(cb_file)
+                            .with_note(note),
                     );
                 }
                 if cb_node.spawns_in_boot {
@@ -2609,10 +2608,7 @@ impl Analyzer {
         // 3. Detect recursive call cycles across boot-spawning (`E0027`), boot-attaching (`E0032`), and yielding (`E0012`) functions.
         let spawning_cycles = self.call_graph.find_spawning_cycles();
         for (cycle, span) in &spawning_cycles {
-            let cycle_file = cycle
-                .first()
-                .and_then(|f| self.node_files.get(f))
-                .cloned();
+            let cycle_file = cycle.first().and_then(|f| self.node_files.get(f)).cloned();
             let cycle_str = cycle.join(" -> ");
             self.emit(
                 Diagnostic::new(
@@ -2631,10 +2627,7 @@ impl Analyzer {
         }
         let attaching_cycles = self.call_graph.find_attaching_cycles();
         for (cycle, span) in &attaching_cycles {
-            let cycle_file = cycle
-                .first()
-                .and_then(|f| self.node_files.get(f))
-                .cloned();
+            let cycle_file = cycle.first().and_then(|f| self.node_files.get(f)).cloned();
             let cycle_str = cycle.join(" -> ");
             self.emit(
                 Diagnostic::new(
@@ -2653,10 +2646,7 @@ impl Analyzer {
         }
 
         for (cycle, span) in self.call_graph.find_yielding_cycles() {
-            let cycle_file = cycle
-                .first()
-                .and_then(|f| self.node_files.get(f))
-                .cloned();
+            let cycle_file = cycle.first().and_then(|f| self.node_files.get(f)).cloned();
             let cycle_str = cycle.join(" -> ");
             self.emit(
                 Diagnostic::new(
@@ -2990,22 +2980,23 @@ impl Analyzer {
         let mut producers_by_ring: RingActorsMap = BTreeMap::new();
         let mut consumers_by_ring: RingActorsMap = BTreeMap::new();
 
-        let record_access =
-            |map: &mut RingActorsMap, ring: String, access: ActorAccess| {
-                let list = map.entry(ring).or_default();
-                if !list.iter().any(|a| a.actor_id == access.actor_id) {
-                    list.push(access);
-                }
-            };
+        let record_access = |map: &mut RingActorsMap, ring: String, access: ActorAccess| {
+            let list = map.entry(ring).or_default();
+            if !list.iter().any(|a| a.actor_id == access.actor_id) {
+                list.push(access);
+            }
+        };
 
-        let mut actors: Vec<(
+        type ActorEntry = (
             ActorId,
             String,
             String,
             Vec<Option<String>>,
             Vec<BTreeMap<String, String>>,
             bool,
-        )> = Vec::new();
+        );
+        type VisitedState = (String, Vec<Option<String>>, Vec<BTreeMap<String, String>>);
+        let mut actors: Vec<ActorEntry> = Vec::new();
 
         for inst in &self.spawned_tasks {
             let caller_key = format!("task::{}", inst.task_name);
@@ -3016,7 +3007,11 @@ impl Analyzer {
                 .unwrap_or_else(|| vec![BTreeMap::new(); inst.endpoint_bindings.len()]);
             actors.push((
                 ActorId::Task(inst.instance_id),
-                format!("task '{}' (spawned via {})", inst.task_name, inst.format_provenance()),
+                format!(
+                    "task '{}' (spawned via {})",
+                    inst.task_name,
+                    inst.format_provenance()
+                ),
                 caller_key,
                 inst.endpoint_bindings.clone(),
                 field_eps,
@@ -3076,13 +3071,13 @@ impl Analyzer {
         }
 
         for (actor_id, actor_desc, root_caller, root_params, root_fields, is_main_post) in actors {
-            let mut visited: BTreeSet<(
-                String,
-                Vec<Option<String>>,
-                Vec<BTreeMap<String, String>>,
-            )> = BTreeSet::new();
+            let mut visited: BTreeSet<VisitedState> = BTreeSet::new();
             let mut worklist = vec![(root_caller.clone(), root_params, root_fields, is_main_post)];
-            visited.insert((worklist[0].0.clone(), worklist[0].1.clone(), worklist[0].2.clone()));
+            visited.insert((
+                worklist[0].0.clone(),
+                worklist[0].1.clone(),
+                worklist[0].2.clone(),
+            ));
 
             while let Some((caller, param_eps, param_fields, post_boot_only)) = worklist.pop() {
                 let op_lookup_key = if post_boot_only {
@@ -3257,14 +3252,16 @@ impl Analyzer {
                 }
             };
 
-        let mut actors: Vec<(
+        type WatchActorEntry = (
             WatchActorId,
             String,
             String,
             Vec<Option<String>>,
             Vec<BTreeMap<String, String>>,
             Option<&'static str>,
-        )> = Vec::new();
+        );
+        type WatchVisitedState = (String, Vec<Option<String>>, Vec<BTreeMap<String, String>>);
+        let mut actors: Vec<WatchActorEntry> = Vec::new();
 
         for inst in &self.spawned_tasks {
             let caller_key = format!("task::{}", inst.task_name);
@@ -3275,7 +3272,11 @@ impl Analyzer {
                 .unwrap_or_else(|| vec![BTreeMap::new(); inst.endpoint_bindings.len()]);
             actors.push((
                 WatchActorId::Task(inst.instance_id),
-                format!("task '{}' (spawned via {})", inst.task_name, inst.format_provenance()),
+                format!(
+                    "task '{}' (spawned via {})",
+                    inst.task_name,
+                    inst.format_provenance()
+                ),
                 caller_key,
                 inst.endpoint_bindings.clone(),
                 field_eps,
@@ -3335,10 +3336,9 @@ impl Analyzer {
         }
 
         let has_main_post_irq_pre_spawn = writes_by_caller.contains_key("main::post_irq_pre_spawn")
-            || self
-                .recorded_call_args
-                .iter()
-                .any(|c| c.caller == "main" && c.in_main_after_irq_attach && !c.in_main_after_spawn);
+            || self.recorded_call_args.iter().any(|c| {
+                c.caller == "main" && c.in_main_after_irq_attach && !c.in_main_after_spawn
+            });
         if has_main_post_irq_pre_spawn {
             actors.push((
                 WatchActorId::MainPostIrqPreSpawn,
@@ -3351,13 +3351,13 @@ impl Analyzer {
         }
 
         for (actor_id, actor_desc, root_caller, root_params, root_fields, root_op_key) in actors {
-            let mut visited: BTreeSet<(
-                String,
-                Vec<Option<String>>,
-                Vec<BTreeMap<String, String>>,
-            )> = BTreeSet::new();
+            let mut visited: BTreeSet<WatchVisitedState> = BTreeSet::new();
             let mut worklist = vec![(root_caller, root_params, root_fields, root_op_key)];
-            visited.insert((worklist[0].0.clone(), worklist[0].1.clone(), worklist[0].2.clone()));
+            visited.insert((
+                worklist[0].0.clone(),
+                worklist[0].1.clone(),
+                worklist[0].2.clone(),
+            ));
 
             while let Some((caller, param_eps, param_fields, op_override)) = worklist.pop() {
                 let op_lookup_key = op_override.unwrap_or(caller.as_str());
@@ -3452,7 +3452,9 @@ impl Analyzer {
                     );
                 }
             } else if let (Some(isr_writer), Some(main_irq_writers)) = (
-                writers.iter().find(|w| matches!(w.actor_id, WatchActorId::Isr(_))),
+                writers
+                    .iter()
+                    .find(|w| matches!(w.actor_id, WatchActorId::Isr(_))),
                 pre_spawn_irq_writers.get(&watch),
             ) {
                 for extra in main_irq_writers {
@@ -3764,10 +3766,7 @@ impl Analyzer {
                         }
                     }
                 }
-                IrqBootNode::Call {
-                    callee,
-                    args,
-                } => {
+                IrqBootNode::Call { callee, args } => {
                     let attaches = self
                         .call_graph
                         .nodes
@@ -3991,8 +3990,7 @@ impl Analyzer {
                             return true;
                         }
                     }
-                    expr_can_yield(callee, cg)
-                        || args.iter().any(|a| expr_can_yield(&a.value, cg))
+                    expr_can_yield(callee, cg) || args.iter().any(|a| expr_can_yield(&a.value, cg))
                 }
                 ExprKind::MethodCall {
                     receiver,
@@ -4016,7 +4014,8 @@ impl Analyzer {
                     expr_can_yield(receiver, cg)
                         || args.iter().any(|a| expr_can_yield(&a.value, cg))
                 }
-                ExprKind::Unary { expr: inner, .. } | ExprKind::Cast { expr: inner, .. }
+                ExprKind::Unary { expr: inner, .. }
+                | ExprKind::Cast { expr: inner, .. }
                 | ExprKind::Field { target: inner, .. } => expr_can_yield(inner, cg),
                 ExprKind::Binary { lhs, rhs, .. }
                 | ExprKind::Index {
@@ -4040,9 +4039,16 @@ impl Analyzer {
                     FormatPart::Hole { expr: e, .. } => expr_can_yield(e, cg),
                     _ => false,
                 }),
-                ExprKind::Catch { expr: inner, clause } => {
+                ExprKind::Catch {
+                    expr: inner,
+                    clause,
+                } => {
                     expr_can_yield(inner, cg)
-                        || clause.body.stmts.iter().any(|s| stmt_can_yield(s, false, cg))
+                        || clause
+                            .body
+                            .stmts
+                            .iter()
+                            .any(|s| stmt_can_yield(s, false, cg))
                 }
                 ExprKind::Literal(_) | ExprKind::Ident(_) | ExprKind::Priority(_) => false,
             }
@@ -4067,7 +4073,9 @@ impl Analyzer {
                     .iter()
                     .any(|a| a.body.stmts.iter().any(|s| stmt_has_boot_spawn(s, cg))),
                 StmtKind::Wait { .. } => false,
-                StmtKind::Block(b) | StmtKind::NoYield { body: b } | StmtKind::Critical { body: b } => {
+                StmtKind::Block(b)
+                | StmtKind::NoYield { body: b }
+                | StmtKind::Critical { body: b } => {
                     b.stmts.iter().any(|s| stmt_has_boot_spawn(s, cg))
                 }
                 _ => false,
@@ -4155,9 +4163,10 @@ impl Analyzer {
                             .iter()
                             .any(|s| stmt_can_yield(s, manual_yield, cg))
                 }
-                StmtKind::Critical { body } | StmtKind::Block(body) => {
-                    body.stmts.iter().any(|s| stmt_can_yield(s, manual_yield, cg))
-                }
+                StmtKind::Critical { body } | StmtKind::Block(body) => body
+                    .stmts
+                    .iter()
+                    .any(|s| stmt_can_yield(s, manual_yield, cg)),
                 StmtKind::NoYield { .. } => false,
                 _ => false,
             }
@@ -4168,11 +4177,15 @@ impl Analyzer {
             };
             let manual_yield = has_attr_manual_yield(&md.attrs);
             let stmts = &body.stmts;
-            let tail = match stmts.iter().rposition(|s| stmt_has_boot_spawn(s, &self.call_graph)) {
+            let tail = match stmts
+                .iter()
+                .rposition(|s| stmt_has_boot_spawn(s, &self.call_graph))
+            {
                 Some(idx) => &stmts[idx + 1..],
                 None => stmts.as_slice(),
             };
-            tail.iter().any(|s| stmt_can_yield(s, manual_yield, &self.call_graph))
+            tail.iter()
+                .any(|s| stmt_can_yield(s, manual_yield, &self.call_graph))
         });
         let total = self.spawned_tasks.len() + usize::from(main_becomes_task);
         if total > MAX_TASKS {
@@ -4196,11 +4209,14 @@ impl Analyzer {
                     ),
                 )
             };
-            self.emit(Diagnostic::new(DiagnosticKind::InvalidSpawnContext, span, msg));
+            self.emit(Diagnostic::new(
+                DiagnosticKind::InvalidSpawnContext,
+                span,
+                msg,
+            ));
         }
     }
 }
-
 
 impl Analyzer {
     pub(super) fn validate_pool_slot_elem(&mut self, elem: &Ty, span: Span, owner_desc: &str) {
@@ -4211,7 +4227,10 @@ impl Analyzer {
             self.emit(Diagnostic::new(
                 DiagnosticKind::LinearLeaseViolation,
                 span,
-                format!("{} cannot wrap linear 'Lease<...>' inside its payload element type '{}'", owner_desc, elem),
+                format!(
+                    "{} cannot wrap linear 'Lease<...>' inside its payload element type '{}'",
+                    owner_desc, elem
+                ),
             ));
             return;
         }
@@ -4219,7 +4238,10 @@ impl Analyzer {
             self.emit(Diagnostic::new(
                 DiagnosticKind::LinearLeaseViolation,
                 span,
-                format!("{} cannot store MMIO register layout '{}' by value", owner_desc, mmio),
+                format!(
+                    "{} cannot store MMIO register layout '{}' by value",
+                    owner_desc, mmio
+                ),
             ));
             return;
         }
@@ -4227,7 +4249,10 @@ impl Analyzer {
             self.emit(Diagnostic::new(
                 DiagnosticKind::LinearLeaseViolation,
                 span,
-                format!("{} cannot embed OS primitives or subsystem structs inside element type '{}'", owner_desc, elem),
+                format!(
+                    "{} cannot embed OS primitives or subsystem structs inside element type '{}'",
+                    owner_desc, elem
+                ),
             ));
             return;
         }
@@ -4316,9 +4341,9 @@ impl Analyzer {
             .program_extern_c_scopes
             .get(prog_idx)
             .is_some_and(|s| s.contains(&ident.name));
-        let imported_pub = self
-            .rewritten_pub_extern_sites
-            .contains(&(prog_idx, ident.span.start, ident.span.end));
+        let imported_pub =
+            self.rewritten_pub_extern_sites
+                .contains(&(prog_idx, ident.span.start, ident.span.end));
         if !declared_locally && !imported_pub {
             self.emit(Diagnostic::new(
                 DiagnosticKind::ModuleError,
@@ -4423,12 +4448,9 @@ impl Analyzer {
                 if !visiting.insert(id.name.clone()) {
                     return None;
                 }
-                let res = self
-                    .raw_const_exprs
-                    .get(&id.name)
-                    .and_then(|(raw, _, _)| {
-                        self.eval_const_bool_shadowed(raw, visiting, &BTreeSet::new())
-                    });
+                let res = self.raw_const_exprs.get(&id.name).and_then(|(raw, _, _)| {
+                    self.eval_const_bool_shadowed(raw, visiting, &BTreeSet::new())
+                });
                 visiting.remove(&id.name);
                 res
             }
@@ -4450,11 +4472,19 @@ impl Analyzer {
                         self.eval_const_bool_shadowed(lhs, visiting, shadowed),
                         self.eval_const_bool_shadowed(rhs, visiting, shadowed),
                     ) {
-                        return Some(if matches!(op, BinaryOp::Eq) { a == b } else { a != b });
+                        return Some(if matches!(op, BinaryOp::Eq) {
+                            a == b
+                        } else {
+                            a != b
+                        });
                     }
                     let a = self.eval_const_expr_i128_shadowed(lhs, visiting, shadowed)?;
                     let b = self.eval_const_expr_i128_shadowed(rhs, visiting, shadowed)?;
-                    Some(if matches!(op, BinaryOp::Eq) { a == b } else { a != b })
+                    Some(if matches!(op, BinaryOp::Eq) {
+                        a == b
+                    } else {
+                        a != b
+                    })
                 }
                 BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge => {
                     let a = self.eval_const_expr_i128_shadowed(lhs, visiting, shadowed)?;
@@ -4488,8 +4518,7 @@ impl Analyzer {
         }
         if ty.is_integer() || matches!(ty, Ty::IntLit) {
             let mut visiting = BTreeSet::new();
-            if let Some(value) = self.eval_const_expr_i128_shadowed(expr, &mut visiting, shadowed)
-            {
+            if let Some(value) = self.eval_const_expr_i128_shadowed(expr, &mut visiting, shadowed) {
                 let final_ty = if matches!(ty, Ty::IntLit) {
                     Ty::u32()
                 } else {
@@ -4504,7 +4533,7 @@ impl Analyzer {
         if self.is_compile_time_const_expr_with_shadowed(expr, shadowed, prog_idx) {
             return Some(IrqBindingArg::ConstExpr {
                 ty: ty.clone(),
-                expr: expr.clone(),
+                expr: Box::new(expr.clone()),
             });
         }
         None

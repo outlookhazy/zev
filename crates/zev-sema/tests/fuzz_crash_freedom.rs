@@ -82,14 +82,100 @@ fn exercise_frontend(label: &str, src: &str) {
 }
 
 const TOKENS: &[&str] = &[
-    "fn", "task", "shared", "inbox", "signal", "watch", "byte_ring", "struct", "enum", "switch",
-    "if", "else", "while", "loop", "for", "in", "spawn", "irq", "attach", "lease", "critical",
-    "noyield", "main", "import", "pub", "const", "static", "extern", "mmio", "register", "as",
-    "return", "break", "continue", "defer", "true", "false", "u8", "u16", "u32", "u64", "i32",
-    "f32", "f64", "bool", "str", "void", "->", "=>", "::", ".", ",", ";", ":", "=", "==", "!=",
-    "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "&", "|", "^", "!", "&&", "||", "<<", ">>",
-    "(", ")", "{", "}", "[", "]", "x", "y", "T", "0", "1", "255", "\"abc\"", "f\"{x}\"",
-    "sys", "delay", "fmt_buf", "fmt_ring", "print", "println",
+    "fn",
+    "task",
+    "shared",
+    "inbox",
+    "signal",
+    "watch",
+    "byte_ring",
+    "struct",
+    "enum",
+    "switch",
+    "if",
+    "else",
+    "while",
+    "loop",
+    "for",
+    "in",
+    "spawn",
+    "irq",
+    "attach",
+    "lease",
+    "critical",
+    "noyield",
+    "main",
+    "import",
+    "pub",
+    "const",
+    "static",
+    "extern",
+    "mmio",
+    "register",
+    "as",
+    "return",
+    "break",
+    "continue",
+    "defer",
+    "true",
+    "false",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "i32",
+    "f32",
+    "f64",
+    "bool",
+    "str",
+    "void",
+    "->",
+    "=>",
+    "::",
+    ".",
+    ",",
+    ";",
+    ":",
+    "=",
+    "==",
+    "!=",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "&",
+    "|",
+    "^",
+    "!",
+    "&&",
+    "||",
+    "<<",
+    ">>",
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    "x",
+    "y",
+    "T",
+    "0",
+    "1",
+    "255",
+    "\"abc\"",
+    "f\"{x}\"",
+    "sys",
+    "delay",
+    "fmt_buf",
+    "fmt_ring",
+    "print",
+    "println",
 ];
 
 #[test]
@@ -101,8 +187,10 @@ fn fuzz_parser_and_sema_crash_freedom() {
     let mut total_cases = 0usize;
 
     // 1. Random UTF-8 / ASCII byte soups and token soups (200 cases)
-    let unicode_fragments = ["a", "0", " ", "\n", "\t", "{", "}", "(", ")", "<", ">", "\"", "\\",
-        "{x}", "é", "λ", "中", "🦀", "\u{0000}", "\u{007f}", "//", "/*", "*/", "->"];
+    let unicode_fragments = [
+        "a", "0", " ", "\n", "\t", "{", "}", "(", ")", "<", ">", "\"", "\\", "{x}", "é", "λ", "中",
+        "🦀", "\u{0000}", "\u{007f}", "//", "/*", "*/", "->",
+    ];
     for i in 0..200 {
         let mut s = String::new();
         if i % 2 == 0 {
@@ -193,9 +281,29 @@ fn fuzz_parser_and_sema_crash_freedom() {
 
     // 3. Malformed and extreme f"..." format strings (120 cases)
     let fmt_fragments = [
-        "{", "}", "{{", "}}", "{x", "x}", "{x:}", "{x:d}", "{x:099999999999d}",
-        "{x:.99999999s}", "{x:99999999999999999999x}", "{x:zzzz}", "{a + {b}}",
-        "{f\"{x}\"}", "{0}", "{:}", "\\", "\\n", "\\x", "\\xZZ", "\"", "\0", "{x:<1000}",
+        "{",
+        "}",
+        "{{",
+        "}}",
+        "{x",
+        "x}",
+        "{x:}",
+        "{x:d}",
+        "{x:099999999999d}",
+        "{x:.99999999s}",
+        "{x:99999999999999999999x}",
+        "{x:zzzz}",
+        "{a + {b}}",
+        "{f\"{x}\"}",
+        "{0}",
+        "{:}",
+        "\\",
+        "\\n",
+        "\\x",
+        "\\xZZ",
+        "\"",
+        "\0",
+        "{x:<1000}",
         "{x:>00010000000000}",
     ];
     for i in 0..120 {
@@ -213,10 +321,27 @@ fn fuzz_parser_and_sema_crash_freedom() {
 
     // 4. Extreme numeric literals and edge constant expressions (80 cases)
     let num_tokens = [
-        "0", "1", "0x0", "0xFFFFFFFFFFFFFFFF", "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
-        "999999999999999999999999999999999999", "0b", "0x", "0o", "0b1010101010102",
-        "1.7976931348623157e308", "1e99999", "1e-99999", "0.0.0", "1e+", "1_000_000_u32",
-        "0xffffffffffffffffu64", "-9223372036854775808", "1 / 0", "1 % 0", "1 << 999",
+        "0",
+        "1",
+        "0x0",
+        "0xFFFFFFFFFFFFFFFF",
+        "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF",
+        "999999999999999999999999999999999999",
+        "0b",
+        "0x",
+        "0o",
+        "0b1010101010102",
+        "1.7976931348623157e308",
+        "1e99999",
+        "1e-99999",
+        "0.0.0",
+        "1e+",
+        "1_000_000_u32",
+        "0xffffffffffffffffu64",
+        "-9223372036854775808",
+        "1 / 0",
+        "1 % 0",
+        "1 << 999",
     ];
     for i in 0..80 {
         let a = rng.pick(&num_tokens);
@@ -237,13 +362,17 @@ fn fuzz_parser_and_sema_crash_freedom() {
                 // Deeply nested parentheses expressions
                 let open = "(".repeat(depth);
                 let close = ")".repeat(depth);
-                format!("fn main() {{\n    u32 _x = {open}1{close};\n    loop {{ delay(1ms); }}\n}}\n")
+                format!(
+                    "fn main() {{\n    u32 _x = {open}1{close};\n    loop {{ delay(1ms); }}\n}}\n"
+                )
             }
             1 => {
                 // Deeply nested blocks
                 let open = "{ ".repeat(depth);
                 let close = "} ".repeat(depth);
-                format!("fn main() {{\n    {open}u32 _x = 1;{close}\n    loop {{ delay(1ms); }}\n}}\n")
+                format!(
+                    "fn main() {{\n    {open}u32 _x = 1;{close}\n    loop {{ delay(1ms); }}\n}}\n"
+                )
             }
             2 => {
                 // Deeply nested generic type expressions + arrays
@@ -255,7 +384,9 @@ fn fuzz_parser_and_sema_crash_freedom() {
                 // Deeply nested array brackets / mismatched delimiters
                 let open = "[".repeat(depth);
                 let close = "]".repeat(depth / 2);
-                format!("fn main() {{\n    u32 _a = {open}1{close};\n    loop {{ delay(1ms); }}\n}}\n")
+                format!(
+                    "fn main() {{\n    u32 _a = {open}1{close};\n    loop {{ delay(1ms); }}\n}}\n"
+                )
             }
         };
         exercise_frontend(&format!("nest_{i}"), &src);

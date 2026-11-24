@@ -15,16 +15,20 @@ pub(super) use std::fmt::Write;
 pub(super) use zev_mir::{
     BlockId, MirAssignOp, MirBakedArg, MirBinOp, MirBlock, MirBootStep, MirCallDst,
     MirChildCallSlot, MirErrorSpec, MirExpr, MirExprKind, MirFloatFmt, MirFmtChunk, MirFnBody,
-    MirFunction, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr,
-    MirMmioInstance, MirMmioLayout, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp,
-    MirPrimReadOp, MirPrimTarget, MirPrimViewKind, MirStmt, MirStruct, MirSwitchPattern,
-    MirSysQuery, MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm,
-    MirWaitArmOp, MirWaitTimer, MirYieldKind, VarId, VarRole,
+    MirFunction, MirIntFmt, MirIntrinsicOp, MirIrqBinding, MirIrqVector, MirIsr, MirMmioInstance,
+    MirMmioLayout, MirModule, MirPlace, MirPrimKind, MirPrimNonBlockingOp, MirPrimReadOp,
+    MirPrimTarget, MirPrimViewKind, MirStmt, MirStruct, MirSwitchPattern, MirSysQuery,
+    MirTaskBlueprint, MirTerminator, MirType, MirUnaryOp, MirVar, MirWaitArm, MirWaitArmOp,
+    MirWaitTimer, MirYieldKind, VarId, VarRole,
 };
 
-pub(super) use crate::arm_cortex_m::{NvicMap, build_nvic_map, emit_arm_cortex_m_startup_ir, sanitize_ident};
-pub(super) use crate::riscv32::{RvIrqRoute, assign_rv_irq_routes_for_spec, emit_riscv32_startup_ir};
-pub(super) use crate::runtime_ir::{RuntimeIrFeatures, emit_kernel_runtime_ir_with_features};
+pub(super) use crate::arm_cortex_m::{
+    build_nvic_map, emit_arm_cortex_m_startup_ir, sanitize_ident, NvicMap,
+};
+pub(super) use crate::riscv32::{
+    assign_rv_irq_routes_for_spec, emit_riscv32_startup_ir, RvIrqRoute,
+};
+pub(super) use crate::runtime_ir::{emit_kernel_runtime_ir_with_features, RuntimeIrFeatures};
 pub(super) use crate::target_spec::{CpuIsa, IrqModel, TargetSpec};
 pub(super) use crate::toolchain::{CodegenError, CodegenOptions};
 
@@ -240,10 +244,16 @@ impl RomWrapperSpec {
         let n = self.param_llvm_tys.len();
         match self.kind {
             RomWrapperKind::U32 => {
-                format!("@__syn_rom_call_u32_a{n}{sig_suffix}_sb{}", self.stack_bound)
+                format!(
+                    "@__syn_rom_call_u32_a{n}{sig_suffix}_sb{}",
+                    self.stack_bound
+                )
             }
             RomWrapperKind::Void => {
-                format!("@__syn_rom_call_void_a{n}{sig_suffix}_sb{}", self.stack_bound)
+                format!(
+                    "@__syn_rom_call_void_a{n}{sig_suffix}_sb{}",
+                    self.stack_bound
+                )
             }
             RomWrapperKind::Noreturn => {
                 format!("@__syn_rom_noreturn_a{n}{sig_suffix}")
@@ -352,7 +362,12 @@ pub fn emit_llvm_ir_with_options(
     let mut out = String::with_capacity(64 * 1024);
 
     // 1. Target header + cooperative OS kernel & HAL (emitting soft-float & fmt helpers on demand)
-    emit_kernel_runtime_ir_with_features(&mut out, module.spawned_tasks.len(), opts, &ctx.rt_features)?;
+    emit_kernel_runtime_ir_with_features(
+        &mut out,
+        module.spawned_tasks.len(),
+        opts,
+        &ctx.rt_features,
+    )?;
 
     // 2. Pure-ISA vector tables, startup reset routines, and software/boot IRQ dispatchers
     match ctx.spec.isa {
@@ -361,7 +376,12 @@ pub fn emit_llvm_ir_with_options(
             emit_cm_irq_dispatch_ir(&mut out, &ctx);
         }
         CpuIsa::Riscv32 => {
-            emit_riscv32_startup_ir(&mut out, &ctx.spec, opts.fn_size_attrs(), &ctx.rv_irq_routes);
+            emit_riscv32_startup_ir(
+                &mut out,
+                &ctx.spec,
+                opts.fn_size_attrs(),
+                &ctx.rv_irq_routes,
+            );
             emit_rv_irq_dispatch_ir(&mut out, &ctx);
         }
         CpuIsa::Avr => {
@@ -483,4 +503,3 @@ pub(super) struct FnIrBuilder<'ctx, 'm> {
     pub(super) terminated: bool,
     pub(super) loop_targets: Vec<(String, String)>, // (continue_lbl, break_lbl) for Direct fns
 }
-

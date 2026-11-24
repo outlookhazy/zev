@@ -185,9 +185,9 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
 
     let mut resolved_owner_idx: Vec<Option<usize>> = Vec::with_capacity(raw_periphs.len());
     let mut resolved_addrs: Vec<u32> = Vec::with_capacity(raw_periphs.len());
-    for i in 0..raw_periphs.len() {
-        resolved_owner_idx.push(resolve_layout_owner_from_chain(&chains[i], &raw_periphs));
-        resolved_addrs.push(resolve_base_address_from_chain(&chains[i], &raw_periphs)?);
+    for chain in &chains {
+        resolved_owner_idx.push(resolve_layout_owner_from_chain(chain, &raw_periphs));
+        resolved_addrs.push(resolve_base_address_from_chain(chain, &raw_periphs)?);
     }
 
     // Collect deduplicated interrupts across all peripherals (expanding `%s` on dimmed ones).
@@ -369,7 +369,9 @@ pub fn svd_to_zev(xml: &str) -> Result<String, String> {
     out.push('\n');
 
     if !irqs.is_empty() {
-        out.push_str("// ── Hardware Interrupts ──────────────────────────────────────────────────────\n");
+        out.push_str(
+            "// ── Hardware Interrupts ──────────────────────────────────────────────────────\n",
+        );
         for (name, num) in &irqs {
             let _ = writeln!(out, "pub irq {name} = {num};");
         }
@@ -717,7 +719,7 @@ struct BuiltLayout {
 
 fn cand_byte_range(cand: &CandidateReg) -> Option<(u32, u32)> {
     let elem_bytes = (cand.elem_bits / 8) as u32;
-    if elem_bytes == 0 || cand.offset % elem_bytes != 0 {
+    if elem_bytes == 0 || !cand.offset.is_multiple_of(elem_bytes) {
         return None;
     }
     let count = u32::try_from(cand.array_len.unwrap_or(1)).ok()?;
@@ -823,7 +825,11 @@ fn resolve_derived_chain<'a>(
             return Err(format!("cyclic `<{tag} derivedFrom>` chain"));
         }
         chain.push(cur);
-        let Some(target) = cur.attr("derivedFrom").map(str::trim).filter(|s| !s.is_empty()) else {
+        let Some(target) = cur
+            .attr("derivedFrom")
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
             break;
         };
         let scoped = if scope_prefix.is_empty() {
@@ -957,8 +963,9 @@ where
                     } else {
                         let indices = parse_dim_indices(dim, dim_index);
                         for (k, idx_str) in indices.iter().enumerate() {
-                            let Some(elem_offset) =
-                                (k as u64).checked_mul(dim_inc).and_then(|d| abs_offset.checked_add(d))
+                            let Some(elem_offset) = (k as u64)
+                                .checked_mul(dim_inc)
+                                .and_then(|d| abs_offset.checked_add(d))
                             else {
                                 continue;
                             };
@@ -1073,8 +1080,9 @@ where
                     let base_cluster = strip_dim_placeholder(raw_name);
                     let next_const_prefix = join_prefix(const_cluster_prefix, &base_cluster);
                     for (k, idx_str) in indices.iter().enumerate() {
-                        let Some(inst_offset) =
-                            (k as u64).checked_mul(dim_inc).and_then(|d| abs_offset.checked_add(d))
+                        let Some(inst_offset) = (k as u64)
+                            .checked_mul(dim_inc)
+                            .and_then(|d| abs_offset.checked_add(d))
                         else {
                             continue;
                         };
@@ -1241,7 +1249,10 @@ fn parse_field_bit_range(field_el: &XmlElement) -> Result<Option<(u32, u32)>, St
     }
 
     if let Some(range_raw) = field_el.child_text("bitRange") {
-        let inner = range_raw.trim().trim_start_matches('[').trim_end_matches(']');
+        let inner = range_raw
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
         let Some((msb_str, lsb_str)) = inner.split_once(':') else {
             return Err(format!("malformed `<bitRange>` value `{range_raw}`"));
         };
@@ -1452,9 +1463,7 @@ fn sanitize_reg_ident(raw: &str) -> String {
 }
 
 fn clean_upper_segment(raw: &str) -> String {
-    sanitize_chars(raw)
-        .trim_matches('_')
-        .to_ascii_uppercase()
+    sanitize_chars(raw).trim_matches('_').to_ascii_uppercase()
 }
 
 fn format_irq_ident(raw: &str) -> String {
@@ -1933,7 +1942,7 @@ fn parse_xml_document(input: &str) -> Result<XmlElement, String> {
 
 fn attach_finished(
     elem: XmlElement,
-    stack: &mut Vec<XmlElement>,
+    stack: &mut [XmlElement],
     root: &mut Option<XmlElement>,
 ) -> Result<(), String> {
     if let Some(parent) = stack.last_mut() {
@@ -2129,22 +2138,34 @@ mod tests {
         assert!(zev.contains("@rw u32 stride_1 @ 0x48;"), "{zev}");
 
         // Bitfields from bitOffset+bitWidth, lsb+msb, and bitRange[msb:lsb]
-        assert!(zev.contains("pub const u32 USART1_CR1_UE_POS = 0;"), "{zev}");
+        assert!(
+            zev.contains("pub const u32 USART1_CR1_UE_POS = 0;"),
+            "{zev}"
+        );
         assert!(
             zev.contains("pub const u32 USART1_CR1_UE_MASK = 0x0000_0001;"),
             "{zev}"
         );
-        assert!(zev.contains("pub const u32 USART1_CR1_M_POS = 12;"), "{zev}");
+        assert!(
+            zev.contains("pub const u32 USART1_CR1_M_POS = 12;"),
+            "{zev}"
+        );
         assert!(
             zev.contains("pub const u32 USART1_CR1_M_MASK = 0x0000_3000;"),
             "{zev}"
         );
-        assert!(zev.contains("pub const u32 USART1_ISR_RXNE_POS = 5;"), "{zev}");
+        assert!(
+            zev.contains("pub const u32 USART1_ISR_RXNE_POS = 5;"),
+            "{zev}"
+        );
         assert!(
             zev.contains("pub const u32 USART1_ISR_RXNE_MASK = 0x0000_0020;"),
             "{zev}"
         );
-        assert!(zev.contains("pub const u32 USART1_ICR_ORECF_POS = 3;"), "{zev}");
+        assert!(
+            zev.contains("pub const u32 USART1_ICR_ORECF_POS = 3;"),
+            "{zev}"
+        );
         assert!(
             zev.contains("pub const u32 USART1_ICR_ORECF_MASK = 0x0000_0008;"),
             "{zev}"
@@ -2236,7 +2257,10 @@ mod tests {
 
         let zev = svd_to_zev(svd).expect("cluster SVD must convert cleanly");
         assert!(zev.contains("pub mmio Dma1Regs {"), "{zev}");
-        assert!(zev.contains("pub mmio DMA1 : Dma1Regs @ 0x4002_0000;"), "{zev}");
+        assert!(
+            zev.contains("pub mmio DMA1 : Dma1Regs @ 0x4002_0000;"),
+            "{zev}"
+        );
 
         // Device-level 8/16/32 and read-only inheritance
         assert!(zev.contains("@ro u8 status8 @ 0x00;"), "{zev}");
@@ -2267,13 +2291,76 @@ mod tests {
     #[test]
     fn sanitizes_all_zev_keywords_types_and_leading_digits() {
         let keywords = [
-            "in", "loop", "task", "fn", "error", "return", "default", "switch", "if", "else",
-            "while", "for", "every", "defer", "noyield", "critical", "spawn", "continue", "break",
-            "restart", "true", "false", "import", "as", "packed", "struct", "enum", "const",
-            "extern", "isr", "catch", "or", "let", "var", "mut", "async", "await", "select",
-            "match", "try", "static", "pub", "mmio", "irq", "state", "u8", "u16", "u32", "u64",
-            "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64", "u16be", "u16le", "u32be",
-            "u32le", "u64be", "u64le", "bool", "void", "signal", "watch", "guarded", "inbox", "ping_pong",
+            "in",
+            "loop",
+            "task",
+            "fn",
+            "error",
+            "return",
+            "default",
+            "switch",
+            "if",
+            "else",
+            "while",
+            "for",
+            "every",
+            "defer",
+            "noyield",
+            "critical",
+            "spawn",
+            "continue",
+            "break",
+            "restart",
+            "true",
+            "false",
+            "import",
+            "as",
+            "packed",
+            "struct",
+            "enum",
+            "const",
+            "extern",
+            "isr",
+            "catch",
+            "or",
+            "let",
+            "var",
+            "mut",
+            "async",
+            "await",
+            "select",
+            "match",
+            "try",
+            "static",
+            "pub",
+            "mmio",
+            "irq",
+            "state",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "usize",
+            "i8",
+            "i16",
+            "i32",
+            "i64",
+            "isize",
+            "f32",
+            "f64",
+            "u16be",
+            "u16le",
+            "u32be",
+            "u32le",
+            "u64be",
+            "u64le",
+            "bool",
+            "void",
+            "signal",
+            "watch",
+            "guarded",
+            "inbox",
+            "ping_pong",
             "lease",
         ];
 
@@ -2349,17 +2436,26 @@ mod tests {
 </device>"#;
 
         let zev = svd_to_zev(svd).expect("XML with entities/CDATA/DOCTYPE must convert");
-        assert!(zev.contains("pub const u32 SYSTIMER_LOAD_ALL_POS = 0;"), "{zev}");
+        assert!(
+            zev.contains("pub const u32 SYSTIMER_LOAD_ALL_POS = 0;"),
+            "{zev}"
+        );
         assert!(
             zev.contains("pub const u32 SYSTIMER_LOAD_ALL_MASK = 0xFFFF_FFFF;"),
             "{zev}"
         );
-        assert!(zev.contains("pub const u32 SYSTIMER_LOAD_CHA_POS = 0;"), "{zev}");
+        assert!(
+            zev.contains("pub const u32 SYSTIMER_LOAD_CHA_POS = 0;"),
+            "{zev}"
+        );
         assert!(
             zev.contains("pub const u32 SYSTIMER_LOAD_CHA_MASK = 0x0000_000F;"),
             "{zev}"
         );
-        assert!(zev.contains("pub const u32 SYSTIMER_LOAD_CHB_POS = 4;"), "{zev}");
+        assert!(
+            zev.contains("pub const u32 SYSTIMER_LOAD_CHB_POS = 4;"),
+            "{zev}"
+        );
         assert!(
             zev.contains("pub const u32 SYSTIMER_LOAD_CHB_MASK = 0x0000_00F0;"),
             "{zev}"
@@ -2482,9 +2578,18 @@ mod tests {
   </peripherals>
 </device>"#;
         let zev = svd_to_zev(svd).expect("audited SVD conversion must succeed cleanly");
-        assert!(zev.contains("pub mmio sys_ : SysRegs @ 0x4000_0000;"), "{zev}");
-        assert!(zev.contains("pub mmio SYS_ALIAS : SysRegs @ 0x4001_0000;"), "{zev}");
-        assert!(zev.contains("pub mmio SYS_LEAF : SysRegs @ 0x4002_0000;"), "{zev}");
+        assert!(
+            zev.contains("pub mmio sys_ : SysRegs @ 0x4000_0000;"),
+            "{zev}"
+        );
+        assert!(
+            zev.contains("pub mmio SYS_ALIAS : SysRegs @ 0x4001_0000;"),
+            "{zev}"
+        );
+        assert!(
+            zev.contains("pub mmio SYS_LEAF : SysRegs @ 0x4002_0000;"),
+            "{zev}"
+        );
         assert!(zev.contains("@ro u16 cr1 @ 0x04;"), "{zev}");
         assert!(zev.contains("@ro u16 cr2 @ 0x08;"), "{zev}");
         assert!(zev.contains("@w1c u32 icr @ 0x0C;"), "{zev}");
@@ -2494,7 +2599,10 @@ mod tests {
         assert!(zev.contains("@rw u32 mix_5 @ 0x38;"), "{zev}");
         assert!(zev.contains("@rw u32 ch0_ctrl @ 0x40;"), "{zev}");
         assert!(zev.contains("@rw u32 ch1_ctrl @ 0x50;"), "{zev}");
-        assert!(!zev.contains("OVR"), "overflow bitfield must be skipped: {zev}");
+        assert!(
+            !zev.contains("OVR"),
+            "overflow bitfield must be skipped: {zev}"
+        );
 
         // Generated Zev must pass full parser + sema!
         let parsed = zev_parser::parse_str(&zev).expect("generated SVD Zev must parse");
@@ -2623,10 +2731,22 @@ mod tests {
         let zev = svd_to_zev(svd).expect("SM34 SVD must convert");
 
         // TIM2 & TIM3 share TimRegs; TIM4 & TIM5 share Tim4Regs with overridden CR1 + base regs + OR
-        assert!(zev.contains("pub mmio TIM2 : TimRegs @ 0x4000_0000;"), "{zev}");
-        assert!(zev.contains("pub mmio TIM3 : TimRegs @ 0x4000_1000;"), "{zev}");
-        assert!(zev.contains("pub mmio TIM4 : Tim4Regs @ 0x4000_4000;"), "{zev}");
-        assert!(zev.contains("pub mmio TIM5 : Tim4Regs @ 0x4000_5000;"), "{zev}");
+        assert!(
+            zev.contains("pub mmio TIM2 : TimRegs @ 0x4000_0000;"),
+            "{zev}"
+        );
+        assert!(
+            zev.contains("pub mmio TIM3 : TimRegs @ 0x4000_1000;"),
+            "{zev}"
+        );
+        assert!(
+            zev.contains("pub mmio TIM4 : Tim4Regs @ 0x4000_4000;"),
+            "{zev}"
+        );
+        assert!(
+            zev.contains("pub mmio TIM5 : Tim4Regs @ 0x4000_5000;"),
+            "{zev}"
+        );
         assert!(zev.contains("pub irq IRQ_TIM2 = 28;"), "{zev}");
         assert!(zev.contains("pub irq IRQ_TIM3 = 28;"), "{zev}");
 
@@ -2641,8 +2761,14 @@ mod tests {
         let tim4_section = zev.split("pub mmio Tim4Regs {").nth(1).expect("Tim4Regs");
         let tim4_body = tim4_section.split('}').next().unwrap();
         assert!(tim4_body.contains("@ro u32 cr1 @ 0x00;"), "{tim4_body}");
-        assert!(tim4_body.contains("@rw u32 mixed_sr @ 0x04;"), "{tim4_body}");
-        assert!(tim4_body.contains("@ro u32 derived_ro @ 0x20;"), "{tim4_body}");
+        assert!(
+            tim4_body.contains("@rw u32 mixed_sr @ 0x04;"),
+            "{tim4_body}"
+        );
+        assert!(
+            tim4_body.contains("@ro u32 derived_ro @ 0x20;"),
+            "{tim4_body}"
+        );
         assert!(tim4_body.contains("@rw u32 or_ @ 0x50;"), "{tim4_body}");
     }
 
@@ -2657,7 +2783,10 @@ mod tests {
         assert_eq!(parse_svd_u64("0x1B", "t").unwrap(), 0x1B);
         assert_eq!(parse_svd_u64("1M", "t").unwrap(), 1024 * 1024);
         assert_eq!(parse_svd_u64("2g", "t").unwrap(), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_svd_u64("1T", "t").unwrap(), 1024u64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_svd_u64("1T", "t").unwrap(),
+            1024u64 * 1024 * 1024 * 1024
+        );
         assert!(parse_svd_u64("+", "t").is_err());
         assert!(parse_svd_u64("++1", "t").is_err());
         assert!(parse_svd_u64("0x100000000T", "t").is_err());
@@ -2673,12 +2802,32 @@ mod tests {
         assert_eq!(sanitize_ident("___"), "_ident");
         assert_eq!(sanitize_ident(""), "_ident");
         for pascal_or_snake in [
-            "pool", "dma_slot", "byte_ring", "Lease", "chan", "Result", "FmtErr", "Err",
-            "checkpoint", "delay", "sleep", "print", "println", "assert", "fmt_buf", "fmt_ring",
-            "set_priority", "now_ticks", "now_ms", "main",
+            "pool",
+            "dma_slot",
+            "byte_ring",
+            "Lease",
+            "chan",
+            "Result",
+            "FmtErr",
+            "Err",
+            "checkpoint",
+            "delay",
+            "sleep",
+            "print",
+            "println",
+            "assert",
+            "fmt_buf",
+            "fmt_ring",
+            "set_priority",
+            "now_ticks",
+            "now_ms",
+            "main",
         ] {
             let s = sanitize_ident(pascal_or_snake);
-            assert!(s.ends_with('_'), "expected keyword {pascal_or_snake} -> {s}");
+            assert!(
+                s.ends_with('_'),
+                "expected keyword {pascal_or_snake} -> {s}"
+            );
         }
     }
 }

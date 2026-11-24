@@ -376,10 +376,7 @@ impl CallGraph {
             return Vec::new();
         }
         if start_node.direct_yield {
-            let site = start_node
-                .direct_yield_reason
-                .as_deref()
-                .unwrap_or("yield");
+            let site = start_node.direct_yield_reason.as_deref().unwrap_or("yield");
             return vec![
                 format_callable_step(start),
                 format!("{} [yields here]", site),
@@ -392,7 +389,10 @@ impl CallGraph {
                 callee.effect == FnEffect::HardBlocking
                     || (callee.effect == FnEffect::SoftYielding && !e.ctx.in_noyield)
             },
-            |n| n.direct_yield.then(|| n.direct_yield_reason.as_deref().unwrap_or("yield")),
+            |n| {
+                n.direct_yield
+                    .then(|| n.direct_yield_reason.as_deref().unwrap_or("yield"))
+            },
         )
     }
 
@@ -406,10 +406,7 @@ impl CallGraph {
             return Vec::new();
         }
         if start_node.direct_yield {
-            let site = start_node
-                .direct_yield_reason
-                .as_deref()
-                .unwrap_or("yield");
+            let site = start_node.direct_yield_reason.as_deref().unwrap_or("yield");
             return vec![
                 format_callable_step(start),
                 format!("{} [yields here]", site),
@@ -419,7 +416,10 @@ impl CallGraph {
         self.bfs_yield_chain(
             start,
             |_e, callee| callee.any_yield_effect.can_yield(),
-            |n| n.direct_yield.then(|| n.direct_yield_reason.as_deref().unwrap_or("yield")),
+            |n| {
+                n.direct_yield
+                    .then(|| n.direct_yield_reason.as_deref().unwrap_or("yield"))
+            },
         )
     }
 
@@ -752,9 +752,7 @@ impl CallGraph {
                 continue;
             }
 
-            let matches_pred = scc
-                .iter()
-                .any(|f| self.nodes.get(f).is_some_and(&pred));
+            let matches_pred = scc.iter().any(|f| self.nodes.get(f).is_some_and(&pred));
             if !matches_pred {
                 continue;
             }

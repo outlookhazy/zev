@@ -340,9 +340,7 @@ impl TargetSpec {
         let features = cdoc.opt_str("chip", "features")?.unwrap_or_default();
         let triple = cdoc.req_str("chip", "triple")?;
         let datalayout = cdoc.req_str("chip", "datalayout")?;
-        let ptr_bits = cdoc
-            .opt_u32("chip", "ptr_bits")?
-            .unwrap_or(isa.ptr_bits());
+        let ptr_bits = cdoc.opt_u32("chip", "ptr_bits")?.unwrap_or(isa.ptr_bits());
         let mut opt_level = cdoc
             .opt_str("chip", "opt_level")?
             .unwrap_or_else(|| "-O2".to_string());
@@ -387,7 +385,9 @@ impl TargetSpec {
             "riscv-vectored" => IrqModel::RiscvVectored {
                 vector_slots: cdoc.opt_u32("irq", "vector_slots")?.unwrap_or(32),
                 max_irq_source: cdoc.req_u32("irq", "max_irq_source")?,
-                reserved_slots: cdoc.opt_u32_array("irq", "reserved_slots")?.unwrap_or_default(),
+                reserved_slots: cdoc
+                    .opt_u32_array("irq", "reserved_slots")?
+                    .unwrap_or_default(),
             },
             "none" => IrqModel::None,
             other => {
@@ -413,7 +413,9 @@ impl TargetSpec {
             other => {
                 return Err(CodegenError::new(
                     "toml",
-                    format!("unknown `[image].format` '{other}'; expected `elf`, `raw-bin`, or `uf2`"),
+                    format!(
+                        "unknown `[image].format` '{other}'; expected `elf`, `raw-bin`, or `uf2`"
+                    ),
                 ));
             }
         };
@@ -423,9 +425,11 @@ impl TargetSpec {
         let reset_first_word_mask =
             u16::try_from(cdoc.opt_u32("image", "reset_first_word_mask")?.unwrap_or(0))
                 .map_err(|_| CodegenError::new("toml", "image.reset_first_word_mask > u16"))?;
-        let reset_first_word_value =
-            u16::try_from(cdoc.opt_u32("image", "reset_first_word_value")?.unwrap_or(0))
-                .map_err(|_| CodegenError::new("toml", "image.reset_first_word_value > u16"))?;
+        let reset_first_word_value = u16::try_from(
+            cdoc.opt_u32("image", "reset_first_word_value")?
+                .unwrap_or(0),
+        )
+        .map_err(|_| CodegenError::new("toml", "image.reset_first_word_value > u16"))?;
 
         let mut board_name = None;
         let mut board_module = None;
@@ -739,7 +743,9 @@ impl TomlDoc {
                         other => {
                             return Err(CodegenError::new(
                                 "toml",
-                                format!("expected string element in `[{sec}].{key}`, found {other}"),
+                                format!(
+                                    "expected string element in `[{sec}].{key}`, found {other}"
+                                ),
                             ));
                         }
                     }
@@ -769,7 +775,9 @@ impl TomlDoc {
                         other => {
                             return Err(CodegenError::new(
                                 "toml",
-                                format!("expected integer element in `[{sec}].{key}`, found {other}"),
+                                format!(
+                                    "expected integer element in `[{sec}].{key}`, found {other}"
+                                ),
                             ));
                         }
                     }
@@ -943,13 +951,22 @@ fn parse_toml_val(s: &str, line_no: usize) -> Result<TomlVal, CodegenError> {
         return Ok(TomlVal::Bool(false));
     }
     let clean: String = s.chars().filter(|&c| c != '_').collect();
-    if let Some(hex) = clean.strip_prefix("0x").or_else(|| clean.strip_prefix("0X")) {
+    if let Some(hex) = clean
+        .strip_prefix("0x")
+        .or_else(|| clean.strip_prefix("0X"))
+    {
         let v = i128::from_str_radix(hex, 16).map_err(|e| {
-            CodegenError::new("toml", format!("invalid hex integer `{s}` on line {line_no}: {e}"))
+            CodegenError::new(
+                "toml",
+                format!("invalid hex integer `{s}` on line {line_no}: {e}"),
+            )
         })?;
         return Ok(TomlVal::Int(v));
     }
-    if let Some(bin) = clean.strip_prefix("0b").or_else(|| clean.strip_prefix("0B")) {
+    if let Some(bin) = clean
+        .strip_prefix("0b")
+        .or_else(|| clean.strip_prefix("0B"))
+    {
         let v = i128::from_str_radix(bin, 2).map_err(|e| {
             CodegenError::new(
                 "toml",
@@ -959,7 +976,10 @@ fn parse_toml_val(s: &str, line_no: usize) -> Result<TomlVal, CodegenError> {
         return Ok(TomlVal::Int(v));
     }
     let v = clean.parse::<i128>().map_err(|e| {
-        CodegenError::new("toml", format!("invalid value `{s}` on line {line_no}: {e}"))
+        CodegenError::new(
+            "toml",
+            format!("invalid value `{s}` on line {line_no}: {e}"),
+        )
     })?;
     Ok(TomlVal::Int(v))
 }
@@ -967,7 +987,10 @@ fn parse_toml_val(s: &str, line_no: usize) -> Result<TomlVal, CodegenError> {
 fn parse_quoted_str(s: &str, line_no: usize) -> Result<(String, &str), CodegenError> {
     let mut chars = s.char_indices();
     let Some((_, '"')) = chars.next() else {
-        return Err(CodegenError::new("toml", format!("expected `\"` on line {line_no}")));
+        return Err(CodegenError::new(
+            "toml",
+            format!("expected `\"` on line {line_no}"),
+        ));
     };
     let mut out = String::new();
     let mut esc = false;

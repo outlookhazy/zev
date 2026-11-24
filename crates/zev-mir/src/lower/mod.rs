@@ -7,8 +7,8 @@ pub(super) use zev_ast::{
     ArrayLen, AssignOp, Attr, AttrKind, BinaryOp, Block, BuiltinFn, CallArg, CatchClause,
     DurationLit, ErrorSpec, Expr, ExprKind, FnDecl, FormatPart, FormatSpec, IsrDecl, ItemKind,
     Literal, MmioAccess, MmioDeclKind, MmioRegDecl, OsPrimitiveType, PrimType, Priority, Program,
-    SYS_NAMESPACE, SpawnStmt, Span, Stmt, StmtKind, SwitchPat, SysMethod, TaskDecl, TypeExpr,
-    TypeKind, UnaryOp,
+    Span, SpawnStmt, Stmt, StmtKind, SwitchPat, SysMethod, TaskDecl, TypeExpr, TypeKind, UnaryOp,
+    SYS_NAMESPACE,
 };
 
 pub(super) use crate::ir::{
@@ -122,10 +122,10 @@ impl ModuleSymbols {
             TypeKind::Named(id) => {
                 if self.mmio_layouts.contains_key(&id.name) {
                     Some(id.name.clone())
-                } else if let Some(inst) = self.mmio_instances.get(&id.name) {
-                    Some(inst.layout.clone())
                 } else {
-                    None
+                    self.mmio_instances
+                        .get(&id.name)
+                        .map(|inst| inst.layout.clone())
                 }
             }
             TypeKind::Path(segs) if !segs.is_empty() => {
@@ -179,7 +179,11 @@ impl ModuleSymbols {
         None
     }
 
-    pub(in crate::lower) fn resolve_irq_field_be(&self, expr: &Expr, scopes: &VarScopes) -> Option<(String, u32)> {
+    pub(in crate::lower) fn resolve_irq_field_be(
+        &self,
+        expr: &Expr,
+        scopes: &VarScopes,
+    ) -> Option<(String, u32)> {
         if let ExprKind::Field { target, field } = &expr.kind {
             if let ExprKind::Ident(alias) = &target.kind {
                 if scopes.lookup(&alias.name).is_none()
@@ -255,9 +259,12 @@ impl ModuleSymbols {
                 }
             }
             TypeKind::Generic { base, .. } => MirType::Struct(base.name.clone()),
-            TypeKind::GenericPath { path, .. } => {
-                MirType::Struct(path.iter().map(|s| s.name.clone()).collect::<Vec<_>>().join("__"))
-            }
+            TypeKind::GenericPath { path, .. } => MirType::Struct(
+                path.iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>()
+                    .join("__"),
+            ),
             TypeKind::Ptr(inner) => {
                 if let Some(layout) = self.resolve_mmio_layout_name(inner) {
                     MirType::MmioPtr(layout)
@@ -333,7 +340,7 @@ impl ModuleSymbols {
         if us == 0 {
             return Ok(0);
         }
-        if us < self.tick_period_us || us % self.tick_period_us != 0 {
+        if us < self.tick_period_us || !us.is_multiple_of(self.tick_period_us) {
             return Err(MirLowerError {
                 message: format!(
                     "duration `{dur}` ({us}us) is not an exact multiple of tick resolution ({}us)",
@@ -563,7 +570,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                         byte_size,
                         regs: mir_regs,
                     };
-                    syms.mmio_layouts.insert(md.name.name.clone(), layout.clone());
+                    syms.mmio_layouts
+                        .insert(md.name.name.clone(), layout.clone());
                     mir_mmio_layouts.push(layout);
                 }
                 MmioDeclKind::Inline { regs, .. } => {
@@ -573,7 +581,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                         byte_size,
                         regs: mir_regs,
                     };
-                    syms.mmio_layouts.insert(md.name.name.clone(), layout.clone());
+                    syms.mmio_layouts
+                        .insert(md.name.name.clone(), layout.clone());
                     mir_mmio_layouts.push(layout);
                 }
                 MmioDeclKind::Instance { .. } => {}
@@ -586,13 +595,15 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
         if let ItemKind::Mmio(md) = &item.kind {
             match &md.kind {
                 MmioDeclKind::Instance { layout, base_addr } => {
-                    let layout_name = syms.resolve_mmio_layout_name(layout).ok_or_else(|| MirLowerError {
-                        message: format!(
-                            "unknown MMIO layout for instance `{}`",
-                            md.name.name
-                        ),
-                        span: md.span,
-                    })?;
+                    let layout_name =
+                        syms.resolve_mmio_layout_name(layout)
+                            .ok_or_else(|| MirLowerError {
+                                message: format!(
+                                    "unknown MMIO layout for instance `{}`",
+                                    md.name.name
+                                ),
+                                span: md.span,
+                            })?;
                     let byte_size = syms.mmio_layouts[&layout_name].byte_size;
                     let addr = eval_const_u64(base_addr, &syms, "MMIO base address", md.span)?;
                     let inst = MirMmioInstance {
@@ -601,7 +612,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                         base_addr: addr,
                         byte_size,
                     };
-                    syms.mmio_instances.insert(md.name.name.clone(), inst.clone());
+                    syms.mmio_instances
+                        .insert(md.name.name.clone(), inst.clone());
                     mir_mmio_instances.push(inst);
                 }
                 MmioDeclKind::Inline { base_addr, .. } => {
@@ -613,7 +625,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                         base_addr: addr,
                         byte_size,
                     };
-                    syms.mmio_instances.insert(md.name.name.clone(), inst.clone());
+                    syms.mmio_instances
+                        .insert(md.name.name.clone(), inst.clone());
                     mir_mmio_instances.push(inst);
                 }
                 MmioDeclKind::Layout { .. } => {}
@@ -754,11 +767,7 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                 if let Some(sig) = extract_monomorphized_sig(&item.attrs)
                     .or_else(|| extract_monomorphized_sig(&fd.attrs))
                 {
-                    let key = (
-                        MonomorphizedItemKind::Fn,
-                        sig.clone(),
-                        fd.name.name.clone(),
-                    );
+                    let key = (MonomorphizedItemKind::Fn, sig.clone(), fd.name.name.clone());
                     mono_map.insert(
                         key,
                         MonomorphizedMirItem {
@@ -878,10 +887,8 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
             ItemKind::Const(cd) => {
                 let ty = syms.resolve_type(&cd.ty);
                 let mut dummy_ctx = DirectLowerCtx::new(&syms, MirType::Void, MirErrorSpec::None);
-                let init = coerce_expr_if_needed(
-                    dummy_ctx.lower_pure_expr(&cd.value, Some(&ty))?,
-                    &ty,
-                );
+                let init =
+                    coerce_expr_if_needed(dummy_ctx.lower_pure_expr(&cd.value, Some(&ty))?, &ty);
                 mir_consts.push(MirConst {
                     name: cd.name.name.clone(),
                     ty,
@@ -889,14 +896,17 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
                 });
             }
             ItemKind::OsPrimitive(pd) => {
-                let pinfo = syms
-                    .primitives
-                    .get(&pd.name.name)
-                    .cloned()
-                    .ok_or_else(|| MirLowerError {
-                        message: format!("internal error: missing primitive '{}'", pd.name.name),
-                        span: pd.span,
-                    })?;
+                let pinfo =
+                    syms.primitives
+                        .get(&pd.name.name)
+                        .cloned()
+                        .ok_or_else(|| MirLowerError {
+                            message: format!(
+                                "internal error: missing primitive '{}'",
+                                pd.name.name
+                            ),
+                            span: pd.span,
+                        })?;
                 let init = if let Some(ie) = &pd.init {
                     let elem_ty = match &pinfo.kind {
                         MirPrimKind::Watch { elem } | MirPrimKind::Guarded { elem } => {
@@ -1145,7 +1155,10 @@ pub(super) fn lower_coroutine_fn_decl(
     syms: &ModuleSymbols,
 ) -> Result<MirFunction, MirLowerError> {
     let body_ast = fd.body.as_ref().ok_or_else(|| MirLowerError {
-        message: format!("function '{}' has no body for coroutine lowering", fd.name.name),
+        message: format!(
+            "function '{}' has no body for coroutine lowering",
+            fd.name.name
+        ),
         span: fd.span,
     })?;
     let mut cctx = CoroutineLowerCtx::new(
@@ -1178,7 +1191,6 @@ pub(super) fn lower_coroutine_fn_decl(
         },
     })
 }
-
 
 mod coroutine;
 mod direct;
