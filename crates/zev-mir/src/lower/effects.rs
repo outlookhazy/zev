@@ -996,6 +996,7 @@ pub(super) fn scan_expr_effect(
                 m,
                 "wait_chunk"
                     | "wait_read"
+                    | "wait_write"
                     | "recv"
                     | "wait"
                     | "send"

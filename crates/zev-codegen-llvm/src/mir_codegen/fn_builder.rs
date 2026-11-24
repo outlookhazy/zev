@@ -989,6 +989,22 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 dst_res: Option<VarId>,
                 target_bb: BlockId,
             },
+            ByteRingWaitWrite {
+                rptr: String,
+                wm_p: String,
+                id: String,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
+            ByteRingViewWaitWrite {
+                hdr: String,
+                cap32: String,
+                wm_p: String,
+                dst_val: Option<VarId>,
+                dst_res: Option<VarId>,
+                target_bb: BlockId,
+            },
         }
 
         impl ResolvedArm {
@@ -1004,7 +1020,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     | ResolvedArm::PingPongWaitChunk { wm_p, .. }
                     | ResolvedArm::PoolAlloc { wm_p, .. }
                     | ResolvedArm::ByteRingWaitRead { wm_p, .. }
-                    | ResolvedArm::ByteRingViewWaitRead { wm_p, .. } => wm_p,
+                    | ResolvedArm::ByteRingViewWaitRead { wm_p, .. }
+                    | ResolvedArm::ByteRingWaitWrite { wm_p, .. }
+                    | ResolvedArm::ByteRingViewWaitWrite { wm_p, .. } => wm_p,
                 }
             }
         }
@@ -1297,6 +1315,48 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         "{wm_p} = getelementptr inbounds %prim.byte_ring_hdr, ptr {hdr}, i32 0, i32 6"
                     ));
                     ResolvedArm::ByteRingViewWaitRead {
+                        hdr,
+                        cap32,
+                        wm_p,
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::ByteRingWaitWrite {
+                    target,
+                    cap,
+                    dst_val,
+                    dst_res,
+                } => {
+                    let pk = MirPrimKind::ByteRing { cap: *cap };
+                    let id = sanitize_ident(&pk.mangle_name());
+                    let pty = format!("%prim.{id}");
+                    let rptr = self.resolve_prim_ptr(target)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds {pty}, ptr {rptr}, i32 0, i32 6"
+                    ));
+                    ResolvedArm::ByteRingWaitWrite {
+                        rptr,
+                        wm_p,
+                        id,
+                        dst_val: *dst_val,
+                        dst_res: *dst_res,
+                        target_bb: arm.target_bb,
+                    }
+                }
+                MirWaitArmOp::ByteRingViewWaitWrite {
+                    view,
+                    dst_val,
+                    dst_res,
+                } => {
+                    let (hdr, cap32) = self.emit_byte_ring_view_parts(view)?;
+                    let wm_p = self.next_tmp();
+                    self.emit_line(format!(
+                        "{wm_p} = getelementptr inbounds %prim.byte_ring_hdr, ptr {hdr}, i32 0, i32 6"
+                    ));
+                    ResolvedArm::ByteRingViewWaitWrite {
                         hdr,
                         cap32,
                         wm_p,
@@ -1752,6 +1812,82 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                         let res0 = self.next_tmp();
                         self.emit_line(format!(
                             "{res0} = insertvalue {rty} zeroinitializer, {slice_ty} {sl_val}, 0"
+                        ));
+                        self.emit_line(format!("store {rty} {res0}, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::ByteRingWaitWrite {
+                    rptr,
+                    id,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let fs = self.next_tmp();
+                    self.emit_line(format!(
+                        "{fs} = {call_kw} i32 @__syn_ring_free_space_{id}(ptr {rptr})"
+                    ));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ugt i32 {fs}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    let fs_u = self.coerce(SsaVal::new("i32".to_string(), fs), &usize_ty, false);
+                    if let Some(vid) = dst_val {
+                        let dp = self.var_ptr(*vid);
+                        self.emit_line(format!(
+                            "store {usize_ty} {}, ptr {dp}, align 1",
+                            fs_u.repr
+                        ));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let res0 = self.next_tmp();
+                        self.emit_line(format!(
+                            "{res0} = insertvalue {rty} zeroinitializer, {usize_ty} {}, 0",
+                            fs_u.repr
+                        ));
+                        self.emit_line(format!("store {rty} {res0}, ptr {rp}, align 1"));
+                    }
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                    self.emit_term(format!("br label %bb_{}", target_bb.0));
+                }
+                ResolvedArm::ByteRingViewWaitWrite {
+                    hdr,
+                    cap32,
+                    dst_val,
+                    dst_res,
+                    target_bb,
+                    ..
+                } => {
+                    let fs = self.next_tmp();
+                    self.emit_line(format!(
+                        "{fs} = {call_kw} i32 @__syn_ring_view_free_space(ptr {hdr}, i32 {cap32})"
+                    ));
+                    let got = self.next_tmp();
+                    self.emit_line(format!("{got} = icmp ugt i32 {fs}, 0"));
+                    self.emit_term(format!("br i1 {got}, label %{ok_lbl}, label %{next_lbl}"));
+
+                    self.start_block(&ok_lbl);
+                    let fs_u = self.coerce(SsaVal::new("i32".to_string(), fs), &usize_ty, false);
+                    if let Some(vid) = dst_val {
+                        let dp = self.var_ptr(*vid);
+                        self.emit_line(format!(
+                            "store {usize_ty} {}, ptr {dp}, align 1",
+                            fs_u.repr
+                        ));
+                    }
+                    if let Some(rvid) = dst_res {
+                        let rp = self.var_ptr(*rvid);
+                        let rty = self.ctx.llvm_ty(&self.vars[rvid.0].ty);
+                        let res0 = self.next_tmp();
+                        self.emit_line(format!(
+                            "{res0} = insertvalue {rty} zeroinitializer, {usize_ty} {}, 0",
+                            fs_u.repr
                         ));
                         self.emit_line(format!("store {rty} {res0}, ptr {rp}, align 1"));
                     }

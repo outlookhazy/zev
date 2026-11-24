@@ -1,4 +1,4 @@
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 mod imp {
     use std::ffi::CString;
     use std::io::{self, Write};
@@ -382,60 +382,60 @@ mod imp {
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 pub use imp::{
     open_serial_115200, run_interactive_monitor, run_interactive_monitor_on, stdin_is_tty,
     wait_for_serial_port, InteractiveTtyGuard, SerialPort,
 };
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn stdin_is_tty() -> bool {
     false
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub struct InteractiveTtyGuard;
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 impl InteractiveTtyGuard {
     pub fn enter(_keep_isig: bool) -> Self {
         Self
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub struct SerialPort;
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 impl SerialPort {
     pub fn poll_read(&self, _buf: &mut [u8], _timeout_ms: i32) -> Result<Option<usize>, String> {
-        Err("serial monitor is only supported on Unix hosts".to_string())
+        Err("zevc monitor is not supported on this OS yet".to_string())
     }
 
     pub fn write_all_bytes(&self, _data: &[u8]) -> Result<(), String> {
-        Err("serial monitor is only supported on Unix hosts".to_string())
+        Err("zevc monitor is not supported on this OS yet".to_string())
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn open_serial_115200(_port_path: &str) -> Result<SerialPort, String> {
-    Err("serial monitor is only supported on Unix hosts".to_string())
+    Err("zevc monitor is not supported on this OS yet".to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn wait_for_serial_port(
     _port_path: &str,
     _timeout: std::time::Duration,
 ) -> Result<SerialPort, String> {
-    Err("serial monitor is only supported on Unix hosts".to_string())
+    Err("zevc monitor is not supported on this OS yet".to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn run_interactive_monitor(_port_path: &str) -> Result<(), String> {
-    Err("serial monitor is only supported on Unix hosts".to_string())
+    Err("zevc monitor is not supported on this OS yet".to_string())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 pub fn run_interactive_monitor_on(_port_path: &str, _port: SerialPort) -> Result<(), String> {
-    Err("serial monitor is only supported on Unix hosts".to_string())
+    Err("zevc monitor is not supported on this OS yet".to_string())
 }

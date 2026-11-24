@@ -1383,7 +1383,8 @@ impl<'a> ScanCtx<'a> {
                                 };
                                 self.visit_prim_target(target, &kind, in_isr, callees);
                             }
-                            MirWaitArmOp::ByteRingWaitRead { target, cap, .. } => {
+                            MirWaitArmOp::ByteRingWaitRead { target, cap, .. }
+                            | MirWaitArmOp::ByteRingWaitWrite { target, cap, .. } => {
                                 let kind = MirPrimKind::ByteRing { cap: *cap };
                                 self.visit_prim_target(target, &kind, in_isr, callees);
                             }
@@ -1397,7 +1398,8 @@ impl<'a> ScanCtx<'a> {
                                 }
                                 self.visit_expr(view, in_isr, callees);
                             }
-                            MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                            MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                            | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
                                 if in_isr {
                                     self.acc
                                         .isr_contended_prim_mangles
@@ -2890,6 +2892,12 @@ impl VarUsageInfo {
                                 dst_res,
                                 ..
                             }
+                            | MirWaitArmOp::ByteRingWaitWrite {
+                                target,
+                                dst_val,
+                                dst_res,
+                                ..
+                            }
                             | MirWaitArmOp::PoolAlloc {
                                 target,
                                 dst_val,
@@ -2969,6 +2977,12 @@ impl VarUsageInfo {
                                 ..
                             }
                             | MirWaitArmOp::ByteRingViewWaitRead {
+                                view,
+                                dst_val,
+                                dst_res,
+                                ..
+                            }
+                            | MirWaitArmOp::ByteRingViewWaitWrite {
                                 view,
                                 dst_val,
                                 dst_res,
@@ -3750,12 +3764,14 @@ fn subst_terminator(term: &mut MirTerminator, target: VarId, repl: &MirExpr) {
                         | MirWaitArmOp::WatchWaitChange { target: t, .. }
                         | MirWaitArmOp::PingPongWaitChunk { target: t, .. }
                         | MirWaitArmOp::PoolAlloc { target: t, .. }
-                        | MirWaitArmOp::ByteRingWaitRead { target: t, .. } => {
+                        | MirWaitArmOp::ByteRingWaitRead { target: t, .. }
+                        | MirWaitArmOp::ByteRingWaitWrite { target: t, .. } => {
                             subst_prim_target(t, target, repl);
                         }
                         MirWaitArmOp::InboxViewRecv { view, .. }
                         | MirWaitArmOp::InboxViewSend { view, .. }
-                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                        | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
                             subst_expr(view, target, repl);
                         }
                     }
@@ -4213,14 +4229,16 @@ fn collect_fn_addrs_and_calls_term(
                         | MirWaitArmOp::WatchWaitChange { target, .. }
                         | MirWaitArmOp::PingPongWaitChunk { target, .. }
                         | MirWaitArmOp::PoolAlloc { target, .. }
-                        | MirWaitArmOp::ByteRingWaitRead { target, .. } => {
+                        | MirWaitArmOp::ByteRingWaitRead { target, .. }
+                        | MirWaitArmOp::ByteRingWaitWrite { target, .. } => {
                             if let MirPrimTarget::PtrExpr(pe) = target {
                                 collect_fn_addrs_and_calls_expr(pe, addr_taken_fns, call_sites);
                             }
                         }
                         MirWaitArmOp::InboxViewRecv { view, .. }
                         | MirWaitArmOp::InboxViewSend { view, .. }
-                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                        | MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                        | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
                             collect_fn_addrs_and_calls_expr(view, addr_taken_fns, call_sites);
                         }
                     }

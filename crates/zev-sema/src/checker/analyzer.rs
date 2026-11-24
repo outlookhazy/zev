@@ -4279,6 +4279,7 @@ impl Analyzer {
                         method.name.as_str(),
                         "wait_chunk"
                             | "wait_read"
+                            | "wait_write"
                             | "recv"
                             | "send"
                             | "wait"

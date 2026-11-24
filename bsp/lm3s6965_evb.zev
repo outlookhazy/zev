@@ -44,6 +44,20 @@ fn uart0_console_flush(*byte_ring tx) {
     }
 }
 
+fn lm3s_console_ring_putc(u8 b) {
+    if (!console_tx.push_byte(b)) {
+        uart0_console_flush(&console_tx);
+        for (u32 spin in 0..50000) {
+            if (console_tx.push_byte(b)) {
+                uart0_console_flush(&console_tx);
+                return;
+            }
+        }
+        return;
+    }
+    uart0_console_flush(&console_tx);
+}
+
 pub fn console_open() -> io.DuplexStream {
     critical {
         hw.SYSCTL.rcgc1 |= hw.SYSCTL_RCGC1_UART0;
@@ -56,6 +70,7 @@ pub fn console_open() -> io.DuplexStream {
         }
     }
     hw.IRQ_UART0.attach(uart0_console_isr(&console_rx, &console_tx));
+    sys.set_putc(lm3s_console_ring_putc);
     return io.DuplexStream {
         rx: &console_rx,
         tx: &console_tx,

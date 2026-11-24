@@ -6,37 +6,89 @@ import std.io as io;
 byte_ring<64>  console_rx;
 byte_ring<128> console_tx;
 
-isr usb_console_rx_isr(*byte_ring rx, *hw.UsbDeviceRegs usb) {
-    usb.int_clr = 4u32;
-    for (u32 i in 0..64) {
-        if ((usb.ep1_conf & 4u32) == 0u32) {
-            break;
+isr usb_console_isr(*byte_ring rx, *byte_ring tx, *hw.UsbDeviceRegs usb) {
+    u32 raw = usb.int_raw;
+    if ((raw & 4u32) != 0u32) {
+        usb.int_clr = 4u32;
+        for (u32 i in 0..64) {
+            if ((usb.ep1_conf & 4u32) == 0u32) {
+                break;
+            }
+            u8 b = (usb.ep1 & 0xFFu32) as u8;
+            bool _ok = rx.push_byte(b, boost: @high);
         }
-        u8 b = (usb.ep1 & 0xFFu32) as u8;
-        bool _ok = rx.push_byte(b, boost: @high);
+    }
+    if ((raw & 8u32) != 0u32 || !tx.is_empty()) {
+        usb.int_clr = 8u32;
+        u32 sent = 0u32;
+        for (u32 i in 0..128) {
+            if ((usb.ep1_conf & 2u32) == 0u32) {
+                break;
+            }
+            u8 tb = tx.try_pop_byte() catch {
+                break;
+            };
+            usb.ep1 = tb as u32;
+            sent += 1u32;
+        }
+        if (sent > 0u32) {
+            usb.ep1_conf = 1u32;
+        }
+        if (tx.is_empty()) {
+            usb.int_ena = usb.int_ena & (~8u32);
+        }
     }
 }
 
 fn esp_console_flush(*byte_ring tx) {
-    u32 sent = 0u32;
-    for (u32 i in 0..128) {
-        if ((hw.USB_DEVICE.ep1_conf & 2u32) == 0u32) {
-            break;
+    critical {
+        u32 sent = 0u32;
+        for (u32 i in 0..128) {
+            if ((hw.USB_DEVICE.ep1_conf & 2u32) == 0u32) {
+                break;
+            }
+            u8 b = tx.try_pop_byte() catch {
+                break;
+            };
+            hw.USB_DEVICE.ep1 = b as u32;
+            sent += 1u32;
         }
-        u8 b = tx.try_pop_byte() catch {
-            break;
-        };
-        hw.USB_DEVICE.ep1 = b as u32;
-        sent += 1u32;
+        if (sent > 0u32) {
+            usb_tx_flush();
+        }
+        if (!tx.is_empty()) {
+            hw.USB_DEVICE.int_clr = 8u32;
+            hw.USB_DEVICE.int_ena = hw.USB_DEVICE.int_ena | 8u32;
+        } else {
+            hw.USB_DEVICE.int_ena = hw.USB_DEVICE.int_ena & (~8u32);
+            hw.USB_DEVICE.int_clr = 8u32;
+        }
     }
-    if (sent > 0u32) {
-        usb_tx_flush();
+}
+
+fn esp_console_ring_putc(u8 b) {
+    if (!console_tx.push_byte(b)) {
+        esp_console_flush(&console_tx);
+        for (u32 spin in 0..4096) {
+            esp_console_flush(&console_tx);
+            if (console_tx.push_byte(b)) {
+                if (b == '\n' || console_tx.is_full()) {
+                    esp_console_flush(&console_tx);
+                }
+                return;
+            }
+        }
+        return;
+    }
+    if (b == '\n' || console_tx.is_full()) {
+        esp_console_flush(&console_tx);
     }
 }
 
 pub fn console_open() -> io.DuplexStream {
     enable_usb_rx_irq();
-    hw.IRQ_USB_DEVICE.attach(usb_console_rx_isr(&console_rx, hw.USB_DEVICE));
+    hw.IRQ_USB_DEVICE.attach(usb_console_isr(&console_rx, &console_tx, hw.USB_DEVICE));
+    sys.set_putc(esp_console_ring_putc);
     return io.DuplexStream {
         rx: &console_rx,
         tx: &console_tx,

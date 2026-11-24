@@ -43,6 +43,12 @@ pub(crate) fn compile_host_llvm_binary(
     ll_source: &str,
     sanitize: bool,
 ) -> Result<PathBuf, String> {
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(
+            "zevc run host simulation is not supported on this OS/architecture yet (requires x86_64 Linux)"
+                .to_string(),
+        );
+    }
     let ll_path = temp.dir.join("program.ll");
     let bin_path = temp.dir.join("program");
 

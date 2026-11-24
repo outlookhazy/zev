@@ -96,10 +96,34 @@ pub struct DuplexStream {
     fn(*byte_ring) flush;
 }
 
-pub fn stream_write(*DuplexStream s, []u8 data) -> usize {
-    usize n = s.tx.push(data);
-    if (n > 0) {
-        (s.flush)(s.tx);
+impl DuplexStream {
+    pub fn try_write(*self, []u8 data) -> usize {
+        usize n = self.tx.push(data);
+        if (n > 0) {
+            (self.flush)(self.tx);
+        }
+        return n;
     }
-    return n;
+
+    pub fn write(*self, []u8 data) {
+        usize offset = 0;
+        while (offset < data.len) {
+            usize n = self.tx.push(data[offset..data.len]);
+            offset += n;
+            if (n > 0 || offset < data.len) {
+                (self.flush)(self.tx);
+            }
+            if (offset < data.len) {
+                usize _sp = self.tx.wait_write();
+            }
+        }
+    }
+}
+
+pub fn stream_try_write(*DuplexStream s, []u8 data) -> usize {
+    return s.try_write(data);
+}
+
+pub fn stream_write(*DuplexStream s, []u8 data) {
+    s.write(data);
 }

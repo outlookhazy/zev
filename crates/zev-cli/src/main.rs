@@ -4548,4 +4548,358 @@ fn main() {
         .unwrap_err();
         assert!(q_to_res.contains("timed out"), "q_to_res={q_to_res}");
     }
+
+    #[test]
+    fn item2_large_blocking_stream_write_and_concurrent_println_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-item2-review").unwrap();
+        let src = "\
+import board;
+import std.io as io;
+
+inbox<u8, 4> bg_go;
+inbox<u8, 4> bg_done;
+
+fn slice_eq([]u8 a, []u8 b) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    for (usize i in 0..a.len) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+task console_task(io.DuplexStream port) {
+    [32]u8 line;
+    usize len = 0;
+    []u8 big_chunk = \"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopq\\n\";
+    loop {
+        []u8 chunk = port.rx.wait_read();
+        usize n = chunk.len;
+        usize idx = 0;
+        while (idx < n) {
+            u8 b = chunk[idx];
+            idx += 1;
+            if (b == 13u8) {
+                continue;
+            }
+            if (b == 10u8) {
+                []u8 cmd = line[0..len];
+                if (slice_eq(cmd, \"burst\")) {
+                    bg_go.post(1u8);
+                    io.stream_write(&port, \"[CON] reply_a=alpha_bravo_charlie\\n\");
+                    delay(1ms);
+                    io.stream_write(&port, \"[CON] reply_b=delta_echo_foxtrot\\n\");
+                    delay(1ms);
+                    io.stream_write(&port, \"[CON] reply_c=golf_hotel_india\\n\");
+                    u8 _done = bg_done.recv();
+                    io.stream_write(&port, \"ok\\n\");
+                } else if (slice_eq(cmd, \"big\")) {
+                    [546]u8 payload;
+                    for (usize r in 0..6) {
+                        for (usize j in 0..90) {
+                            payload[(r * 90) + j] = big_chunk[j];
+                        }
+                    }
+                    payload[540] = 'o';
+                    payload[541] = 'k';
+                    payload[542] = 10u8;
+                    io.stream_write(&port, payload[0..543]);
+                } else {
+                    io.stream_write(&port, \"err Unknown\\n\");
+                }
+                len = 0;
+            } else if (len < line.len) {
+                line[len] = b;
+                len += 1;
+            }
+        }
+        port.rx.consume(n);
+    }
+}
+
+task bg_task() {
+    loop {
+        u8 _go = bg_go.recv();
+        for (u32 i in 0..8) {
+            println(f\"[BG] idx={i} intact_line\");
+            delay(1ms);
+        }
+        bg_done.post(1u8);
+    }
+}
+
+fn main() {
+    board.init();
+    io.DuplexStream port = board.console_open();
+    spawn console_task(port) @normal;
+    spawn bg_task() @high;
+}
+";
+        let app_path = temp.dir.join("review_app.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        let cmds = vec!["big".to_string(), "burst".to_string()];
+        let timeout = std::time::Duration::from_millis(4_000);
+        let expected_row = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopq";
+
+        let assert_transcript = |label: &str, out: &str| {
+            let clean = out.replace('\r', "");
+            assert!(
+                clean.contains("[CON] reply_a=alpha_bravo_charlie"),
+                "{label} missing [CON] reply_a:\n{clean}"
+            );
+            assert!(
+                clean.contains("[CON] reply_b=delta_echo_foxtrot"),
+                "{label} missing [CON] reply_b:\n{clean}"
+            );
+            assert!(
+                clean.contains("[CON] reply_c=golf_hotel_india"),
+                "{label} missing [CON] reply_c:\n{clean}"
+            );
+            let mut bg_count = 0usize;
+            for line in clean.lines() {
+                if line.is_empty()
+                    || line == "ok"
+                    || line == "[CON] reply_a=alpha_bravo_charlie"
+                    || line == "[CON] reply_b=delta_echo_foxtrot"
+                    || line == "[CON] reply_c=golf_hotel_india"
+                    || line == expected_row
+                {
+                    continue;
+                }
+                if line.starts_with("[BG] idx=") && line.ends_with(" intact_line") {
+                    bg_count += 1;
+                    continue;
+                }
+                panic!("{label} observed interleaved/corrupted line `{line}` in:\n{clean}");
+            }
+            assert_eq!(
+                bg_count, 8,
+                "{label} expected all 8 background println lines, got {bg_count}:\n{clean}"
+            );
+            assert_eq!(
+                clean.matches(expected_row).count(),
+                6,
+                "{label} expected all 6x90=540 bytes of big reply without truncation:\n{clean}"
+            );
+        };
+
+        // Host simulator (--sanitize)
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let mut host_transcript = Vec::new();
+        let mut host_child = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+        script_runner::run_script_on_child_to(
+            &mut host_child,
+            &cmds,
+            timeout,
+            &mut host_transcript,
+        )
+        .expect("host concurrent + >4x ring write script should pass");
+        assert_transcript("host", &String::from_utf8_lossy(&host_transcript));
+
+        // QEMU (lm3s6965_evb)
+        let qemu_opts_cg = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts_cg));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts_cg.hal_dir.as_deref(),
+            qemu_opts_cg.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("review_qemu.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts_cg).unwrap();
+        let q_run_opts = zev_codegen_llvm::QemuRunOptions::default();
+        let mut qemu_transcript = Vec::new();
+        let mut q_child =
+            zev_codegen_llvm::spawn_elf_in_qemu(&qemu_build.elf_path, &q_run_opts, true).unwrap();
+        script_runner::run_script_on_child_to(&mut q_child, &cmds, timeout, &mut qemu_transcript)
+            .expect("qemu concurrent + >4x ring write script should pass");
+        assert_transcript("qemu", &String::from_utf8_lossy(&qemu_transcript));
+    }
+
+    #[test]
+    fn item2_sim_user_idle_hook_busy_task_and_piped_eof_exit() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let temp = TempWorkDir::create("zevc-item2-sim-minor").unwrap();
+
+        // 1. User `sys.set_idle` coexists with `board.console_open()`, and piped non-TTY EOF
+        // exits cleanly with status 0 instead of running forever.
+        let idle_src = "\
+import board;
+import std.io as io;
+
+guarded<u32> idle_hits = 0u32;
+
+fn app_idle(u32 _ms, u32 _depth) {
+    critical {
+        idle_hits.set(idle_hits.get() + 1u32);
+    }
+}
+
+task con(io.DuplexStream port) {
+    [16]u8 line;
+    usize len = 0;
+    loop {
+        []u8 chunk = port.rx.wait_read();
+        usize n = chunk.len;
+        for (usize i in 0..n) {
+            u8 b = chunk[i];
+            if (b == 10u8) {
+                u32 hits = 0u32;
+                critical {
+                    hits = idle_hits.get();
+                }
+                bool saw_idle = hits > 0u32;
+                println(f\"reply len={len} idle={saw_idle}\");
+                io.stream_write(&port, \"ok\\n\");
+                len = 0;
+            } else if (b != 13u8 && len < line.len) {
+                line[len] = b;
+                len += 1;
+            }
+        }
+        port.rx.consume(n);
+    }
+}
+
+fn main() {
+    board.init();
+    sys.set_idle(app_idle);
+    io.DuplexStream port = board.console_open();
+    spawn con(port) @normal;
+}
+";
+        let idle_path = temp.dir.join("idle_eof.zev");
+        std::fs::write(&idle_path, idle_src).unwrap();
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, idle_mir) = compile_to_mir_with_target(
+            &[idle_path],
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let idle_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&idle_mir, &host_opts).unwrap();
+        let idle_bin = runner::compile_host_llvm_binary(&temp, &idle_ll, true).unwrap();
+
+        let mut child = Command::new(&idle_bin)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            stdin.write_all(b"ping\n").unwrap();
+            stdin.flush().unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Some(_st) = child.try_wait().unwrap() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host simulator hung on closed non-TTY stdin instead of exiting cleanly"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "status={}", out.status);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("reply len=4 idle=true\nok\n"),
+            "expected reply + user idle coexistence, got:\n{stdout}"
+        );
+
+        // 2. Never-idle busy task (`loop { checkpoint(); }`) still receives stdin input!
+        let busy_src = "\
+import board;
+import std.io as io;
+
+task spinner() {
+    loop {
+        checkpoint();
+    }
+}
+
+task con(io.DuplexStream port) {
+    [16]u8 line;
+    usize len = 0;
+    loop {
+        []u8 chunk = port.rx.wait_read();
+        usize n = chunk.len;
+        for (usize i in 0..n) {
+            u8 b = chunk[i];
+            if (b == 10u8) {
+                io.stream_write(&port, \"busy_pong\\nok\\n\");
+                len = 0;
+            } else if (b != 13u8 && len < line.len) {
+                line[len] = b;
+                len += 1;
+            }
+        }
+        port.rx.consume(n);
+    }
+}
+
+fn main() {
+    board.init();
+    io.DuplexStream port = board.console_open();
+    spawn spinner() @normal;
+    spawn con(port) @high;
+}
+";
+        let busy_path = temp.dir.join("busy_app.zev");
+        std::fs::write(&busy_path, busy_src).unwrap();
+        let (_, busy_mir) = compile_to_mir_with_target(
+            &[busy_path],
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let busy_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&busy_mir, &host_opts).unwrap();
+        let busy_bin = runner::compile_host_llvm_binary(&temp, &busy_ll, true).unwrap();
+        let mut busy_transcript = Vec::new();
+        let mut busy_child = runner::spawn_host_llvm_binary(&busy_bin, &[]).unwrap();
+        script_runner::run_script_on_child_to(
+            &mut busy_child,
+            &["ping".to_string()],
+            std::time::Duration::from_millis(3_000),
+            &mut busy_transcript,
+        )
+        .expect("host simulator should read stdin even when firmware is never idle");
+        let busy_out = String::from_utf8_lossy(&busy_transcript);
+        assert!(
+            busy_out.contains("busy_pong\nok\n"),
+            "busy_out={busy_out:?}"
+        );
+    }
 }

@@ -14,7 +14,26 @@ fn pico_console_flush(*byte_ring tx) {
     }
 }
 
+fn pico_console_ring_putc(u8 b) {
+    if (!usb_tx.push_byte(b)) {
+        bsp.usb_kick_tx();
+        for (u32 spin in 0..50000) {
+            if (usb_tx.push_byte(b)) {
+                if (b == '\n' || usb_tx.is_full()) {
+                    bsp.usb_kick_tx();
+                }
+                return;
+            }
+        }
+        return;
+    }
+    if (b == '\n' || usb_tx.is_full()) {
+        bsp.usb_kick_tx();
+    }
+}
+
 pub fn console_open() -> io.DuplexStream {
+    sys.set_putc(pico_console_ring_putc);
     return io.DuplexStream {
         rx: &usb_rx,
         tx: &usb_tx,

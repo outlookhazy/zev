@@ -19,15 +19,15 @@ pub fn collect_script_commands(
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read script file `{}`: {e}", path.display()))?;
         for raw in text.lines() {
-            let trimmed = raw.trim_end_matches('\r').trim();
+            let trimmed = raw.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
-            commands.push(raw.trim_end_matches('\r').to_string());
+            commands.push(trimmed.to_string());
         }
     }
     for cmd in inline_cmds {
-        let trimmed = cmd.trim_end_matches('\r');
+        let trimmed = cmd.trim();
         if !trimmed.is_empty() {
             commands.push(trimmed.to_string());
         }
@@ -235,4 +235,27 @@ pub fn run_script_on_serial(
 ) -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     run_script_on_serial_to(port, commands, timeout_per_cmd, &mut stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_script_commands;
+
+    #[test]
+    fn collect_script_commands_trims_leading_and_trailing_whitespace() {
+        let dir = crate::runner::TempWorkDir::create("zevc-script-trim").unwrap();
+        let script = dir.dir.join("cmds.txt");
+        std::fs::write(
+            &script,
+            "   # indented comment\n\n\t  help  \r\n   led on\t \n   \t\r\n",
+        )
+        .unwrap();
+        let inline = vec![
+            "  status\t\r\n".to_string(),
+            "   \t ".to_string(),
+            "\techo off  ".to_string(),
+        ];
+        let cmds = collect_script_commands(Some(&script), &inline).unwrap();
+        assert_eq!(cmds, vec!["help", "led on", "status", "echo off"]);
+    }
 }

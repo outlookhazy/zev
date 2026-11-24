@@ -691,9 +691,12 @@ declare i32 @putchar(i32) nounwind
 declare i32 @fflush(ptr) nounwind
 declare i32 @poll(ptr, i64, i32) nounwind
 declare i64 @read(i32, ptr, i64) nounwind
+declare i32 @isatty(i32) nounwind
 declare void @exit(i32) noreturn nounwind
 
 @__syn_sim_stdin_eof = internal global i8 0, align 1
+@__syn_sim_console_irq = internal global i32 -1, align 4
+@__syn_sim_stdin_is_tty = internal global i8 0, align 1
 
 define i32 @__zev_sim_poll_stdin(i32 %timeout_ms) nounwind{sz} {{
 entry:
@@ -753,9 +756,20 @@ ret_neg:
   ret i32 -1
 }}
 
+define void @__zev_sim_enable_console(i32 %irq) nounwind{sz} {{
+entry:
+  store i32 %irq, ptr @__syn_sim_console_irq, align 4
+  %tty = call i32 @isatty(i32 0)
+  %is_tty = icmp eq i32 %tty, 1
+  %tty8 = zext i1 %is_tty to i8
+  store i8 %tty8, ptr @__syn_sim_stdin_is_tty, align 1
+  ret void
+}}
+
 define void @__zev_sim_putc(i8 %c) nounwind{sz} {{
 entry:
-  call void @__syn_uart_putc(i8 %c)
+  %z = zext i8 %c to i32
+  %r = call i32 @putchar(i32 %z)
   ret void
 }}
 
@@ -763,6 +777,28 @@ define void @__zev_sim_flush_stdout() nounwind{sz} {{
 entry:
   %r = call i32 @fflush(ptr null)
   ret void
+}}
+
+define i32 @__syn_host_poll_console(i32 %timeout_ms) nounwind{sz} {{
+entry:
+  %irq = load i32, ptr @__syn_sim_console_irq, align 4
+  %enabled = icmp sge i32 %irq, 0
+  br i1 %enabled, label %chk_crit, label %ret0
+chk_crit:
+  %d = load i32, ptr @__syn_host_crit_depth, align 4
+  %ok = icmp eq i32 %d, 0
+  br i1 %ok, label %do_poll, label %ret0
+do_poll:
+  %rdy = call i32 @__zev_sim_poll_stdin(i32 %timeout_ms)
+  %has = icmp ne i32 %rdy, 0
+  br i1 %has, label %do_irq, label %ret0
+do_irq:
+  store i32 1, ptr @__syn_host_crit_depth, align 4
+  call void @__syn_host_dispatch_irq(i32 %irq)
+  store i32 0, ptr @__syn_host_crit_depth, align 4
+  ret i32 1
+ret0:
+  ret i32 0
 }}
 
 @__syn_host_in_boot = global i8 1, align 1
@@ -912,6 +948,17 @@ entry:
   %wc = load volatile i32, ptr @__syn_wfi_count, align 4
   %wc1 = add i32 %wc, 1
   store volatile i32 %wc1, ptr @__syn_wfi_count, align 4
+  %got_in = call i32 @__syn_host_poll_console(i32 1)
+  %no_in = icmp eq i32 %got_in, 0
+  br i1 %no_in, label %chk_eof, label %do_idle_hook
+chk_eof:
+  %eof_exit = call i1 @__syn_host_console_rx_idle_eof()
+  br i1 %eof_exit, label %do_eof_exit, label %do_idle_hook
+do_eof_exit:
+  %rf = call i32 @fflush(ptr null)
+  call void @__syn_platform_exit(i32 0)
+  unreachable
+do_idle_hook:
   call void @__syn_on_idle(i32 1, i32 %depth)
   store i32 0, ptr @__syn_host_spin_polls, align 4
   %t = load volatile i32, ptr @__syn_tick_ms, align 4
@@ -1935,6 +1982,11 @@ entry:
              br label %tick_loop\n"
         )
     };
+    let host_tick_poll = if isa == CpuIsa::HostX86_64Linux {
+        "  %host_con_rdy = call i32 @__syn_host_poll_console(i32 0)\n"
+    } else {
+        ""
+    };
     let _ = writeln!(
         out,
         r#"define void @__syn_sched_loop(){fn_as} noreturn nounwind{sz} {{
@@ -1942,7 +1994,7 @@ entry:
 {mie_enable_ir}  %init_tick = {call_kw} i32 @__syn_now_ms()
   store i32 %init_tick, ptr @__syn_sched_start_tick, align 4
 {auto_systick_check}tick_loop:
-  %now = {call_kw} i32 @__syn_now_ms()
+{host_tick_poll}  %now = {call_kw} i32 @__syn_now_ms()
   %cap = load i32, ptr @__syn_max_ticks, align 4
   %has_cap = icmp sgt i32 %cap, 0
   br i1 %has_cap, label %chk_cap, label %wake_phase

@@ -38,12 +38,34 @@ fn usart2_console_flush(*byte_ring tx) {
     }
 }
 
+fn nucleo_ring_push_one(u8 ch) {
+    if (!console_tx.push_byte(ch)) {
+        usart2_console_flush(&console_tx);
+        for (u32 spin in 0..50000) {
+            if (console_tx.push_byte(ch)) {
+                usart2_console_flush(&console_tx);
+                return;
+            }
+        }
+        return;
+    }
+    usart2_console_flush(&console_tx);
+}
+
+fn nucleo_console_ring_putc(u8 b) {
+    if (b == '\n') {
+        nucleo_ring_push_one('\r');
+    }
+    nucleo_ring_push_one(b);
+}
+
 pub fn console_open() -> io.DuplexStream {
     critical {
         hw.USART2.icr = 0x0Fu32;
         hw.USART2.cr1 = hw.USART2.cr1 | (1u32 << 5) | (1u32 << 2);
     }
     hw.IRQ_USART2.attach(usart2_console_isr(&console_rx, &console_tx));
+    sys.set_putc(nucleo_console_ring_putc);
     return io.DuplexStream {
         rx: &console_rx,
         tx: &console_tx,

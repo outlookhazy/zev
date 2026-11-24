@@ -14,6 +14,7 @@ irq IRQ_SIM_CONSOLE = 30;
 byte_ring<128> console_rx;
 byte_ring<128> console_tx;
 
+extern "C" fn __zev_sim_enable_console(u32 irq_num);
 extern "C" fn __zev_sim_poll_stdin(i32 timeout_ms) -> i32;
 extern "C" fn __zev_sim_read_stdin_byte() -> i32;
 extern "C" fn __zev_sim_putc(u8 b);
@@ -26,12 +27,6 @@ isr sim_console_rx_isr(*byte_ring rx) {
             break;
         }
         bool _ok = rx.push_byte(ch as u8, boost: @high);
-    }
-}
-
-fn sim_console_idle(u32 _ms, u32 _depth) {
-    if (__zev_sim_poll_stdin(1) != 0) {
-        sys.pend_irq(IRQ_SIM_CONSOLE);
     }
 }
 
@@ -49,9 +44,18 @@ fn sim_console_flush(*byte_ring tx) {
     }
 }
 
+fn sim_console_ring_putc(u8 b) {
+    if (!console_tx.push_byte(b)) {
+        sim_console_flush(&console_tx);
+        bool _ok = console_tx.push_byte(b);
+    }
+    sim_console_flush(&console_tx);
+}
+
 pub fn console_open() -> io.DuplexStream {
     IRQ_SIM_CONSOLE.attach(sim_console_rx_isr(&console_rx));
-    sys.set_idle(sim_console_idle);
+    __zev_sim_enable_console(30u32);
+    sys.set_putc(sim_console_ring_putc);
     return io.DuplexStream {
         rx: &console_rx,
         tx: &console_tx,

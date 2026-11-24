@@ -25,6 +25,20 @@ fn uno_console_flush(*byte_ring tx) {
     }
 }
 
+fn uno_console_ring_putc(u8 b) {
+    if (!console_tx.push_byte(b)) {
+        enable_uart_udre_irq();
+        for (u32 spin in 0..4096) {
+            if (console_tx.push_byte(b)) {
+                enable_uart_udre_irq();
+                return;
+            }
+        }
+        return;
+    }
+    enable_uart_udre_irq();
+}
+
 pub fn init() {
     critical {
         hw.MCU_CTRL.mcusr = 0;
@@ -50,6 +64,7 @@ pub fn init() {
 pub fn console_open() -> io.DuplexStream {
     hw.IRQ_USART_RX.attach(uno_console_rx_isr(&console_rx, hw.USART0));
     hw.IRQ_USART_UDRE.attach(uno_console_tx_isr(&console_tx, hw.USART0));
+    sys.set_putc(uno_console_ring_putc);
     critical {
         hw.USART0.ucsr0b = hw.USART0.ucsr0b | 0x10u8 | hw.BIT_RXCIE0;
     }

@@ -2068,7 +2068,7 @@ impl<'a> BodyChecker<'a> {
                                         | (
                                             ResolvedOsPrimitive::ByteRing { .. }
                                                 | ResolvedOsPrimitive::ByteRingUnsized,
-                                            "wait_read"
+                                            "wait_read" | "wait_write"
                                         )
                                         | (ResolvedOsPrimitive::PingPong { .. }, "wait_chunk")
                                         | (ResolvedOsPrimitive::Watch { .. }, "wait_change")

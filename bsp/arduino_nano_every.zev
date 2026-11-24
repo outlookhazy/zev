@@ -33,6 +33,20 @@ fn nano_console_flush(*byte_ring tx) {
     }
 }
 
+fn nano_console_ring_putc(u8 b) {
+    if (!console_tx.push_byte(b)) {
+        enable_uart_dre_irq();
+        for (u32 spin in 0..4096) {
+            if (console_tx.push_byte(b)) {
+                enable_uart_dre_irq();
+                return;
+            }
+        }
+        return;
+    }
+    enable_uart_dre_irq();
+}
+
 pub fn init() {
     init_board();
 }
@@ -41,6 +55,7 @@ pub fn console_open() -> io.DuplexStream {
     hw.IRQ_USART3_RXC.attach(nano_console_rx_isr(&console_rx, hw.USART3));
     hw.IRQ_USART3_DRE.attach(nano_console_tx_isr(&console_tx, hw.USART3));
     enable_uart_rx_irq();
+    sys.set_putc(nano_console_ring_putc);
     return io.DuplexStream {
         rx: &console_rx,
         tx: &console_tx,

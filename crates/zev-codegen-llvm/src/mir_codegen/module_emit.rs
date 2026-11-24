@@ -76,6 +76,82 @@ entry:
 }}
 "#
     );
+
+    let mut console_rings: Vec<(u32, String)> = Vec::new();
+    for vec in &ctx.module.irq_vectors {
+        for b in &vec.bindings {
+            for ba in &b.baked_args {
+                if let MirBakedArg::PrimAddr(name) = ba {
+                    if matches!(
+                        ctx.prim_globals.get(name),
+                        Some(MirPrimKind::ByteRing { .. })
+                    ) {
+                        let sym = format!("@__syn_prim_{}", sanitize_ident(name));
+                        if !console_rings.iter().any(|(n, _)| *n == vec.irq_num) {
+                            console_rings.push((vec.irq_num, sym));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "define i1 @__syn_host_console_rx_idle_eof() nounwind {{"
+    );
+    let _ = writeln!(out, "entry:");
+    if console_rings.is_empty() {
+        let _ = writeln!(out, "  ret i1 false\n}}\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "  %tty = load i8, ptr @__syn_sim_stdin_is_tty, align 1"
+        );
+        let _ = writeln!(out, "  %is_tty = icmp ne i8 %tty, 0");
+        let _ = writeln!(out, "  br i1 %is_tty, label %ret0, label %chk_eof");
+        let _ = writeln!(out, "chk_eof:");
+        let _ = writeln!(out, "  %eof = load i8, ptr @__syn_sim_stdin_eof, align 1");
+        let _ = writeln!(out, "  %no_eof = icmp eq i8 %eof, 0");
+        let _ = writeln!(out, "  br i1 %no_eof, label %ret0, label %chk_irq");
+        let _ = writeln!(out, "chk_irq:");
+        let _ = writeln!(
+            out,
+            "  %irq = load i32, ptr @__syn_sim_console_irq, align 4"
+        );
+        let _ = writeln!(out, "  switch i32 %irq, label %ret0 [");
+        for (irq_num, _) in &console_rings {
+            let _ = writeln!(out, "    i32 {irq_num}, label %ring_{irq_num}");
+        }
+        let _ = writeln!(out, "  ]");
+        for (irq_num, sym) in &console_rings {
+            let _ = writeln!(out, "ring_{irq_num}:");
+            let _ = writeln!(
+                out,
+                "  %cp_{irq_num} = getelementptr inbounds %SynRingHdr, ptr {sym}, i32 0, i32 2"
+            );
+            let _ = writeln!(
+                out,
+                "  %cnt_{irq_num} = load i32, ptr %cp_{irq_num}, align 4"
+            );
+            let _ = writeln!(
+                out,
+                "  %wm_p_{irq_num} = getelementptr inbounds %SynRingHdr, ptr {sym}, i32 0, i32 6"
+            );
+            let _ = writeln!(
+                out,
+                "  %wm_{irq_num} = load volatile i32, ptr %wm_p_{irq_num}, align 4"
+            );
+            let _ = writeln!(out, "  %emp_{irq_num} = icmp eq i32 %cnt_{irq_num}, 0");
+            let _ = writeln!(out, "  %waiting_{irq_num} = icmp ne i32 %wm_{irq_num}, 0");
+            let _ = writeln!(
+                out,
+                "  %done_{irq_num} = and i1 %emp_{irq_num}, %waiting_{irq_num}"
+            );
+            let _ = writeln!(out, "  ret i1 %done_{irq_num}");
+        }
+        let _ = writeln!(out, "ret0:");
+        let _ = writeln!(out, "  ret i1 false\n}}\n");
+    }
 }
 
 pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatures {
@@ -627,7 +703,8 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                                 }
                                 MirWaitArmOp::SignalWait { target, .. }
                                 | MirWaitArmOp::WaitQueueCommit { target, .. }
-                                | MirWaitArmOp::ByteRingWaitRead { target, .. } => {
+                                | MirWaitArmOp::ByteRingWaitRead { target, .. }
+                                | MirWaitArmOp::ByteRingWaitWrite { target, .. } => {
                                     scan_prim_target(target, feat);
                                 }
                                 MirWaitArmOp::InboxViewRecv { view, elem_ty, .. }
@@ -635,7 +712,8 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                                     scan_expr(view, feat);
                                     scan_ty(elem_ty, feat);
                                 }
-                                MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                                MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                                | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
                                     scan_expr(view, feat);
                                 }
                             }
@@ -1724,6 +1802,11 @@ impl<'a> ModuleCtx<'a> {
                                     self.scan_expr_for_prims(view);
                                     self.uses_byte_ring_view = true;
                                 }
+                                MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
+                                    self.scan_expr_for_prims(view);
+                                    self.uses_byte_ring_view = true;
+                                    self.uses_byte_ring_wait_write = true;
+                                }
                                 MirWaitArmOp::PoolAlloc {
                                     target,
                                     elem_ty,
@@ -1785,6 +1868,11 @@ impl<'a> ModuleCtx<'a> {
                                 MirWaitArmOp::ByteRingWaitRead { target, cap, .. } => {
                                     self.scan_prim_target_for_prims(target);
                                     self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                                }
+                                MirWaitArmOp::ByteRingWaitWrite { target, cap, .. } => {
+                                    self.scan_prim_target_for_prims(target);
+                                    self.register_prim_kind(&MirPrimKind::ByteRing { cap: *cap });
+                                    self.uses_byte_ring_wait_write = true;
                                 }
                             }
                         }
@@ -4440,6 +4528,19 @@ entry:
                     let ok_back = mk_slice_ok("b", "%pb", "%req_u");
                     let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
                     let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
+                    let mk_wake_writer = |tag: &str| -> String {
+                        if self.uses_byte_ring_wait_write {
+                            format!(
+                                "  %wm_w_{tag} = getelementptr inbounds {pty}, ptr %r, i32 0, i32 6\n  {call_kw} void @__syn_wake_all_mask(ptr %wm_w_{tag}, i32 -1)\n"
+                            )
+                        } else {
+                            String::new()
+                        }
+                    };
+                    let wake_w_ae = mk_wake_writer("ae");
+                    let wake_w_ah = mk_wake_writer("ah");
+                    let wake_w_wh = mk_wake_writer("wh");
+                    let wake_w_clr = mk_wake_writer("clr");
                     let _ = writeln!(
                         out,
                         r#"define i32 @__syn_ring_seg1_{id}(ptr %r){fn_as} nounwind{fn_sz} {{
@@ -4525,7 +4626,7 @@ do_tail_rst:
 skip_tail_rst:
   store i32 0, ptr %cp, align 4
   store i32 0, ptr %sp0, align 4
-  ret void
+{wake_w_ae}  ret void
 partial:
   %hp1 = getelementptr inbounds {pty}, ptr %r, i32 0, i32 0
   %h1 = load i32, ptr %hp1, align 4
@@ -4536,7 +4637,7 @@ adv_h:
   %nc1 = sub i32 %cnt, %rem
   store i32 %nh1, ptr %hp1, align 4
   store i32 %nc1, ptr %cp, align 4
-  ret void
+{wake_w_ah}  ret void
 wrap_h:
   %nh2 = sub i32 %rem, %s1
   %nc2 = sub i32 %cnt, %rem
@@ -4544,7 +4645,7 @@ wrap_h:
   store i32 %nh2, ptr %hp1, align 4
   store i32 %nc2, ptr %cp, align 4
   store i32 0, ptr %sp2, align 4
-  ret void
+{wake_w_wh}  ret void
 done:
   ret void
 }}
@@ -4937,7 +5038,7 @@ entry:
   store i32 0, ptr %gop, align 4
   store i32 0, ptr %gcp, align 4
   store i8 0, ptr %bp, align 1
-{crit_exit}  ret void
+{wake_w_clr}{crit_exit}  ret void
 }}"#
                     );
                 }
@@ -5079,6 +5180,19 @@ done:
             let ok_back = mk_slice_ok("b", "%pb", "%req_u");
             let ok_wrap = mk_slice_ok("w", "%pw", "%req_u");
             let ok_gap = mk_slice_ok("g", "%pg", "%req_u");
+            let mk_vw_wake_writer = |tag: &str| -> String {
+                if self.uses_byte_ring_wait_write {
+                    format!(
+                        "  %wm_vw_{tag} = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 6\n  {call_kw} void @__syn_wake_all_mask(ptr %wm_vw_{tag}, i32 -1)\n"
+                    )
+                } else {
+                    String::new()
+                }
+            };
+            let vw_wake_w_ae = mk_vw_wake_writer("ae");
+            let vw_wake_w_ah = mk_vw_wake_writer("ah");
+            let vw_wake_w_wh = mk_vw_wake_writer("wh");
+            let vw_wake_w_clr = mk_vw_wake_writer("clr");
             let _ = writeln!(
                 out,
                 r#"define i32 @__syn_ring_view_seg1(ptr %r, i32 %cap){fn_as} nounwind{fn_sz} {{
@@ -5164,7 +5278,7 @@ do_tail_rst:
 skip_tail_rst:
   store i32 0, ptr %cp, align 4
   store i32 0, ptr %sp0, align 4
-  ret void
+{vw_wake_w_ae}  ret void
 partial:
   %hp1 = getelementptr inbounds %prim.byte_ring_hdr, ptr %r, i32 0, i32 0
   %h1 = load i32, ptr %hp1, align 4
@@ -5175,7 +5289,7 @@ adv_h:
   %nc1 = sub i32 %cnt, %rem
   store i32 %nh1, ptr %hp1, align 4
   store i32 %nc1, ptr %cp, align 4
-  ret void
+{vw_wake_w_ah}  ret void
 wrap_h:
   %nh2 = sub i32 %rem, %s1
   %nc2 = sub i32 %cnt, %rem
@@ -5183,7 +5297,7 @@ wrap_h:
   store i32 %nh2, ptr %hp1, align 4
   store i32 %nc2, ptr %cp, align 4
   store i32 0, ptr %sp2, align 4
-  ret void
+{vw_wake_w_wh}  ret void
 done:
   ret void
 }}
@@ -5582,7 +5696,7 @@ entry:
   store i32 0, ptr %gop, align 4
   store i32 0, ptr %gcp, align 4
   store i8 0, ptr %bp, align 1
-{crit_exit}  ret void
+{vw_wake_w_clr}{crit_exit}  ret void
 }}"#
             );
         }
@@ -5639,7 +5753,8 @@ entry:
             if self.spec.isa == CpuIsa::HostX86_64Linux
                 && matches!(
                     ext.name.as_str(),
-                    "__zev_sim_poll_stdin"
+                    "__zev_sim_enable_console"
+                        | "__zev_sim_poll_stdin"
                         | "__zev_sim_read_stdin_byte"
                         | "__zev_sim_putc"
                         | "__zev_sim_flush_stdout"

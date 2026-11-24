@@ -2099,14 +2099,16 @@ fn analyze_coro_blocks(
                             | crate::ir::MirWaitArmOp::WatchWaitChange { target, .. }
                             | crate::ir::MirWaitArmOp::PingPongWaitChunk { target, .. }
                             | crate::ir::MirWaitArmOp::PoolAlloc { target, .. }
-                            | crate::ir::MirWaitArmOp::ByteRingWaitRead { target, .. } => {
+                            | crate::ir::MirWaitArmOp::ByteRingWaitRead { target, .. }
+                            | crate::ir::MirWaitArmOp::ByteRingWaitWrite { target, .. } => {
                                 fold_prim_target_run(
                                     target, fn_map, cache, visiting, &mut k, &mut w,
                                 );
                             }
                             crate::ir::MirWaitArmOp::InboxViewRecv { view, .. }
                             | crate::ir::MirWaitArmOp::InboxViewSend { view, .. }
-                            | crate::ir::MirWaitArmOp::ByteRingViewWaitRead { view, .. } => {
+                            | crate::ir::MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                            | crate::ir::MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
                                 fold_expr_run(view, fn_map, cache, visiting, &mut k, &mut w);
                             }
                         }
