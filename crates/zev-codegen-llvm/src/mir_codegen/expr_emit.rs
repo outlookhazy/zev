@@ -255,6 +255,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 index,
                 raw_elem_ty,
                 is_slice: false,
+                ..
             } => {
                 let Some((bp, bty, packed)) = self.try_emit_rodata_const_ptr(base)? else {
                     return Ok(None);
@@ -848,6 +849,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 index,
                 raw_elem_ty,
                 is_slice,
+                in_bounds,
             } => {
                 // Operands evaluate left to right (base, then index), matching indexed writes.
                 let usize_ty = self.ctx.spec.isa.usize_llvm_ty().to_string();
@@ -863,8 +865,13 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     let ep = self.next_tmp();
                     self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", bv.repr));
                     self.emit_line(format!("{sl_len} = extractvalue {sl_ty} {}, 1", bv.repr));
-                    self.emit_line(format!("{inb} = icmp ult {usize_ty} {}, {sl_len}", ic.repr));
-                    self.emit_bounds_check(&inb, 1);
+                    if !*in_bounds {
+                        self.emit_line(format!(
+                            "{inb} = icmp ult {usize_ty} {}, {sl_len}",
+                            ic.repr
+                        ));
+                        self.emit_bounds_check(&inb, 1);
+                    }
                     self.emit_line(format!(
                         "{ep} = getelementptr {ety}, ptr {dp}, {usize_ty} {}",
                         ic.repr
