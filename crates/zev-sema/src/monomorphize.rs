@@ -4473,6 +4473,82 @@ impl<'a> Monomorphizer<'a> {
                 );
             }
 
+            if matches!(fn_id.name.as_str(), "print" | "println")
+                && pos_arg_tys.len() == 2
+                && generic_args.is_empty()
+            {
+                let mut resolved_write_fn: Option<String> = None;
+                if let Some(InferTy::Concrete(ct)) = pos_arg_tys.first() {
+                    let struct_name_opt = match &ct.kind {
+                        TypeKind::Ptr(inner) => match &inner.kind {
+                            TypeKind::Named(s) => Some(s.name.clone()),
+                            _ => None,
+                        },
+                        TypeKind::Named(s) => Some(s.name.clone()),
+                        _ => None,
+                    };
+                    if let Some(struct_name) = struct_name_opt {
+                        let caller_scope = if env.prog_idx < self.non_root_prog_count {
+                            Some(env.prog_idx)
+                        } else {
+                            None
+                        };
+                        if let Some(info) = self
+                            .concrete_methods
+                            .get(&(struct_name.clone(), "write".to_string()))
+                            .cloned()
+                        {
+                            if !info.is_pub && info.owner_scope != caller_scope {
+                                self.emit(
+                                    &env.file,
+                                    Diagnostic::new(
+                                        DiagnosticKind::ModuleError,
+                                        span,
+                                        format!(
+                                            "method `write` on `{}` is private; mark it `pub` to use `{}` with `print`/`println`",
+                                            struct_name, struct_name
+                                        ),
+                                    ),
+                                );
+                            }
+                            resolved_write_fn = Some(info.fn_name);
+                        } else if let Some((base_struct, conc_args)) =
+                            self.instantiated_struct_args.get(&struct_name).cloned()
+                        {
+                            if let Some((wfn, _, _, _, _)) = self.resolve_generic_method_call(
+                                &base_struct,
+                                &struct_name,
+                                &conc_args,
+                                "write",
+                                span,
+                                caller_scope,
+                                env,
+                            ) {
+                                resolved_write_fn = Some(wfn);
+                            }
+                        }
+                    }
+                }
+                if let Some(wfn_name) = resolved_write_fn {
+                    let void_ty = TypeExpr::new(TypeKind::Prim(PrimType::Void), span);
+                    let synth_gargs = vec![GenericArg::Type(TypeExpr::new(
+                        TypeKind::Named(Ident::new(wfn_name, span)),
+                        span,
+                    ))];
+                    return (
+                        Expr::new(
+                            ExprKind::Call {
+                                callee: Box::new(callee.clone()),
+                                generic_args: synth_gargs,
+                                args: r_args,
+                            },
+                            span,
+                        ),
+                        InferTy::Concrete(void_ty),
+                    );
+                }
+            }
+
             if fn_id.name == "fmt_buf" {
                 let slice_u8 = TypeExpr::new(
                     TypeKind::Slice(Box::new(TypeExpr::new(TypeKind::Prim(PrimType::U8), span))),

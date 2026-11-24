@@ -8032,3 +8032,138 @@ fn pr19_rejects_unsupported_aggregate_equality_and_invalid_operator_type_pairs()
         );
     }
 }
+
+#[test]
+fn item4_user_sink_print_diagnostics_and_effect_inheritance() {
+    // 1. Standalone f"..." error suggests println(sink, f"...").
+    let standalone_src = r#"
+fn main() {
+    u32 x = 1;
+    []u8 bad = f"{x}";
+}
+"#;
+    let p_standalone = zev_parser::parse_str(standalone_src).unwrap();
+    let out_standalone =
+        analyze_and_monomorphize_programs(&[p_standalone], &AnalyzeOptions::default());
+    let msg_standalone = out_standalone
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        msg_standalone.contains("println(sink, f\"...\")"),
+        "expected println(sink, f\"...\") suggestion, got:\n{msg_standalone}"
+    );
+
+    let cases: [(&str, &str, &str); 7] = [
+        (
+            "missing_write_method",
+            "does not implement `fn write(*self, []u8)`",
+            "struct EmptySink { u32 x; }\nfn main() { EmptySink s = EmptySink { x: 0 }; println(s, \"hi\"); }",
+        ),
+        (
+            "wrong_write_signature",
+            "must have signature `fn write(*self, []u8)`",
+            "struct BadSig { u32 x; }\nimpl BadSig { pub fn write(*self, u32 b) {} }\nfn main() { BadSig s = BadSig { x: 0 }; println(s, \"hi\"); }",
+        ),
+        (
+            "const_value_sink",
+            "immutable `const`",
+            "struct CLog { u32 n; }\nimpl CLog { pub fn write(*self, []u8 b) {} }\nconst CLog CS = CLog { n: 0 };\nfn main() { println(CS, \"hi\"); }",
+        ),
+        (
+            "unhandled_fallible_write",
+            "catch (IOErr err)",
+            "pub enum IOErr { Full }\nstruct ErrSink { u32 n; }\nimpl ErrSink { pub fn write(*self, []u8 b) error IOErr { error Full; } }\nfn main() { ErrSink s = ErrSink { n: 0 }; println(s, f\"v={1}\"); }",
+        ),
+        (
+            "yielding_write_in_critical",
+            "critical",
+            "struct SlowSink { u32 n; }\nimpl SlowSink { pub fn write(*self, []u8 b) { delay(1ms); } }\nfn main() { SlowSink s = SlowSink { n: 0 }; critical { println(s, \"hi\"); } }",
+        ),
+        (
+            "yielding_write_in_noyield",
+            "noyield",
+            "struct SlowSink { u32 n; }\nimpl SlowSink { pub fn write(*self, []u8 b) { delay(1ms); } }\nfn main() { SlowSink s = SlowSink { n: 0 }; noyield { print(s, \"hi\"); } }",
+        ),
+        (
+            "non_struct_sink",
+            "must be a struct or `*Struct`",
+            "fn main() { u32 x = 5; println(x, \"hi\"); }",
+        ),
+    ];
+
+    for (label, needle, src) in cases {
+        let p = zev_parser::parse_str(src).unwrap_or_else(|e| panic!("{label} parse: {e}"));
+        let out = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(!out.diagnostics.is_empty(), "{label}: expected Sema error");
+        let joined = out
+            .diagnostics
+            .iter()
+            .map(|d| format!("{} {:?}", d.message, d.note))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined.contains(needle),
+            "{label}: expected {needle:?} in diagnostics:\n{joined}"
+        );
+    }
+
+    // Check cross-module private `write` rejection & endpoint provenance through sink.
+    let tmp = std::env::temp_dir().join(format!(
+        "zev_item4_mod_{}_{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(
+        tmp.join("priv_sink.zev"),
+        "pub struct PrivSink { u32 x; }\nimpl PrivSink { fn write(*self, []u8 b) { self.x += b.len as u32; } }\n",
+    )
+    .unwrap();
+    let app_path = tmp.join("app.zev");
+    let app_src = "import priv_sink;\nfn main() { priv_sink.PrivSink s = priv_sink.PrivSink { x: 0 }; println(s, \"hi\"); }\n";
+    let p_mod = zev_parser::parse_str_named(app_src, app_path.to_str().unwrap()).unwrap();
+    let out_mod = analyze_and_monomorphize_named_programs(
+        &[(&p_mod, app_path.to_str())],
+        &AnalyzeOptions {
+            include_dirs: vec![tmp.clone()],
+            ..AnalyzeOptions::default()
+        },
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+    let mod_msgs = out_mod
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        mod_msgs.contains("private"),
+        "expected private write error, got:\n{mod_msgs}"
+    );
+
+    // Check endpoint provenance through user sink `write`: two tasks printing to sinks wrapping the same `byte_ring`.
+    let ring_src = r#"
+byte_ring<16> R;
+struct RingSink { *byte_ring rx; }
+impl RingSink { pub fn write(*self, []u8 b) { usize _n = self.rx.push(b); } }
+task t1(*byte_ring r) { RingSink s = RingSink { rx: r }; loop { println(s, "a"); delay(1ms); } }
+task t2(*byte_ring r) { RingSink s = RingSink { rx: r }; loop { println(s, "b"); delay(1ms); } }
+fn main() { spawn t1(&R) @normal; spawn t2(&R) @low; }
+"#;
+    let p_ring = zev_parser::parse_str(ring_src).unwrap();
+    let out_ring = analyze_and_monomorphize_programs(&[p_ring], &AnalyzeOptions::default());
+    let ring_msgs = out_ring
+        .diagnostics
+        .iter()
+        .map(|d| d.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !out_ring.diagnostics.is_empty(),
+        "expected E0004 single-producer error via user sink `println(s, ...)`, got OK:\n{ring_msgs}"
+    );
+}

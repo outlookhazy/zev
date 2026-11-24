@@ -1573,8 +1573,16 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                 },
             ))
         }
-        ExprKind::Call { callee, args, .. } => {
+        ExprKind::Call {
+            callee,
+            generic_args,
+            args,
+        } => {
             let mut largs = Vec::new();
+            if let Some((wfn, newline)) = resolve_user_sink_write_callee(callee, generic_args, args)
+            {
+                return lower_user_sink_print_non_yielding_be(&wfn, newline, args, expr.span, be);
+            }
             if let ExprKind::Ident(id) = &callee.kind {
                 match BuiltinFn::from_name(&id.name) {
                     Some(BuiltinFn::FmtBuf) => {
@@ -3216,7 +3224,7 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                         }
                     }
                 }
-                if matches!(id.name.as_str(), "print" | "println") {
+                if matches!(id.name.as_str(), "print" | "println") && args.len() == 1 {
                     let newline = id.name == "println";
                     if let Some(first) = first_positional_arg(args) {
                         if let Some(pfmt) = try_lower_print_arg_be(first, newline, be)? {
@@ -3795,6 +3803,548 @@ pub(super) fn lower_fmt_ring_call_be<B: LowerBackend>(
         boost,
     });
     Ok(MirExpr::new(MirExprKind::Var(dst_res), res_ty))
+}
+
+pub(super) fn resolve_user_sink_write_callee(
+    callee: &Expr,
+    generic_args: &[GenericArg],
+    args: &[CallArg],
+) -> Option<(String, bool)> {
+    let ExprKind::Ident(id) = &callee.kind else {
+        return None;
+    };
+    let newline = match id.name.as_str() {
+        "print" => false,
+        "println" => true,
+        _ => return None,
+    };
+    if args.len() != 2 || args.iter().any(|a| a.name.is_some()) {
+        return None;
+    }
+    let GenericArg::Type(TypeExpr {
+        kind: TypeKind::Named(wfn),
+        ..
+    }) = generic_args.first()?
+    else {
+        return None;
+    };
+    Some((wfn.name.clone(), newline))
+}
+
+pub(super) fn lower_user_sink_ptr_var_be<B: LowerBackend>(
+    sink_expr: &Expr,
+    be: &mut B,
+) -> Result<VarId, MirLowerError> {
+    if let Ok((place, MirType::Struct(sname))) = be.lower_place_be(sink_expr) {
+        let ptr_ty = MirType::Ptr(Box::new(MirType::Struct(sname)));
+        let sink_ptr = be.alloc_temp_be("sink_ptr", ptr_ty.clone());
+        be.emit_stmt_be(MirStmt::Assign {
+            target: MirPlace::Var(sink_ptr),
+            op: MirAssignOp::Assign,
+            value: MirExpr::new(MirExprKind::AddrOfPlace(Box::new(place)), ptr_ty),
+        });
+        return Ok(sink_ptr);
+    }
+    let sv = be.lower_sub(sink_expr, None)?;
+    match &sv.ty {
+        MirType::Ptr(inner) if matches!(&**inner, MirType::Struct(_)) => {
+            let sink_ptr = be.alloc_temp_be("sink_ptr", sv.ty.clone());
+            be.emit_stmt_be(MirStmt::Assign {
+                target: MirPlace::Var(sink_ptr),
+                op: MirAssignOp::Assign,
+                value: sv,
+            });
+            Ok(sink_ptr)
+        }
+        MirType::Struct(_) => {
+            let st_val = be.alloc_temp_be("sink_val", sv.ty.clone());
+            let ptr_ty = MirType::Ptr(Box::new(sv.ty.clone()));
+            be.emit_stmt_be(MirStmt::Assign {
+                target: MirPlace::Var(st_val),
+                op: MirAssignOp::Assign,
+                value: sv,
+            });
+            let sink_ptr = be.alloc_temp_be("sink_ptr", ptr_ty.clone());
+            be.emit_stmt_be(MirStmt::Assign {
+                target: MirPlace::Var(sink_ptr),
+                op: MirAssignOp::Assign,
+                value: MirExpr::new(
+                    MirExprKind::AddrOfPlace(Box::new(MirPlace::Var(st_val))),
+                    ptr_ty,
+                ),
+            });
+            Ok(sink_ptr)
+        }
+        other => Err(MirLowerError {
+            message: format!(
+                "invalid sink argument type `{}`; expected struct or pointer to struct",
+                other.display_name()
+            ),
+            span: sink_expr.span,
+        }),
+    }
+}
+
+pub(super) fn lower_user_sink_chunks_be<B: LowerBackend>(
+    msg_expr: &Expr,
+    newline: bool,
+    be: &mut B,
+) -> Result<Vec<MirFmtChunk>, MirLowerError> {
+    let mut chunks = match &msg_expr.kind {
+        ExprKind::FormatString(parts) => lower_format_parts_be(parts, be)?,
+        ExprKind::Literal(Literal::String(s)) => {
+            let mut out = Vec::new();
+            push_fmt_lit(&mut out, s);
+            out
+        }
+        _ => {
+            let v = unwrap_ok_result_expr(be.lower_sub(msg_expr, None)?);
+            let vty = v.ty.clone();
+            match vty {
+                MirType::Slice(inner) if *inner == MirType::U8 => vec![MirFmtChunk::Bytes(v)],
+                MirType::Array { elem, len } if *elem == MirType::U8 => {
+                    vec![MirFmtChunk::Bytes(array_expr_to_slice_be(
+                        v,
+                        MirType::U8,
+                        len,
+                        be,
+                    ))]
+                }
+                MirType::Str | MirType::Ptr(_) => vec![MirFmtChunk::Str(v)],
+                _ => {
+                    let mut out = Vec::new();
+                    emit_fmt_value_be(v, FormatSpec::Default, msg_expr.span, &mut out, be)?;
+                    out
+                }
+            }
+        }
+    };
+    if newline {
+        push_fmt_lit(&mut chunks, "\n");
+    }
+    Ok(chunks)
+}
+
+pub(super) fn user_sink_chunk_scratch_needed(ch: &MirFmtChunk) -> usize {
+    match ch {
+        MirFmtChunk::Literal(_) | MirFmtChunk::Bytes(_) | MirFmtChunk::Str(_) => 0,
+        MirFmtChunk::Bool(_) => 8,
+        MirFmtChunk::EnumName { .. } => 64,
+        MirFmtChunk::Int { fmt, .. } => match fmt {
+            MirIntFmt::Dec => 24,
+            MirIntFmt::Hex { zero_pad_width, .. } => 16usize.max(usize::from(*zero_pad_width)),
+            MirIntFmt::Bin { zero_pad_width } => 64usize.max(usize::from(*zero_pad_width)),
+        },
+        MirFmtChunk::Float { fmt, .. } => match fmt {
+            MirFloatFmt::Fixed { precision } | MirFloatFmt::Sci { precision } => {
+                16 + usize::from(*precision)
+            }
+        },
+        MirFmtChunk::DebugSlice { elem_ty, .. } => match elem_ty {
+            MirType::Str => 0,
+            MirType::Slice(inner) if **inner == MirType::U8 => 0,
+            MirType::Enum(_) => 64,
+            MirType::Bool => 8,
+            MirType::F32 | MirType::F64 => 24,
+            _ => 24,
+        },
+    }
+}
+
+pub(super) fn user_sink_scratch_cap(chunks: &[MirFmtChunk]) -> usize {
+    chunks
+        .iter()
+        .map(user_sink_chunk_scratch_needed)
+        .max()
+        .unwrap_or(0)
+}
+
+pub(super) fn chunk_to_slice_or_scalar_be<B: LowerBackend>(
+    ch: MirFmtChunk,
+    scratch: Option<(VarId, usize)>,
+    be: &mut B,
+) -> MirExpr {
+    let slice_u8_ty = MirType::Slice(Box::new(MirType::U8));
+    match ch {
+        MirFmtChunk::Literal(s) => MirExpr::new(MirExprKind::StringLit(s), slice_u8_ty),
+        MirFmtChunk::Bytes(e) => e,
+        MirFmtChunk::Str(e) => {
+            if let MirExprKind::StringLit(s) = e.kind {
+                MirExpr::new(MirExprKind::StringLit(s), slice_u8_ty)
+            } else {
+                MirExpr::new(MirExprKind::CStrToSlice(Box::new(e)), slice_u8_ty)
+            }
+        }
+        scalar_ch => {
+            let (scratch_var, scratch_cap) =
+                scratch.expect("scratch buffer allocated for scalar user-sink chunk");
+            let buf_slice = MirExpr::new(
+                MirExprKind::ArrayToSlice {
+                    array_place: Box::new(MirPlace::Var(scratch_var)),
+                    len: scratch_cap,
+                    elem_ty: MirType::U8,
+                },
+                slice_u8_ty.clone(),
+            );
+            let fmt_res_ty = MirType::Result {
+                ok: Box::new(slice_u8_ty.clone()),
+                err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
+            };
+            let fmt_res_var = be.alloc_temp_be("sink_fmt_res", fmt_res_ty);
+            be.emit_stmt_be(MirStmt::FmtBuf {
+                dst_res: fmt_res_var,
+                buf: buf_slice,
+                chunks: vec![scalar_ch],
+            });
+            MirExpr::new(MirExprKind::ResultVal(fmt_res_var), slice_u8_ty)
+        }
+    }
+}
+
+pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
+    wfn: &str,
+    newline: bool,
+    args: &[CallArg],
+    span: Span,
+    be: &mut B,
+) -> Result<MirExpr, MirLowerError> {
+    let sig = be
+        .syms()
+        .fns
+        .get(wfn)
+        .cloned()
+        .ok_or_else(|| MirLowerError {
+            message: format!("internal error: missing sink method `{wfn}`"),
+            span,
+        })?;
+    if sig.spawns_in_boot {
+        return Err(MirLowerError {
+            message: format!(
+                "boot helper `{wfn}` (contains `spawn` or IRQ `.attach`) may only be called during `fn main()` boot"
+            ),
+            span,
+        });
+    }
+    let yields_here =
+        sig.is_yielding && !(be.in_noyield() && sig.effect == MirFnEffect::SoftYielding);
+    if yields_here {
+        return Err(MirLowerError {
+            message: format!(
+                "`{wfn}` yields cooperatively and cannot be lowered in a non-yielding sink print context"
+            ),
+            span,
+        });
+    }
+    let target_callee = if be.in_noyield() && sig.effect == MirFnEffect::SoftYielding {
+        format!("{wfn}__noyield")
+    } else {
+        wfn.to_string()
+    };
+    if be.syms().boost_capable_fns.contains(wfn) {
+        be.mark_may_hold_boost_be();
+    }
+
+    let sink_ptr_var = lower_user_sink_ptr_var_be(&args[0].value, be)?;
+    let chunks = lower_user_sink_chunks_be(&args[1].value, newline, be)?;
+    let scratch_cap = user_sink_scratch_cap(&chunks);
+    let scratch = if scratch_cap > 0 {
+        let sv = be.alloc_temp_be(
+            "sink_fmt_buf",
+            MirType::Array {
+                elem: Box::new(MirType::U8),
+                len: scratch_cap,
+            },
+        );
+        Some((sv, scratch_cap))
+    } else {
+        None
+    };
+
+    let res_ty_opt = if sig.error_spec.has_error() {
+        Some(MirType::Result {
+            ok: Box::new(MirType::Void),
+            err: sig.error_spec.err_type().map(Box::new),
+        })
+    } else {
+        None
+    };
+    let res_vid_opt = res_ty_opt.as_ref().map(|rt| {
+        let rv = be.alloc_temp_be("sink_write_res", rt.clone());
+        be.emit_stmt_be(MirStmt::Assign {
+            target: MirPlace::Var(rv),
+            op: MirAssignOp::Assign,
+            value: MirExpr::new(MirExprKind::IntLit(0), rt.clone()),
+        });
+        rv
+    });
+
+    let call_ret_ty = res_ty_opt.clone().unwrap_or(MirType::Void);
+    let sink_ptr_ty = be.vars()[sink_ptr_var.0].ty.clone();
+    let emit_slice_write = |slice_expr: MirExpr, be: &mut B| {
+        let call = MirExpr::new(
+            MirExprKind::CallDirect {
+                callee: target_callee.clone(),
+                is_extern_c: sig.is_extern_c,
+                args: vec![
+                    MirExpr::new(MirExprKind::Var(sink_ptr_var), sink_ptr_ty.clone()),
+                    slice_expr,
+                ],
+            },
+            call_ret_ty.clone(),
+        );
+        if let Some(rv) = res_vid_opt {
+            be.emit_stmt_be(MirStmt::If {
+                cond: MirExpr::new(
+                    MirExprKind::Unary {
+                        op: MirUnaryOp::Not,
+                        expr: Box::new(MirExpr::new(MirExprKind::ResultIsErr(rv), MirType::Bool)),
+                    },
+                    MirType::Bool,
+                ),
+                then_body: vec![MirStmt::Assign {
+                    target: MirPlace::Var(rv),
+                    op: MirAssignOp::Assign,
+                    value: call,
+                }],
+                else_body: Vec::new(),
+            });
+        } else {
+            be.emit_stmt_be(MirStmt::Expr(call));
+        }
+    };
+
+    let slice_u8_ty = MirType::Slice(Box::new(MirType::U8));
+    for ch in chunks {
+        match ch {
+            MirFmtChunk::DebugSlice { slice, .. } => {
+                let ds_ty = slice.ty.clone();
+                let raw_el_ty = match &ds_ty {
+                    MirType::Slice(inner) => (**inner).clone(),
+                    _ => MirType::U8,
+                };
+                let ds_var = be.alloc_temp_be("sink_ds", ds_ty.clone());
+                be.emit_stmt_be(MirStmt::Assign {
+                    target: MirPlace::Var(ds_var),
+                    op: MirAssignOp::Assign,
+                    value: slice,
+                });
+                emit_slice_write(
+                    MirExpr::new(MirExprKind::StringLit("[".to_string()), slice_u8_ty.clone()),
+                    be,
+                );
+                let idx_var = be.alloc_temp_be("sink_ds_i", MirType::Usize);
+                be.emit_stmt_be(MirStmt::Assign {
+                    target: MirPlace::Var(idx_var),
+                    op: MirAssignOp::Assign,
+                    value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
+                });
+                let len_expr = MirExpr::new(
+                    MirExprKind::SliceLen(Box::new(MirExpr::new(
+                        MirExprKind::Var(ds_var),
+                        ds_ty.clone(),
+                    ))),
+                    MirType::Usize,
+                );
+                let idx_lt_len = MirExpr::new(
+                    MirExprKind::Binary {
+                        op: MirBinOp::Lt,
+                        lhs: Box::new(MirExpr::new(MirExprKind::Var(idx_var), MirType::Usize)),
+                        rhs: Box::new(len_expr),
+                    },
+                    MirType::Bool,
+                );
+                let while_cond = if let Some(rv) = res_vid_opt {
+                    MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::LogicalAnd,
+                            lhs: Box::new(MirExpr::new(
+                                MirExprKind::Unary {
+                                    op: MirUnaryOp::Not,
+                                    expr: Box::new(MirExpr::new(
+                                        MirExprKind::ResultIsErr(rv),
+                                        MirType::Bool,
+                                    )),
+                                },
+                                MirType::Bool,
+                            )),
+                            rhs: Box::new(idx_lt_len),
+                        },
+                        MirType::Bool,
+                    )
+                } else {
+                    idx_lt_len
+                };
+                let mut body_stmts = Vec::new();
+                {
+                    struct BufBackend<'a, Inner: LowerBackend> {
+                        inner: &'a mut Inner,
+                        stmts: &'a mut Vec<MirStmt>,
+                    }
+                    impl<'a, Inner: LowerBackend> LowerBackend for BufBackend<'a, Inner> {
+                        fn syms(&self) -> &ModuleSymbols {
+                            self.inner.syms()
+                        }
+                        fn vars(&self) -> &[MirVar] {
+                            self.inner.vars()
+                        }
+                        fn scopes(&self) -> &VarScopes {
+                            self.inner.scopes()
+                        }
+                        fn in_noyield(&self) -> bool {
+                            self.inner.in_noyield()
+                        }
+                        fn alloc_temp_be(&mut self, prefix: &str, ty: MirType) -> VarId {
+                            self.inner.alloc_temp_be(prefix, ty)
+                        }
+                        fn emit_stmt_be(&mut self, stmt: MirStmt) {
+                            self.stmts.push(stmt);
+                        }
+                        fn mark_may_hold_boost_be(&mut self) {
+                            self.inner.mark_may_hold_boost_be();
+                        }
+                        fn lower_sub(
+                            &mut self,
+                            expr: &Expr,
+                            expected: Option<&MirType>,
+                        ) -> Result<MirExpr, MirLowerError> {
+                            self.inner.lower_sub(expr, expected)
+                        }
+                        fn lower_place_be(
+                            &mut self,
+                            expr: &Expr,
+                        ) -> Result<(MirPlace, MirType), MirLowerError> {
+                            self.inner.lower_place_be(expr)
+                        }
+                    }
+
+                    let mut sub_be = BufBackend {
+                        inner: be,
+                        stmts: &mut body_stmts,
+                    };
+                    let sep_call = MirExpr::new(
+                        MirExprKind::CallDirect {
+                            callee: target_callee.clone(),
+                            is_extern_c: sig.is_extern_c,
+                            args: vec![
+                                MirExpr::new(MirExprKind::Var(sink_ptr_var), sink_ptr_ty.clone()),
+                                MirExpr::new(
+                                    MirExprKind::StringLit(", ".to_string()),
+                                    slice_u8_ty.clone(),
+                                ),
+                            ],
+                        },
+                        call_ret_ty.clone(),
+                    );
+                    let sep_stmt = if let Some(rv) = res_vid_opt {
+                        MirStmt::Assign {
+                            target: MirPlace::Var(rv),
+                            op: MirAssignOp::Assign,
+                            value: sep_call,
+                        }
+                    } else {
+                        MirStmt::Expr(sep_call)
+                    };
+                    sub_be.emit_stmt_be(MirStmt::If {
+                        cond: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Gt,
+                                lhs: Box::new(MirExpr::new(
+                                    MirExprKind::Var(idx_var),
+                                    MirType::Usize,
+                                )),
+                                rhs: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                            },
+                            MirType::Bool,
+                        ),
+                        then_body: vec![sep_stmt],
+                        else_body: Vec::new(),
+                    });
+
+                    let el_expr = MirExpr::new(
+                        MirExprKind::Index {
+                            base: Box::new(MirExpr::new(MirExprKind::Var(ds_var), ds_ty.clone())),
+                            index: Box::new(MirExpr::new(
+                                MirExprKind::Var(idx_var),
+                                MirType::Usize,
+                            )),
+                            is_slice: true,
+                        },
+                        raw_el_ty,
+                    );
+                    let mut el_chunks = Vec::new();
+                    emit_fmt_value_be(
+                        el_expr,
+                        FormatSpec::Debug,
+                        span,
+                        &mut el_chunks,
+                        &mut sub_be,
+                    )?;
+                    for el_ch in el_chunks {
+                        let sl = chunk_to_slice_or_scalar_be(el_ch, scratch, &mut sub_be);
+                        let call = MirExpr::new(
+                            MirExprKind::CallDirect {
+                                callee: target_callee.clone(),
+                                is_extern_c: sig.is_extern_c,
+                                args: vec![
+                                    MirExpr::new(
+                                        MirExprKind::Var(sink_ptr_var),
+                                        sink_ptr_ty.clone(),
+                                    ),
+                                    sl,
+                                ],
+                            },
+                            call_ret_ty.clone(),
+                        );
+                        if let Some(rv) = res_vid_opt {
+                            sub_be.emit_stmt_be(MirStmt::If {
+                                cond: MirExpr::new(
+                                    MirExprKind::Unary {
+                                        op: MirUnaryOp::Not,
+                                        expr: Box::new(MirExpr::new(
+                                            MirExprKind::ResultIsErr(rv),
+                                            MirType::Bool,
+                                        )),
+                                    },
+                                    MirType::Bool,
+                                ),
+                                then_body: vec![MirStmt::Assign {
+                                    target: MirPlace::Var(rv),
+                                    op: MirAssignOp::Assign,
+                                    value: call,
+                                }],
+                                else_body: Vec::new(),
+                            });
+                        } else {
+                            sub_be.emit_stmt_be(MirStmt::Expr(call));
+                        }
+                    }
+                    sub_be.emit_stmt_be(MirStmt::Assign {
+                        target: MirPlace::Var(idx_var),
+                        op: MirAssignOp::AddAssign,
+                        value: MirExpr::new(MirExprKind::IntLit(1), MirType::Usize),
+                    });
+                }
+                be.emit_stmt_be(MirStmt::While {
+                    cond: while_cond,
+                    body: body_stmts,
+                });
+                emit_slice_write(
+                    MirExpr::new(MirExprKind::StringLit("]".to_string()), slice_u8_ty.clone()),
+                    be,
+                );
+            }
+            other_ch => {
+                let sl = chunk_to_slice_or_scalar_be(other_ch, scratch, be);
+                emit_slice_write(sl, be);
+            }
+        }
+    }
+
+    if let (Some(rv), Some(rty)) = (res_vid_opt, res_ty_opt) {
+        Ok(MirExpr::new(MirExprKind::Var(rv), rty))
+    } else {
+        Ok(MirExpr::new(MirExprKind::IntLit(0), MirType::Void))
+    }
 }
 
 pub(super) fn lower_format_parts_be<B: LowerBackend>(

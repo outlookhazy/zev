@@ -1103,6 +1103,8 @@ pub enum MirExprKind {
         rhs: Box<MirExpr>,
         elem_ty: MirType,
     },
+    /// Zero-heap NUL-terminated `*u8`/`*i8` C string pointer -> `[]u8` slice via inline NUL scan.
+    CStrToSlice(Box<MirExpr>),
     Cast {
         expr: Box<MirExpr>,
         target_ty: MirType,

@@ -5376,4 +5376,258 @@ fn main() {
             qres.stdout
         );
     }
+
+    #[test]
+    fn item4_user_sink_print_and_yielding_runs_on_host_and_qemu() {
+        let temp = TempWorkDir::create("item4_user_sinks").unwrap();
+        std::fs::write(
+            temp.dir.join("sink_mod.zev"),
+            r#"
+pub enum SinkErr { Full }
+
+pub struct ModSink {
+    [64]u8 buf;
+    usize len;
+    usize max_cap;
+    u32 flushes;
+}
+
+impl ModSink {
+    pub fn write(*self, []u8 bytes) error SinkErr {
+        if (self.len + bytes.len > self.max_cap) {
+            error Full;
+        }
+        for (u8 b in bytes) {
+            self.buf[self.len] = b;
+            self.len += 1;
+        }
+        return;
+    }
+
+    pub fn view(*self) -> []u8 {
+        return self.buf[0..self.len];
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let app_path = temp.dir.join("app.zev");
+        let src = r#"
+import board;
+import sink_mod as sm;
+
+enum Kind { Ping, Pong }
+
+struct MemSink {
+    [128]u8 buf;
+    usize len;
+    u32 writes;
+}
+
+impl MemSink {
+    pub fn write(*self, []u8 bytes) {
+        self.writes += 1;
+        for (u8 b in bytes) {
+            if (self.len < 128) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+
+    pub fn slice(*self) -> []u8 {
+        return self.buf[0..self.len];
+    }
+}
+
+struct GenSink<const usize CAP> {
+    [CAP]u8 buf;
+    usize len;
+}
+
+impl<const usize CAP> GenSink<CAP> {
+    pub fn write(*self, []u8 bytes) {
+        for (u8 b in bytes) {
+            if (self.len < CAP) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+struct YieldSink {
+    [96]u8 buf;
+    usize len;
+    u32 delays;
+}
+
+impl YieldSink {
+    pub fn write(*self, []u8 bytes) {
+        if (bytes.len > 0) {
+            delay(1ms);
+            self.delays += 1;
+        }
+        for (u8 b in bytes) {
+            if (self.len < 96) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+struct SoftSink {
+    [32]u8 buf;
+    usize len;
+}
+
+impl SoftSink {
+    pub fn write(*self, []u8 bytes) {
+        for (u8 b in bytes) {
+            checkpoint();
+            if (self.len < 32) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+fn pick_sink(*MemSink s, *u32 hits) -> *MemSink {
+    *hits += 1;
+    return s;
+}
+
+signal done_sig;
+
+task driver() {
+    YieldSink ys;
+    ys.len = 0;
+    ys.delays = 0;
+    u32 val = 42;
+    println(ys, f"ys={val}");
+    []u8 expected = "ys=42\n";
+    assert(ys.buf[0..ys.len] == expected);
+    assert(ys.delays == 3);
+    done_sig.notify();
+    loop {
+        delay(100ms);
+    }
+}
+
+fn main() {
+    board.init();
+
+    // 1. Value sink, single evaluation of sink expression, multi-hole f"...", DebugSlice, C-str, []u8
+    MemSink s;
+    s.len = 0;
+    s.writes = 0;
+    u32 hits = 0;
+    *u8 cstr = "cstr" as *u8;
+    []u8 raw_sl = "sl";
+    [3]u8 arr = ['A', 'B', 'C'];
+    [2]i32 nums = [7, -3];
+    Kind k = Kind.Pong;
+    println(pick_sink(&s, &hits), f"v={12} hx={0x2a:04x} k={k} b={true} fl={1.5f32:.1} c={cstr} sl={raw_sl} a={arr} n={nums:?}");
+    assert(hits == 1);
+    []u8 exp1 = "v=12 hx=002a k=Pong b=true fl=1.5 c=cstr sl=sl a=ABC n=[7, -3]\n";
+    assert(s.slice() == exp1);
+
+    // 2. Plain string, []u8, *u8 without format string
+    MemSink s2;
+    s2.len = 0;
+    s2.writes = 0;
+    print(s2, "ab");
+    print(s2, raw_sl);
+    println(s2, cstr);
+    assert(s2.slice() == "abslcstr\n");
+
+    // 3. Generic struct sink
+    GenSink<32> gs;
+    gs.len = 0;
+    println(gs, f"g={99}");
+    assert(gs.buf[0..gs.len] == "g=99\n");
+
+    // 4. Cross-module fallible sink short-circuits cleanly on Full
+    sm.ModSink ms;
+    ms.len = 0;
+    ms.max_cap = 5;
+    ms.flushes = 0;
+    bool caught = false;
+    println(ms, f"hi={123456}!") catch (sm.SinkErr _e) {
+        caught = true;
+    };
+    assert(caught);
+    assert(ms.view() == "hi=");
+
+    // 5. SoftYielding sink inside `noyield` uses __noyield clone cleanly
+    SoftSink ss;
+    ss.len = 0;
+    noyield {
+        print(ss, f"ny={7}");
+    }
+    assert(ss.buf[0..ss.len] == "ny=7");
+
+    spawn driver() @normal;
+    // Also spawn a waiter to verify yielding driver completed cleanly
+    spawn verify_done() @low;
+}
+
+task verify_done() {
+    loop {
+        done_sig.wait();
+        println("USER_SINKS_ALL_OK");
+        sys.exit(0);
+    }
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "host failed: {stdout}");
+        assert!(
+            stdout.contains("USER_SINKS_ALL_OK"),
+            "host stdout={stdout:?}"
+        );
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("item4_user_sinks.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout.contains("USER_SINKS_ALL_OK"),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
 }

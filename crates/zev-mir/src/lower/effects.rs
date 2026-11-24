@@ -939,8 +939,19 @@ pub(super) fn scan_expr_effect(
     edges: &mut Vec<RawCallEdge>,
 ) {
     match &expr.kind {
-        ExprKind::Call { callee, args, .. } => {
-            if let ExprKind::Ident(id) = &callee.kind {
+        ExprKind::Call {
+            callee,
+            generic_args,
+            args,
+        } => {
+            if let Some((wfn, _)) = resolve_user_sink_write_callee(callee, generic_args, args) {
+                edges.push(RawCallEdge {
+                    caller: caller.to_string(),
+                    callee: wfn,
+                    in_noyield,
+                    in_restricted,
+                });
+            } else if let ExprKind::Ident(id) = &callee.kind {
                 match id.name.as_str() {
                     "delay" | "delay_ms" | "sleep" => {
                         if !in_noyield && !in_restricted {
@@ -1189,7 +1200,16 @@ pub(super) fn stmt_contains_boot_spawn(stmt: &Stmt, syms: &ModuleSymbols) -> boo
 
 pub(super) fn expr_contains_boot_spawn(expr: &Expr, syms: &ModuleSymbols) -> bool {
     match &expr.kind {
-        ExprKind::Call { callee, args, .. } => {
+        ExprKind::Call {
+            callee,
+            generic_args,
+            args,
+        } => {
+            if let Some((wfn, _)) = resolve_user_sink_write_callee(callee, generic_args, args) {
+                if syms.fns.get(&wfn).is_some_and(|sig| sig.spawns_in_boot) {
+                    return true;
+                }
+            }
             if let ExprKind::Ident(id) = &callee.kind {
                 if syms.fns.get(&id.name).is_some_and(|sig| sig.spawns_in_boot) {
                     return true;

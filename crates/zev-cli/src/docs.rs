@@ -644,6 +644,9 @@ format-string parser, zero global handler registry):
 - **Ring Stream Sink**: `fmt_ring(tx_ring, f\"...\" [, boost: @prio]) -> usize error FmtErr` accepts
   `*byte_ring<N>` or capacity-erased `*byte_ring`, emits directly into the SPSC ring with single-wake
   notification, and supports `boost:` for interrupt-driven or buffered serial TX.
+- **User-Defined Sinks**: `print(sink, f\"...\");` and `println(sink, f\"...\");` accept any struct
+  value or `*Struct` implementing `pub fn write(*self, []u8 bytes)` (optionally `error E`, and may yield),
+  unpacking chunks at compile time into direct `write` calls with zero heap or runtime dispatch.
 - **Supported `{...}` Specifiers** (`{{` and `}}` escape literal braces):
   - `{v}` — Decimal integers, `bool`, `[]u8` / string literals, default `.2` fixed float, and automatic
     `enum` variant names (`.rodata` emitted only for formatted enums!).
