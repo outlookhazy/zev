@@ -877,7 +877,13 @@ pub fn lower_program(program: &Program) -> Result<MirModule, MirLowerError> {
     }
 
     // Pass 2: Whole-program 3-tier `FnEffect`, `spawns_in_boot`, and `SoftYielding` specialization inference.
-    infer_effects_and_specializations(&raw_fn_decls, &raw_task_decls, main_decl, &mut syms);
+    infer_effects_and_specializations(
+        &raw_fn_decls,
+        &raw_task_decls,
+        main_decl,
+        &program.items,
+        &mut syms,
+    );
 
     // Pass 3: Lower constants & top-level primitive initializers.
     let mut mir_consts = Vec::new();

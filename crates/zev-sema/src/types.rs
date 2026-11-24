@@ -33,8 +33,12 @@ pub enum Ty {
     OsPrimitive(ResolvedOsPrimitive),
     /// Linear, move-only buffer lease `Lease<T>` allocated from a `pool<T, K>`.
     Lease(Box<Ty>),
-    /// Function pointer or function reference (`fn(T1, T2) -> Ret`).
-    FnPtr { params: Vec<Ty>, ret: Box<Ty> },
+    /// Function pointer or function reference (`fn(T1, T2) -> Ret [error E]`).
+    FnPtr {
+        params: Vec<Ty>,
+        ret: Box<Ty>,
+        error_spec: Box<ResolvedErrorSpec>,
+    },
     /// Typed MMIO register block layout (`UartRegs`), usable behind pointer `*UartRegs` (`mmio` values cannot be copied by value).
     MmioLayout(String),
     /// Typed physical MMIO peripheral instance (`USART1 : UartRegs @ 0x4001_1000`), coercing implicitly to `*UartRegs`.
@@ -186,7 +190,7 @@ impl fmt::Display for ResolvedOsPrimitive {
 }
 
 /// Resolved dual-exit error specification on a function or fallible operation.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ResolvedErrorSpec {
     /// Infallible (`return` only).
     None,
@@ -573,23 +577,28 @@ impl Ty {
                 true
             }
 
-            // Function pointers match when parameter/return types are compatible.
+            // Function pointers match when parameter/return types and error specs are compatible.
             (
                 Ty::FnPtr {
                     params: pa,
                     ret: ra,
+                    error_spec: ea,
                 },
                 Ty::FnPtr {
                     params: pb,
                     ret: rb,
+                    error_spec: eb,
                 },
             ) => {
-                pa.len() == pb.len()
+                ea == eb
+                    && pa.len() == pb.len()
                     && pa.iter().zip(pb.iter()).all(|(a, b)| a.is_assignable_to(b))
                     && ra.is_assignable_to(rb)
             }
-            // Allow passing a function reference to opaque `*void` callback parameter in extern "C".
-            (Ty::FnPtr { .. }, Ty::Ptr(inner)) if inner.is_void() => true,
+            // Allow passing a non-fallible function reference to opaque `*void` callback parameter in extern "C".
+            (Ty::FnPtr { error_spec, .. }, Ty::Ptr(inner)) if inner.is_void() => {
+                !error_spec.is_fallible()
+            }
 
             _ => false,
         }
@@ -662,7 +671,11 @@ impl fmt::Display for Ty {
             Self::Ptr(inner) => write!(f, "*{}", inner),
             Self::OsPrimitive(p) => write!(f, "{}", p),
             Self::Lease(elem) => write!(f, "Lease<{}>", elem),
-            Self::FnPtr { params, ret } => {
+            Self::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
                 write!(f, "fn(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
@@ -670,7 +683,12 @@ impl fmt::Display for Ty {
                     }
                     write!(f, "{}", p)?;
                 }
-                write!(f, ") -> {}", ret)
+                write!(f, ") -> {}", ret)?;
+                match &**error_spec {
+                    ResolvedErrorSpec::None => Ok(()),
+                    ResolvedErrorSpec::Untyped => write!(f, " error"),
+                    ResolvedErrorSpec::Typed(err_ty) => write!(f, " error {}", err_ty),
+                }
             }
             Self::MmioLayout(name) => write!(f, "mmio {name}"),
             Self::MmioInstance { name, layout } => write!(f, "mmio {name} : {layout}"),

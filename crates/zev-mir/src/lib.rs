@@ -5093,4 +5093,130 @@ mod tests {
         }
         assert!(saw_u32_bound && saw_void_bound && saw_noreturn);
     }
+
+    #[test]
+    fn item1_soft_yielding_fnptr_lowers_to_noyield_clone() {
+        let sp = Span::dummy();
+        let prog = Program::new(
+            vec![
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Fn(FnDecl {
+                        attrs: vec![],
+                        generic_params: vec![],
+                        is_extern_c: false,
+                        is_variadic: false,
+                        name: id("soft_acc"),
+                        params: vec![Param {
+                            ty: ty_prim(PrimType::U32),
+                            name: id("n"),
+                            span: sp,
+                        }],
+                        ret_type: ty_prim(PrimType::U32),
+                        error_spec: None,
+                        body: Some(Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::While {
+                                        cond: Expr::new(
+                                            ExprKind::Literal(Literal::Bool(false)),
+                                            sp,
+                                        ),
+                                        body: Block::new(vec![], sp),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(StmtKind::Return(Some(expr_id("n"))), sp),
+                            ],
+                            sp,
+                        )),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+                Item {
+                    attrs: vec![],
+                    is_pub: false,
+                    kind: ItemKind::Task(TaskDecl {
+                        attrs: vec![],
+                        name: id("sh"),
+                        params: vec![],
+                        body: Block::new(
+                            vec![
+                                Stmt::new(
+                                    StmtKind::VarDecl {
+                                        ty: TypeExpr::new(
+                                            TypeKind::FnPtr {
+                                                params: vec![ty_prim(PrimType::U32)],
+                                                ret: Box::new(ty_prim(PrimType::U32)),
+                                            },
+                                            sp,
+                                        ),
+                                        name: id("h"),
+                                        init: Some(expr_id("soft_acc")),
+                                    },
+                                    sp,
+                                ),
+                                Stmt::new(
+                                    StmtKind::Loop {
+                                        body: Block::new(
+                                            vec![Stmt::new(
+                                                StmtKind::VarDecl {
+                                                    ty: ty_prim(PrimType::U32),
+                                                    name: id("x"),
+                                                    init: Some(Expr::new(
+                                                        ExprKind::Call {
+                                                            callee: Box::new(expr_id("h")),
+                                                            generic_args: vec![],
+                                                            args: vec![CallArg {
+                                                                name: None,
+                                                                value: expr_int(5),
+                                                                span: sp,
+                                                            }],
+                                                        },
+                                                        sp,
+                                                    )),
+                                                },
+                                                sp,
+                                            )],
+                                            sp,
+                                        ),
+                                    },
+                                    sp,
+                                ),
+                            ],
+                            sp,
+                        ),
+                        span: sp,
+                    }),
+                    span: sp,
+                },
+            ],
+            sp,
+        );
+        let mir = lower_program(&prog).expect("MIR lower");
+        let ny_fn = mir
+            .functions
+            .iter()
+            .find(|f| f.name == "soft_acc__noyield")
+            .expect("soft_acc__noyield Direct fn must be emitted");
+        assert!(!ny_fn.is_yielding);
+        assert!(matches!(ny_fn.body, MirFnBody::Direct(_)));
+
+        let sh = mir
+            .task_blueprints
+            .iter()
+            .find(|t| t.name == "sh")
+            .expect("sh blueprint");
+        let saw_ny_addr = sh
+            .blocks
+            .iter()
+            .flat_map(|b| b.stmts.iter())
+            .any(|s| format!("{s:?}").contains("FnAddr(\"soft_acc__noyield\")"));
+        assert!(
+            saw_ny_addr,
+            "task sh must reference soft_acc__noyield FnAddr"
+        );
+    }
 }

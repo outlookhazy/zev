@@ -271,6 +271,14 @@ pub(super) enum IrqBootNode {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct FnPtrValueSite {
+    pub(super) fn_name: String,
+    pub(super) span: Span,
+    pub(super) prog_idx: usize,
+    pub(super) file: Option<String>,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct RecordedCallArgs {
     pub(super) caller: String,
     pub(super) callee: String,
@@ -315,6 +323,8 @@ pub(crate) struct Analyzer {
     pub(super) recorded_call_args: Vec<RecordedCallArgs>,
     pub(super) recorded_byte_ring_ops: Vec<RecordedByteRingOp>,
     pub(super) recorded_watch_writes: Vec<RecordedWatchWrite>,
+    pub(super) fn_ptr_value_sites: Vec<FnPtrValueSite>,
+    pub(super) extern_callback_arg_spans: BTreeSet<(usize, u32, u32)>,
     pub(super) spawned_task_field_endpoints: BTreeMap<usize, Vec<BTreeMap<String, String>>>,
     pub(super) prim_escaping_ref_params: BTreeMap<String, BTreeSet<usize>>,
     pub(super) tasks: BTreeMap<String, TaskInfo>,

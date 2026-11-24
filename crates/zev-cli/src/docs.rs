@@ -409,6 +409,8 @@ fn main() {
    - In normal `task` flow, runs as a union-packed coroutine sharing the CPU smoothly.
    - Inside `noyield { ... }`, **auto-specializes a direct `0 B`-`.bss` stack clone** (`{fn}__noyield`,
      checkpoints stripped) reported transparently in `zevc ram` and `zevc check --json`!
+   - Function pointers referencing a `SoftYielding` function point to `{fn}__noyield` and execute
+     without sharing the CPU (`HardBlocking` functions are not yet supported through function pointers).
    - Still **forbidden** inside `critical`, `isr`, `defer`, and `extern \"C\"` callbacks (`E0003`–`E0006`).
 3. **`HardBlocking`**: Awaits external events or time (`delay`, `wait { ... }`, `inbox.recv`/`send`,
    `watch.wait_change`, `signal.wait`, `ping_pong.wait_chunk`, `byte_ring.wait_read`, `pool.alloc`,

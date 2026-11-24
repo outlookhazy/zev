@@ -470,7 +470,9 @@ impl<'a> BodyChecker<'a> {
                             "linear 'Lease<T>' handles cannot be stored inside an array literal",
                         ));
                     }
-                    if ev.ty.contains_reference(&self.sema.structs) {
+                    if ev.ty.contains_reference(&self.sema.structs)
+                        || ev.ty.contains_fn_ptr(&self.sema.structs)
+                    {
                         combined_prov = combined_prov.merge(&ev.prov);
                     }
                     match &elem_ty {
@@ -887,9 +889,16 @@ impl<'a> BodyChecker<'a> {
         }
         if let Some(fn_info) = self.sema.functions.get(&ident.name).cloned() {
             self.sema.check_extern_c_access(self.prog_idx, ident);
+            self.sema.fn_ptr_value_sites.push(FnPtrValueSite {
+                fn_name: ident.name.clone(),
+                span: ident.span,
+                prog_idx: self.prog_idx,
+                file: self.sema.current_file.clone(),
+            });
             let fn_ty = Ty::FnPtr {
                 params: fn_info.params.iter().map(|p| p.ty.clone()).collect(),
                 ret: Box::new(fn_info.ret_ty),
+                error_spec: Box::new(fn_info.error_spec),
             };
             return ExprVal {
                 ty: fn_ty,
@@ -958,9 +967,16 @@ impl<'a> BodyChecker<'a> {
                     }
                     if let Some(fn_info) = self.sema.functions.get(&id.name).cloned() {
                         self.sema.check_extern_c_access(self.prog_idx, id);
+                        self.sema.fn_ptr_value_sites.push(FnPtrValueSite {
+                            fn_name: id.name.clone(),
+                            span,
+                            prog_idx: self.prog_idx,
+                            file: self.sema.current_file.clone(),
+                        });
                         let fn_ty = Ty::FnPtr {
                             params: fn_info.params.iter().map(|p| p.ty.clone()).collect(),
                             ret: Box::new(fn_info.ret_ty),
+                            error_spec: Box::new(fn_info.error_spec),
                         };
                         return ExprVal {
                             ty: fn_ty,
@@ -2160,7 +2176,18 @@ impl<'a> BodyChecker<'a> {
         // 4. Indirect call through a local `FnPtr` variable or expression.
         let cv = self.check_expr_infallible(callee);
         match cv.ty {
-            Ty::FnPtr { params, ret } => {
+            Ty::FnPtr {
+                params,
+                ret,
+                error_spec,
+            } => {
+                if error_spec.is_fallible() {
+                    self.sema.emit(Diagnostic::new(
+                        DiagnosticKind::TypeMismatch,
+                        callee.span,
+                        "indirect calls to fallible functions are not yet supported",
+                    ));
+                }
                 if args.len() != params.len() {
                     self.sema.emit(Diagnostic::new(
                         DiagnosticKind::TypeMismatch,
@@ -2295,6 +2322,11 @@ impl<'a> BodyChecker<'a> {
 
             // If calling an `extern "C"` function, record any user `fn` callbacks passed in `arg`!
             if fn_info.is_extern_c {
+                self.sema.extern_callback_arg_spans.insert((
+                    self.prog_idx,
+                    arg.span.start,
+                    arg.span.end,
+                ));
                 for cb_fn in &av.prov.fn_callbacks {
                     self.sema
                         .call_graph
@@ -2855,7 +2887,12 @@ impl<'a> BodyChecker<'a> {
 
             Ty::Struct(struct_name) => {
                 if let Some(FieldInfo {
-                    ty: Ty::FnPtr { params, ret },
+                    ty:
+                        Ty::FnPtr {
+                            params,
+                            ret,
+                            error_spec,
+                        },
                     ..
                 }) = self
                     .sema
@@ -2927,6 +2964,7 @@ impl<'a> BodyChecker<'a> {
                             ctx: self.call_context(),
                         });
                     }
+                    let _ = error_spec;
                     return ExprVal::scalar(*ret, span);
                 }
 
@@ -3129,6 +3167,7 @@ impl<'a> BodyChecker<'a> {
                 let expected_ty = Ty::FnPtr {
                     params: vec![Ty::u8()],
                     ret: Box::new(Ty::void()),
+                    error_spec: Box::new(ResolvedErrorSpec::None),
                 };
                 if args.len() != 1 {
                     self.sema.emit(Diagnostic::new(
@@ -3173,6 +3212,7 @@ impl<'a> BodyChecker<'a> {
                         Ty::FnPtr {
                             params: vec![],
                             ret: Box::new(Ty::u32()),
+                            error_spec: Box::new(ResolvedErrorSpec::None),
                         },
                     ),
                     SysMethod::SetExit => (
@@ -3181,6 +3221,7 @@ impl<'a> BodyChecker<'a> {
                         Ty::FnPtr {
                             params: vec![Ty::Prim(PrimType::I32)],
                             ret: Box::new(Ty::void()),
+                            error_spec: Box::new(ResolvedErrorSpec::None),
                         },
                     ),
                     SysMethod::SetFaultHandler => (
@@ -3189,6 +3230,7 @@ impl<'a> BodyChecker<'a> {
                         Ty::FnPtr {
                             params: vec![],
                             ret: Box::new(Ty::void()),
+                            error_spec: Box::new(ResolvedErrorSpec::None),
                         },
                     ),
                     SysMethod::SetIdle => (
@@ -3197,6 +3239,7 @@ impl<'a> BodyChecker<'a> {
                         Ty::FnPtr {
                             params: vec![Ty::u32(), Ty::u32()],
                             ret: Box::new(Ty::void()),
+                            error_spec: Box::new(ResolvedErrorSpec::None),
                         },
                     ),
                     _ => unreachable!(),
@@ -3232,10 +3275,12 @@ impl<'a> BodyChecker<'a> {
                 let route_ty = Ty::FnPtr {
                     params: vec![Ty::u32(), Ty::u32()],
                     ret: Box::new(Ty::void()),
+                    error_spec: Box::new(ResolvedErrorSpec::None),
                 };
                 let ack_ty = Ty::FnPtr {
                     params: vec![Ty::u32()],
                     ret: Box::new(Ty::void()),
+                    error_spec: Box::new(ResolvedErrorSpec::None),
                 };
                 if args.len() != 2 {
                     self.sema.emit(Diagnostic::new(
@@ -3542,6 +3587,9 @@ impl<'a> BodyChecker<'a> {
         arg: &CallArg,
         expected_ty: &Ty,
     ) {
+        self.sema
+            .extern_callback_arg_spans
+            .insert((self.prog_idx, arg.span.start, arg.span.end));
         let av = self.check_expr_infallible(&arg.value);
         if av.ty != *expected_ty && !av.ty.is_error() {
             let msg = if method_name == "set_putc" {

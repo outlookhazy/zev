@@ -7505,3 +7505,211 @@ fn main() { pick(5_000_000_000, 4); }
         out_ovf.diagnostics
     );
 }
+
+#[test]
+fn item1_function_pointer_soundness_rejects_blocking_and_fallible_routes_soft_to_noyield() {
+    // 1. Hard-blocking targets rejected across locals, struct fields, arguments, returns, arrays, and generics,
+    //    naming the shortest blocking chain and stating "not yet supported through function pointers".
+    let blocking_cases = [
+        (
+            "local",
+            r#"
+            fn leaf_delay() { delay(10ms); }
+            fn slow([]u8 a) -> bool { leaf_delay(); return true; }
+            task sh() {
+                fn([]u8) -> bool h = slow;
+                loop { bool _ok = h("x"); delay(1ms); }
+            }
+            fn main() { spawn sh() @normal; }
+            "#,
+            "slow() -> leaf_delay() -> delay()",
+        ),
+        (
+            "struct_field",
+            r#"
+            fn wait_tick() { delay(5ms); }
+            struct Handler { fn([]u8) -> bool run; }
+            fn main() {
+                Handler _h = Handler { run: wait_tick_wrap };
+            }
+            fn wait_tick_wrap([]u8 _b) -> bool { wait_tick(); return true; }
+            "#,
+            "wait_tick_wrap() -> wait_tick() -> delay()",
+        ),
+        (
+            "arg",
+            r#"
+            fn slow([]u8 a) -> bool { delay(10ms); return true; }
+            fn reg(fn([]u8) -> bool _cb) {}
+            fn main() { reg(slow); }
+            "#,
+            "slow() -> delay()",
+        ),
+        (
+            "return",
+            r#"
+            fn slow([]u8 a) -> bool { delay(10ms); return true; }
+            fn get_cb() -> fn([]u8) -> bool { return slow; }
+            fn main() {}
+            "#,
+            "slow() -> delay()",
+        ),
+        (
+            "generic",
+            r#"
+            struct Box<T> { T cb; }
+            fn slow_u8(u8 _x) -> bool { delay(3ms); return true; }
+            fn take<T>(fn(T) -> bool _cb) {}
+            fn via_generic<T>(T _v) {
+                fn(u8) -> bool _h = slow_u8;
+            }
+            fn main() {
+                Box<fn(u8) -> bool> _b = Box<fn(u8) -> bool> { cb: slow_u8 };
+                take<u8>(slow_u8);
+                via_generic<u8>(1u8);
+            }
+            "#,
+            "delay()",
+        ),
+    ];
+
+    for (label, src, expected_chain) in blocking_cases {
+        let p = zev_parser::parse_str(src).unwrap();
+        let out = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            out.diagnostics.iter().any(|d| {
+                d.kind == DiagnosticKind::YieldInNoYield
+                    && d.message.contains("not yet supported through function pointers")
+                    && d.note.iter().any(|n| n.contains(expected_chain))
+            }),
+            "case '{label}' expected blocking fn-ptr error containing chain '{expected_chain}', got: {:?}",
+            out.diagnostics
+        );
+    }
+
+    // 2. Fallible (`error` and `error E`) targets rejected across locals, struct fields, arguments, returns,
+    //    casts to `*void`, and generic instantiations.
+    let fallible_cases = [
+        (
+            "local_typed",
+            r#"
+            enum Err { Bad }
+            fn f([]u8 _a) -> bool error Err { return true; }
+            fn main() { fn([]u8) -> bool _h = f; }
+            "#,
+        ),
+        (
+            "local_untyped",
+            r#"
+            fn f() error { error; }
+            fn main() { fn() _h = f; }
+            "#,
+        ),
+        (
+            "struct_field",
+            r#"
+            enum Err { Bad }
+            struct Cmd { fn([]u8) -> bool run; }
+            fn f([]u8 _a) -> bool error Err { return true; }
+            fn main() { Cmd _c = Cmd { run: f }; }
+            "#,
+        ),
+        (
+            "argument",
+            r#"
+            enum Err { Bad }
+            fn f(u8 _x) -> u8 error Err { return 1u8; }
+            fn reg(fn(u8) -> u8 _cb) {}
+            fn main() { reg(f); }
+            "#,
+        ),
+        (
+            "return_val",
+            r#"
+            enum Err { Bad }
+            fn f(u8 _x) -> u8 error Err { return 1u8; }
+            fn get_f() -> fn(u8) -> u8 { return f; }
+            fn main() {}
+            "#,
+        ),
+        (
+            "array_elem",
+            r#"
+            enum Err { Bad }
+            fn f() error Err { return; }
+            fn ok() {}
+            fn main() { [2]fn() _a = [ok, f]; }
+            "#,
+        ),
+        (
+            "generic_arg",
+            r#"
+            enum Err { Bad }
+            fn f_u8(u8 x) -> u8 error Err { return x; }
+            fn apply<T>(fn(T) -> T cb, T v) -> T { return cb(v); }
+            fn main() { u8 _v = apply<u8>(f_u8, 1u8); }
+            "#,
+        ),
+        (
+            "generic_local",
+            r#"
+            enum Err { Bad }
+            fn f_u8(u8 x) -> u8 error Err { return x; }
+            fn wrap<T>(T _v) { fn(u8) -> u8 _h = f_u8; }
+            fn main() { wrap<u8>(1u8); }
+            "#,
+        ),
+        (
+            "cast_void",
+            r#"
+            enum Err { Bad }
+            fn f() error Err { return; }
+            fn main() { *void _p = f as *void; }
+            "#,
+        ),
+    ];
+
+    for (label, src) in fallible_cases {
+        let p = zev_parser::parse_str(src).unwrap();
+        let out = analyze_and_monomorphize_programs(&[p], &AnalyzeOptions::default());
+        assert!(
+            !out.diagnostics.is_empty(),
+            "case '{label}' must reject fallible function assigned/passed to infallible pointer type"
+        );
+    }
+
+    // 3. Soft-yielding (`while` loop and `checkpoint()`) targets are accepted cleanly and routed to `noyield` clone.
+    let soft_src = r#"
+        fn soft_while(u32 n) -> u32 {
+            u32 s = 0u32;
+            u32 i = 0u32;
+            while (i < n) {
+                s += i;
+                i += 1u32;
+            }
+            return s;
+        }
+        struct Ops { fn(u32) -> u32 work; }
+        task sh() {
+            fn(u32) -> u32 h = soft_while;
+            Ops op = Ops { work: soft_while };
+            loop {
+                u32 _a = h(4u32);
+                u32 _b = (op.work)(4u32);
+                delay(1ms);
+            }
+        }
+        fn main() { spawn sh() @normal; }
+    "#;
+    let p_soft = zev_parser::parse_str(soft_src).unwrap();
+    let (model, diags) = analyze_and_monomorphize_programs(&[p_soft], &AnalyzeOptions::default())
+        .into_result()
+        .map(|m| (m, Vec::<zev_sema::Diagnostic>::new()))
+        .unwrap_or_else(|d| panic!("soft-yielding fn pointer must pass sema cleanly: {d:?}"));
+    assert!(diags.is_empty());
+    assert!(
+        model.1.soft_yielding_in_noyield.contains("soft_while"),
+        "soft_while should be scheduled for __noyield clone generation: {:?}",
+        model.1.soft_yielding_in_noyield
+    );
+}
