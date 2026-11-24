@@ -48,7 +48,7 @@ What `zevc` enforces and synthesizes from this file:
 - **Zero heap, single stack:** Every `spawn` in `main()`'s boot tree allocates a fixed `.bss` coroutine frame (`MAX_TASKS <= 32`), union-packing disjoint child frames and reporting worst-case SRAM + stack depth via `zevc ram`.
 - **Call-graph inferred yielding (no `async`/`.await`):** Functions are inferred as `NonYielding`, `SoftYielding` (auto-cloned as zero-`.bss` stack functions inside `noyield`), or `HardBlocking` (statically forbidden in `noyield`, `critical`, `isr`, and `defer`).
 - **Task/ISR & MMIO safety:** Raw mutable globals are rejected (`E0001`/`E0002`); `@ro`, `@wo`, and `@w1c` register rules prevent read-modify-write interrupt-clear bugs (`E0031`); `wait { ... }` polls and parks atomically across multiple primitives with zero lost wakeups.
-- **Defined runtime semantics:** Out-of-bounds array/slice/MMIO indexing and division by zero trap deterministically (`@__syn_panic`), variable bit-shifts mask by `(bit_width - 1)`, float-to-int casts saturate, `sys.trace_sleep(bool)` accepts sleep-tracing hooks alongside `sys.sleep_depth()` / `sys.wfi_count()` / `sys.set_idle`, and host simulation runs the exact same LLVM scheduler IR under Clang ASan+UBSan (`sys.fuzz_irqs`).
+- **Defined runtime semantics:** Out-of-bounds array/slice/MMIO indexing and division by zero trap deterministically (invoking any registered `sys.set_fault_handler` callback before halting), variable bit-shifts mask by `(bit_width - 1)`, float-to-int casts saturate, `sys.trace_sleep(bool)` accepts sleep-tracing hooks alongside `sys.sleep_depth()` / `sys.wfi_count()` / `sys.set_idle`, and host simulation runs the exact same LLVM scheduler IR under Clang ASan+UBSan (`sys.fuzz_irqs`).
 
 ---
 
@@ -73,7 +73,7 @@ Additional board-specific hardware demos in `examples/` exercise board periphera
 - **`zev-ast` / `zev-parser`**: Recursive-descent parser (`f32`/`f64`, `<T, usize N>` generics, canonical prefix types `*T` / `[]T` / `[N]T`, `f"..."` strings, `mmio`, `irq`, `wait { ... }`, `wait_queue`, and `P0001`–`P0018` diagnostics for common C/Rust/Go/Zig syntax habits).
 - **`zev-sema`**: Generic monomorphization, `import`/`pub` module resolution, 3-tier call-graph yield inference (`NonYielding`, `SoftYielding`, `HardBlocking`), Boot-Tree `spawn` (`MAX_TASKS <= 32`) / `irq.attach` checking, ISR isolation (`E0001`/`E0002`/`E0033`), constant shift range & `fmt_buf` bounds checking (`E0024`/`E0028`), per-arm `wait` lease scoping, and linear `Lease<T>` tracking (`E0034`).
 - **`zev-mir`**: Stackless state-machine lowering, liveness hoisting, disjoint child-frame `union` packing, unreachable function pruning, per-task non-yielding run-bound classification (`straight-line`, `bounded-for`, `noyield-spin`), and static SRAM budget reporting.
-- **`zev-codegen-llvm`**: Unified LLVM 23 IR backend driving `opt`, `llc`, and `ld.lld` across host `x86_64` sanitized simulation (`zevc run --sanitize` + `sys.fuzz_irqs`) and bare-metal ARM Cortex-M, RISC-V (`rv32imac`), and AVR targets configured via `chips/*.toml` and `boards/*.toml`, with defined `@__syn_panic` bounds/div-zero traps and bit-width-masked shifts.
+- **`zev-codegen-llvm`**: Unified LLVM 23 IR backend driving `opt`, `llc`, and `ld.lld` across host `x86_64` sanitized simulation (`zevc run --sanitize` + `sys.fuzz_irqs`) and bare-metal ARM Cortex-M, RISC-V (`rv32imac`), and AVR targets configured via `chips/*.toml` and `boards/*.toml`, with deterministic runtime traps for bounds checks and division by zero (`sys.set_fault_handler`) and bit-width-masked shifts.
 - **`zev-cli` (`zevc`)**: Unified compiler CLI, SVD-to-MMIO importer (`import-svd`), and offline documentation (`zevc doc`).
 
 ---
@@ -100,6 +100,7 @@ make check
 
 # Built-in offline language & error reference
 cargo run --quiet --bin zevc -- doc
+cargo run --quiet --bin zevc -- doc tutorial
 cargo run --quiet --bin zevc -- doc --list
 cargo run --quiet --bin zevc -- doc E0034
 

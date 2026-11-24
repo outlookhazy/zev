@@ -13,7 +13,7 @@ build:
 doc:
 	$(ZEVC) doc >/dev/null
 	$(ZEVC) doc --list >/dev/null
-	@for q in syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 P0013 P0014 P0015 P0016 P0017 P0018 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029 E0030 E0031 E0032 E0033 E0034; do \
+	@for q in tutorial syntax errors tasks yielding primitives dma runtime targets P0001 P0010 P0011 P0012 P0013 P0014 P0015 P0016 P0017 P0018 E0001 E0008 E0017 E0024 E0025 E0026 E0027 E0028 E0029 E0030 E0031 E0032 E0033 E0034; do \
 		$(ZEVC) doc $$q >/dev/null || exit 1; \
 	done
 	@CARGO_BIN="$(CARGO)" python3 -c 'import os, shutil, subprocess, sys, tempfile; \
@@ -27,7 +27,7 @@ cargo_bin = os.environ["CARGO_BIN"]; \
    for p in [os.path.join(td, f"f_{i}.zev")] \
    if (open(p, "w").write(src if "fn main(" in src else src + "\nfn main() {}\n") or True)], \
   shutil.rmtree(td, ignore_errors=True), \
-  print(f"OK (zevc doc primer, 8 topics, error explainers, and {len(fences)} markdown zev fences verified)")\
+  print(f"OK (zevc doc primer, 9 topics, error explainers, and {len(fences)} markdown zev fences verified)")\
 )'
 
 check:
