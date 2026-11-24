@@ -1,6 +1,6 @@
 use crate::error::ParseError;
 use crate::token::{LexedFormatPart, Token, TokenKind};
-use zev_ast::{DurationUnit, FormatSpec, PrimType, Span};
+use zev_ast::{DurationUnit, FormatAlign, FormatPadBase, FormatSpec, PrimType, Span};
 
 /// Tokenize `.zev` source code into a `Vec<Token>` ending with [`TokenKind::Eof`].
 pub fn lex(source: &str, filename: Option<&str>) -> Result<Vec<Token>, ParseError> {
@@ -1055,7 +1055,7 @@ impl<'a> Lexer<'a> {
                 .err_at("empty format specifier after `:`", span)
                 .with_doc_topic("syntax")
                 .with_hint(
-                    "supported specifiers: `:x`, `:X`, `:04x`, `:b`, `:08b`, `:.2`, `:e`, `:.2e`, `:?`",
+                    "supported specifiers: `:x`, `:X`, `:04x`, `:b`, `:08b`, `:.2`, `:e`, `:.2e`, `:>5`, `:<12`, `:05`, `:?`",
                 ));
         }
 
@@ -1065,6 +1065,68 @@ impl<'a> Lexer<'a> {
 
         if s == "e" || s == "E" {
             return Ok(FormatSpec::Sci { precision: None });
+        }
+
+        if let Some(pos) = s.find(['<', '>']) {
+            let align = if s.as_bytes()[pos] == b'<' {
+                FormatAlign::Left
+            } else {
+                FormatAlign::Right
+            };
+            let before = &s[..pos];
+            let mut zero_pad = match before {
+                "" | " " => false,
+                "0" => true,
+                _ => {
+                    return Err(self
+                        .err_at(
+                            format!("unsupported fill prefix in format specifier `:{s}` (only space or `'0'` is supported)"),
+                            span,
+                        )
+                        .with_doc_topic("syntax"));
+                }
+            };
+            let after_raw = &s[pos + 1..];
+            let (base, mut width_digits) = if let Some(d) = after_raw.strip_suffix('x') {
+                (FormatPadBase::Hex { upper: false }, d)
+            } else if let Some(d) = after_raw.strip_suffix('X') {
+                (FormatPadBase::Hex { upper: true }, d)
+            } else if let Some(d) = after_raw.strip_suffix('b') {
+                (FormatPadBase::Bin, d)
+            } else {
+                (FormatPadBase::Default, after_raw)
+            };
+            if before.is_empty() && width_digits.starts_with('0') && width_digits.len() >= 2 {
+                zero_pad = true;
+                width_digits = &width_digits[1..];
+            }
+            if width_digits.is_empty() || !width_digits.chars().all(|c| c.is_ascii_digit()) {
+                return Err(self
+                    .err_at(format!("invalid format width in specifier `:{s}`"), span)
+                    .with_doc_topic("syntax")
+                    .with_hint("examples: `{x:>5}`, `{s:<12}`, `{x:0>5}`, `{x:>6x}`, `{x:>8b}`"));
+            }
+            let w = width_digits.parse::<u8>().map_err(|_| {
+                self.err_at(
+                    format!("format width `{width_digits}` out of `u8` range"),
+                    span,
+                )
+                .with_doc_topic("syntax")
+            })?;
+            if w == 0 {
+                return Err(self
+                    .err_at(
+                        format!("invalid format specifier `:{s}` (width must be >= 1)"),
+                        span,
+                    )
+                    .with_doc_topic("syntax"));
+            }
+            return Ok(FormatSpec::Padded {
+                align: Some(align),
+                zero_pad,
+                width: w,
+                base,
+            });
         }
 
         if let Some(rest) = s.strip_prefix('.') {
@@ -1167,11 +1229,34 @@ impl<'a> Lexer<'a> {
             }
         }
 
+        if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+            let zero_pad = s.starts_with('0') && s.len() >= 2;
+            let digits = if zero_pad { &s[1..] } else { s };
+            let w = digits.parse::<u8>().map_err(|_| {
+                self.err_at(format!("format width `{s}` out of `u8` range"), span)
+                    .with_doc_topic("syntax")
+            })?;
+            if w == 0 {
+                return Err(self
+                    .err_at(
+                        format!("invalid format specifier `:{s}` (width must be >= 1)"),
+                        span,
+                    )
+                    .with_doc_topic("syntax"));
+            }
+            return Ok(FormatSpec::Padded {
+                align: None,
+                zero_pad,
+                width: w,
+                base: FormatPadBase::Default,
+            });
+        }
+
         Err(self
             .err_at(format!("unsupported format specifier `:{s}`"), span)
             .with_doc_topic("syntax")
             .with_hint(
-                "supported specifiers: `:x`, `:X`, `:04x`, `:b`, `:08b`, `:.2`, `:e`, `:.2e`, `:?`",
+                "supported specifiers: `:x`, `:X`, `:04x`, `:b`, `:08b`, `:.2`, `:e`, `:.2e`, `:>5`, `:<12`, `:05`, `:?`",
             ))
     }
 

@@ -662,7 +662,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{cp} = getelementptr inbounds i8, ptr {}, {usize_ty} {idx}",
                     p.repr
                 ));
-                self.emit_line(format!("{ch} = load i8, ptr {cp}, align 1"));
+                // `load volatile` keeps LLVM LoopIdiomRecognize from lowering the NUL scan to `@strlen` in `-nostdlib` builds.
+                self.emit_line(format!("{ch} = load volatile i8, ptr {cp}, align 1"));
                 self.emit_line(format!("{is_z} = icmp eq i8 {ch}, 0"));
                 self.emit_term(format!(
                     "br i1 {is_z}, label %{done_lbl}, label %{step_lbl}"

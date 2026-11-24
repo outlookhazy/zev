@@ -84,6 +84,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
         uses_floats: false,
         uses_fmt: false,
         uses_fmt_float_sci: false,
+        uses_fmt_pad: false,
         uses_rv_irqs: false,
         uses_sys_tick: false,
         uses_clock_hook: false,
@@ -413,9 +414,14 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
         for ch in chunks {
             match ch {
                 MirFmtChunk::Literal(_) => {}
-                MirFmtChunk::Int { value, bits, .. } => {
+                MirFmtChunk::Int {
+                    value, bits, fmt, ..
+                } => {
                     if *bits == 64 {
                         feat.uses_i64 = true;
+                    }
+                    if matches!(fmt, zev_mir::MirIntFmt::Padded { .. }) {
+                        feat.uses_fmt_pad = true;
                     }
                     scan_expr(value, feat);
                 }
@@ -427,6 +433,11 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                     scan_expr(value, feat);
                 }
                 MirFmtChunk::Bool(v) | MirFmtChunk::Str(v) | MirFmtChunk::Bytes(v) => {
+                    scan_expr(v, feat);
+                }
+                MirFmtChunk::PaddedStr { cstr: v, .. }
+                | MirFmtChunk::PaddedBytes { slice: v, .. } => {
+                    feat.uses_fmt_pad = true;
                     scan_expr(v, feat);
                 }
                 MirFmtChunk::EnumName { value, .. } => scan_expr(value, feat),
@@ -2027,7 +2038,9 @@ impl<'a> ModuleCtx<'a> {
             | MirFmtChunk::Float { value, .. }
             | MirFmtChunk::Bool(value)
             | MirFmtChunk::Str(value)
+            | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
+            | MirFmtChunk::PaddedBytes { slice: value, .. }
             | MirFmtChunk::EnumName { value, .. } => self.scan_expr_for_prims(value),
             MirFmtChunk::DebugSlice { slice, .. } => self.scan_expr_for_prims(slice),
             MirFmtChunk::Literal(_) => {}

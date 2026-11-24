@@ -2361,6 +2361,325 @@ impl<'a> CoroutineLowerCtx<'a> {
                         MirExpr::new(MirExprKind::StringLit("]".to_string()), slice_u8_ty.clone()),
                     );
                 }
+                MirFmtChunk::PaddedBytes { slice, pad } => {
+                    let raw_slice = slice;
+                    let s_var = self.alloc_temp("sink_pad_s", slice_u8_ty.clone());
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(s_var),
+                        op: MirAssignOp::Assign,
+                        value: raw_slice,
+                    });
+                    let slen_var = self.alloc_temp("sink_pad_len", MirType::Usize);
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(slen_var),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::SliceLen(Box::new(MirExpr::new(
+                                MirExprKind::Var(s_var),
+                                slice_u8_ty.clone(),
+                            ))),
+                            MirType::Usize,
+                        ),
+                    });
+                    let rem_var = self.alloc_temp("sink_pad_rem", MirType::Usize);
+                    let w_lit =
+                        MirExpr::new(MirExprKind::IntLit(i128::from(pad.width)), MirType::Usize);
+                    self.cur_stmts.push(MirStmt::If {
+                        cond: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Lt,
+                                lhs: Box::new(MirExpr::new(
+                                    MirExprKind::Var(slen_var),
+                                    MirType::Usize,
+                                )),
+                                rhs: Box::new(w_lit.clone()),
+                            },
+                            MirType::Bool,
+                        ),
+                        then_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(rem_var),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Sub,
+                                    lhs: Box::new(w_lit),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(slen_var),
+                                        MirType::Usize,
+                                    )),
+                                },
+                                MirType::Usize,
+                            ),
+                        }],
+                        else_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(rem_var),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
+                        }],
+                    });
+                    let emit_pad = |this: &mut Self| {
+                        let fill_str = if pad.zero_pad {
+                            "0000000000000000"
+                        } else {
+                            "                "
+                        };
+                        let hdr_bb = this.alloc_bb();
+                        let body_bb = this.alloc_bb();
+                        let done_bb = this.alloc_bb();
+                        this.seal_bb(MirTerminator::Goto(hdr_bb), hdr_bb, false);
+                        this.seal_bb(
+                            MirTerminator::Branch {
+                                cond: MirExpr::new(
+                                    MirExprKind::Binary {
+                                        op: MirBinOp::Gt,
+                                        lhs: Box::new(MirExpr::new(
+                                            MirExprKind::Var(rem_var),
+                                            MirType::Usize,
+                                        )),
+                                        rhs: Box::new(MirExpr::new(
+                                            MirExprKind::IntLit(0),
+                                            MirType::Usize,
+                                        )),
+                                    },
+                                    MirType::Bool,
+                                ),
+                                then_bb: body_bb,
+                                else_bb: done_bb,
+                            },
+                            body_bb,
+                            false,
+                        );
+                        let step_var = this.alloc_temp("sink_pad_step", MirType::Usize);
+                        this.cur_stmts.push(MirStmt::If {
+                            cond: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Gt,
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(rem_var),
+                                        MirType::Usize,
+                                    )),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::IntLit(16),
+                                        MirType::Usize,
+                                    )),
+                                },
+                                MirType::Bool,
+                            ),
+                            then_body: vec![MirStmt::Assign {
+                                target: MirPlace::Var(step_var),
+                                op: MirAssignOp::Assign,
+                                value: MirExpr::new(MirExprKind::IntLit(16), MirType::Usize),
+                            }],
+                            else_body: vec![MirStmt::Assign {
+                                target: MirPlace::Var(step_var),
+                                op: MirAssignOp::Assign,
+                                value: MirExpr::new(MirExprKind::Var(rem_var), MirType::Usize),
+                            }],
+                        });
+                        let pad_slice = MirExpr::new(
+                            MirExprKind::SubSlice {
+                                base: Box::new(MirExpr::new(
+                                    MirExprKind::StringLit(fill_str.to_string()),
+                                    slice_u8_ty.clone(),
+                                )),
+                                start: Box::new(MirExpr::new(
+                                    MirExprKind::IntLit(0),
+                                    MirType::Usize,
+                                )),
+                                end: Box::new(MirExpr::new(
+                                    MirExprKind::Var(step_var),
+                                    MirType::Usize,
+                                )),
+                                elem_ty: MirType::U8,
+                                base_is_array: false,
+                            },
+                            slice_u8_ty.clone(),
+                        );
+                        emit_chunk_write(this, pad_slice);
+                        this.cur_stmts.push(MirStmt::Assign {
+                            target: MirPlace::Var(rem_var),
+                            op: MirAssignOp::SubAssign,
+                            value: MirExpr::new(MirExprKind::Var(step_var), MirType::Usize),
+                        });
+                        this.seal_bb(MirTerminator::Goto(hdr_bb), done_bb, false);
+                    };
+                    if pad.left_align {
+                        emit_chunk_write(
+                            self,
+                            MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
+                        );
+                        emit_pad(self);
+                    } else {
+                        emit_pad(self);
+                        emit_chunk_write(
+                            self,
+                            MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
+                        );
+                    }
+                }
+                MirFmtChunk::PaddedStr { cstr, pad } => {
+                    let raw_slice = if let MirExprKind::StringLit(s) = cstr.kind {
+                        MirExpr::new(MirExprKind::StringLit(s), slice_u8_ty.clone())
+                    } else {
+                        MirExpr::new(
+                            MirExprKind::CStrToSlice(Box::new(cstr)),
+                            slice_u8_ty.clone(),
+                        )
+                    };
+                    let s_var = self.alloc_temp("sink_pad_s", slice_u8_ty.clone());
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(s_var),
+                        op: MirAssignOp::Assign,
+                        value: raw_slice,
+                    });
+                    let slen_var = self.alloc_temp("sink_pad_len", MirType::Usize);
+                    self.cur_stmts.push(MirStmt::Assign {
+                        target: MirPlace::Var(slen_var),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::SliceLen(Box::new(MirExpr::new(
+                                MirExprKind::Var(s_var),
+                                slice_u8_ty.clone(),
+                            ))),
+                            MirType::Usize,
+                        ),
+                    });
+                    let rem_var = self.alloc_temp("sink_pad_rem", MirType::Usize);
+                    let w_lit =
+                        MirExpr::new(MirExprKind::IntLit(i128::from(pad.width)), MirType::Usize);
+                    self.cur_stmts.push(MirStmt::If {
+                        cond: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Lt,
+                                lhs: Box::new(MirExpr::new(
+                                    MirExprKind::Var(slen_var),
+                                    MirType::Usize,
+                                )),
+                                rhs: Box::new(w_lit.clone()),
+                            },
+                            MirType::Bool,
+                        ),
+                        then_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(rem_var),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Sub,
+                                    lhs: Box::new(w_lit),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(slen_var),
+                                        MirType::Usize,
+                                    )),
+                                },
+                                MirType::Usize,
+                            ),
+                        }],
+                        else_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(rem_var),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
+                        }],
+                    });
+                    let emit_pad = |this: &mut Self| {
+                        let fill_str = if pad.zero_pad {
+                            "0000000000000000"
+                        } else {
+                            "                "
+                        };
+                        let hdr_bb = this.alloc_bb();
+                        let body_bb = this.alloc_bb();
+                        let done_bb = this.alloc_bb();
+                        this.seal_bb(MirTerminator::Goto(hdr_bb), hdr_bb, false);
+                        this.seal_bb(
+                            MirTerminator::Branch {
+                                cond: MirExpr::new(
+                                    MirExprKind::Binary {
+                                        op: MirBinOp::Gt,
+                                        lhs: Box::new(MirExpr::new(
+                                            MirExprKind::Var(rem_var),
+                                            MirType::Usize,
+                                        )),
+                                        rhs: Box::new(MirExpr::new(
+                                            MirExprKind::IntLit(0),
+                                            MirType::Usize,
+                                        )),
+                                    },
+                                    MirType::Bool,
+                                ),
+                                then_bb: body_bb,
+                                else_bb: done_bb,
+                            },
+                            body_bb,
+                            false,
+                        );
+                        let step_var = this.alloc_temp("sink_pad_step", MirType::Usize);
+                        this.cur_stmts.push(MirStmt::If {
+                            cond: MirExpr::new(
+                                MirExprKind::Binary {
+                                    op: MirBinOp::Gt,
+                                    lhs: Box::new(MirExpr::new(
+                                        MirExprKind::Var(rem_var),
+                                        MirType::Usize,
+                                    )),
+                                    rhs: Box::new(MirExpr::new(
+                                        MirExprKind::IntLit(16),
+                                        MirType::Usize,
+                                    )),
+                                },
+                                MirType::Bool,
+                            ),
+                            then_body: vec![MirStmt::Assign {
+                                target: MirPlace::Var(step_var),
+                                op: MirAssignOp::Assign,
+                                value: MirExpr::new(MirExprKind::IntLit(16), MirType::Usize),
+                            }],
+                            else_body: vec![MirStmt::Assign {
+                                target: MirPlace::Var(step_var),
+                                op: MirAssignOp::Assign,
+                                value: MirExpr::new(MirExprKind::Var(rem_var), MirType::Usize),
+                            }],
+                        });
+                        let pad_slice = MirExpr::new(
+                            MirExprKind::SubSlice {
+                                base: Box::new(MirExpr::new(
+                                    MirExprKind::StringLit(fill_str.to_string()),
+                                    slice_u8_ty.clone(),
+                                )),
+                                start: Box::new(MirExpr::new(
+                                    MirExprKind::IntLit(0),
+                                    MirType::Usize,
+                                )),
+                                end: Box::new(MirExpr::new(
+                                    MirExprKind::Var(step_var),
+                                    MirType::Usize,
+                                )),
+                                elem_ty: MirType::U8,
+                                base_is_array: false,
+                            },
+                            slice_u8_ty.clone(),
+                        );
+                        emit_chunk_write(this, pad_slice);
+                        this.cur_stmts.push(MirStmt::Assign {
+                            target: MirPlace::Var(rem_var),
+                            op: MirAssignOp::SubAssign,
+                            value: MirExpr::new(MirExprKind::Var(step_var), MirType::Usize),
+                        });
+                        this.seal_bb(MirTerminator::Goto(hdr_bb), done_bb, false);
+                    };
+                    if pad.left_align {
+                        emit_chunk_write(
+                            self,
+                            MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
+                        );
+                        emit_pad(self);
+                    } else {
+                        emit_pad(self);
+                        emit_chunk_write(
+                            self,
+                            MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
+                        );
+                    }
+                }
                 other_ch => {
                     let sl = chunk_to_slice_or_scalar_be(other_ch, scratch, self);
                     emit_chunk_write(self, sl);

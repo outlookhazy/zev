@@ -3112,4 +3112,114 @@ fn pick_bare() -> (fn(u8) -> u8) error {
             other => panic!("expected Fn pick_bare, got {other:?}"),
         }
     }
+
+    #[test]
+    fn item5_parses_width_and_alignment_format_specifiers() {
+        use zev_ast::{FormatAlign, FormatPadBase, FormatPart, FormatSpec};
+
+        let src = r#"
+fn main() {
+    i32 x = -7;
+    []u8 s = "led";
+    println(f"{x:>5}|{s:<12}|{x:05}|{x:0>5}|{x:>05}|{x:0<5}|{x:>6x}|{x:<6X}|{x:>8b}|{x:5}");
+}
+"#;
+        let prog = parse_str(src).expect("padded format specs should parse");
+        let ItemKind::Fn(f) = &prog.items[0].kind else {
+            panic!("expected main fn");
+        };
+        let StmtKind::Expr(expr) = &f.body.as_ref().unwrap().stmts[2].kind else {
+            panic!("expected println call");
+        };
+        let ExprKind::Call { args, .. } = &expr.kind else {
+            panic!("expected Call");
+        };
+        let ExprKind::FormatString(parts) = &args[0].value.kind else {
+            panic!("expected FormatString");
+        };
+        let specs: Vec<FormatSpec> = parts
+            .iter()
+            .filter_map(|p| match p {
+                FormatPart::Hole { spec, .. } => Some(*spec),
+                FormatPart::Literal(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            specs,
+            vec![
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Right),
+                    zero_pad: false,
+                    width: 5,
+                    base: FormatPadBase::Default,
+                },
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Left),
+                    zero_pad: false,
+                    width: 12,
+                    base: FormatPadBase::Default,
+                },
+                FormatSpec::Padded {
+                    align: None,
+                    zero_pad: true,
+                    width: 5,
+                    base: FormatPadBase::Default,
+                },
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Right),
+                    zero_pad: true,
+                    width: 5,
+                    base: FormatPadBase::Default,
+                },
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Right),
+                    zero_pad: true,
+                    width: 5,
+                    base: FormatPadBase::Default,
+                },
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Left),
+                    zero_pad: true,
+                    width: 5,
+                    base: FormatPadBase::Default,
+                },
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Right),
+                    zero_pad: false,
+                    width: 6,
+                    base: FormatPadBase::Hex { upper: false },
+                },
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Left),
+                    zero_pad: false,
+                    width: 6,
+                    base: FormatPadBase::Hex { upper: true },
+                },
+                FormatSpec::Padded {
+                    align: Some(FormatAlign::Right),
+                    zero_pad: false,
+                    width: 8,
+                    base: FormatPadBase::Bin,
+                },
+                FormatSpec::Padded {
+                    align: None,
+                    zero_pad: false,
+                    width: 5,
+                    base: FormatPadBase::Default,
+                },
+            ]
+        );
+
+        for bad in [
+            "fn main() { i32 x = 1; println(f\"{x:0}\"); }",
+            "fn main() { i32 x = 1; println(f\"{x:00}\"); }",
+            "fn main() { i32 x = 1; println(f\"{x:>0}\"); }",
+        ] {
+            let err = parse_str(bad).expect_err("zero width must be rejected");
+            assert!(
+                err.message.contains("width must be >= 1"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
 }

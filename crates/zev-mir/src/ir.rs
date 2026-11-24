@@ -590,6 +590,14 @@ pub enum MirStmt {
     ZeroTaskLocals,
 }
 
+/// Padding and alignment options for formatted integers and byte text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MirPadSpec {
+    pub left_align: bool,
+    pub zero_pad: bool,
+    pub width: u8,
+}
+
 /// Integer radix and zero-padding format mode for [`MirFmtChunk::Int`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MirIntFmt {
@@ -599,6 +607,12 @@ pub enum MirIntFmt {
     Hex { upper: bool, zero_pad_width: u8 },
     /// Base-2 binary (`{x:b}`, `{x:08b}`).
     Bin { zero_pad_width: u8 },
+    /// General width/alignment-padded integer formatting (`{x:>5}`, `{x:<12}`, `{x:05}`, `{x:>6x}`, ...).
+    Padded {
+        base: u8,
+        upper: bool,
+        pad: MirPadSpec,
+    },
 }
 
 /// Floating-point format mode for [`MirFmtChunk::Float`].
@@ -636,8 +650,12 @@ pub enum MirFmtChunk {
     Bool(MirExpr),
     /// Null-terminated string literal or `*u8` pointer.
     Str(MirExpr),
+    /// Padded/aligned NUL-terminated `*u8` / string literal (`{s:>8}`, `{s:<12}`).
+    PaddedStr { cstr: MirExpr, pad: MirPadSpec },
     /// Raw `[]u8` byte slice written verbatim (`{slice}`).
     Bytes(MirExpr),
+    /// Padded/aligned `[]u8` / `[N]u8` byte slice (`{name:<12}`).
+    PaddedBytes { slice: MirExpr, pad: MirPadSpec },
     /// Enum variant name (`f"{err}"` -> `"BadCrc"`). `enum_name` is also recorded in `MirModule.formatted_enums`.
     EnumName { enum_name: String, value: MirExpr },
     /// Debug-formatted primitive slice `[e0, e1, ...]` (`{slice:?}` or `{arr:?}`).

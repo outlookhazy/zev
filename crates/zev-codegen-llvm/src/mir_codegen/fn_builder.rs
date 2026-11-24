@@ -2895,6 +2895,54 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                             ));
                         }
                     }
+                    MirIntFmt::Padded { base, upper, pad } => {
+                        let up = i32::from(*upper);
+                        let w = i32::from(pad.width);
+                        let la = i32::from(pad.left_align);
+                        let zp = i32::from(pad.zero_pad);
+                        let lf = if pad.zero_pad { 48 } else { 32 };
+                        let b = i32::from(*base);
+                        let ptr64 = self.ctx.spec.isa.ptr_bits() == 64;
+                        let is64 = *bits == 64 || (*bits == 0 && ptr64);
+                        if *base == 10 {
+                            let sg = i32::from(*signed);
+                            if is64 {
+                                let v64 = self.coerce(vv, "i64", *signed);
+                                self.emit_line(format!(
+                                    "{call_kw} void @__syn_fmt_int64_pad(ptr {sink}, i64 {}, i8 {sg}, i32 {b}, i8 {up}, i32 {w}, i8 {la}, i8 {zp}, i8 {lf})",
+                                    v64.repr
+                                ));
+                            } else {
+                                let v32 = self.coerce(vv, "i32", *signed);
+                                self.emit_line(format!(
+                                    "{call_kw} void @__syn_fmt_int32_pad(ptr {sink}, i32 {}, i8 {sg}, i32 {b}, i8 {up}, i32 {w}, i8 {la}, i8 {zp}, i8 {lf})",
+                                    v32.repr
+                                ));
+                            }
+                        } else {
+                            let narrow_ty = match *bits {
+                                8 => "i8",
+                                16 => "i16",
+                                32 => "i32",
+                                64 => "i64",
+                                _ => usize_ty.as_str(),
+                            };
+                            let nv = self.coerce(vv, narrow_ty, false);
+                            if narrow_ty == "i64" || (narrow_ty == usize_ty && ptr64) {
+                                let v64 = self.coerce(nv, "i64", false);
+                                self.emit_line(format!(
+                                    "{call_kw} void @__syn_fmt_int64_pad(ptr {sink}, i64 {}, i8 0, i32 {b}, i8 {up}, i32 {w}, i8 {la}, i8 {zp}, i8 {lf})",
+                                    v64.repr
+                                ));
+                            } else {
+                                let u32v = self.coerce(nv, "i32", false);
+                                self.emit_line(format!(
+                                    "{call_kw} void @__syn_fmt_int32_pad(ptr {sink}, i32 {}, i8 0, i32 {b}, i8 {up}, i32 {w}, i8 {la}, i8 {zp}, i8 {lf})",
+                                    u32v.repr
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             MirFmtChunk::Float { value, is_f64, fmt } => {
@@ -2951,6 +2999,17 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     p.repr
                 ));
             }
+            MirFmtChunk::PaddedStr { cstr, pad } => {
+                let vv = self.emit_expr(cstr)?;
+                let p = self.coerce_str_ptr(vv);
+                let w = i32::from(pad.width);
+                let la = i32::from(pad.left_align);
+                let fill = if pad.zero_pad { 48 } else { 32 };
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_fmt_cstr_pad(ptr {sink}, ptr {}, i32 {w}, i8 {la}, i8 {fill})",
+                    p.repr
+                ));
+            }
             MirFmtChunk::Bytes(value) => {
                 let sl_ty = format!("{{ ptr, {usize_ty} }}");
                 let sv = self.emit_expr(value)?;
@@ -2961,6 +3020,22 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let dl32 = self.coerce(SsaVal::new(&usize_ty, dl), "i32", false);
                 self.emit_line(format!(
                     "{call_kw} void @__syn_fmt_bytes(ptr {sink}, ptr {dp}, i32 {})",
+                    dl32.repr
+                ));
+            }
+            MirFmtChunk::PaddedBytes { slice, pad } => {
+                let sl_ty = format!("{{ ptr, {usize_ty} }}");
+                let sv = self.emit_expr(slice)?;
+                let dp = self.next_tmp();
+                let dl = self.next_tmp();
+                self.emit_line(format!("{dp} = extractvalue {sl_ty} {}, 0", sv.repr));
+                self.emit_line(format!("{dl} = extractvalue {sl_ty} {}, 1", sv.repr));
+                let dl32 = self.coerce(SsaVal::new(&usize_ty, dl), "i32", false);
+                let w = i32::from(pad.width);
+                let la = i32::from(pad.left_align);
+                let fill = if pad.zero_pad { 48 } else { 32 };
+                self.emit_line(format!(
+                    "{call_kw} void @__syn_fmt_bytes_pad(ptr {sink}, ptr {dp}, i32 {}, i32 {w}, i8 {la}, i8 {fill})",
                     dl32.repr
                 ));
             }

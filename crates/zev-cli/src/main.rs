@@ -5630,4 +5630,187 @@ task verify_done() {
             qres.stdout
         );
     }
+
+    #[test]
+    fn item5_width_and_alignment_host_and_qemu_all_sinks() {
+        let temp = TempWorkDir::create("item5_width_align").unwrap();
+        let app_path = temp.dir.join("app.zev");
+        let src = r#"
+import board;
+
+byte_ring<256> out_ring;
+signal done_sig;
+
+struct MemSink {
+    [256]u8 buf;
+    usize len;
+}
+
+impl MemSink {
+    pub fn write(*self, []u8 bytes) {
+        for (u8 b in bytes) {
+            if (self.len < 256) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+
+    pub fn view(*self) -> []u8 {
+        return self.buf[0..self.len];
+    }
+}
+
+struct YieldSink {
+    [256]u8 buf;
+    usize len;
+}
+
+impl YieldSink {
+    pub fn write(*self, []u8 bytes) {
+        for (u8 b in bytes) {
+            if (self.len < 256) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+        delay(1ms);
+    }
+
+    pub fn view(*self) -> []u8 {
+        return self.buf[0..self.len];
+    }
+}
+
+fn check_int_and_text_formatting() {
+    i32 p = 3;
+    i32 neg = -7;
+    i32 big = 123456;
+    i32 min32 = (-2147483647i32) - 1i32;
+    u32 hx = 26u32;
+    u8 bn = 5u8;
+    []u8 dyn = "abc";
+    [4]u8 arr = ['x', 'y', 'z', '!'];
+    *u8 cptr = "ok";
+
+    []u8 expected = "    3|   -7|-7   |00003|-0007|-0007|    3|123456|-2147483648|   1a|1A   |0001a|   101|101   |hi    |    hi|0000hi|toolong|abc  |  abc|xyz!  |  ok";
+
+    // 1. fmt_buf
+    [256]u8 fb;
+    []u8 fb_out = fmt_buf(
+        fb,
+        f"{p:>5}|{neg:>5}|{neg:<5}|{p:05}|{neg:05}|{neg:0>5}|{p:5}|{big:>4}|{min32:>6}|{hx:>5x}|{hx:<5X}|{hx:>05x}|{bn:>6b}|{bn:<6b}|{"hi":<6}|{"hi":>6}|{"hi":0>6}|{"toolong":<4}|{dyn:<5}|{dyn:>5}|{arr:<6}|{cptr:>4}"
+    ) or fb[0..0];
+    assert(fb_out == expected);
+
+    // 2. fmt_ring
+    usize rn = fmt_ring(
+        &out_ring,
+        f"{p:>5}|{neg:>5}|{neg:<5}|{p:05}|{neg:05}|{neg:0>5}|{p:5}|{big:>4}|{min32:>6}|{hx:>5x}|{hx:<5X}|{hx:>05x}|{bn:>6b}|{bn:<6b}|{"hi":<6}|{"hi":>6}|{"hi":0>6}|{"toolong":<4}|{dyn:<5}|{dyn:>5}|{arr:<6}|{cptr:>4}"
+    ) or 0;
+    assert(rn == expected.len);
+    [256]u8 rtmp;
+    usize popped = out_ring.pop(rtmp);
+    assert(rtmp[0..popped] == expected);
+
+    // 3. Non-yielding user sink
+    MemSink ms;
+    ms.len = 0;
+    print(
+        ms,
+        f"{p:>5}|{neg:>5}|{neg:<5}|{p:05}|{neg:05}|{neg:0>5}|{p:5}|{big:>4}|{min32:>6}|{hx:>5x}|{hx:<5X}|{hx:>05x}|{bn:>6b}|{bn:<6b}|{"hi":<6}|{"hi":>6}|{"hi":0>6}|{"toolong":<4}|{dyn:<5}|{dyn:>5}|{arr:<6}|{cptr:>4}"
+    );
+    assert(ms.view() == expected);
+
+    // 4. Console println sink (verified directly in stdout)
+    println(f"CON:{p:>5}|{neg:05}|{dyn:<6}|{"hi":>4}|{hx:>4x}|{bn:>5b}|{"toolong":<4}");
+}
+
+task yielding_sink_driver() {
+    []u8 dyn = "abc";
+    *u8 cptr = "ok";
+    [4]u8 arr = ['w', 'x', 'y', 'z'];
+    YieldSink ys;
+    ys.len = 0;
+    print(ys, f"{-7:05}|{-7:>5}|{dyn:<5}|{"hi":>5}|{"toolong":<4}|{arr:<6}|{cptr:>4}");
+    assert(ys.view() == "-0007|   -7|abc  |   hi|toolong|wxyz  |  ok");
+    println("YIELD_PAD_OK");
+    done_sig.notify();
+    loop {
+        delay(100ms);
+    }
+}
+
+fn main() {
+    board.init();
+    check_int_and_text_formatting();
+    spawn yielding_sink_driver() @normal;
+    spawn verifier() @low;
+}
+
+task verifier() {
+    loop {
+        done_sig.wait();
+        println("ITEM5_PAD_ALL_OK");
+        sys.exit(0);
+    }
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "host failed: {stdout}");
+        assert!(
+            stdout.contains("CON:    3|-0007|abc   |  hi|  1a|  101|toolong"),
+            "host stdout={stdout:?}"
+        );
+        assert!(
+            stdout.contains("ITEM5_PAD_ALL_OK"),
+            "host stdout={stdout:?}"
+        );
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("item5_pad.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout
+                .contains("CON:    3|-0007|abc   |  hi|  1a|  101|toolong"),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+        assert!(
+            qres.stdout.contains("ITEM5_PAD_ALL_OK"),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
 }

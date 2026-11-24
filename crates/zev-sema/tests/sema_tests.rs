@@ -8167,3 +8167,124 @@ fn main() { spawn t1(&R) @normal; spawn t2(&R) @low; }
         "expected E0004 single-producer error via user sink `println(s, ...)`, got OK:\n{ring_msgs}"
     );
 }
+
+#[test]
+fn item5_width_and_alignment_sema_static_fit_and_type_checks() {
+    // 1. E0028 static overflow when padded width exceeds destination buffer
+    let e_u8_too_small = analyze_and_monomorphize_programs(
+        &[zev_parser::parse_str(
+            "fn main() { u8 x = 3; [4]u8 buf; []u8 _out = fmt_buf(buf, f\"{x:>5}\") or buf[0..0]; }",
+        )
+        .unwrap()],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        e_u8_too_small
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::FormatBufferTooSmall),
+        "expected E0028 for u8:>5 into [4]u8, got {:?}",
+        e_u8_too_small.diagnostics
+    );
+
+    let e_slice_min_too_small = analyze_and_monomorphize_programs(
+        &[zev_parser::parse_str(
+            "fn f([]u8 s) -> usize { [4]u8 buf; []u8 r = fmt_buf(buf, f\"{s:<5}\") or buf[0..0]; return r.len; } fn main() {}",
+        )
+        .unwrap()],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        e_slice_min_too_small
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::FormatBufferTooSmall),
+        "expected E0028 for []u8:<5 into [4]u8, got {:?}",
+        e_slice_min_too_small.diagnostics
+    );
+
+    let e_ring_too_small = analyze_and_monomorphize_programs(
+        &[zev_parser::parse_str(
+            "byte_ring<4> R;\nfn main() { []u8 s = \"a\"; usize _n = fmt_ring(&R, f\"{s:<5}\") or 0; }",
+        )
+        .unwrap()],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        e_ring_too_small
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::FormatBufferTooSmall),
+        "expected E0028 for []u8:<5 into byte_ring<4>, got {:?}",
+        e_ring_too_small.diagnostics
+    );
+
+    // 2. Proven-fit without catch/or: u8:>5 fits in [5]u8; [4]u8:<12 fits in [12]u8
+    let ok_fit = analyze_and_monomorphize_programs(
+        &[zev_parser::parse_str(
+            r#"
+fn main() {
+    u8 x = 3;
+    [5]u8 b1;
+    []u8 _o1 = fmt_buf(b1, f"{x:>5}");
+    [4]u8 arr = ['a', 'b', 'c', 'd'];
+    [12]u8 b2;
+    []u8 _o2 = fmt_buf(b2, f"{arr:<12}");
+}
+"#,
+        )
+        .unwrap()],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        ok_fit.diagnostics.is_empty(),
+        "expected proven-fit padded fmt_buf without catch/or, got {:?}",
+        ok_fit.diagnostics
+    );
+
+    // 3. Zero-padded alignment `{s:0>5}` and `{s:0<5}` are accepted for text,
+    //    while numeric `{s:05}`, `{s:>4x}`, `{true:>5}`, `{1.5f32:>5}` are rejected.
+    let ok_text_zero_fill = analyze_and_monomorphize_programs(
+        &[
+            zev_parser::parse_str("fn main() { []u8 s = \"hi\"; println(f\"{s:0>5}|{s:0<5}\"); }")
+                .unwrap(),
+        ],
+        &AnalyzeOptions::default(),
+    );
+    assert!(
+        ok_text_zero_fill.diagnostics.is_empty(),
+        "expected {{s:0>5}} and {{s:0<5}} to succeed, got {:?}",
+        ok_text_zero_fill.diagnostics
+    );
+
+    for (label, src) in [
+        (
+            "text_bare_05",
+            "fn main() { []u8 s = \"hi\"; println(f\"{s:05}\"); }",
+        ),
+        (
+            "text_hex_pad",
+            "fn main() { []u8 s = \"hi\"; println(f\"{s:>4x}\"); }",
+        ),
+        (
+            "bool_width",
+            "fn main() { bool b = true; println(f\"{b:>5}\"); }",
+        ),
+        (
+            "float_width",
+            "fn main() { f32 f = 1.5f32; println(f\"{f:>5}\"); }",
+        ),
+    ] {
+        let res = analyze_and_monomorphize_programs(
+            &[zev_parser::parse_str(src).unwrap()],
+            &AnalyzeOptions::default(),
+        );
+        assert!(
+            res.diagnostics
+                .iter()
+                .any(|d| d.kind == DiagnosticKind::TypeMismatch),
+            "{label}: expected TypeMismatch, got {:?}",
+            res.diagnostics
+        );
+    }
+}

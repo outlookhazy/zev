@@ -1603,7 +1603,9 @@ fn fold_fmt_chunks_run(
             | MirFmtChunk::Float { value, .. }
             | MirFmtChunk::Bool(value)
             | MirFmtChunk::Str(value)
+            | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
+            | MirFmtChunk::PaddedBytes { slice: value, .. }
             | MirFmtChunk::EnumName { value, .. } => {
                 fold_expr_run(value, fn_map, cache, visiting, kind, extra_blocks);
             }
