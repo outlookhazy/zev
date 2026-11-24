@@ -1,0 +1,43 @@
+# WCH CH32V307 (QingKe V4F RISC-V, 256 KB Flash / 64 KB SRAM) Chip Target Specification
+#
+# Built as rv32imac (soft-float): the core also implements `F`, which is left unused until the
+# backend passes a float ABI and saves FP registers on interrupt entry.
+
+[chip]
+name = "ch32v307"
+isa = "riscv32"
+cpu = "generic-rv32"
+features = "+m,+a,+c"
+triple = "riscv32-unknown-none-elf"
+datalayout = "e-m:e-p:32:32-i64:64-n32-S128"
+ptr_bits = 32
+opt_level = "-O2"
+hal_dir = "hal/ch32v3"
+# QingKe V4 documents WFI wake-up only through an interrupt taken by PFIC; whether a pending
+# interrupt wakes the core while `mstatus.MIE` is clear (which the masked-`wfi` idle relies on)
+# is unverified on hardware, so idle polls until that is confirmed.
+allow_wfi = false
+
+[memory]
+# Code flash is programmed at 0x0800_0000 and aliased at 0x0000_0000, where the core starts.
+flash_base = 0x0800_0000
+flash_size = 262144
+ram_base = 0x2000_0000
+ram_size = 65536
+stack_reserve_bytes = 1024
+
+[irq]
+# PFIC dispatches by interrupt number: the vector slot IS the interrupt number, there are more
+# than 32 of them, and the core has no `mie` CSR (lines are enabled in PFIC by the route hook).
+model = "riscv-vectored"
+routing = "identity"
+enable_csr = "none"
+vector_slots = 104
+max_irq_source = 103
+# NMI (2), EXC (3), Ecall-M (5), Ecall-U (8) and Breakpoint (9) enter the exception trampoline.
+exception_slots = [2, 3, 5, 8, 9]
+# Unassigned core slots. SysTick (12) and Software (14) remain attachable.
+reserved_slots = [0, 1, 4, 6, 7, 10, 11, 13, 15]
+
+[image]
+format = "raw-bin"

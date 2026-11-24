@@ -801,6 +801,18 @@ zevc ram --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
 zevc build --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev -o build/nucleo_f334r8_demo.elf
 zevc flash --board nucleo_f334r8 examples/nucleo_f334r8_demo.zev
 ```
+
+## 11. WCH CH32V307 / YD-CH32V307VCT6 (`yd_ch32v307`, QingKe V4F `riscv32imac`) — bring-up, untested on hardware
+Reuses the `riscv32` backend with `[irq] routing = \"identity\"` and `enable_csr = \"none\"`: the PFIC
+interrupt number is the vector slot (104 slots) and the core has no `mie` CSR, so lines are enabled by
+`route_irq` in `.zev`. Built soft-float; idle polls (`allow_wfi = false`). The 8 MHz HSI bring-up clock,
+core-timer `sys.set_clock_ms`, and `115200 8N1` `USART1` on `PA9` (`sys.set_putc`) live in `.zev`.
+Flash over the chip's USB bootloader: hold `BOOT0`, tap `RST`, release, then:
+```bash
+zevc build --board yd_ch32v307 examples/ch32v307_blink.zev -o build/ch32v307_blink.bin
+zevc flash --board yd_ch32v307 examples/ch32v307_blink.zev      # runs `wchisp flash <image>`
+zevc flash --board yd_ch32v307 examples/ch32v307_demo.zev       # button interrupt via PFIC
+```
 ",
     },
 ];

@@ -67,6 +67,53 @@ pub fn assign_rv_irq_routes(
         .collect())
 }
 
+/// Identity routing for interrupt controllers that dispatch by interrupt number (`PFIC`, `CLIC`):
+/// each attached source uses the vector slot equal to its own number, so no slot is shared and
+/// nothing is remapped. Reserved and exception slots cannot be attached.
+pub fn assign_rv_identity_irq_routes(
+    vectors: &[zev_mir::MirIrqVector],
+    max_irq_source: u32,
+    vector_slots: u32,
+    reserved_slots: &[u32],
+    exception_slots: &[u32],
+) -> Result<Vec<RvIrqRoute>, CodegenError> {
+    let mut unique_srcs = BTreeSet::new();
+    for v in vectors {
+        if v.irq_num > max_irq_source || v.irq_num >= vector_slots {
+            return Err(CodegenError::new(
+                "llvm-ir",
+                format!(
+                    "RISC-V IRQ number {} is outside the chip's vector table (`[irq].max_irq_source` = {max_irq_source}, `vector_slots` = {vector_slots})",
+                    v.irq_num
+                ),
+            ));
+        }
+        if reserved_slots.contains(&v.irq_num) || exception_slots.contains(&v.irq_num) {
+            return Err(CodegenError::new(
+                "llvm-ir",
+                format!(
+                    "RISC-V IRQ number {} is a reserved or exception vector slot on this chip and cannot be attached",
+                    v.irq_num
+                ),
+            ));
+        }
+        unique_srcs.insert(v.irq_num);
+    }
+    unique_srcs
+        .into_iter()
+        .map(|src_id| {
+            u8::try_from(src_id)
+                .map(|cpu_slot| RvIrqRoute { src_id, cpu_slot })
+                .map_err(|_| {
+                    CodegenError::new(
+                        "llvm-ir",
+                        format!("RISC-V IRQ number {src_id} does not fit an 8-bit vector slot"),
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Convenience helper deriving `assign_rv_irq_routes` directly from `TargetSpec`.
 pub fn assign_rv_irq_routes_for_spec(
     vectors: &[zev_mir::MirIrqVector],
@@ -77,7 +124,22 @@ pub fn assign_rv_irq_routes_for_spec(
             vector_slots,
             max_irq_source,
             reserved_slots,
-        } => assign_rv_irq_routes(vectors, *max_irq_source, *vector_slots, reserved_slots),
+            identity_routing,
+            exception_slots,
+            ..
+        } => {
+            if *identity_routing {
+                assign_rv_identity_irq_routes(
+                    vectors,
+                    *max_irq_source,
+                    *vector_slots,
+                    reserved_slots,
+                    exception_slots,
+                )
+            } else {
+                assign_rv_irq_routes(vectors, *max_irq_source, *vector_slots, reserved_slots)
+            }
+        }
         _ => Ok(Vec::new()),
     }
 }
@@ -226,11 +288,21 @@ fn emit_riscv32_irq_vectors_ir(
         return;
     }
 
+    let (write_mie, exception_slots): (bool, &[u32]) = match &spec.irq {
+        IrqModel::RiscvVectored {
+            write_mie,
+            exception_slots,
+            ..
+        } => (*write_mie, exception_slots.as_slice()),
+        _ => (true, &[0]),
+    };
+
     let mut by_slot: BTreeMap<u8, Vec<u32>> = BTreeMap::new();
     let mut enable_mask: u32 = 0;
     for r in routes {
         by_slot.entry(r.cpu_slot).or_default().push(r.src_id);
-        enable_mask |= 1u32 << u32::from(r.cpu_slot);
+        // Only meaningful with `enable_csr = "mie"`, where the spec caps slots at 32.
+        enable_mask |= 1u32.checked_shl(u32::from(r.cpu_slot)).unwrap_or(0);
     }
 
     let tramp_sec = if spec.iram_in_data { ".iram1" } else { ".text" };
@@ -254,10 +326,13 @@ fn emit_riscv32_irq_vectors_ir(
     let _ = writeln!(out, "module asm \"__syn_rv_vector_table:\"");
     let _ = writeln!(out, "module asm \"  .option push\"");
     let _ = writeln!(out, "module asm \"  .option norvc\"");
-    let _ = writeln!(out, "module asm \"  j __syn_rv_exc_tramp\"");
-    for slot in 1..vector_slots {
-        let slot_u8 = slot as u8;
-        if by_slot.contains_key(&slot_u8) {
+    for slot in 0..vector_slots {
+        let attached = u8::try_from(slot)
+            .ok()
+            .filter(|slot_u8| by_slot.contains_key(slot_u8));
+        if exception_slots.contains(&slot) {
+            let _ = writeln!(out, "module asm \"  j __syn_rv_exc_tramp\"");
+        } else if let Some(slot_u8) = attached {
             let _ = writeln!(out, "module asm \"  j __syn_rv_irq_tramp_{slot_u8}\"");
         } else {
             let _ = writeln!(out, "module asm \"  j __syn_rv_unhandled_irq\"");
@@ -364,6 +439,14 @@ define void @__syn_rv_unhandled_irq() naked nounwind{tramp_sec_attr} {{
     }
     let mie_mask: u32 = enable_mask | (1u32 << 11);
     let mie_mask_i32 = mie_mask as i32;
+    // Cores without a `mie` CSR fault on the write; their lines are enabled by the route hook.
+    let mie_write_ir = if write_mie {
+        format!(
+            "  call void asm sideeffect \"csrw mie, $0\", \"r,~{{memory}}\"(i32 {mie_mask_i32})\n"
+        )
+    } else {
+        String::new()
+    };
     let _ = writeln!(
         out,
         r#"define void @__syn_rv_irq_init() nounwind{sz} {{
@@ -371,8 +454,7 @@ entry:
 {route_calls}  %vt_a = ptrtoint ptr @__syn_rv_vector_table to i32
   %mtvec_v = or i32 %vt_a, 1
   call void asm sideeffect "csrw mtvec, $0", "r,~{{memory}}"(i32 %mtvec_v)
-  call void asm sideeffect "csrw mie, $0", "r,~{{memory}}"(i32 {mie_mask_i32})
-  ret void
+{mie_write_ir}  ret void
 }}
 "#
     );
@@ -387,7 +469,8 @@ pub fn emit_riscv32_hal_ir(
     enable_irqs: bool,
     can_wfi_on_deadline: bool,
 ) {
-    let idle_sleep_ir = if !enable_irqs {
+    // `allow_wfi = false` keeps the polling idle even with interrupts attached.
+    let idle_sleep_ir = if !enable_irqs || !spec.allow_wfi {
         r#"define void @__syn_idle_sleep() nounwind{sz} {{
 entry:
   %locks = load volatile i32, ptr @__syn_sleep_lock_mask, align 4

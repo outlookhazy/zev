@@ -1,0 +1,52 @@
+// CH32V307 Interrupt Demo: Button Interrupt + Heartbeat Task
+//
+// Second step after `ch32v307_blink.zev`. It exercises the PFIC interrupt path: the user button
+// (PB3, EXTI line 3) raises an interrupt whose handler notifies a task, which toggles LED2 and
+// reports the press. LED1 keeps a steady heartbeat from a periodic task.
+//
+//   zevc flash --board yd_ch32v307 examples/ch32v307_demo.zev
+
+import board;
+import chip.ch32v30x as hw;
+
+signal button_pressed;
+watch<u32> press_count = 0;
+
+isr on_button(*hw.ExtiRegs exti) {
+    state u32 presses = 0;
+    exti.intfr = 1u32 << 3;                 // write-1-to-clear the line 3 pending flag
+    presses += 1;
+    press_count.publish(presses);
+    button_pressed.notify(boost: @high);
+}
+
+task heartbeat() {
+    u32 beat = 0;
+    loop every 500ms {
+        beat += 1;
+        board.toggle_led();
+        if ((beat & 1) == 0) {
+            println(f"[DEMO] beat={beat / 2} t={sys.now_ms()}ms presses={press_count.read()}");
+        }
+    }
+}
+
+task button_task() {
+    loop {
+        button_pressed.wait();
+        board.toggle_led2();
+        println(f"[DEMO] button interrupt #{press_count.read()}");
+        delay(30ms);                        // crude debounce
+    }
+}
+
+fn main() {
+    board.init();
+    println(f"[DEMO board={board.BOARD_NAME}] boot");
+
+    board.button_irq_enable();
+    hw.IRQ_EXTI3.attach(on_button(hw.EXTI));
+
+    spawn heartbeat() @normal;
+    spawn button_task() @high;
+}

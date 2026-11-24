@@ -1,0 +1,224 @@
+// WCH CH32V30x (QingKe V4F RISC-V) Typed MMIO Register Map, PFIC Interrupt Numbers & Routing
+//
+// Register offsets, bit positions and interrupt numbers follow WCH's CH32V30x reference
+// material (`ch32v30x.h`, `core_riscv.h`, QingKe V4 Processor Manual V1.2).
+
+// ── Reset & Clock Control ───────────────────────────────────────────────────
+pub mmio RccRegs {
+    @rw u32 ctlr      @ 0x00;
+    @rw u32 cfgr0     @ 0x04;
+    @rw u32 intr      @ 0x08;
+    @rw u32 apb2prstr @ 0x0C;
+    @rw u32 apb1prstr @ 0x10;
+    @rw u32 ahbpcenr  @ 0x14;
+    @rw u32 apb2pcenr @ 0x18;
+    @rw u32 apb1pcenr @ 0x1C;
+    @rw u32 bdctlr    @ 0x20;
+    @rw u32 rstsckr   @ 0x24;
+    @rw u32 ahbrstr   @ 0x28;
+    @rw u32 cfgr2     @ 0x2C;
+}
+
+// ── GPIO (STM32F1-style 4-bit MODE/CNF configuration nibbles) ───────────────
+pub mmio GpioRegs {
+    @rw u32 cfglr @ 0x00;
+    @rw u32 cfghr @ 0x04;
+    @ro u32 indr  @ 0x08;
+    @rw u32 outdr @ 0x0C;
+    @wo u32 bshr  @ 0x10;
+    @wo u32 bcr   @ 0x14;
+    @rw u32 lckr  @ 0x18;
+}
+
+pub mmio AfioRegs {
+    @rw u32    ecr    @ 0x00;
+    @rw u32    pcfr1  @ 0x04;
+    @rw [4]u32 exticr @ 0x08;
+    @rw u32    pcfr2  @ 0x1C;
+}
+
+pub mmio ExtiRegs {
+    @rw  u32 intenr @ 0x00;
+    @rw  u32 evenr  @ 0x04;
+    @rw  u32 rtenr  @ 0x08;
+    @rw  u32 ftenr  @ 0x0C;
+    @rw  u32 swievr @ 0x10;
+    @w1c u32 intfr  @ 0x14;
+}
+
+// ── USART (16-bit registers on 4-byte spacing) ──────────────────────────────
+pub mmio UsartRegs {
+    @rw u16 statr @ 0x00;
+    @rw u16 datar @ 0x04;
+    @rw u16 brr   @ 0x08;
+    @rw u16 ctlr1 @ 0x0C;
+    @rw u16 ctlr2 @ 0x10;
+    @rw u16 ctlr3 @ 0x14;
+    @rw u16 gpr   @ 0x18;
+}
+
+// ── PFIC (Programmable Fast Interrupt Controller) ───────────────────────────
+pub mmio PficRegs {
+    @ro [8]u32   isr      @ 0x000;
+    @ro [8]u32   ipr      @ 0x020;
+    @rw u32      ithresdr @ 0x040;
+    @rw u32      cfgr     @ 0x048;
+    @ro u32      gisr     @ 0x04C;
+    @wo [8]u32   ienr     @ 0x100;
+    @wo [8]u32   irer     @ 0x180;
+    @wo [8]u32   ipsr     @ 0x200;
+    @wo [8]u32   iprr     @ 0x280;
+    @rw [8]u32   iactr    @ 0x300;
+    @rw [256]u8  iprior   @ 0x400;
+    @rw u32      sctlr    @ 0xD10;
+}
+
+// ── Core System Timer (64-bit counter) ──────────────────────────────────────
+pub mmio StkRegs {
+    @rw u32 ctlr  @ 0x00;
+    @rw u32 sr    @ 0x04;
+    @rw u32 cntl  @ 0x08;
+    @rw u32 cnth  @ 0x0C;
+    @rw u32 cmplr @ 0x10;
+    @rw u32 cmphr @ 0x14;
+}
+
+pub mmio AFIO   : AfioRegs  @ 0x4001_0000;
+pub mmio EXTI   : ExtiRegs  @ 0x4001_0400;
+pub mmio GPIOA  : GpioRegs  @ 0x4001_0800;
+pub mmio GPIOB  : GpioRegs  @ 0x4001_0C00;
+pub mmio GPIOC  : GpioRegs  @ 0x4001_1000;
+pub mmio GPIOD  : GpioRegs  @ 0x4001_1400;
+pub mmio GPIOE  : GpioRegs  @ 0x4001_1800;
+pub mmio USART1 : UsartRegs @ 0x4001_3800;
+pub mmio RCC    : RccRegs   @ 0x4002_1000;
+pub mmio PFIC   : PficRegs  @ 0xE000_E000;
+pub mmio STK    : StkRegs   @ 0xE000_F000;
+
+// ── RCC_APB2PCENR Peripheral Clock Enables ──────────────────────────────────
+pub const u32 RCC_APB2_AFIO   = 0x0000_0001;
+pub const u32 RCC_APB2_IOPA   = 0x0000_0004;
+pub const u32 RCC_APB2_IOPB   = 0x0000_0008;
+pub const u32 RCC_APB2_IOPC   = 0x0000_0010;
+pub const u32 RCC_APB2_IOPD   = 0x0000_0020;
+pub const u32 RCC_APB2_IOPE   = 0x0000_0040;
+pub const u32 RCC_APB2_USART1 = 0x0000_4000;
+
+// ── USART Status / Control Bits ─────────────────────────────────────────────
+pub const u16 USART_STATR_RXNE   = 0x0020;
+pub const u16 USART_STATR_TC     = 0x0040;
+pub const u16 USART_STATR_TXE    = 0x0080;
+pub const u16 USART_CTLR1_RE     = 0x0004;
+pub const u16 USART_CTLR1_TE     = 0x0008;
+pub const u16 USART_CTLR1_RXNEIE = 0x0020;
+pub const u16 USART_CTLR1_UE     = 0x2000;
+
+// ── System Timer Control Bits ───────────────────────────────────────────────
+pub const u32 STK_CTLR_STE   = 0x0000_0001;   // counter enable
+pub const u32 STK_CTLR_STIE  = 0x0000_0002;   // compare interrupt enable
+pub const u32 STK_CTLR_STCLK = 0x0000_0004;   // 1: HCLK, 0: HCLK / 8
+pub const u32 STK_CTLR_STRE  = 0x0000_0008;   // reload on compare match
+pub const u32 STK_CTLR_INIT  = 0x0000_0020;   // reset the counter
+
+// ── GPIO Configuration Nibbles (MODE[1:0] | CNF[1:0] << 2) ──────────────────
+pub const u32 GPIO_CFG_ANALOG_IN     = 0x0;
+pub const u32 GPIO_CFG_OUT_PP_2MHZ   = 0x2;
+pub const u32 GPIO_CFG_FLOATING_IN   = 0x4;
+pub const u32 GPIO_CFG_PULL_IN       = 0x8;   // OUTDR bit selects pull-up (1) or pull-down (0)
+pub const u32 GPIO_CFG_AF_PP_50MHZ   = 0xB;
+
+pub const u8 PORT_A = 0;
+pub const u8 PORT_B = 1;
+pub const u8 PORT_C = 2;
+pub const u8 PORT_D = 3;
+pub const u8 PORT_E = 4;
+
+// ── Interrupt Numbers (the PFIC vector slot equals the interrupt number) ────
+pub irq IRQ_SYSTICK   = 12;
+pub irq IRQ_SOFTWARE  = 14;
+pub irq IRQ_EXTI0     = 22;
+pub irq IRQ_EXTI1     = 23;
+pub irq IRQ_EXTI2     = 24;
+pub irq IRQ_EXTI3     = 25;
+pub irq IRQ_EXTI4     = 26;
+pub irq IRQ_EXTI9_5   = 39;
+pub irq IRQ_TIM2      = 44;
+pub irq IRQ_I2C2_EV   = 49;
+pub irq IRQ_SPI1      = 51;
+pub irq IRQ_USART1    = 53;
+pub irq IRQ_USART2    = 54;
+pub irq IRQ_USART3    = 55;
+pub irq IRQ_EXTI15_10 = 56;
+pub irq IRQ_ETH       = 77;
+pub irq IRQ_USBFS     = 83;
+pub irq IRQ_USBHS     = 85;
+
+// Write one configuration nibble for `pin` (0..15) of a GPIO port.
+pub fn gpio_configure(*GpioRegs g, u32 pin, u32 cfg) {
+    u32 sh = (pin & 7u32) * 4u32;
+    u32 mask = 0xFu32 << sh;
+    if (pin < 8u32) {
+        g.cfglr = (g.cfglr & (~mask)) | ((cfg & 0xFu32) << sh);
+    } else {
+        g.cfghr = (g.cfghr & (~mask)) | ((cfg & 0xFu32) << sh);
+    }
+}
+
+// `sys.set_irq_router` hooks. PFIC needs no routing: enabling the interrupt number is enough,
+// and the pending state clears with the peripheral's own flag, so acknowledgement is a no-op.
+pub fn route_irq(u32 src_id, u32 cpu_slot) {
+    u32 _slot = cpu_slot;
+    PFIC.ienr[(src_id >> 5) as usize] = 1u32 << (src_id & 31u32);
+}
+
+pub fn ack_irq(u32 cpu_slot) {
+    u32 _slot = cpu_slot;
+}
+
+// Start the core timer free-running from zero at HCLK. It then serves as a monotonic clock.
+pub fn stk_start_free_running() {
+    STK.ctlr = 0;
+    STK.sr = 0;
+    STK.cmplr = 0xFFFF_FFFF;
+    STK.cmphr = 0xFFFF_FFFF;
+    STK.ctlr = STK_CTLR_STE | STK_CTLR_STCLK | STK_CTLR_INIT;
+}
+
+// Read the 64-bit count without tearing across the two 32-bit halves.
+pub fn stk_read() -> u64 {
+    u32 hi = STK.cnth;
+    u32 lo = STK.cntl;
+    for (u32 _try in 0..4) {
+        u32 hi2 = STK.cnth;
+        if (hi2 == hi) {
+            break;
+        }
+        hi = hi2;
+        lo = STK.cntl;
+    }
+    return ((hi as u64) << 32) | (lo as u64);
+}
+
+// USART1 on PA9 (TX) / PA10 (RX), 8N1. `pclk_hz` is the APB2 clock feeding the USART.
+pub fn usart1_init(u32 pclk_hz, u32 baud) {
+    RCC.apb2pcenr = RCC.apb2pcenr | RCC_APB2_AFIO | RCC_APB2_IOPA | RCC_APB2_USART1;
+    u32 _stab = RCC.apb2pcenr;
+    gpio_configure(GPIOA, 9u32, GPIO_CFG_AF_PP_50MHZ);
+    gpio_configure(GPIOA, 10u32, GPIO_CFG_FLOATING_IN);
+    USART1.ctlr1 = 0;
+    USART1.ctlr2 = 0;
+    USART1.ctlr3 = 0;
+    // 16x oversampling: BRR holds the divider as a 12.4 fixed-point value, i.e. pclk / baud.
+    USART1.brr = (((pclk_hz + (baud / 2u32)) / baud) & 0xFFFFu32) as u16;
+    USART1.ctlr1 = USART_CTLR1_UE | USART_CTLR1_TE;
+}
+
+// Blocking transmit with a bounded wait so a stuck UART cannot hang the caller.
+pub fn usart1_tx_byte(u8 b) {
+    for (u32 _spin in 0..200000) {
+        if ((USART1.statr & USART_STATR_TXE) != 0u16) {
+            USART1.datar = b as u16;
+            return;
+        }
+    }
+}
