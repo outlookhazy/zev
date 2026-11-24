@@ -512,6 +512,7 @@ fn collect_prim_target_uses(target: &MirPrimTarget, uses: &mut BTreeSet<VarId>) 
 fn collect_prim_op_uses(op: &MirPrimNonBlockingOp, uses: &mut BTreeSet<VarId>) {
     match op {
         MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+        | MirPrimNonBlockingOp::GuardedSet { target, value, .. }
         | MirPrimNonBlockingOp::InboxPost { target, value, .. } => {
             collect_prim_target_uses(target, uses);
             collect_expr_uses(value, uses);
@@ -652,6 +653,7 @@ fn collect_expr_uses(expr: &MirExpr, uses: &mut BTreeSet<VarId>) {
             }
             MirPrimReadOp::WatchRead { target, .. }
             | MirPrimReadOp::WatchGen { target, .. }
+            | MirPrimReadOp::GuardedGet { target, .. }
             | MirPrimReadOp::InboxTryRecv { target, .. }
             | MirPrimReadOp::InboxLen { target, .. }
             | MirPrimReadOp::InboxIsEmpty { target, .. }
@@ -1069,6 +1071,7 @@ fn collect_addr_taken_stmt(stmt: &MirStmt, vars: &mut [MirVar]) {
         }
         MirStmt::PrimOp(op) => match op {
             MirPrimNonBlockingOp::WatchPublish { value, .. }
+            | MirPrimNonBlockingOp::GuardedSet { value, .. }
             | MirPrimNonBlockingOp::InboxPost { value, .. }
             | MirPrimNonBlockingOp::LeaseRelease { value, .. } => {
                 collect_addr_of_vars(value, &mut taken);

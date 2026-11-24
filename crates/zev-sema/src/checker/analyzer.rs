@@ -33,6 +33,7 @@ impl Analyzer {
             fn_boot_steps: BTreeMap::new(),
             recorded_call_args: Vec::new(),
             recorded_byte_ring_ops: Vec::new(),
+            recorded_watch_writes: Vec::new(),
             spawned_task_field_endpoints: BTreeMap::new(),
             prim_escaping_ref_params: BTreeMap::new(),
             tasks: BTreeMap::new(),
@@ -698,7 +699,7 @@ impl Analyzer {
                             ),
                         )
                         .with_file(file.clone())
-                        .with_note("move raw scalar/buffer fields into `watch<T>`, `inbox<T, N>`, `pool<T, K>`, `dma_slot<T>`, or `byte_ring<N>` fields"),
+                        .with_note("move raw scalar/buffer fields into `watch<T>`, `guarded<T>`, `inbox<T, N>`, `pool<T, K>`, `dma_slot<T>`, `wait_queue`, or `byte_ring<N>` fields"),
                     );
                 }
                 match &f.ty {
@@ -1376,14 +1377,14 @@ impl Analyzer {
             );
             let val = body_checker.check_expr_infallible(init_expr);
             match &resolved {
-                ResolvedOsPrimitive::Watch { elem } => {
+                ResolvedOsPrimitive::Watch { elem } | ResolvedOsPrimitive::Guarded { elem } => {
                     if !val.ty.is_assignable_to(elem) {
                         self.emit(Diagnostic::new(
                             DiagnosticKind::TypeMismatch,
                             init_expr.span,
                             format!(
-                                "watch '{}' initializer has type '{}', expected '{}'",
-                                p.name.name, val.ty, elem
+                                "{} '{}' initializer has type '{}', expected '{}'",
+                                resolved.kind(), p.name.name, val.ty, elem
                             ),
                         ));
                     } else {
@@ -1524,7 +1525,7 @@ impl Analyzer {
                 ),
             )
             .with_note(format!(
-                "replace with `const {ty} {name} = ...;` (immutable), `watch<{ty}> {name} = 0;` (single-writer latest value via `.read()`/`.publish(val)`), or `inbox<{ty}, 8> {name};` (queued events via `.post(ev)`/`.recv()`)",
+                "replace with `const {ty} {name} = ...;` (immutable), `watch<{ty}> {name} = 0;` (single-writer latest value via `.read()`/`.publish(val)`), `guarded<{ty}> {name} = 0;` (multi-writer inside `critical {{ ... }}` via `.get()`/`.set(val)`), or `inbox<{ty}, 8> {name};` (queued events via `.post(ev)`/`.recv()`)",
                 ty = ty_str,
                 name = g.name.name
             )),
@@ -1954,6 +1955,9 @@ impl Analyzer {
                 elem: Box::new(self.resolve_non_void_elem(elem)),
             },
             OsPrimitiveType::Watch { elem } => ResolvedOsPrimitive::Watch {
+                elem: Box::new(self.resolve_non_void_elem(elem)),
+            },
+            OsPrimitiveType::Guarded { elem } => ResolvedOsPrimitive::Guarded {
                 elem: Box::new(self.resolve_non_void_elem(elem)),
             },
             OsPrimitiveType::PingPong { elem, cap } => {
@@ -2676,6 +2680,7 @@ impl Analyzer {
         self.unroll_boot_spawn_tree();
         self.unroll_irq_boot_tree();
         self.verify_byte_ring_spsc();
+        self.verify_watch_single_writer();
 
         // 5. Compute 3-tier `SoftYielding` coroutine vs `noyield` dual specializations.
         let (soft_coro, soft_ny, dual_spec) = self.call_graph.compute_soft_specializations();
@@ -3204,6 +3209,268 @@ impl Analyzer {
                             )),
                         );
                     }
+                }
+            }
+        }
+    }
+
+    pub(super) fn verify_watch_single_writer(&mut self) {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        enum WatchActorId {
+            Task(usize),
+            Isr(usize),
+            MainPostBoot,
+            MainPostIrqPreSpawn,
+        }
+        #[derive(Clone, Debug)]
+        struct WatchWriterAccess {
+            actor_id: WatchActorId,
+            actor_desc: String,
+            span: Span,
+            file: Option<String>,
+        }
+
+        let mut writes_by_caller: BTreeMap<String, Vec<RecordedWatchWrite>> = BTreeMap::new();
+        for op in &self.recorded_watch_writes {
+            writes_by_caller
+                .entry(op.caller.clone())
+                .or_default()
+                .push(op.clone());
+        }
+        let mut calls_by_caller: BTreeMap<String, Vec<RecordedCallArgs>> = BTreeMap::new();
+        for call in &self.recorded_call_args {
+            calls_by_caller
+                .entry(call.caller.clone())
+                .or_default()
+                .push(call.clone());
+        }
+
+        type WatchWritersMap = BTreeMap<String, Vec<WatchWriterAccess>>;
+        let mut writers_by_watch: WatchWritersMap = BTreeMap::new();
+        let mut pre_spawn_irq_writers: WatchWritersMap = BTreeMap::new();
+
+        let record_writer =
+            |map: &mut WatchWritersMap, watch: String, access: WatchWriterAccess| {
+                let list = map.entry(watch).or_default();
+                if !list.iter().any(|a| a.actor_id == access.actor_id) {
+                    list.push(access);
+                }
+            };
+
+        let mut actors: Vec<(
+            WatchActorId,
+            String,
+            String,
+            Vec<Option<String>>,
+            Vec<BTreeMap<String, String>>,
+            Option<&'static str>,
+        )> = Vec::new();
+
+        for inst in &self.spawned_tasks {
+            let caller_key = format!("task::{}", inst.task_name);
+            let field_eps = self
+                .spawned_task_field_endpoints
+                .get(&inst.instance_id)
+                .cloned()
+                .unwrap_or_else(|| vec![BTreeMap::new(); inst.endpoint_bindings.len()]);
+            actors.push((
+                WatchActorId::Task(inst.instance_id),
+                format!("task '{}' (spawned via {})", inst.task_name, inst.format_provenance()),
+                caller_key,
+                inst.endpoint_bindings.clone(),
+                field_eps,
+                None,
+            ));
+        }
+
+        for (idx, binding) in self.irq_bindings.iter().enumerate() {
+            let caller_key = format!("isr::{}", binding.isr_name);
+            let mut param_eps = Vec::with_capacity(binding.args.len());
+            for arg in &binding.args {
+                let ep = match arg {
+                    IrqBindingArg::PrimAddr(name) => Some(name.clone()),
+                    IrqBindingArg::SubsystemPath {
+                        root, field_chain, ..
+                    } => {
+                        if field_chain.is_empty() {
+                            Some(root.clone())
+                        } else {
+                            let chain = field_chain
+                                .iter()
+                                .map(|(f, _)| f.as_str())
+                                .collect::<Vec<_>>()
+                                .join(".");
+                            Some(format!("{root}.{chain}"))
+                        }
+                    }
+                    _ => None,
+                };
+                param_eps.push(ep);
+            }
+            let field_eps = vec![BTreeMap::new(); param_eps.len()];
+            actors.push((
+                WatchActorId::Isr(idx),
+                format!("ISR '{}' (IRQ '{}')", binding.isr_name, binding.irq_name),
+                caller_key,
+                param_eps,
+                field_eps,
+                None,
+            ));
+        }
+
+        let has_main_post_spawn = writes_by_caller.contains_key("main::post_spawn")
+            || self
+                .recorded_call_args
+                .iter()
+                .any(|c| c.caller == "main" && c.in_main_after_spawn);
+        if has_main_post_spawn {
+            actors.push((
+                WatchActorId::MainPostBoot,
+                "main() (post-boot)".to_string(),
+                "main".to_string(),
+                Vec::new(),
+                Vec::new(),
+                Some("main::post_spawn"),
+            ));
+        }
+
+        let has_main_post_irq_pre_spawn = writes_by_caller.contains_key("main::post_irq_pre_spawn")
+            || self
+                .recorded_call_args
+                .iter()
+                .any(|c| c.caller == "main" && c.in_main_after_irq_attach && !c.in_main_after_spawn);
+        if has_main_post_irq_pre_spawn {
+            actors.push((
+                WatchActorId::MainPostIrqPreSpawn,
+                "main() (after irq.attach)".to_string(),
+                "main".to_string(),
+                Vec::new(),
+                Vec::new(),
+                Some("main::post_irq_pre_spawn"),
+            ));
+        }
+
+        for (actor_id, actor_desc, root_caller, root_params, root_fields, root_op_key) in actors {
+            let mut visited: BTreeSet<(
+                String,
+                Vec<Option<String>>,
+                Vec<BTreeMap<String, String>>,
+            )> = BTreeSet::new();
+            let mut worklist = vec![(root_caller, root_params, root_fields, root_op_key)];
+            visited.insert((worklist[0].0.clone(), worklist[0].1.clone(), worklist[0].2.clone()));
+
+            while let Some((caller, param_eps, param_fields, op_override)) = worklist.pop() {
+                let op_lookup_key = op_override.unwrap_or(caller.as_str());
+                if let Some(ops) = writes_by_caller.get(op_lookup_key) {
+                    for op in ops {
+                        let Some(concrete_watch) = Self::resolve_endpoint_spec_with_bindings(
+                            &op.target,
+                            &param_eps,
+                            &param_fields,
+                        ) else {
+                            continue;
+                        };
+                        if concrete_watch == "<anon_endpoint>" {
+                            continue;
+                        }
+                        let access = WatchWriterAccess {
+                            actor_id: actor_id.clone(),
+                            actor_desc: actor_desc.clone(),
+                            span: op.span,
+                            file: op.file.clone(),
+                        };
+                        if matches!(actor_id, WatchActorId::MainPostIrqPreSpawn) {
+                            record_writer(&mut pre_spawn_irq_writers, concrete_watch, access);
+                        } else {
+                            record_writer(&mut writers_by_watch, concrete_watch, access);
+                        }
+                    }
+                }
+
+                if visited.len() >= 4096 {
+                    continue;
+                }
+                if let Some(calls) = calls_by_caller.get(&caller) {
+                    for call in calls {
+                        if let Some(mode) = op_override {
+                            let allow = match mode {
+                                "main::post_spawn" => call.in_main_after_spawn,
+                                "main::post_irq_pre_spawn" => {
+                                    call.in_main_after_irq_attach && !call.in_main_after_spawn
+                                }
+                                _ => true,
+                            };
+                            if !allow {
+                                continue;
+                            }
+                        }
+                        let mut child_eps = Vec::with_capacity(call.args.len());
+                        let mut child_fields = Vec::with_capacity(call.args.len());
+                        for arg in &call.args {
+                            let (ep, f_map) = Self::resolve_boot_arg_endpoint_and_fields(
+                                &arg.static_endpoint,
+                                &arg.endpoint_from_param,
+                                &arg.field_endpoints,
+                                &param_eps,
+                                &param_fields,
+                            );
+                            child_eps.push(ep);
+                            child_fields.push(f_map);
+                        }
+                        let state = (call.callee.clone(), child_eps.clone(), child_fields.clone());
+                        if visited.insert(state) {
+                            worklist.push((call.callee.clone(), child_eps, child_fields, None));
+                        }
+                    }
+                }
+            }
+        }
+
+        for (watch, writers) in writers_by_watch {
+            let disp_watch = self
+                .display_names
+                .get(&watch)
+                .cloned()
+                .unwrap_or_else(|| watch.clone());
+            if writers.len() > 1 {
+                let first = &writers[0];
+                for extra in &writers[1..] {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::GlobalIsolationViolation,
+                            extra.span,
+                            format!(
+                                "watch '{}' single-writer violation: multiple concurrent writers ('{}' and '{}' both call `publish`)",
+                                disp_watch, first.actor_desc, extra.actor_desc
+                            ),
+                        )
+                        .with_file(extra.file.clone())
+                        .with_note(format!(
+                            "first writer '{}' called `publish` at {}; `watch<T>` is strictly single-writer — use `guarded<T>` inside `critical {{ ... }}` (paired with `wait_queue` if blocking wait is needed) or `inbox<T, N>` for multi-writer communication",
+                            first.actor_desc, first.span
+                        )),
+                    );
+                }
+            } else if let (Some(isr_writer), Some(main_irq_writers)) = (
+                writers.iter().find(|w| matches!(w.actor_id, WatchActorId::Isr(_))),
+                pre_spawn_irq_writers.get(&watch),
+            ) {
+                for extra in main_irq_writers {
+                    self.emit(
+                        Diagnostic::new(
+                            DiagnosticKind::GlobalIsolationViolation,
+                            extra.span,
+                            format!(
+                                "watch '{}' single-writer violation: multiple concurrent writers ('{}' and '{}' both call `publish`)",
+                                disp_watch, isr_writer.actor_desc, extra.actor_desc
+                            ),
+                        )
+                        .with_file(extra.file.clone())
+                        .with_note(format!(
+                            "ISR writer '{}' calls `publish` at {}; `watch<T>` is strictly single-writer — use `guarded<T>` inside `critical {{ ... }}` or publish before `irq.attach(...)`",
+                            isr_writer.actor_desc, isr_writer.span
+                        )),
+                    );
                 }
             }
         }

@@ -746,6 +746,11 @@ impl<'a> LayoutCtx<'a> {
                 let el = self.type_layout(elem, abi);
                 self.struct_layout(&[el, SizeAlign::new(4, 4), SizeAlign::new(4, 4)], false)
             }
+            MirPrimKind::Guarded { elem } => {
+                // `{ T value; }`
+                let el = self.type_layout(elem, abi);
+                self.struct_layout(&[el], false)
+            }
             MirPrimKind::Inbox { elem, cap } => {
                 // `{ u32 head, tail, count, rx_waiters, tx_waiters; u8 boosts[N]; T items[N]; }`
                 let hdr = self.struct_layout(
@@ -1662,6 +1667,7 @@ fn fold_expr_run(
         MirExprKind::PrimRead(op) => match op.as_ref() {
             MirPrimReadOp::WatchRead { target, .. }
             | MirPrimReadOp::WatchGen { target, .. }
+            | MirPrimReadOp::GuardedGet { target, .. }
             | MirPrimReadOp::InboxTryRecv { target, .. }
             | MirPrimReadOp::InboxLen { target, .. }
             | MirPrimReadOp::InboxIsEmpty { target, .. }
@@ -1769,6 +1775,7 @@ fn analyze_direct_stmts(
                     fold_prim_target_run(target, fn_map, cache, visiting, &mut kind, &mut blocks);
                 }
                 MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+                | MirPrimNonBlockingOp::GuardedSet { target, value, .. }
                 | MirPrimNonBlockingOp::InboxPost { target, value, .. }
                 | MirPrimNonBlockingOp::PingPongCompleteHalf { target, half: value, .. }
                 | MirPrimNonBlockingOp::ByteRingConsume { target, len: value, .. }

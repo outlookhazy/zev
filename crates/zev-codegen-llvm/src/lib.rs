@@ -953,14 +953,16 @@ mod tests {
     #[test]
     fn avr_scheduler_select_next_task_compact_loop_and_all_opt_levels_link() {
         let src = r#"
-            watch<u16> latest = 0;
+            guarded<u16> latest = 0;
             signal wake_sig;
             inbox<u8, 4> cmd_q;
 
             task crit_worker() {
                 loop {
                     wake_sig.wait();
-                    latest.publish(latest.read() + 1u16);
+                    critical {
+                        latest.set(latest.get() + 1u16);
+                    }
                 }
             }
 
@@ -974,7 +976,9 @@ mod tests {
             task norm_worker() {
                 loop {
                     u8 v = cmd_q.recv();
-                    latest.publish((u16)v);
+                    critical {
+                        latest.set((u16)v);
+                    }
                 }
             }
 
@@ -1084,6 +1088,7 @@ mod tests {
             watch<u32> w_diag = 0;
             watch<u32> w_opt = 0;
             watch<u32> w_never = 0;
+            watch<u32> w_never2 = 0;
 
             task worker(u32 val, *watch<u32> out) {
                 loop every 5ms {
@@ -1115,6 +1120,7 @@ mod tests {
                 assert(w_diag.read() == 111);
                 assert(w_opt.read() == 77);
                 assert(w_never.read() == 0);
+                assert(w_never2.read() == 0);
                 sys.exit(0);
             }
 
@@ -1128,7 +1134,7 @@ mod tests {
                 if (early_stop) {
                     return;
                 }
-                spawn opt_task(88, &w_never) @normal;
+                spawn opt_task(88, &w_never2) @normal;
             }
 
             fn setup_system(bool en_diag, bool en_aux) {
@@ -1860,12 +1866,14 @@ mod tests {
 
             inbox<Cmd, 4> actor_q;
             signal mid_sig;
-            watch<u32> seq_log = 0;
+            guarded<u32> seq_log = 0;
             watch<u32> restart_count = 0;
             watch<u32> defer_ran = 0;
 
             fn append_step(u32 digit) {
-                seq_log.publish((seq_log.read() * 10) + digit);
+                critical {
+                    seq_log.set((seq_log.get() * 10) + digit);
+                }
             }
 
             task mid_observer() {
@@ -1882,11 +1890,13 @@ mod tests {
 
                 if (boots == 2) {
                     append_step(3);
-                    sys.log_kv("seq=", seq_log.read() as i32);
+                    u32 seq_v = 0;
+                    critical { seq_v = seq_log.get(); }
+                    sys.log_kv("seq=", seq_v as i32);
                     sys.log_kv("after_seed=", param_seed as i32);
                     sys.log_kv("after_local=", local_acc as i32);
                     sys.log_kv("defer_ran=", defer_ran.read() as i32);
-                    assert(seq_log.read() == 123);
+                    assert(seq_v == 123);
                     assert(param_seed == 77);
                     assert(local_acc == 0);
                     assert(defer_ran.read() == 10);
@@ -7624,6 +7634,80 @@ fn main() {
         let (_mir, _ll, qres) = run_zev_cortex_m_qemu("destination_typed_arithmetic", src);
         assert!(
             qres.exec.stdout.contains("INT_SEMANTICS_OK"),
+            "unexpected qemu output: {}",
+            qres.exec.stdout
+        );
+    }
+
+    #[test]
+    fn guarded_multi_writer_tasks_and_isr_in_qemu() {
+        let src = r#"
+struct SharedBank {
+    guarded<u16> hits;
+    wait_queue wq;
+}
+
+guarded<u32> shared_acc = 10u32;
+SharedBank bank;
+irq IRQ_BUMP = 2;
+
+isr bump_isr(*guarded<u32> acc, *SharedBank b) {
+    critical {
+        acc.set(acc.get() + 100u32);
+        b.hits.set(b.hits.get() + 1u16);
+    }
+    b.wq.wake_all();
+}
+
+task adder_task(u32 delta, *guarded<u32> acc, *SharedBank b) {
+    for (u32 i in 0..3) {
+        critical {
+            acc.set(acc.get() + delta);
+            b.hits.set(b.hits.get() + 1u16);
+        }
+        b.wq.wake_all();
+        delay(2ms);
+    }
+    loop { delay(20ms); }
+}
+
+task observer() {
+    loop {
+        bool ready = false;
+        u32 acc_v = 0u32;
+        u16 hits_v = 0u16;
+        critical {
+            acc_v = shared_acc.get();
+            hits_v = bank.hits.get();
+            if (hits_v >= 7u16) {
+                ready = true;
+            } else {
+                bank.wq.prepare_wait();
+            }
+        }
+        if (ready) {
+            if (acc_v == 140u32 && hits_v == 7u16) {
+                println("GUARDED_QEMU_OK");
+            }
+            sys.exit(0);
+        }
+        bank.wq.commit_wait(timeout: 20ms) catch {};
+    }
+}
+
+fn main() {
+    sys.use_systick(12_000_000);
+    IRQ_BUMP.attach(bump_isr(&shared_acc, &bank));
+    spawn adder_task(4u32, &shared_acc, &bank) @high;
+    spawn adder_task(6u32, &shared_acc, &bank) @normal;
+    spawn observer() @low;
+    sys.pend_irq(2);
+    loop { delay(20ms); }
+}
+"#;
+        let (_mir, _ll, qres) = run_zev_cortex_m_qemu("guarded_multi_writer_tasks_and_isr", src);
+        assert!(
+            qres.exec.stdout.contains("GUARDED_QEMU_OK"),
             "unexpected qemu output: {}",
             qres.exec.stdout
         );

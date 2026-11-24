@@ -1388,6 +1388,7 @@ const ZEV_KEYWORDS: &[&str] = &[
     "void",
     "signal",
     "watch",
+    "guarded",
     "inbox",
     "ping_pong",
     "lease",
@@ -2272,7 +2273,7 @@ mod tests {
             "extern", "isr", "catch", "or", "let", "var", "mut", "async", "await", "select",
             "match", "try", "static", "pub", "mmio", "irq", "state", "u8", "u16", "u32", "u64",
             "usize", "i8", "i16", "i32", "i64", "isize", "f32", "f64", "u16be", "u16le", "u32be",
-            "u32le", "u64be", "u64le", "bool", "void", "signal", "watch", "inbox", "ping_pong",
+            "u32le", "u64be", "u64le", "bool", "void", "signal", "watch", "guarded", "inbox", "ping_pong",
             "lease",
         ];
 

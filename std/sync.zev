@@ -1,27 +1,31 @@
 // Standard cooperative synchronization primitives built on `wait_queue` and `critical { ... }`
 
 pub struct Semaphore {
-    watch<u32> count;
+    guarded<u32> count;
     wait_queue wq;
 }
 
 impl Semaphore {
     pub fn init(*self, u32 initial) {
         critical {
-            self.count.publish(initial);
+            self.count.set(initial);
         }
     }
 
     pub u32 count(*self) {
-        return self.count.read();
+        u32 v = 0u32;
+        critical {
+            v = self.count.get();
+        }
+        return v;
     }
 
     pub bool try_acquire(*self) {
         bool ok = false;
         critical {
-            u32 c = self.count.read();
+            u32 c = self.count.get();
             if (c > 0u32) {
-                self.count.publish(c - 1u32);
+                self.count.set(c - 1u32);
                 ok = true;
             }
         }
@@ -32,9 +36,9 @@ impl Semaphore {
         loop {
             bool ok = false;
             critical {
-                u32 c = self.count.read();
+                u32 c = self.count.get();
                 if (c > 0u32) {
-                    self.count.publish(c - 1u32);
+                    self.count.set(c - 1u32);
                     ok = true;
                 } else {
                     self.wq.prepare_wait();
@@ -49,32 +53,36 @@ impl Semaphore {
 
     pub fn release(*self) {
         critical {
-            self.count.publish(self.count.read() + 1u32);
+            self.count.set(self.count.get() + 1u32);
         }
         self.wq.wake_one();
     }
 }
 
 pub struct EventFlags {
-    watch<u32> bits;
+    guarded<u32> bits;
     wait_queue wq;
 }
 
 impl EventFlags {
     pub u32 read(*self) {
-        return self.bits.read();
+        u32 v = 0u32;
+        critical {
+            v = self.bits.get();
+        }
+        return v;
     }
 
     pub fn set(*self, u32 mask) {
         critical {
-            self.bits.publish(self.bits.read() | mask);
+            self.bits.set(self.bits.get() | mask);
         }
         self.wq.wake_all();
     }
 
     pub fn clear(*self, u32 mask) {
         critical {
-            self.bits.publish(self.bits.read() & ~mask);
+            self.bits.set(self.bits.get() & ~mask);
         }
     }
 
@@ -83,7 +91,7 @@ impl EventFlags {
             u32 cur = 0u32;
             bool matched = false;
             critical {
-                cur = self.bits.read();
+                cur = self.bits.get();
                 if ((cur & mask) != 0u32) {
                     matched = true;
                 } else {
@@ -102,7 +110,7 @@ impl EventFlags {
             u32 cur = 0u32;
             bool matched = false;
             critical {
-                cur = self.bits.read();
+                cur = self.bits.get();
                 if ((cur & mask) == mask) {
                     matched = true;
                 } else {
@@ -118,18 +126,22 @@ impl EventFlags {
 }
 
 pub struct Latch {
-    watch<bool> ready;
+    guarded<bool> ready;
     wait_queue wq;
 }
 
 impl Latch {
     pub bool is_ready(*self) {
-        return self.ready.read();
+        bool v = false;
+        critical {
+            v = self.ready.get();
+        }
+        return v;
     }
 
     pub fn arrive(*self) {
         critical {
-            self.ready.publish(true);
+            self.ready.set(true);
         }
         self.wq.wake_all();
     }
@@ -138,7 +150,7 @@ impl Latch {
         loop {
             bool done = false;
             critical {
-                done = self.ready.read();
+                done = self.ready.get();
                 if (!done) {
                     self.wq.prepare_wait();
                 }
@@ -152,8 +164,8 @@ impl Latch {
 }
 
 pub struct Barrier<usize N> {
-    watch<usize> count;
-    watch<u32> generation;
+    guarded<usize> count;
+    guarded<u32> generation;
     wait_queue wq;
 }
 
@@ -162,15 +174,15 @@ impl<usize N> Barrier<N> {
         u32 my_gen = 0u32;
         bool last = false;
         critical {
-            u32 gen0 = self.generation.read();
+            u32 gen0 = self.generation.get();
             my_gen = gen0;
-            usize nxt = self.count.read() + 1;
+            usize nxt = self.count.get() + 1;
             if (nxt >= N) {
-                self.count.publish(0);
-                self.generation.publish(gen0 + 1u32);
+                self.count.set(0);
+                self.generation.set(gen0 + 1u32);
                 last = true;
             } else {
-                self.count.publish(nxt);
+                self.count.set(nxt);
                 self.wq.prepare_wait();
             }
         }
@@ -182,7 +194,7 @@ impl<usize N> Barrier<N> {
             self.wq.commit_wait();
             bool tripped = false;
             critical {
-                if (self.generation.read() != my_gen) {
+                if (self.generation.get() != my_gen) {
                     tripped = true;
                 } else {
                     self.wq.prepare_wait();

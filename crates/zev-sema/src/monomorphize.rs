@@ -1488,6 +1488,9 @@ impl<'a> Monomorphizer<'a> {
             OsPrimitiveType::Watch { elem } => OsPrimitiveType::Watch {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
             },
+            OsPrimitiveType::Guarded { elem } => OsPrimitiveType::Guarded {
+                elem: Box::new(self.rewrite_type_expr(elem, env)),
+            },
             OsPrimitiveType::PingPong { elem, cap } => OsPrimitiveType::PingPong {
                 elem: Box::new(self.rewrite_type_expr(elem, env)),
                 cap: *cap,
@@ -1544,6 +1547,9 @@ impl<'a> Monomorphizer<'a> {
                 OsPrimitiveType::WaitQueue => "wait_queue".to_string(),
                 OsPrimitiveType::Watch { elem } => {
                     format!("_Gwatch_L_{}_R_", self.format_mangled_type(elem))
+                }
+                OsPrimitiveType::Guarded { elem } => {
+                    format!("_Gguarded_L_{}_R_", self.format_mangled_type(elem))
                 }
                 OsPrimitiveType::Inbox { elem, cap } => {
                     format!("_Ginbox_L_{}__{}_R_", self.format_mangled_type(elem), cap)
@@ -1621,6 +1627,9 @@ impl<'a> Monomorphizer<'a> {
                 OsPrimitiveType::WaitQueue => "wait_queue".to_string(),
                 OsPrimitiveType::Watch { elem } => {
                     format!("watch<{}>", self.format_human_type(elem))
+                }
+                OsPrimitiveType::Guarded { elem } => {
+                    format!("guarded<{}>", self.format_human_type(elem))
                 }
                 OsPrimitiveType::Inbox { elem, cap } => {
                     format!("inbox<{}, {}>", self.format_human_type(elem), cap)
@@ -3520,6 +3529,7 @@ impl<'a> Monomorphizer<'a> {
                                 OsPrimitiveType::Watch { elem },
                                 "read" | "wait_change",
                             )
+                            | (OsPrimitiveType::Guarded { elem }, "get")
                             | (
                                 OsPrimitiveType::Inbox { elem, .. }
                                 | OsPrimitiveType::InboxUnsized { elem },
@@ -4213,6 +4223,10 @@ impl<'a> Monomorphizer<'a> {
                             OsPrimitiveType::Watch { elem: ae },
                         )
                         | (
+                            OsPrimitiveType::Guarded { elem: pe },
+                            OsPrimitiveType::Guarded { elem: ae },
+                        )
+                        | (
                             OsPrimitiveType::DmaSlot { elem: pe },
                             OsPrimitiveType::DmaSlot { elem: ae },
                         )
@@ -4447,6 +4461,9 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             OsPrimitiveType::Signal => "signal".to_string(),
             OsPrimitiveType::WaitQueue => "wait_queue".to_string(),
             OsPrimitiveType::Watch { elem } => format!("_Gwatch_L_{}_R_", mangle_type_expr(elem)),
+            OsPrimitiveType::Guarded { elem } => {
+                format!("_Gguarded_L_{}_R_", mangle_type_expr(elem))
+            }
             OsPrimitiveType::Inbox { elem, cap } => {
                 format!("_Ginbox_L_{}__{}_R_", mangle_type_expr(elem), cap)
             }

@@ -2247,8 +2247,15 @@ pub(super) fn finish_prim_read_method<B: LowerBackend>(
     be: &mut B,
 ) -> Result<MirExpr, MirLowerError> {
     match (method, pkind) {
-        ("read" | "get", MirPrimKind::Watch { elem }) => Ok(MirExpr::new(
+        ("read", MirPrimKind::Watch { elem }) => Ok(MirExpr::new(
             MirExprKind::PrimRead(Box::new(MirPrimReadOp::WatchRead {
+                target,
+                elem_ty: *elem.clone(),
+            })),
+            *elem,
+        )),
+        ("get", MirPrimKind::Guarded { elem }) => Ok(MirExpr::new(
+            MirExprKind::PrimRead(Box::new(MirPrimReadOp::GuardedGet {
                 target,
                 elem_ty: *elem.clone(),
             })),
@@ -3069,13 +3076,25 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                     },
                     LoweredPrimReceiver::Sized(target, pkind) => {
                         match (m, pkind) {
-                    ("publish" | "write" | "set", MirPrimKind::Watch { elem }) => {
+                    ("publish", MirPrimKind::Watch { elem }) => {
                         let v = if let Some(first) = first_positional_arg(args) {
                             be.lower_sub(first, Some(&elem))?
                         } else {
                             MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
                         };
                         return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::WatchPublish {
+                            target,
+                            elem_ty: *elem.clone(),
+                            value: coerce_expr_if_needed(v, &elem),
+                        })));
+                    }
+                    ("set", MirPrimKind::Guarded { elem }) => {
+                        let v = if let Some(first) = first_positional_arg(args) {
+                            be.lower_sub(first, Some(&elem))?
+                        } else {
+                            MirExpr::new(MirExprKind::IntLit(0), *elem.clone())
+                        };
+                        return Ok(Some(MirStmt::PrimOp(MirPrimNonBlockingOp::GuardedSet {
                             target,
                             elem_ty: *elem.clone(),
                             value: coerce_expr_if_needed(v, &elem),

@@ -24,7 +24,7 @@ enum SupEvent { Overcurrent, BadPacket, IdleCheck }
 
 // ── Static OS & DMA Primitives (100% .bss / .data SRAM, zero heap) ──────────
 @dma_safe ping_pong<u8, 64> uart1_dma;
-watch<u16>                  motor1_rpm = 0;
+guarded<u16>                motor1_rpm = 0;
 watch<u32>                  flash_diag = 0;
 inbox<SupEvent, 8>          sup_inbox;
 
@@ -115,11 +115,14 @@ fn scrub_flash_crc() {
 }
 
 // ── Reusable Static Task Blueprints ─────────────────────────────────────────
-task motor_control(*watch<u16> target_rpm, u8 pwm_ch) {
+task motor_control(*guarded<u16> target_rpm, u8 pwm_ch) {
     i32 integral = 0;
 
     loop every 1ms {
-        u16 target = target_rpm.read();
+        u16 target = 0;
+        critical {
+            target = target_rpm.get();
+        }
         u16 actual = adc_read_rpm(pwm_ch);
 
         noyield {
@@ -129,7 +132,7 @@ task motor_control(*watch<u16> target_rpm, u8 pwm_ch) {
     }
 }
 
-task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
+task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *guarded<u16> out_rpm) {
     loop {
         []u8 half = rx_dma.wait_chunk();
 
@@ -139,7 +142,9 @@ task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
             continue;
         };
 
-        out_rpm.publish(rpm);
+        critical {
+            out_rpm.set(rpm);
+        }
     }
 }
 
@@ -181,7 +186,11 @@ fn main() {
 
             // Yield across 3 real SysTick interrupts (WFI clamped to LIGHT=1 by active DMA lock)
             delay(3ms);
-            println(f"[TELEM] motor1_rpm={motor1_rpm.read()}");
+            u16 rpm_snap = 0;
+            critical {
+                rpm_snap = motor1_rpm.get();
+            }
+            println(f"[TELEM] motor1_rpm={rpm_snap}");
             println(f"[TELEM] pwm_duty={bsp.read_pwm_duty(1)}");
             println(f"[TELEM] sleep_depth_dma_active={sys.sleep_depth()}");
 
@@ -213,7 +222,9 @@ fn main() {
                 u32 boosted_prio = sys.current_prio();
                 println(f"[TELEM] sup_boosted_prio={boosted_prio}");
                 println(f"[TELEM] gpio_safe_off={bsp.read_motor_enable()}");
-                motor1_rpm.publish(0);
+                critical {
+                    motor1_rpm.set(0);
+                }
                 save_fault_record(bad_packets);
                 stage = 3;
             }

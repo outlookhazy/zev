@@ -252,6 +252,7 @@ pub enum MirPrimKind {
     Signal,
     WaitQueue,
     Watch { elem: Box<MirType> },
+    Guarded { elem: Box<MirType> },
     Inbox { elem: Box<MirType>, cap: usize },
     PingPong { elem: Box<MirType>, cap: usize },
     Pool { elem: Box<MirType>, cap: usize },
@@ -265,6 +266,7 @@ impl MirPrimKind {
             MirPrimKind::Signal => "signal".to_string(),
             MirPrimKind::WaitQueue => "wait_queue".to_string(),
             MirPrimKind::Watch { elem } => format!("watch_{}", elem.mangle_name()),
+            MirPrimKind::Guarded { elem } => format!("guarded_{}", elem.mangle_name()),
             MirPrimKind::Inbox { elem, cap } => format!("inbox_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::PingPong { elem, cap } => format!("pp_{}_{}", elem.mangle_name(), cap),
             MirPrimKind::Pool { elem, cap } => format!("pool_{}_{}", elem.mangle_name(), cap),
@@ -278,6 +280,7 @@ impl MirPrimKind {
             MirPrimKind::Signal => "signal".to_string(),
             MirPrimKind::WaitQueue => "wait_queue".to_string(),
             MirPrimKind::Watch { elem } => format!("watch<{}>", elem.display_name()),
+            MirPrimKind::Guarded { elem } => format!("guarded<{}>", elem.display_name()),
             MirPrimKind::Inbox { elem, cap } => format!("inbox<{}, {cap}>", elem.display_name()),
             MirPrimKind::PingPong { elem, cap } => {
                 format!("ping_pong<{}, {cap}>", elem.display_name())
@@ -673,6 +676,11 @@ pub enum MirPrimTarget {
 #[derive(Debug, Clone)]
 pub enum MirPrimNonBlockingOp {
     WatchPublish {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+        value: MirExpr,
+    },
+    GuardedSet {
         target: MirPrimTarget,
         elem_ty: MirType,
         value: MirExpr,
@@ -1164,6 +1172,10 @@ pub enum MirSysQuery {
 #[derive(Debug, Clone)]
 pub enum MirPrimReadOp {
     WatchRead {
+        target: MirPrimTarget,
+        elem_ty: MirType,
+    },
+    GuardedGet {
         target: MirPrimTarget,
         elem_ty: MirType,
     },

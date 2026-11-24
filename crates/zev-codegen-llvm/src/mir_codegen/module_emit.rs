@@ -112,6 +112,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
             MirType::Primitive(pk) => match pk {
                 MirPrimKind::Signal | MirPrimKind::WaitQueue | MirPrimKind::ByteRing { .. } => {}
                 MirPrimKind::Watch { elem }
+                | MirPrimKind::Guarded { elem }
                 | MirPrimKind::Inbox { elem, .. }
                 | MirPrimKind::PingPong { elem, .. }
                 | MirPrimKind::Pool { elem, .. }
@@ -231,6 +232,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
             MirExprKind::PrimRead(prop) => match &**prop {
                 MirPrimReadOp::WatchRead { target, elem_ty }
                 | MirPrimReadOp::WatchGen { target, elem_ty }
+                | MirPrimReadOp::GuardedGet { target, elem_ty }
                 | MirPrimReadOp::InboxTryRecv { target, elem_ty, .. }
                 | MirPrimReadOp::InboxLen { target, elem_ty, .. }
                 | MirPrimReadOp::InboxIsEmpty { target, elem_ty, .. }
@@ -419,6 +421,11 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 MirStmt::Expr(value) => scan_expr(value, feat),
                 MirStmt::PrimOp(pop) => match pop {
                     MirPrimNonBlockingOp::WatchPublish {
+                        target,
+                        elem_ty,
+                        value,
+                    }
+                    | MirPrimNonBlockingOp::GuardedSet {
                         target,
                         elem_ty,
                         value,
@@ -1638,6 +1645,7 @@ impl<'a> ModuleCtx<'a> {
         }
         match pk {
             MirPrimKind::Watch { elem }
+            | MirPrimKind::Guarded { elem }
             | MirPrimKind::Inbox { elem, .. }
             | MirPrimKind::PingPong { elem, .. }
             | MirPrimKind::Pool { elem, .. }
@@ -1842,6 +1850,17 @@ impl<'a> ModuleCtx<'a> {
                 MirPrimNonBlockingOp::WatchPublish { target, value, .. }
                 | MirPrimNonBlockingOp::InboxPost { target, value, .. } => {
                     self.scan_prim_target_for_prims(target);
+                    self.scan_expr_for_prims(value);
+                }
+                MirPrimNonBlockingOp::GuardedSet {
+                    target,
+                    elem_ty,
+                    value,
+                } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::Guarded {
+                        elem: Box::new(elem_ty.clone()),
+                    });
                     self.scan_expr_for_prims(value);
                 }
                 MirPrimNonBlockingOp::LeaseRelease { value, elem_ty, .. } => {
@@ -2142,6 +2161,12 @@ impl<'a> ModuleCtx<'a> {
                     self.scan_prim_target_for_prims(target);
                     self.register_prim_kind(&MirPrimKind::WaitQueue);
                 }
+                MirPrimReadOp::GuardedGet { target, elem_ty } => {
+                    self.scan_prim_target_for_prims(target);
+                    self.register_prim_kind(&MirPrimKind::Guarded {
+                        elem: Box::new(elem_ty.clone()),
+                    });
+                }
                 _ => {}
             },
             MirExprKind::LeaseGet { lease, elem_ty }
@@ -2307,6 +2332,7 @@ impl<'a> ModuleCtx<'a> {
                     let al = eal.max(4);
                     (align_up(esz, 4) + 8, al)
                 }
+                MirPrimKind::Guarded { elem } => self.size_align(elem, ptr_bytes),
                 MirPrimKind::Inbox { elem, cap } => {
                     let (esz, eal) = self.size_align(elem, ptr_bytes);
                     let al = eal.max(4);
@@ -2422,6 +2448,7 @@ impl<'a> ModuleCtx<'a> {
                     let al = eal.max(i32_al);
                     (align_up(align_up(esz, i32_al) + 8, al), al)
                 }
+                MirPrimKind::Guarded { elem } => self.llvm_abi_size_align(elem, false),
                 MirPrimKind::Inbox { elem, cap } => {
                     let (esz, eal) = self.llvm_abi_size_align(elem, false);
                     let i32_al = self.llvm_scalar_abi_align(4);
@@ -3490,6 +3517,10 @@ ok_bb:
                     let ety = self.llvm_ty(elem);
                     let _ = writeln!(out, "%prim.{id} = type {{ {ety}, i32, i32 }}");
                 }
+                MirPrimKind::Guarded { elem } => {
+                    let ety = self.llvm_ty(elem);
+                    let _ = writeln!(out, "%prim.{id} = type {{ {ety} }}");
+                }
                 MirPrimKind::Inbox { elem, cap } => {
                     let ety = self.llvm_ty(elem);
                     let c = (*cap).max(1);
@@ -3634,6 +3665,23 @@ ok_bb:
                         let _ = writeln!(
                             out,
                             "{gsym} = global {pty} zeroinitializer, align {watch_align}"
+                        );
+                    }
+                }
+                MirPrimKind::Guarded { elem } => {
+                    let ety = self.llvm_ty(elem);
+                    let (_, elem_align) = self.size_align(elem, ptr_bytes);
+                    let guarded_align = align.max(elem_align);
+                    if let Some(init_expr) = p.init.clone() {
+                        let iv = self.const_expr_to_llvm(&init_expr, elem);
+                        let _ = writeln!(
+                            out,
+                            "{gsym} = global {pty} {{ {ety} {iv} }}, align {guarded_align}"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            out,
+                            "{gsym} = global {pty} zeroinitializer, align {guarded_align}"
                         );
                     }
                 }
@@ -3818,6 +3866,9 @@ empty:
 {crit_exit}  ret i8 0
 }}"#
                     );
+                }
+                MirPrimKind::Guarded { .. } => {
+                    // Accessed exclusively inside caller-provided `critical { ... }` via inline volatile GEP load/store.
                 }
                 MirPrimKind::Watch { elem } => {
                     let ety = self.llvm_ty(elem);

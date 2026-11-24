@@ -1611,6 +1611,9 @@ impl<'a> AstRewriter<'a> {
             OsPrimitiveType::Watch { elem } => OsPrimitiveType::Watch {
                 elem: Box::new(self.rewrite_type(elem)),
             },
+            OsPrimitiveType::Guarded { elem } => OsPrimitiveType::Guarded {
+                elem: Box::new(self.rewrite_type(elem)),
+            },
             OsPrimitiveType::Inbox { elem, cap } => OsPrimitiveType::Inbox {
                 elem: Box::new(self.rewrite_type(elem)),
                 cap: *cap,
@@ -2318,6 +2321,7 @@ fn check_pub_surface_os_primitive(
 ) {
     let elem = match op {
         OsPrimitiveType::Watch { elem }
+        | OsPrimitiveType::Guarded { elem }
         | OsPrimitiveType::Inbox { elem, .. }
         | OsPrimitiveType::InboxUnsized { elem }
         | OsPrimitiveType::PingPong { elem, .. }

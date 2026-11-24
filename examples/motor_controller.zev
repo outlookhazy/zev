@@ -19,8 +19,8 @@ enum SupEvent { Overcurrent, BadPacket, IdleCheck }
 @dma_safe ping_pong<u8, 64> uart1_dma;
 @dma_safe ping_pong<u8, 64> uart2_dma;
 
-watch<u16>                  motor1_rpm = 0;
-watch<u16>                  motor2_rpm = 0;
+guarded<u16>                motor1_rpm = 0;
+guarded<u16>                motor2_rpm = 0;
 inbox<SupEvent, 8>          sup_inbox;
 
 // ── Parameterized Hardware Interrupt Handlers (zero RAM vector table) ──────
@@ -53,11 +53,14 @@ u16 parse_setpoint([]u8 buf) error ParseErr {
 }
 
 // ── Reusable Task Blueprints (do nothing until spawned; 100% static RAM) ────
-task motor_control(*watch<u16> target_rpm, u8 pwm_ch) {
+task motor_control(*guarded<u16> target_rpm, u8 pwm_ch) {
     i32 integral = 0;                                  // Persists across yields in static frame
 
     loop every 1ms {                                   // Drift-free periodic deadline
-        u16 target = target_rpm.read();
+        u16 target = 0;
+        critical {
+            target = target_rpm.get();
+        }
         u16 actual = adc_read_rpm(pwm_ch);             // Yields automatically until conversion done
 
         noyield {                                      // Task-atomic: registers stay hot, no interleave
@@ -67,7 +70,7 @@ task motor_control(*watch<u16> target_rpm, u8 pwm_ch) {
     }
 }
 
-task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
+task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *guarded<u16> out_rpm) {
     loop {
         []u8 half = rx_dma.wait_chunk();               // Yields; compiler prevents DMA buffer clash
 
@@ -77,7 +80,9 @@ task fieldbus_listener(*ping_pong<u8, 64> rx_dma, *watch<u16> out_rpm) {
             continue;
         };
 
-        out_rpm.publish(rpm);
+        critical {
+            out_rpm.set(rpm);
+        }
     }
 }
 
@@ -113,8 +118,10 @@ fn main() {
 
         switch (ev) {
             Overcurrent => {
-                motor1_rpm.publish(0);
-                motor2_rpm.publish(0);
+                critical {
+                    motor1_rpm.set(0);
+                    motor2_rpm.set(0);
+                }
                 save_fault_record(bad_packets);        // Nested yielding flash write; runs @critical
             }                                          // Priority restores to @low at end of turn
             BadPacket => {

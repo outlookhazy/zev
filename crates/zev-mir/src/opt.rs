@@ -282,6 +282,10 @@ fn watch_or_prim_size_align(
             let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
             struct_size_align(&[el, (4, 4), (4, 4)], false)
         }
+        MirPrimKind::Guarded { elem } => {
+            let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
+            struct_size_align(&[el], false)
+        }
         MirPrimKind::Inbox { elem, cap } => {
             let el = type_size_align(elem, false, ptr_bytes, structs, dma_layout_structs, seen_structs);
             struct_size_align(
@@ -712,6 +716,12 @@ impl<'a> ScanCtx<'a> {
                     }
                     self.visit_prim_target(target, &kind, in_isr, callees);
                 }
+                MirPrimReadOp::GuardedGet { target, elem_ty } => {
+                    let kind = MirPrimKind::Guarded {
+                        elem: Box::new(elem_ty.clone()),
+                    };
+                    self.visit_prim_target(target, &kind, in_isr, callees);
+                }
                 MirPrimReadOp::InboxTryRecv {
                     target,
                     elem_ty,
@@ -954,6 +964,17 @@ impl<'a> ScanCtx<'a> {
                 value,
             } => {
                 let kind = MirPrimKind::Watch {
+                    elem: Box::new(elem_ty.clone()),
+                };
+                self.visit_prim_target(target, &kind, in_isr, callees);
+                self.visit_expr(value, in_isr, callees);
+            }
+            MirPrimNonBlockingOp::GuardedSet {
+                target,
+                elem_ty,
+                value,
+            } => {
+                let kind = MirPrimKind::Guarded {
                     elem: Box::new(elem_ty.clone()),
                 };
                 self.visit_prim_target(target, &kind, in_isr, callees);
@@ -2308,6 +2329,16 @@ fn mir_expr_eq(a: &MirExpr, b: &MirExpr) -> bool {
                         target: tb,
                         elem_ty: eb,
                     },
+                )
+                | (
+                    MirPrimReadOp::GuardedGet {
+                        target: ta,
+                        elem_ty: ea,
+                    },
+                    MirPrimReadOp::GuardedGet {
+                        target: tb,
+                        elem_ty: eb,
+                    },
                 ) => ea == eb && mir_prim_target_eq(ta, tb),
                 _ => false,
             }
@@ -2455,6 +2486,7 @@ impl VarUsageInfo {
             MirExprKind::PrimRead(op) => match op.as_ref() {
                 MirPrimReadOp::WatchRead { target, .. }
                 | MirPrimReadOp::WatchGen { target, .. }
+                | MirPrimReadOp::GuardedGet { target, .. }
                 | MirPrimReadOp::InboxTryRecv { target, .. }
                 | MirPrimReadOp::InboxLen { target, .. }
                 | MirPrimReadOp::InboxIsEmpty { target, .. }
@@ -2548,6 +2580,7 @@ impl VarUsageInfo {
             MirStmt::Expr(e) => self.visit_expr(e),
             MirStmt::PrimOp(op) => match op {
                 MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+                | MirPrimNonBlockingOp::GuardedSet { target, value, .. }
                 | MirPrimNonBlockingOp::InboxPost { target, value, .. } => {
                     self.visit_prim_target(target);
                     self.visit_expr(value);
@@ -2991,6 +3024,7 @@ fn expr_reads_var(expr: &MirExpr, target: VarId) -> bool {
         MirExprKind::PrimRead(op) => match op.as_ref() {
             MirPrimReadOp::WatchRead { target: t, .. }
             | MirPrimReadOp::WatchGen { target: t, .. }
+            | MirPrimReadOp::GuardedGet { target: t, .. }
             | MirPrimReadOp::InboxTryRecv { target: t, .. }
             | MirPrimReadOp::InboxLen { target: t, .. }
             | MirPrimReadOp::InboxIsEmpty { target: t, .. }
@@ -3104,6 +3138,9 @@ fn stmt_reads_var(stmt: &MirStmt, target: VarId) -> bool {
         MirStmt::Expr(e) => expr_reads_var(e, target),
         MirStmt::PrimOp(op) => match op {
             MirPrimNonBlockingOp::WatchPublish {
+                target: t, value, ..
+            }
+            | MirPrimNonBlockingOp::GuardedSet {
                 target: t, value, ..
             }
             | MirPrimNonBlockingOp::InboxPost {
@@ -3336,6 +3373,7 @@ fn subst_expr(expr: &mut MirExpr, target: VarId, repl: &MirExpr) {
         MirExprKind::PrimRead(op) => match op.as_mut() {
             MirPrimReadOp::WatchRead { target: t, .. }
             | MirPrimReadOp::WatchGen { target: t, .. }
+            | MirPrimReadOp::GuardedGet { target: t, .. }
             | MirPrimReadOp::InboxTryRecv { target: t, .. }
             | MirPrimReadOp::InboxLen { target: t, .. }
             | MirPrimReadOp::InboxIsEmpty { target: t, .. }
@@ -3442,6 +3480,9 @@ fn subst_stmt(stmt: &mut MirStmt, target: VarId, repl: &MirExpr) {
         MirStmt::Expr(e) => subst_expr(e, target, repl),
         MirStmt::PrimOp(op) => match op {
             MirPrimNonBlockingOp::WatchPublish {
+                target: t, value, ..
+            }
+            | MirPrimNonBlockingOp::GuardedSet {
                 target: t, value, ..
             }
             | MirPrimNonBlockingOp::InboxPost {
@@ -3728,6 +3769,7 @@ fn collect_fn_addrs_and_calls_expr<'a>(
         MirExprKind::PrimRead(op) => match op.as_ref() {
             MirPrimReadOp::WatchRead { target, .. }
             | MirPrimReadOp::WatchGen { target, .. }
+            | MirPrimReadOp::GuardedGet { target, .. }
             | MirPrimReadOp::InboxTryRecv { target, .. }
             | MirPrimReadOp::InboxLen { target, .. }
             | MirPrimReadOp::InboxIsEmpty { target, .. }
@@ -3894,6 +3936,7 @@ fn collect_fn_addrs_and_calls_stmt(
         MirStmt::Expr(e) => collect_fn_addrs_and_calls_expr(e, addr_taken_fns, call_sites),
         MirStmt::PrimOp(op) => match op {
             MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+            | MirPrimNonBlockingOp::GuardedSet { target, value, .. }
             | MirPrimNonBlockingOp::InboxPost { target, value, .. } => {
                 if let MirPrimTarget::PtrExpr(pe) = target {
                     collect_fn_addrs_and_calls_expr(pe, addr_taken_fns, call_sites);
