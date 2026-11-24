@@ -182,7 +182,7 @@ CHECK & TARGET OPTIONS:
     -p <dev> | --port <dev>                 Serial/flash port override (`flash` / `flash-*`, else board default)
 
 LLVM OPTIMIZATION & TARGET OPTIONS (ram, emit-llvm, build, flash, build-*, flash-*, run-qemu):
-    -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default from chip TOML or -O2)
+    -O0 | -O1 | -O2 | -O3 | -Os | -Oz       LLVM 23 opt + llc optimization level (default from chip TOML or -Os)
     --opt-level <O0|O1|O2|O3|Os|Oz>         Explicit long-form optimization level selector
     --target <cortex-m3|esp32c6|avr|nano-every|rp2040|host> Legacy target alias (`ram`: MCUs; `emit-llvm`: +host)
 
@@ -256,7 +256,7 @@ where
             }),
             None => Ok(Command::Help),
         },
-        "flash-esp32c6" => match parse_flash_serial(&raw[1..], "flash-esp32c6", "-O2")? {
+        "flash-esp32c6" => match parse_flash_serial(&raw[1..], "flash-esp32c6", "-Os")? {
             Some((files, include_dirs, port, opt_level, output)) => Ok(Command::FlashEsp32C6 {
                 files,
                 include_dirs,
@@ -311,7 +311,7 @@ where
             }
         }
         "build-rp2040" | "build-pico" => {
-            match parse_files_with_output_and_opt_default(&raw[1..], &raw[0], "-O2")? {
+            match parse_files_with_output_and_opt_default(&raw[1..], &raw[0], "-Os")? {
                 Some((files, include_dirs, opt_level, output)) => Ok(Command::BuildRp2040 {
                     files,
                     include_dirs,
@@ -321,7 +321,7 @@ where
                 None => Ok(Command::Help),
             }
         }
-        "flash-rp2040" | "flash-pico" => match parse_flash_serial(&raw[1..], &raw[0], "-O2")? {
+        "flash-rp2040" | "flash-pico" => match parse_flash_serial(&raw[1..], &raw[0], "-Os")? {
             Some((files, include_dirs, port, opt_level, output)) => Ok(Command::FlashRp2040 {
                 files,
                 include_dirs,
@@ -700,7 +700,7 @@ fn parse_files_with_output_and_opt(
     args: &[String],
     subcmd: &str,
 ) -> Result<Option<FilesWithOutputAndOpt>, String> {
-    parse_files_with_output_and_opt_default(args, subcmd, "-O2")
+    parse_files_with_output_and_opt_default(args, subcmd, "-Os")
 }
 
 fn parse_files_with_output_and_opt_default(
@@ -1070,7 +1070,7 @@ fn parse_run_qemu(args: &[String]) -> Result<Command, String> {
     let mut files = Vec::new();
     let mut include_dirs = Vec::new();
     let mut max_ticks: Option<u64> = None;
-    let mut opt_level = "-O2".to_string();
+    let mut opt_level = "-Os".to_string();
     let mut script_args = ParsedScriptArgs::default();
     let mut i = 0;
     while i < args.len() {
@@ -1814,7 +1814,7 @@ mod tests {
             Command::BuildElf {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
-                opt_level: "-O2".to_string(),
+                opt_level: "-Os".to_string(),
                 output: None,
             }
         );
@@ -1828,7 +1828,7 @@ mod tests {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
                 max_ticks: None,
-                opt_level: "-O2".to_string(),
+                opt_level: "-Os".to_string(),
                 script: None,
                 cmds: vec![],
                 script_timeout_ms: None,
@@ -1843,7 +1843,7 @@ mod tests {
             Command::BuildEsp32C6 {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
-                opt_level: "-O2".to_string(),
+                opt_level: "-Os".to_string(),
                 output: None,
             }
         );
@@ -1857,7 +1857,7 @@ mod tests {
                 files: vec![PathBuf::from("app.zev")],
                 include_dirs: expected_dirs.clone(),
                 port: "/dev/ttyACM0".to_string(),
-                opt_level: "-O2".to_string(),
+                opt_level: "-Os".to_string(),
                 output: None,
             }
         );

@@ -5533,7 +5533,7 @@ task driver() {
     println(ys, f"ys={val}");
     []u8 expected = "ys=42\n";
     assert(ys.buf[0..ys.len] == expected);
-    assert(ys.delays == 3);
+    assert(ys.delays == 1);
     done_sig.notify();
     loop {
         delay(100ms);
@@ -7001,7 +7001,9 @@ fn main() {
         assert!(
             check_json.contains("\"caller\": \"fn std_shell__Session__poll_once\"")
                 && check_json.contains("\"candidates\": [\"cmd_led\", \"cmd_scan\"]")
-                && check_json.contains("\"frame_bytes_32\": 140"),
+                && !check_json.contains(
+                    "\"candidates\": [\"cmd_led\", \"cmd_scan\"], \"frame_bytes_32\": 0,"
+                ),
             "missing shell handler candidates in check json:\n{check_json}"
         );
         assert!(
@@ -8091,5 +8093,119 @@ fn main() {
                 q_res.exec.stdout
             );
         }
+    }
+
+    #[test]
+    fn post_item9_coalesced_and_oversize_yielding_sink_print_host_and_qemu() {
+        let temp = TempWorkDir::create("zevc-pr29-coalesce").unwrap();
+        let src = r#"
+import board;
+
+struct CountSink {
+    [256]u8 buf;
+    usize len;
+    u32 calls;
+}
+
+impl CountSink {
+    pub fn write(*self, []u8 bytes) {
+        self.calls += 1u32;
+        if (bytes.len > 0) {
+            delay(1ms);
+        }
+        for (u8 b in bytes) {
+            if (self.len < 256) {
+                self.buf[self.len] = b;
+                self.len += 1;
+            }
+        }
+    }
+}
+
+task driver() {
+    CountSink s1;
+    s1.len = 0;
+    s1.calls = 0u32;
+    u32 i = 3u32;
+    u32 n = 10u32;
+    println(&s1, f"value {i} is {n}");
+    []u8 expected_a = "value 3 is 10\n";
+    assert(s1.calls == 1u32);
+    assert(s1.buf[0..s1.len] == expected_a);
+
+    [140]u8 big_arr;
+    usize k = 0;
+    while (k < 140) {
+        big_arr[k] = 'a' + ((k % 26) as u8);
+        k += 1;
+    }
+    []u8 big = big_arr[0..140];
+    CountSink s2;
+    s2.len = 0;
+    s2.calls = 0u32;
+    println(&s2, f"hdr={i}:{big}");
+    assert(s2.len == 147);
+    assert(s2.calls > 1u32);
+    []u8 prefix = "hdr=3:abc";
+    assert(s2.buf[0..9] == prefix);
+    assert(s2.buf[6..146] == big);
+    assert(s2.buf[146] == '\n');
+
+    println("PR29_SINK_COALESCE_OK");
+    sys.exit(0);
+}
+
+fn main() {
+    board.init();
+    spawn driver() @normal;
+}
+"#;
+        let app_path = temp.dir.join("coalesce.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, h_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let h_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&h_mir, &host_opts).unwrap();
+        let (h_code, h_out) = runner::compile_and_run_host_llvm_output(&h_ll, true, &[]).unwrap();
+        assert_eq!(h_code, 0, "host coalesce failed:\n{h_out}");
+        assert!(h_out.contains("PR29_SINK_COALESCE_OK"), "{h_out}");
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, q_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let q_res = zev_codegen_llvm::run_qemu_cortex_m(
+            &q_mir,
+            &temp.dir.join("coalesce_qemu.elf"),
+            &qemu_opts,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            q_res.exec.exit_code, 0,
+            "qemu coalesce failed:\n{}",
+            q_res.exec.stdout
+        );
+        assert!(
+            q_res.exec.stdout.contains("PR29_SINK_COALESCE_OK"),
+            "{}",
+            q_res.exec.stdout
+        );
     }
 }

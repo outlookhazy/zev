@@ -356,7 +356,7 @@ impl TargetSpec {
         let ptr_bits = cdoc.opt_u32("chip", "ptr_bits")?.unwrap_or(isa.ptr_bits());
         let mut opt_level = cdoc
             .opt_str("chip", "opt_level")?
-            .unwrap_or_else(|| "-O2".to_string());
+            .unwrap_or_else(|| "-Os".to_string());
         let code_in_ram = cdoc.opt_bool("chip", "code_in_ram")?.unwrap_or(false);
         let rodata_in_ram = cdoc.opt_bool("chip", "rodata_in_ram")?.unwrap_or(false);
         let has_thumb2 = cdoc.opt_bool("chip", "has_thumb2")?.unwrap_or(false);

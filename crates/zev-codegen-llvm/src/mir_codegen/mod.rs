@@ -500,6 +500,7 @@ pub(super) struct FnIrBuilder<'ctx, 'm> {
     pub(super) ctx: &'ctx mut ModuleCtx<'m>,
     pub(super) vars: Vec<MirVar>,
     pub(super) coroutine: Option<CoroutineFrameLayout>,
+    pub(super) is_task: bool,
     pub(super) isr_state_ptrs: HashMap<VarId, String>,
     pub(super) ret_ty: MirType,
     pub(super) error_spec: MirErrorSpec,

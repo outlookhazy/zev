@@ -4428,6 +4428,101 @@ pub(super) fn chunk_to_slice_or_scalar_be<B: LowerBackend>(
     }
 }
 
+pub(super) fn fmt_chunk_static_max_bytes(ch: &MirFmtChunk, syms: &ModuleSymbols) -> Option<usize> {
+    match ch {
+        MirFmtChunk::Literal(s) => Some(s.len()),
+        MirFmtChunk::Bool(_) => Some(5),
+        MirFmtChunk::PaddedBool { pad, .. } => Some(5usize.max(usize::from(pad.width))),
+        MirFmtChunk::EnumName { enum_name, .. } => {
+            let nat = syms
+                .enums
+                .get(enum_name)
+                .and_then(|en| en.iter().map(|(n, _)| n.len()).max())
+                .unwrap_or(0)
+                .max(enum_name.len() + 3);
+            Some(nat)
+        }
+        MirFmtChunk::PaddedEnumName { enum_name, pad, .. } => {
+            let nat = syms
+                .enums
+                .get(enum_name)
+                .and_then(|en| en.iter().map(|(n, _)| n.len()).max())
+                .unwrap_or(0)
+                .max(enum_name.len() + 3);
+            Some(nat.max(usize::from(pad.width)))
+        }
+        MirFmtChunk::Int {
+            bits, signed, fmt, ..
+        } => {
+            let dec_max = match bits {
+                8 => {
+                    if *signed {
+                        4
+                    } else {
+                        3
+                    }
+                }
+                16 => {
+                    if *signed {
+                        6
+                    } else {
+                        5
+                    }
+                }
+                32 => {
+                    if *signed {
+                        11
+                    } else {
+                        10
+                    }
+                }
+                _ => 20,
+            };
+            match fmt {
+                MirIntFmt::Dec => Some(dec_max),
+                MirIntFmt::Hex { zero_pad_width, .. } => {
+                    Some((usize::from(*bits) / 4).max(usize::from(*zero_pad_width)))
+                }
+                MirIntFmt::Bin { zero_pad_width } => {
+                    Some(usize::from(*bits).max(usize::from(*zero_pad_width)))
+                }
+                MirIntFmt::Padded { base, pad, .. } => {
+                    let nat = match base {
+                        2 => usize::from(*bits),
+                        16 => usize::from(*bits) / 4,
+                        _ => dec_max,
+                    };
+                    Some(nat.max(usize::from(pad.width)))
+                }
+            }
+        }
+        MirFmtChunk::Float { fmt, .. } => match fmt {
+            MirFloatFmt::Fixed { precision } | MirFloatFmt::Sci { precision } => {
+                Some(16 + usize::from(*precision))
+            }
+        },
+        MirFmtChunk::Bytes(e) => match &e.kind {
+            MirExprKind::StringLit(s) => Some(s.len()),
+            MirExprKind::ArrayToSlice { len, .. } => Some(*len),
+            _ => None,
+        },
+        MirFmtChunk::PaddedBytes { slice, pad } => match &slice.kind {
+            MirExprKind::StringLit(s) => Some(s.len().max(usize::from(pad.width))),
+            MirExprKind::ArrayToSlice { len, .. } => Some((*len).max(usize::from(pad.width))),
+            _ => None,
+        },
+        MirFmtChunk::Str(e) => match &e.kind {
+            MirExprKind::StringLit(s) => Some(s.len()),
+            _ => None,
+        },
+        MirFmtChunk::PaddedStr { cstr, pad } => match &cstr.kind {
+            MirExprKind::StringLit(s) => Some(s.len().max(usize::from(pad.width))),
+            _ => None,
+        },
+        MirFmtChunk::DebugSlice { .. } => None,
+    }
+}
+
 pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
     wfn: &str,
     newline: bool,

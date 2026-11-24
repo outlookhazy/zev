@@ -12,6 +12,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             ctx,
             vars: vars.to_vec(),
             coroutine: coroutine.cloned(),
+            is_task: false,
             isr_state_ptrs: HashMap::new(),
             ret_ty: ret_ty.clone(),
             error_spec: error_spec.clone(),
@@ -224,6 +225,26 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
         }
     }
 
+    pub(super) fn emit_zero_fn_hoisted_locals(&mut self) {
+        let Some(coro) = self.coroutine.clone() else {
+            return;
+        };
+        let vars_snapshot = self.vars.clone();
+        for v in &vars_snapshot {
+            if v.role == VarRole::Param
+                || v.role == VarRole::IsrState
+                || self.isr_state_ptrs.contains_key(&v.id)
+                || v.ty.is_void()
+                || !coro.hoisted_var_gep.contains_key(&v.id)
+            {
+                continue;
+            }
+            let vp = self.var_ptr(v.id);
+            let lty = self.ctx.llvm_ty(&v.ty);
+            self.emit_line(format!("store {lty} zeroinitializer, ptr {vp}, align 1"));
+        }
+    }
+
     pub(super) fn coerce(&mut self, val: SsaVal, dst_ty: &str, signed: bool) -> SsaVal {
         if val.ty == dst_ty {
             return val;
@@ -387,9 +408,12 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             let lbl = format!("bb_{}", b.id.0);
             self.start_block(&lbl);
 
-            // On `restart;` back into `bb_0`, zero non-Param locals and child frames while keeping `Param` fields intact!
-            if b.id.0 == entry_bb && entry_is_restart_target {
-                self.emit_zero_task_locals();
+            if b.id.0 == entry_bb {
+                if self.is_task && entry_is_restart_target {
+                    self.emit_zero_task_locals();
+                } else if !self.is_task {
+                    self.emit_zero_fn_hoisted_locals();
+                }
             }
 
             // Resync while-sleeping overruns at `loop every` body entry (`wdiff >= eff_p`)
@@ -804,10 +828,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     "{cptr} = getelementptr inbounds {}, ptr %__frame, i32 0, i32 {ug_gep}",
                     coro.llvm_name
                 ));
-                self.emit_line(format!(
-                    "store {} zeroinitializer, ptr {cptr}, align 8",
-                    child_layout.llvm_name
-                ));
+                self.emit_line(format!("store i32 0, ptr {cptr}, align 4"));
                 for (i, &pvid) in callee_fn.params.iter().enumerate() {
                     if let Some(&pgep) = child_layout.hoisted_var_gep.get(&pvid) {
                         let pty_mir = callee_fn.vars[pvid.0].ty.clone();
@@ -853,15 +874,9 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                     coro.llvm_name
                 ));
 
-                // Uncontended back-to-back MORE execution loop (mirroring PT_SPAWN_IF_NEEDED!)
-                let loop_lbl = self.next_label("poll_child_loop");
-                let chk_more_lbl = self.next_label("poll_child_more");
                 let yield_lbl = self.next_label("poll_child_yield");
                 let done_lbl = self.next_label("poll_child_done");
-                self.emit_term(format!("br label %{loop_lbl}"));
-
                 let call_kw = self.call_kw();
-                self.start_block(&loop_lbl);
                 let st = self.next_tmp();
                 self.emit_line(format!(
                     "{st} = {call_kw} i32 {}(ptr {cptr}, ptr %__task)",
@@ -870,22 +885,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let is_done = self.next_tmp();
                 self.emit_line(format!("{is_done} = icmp eq i32 {st}, 2"));
                 self.emit_term(format!(
-                    "br i1 {is_done}, label %{done_lbl}, label %{chk_more_lbl}"
-                ));
-
-                self.start_block(&chk_more_lbl);
-                let is_more = self.next_tmp();
-                self.emit_line(format!("{is_more} = icmp eq i32 {st}, 0"));
-                let share = self.next_tmp();
-                self.emit_line(format!(
-                    "{share} = {call_kw} i1 @__syn_should_share(ptr %__task)"
-                ));
-                let not_share = self.next_tmp();
-                self.emit_line(format!("{not_share} = xor i1 {share}, true"));
-                let keep_going = self.next_tmp();
-                self.emit_line(format!("{keep_going} = and i1 {is_more}, {not_share}"));
-                self.emit_term(format!(
-                    "br i1 {keep_going}, label %{loop_lbl}, label %{yield_lbl}"
+                    "br i1 {is_done}, label %{done_lbl}, label %{yield_lbl}"
                 ));
 
                 self.start_block(&yield_lbl);
@@ -2123,10 +2123,7 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             eval_args.push(self.coerce(av, &pty, signed));
         }
 
-        self.emit_line(format!(
-            "store {} zeroinitializer, ptr {fsym}, align 8",
-            child_layout.llvm_name
-        ));
+        self.emit_line(format!("store i32 0, ptr {fsym}, align 4"));
         for (i, &pvid) in callee_fn.params.iter().enumerate() {
             if let Some(&pgep) = child_layout.hoisted_var_gep.get(&pvid) {
                 let pty_mir = callee_fn.vars[pvid.0].ty.clone();

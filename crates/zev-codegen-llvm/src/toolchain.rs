@@ -130,7 +130,7 @@ pub struct CodegenOptions {
     pub ram_origin: u32,
     /// SRAM size in bytes override.
     pub ram_len: u32,
-    /// Optimization flag passed to `opt`/`llc` (`"-O2"` by default; `"-Os"` on AVR).
+    /// Optimization flag passed to `opt`/`llc` (`"-Os"` default on MCUs; `"-O2"` on host).
     pub opt_level: String,
     /// Optional deterministic tick cap (`0` = unlimited, `> 0` = auto-exit at tick cap if reached).
     pub max_ticks: u32,
@@ -147,7 +147,7 @@ impl Default for CodegenOptions {
             flash_len: 256 * 1024,
             ram_origin: 0x2000_0000,
             ram_len: 64 * 1024,
-            opt_level: "-O2".to_string(),
+            opt_level: "-Os".to_string(),
             max_ticks: 0,
         }
     }
@@ -238,7 +238,7 @@ impl CodegenOptions {
                 flash_len: 4 * 1024 * 1024,
                 ram_origin: 0x4080_0000,
                 ram_len: 448 * 1024,
-                opt_level: "-O2".to_string(),
+                opt_level: "-Os".to_string(),
                 max_ticks: 0,
             },
         }
@@ -303,7 +303,7 @@ impl CodegenOptions {
                 flash_len: 264 * 1024,
                 ram_origin: 0x2000_0000,
                 ram_len: 264 * 1024,
-                opt_level: "-O2".to_string(),
+                opt_level: "-Os".to_string(),
                 max_ticks: 0,
             },
         }
