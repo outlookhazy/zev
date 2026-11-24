@@ -1,0 +1,347 @@
+// Standard zero-heap interactive command shell (`std.shell`)
+
+import std.io as io;
+import std.str as str;
+
+pub enum Err {
+    Usage,
+    Unknown,
+    LineTooLong,
+    Failed,
+}
+
+const [3]u8 BS_ERASE_SEQ = [8u8, 32u8, 8u8];
+
+pub struct Session {
+    io.DuplexStream port;
+    []u8            line_buf;
+    usize           line_len;
+    bool            echo;
+    bool            overflowed;
+    bool            prev_cr;
+}
+
+pub struct Cmd {
+    []u8                         name;
+    []u8                         help;
+    fn(*Session, []u8) error Err run;
+}
+
+fn is_ws(u8 b) -> bool {
+    return b == ' ' || b == '\t' || b == '\r' || b == '\n';
+}
+
+fn nth_token([]u8 s, usize target_idx) -> []u8 error Err {
+    usize i = 0;
+    usize cur_idx = 0;
+    noyield {
+        while (i < s.len) {
+            while (i < s.len && is_ws(s[i])) {
+                i += 1;
+            }
+            if (i >= s.len) {
+                break;
+            }
+            usize start = i;
+            while (i < s.len && !is_ws(s[i])) {
+                i += 1;
+            }
+            if (cur_idx == target_idx) {
+                return s[start..i];
+            }
+            cur_idx += 1;
+        }
+    }
+    error Usage;
+}
+
+fn find_verb_end([]u8 line) -> usize {
+    usize verb_end = 0;
+    noyield {
+        while (verb_end < line.len && !is_ws(line[verb_end])) {
+            verb_end += 1;
+        }
+    }
+    return verb_end;
+}
+
+pub fn arg_str([]u8 args, usize index) -> []u8 error Err {
+    return nth_token(args, index) catch (Err e) { error e; };
+}
+
+pub fn arg_u32([]u8 args, usize index) -> u32 error Err {
+    []u8 tok = nth_token(args, index) catch (Err e) { error e; };
+    return str.parse_u32(tok) catch (str.ParseErr _pe) { error Usage; };
+}
+
+pub fn arg_i32([]u8 args, usize index) -> i32 error Err {
+    []u8 tok = nth_token(args, index) catch (Err e) { error e; };
+    return str.parse_i32(tok) catch (str.ParseErr _pe) { error Usage; };
+}
+
+pub fn arg_hex([]u8 args, usize index) -> u32 error Err {
+    []u8 tok = nth_token(args, index) catch (Err e) { error e; };
+    if (tok.len >= 2 && tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
+        tok = tok[2..tok.len];
+    }
+    return str.parse_hex_u32(tok) catch (str.ParseErr _pe) { error Usage; };
+}
+
+pub fn arg_bool([]u8 args, usize index) -> bool error Err {
+    []u8 tok = nth_token(args, index) catch (Err e) { error e; };
+    if (tok == "on" || tok == "1" || tok == "true") {
+        return true;
+    }
+    if (tok == "off" || tok == "0" || tok == "false") {
+        return false;
+    }
+    error Usage;
+}
+
+fn parse_echo_args([]u8 rest) -> bool error Err {
+    bool next_echo = arg_bool(rest, 0) catch (Err e) { error e; };
+    bool has_extra = true;
+    []u8 _extra = nth_token(rest, 1) catch (Err _e) { has_extra = false; "" };
+    if (has_extra) {
+        error Usage;
+    }
+    return next_echo;
+}
+
+fn lookup_cmd([]u8 verb, []Cmd cmds) -> i32 {
+    if (verb == "help") {
+        return -1i32;
+    }
+    if (verb == "echo") {
+        return -2i32;
+    }
+    for (usize i in 0..cmds.len) {
+        if (cmds[i].name == verb) {
+            return i as i32;
+        }
+    }
+    return -3i32;
+}
+
+fn trim_bounds([]u8 buf, usize len) -> [2]usize {
+    usize start = 0;
+    usize end = len;
+    noyield {
+        while (start < end && is_ws(buf[start])) {
+            start += 1;
+        }
+        while (end > start && is_ws(buf[end - 1])) {
+            end -= 1;
+        }
+    }
+    return [start, end];
+}
+
+fn err_status_line(Err e) -> []u8 {
+    switch (e) {
+        Usage => return "err Usage\r\n",
+        Unknown => return "err Unknown\r\n",
+        LineTooLong => return "err LineTooLong\r\n",
+        Failed => return "err Failed\r\n",
+    }
+}
+
+impl Session {
+    pub fn make(io.DuplexStream port, []u8 buf) -> Session {
+        return Session {
+            port: port,
+            line_buf: buf,
+            line_len: 0,
+            echo: true,
+            overflowed: false,
+            prev_cr: false,
+        };
+    }
+
+    pub fn write(*self, []u8 bytes) {
+        usize offset = 0;
+        while (offset < bytes.len) {
+            usize n = self.port.tx.push(bytes[offset..bytes.len]);
+            offset += n;
+            if (n > 0 || offset < bytes.len) {
+                (self.port.flush)(self.port.tx);
+            }
+            if (offset < bytes.len) {
+                checkpoint();
+            }
+        }
+    }
+
+    // Returns echo action for `b`: 0 = none, 1 = erase (`\b \b`), 2 = echo `b` (or `' '` if tab).
+    fn accept_byte(*self, u8 b) -> u8 {
+        if (b == 8u8 || b == 127u8) {
+            self.prev_cr = false;
+            if (!self.overflowed && self.line_len > 0) {
+                self.line_len -= 1;
+                if (self.echo) {
+                    return 1u8;
+                }
+            }
+            return 0u8;
+        }
+        if (b == 9u8) {
+            b = ' ';
+        }
+        if (b < 32u8 || b > 126u8) {
+            return 0u8;
+        }
+        self.prev_cr = false;
+        if (self.overflowed) {
+            return 0u8;
+        }
+        if (self.line_len < self.line_buf.len) {
+            self.line_buf[self.line_len] = b;
+            self.line_len += 1;
+            if (self.echo) {
+                return 2u8;
+            }
+        } else {
+            self.overflowed = true;
+        }
+        return 0u8;
+    }
+
+    pub fn begin(*self) {
+        if (self.echo) {
+            self.port.write("> ");
+        }
+    }
+
+    pub fn poll_once(*self, []Cmd cmds) {
+        []u8 chunk = self.port.rx.wait_read();
+        usize used = 0;
+        u8 eol_b = 0u8;
+        for (usize i in 0..chunk.len) {
+            u8 b = chunk[i];
+            if (b == 13u8 || b == 10u8) {
+                used = i + 1;
+                eol_b = b;
+                break;
+            }
+            u8 act = self.accept_byte(b);
+            if (act == 1u8) {
+                if (self.port.tx.free_space() >= 3usize) {
+                    usize _w = self.port.try_write(BS_ERASE_SEQ);
+                } else {
+                    self.port.rx.consume(i + 1);
+                    self.port.write(BS_ERASE_SEQ);
+                    return;
+                }
+            } else if (act == 2u8) {
+                [1]u8 ch = [self.line_buf[self.line_len - 1]];
+                if (self.port.tx.free_space() >= 1usize) {
+                    usize _w = self.port.try_write(ch);
+                } else {
+                    self.port.rx.consume(i + 1);
+                    self.port.write(ch);
+                    return;
+                }
+            }
+            used = i + 1;
+        }
+        self.port.rx.consume(used);
+        if (eol_b == 0u8) {
+            return;
+        }
+
+        if (eol_b == 10u8 && self.prev_cr && !self.overflowed && self.line_len == 0) {
+            self.prev_cr = false;
+            return;
+        }
+
+        bool was_echo = self.echo;
+        if (self.overflowed) {
+            self.overflowed = false;
+            self.line_len = 0;
+            self.prev_cr = eol_b == 13u8;
+            if (was_echo) {
+                self.port.write("\r\n");
+            }
+            self.port.write("err LineTooLong\r\n");
+            if (self.echo) {
+                self.port.write("> ");
+            }
+            return;
+        }
+
+        usize raw_len = self.line_len;
+        self.line_len = 0;
+        self.prev_cr = eol_b == 13u8;
+
+        if (was_echo) {
+            self.port.write("\r\n");
+        }
+
+        [2]usize span = trim_bounds(self.line_buf, raw_len);
+        if (span[0] < span[1]) {
+            usize line_start = span[0];
+            usize line_end = span[1];
+            usize verb_rel = find_verb_end(self.line_buf[line_start..line_end]);
+            [2]usize rest_span = trim_bounds(
+                self.line_buf[(line_start + verb_rel)..line_end],
+                line_end - (line_start + verb_rel),
+            );
+            usize rest_start = line_start + verb_rel + rest_span[0];
+            usize rest_end = line_start + verb_rel + rest_span[1];
+            i32 which = lookup_cmd(self.line_buf[line_start..(line_start + verb_rel)], cmds);
+
+            if (which == -1i32) {
+                self.port.write("  help         show commands\r\n  echo         echo on|off\r\n");
+                for (usize i in 0..cmds.len) {
+                    print(&self.port, f"  {cmds[i].name:<12} {cmds[i].help}\r\n");
+                }
+                self.port.write("ok\r\n");
+            } else if (which == -2i32) {
+                bool ok_args = true;
+                bool next_echo = parse_echo_args(self.line_buf[rest_start..rest_end]) catch (Err _e) {
+                    ok_args = false;
+                    false
+                };
+                if (!ok_args) {
+                    self.port.write("usage: echo on|off\r\nerr Usage\r\n");
+                } else {
+                    self.echo = next_echo;
+                    self.port.write("ok\r\n");
+                }
+            } else if (which >= 0i32) {
+                usize cmd_idx = which as usize;
+                bool ran_ok = true;
+                Err cmd_err = Err.Failed;
+                (cmds[cmd_idx].run)(self, self.line_buf[rest_start..rest_end]) catch (Err e) {
+                    ran_ok = false;
+                    cmd_err = e;
+                };
+                if (ran_ok) {
+                    self.port.write("ok\r\n");
+                } else {
+                    if (cmd_err == Err.Usage) {
+                        self.port.write("usage: ");
+                        self.port.write(cmds[cmd_idx].help);
+                        self.port.write("\r\n");
+                    }
+                    self.port.write(err_status_line(cmd_err));
+                }
+            } else {
+                self.port.write("err Unknown\r\n");
+            }
+        }
+
+        if (self.echo) {
+            self.port.write("> ");
+        }
+    }
+}
+
+pub task serve(io.DuplexStream port, []Cmd cmds) {
+    [64]u8 line_buf;
+    Session s = Session.make(port, line_buf);
+    s.begin();
+    loop {
+        s.poll_once(cmds);
+    }
+}

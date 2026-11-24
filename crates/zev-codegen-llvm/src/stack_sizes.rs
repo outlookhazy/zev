@@ -15,14 +15,18 @@
 //! Stack-bounded ROM ABI wrappers (`@__syn_rom_call_*_sb<N>` / `@__syn_rom_noreturn_*`) supply
 //! compile-time verified constant bounds directly via their `_sb<N>` suffix.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zev_mir::MirModule;
+use zev_mir::{
+    MirBakedArg, MirBootStep, MirErrorSpec, MirExpr, MirExprKind, MirFmtChunk, MirFnBody,
+    MirIntrinsicOp, MirModule, MirPlace, MirPrimNonBlockingOp, MirPrimReadOp, MirPrimTarget,
+    MirStmt, MirTerminator, MirType, MirVar, MirWaitArmOp, MirYieldKind,
+};
 
 use crate::arm_cortex_m::sanitize_ident;
 use crate::riscv32::assign_rv_irq_routes_for_spec;
@@ -1135,6 +1139,770 @@ fn walk_worst_stack(
     res
 }
 
+type FnPtrSigKey = (Vec<MirType>, MirType, MirErrorSpec);
+
+fn fnptr_sig_key(params: &[MirType], ret: &MirType, error_spec: &MirErrorSpec) -> FnPtrSigKey {
+    (
+        params.iter().map(MirType::host_value_type).collect(),
+        ret.host_value_type(),
+        error_spec.clone(),
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MirNodeKey {
+    Fn(String),
+    Task(String),
+    Isr(String),
+    Boot,
+}
+
+struct MirIndirectScan<'a> {
+    fn_sigs: HashMap<&'a str, (String, FnPtrSigKey)>,
+    ext_sigs: HashMap<&'a str, (String, FnPtrSigKey)>,
+    elf_or_frame_syms: &'a BTreeSet<String>,
+    sig_to_targets: HashMap<FnPtrSigKey, BTreeSet<String>>,
+    all_addr_taken: BTreeSet<String>,
+    direct_callees: BTreeMap<MirNodeKey, BTreeSet<String>>,
+    direct_sig_calls: BTreeMap<MirNodeKey, HashSet<FnPtrSigKey>>,
+}
+
+impl<'a> MirIndirectScan<'a> {
+    fn record_fn_addr(&mut self, name: &str) {
+        let entry = self.fn_sigs.get(name).or_else(|| self.ext_sigs.get(name));
+        let Some((elf_sym, sig)) = entry else {
+            return;
+        };
+        if !self.elf_or_frame_syms.contains(elf_sym) {
+            return;
+        }
+        self.all_addr_taken.insert(elf_sym.clone());
+        self.sig_to_targets
+            .entry(sig.clone())
+            .or_default()
+            .insert(elf_sym.clone());
+    }
+
+    fn scan_prim_target(
+        &mut self,
+        t: &MirPrimTarget,
+        caller: Option<&MirNodeKey>,
+        vars: &[MirVar],
+    ) {
+        match t {
+            MirPrimTarget::Global(_) => {}
+            MirPrimTarget::PtrExpr(e) => self.scan_expr(e, caller, vars),
+        }
+    }
+
+    fn scan_place(&mut self, p: &MirPlace, caller: Option<&MirNodeKey>, vars: &[MirVar]) {
+        match p {
+            MirPlace::Var(_) => {}
+            MirPlace::Deref(e, _) => self.scan_expr(e, caller, vars),
+            MirPlace::Field { base, .. } => self.scan_place(base, caller, vars),
+            MirPlace::Index { base, index, .. } => {
+                self.scan_place(base, caller, vars);
+                self.scan_expr(index, caller, vars);
+            }
+        }
+    }
+
+    fn scan_fmt_chunks(
+        &mut self,
+        chunks: &[MirFmtChunk],
+        caller: Option<&MirNodeKey>,
+        vars: &[MirVar],
+    ) {
+        for ch in chunks {
+            match ch {
+                MirFmtChunk::Literal(_) => {}
+                MirFmtChunk::Int { value, .. }
+                | MirFmtChunk::Float { value, .. }
+                | MirFmtChunk::Bool(value)
+                | MirFmtChunk::Str(value)
+                | MirFmtChunk::PaddedStr { cstr: value, .. }
+                | MirFmtChunk::Bytes(value)
+                | MirFmtChunk::PaddedBytes { slice: value, .. }
+                | MirFmtChunk::EnumName { value, .. }
+                | MirFmtChunk::DebugSlice { slice: value, .. } => {
+                    self.scan_expr(value, caller, vars);
+                }
+            }
+        }
+    }
+
+    fn scan_expr(&mut self, expr: &MirExpr, caller: Option<&MirNodeKey>, vars: &[MirVar]) {
+        match &expr.kind {
+            MirExprKind::IntLit(_)
+            | MirExprKind::FloatLit(_)
+            | MirExprKind::BoolLit(_)
+            | MirExprKind::StringLit(_)
+            | MirExprKind::TicksLit(_)
+            | MirExprKind::EnumVariant { .. }
+            | MirExprKind::ConstRef(_)
+            | MirExprKind::GlobalPrimAddr(_)
+            | MirExprKind::SubsystemAddr(_)
+            | MirExprKind::MmioAddr(_)
+            | MirExprKind::Var(_)
+            | MirExprKind::ArrayLen(_)
+            | MirExprKind::ResultIsErr(_)
+            | MirExprKind::ResultErr(_)
+            | MirExprKind::ResultVal(_)
+            | MirExprKind::NowTicks
+            | MirExprKind::SysQuery(_) => {}
+            MirExprKind::FnAddr(name) => self.record_fn_addr(name),
+            MirExprKind::MakePrimView { ptr, .. } => self.scan_expr(ptr, caller, vars),
+            MirExprKind::MmioRead { base, index, .. } => {
+                self.scan_expr(base, caller, vars);
+                if let Some(idx) = index {
+                    self.scan_expr(idx, caller, vars);
+                }
+            }
+            MirExprKind::Unary { expr: sub, .. }
+            | MirExprKind::CStrToSlice(sub)
+            | MirExprKind::Cast { expr: sub, .. }
+            | MirExprKind::FieldAccess { base: sub, .. }
+            | MirExprKind::SliceLen(sub)
+            | MirExprKind::FromBytes { slice: sub, .. }
+            | MirExprKind::LeaseGet { lease: sub, .. }
+            | MirExprKind::LeaseAddr { lease: sub, .. } => self.scan_expr(sub, caller, vars),
+            MirExprKind::AddrOfPlace(place)
+            | MirExprKind::ArrayToSlice {
+                array_place: place, ..
+            } => self.scan_place(place, caller, vars),
+            MirExprKind::Binary { lhs, rhs, .. }
+            | MirExprKind::SeqEq { lhs, rhs, .. }
+            | MirExprKind::Index {
+                base: lhs,
+                index: rhs,
+                ..
+            } => {
+                self.scan_expr(lhs, caller, vars);
+                self.scan_expr(rhs, caller, vars);
+            }
+            MirExprKind::SubSlice {
+                base, start, end, ..
+            } => {
+                self.scan_expr(base, caller, vars);
+                self.scan_expr(start, caller, vars);
+                self.scan_expr(end, caller, vars);
+            }
+            MirExprKind::StructLit { fields, .. } => {
+                for (_, fe, _) in fields {
+                    self.scan_expr(fe, caller, vars);
+                }
+            }
+            MirExprKind::ArrayLit { elems, .. } => {
+                for el in elems {
+                    self.scan_expr(el, caller, vars);
+                }
+            }
+            MirExprKind::PrimRead(op) => match op.as_ref() {
+                MirPrimReadOp::WatchRead { target, .. }
+                | MirPrimReadOp::GuardedGet { target, .. }
+                | MirPrimReadOp::WatchGen { target, .. }
+                | MirPrimReadOp::InboxTryRecv { target, .. }
+                | MirPrimReadOp::InboxLen { target, .. }
+                | MirPrimReadOp::InboxIsEmpty { target, .. }
+                | MirPrimReadOp::InboxIsFull { target, .. }
+                | MirPrimReadOp::SignalIsSet { target }
+                | MirPrimReadOp::SignalTryWait { target }
+                | MirPrimReadOp::WaitQueueWakeOne { target, .. }
+                | MirPrimReadOp::PingPongDmaBuf { target, .. }
+                | MirPrimReadOp::PingPongBaseAddr { target, .. }
+                | MirPrimReadOp::PoolTryAlloc { target, .. }
+                | MirPrimReadOp::PoolAvail { target, .. }
+                | MirPrimReadOp::PoolInUse { target, .. }
+                | MirPrimReadOp::PoolIsExhausted { target, .. }
+                | MirPrimReadOp::PoolCap { target, .. }
+                | MirPrimReadOp::DmaSlotTake { target, .. }
+                | MirPrimReadOp::DmaSlotRelease { target, .. }
+                | MirPrimReadOp::DmaSlotIsBusy { target, .. }
+                | MirPrimReadOp::DmaSlotIsEmpty { target, .. }
+                | MirPrimReadOp::DmaSlotAddr { target, .. }
+                | MirPrimReadOp::ByteRingReadSlice { target, .. }
+                | MirPrimReadOp::ByteRingTryPopByte { target, .. }
+                | MirPrimReadOp::ByteRingLen { target, .. }
+                | MirPrimReadOp::ByteRingFreeSpace { target, .. }
+                | MirPrimReadOp::ByteRingIsEmpty { target, .. }
+                | MirPrimReadOp::ByteRingIsFull { target, .. } => {
+                    self.scan_prim_target(target, caller, vars);
+                }
+                MirPrimReadOp::InboxTrySend { target, value, .. } => {
+                    self.scan_prim_target(target, caller, vars);
+                    self.scan_expr(value, caller, vars);
+                }
+                MirPrimReadOp::DmaSlotPark { target, lease, .. } => {
+                    self.scan_prim_target(target, caller, vars);
+                    self.scan_expr(lease, caller, vars);
+                }
+                MirPrimReadOp::ByteRingPush { target, src, .. } => {
+                    self.scan_prim_target(target, caller, vars);
+                    self.scan_expr(src, caller, vars);
+                }
+                MirPrimReadOp::ByteRingPushByte { target, byte, .. } => {
+                    self.scan_prim_target(target, caller, vars);
+                    self.scan_expr(byte, caller, vars);
+                }
+                MirPrimReadOp::ByteRingGrantWrite { target, len, .. } => {
+                    self.scan_prim_target(target, caller, vars);
+                    self.scan_expr(len, caller, vars);
+                }
+                MirPrimReadOp::ByteRingPop { target, dst, .. } => {
+                    self.scan_prim_target(target, caller, vars);
+                    self.scan_expr(dst, caller, vars);
+                }
+                MirPrimReadOp::InboxViewTryRecv { view, .. }
+                | MirPrimReadOp::InboxViewLen { view, .. }
+                | MirPrimReadOp::InboxViewCap { view, .. }
+                | MirPrimReadOp::InboxViewIsEmpty { view, .. }
+                | MirPrimReadOp::InboxViewIsFull { view, .. }
+                | MirPrimReadOp::ByteRingViewReadSlice { view }
+                | MirPrimReadOp::ByteRingViewTryPopByte { view }
+                | MirPrimReadOp::ByteRingViewLen { view }
+                | MirPrimReadOp::ByteRingViewCap { view }
+                | MirPrimReadOp::ByteRingViewFreeSpace { view }
+                | MirPrimReadOp::ByteRingViewIsEmpty { view }
+                | MirPrimReadOp::ByteRingViewIsFull { view } => {
+                    self.scan_expr(view, caller, vars);
+                }
+                MirPrimReadOp::InboxViewTrySend { view, value, .. } => {
+                    self.scan_expr(view, caller, vars);
+                    self.scan_expr(value, caller, vars);
+                }
+                MirPrimReadOp::ByteRingViewPush { view, src, .. } => {
+                    self.scan_expr(view, caller, vars);
+                    self.scan_expr(src, caller, vars);
+                }
+                MirPrimReadOp::ByteRingViewPushByte { view, byte, .. } => {
+                    self.scan_expr(view, caller, vars);
+                    self.scan_expr(byte, caller, vars);
+                }
+                MirPrimReadOp::ByteRingViewGrantWrite { view, len } => {
+                    self.scan_expr(view, caller, vars);
+                    self.scan_expr(len, caller, vars);
+                }
+                MirPrimReadOp::ByteRingViewPop { view, dst } => {
+                    self.scan_expr(view, caller, vars);
+                    self.scan_expr(dst, caller, vars);
+                }
+            },
+            MirExprKind::CallDirect {
+                callee,
+                is_extern_c,
+                args,
+            } => {
+                if let Some(cnode) = caller {
+                    if !*is_extern_c {
+                        self.direct_callees
+                            .entry(cnode.clone())
+                            .or_default()
+                            .insert(callee.clone());
+                    } else if callee != "assert" {
+                        if let Some(sig) = vars.iter().rev().find_map(|v| match &v.ty {
+                            MirType::FnPtr {
+                                params,
+                                ret,
+                                error_spec,
+                            } if v.name == *callee => Some(fnptr_sig_key(params, ret, error_spec)),
+                            _ => None,
+                        }) {
+                            self.direct_sig_calls
+                                .entry(cnode.clone())
+                                .or_default()
+                                .insert(sig);
+                        }
+                    }
+                }
+                for a in args {
+                    self.scan_expr(a, caller, vars);
+                }
+            }
+            MirExprKind::RomCallU32 { addr, args, .. } => {
+                self.scan_expr(addr, caller, vars);
+                for a in args {
+                    self.scan_expr(a, caller, vars);
+                }
+            }
+        }
+    }
+
+    fn scan_stmt(&mut self, stmt: &MirStmt, caller: &MirNodeKey, vars: &[MirVar]) {
+        match stmt {
+            MirStmt::Assign { target, value, .. } => {
+                self.scan_place(target, Some(caller), vars);
+                self.scan_expr(value, Some(caller), vars);
+            }
+            MirStmt::Expr(e) => self.scan_expr(e, Some(caller), vars),
+            MirStmt::PrimOp(op) => match op {
+                MirPrimNonBlockingOp::WatchPublish { target, value, .. }
+                | MirPrimNonBlockingOp::GuardedSet { target, value, .. }
+                | MirPrimNonBlockingOp::InboxPost { target, value, .. } => {
+                    self.scan_prim_target(target, Some(caller), vars);
+                    self.scan_expr(value, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::SignalNotify { target, .. }
+                | MirPrimNonBlockingOp::SignalClear { target }
+                | MirPrimNonBlockingOp::WaitQueuePrepare { target }
+                | MirPrimNonBlockingOp::WaitQueueCancel { target }
+                | MirPrimNonBlockingOp::WaitQueueWakeAll { target, .. }
+                | MirPrimNonBlockingOp::PingPongFlip { target, .. }
+                | MirPrimNonBlockingOp::PingPongSetActive { target, .. }
+                | MirPrimNonBlockingOp::ByteRingClear { target, .. } => {
+                    self.scan_prim_target(target, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::PingPongCompleteHalf { target, half, .. } => {
+                    self.scan_prim_target(target, Some(caller), vars);
+                    self.scan_expr(half, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::LeaseRelease { value, .. } => {
+                    self.scan_expr(value, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::LeaseNullify { target, .. } => {
+                    self.scan_place(target, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::ByteRingConsume { target, len, .. }
+                | MirPrimNonBlockingOp::ByteRingCommitWrite { target, len, .. } => {
+                    self.scan_prim_target(target, Some(caller), vars);
+                    self.scan_expr(len, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::InboxViewPost { view, value, .. } => {
+                    self.scan_expr(view, Some(caller), vars);
+                    self.scan_expr(value, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::ByteRingViewConsume { view, len }
+                | MirPrimNonBlockingOp::ByteRingViewCommitWrite { view, len, .. } => {
+                    self.scan_expr(view, Some(caller), vars);
+                    self.scan_expr(len, Some(caller), vars);
+                }
+                MirPrimNonBlockingOp::ByteRingViewClear { view } => {
+                    self.scan_expr(view, Some(caller), vars);
+                }
+            },
+            MirStmt::Intrinsic(op) => match op {
+                MirIntrinsicOp::UseSystick { hz } => self.scan_expr(hz, Some(caller), vars),
+                MirIntrinsicOp::SetPriority { .. } => {}
+                MirIntrinsicOp::SysOp { args, .. } => {
+                    for a in args {
+                        self.scan_expr(a, Some(caller), vars);
+                    }
+                }
+            },
+            MirStmt::EnterCritical
+            | MirStmt::ExitCritical
+            | MirStmt::EndInboxTurn
+            | MirStmt::Break
+            | MirStmt::Continue
+            | MirStmt::SetIrqSelector { .. }
+            | MirStmt::BoundedForLatch
+            | MirStmt::ZeroTaskLocals => {}
+            MirStmt::If {
+                cond,
+                then_body,
+                else_body,
+            } => {
+                self.scan_expr(cond, Some(caller), vars);
+                for s in then_body {
+                    self.scan_stmt(s, caller, vars);
+                }
+                for s in else_body {
+                    self.scan_stmt(s, caller, vars);
+                }
+            }
+            MirStmt::While { cond, body } => {
+                self.scan_expr(cond, Some(caller), vars);
+                for s in body {
+                    self.scan_stmt(s, caller, vars);
+                }
+            }
+            MirStmt::Switch {
+                discr,
+                arms,
+                default,
+            } => {
+                self.scan_expr(discr, Some(caller), vars);
+                for (_, body) in arms {
+                    for s in body {
+                        self.scan_stmt(s, caller, vars);
+                    }
+                }
+                for s in default {
+                    self.scan_stmt(s, caller, vars);
+                }
+            }
+            MirStmt::Return(v) => {
+                if let Some(e) = v {
+                    self.scan_expr(e, Some(caller), vars);
+                }
+            }
+            MirStmt::Error { reason, partial } => {
+                if let Some(e) = reason {
+                    self.scan_expr(e, Some(caller), vars);
+                }
+                if let Some(e) = partial {
+                    self.scan_expr(e, Some(caller), vars);
+                }
+            }
+            MirStmt::SpawnActivate { args, .. } => {
+                for a in args {
+                    self.scan_expr(a, Some(caller), vars);
+                }
+            }
+            MirStmt::PrintFmt { chunks, .. } => {
+                self.scan_fmt_chunks(chunks, Some(caller), vars);
+            }
+            MirStmt::FmtBuf { buf, chunks, .. } => {
+                self.scan_expr(buf, Some(caller), vars);
+                self.scan_fmt_chunks(chunks, Some(caller), vars);
+            }
+            MirStmt::FmtRing { ring, chunks, .. } => {
+                self.scan_expr(ring, Some(caller), vars);
+                self.scan_fmt_chunks(chunks, Some(caller), vars);
+            }
+            MirStmt::MmioWrite {
+                base, index, value, ..
+            } => {
+                self.scan_expr(base, Some(caller), vars);
+                if let Some(idx) = index {
+                    self.scan_expr(idx, Some(caller), vars);
+                }
+                self.scan_expr(value, Some(caller), vars);
+            }
+        }
+    }
+
+    fn scan_terminator(&mut self, term: &MirTerminator, caller: &MirNodeKey, vars: &[MirVar]) {
+        match term {
+            MirTerminator::Goto(_) => {}
+            MirTerminator::Branch { cond, .. } => self.scan_expr(cond, Some(caller), vars),
+            MirTerminator::Switch { discr, .. } => self.scan_expr(discr, Some(caller), vars),
+            MirTerminator::Return(v) => {
+                if let Some(e) = v {
+                    self.scan_expr(e, Some(caller), vars);
+                }
+            }
+            MirTerminator::Error { reason, partial } => {
+                if let Some(e) = reason {
+                    self.scan_expr(e, Some(caller), vars);
+                }
+                if let Some(e) = partial {
+                    self.scan_expr(e, Some(caller), vars);
+                }
+            }
+            MirTerminator::Yield(yk) => match yk {
+                MirYieldKind::EveryLatch { .. }
+                | MirYieldKind::DelayPoll { .. }
+                | MirYieldKind::ShareCheckpoint { .. } => {}
+                MirYieldKind::Wait { arms, .. } => {
+                    for arm in arms {
+                        match &arm.op {
+                            MirWaitArmOp::InboxRecv { target, .. }
+                            | MirWaitArmOp::InboxSend { target, .. }
+                            | MirWaitArmOp::SignalWait { target, .. }
+                            | MirWaitArmOp::WaitQueueCommit { target, .. }
+                            | MirWaitArmOp::WatchWaitChange { target, .. }
+                            | MirWaitArmOp::PingPongWaitChunk { target, .. }
+                            | MirWaitArmOp::PoolAlloc { target, .. }
+                            | MirWaitArmOp::ByteRingWaitRead { target, .. }
+                            | MirWaitArmOp::ByteRingWaitWrite { target, .. } => {
+                                self.scan_prim_target(target, Some(caller), vars);
+                            }
+                            MirWaitArmOp::InboxViewRecv { view, .. }
+                            | MirWaitArmOp::InboxViewSend { view, .. }
+                            | MirWaitArmOp::ByteRingViewWaitRead { view, .. }
+                            | MirWaitArmOp::ByteRingViewWaitWrite { view, .. } => {
+                                self.scan_expr(view, Some(caller), vars);
+                            }
+                        }
+                    }
+                }
+                MirYieldKind::CallYielding { callee, args, .. } => {
+                    self.direct_callees
+                        .entry(caller.clone())
+                        .or_default()
+                        .insert(callee.clone());
+                    for a in args {
+                        self.scan_expr(a, Some(caller), vars);
+                    }
+                }
+                MirYieldKind::PollChild { .. } => {}
+            },
+        }
+    }
+}
+
+fn collect_mir_indirect_targets_by_caller(
+    mir: &MirModule,
+    elf_or_frame_syms: &BTreeSet<String>,
+) -> (BTreeMap<String, BTreeSet<String>>, BTreeSet<String>) {
+    let mut fn_sigs = HashMap::new();
+    for f in &mir.functions {
+        let sym = if f.is_yielding {
+            format!("__syn_fn_step_{}", sanitize_ident(&f.name))
+        } else {
+            format!("__syn_fn_{}", sanitize_ident(&f.name))
+        };
+        let params: Vec<MirType> = f
+            .params
+            .iter()
+            .map(|vid| f.vars[vid.0].ty.host_value_type())
+            .collect();
+        let sig = (params, f.ret_ty.host_value_type(), f.error_spec.clone());
+        fn_sigs.insert(f.name.as_str(), (sym, sig));
+    }
+    let mut ext_sigs = HashMap::new();
+    for ext in &mir.extern_fns {
+        let sym = sanitize_ident(&ext.name);
+        let params: Vec<MirType> = ext
+            .params
+            .iter()
+            .map(|(_, ty)| ty.host_value_type())
+            .collect();
+        let sig = (params, ext.ret_ty.host_value_type(), MirErrorSpec::None);
+        ext_sigs.insert(ext.name.as_str(), (sym, sig));
+    }
+
+    let mut scan = MirIndirectScan {
+        fn_sigs,
+        ext_sigs,
+        elf_or_frame_syms,
+        sig_to_targets: HashMap::new(),
+        all_addr_taken: BTreeSet::new(),
+        direct_callees: BTreeMap::new(),
+        direct_sig_calls: BTreeMap::new(),
+    };
+
+    for c in &mir.consts {
+        scan.scan_expr(&c.init, None, &[]);
+    }
+    for p in &mir.primitives {
+        if let Some(init) = &p.init {
+            scan.scan_expr(init, None, &[]);
+        }
+    }
+    for sp in &mir.spawned_tasks {
+        for a in &sp.init_args {
+            scan.scan_expr(a, None, &[]);
+        }
+    }
+    for v in &mir.irq_vectors {
+        for b in &v.bindings {
+            for ba in &b.baked_args {
+                if let MirBakedArg::Const(e) = ba {
+                    scan.scan_expr(e, None, &[]);
+                }
+            }
+            for sv in &b.state_vars {
+                scan.scan_expr(&sv.init, None, &[]);
+            }
+        }
+    }
+
+    for f in &mir.functions {
+        let node = MirNodeKey::Fn(f.name.clone());
+        match &f.body {
+            MirFnBody::Direct(stmts) => {
+                for s in stmts {
+                    scan.scan_stmt(s, &node, &f.vars);
+                }
+            }
+            MirFnBody::Coroutine { blocks, .. } => {
+                for b in blocks {
+                    for s in &b.stmts {
+                        scan.scan_stmt(s, &node, &f.vars);
+                    }
+                    scan.scan_terminator(&b.terminator, &node, &f.vars);
+                }
+            }
+        }
+    }
+    for bp in &mir.task_blueprints {
+        let node = MirNodeKey::Task(bp.name.clone());
+        for b in &bp.blocks {
+            for s in &b.stmts {
+                scan.scan_stmt(s, &node, &bp.vars);
+            }
+            scan.scan_terminator(&b.terminator, &node, &bp.vars);
+        }
+    }
+    for isr in &mir.isrs {
+        let node = MirNodeKey::Isr(isr.name.clone());
+        for sv in &isr.state_vars {
+            scan.scan_expr(&sv.init, Some(&node), &isr.vars);
+        }
+        for s in &isr.body {
+            scan.scan_stmt(s, &node, &isr.vars);
+        }
+    }
+    for step in &mir.boot.steps {
+        let node = MirNodeKey::Boot;
+        match step {
+            MirBootStep::Stmt(s) => scan.scan_stmt(s, &node, &mir.boot.vars),
+            MirBootStep::RunYieldingFn { callee, args, .. } => {
+                scan.direct_callees
+                    .entry(node.clone())
+                    .or_default()
+                    .insert(callee.clone());
+                for a in args {
+                    scan.scan_expr(a, Some(&node), &mir.boot.vars);
+                }
+            }
+            MirBootStep::SpawnActivate { args, .. } => {
+                for a in args {
+                    scan.scan_expr(a, Some(&node), &mir.boot.vars);
+                }
+            }
+        }
+    }
+
+    // Fixed-point propagation of indirect FnPtr call signatures over direct MIR call edges
+    // so `/bin/opt` cross-function inlining preserves every caller's possible indirect targets.
+    let mut node_sigs: BTreeMap<MirNodeKey, HashSet<FnPtrSigKey>> = scan.direct_sig_calls;
+    let mut all_nodes: BTreeSet<MirNodeKey> = BTreeSet::new();
+    all_nodes.extend(scan.direct_callees.keys().cloned());
+    all_nodes.extend(node_sigs.keys().cloned());
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for caller in &all_nodes {
+            let Some(callees) = scan.direct_callees.get(caller) else {
+                continue;
+            };
+            let mut inherited = Vec::new();
+            for callee_name in callees {
+                if let Some(csigs) = node_sigs.get(&MirNodeKey::Fn(callee_name.clone())) {
+                    inherited.extend(csigs.iter().cloned());
+                }
+            }
+            if !inherited.is_empty() {
+                let entry = node_sigs.entry(caller.clone()).or_default();
+                for sig in inherited {
+                    if entry.insert(sig) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let targets_for_sigs = |sigs: &HashSet<FnPtrSigKey>| -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        for sig in sigs {
+            if let Some(cands) = scan.sig_to_targets.get(sig) {
+                out.extend(cands.iter().cloned());
+            }
+        }
+        out
+    };
+
+    let mut per_caller_targets: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for f in &mir.functions {
+        let node = MirNodeKey::Fn(f.name.clone());
+        let targets = node_sigs
+            .get(&node)
+            .map(targets_for_sigs)
+            .unwrap_or_default();
+        let sym = if f.is_yielding {
+            format!("__syn_fn_step_{}", sanitize_ident(&f.name))
+        } else {
+            format!("__syn_fn_{}", sanitize_ident(&f.name))
+        };
+        per_caller_targets.insert(sym, targets);
+    }
+    for bp in &mir.task_blueprints {
+        let node = MirNodeKey::Task(bp.name.clone());
+        let targets = node_sigs
+            .get(&node)
+            .map(targets_for_sigs)
+            .unwrap_or_default();
+        per_caller_targets.insert(
+            format!("__syn_task_step_{}", sanitize_ident(&bp.name)),
+            targets,
+        );
+    }
+    for isr in &mir.isrs {
+        let node = MirNodeKey::Isr(isr.name.clone());
+        let targets = node_sigs
+            .get(&node)
+            .map(targets_for_sigs)
+            .unwrap_or_default();
+        per_caller_targets.insert(format!("__syn_isr_{}", sanitize_ident(&isr.name)), targets);
+    }
+    for v in &mir.irq_vectors {
+        let mut vec_targets = BTreeSet::new();
+        for b in &v.bindings {
+            if let Some(ts) = node_sigs
+                .get(&MirNodeKey::Isr(b.isr_name.clone()))
+                .map(targets_for_sigs)
+            {
+                vec_targets.extend(ts);
+            }
+        }
+        per_caller_targets.insert(format!("__syn_vec_irq_{}", v.irq_num), vec_targets.clone());
+        per_caller_targets.insert(format!("__syn_avr_vec_{}", v.irq_num), vec_targets);
+    }
+    let boot_targets = node_sigs
+        .get(&MirNodeKey::Boot)
+        .map(targets_for_sigs)
+        .unwrap_or_default();
+    for boot_sym in [
+        "__syn_boot",
+        "__syn_avr_entry",
+        "Reset_Handler",
+        "__syn_rv_reset",
+    ] {
+        per_caller_targets.insert(boot_sym.to_string(), boot_targets.clone());
+    }
+
+    // Map `sys.set_*` indirect dispatch wrappers (used only when dynamic `fn(...)` is passed).
+    let hook_wrappers: [(&str, FnPtrSigKey); 7] = [
+        (
+            "__syn_on_putc",
+            (vec![MirType::U8], MirType::Void, MirErrorSpec::None),
+        ),
+        (
+            "__syn_now_ms",
+            (Vec::new(), MirType::U32, MirErrorSpec::None),
+        ),
+        (
+            "__syn_on_exit",
+            (vec![MirType::I32], MirType::Void, MirErrorSpec::None),
+        ),
+        (
+            "__syn_on_fault",
+            (Vec::new(), MirType::Void, MirErrorSpec::None),
+        ),
+        (
+            "__syn_on_idle",
+            (
+                vec![MirType::U32, MirType::U32],
+                MirType::Void,
+                MirErrorSpec::None,
+            ),
+        ),
+        (
+            "__syn_on_rv_irq_route",
+            (
+                vec![MirType::U32, MirType::U32],
+                MirType::Void,
+                MirErrorSpec::None,
+            ),
+        ),
+        (
+            "__syn_on_rv_irq_ack",
+            (vec![MirType::U32], MirType::Void, MirErrorSpec::None),
+        ),
+    ];
+    for (wsym, sig) in hook_wrappers {
+        if let Some(cands) = scan.sig_to_targets.get(&sig) {
+            per_caller_targets.insert(wsym.to_string(), cands.clone());
+        }
+    }
+
+    (per_caller_targets, scan.all_addr_taken)
+}
+
 /// Compile `mir` using the resolved `TargetSpec` and prove worst-case hardware
 /// single-stack + `.data`/`.bss` SRAM high-water mark against `spec.sram_budget_bytes`.
 pub fn analyze_hardware_stack_high_water(
@@ -1239,23 +2007,36 @@ pub fn analyze_hardware_stack_high_water(
         }
     }
     if !indirect_callers.is_empty() {
-        let mut indirect_targets = BTreeSet::new();
-        for sym in disasm.elf_symbols.iter().chain(frame_sizes.keys()) {
-            if sym.starts_with("__syn_fn_") && !sym.starts_with("__syn_fn_step_") {
-                indirect_targets.insert(sym.clone());
+        let mut known_elf_syms: BTreeSet<String> = disasm.elf_symbols.clone();
+        known_elf_syms.extend(frame_sizes.keys().cloned());
+        let (per_caller_targets, all_addr_taken) =
+            collect_mir_indirect_targets_by_caller(mir, &known_elf_syms);
+
+        let mut legacy_fallback_targets = BTreeSet::new();
+        if all_addr_taken.is_empty() && mir.functions.is_empty() {
+            for sym in disasm.elf_symbols.iter().chain(frame_sizes.keys()) {
+                if sym.starts_with("__syn_fn_") && !sym.starts_with("__syn_fn_step_") {
+                    legacy_fallback_targets.insert(sym.clone());
+                }
+            }
+            for ext in &mir.extern_fns {
+                let ext_sym = sanitize_ident(&ext.name);
+                if disasm.elf_symbols.contains(&ext_sym) || frame_sizes.contains_key(&ext_sym) {
+                    legacy_fallback_targets.insert(ext_sym);
+                }
             }
         }
-        for ext in &mir.extern_fns {
-            let ext_sym = sanitize_ident(&ext.name);
-            if disasm.elf_symbols.contains(&ext_sym) || frame_sizes.contains_key(&ext_sym) {
-                indirect_targets.insert(ext_sym);
-            }
-        }
+
         for (caller, cost) in &indirect_callers {
             if is_exempt_indirect_wrapper(caller) {
                 continue;
             }
-            for target in &indirect_targets {
+            let targets: &BTreeSet<String> = match per_caller_targets.get(caller) {
+                Some(specific) => specific,
+                None if !all_addr_taken.is_empty() => &all_addr_taken,
+                None => &legacy_fallback_targets,
+            };
+            for target in targets {
                 add_edge(&mut graph, caller, target, *cost);
             }
         }

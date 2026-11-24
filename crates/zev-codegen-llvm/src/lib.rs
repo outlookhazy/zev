@@ -8762,4 +8762,82 @@ fn main() {
             "expected only the 1 enter from the explicit critical {{ set }} block; guarded.get() in ISR emits 0:\n{isr_fn}"
         );
     }
+
+    #[test]
+    fn avr_disjoint_fnptr_signatures_do_not_form_false_cycle() {
+        let src = r#"
+enum ShellErr {
+    Usage,
+}
+
+struct Port {
+    *byte_ring tx;
+    fn(*byte_ring) flush;
+}
+
+struct Session {
+    Port port;
+    u8 state_flag;
+}
+
+struct Cmd {
+    []u8 name;
+    fn(*Session, []u8) error ShellErr run;
+}
+
+byte_ring<32> ring;
+
+fn ring_flush(*byte_ring tx) {
+    u8 _b = tx.try_pop_byte() catch { 0u8 };
+}
+
+fn soft_write(*Session s, []u8 bytes) {
+    usize off = 0;
+    while (off < bytes.len) {
+        usize n = s.port.tx.push(bytes[off..bytes.len]);
+        off += n;
+        (s.port.flush)(s.port.tx);
+        if (off < bytes.len) {
+            checkpoint();
+        }
+    }
+}
+
+fn cmd_echo(*Session s, []u8 args) error ShellErr {
+    if (args.len == 0) {
+        error Usage;
+    }
+    soft_write(s, args);
+}
+
+const [1]Cmd CMDS = [
+    Cmd { name: "echo", run: cmd_echo },
+];
+
+task shell_task() {
+    Session s = Session {
+        port: Port { tx: &ring, flush: ring_flush },
+        state_flag: 0u8,
+    };
+    loop {
+        (CMDS[0].run)(&s, "hi") catch (ShellErr _e) { };
+        delay(10ms);
+    }
+}
+
+fn main() {
+    spawn shell_task() @low;
+}
+"#;
+        let mir = compile_src_mir(src);
+        let spec = TargetSpec::resolve(None, Some("arduino_uno")).expect("arduino_uno spec");
+        let opts = CodegenOptions::from_spec(spec);
+        let proof = analyze_hardware_stack_high_water(&mir, &opts).expect("avr stack proof");
+        assert!(
+            !proof.has_cycle,
+            "disjoint FnPtr signatures must not report a false call-graph cycle:\n{}",
+            proof.format_table()
+        );
+        assert!(proof.within_budget, "{}", proof.format_table());
+    }
 }

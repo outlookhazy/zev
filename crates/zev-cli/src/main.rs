@@ -6354,4 +6354,548 @@ fn main() {
             qres.stdout
         );
     }
+
+    #[test]
+    fn item7_missing_console_board_produces_clear_compile_error() {
+        let temp = TempWorkDir::create("item7_missing_console").unwrap();
+        let bsp_dir = temp.dir.join("bsp");
+        std::fs::create_dir_all(&bsp_dir).unwrap();
+        std::fs::write(bsp_dir.join("no_console.zev"), "pub fn init() {}\n").unwrap();
+        let app_path = temp.dir.join("app.zev");
+        std::fs::write(
+            &app_path,
+            r#"
+import board;
+import std.io as io;
+import std.shell as shell;
+
+fn cmd_noop(*shell.Session s, []u8 args) error shell.Err {
+    println(s, "noop");
+}
+
+const [1]shell.Cmd CMDS = [
+    shell.Cmd { name: "noop", help: "noop", run: cmd_noop },
+];
+
+fn main() {
+    board.init();
+    io.DuplexStream c = board.console_open();
+    spawn shell.serve(c, CMDS) @low;
+}
+"#,
+        )
+        .unwrap();
+        let err = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            None,
+            Some("bsp/no_console"),
+            32,
+            "no_console",
+        )
+        .err()
+        .expect("expected missing-console compile error");
+        assert!(
+            err.contains("does not provide console input"),
+            "expected clear missing-console message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn item7_std_shell_scripted_host_fuzz_and_qemu() {
+        let temp = TempWorkDir::create("item7_shell_scripted").unwrap();
+        let app_path = temp.dir.join("shell_app.zev");
+        let src = r#"
+import board;
+import std.io as io;
+import std.shell as shell;
+
+fn cmd_u(*shell.Session s, []u8 args) error shell.Err {
+    u32 v = shell.arg_u32(args, 0) catch (shell.Err e) { error e; };
+    println(s, f"u={v}");
+}
+
+fn cmd_i(*shell.Session s, []u8 args) error shell.Err {
+    i32 v = shell.arg_i32(args, 0) catch (shell.Err e) { error e; };
+    println(s, f"i={v}");
+}
+
+fn cmd_x(*shell.Session s, []u8 args) error shell.Err {
+    u32 v = shell.arg_hex(args, 0) catch (shell.Err e) { error e; };
+    println(s, f"x=0x{v:04X}");
+}
+
+fn cmd_b(*shell.Session s, []u8 args) error shell.Err {
+    bool v = shell.arg_bool(args, 0) catch (shell.Err e) { error e; };
+    println(s, f"b={v}");
+}
+
+fn cmd_s(*shell.Session s, []u8 args) error shell.Err {
+    []u8 v = shell.arg_str(args, 0) catch (shell.Err e) { error e; };
+    println(s, f"s={v}");
+}
+
+fn cmd_big(*shell.Session s, []u8 _args) error shell.Err {
+    for (u32 n in 0..20) {
+        println(s, f"LINE[{n:02}]=0123456789abcdef");
+    }
+}
+
+fn cmd_fail(*shell.Session _s, []u8 _args) error shell.Err {
+    error Failed;
+}
+
+const [7]shell.Cmd COMMANDS = [
+    shell.Cmd { name: "u",    help: "u <u32>",            run: cmd_u },
+    shell.Cmd { name: "i",    help: "i <i32>",            run: cmd_i },
+    shell.Cmd { name: "x",    help: "x <hex>",            run: cmd_x },
+    shell.Cmd { name: "b",    help: "b on|off",           run: cmd_b },
+    shell.Cmd { name: "s",    help: "s <word>",           run: cmd_s },
+    shell.Cmd { name: "big",  help: "emit >400B output",  run: cmd_big },
+    shell.Cmd { name: "fail", help: "fail always",        run: cmd_fail },
+];
+
+fn main() {
+    board.init();
+    sys.fuzz_irqs(0x5EED_7777u32, 0u32);
+    io.DuplexStream console = board.console_open();
+    spawn shell.serve(console, COMMANDS) @low;
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let ok_script = temp.dir.join("shell_ok.script");
+        std::fs::write(
+            &ok_script,
+            "\
+# std.shell shared Host + QEMU validation script
+echo off
+help
+u 42
+i -77
+i 99
+x 0xBEEF
+x cafe
+b on
+b off
+b 1
+b 0
+b true
+b false
+s hello
+big
+echo on
+s back_on
+",
+        )
+        .unwrap();
+        let ok_cmds = script_runner::collect_script_commands(Some(&ok_script), &[]).unwrap();
+        let timeout = std::time::Duration::from_millis(5_000);
+
+        let verify_transcript = |out: &str, label: &str| {
+            let norm = out.replace("\r\n", "\n");
+            for expected in [
+                "  help         show commands\n",
+                "  echo         echo on|off\n",
+                "  u            u <u32>\n",
+                "  big          emit >400B output\n",
+                "u=42\nok\n",
+                "i=-77\nok\n",
+                "i=99\nok\n",
+                "x=0xBEEF\nok\n",
+                "x=0xCAFE\nok\n",
+                "b=true\nok\n",
+                "b=false\nok\n",
+                "s=hello\nok\n",
+                "LINE[00]=0123456789abcdef\n",
+                "LINE[19]=0123456789abcdef\nok\n",
+                "s=back_on\nok\n",
+            ] {
+                assert!(
+                    norm.contains(expected),
+                    "{label} missing {expected:?} in:\n{norm}"
+                );
+            }
+            for n in 0..20u32 {
+                let row = format!("LINE[{n:02}]=0123456789abcdef\n");
+                assert!(
+                    norm.contains(&row),
+                    "{label} dropped/truncated {row:?} in:\n{norm}"
+                );
+            }
+        };
+
+        // 1. Host simulator under ASan + UBSan with `sys.fuzz_irqs`
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+
+        let mut host_transcript = Vec::new();
+        let mut child_ok = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+        script_runner::run_script_on_child_to(
+            &mut child_ok,
+            &ok_cmds,
+            timeout,
+            &mut host_transcript,
+        )
+        .expect("host std.shell scripted run should pass");
+        verify_transcript(&String::from_utf8_lossy(&host_transcript), "host");
+
+        for (bad_cmd, expect_err, expect_usage) in [
+            ("unknown_cmd", "err Unknown", None),
+            ("u badnum", "err Usage", Some("usage: u <u32>")),
+            ("fail", "err Failed", None),
+        ] {
+            let mut tr = Vec::new();
+            let mut ch = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+            let res = script_runner::run_script_on_child_to(
+                &mut ch,
+                &[bad_cmd.to_string()],
+                timeout,
+                &mut tr,
+            )
+            .unwrap_err();
+            assert!(res.contains(expect_err), "host {bad_cmd}: {res}");
+            let tr_s = String::from_utf8_lossy(&tr).replace("\r\n", "\n");
+            if let Some(u_line) = expect_usage {
+                assert!(
+                    tr_s.contains(u_line),
+                    "host {bad_cmd} missing {u_line}: {tr_s}"
+                );
+            }
+        }
+
+        // 2. QEMU (`lm3s6965_evb`) running the exact same script
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("shell_qemu.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let q_run_opts = zev_codegen_llvm::QemuRunOptions::default();
+
+        let mut qemu_transcript = Vec::new();
+        let mut q_ok =
+            zev_codegen_llvm::spawn_elf_in_qemu(&qemu_build.elf_path, &q_run_opts, true).unwrap();
+        script_runner::run_script_on_child_to(&mut q_ok, &ok_cmds, timeout, &mut qemu_transcript)
+            .expect("qemu std.shell scripted run should pass");
+        verify_transcript(&String::from_utf8_lossy(&qemu_transcript), "qemu");
+
+        for (bad_cmd, expect_err) in [
+            ("unknown_cmd", "err Unknown"),
+            ("u badnum", "err Usage"),
+            ("fail", "err Failed"),
+        ] {
+            let mut tr = Vec::new();
+            let mut qch =
+                zev_codegen_llvm::spawn_elf_in_qemu(&qemu_build.elf_path, &q_run_opts, true)
+                    .unwrap();
+            let res = script_runner::run_script_on_child_to(
+                &mut qch,
+                &[bad_cmd.to_string()],
+                timeout,
+                &mut tr,
+            )
+            .unwrap_err();
+            assert!(res.contains(expect_err), "qemu {bad_cmd}: {res}");
+        }
+    }
+
+    #[test]
+    fn item7_std_shell_editing_crlf_overflow_and_custom_session_host() {
+        use std::io::Write as _;
+
+        let temp = TempWorkDir::create("item7_shell_edges").unwrap();
+        let src = r#"
+import board;
+import std.io as io;
+import std.shell as shell;
+
+fn cmd_u(*shell.Session s, []u8 args) error shell.Err {
+    u32 v = shell.arg_u32(args, 0) catch (shell.Err e) { error e; };
+    []u8 _extra = shell.arg_str(args, 1) catch (shell.Err _e) { "" };
+    println(s, f"u={v}");
+}
+
+fn cmd_fail(*shell.Session _s, []u8 _args) error shell.Err {
+    error Failed;
+}
+
+const [2]shell.Cmd CMDS = [
+    shell.Cmd { name: "u",    help: "u <n>",       run: cmd_u },
+    shell.Cmd { name: "fail", help: "fail always", run: cmd_fail },
+];
+
+fn main() {
+    board.init();
+    sys.fuzz_irqs(0x1357_2468u32, 0u32);
+    io.DuplexStream console = board.console_open();
+    spawn shell.serve(console, CMDS) @low;
+}
+"#;
+        let app_path = temp.dir.join("edges.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+
+        let mut child = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut buf = [0u8; 256];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let mut acc = Vec::<u8>::new();
+        let read_until = |acc: &mut Vec<u8>, needle: &[u8]| -> String {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(pos) = acc.windows(needle.len()).position(|w| w == needle) {
+                    let end = pos + needle.len();
+                    let out = String::from_utf8_lossy(&acc[..end]).into_owned();
+                    acc.drain(..end);
+                    return out;
+                }
+                let rem = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "timeout waiting for {:?}; accumulated={:?}",
+                            String::from_utf8_lossy(needle),
+                            String::from_utf8_lossy(acc)
+                        )
+                    });
+                let chunk = rx
+                    .recv_timeout(rem.min(std::time::Duration::from_millis(50)))
+                    .unwrap_or_default();
+                acc.extend_from_slice(&chunk);
+            }
+        };
+
+        // 1. Initial prompt
+        assert_eq!(read_until(&mut acc, b"> "), "> ");
+
+        // 2. BS/DEL at column 0 (ignored) + BS/DEL editing mid-line -> "u 12"
+        stdin.write_all(b"\x08\x7fu x\x08\x7f 1y\x7f2\n").unwrap();
+        stdin.flush().unwrap();
+        let r2 = read_until(&mut acc, b"> ");
+        assert!(
+            r2.contains("\x08 \x08"),
+            "expected BS erase echo sequence in {r2:?}"
+        );
+        assert!(r2.contains("u=12\nok\r\n> "), "unexpected {r2:?}");
+        assert!(
+            !r2.starts_with("\x08"),
+            "BS/DEL at col 0 must not emit erase: {r2:?}"
+        );
+
+        // 3. Empty/whitespace lines do not print `ok`
+        stdin.write_all(b"   \t \n").unwrap();
+        stdin.flush().unwrap();
+        let r3 = read_until(&mut acc, b"> ");
+        assert!(!r3.contains("ok"), "empty line must not print ok: {r3:?}");
+
+        // 4. Bare CR, then split CRLF across two chunks
+        stdin.write_all(b"u 7\ru 8\r").unwrap();
+        stdin.flush().unwrap();
+        let r4a = read_until(&mut acc, b"u=8\nok\r\n> ");
+        assert!(r4a.contains("u=7\nok\r\n> "), "bare CR failed: {r4a:?}");
+
+        // Now send the trailing `\n` from CRLF followed by `u 9\n`
+        stdin.write_all(b"\nu 9\n").unwrap();
+        stdin.flush().unwrap();
+        let r4b = read_until(&mut acc, b"> ");
+        assert!(
+            !r4b.starts_with("\r\n> "),
+            "CRLF tail emitted spurious prompt: {r4b:?}"
+        );
+        assert!(r4b.contains("u=9\nok\r\n> "), "split CRLF failed: {r4b:?}");
+
+        // 5. >64B line overflow + BS while overflowed, then clean next command
+        let mut long_line = vec![b'u', b' '];
+        long_line.extend(std::iter::repeat_n(b'9', 70));
+        long_line.extend_from_slice(b"\x08\r\n");
+        stdin.write_all(&long_line).unwrap();
+        stdin.flush().unwrap();
+        let r5 = read_until(&mut acc, b"> ");
+        assert!(
+            r5.contains("err LineTooLong\r\n> "),
+            "overflow failed: {r5:?}"
+        );
+
+        stdin.write_all(b"u 55\r\n").unwrap();
+        stdin.flush().unwrap();
+        let r5b = read_until(&mut acc, b"> ");
+        assert!(
+            r5b.contains("u=55\nok\r\n> "),
+            "next line after overflow corrupted: {r5b:?}"
+        );
+
+        // 6. Unknown command, Usage errors (`u`, `u abc`, `echo`), Failed error
+        stdin.write_all(b"bogus\n").unwrap();
+        stdin.flush().unwrap();
+        let r6a = read_until(&mut acc, b"> ");
+        assert!(r6a.contains("err Unknown\r\n> "), "{r6a:?}");
+
+        stdin.write_all(b"u\n").unwrap();
+        stdin.flush().unwrap();
+        let r6b = read_until(&mut acc, b"> ");
+        assert!(r6b.contains("usage: u <n>\r\nerr Usage\r\n> "), "{r6b:?}");
+
+        stdin.write_all(b"u abc\n").unwrap();
+        stdin.flush().unwrap();
+        let r6c = read_until(&mut acc, b"> ");
+        assert!(r6c.contains("usage: u <n>\r\nerr Usage\r\n> "), "{r6c:?}");
+
+        stdin.write_all(b"echo badarg\n").unwrap();
+        stdin.flush().unwrap();
+        let r6d = read_until(&mut acc, b"> ");
+        assert!(
+            r6d.contains("usage: echo on|off\r\nerr Usage\r\n> "),
+            "{r6d:?}"
+        );
+
+        stdin.write_all(b"echo on extra\n").unwrap();
+        stdin.flush().unwrap();
+        let r6e = read_until(&mut acc, b"> ");
+        assert!(
+            r6e.contains("usage: echo on|off\r\nerr Usage\r\n> "),
+            "{r6e:?}"
+        );
+
+        stdin.write_all(b"fail\n").unwrap();
+        stdin.flush().unwrap();
+        let r6f = read_until(&mut acc, b"> ");
+        assert!(r6f.contains("err Failed\r\n> "), "{r6f:?}");
+
+        // 7. `echo off` suppresses char echo and `> ` prompt until `echo on`
+        stdin.write_all(b"echo off\n").unwrap();
+        stdin.flush().unwrap();
+        let r7a = read_until(&mut acc, b"ok\r\n");
+        assert!(r7a.contains("echo off\r\nok\r\n"), "{r7a:?}");
+        stdin.write_all(b"u 33\necho on\n").unwrap();
+        stdin.flush().unwrap();
+        let r7b = read_until(&mut acc, b"> ");
+        assert!(
+            !r7b.contains("> u=33"),
+            "echo off leaked prompt on u=33: {r7b:?}"
+        );
+        assert!(
+            r7b.contains("u=33\nok\r\nok\r\n> "),
+            "echo off/on failed: {r7b:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        // 8. Custom buffer length (`[16]u8`) in app-written task via `Session.make` / `begin` / `poll_once`
+        let custom_src = r#"
+import board;
+import std.io as io;
+import std.shell as shell;
+
+fn cmd_say(*shell.Session s, []u8 args) error shell.Err {
+    []u8 w = shell.arg_str(args, 0) catch (shell.Err e) { error e; };
+    println(s, f"say={w}");
+}
+
+const [1]shell.Cmd CMDS = [
+    shell.Cmd { name: "say", help: "say <word>", run: cmd_say },
+];
+
+task custom_shell(io.DuplexStream port) {
+    [16]u8 custom_buf;
+    shell.Session sess = shell.Session.make(port, custom_buf);
+    sess.begin();
+    loop {
+        sess.poll_once(CMDS);
+    }
+}
+
+fn main() {
+    board.init();
+    io.DuplexStream console = board.console_open();
+    spawn custom_shell(console) @low;
+}
+"#;
+        let custom_path = temp.dir.join("custom_shell.zev");
+        std::fs::write(&custom_path, custom_src).unwrap();
+        let (_, c_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&custom_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let c_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&c_mir, &host_opts).unwrap();
+        let c_bin = runner::compile_host_llvm_binary(&temp, &c_ll, true).unwrap();
+
+        let mut c_child = runner::spawn_host_llvm_binary(&c_bin, &[]).unwrap();
+        let mut c_tr = Vec::new();
+        // 17-char command exceeds 16-byte custom buffer -> `err LineTooLong`
+        let over_err = script_runner::run_script_on_child_to(
+            &mut c_child,
+            &["say 1234567890123".to_string()],
+            std::time::Duration::from_millis(3_000),
+            &mut c_tr,
+        )
+        .unwrap_err();
+        assert!(
+            over_err.contains("err LineTooLong"),
+            "custom buf overflow: {over_err}"
+        );
+
+        let mut c_child2 = runner::spawn_host_llvm_binary(&c_bin, &[]).unwrap();
+        let mut c_tr2 = Vec::new();
+        script_runner::run_script_on_child_to(
+            &mut c_child2,
+            &["echo off".to_string(), "say ok16".to_string()],
+            std::time::Duration::from_millis(3_000),
+            &mut c_tr2,
+        )
+        .expect("15-char command within 16B custom buffer must succeed");
+        let c_out = String::from_utf8_lossy(&c_tr2).replace("\r\n", "\n");
+        assert!(c_out.contains("say=ok16\nok\n"), "c_out={c_out:?}");
+    }
 }

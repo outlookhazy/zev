@@ -1370,6 +1370,21 @@ pub(super) fn lower_leaf_expr(
                 let vty = vars[vid.0].ty.clone();
                 return Ok(MirExpr::new(MirExprKind::Var(vid), vty));
             }
+            if let Some(MirType::Enum(exp_ename)) = expected {
+                if syms
+                    .enums
+                    .get(exp_ename)
+                    .is_some_and(|en| en.iter().any(|(v, _)| v == &id.name))
+                {
+                    return Ok(MirExpr::new(
+                        MirExprKind::EnumVariant {
+                            enum_name: exp_ename.clone(),
+                            variant: id.name.clone(),
+                        },
+                        MirType::Enum(exp_ename.clone()),
+                    ));
+                }
+            }
             if let Some((ename, _)) = syms.variant_to_enum.get(&id.name) {
                 return Ok(MirExpr::new(
                     MirExprKind::EnumVariant {
