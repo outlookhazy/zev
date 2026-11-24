@@ -193,6 +193,8 @@ RUN, RUN-QEMU, MONITOR & SCRIPT OPTIONS:
     --script <path>                         Send command lines lockstep, waiting for `ok` / `err` (`run`/`run-qemu`/`flash`/`monitor`)
     --cmd <line>                            Inline scripted command line (repeatable; runs after `--script`)
     --script-timeout-ms <ms>                Per-command response timeout in scripted mode (default: 5000 ms)
+                                            Note: piping/closing stdin on `run` without `--script`/`--cmd` stops polling stdin at EOF
+                                            and keeps running; use `--script`/`--cmd`, `--max-ticks`, or `sys.exit(...)` to stop.
     -- <args...>                            Forward trailing arguments to compiled host binary (`run` only)
 ";
 

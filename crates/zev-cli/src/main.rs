@@ -4736,14 +4736,107 @@ fn main() {
     }
 
     #[test]
+    fn item2_sim_stdin_dev_null_and_closed_keep_running_until_sys_exit() {
+        use std::process::{Command, Stdio};
+
+        let temp = TempWorkDir::create("zevc-item2-stdin-eof").unwrap();
+        let make_src = |exit_code: i32| {
+            format!(
+                "\
+import board;
+import std.io as io;
+
+task worker() {{
+    u32 n = 0u32;
+    loop every 10ms {{
+        n += 1u32;
+        println(f\"work {{n}}\");
+        if (n == 3u32) {{
+            println(\"done\");
+            sys.exit({exit_code});
+        }}
+    }}
+}}
+
+task console_task(io.DuplexStream port) {{
+    loop {{
+        []u8 chunk = port.rx.wait_read();
+        port.rx.consume(chunk.len);
+    }}
+}}
+
+fn main() {{
+    board.init();
+    io.DuplexStream port = board.console_open();
+    spawn worker() @normal;
+    spawn console_task(port) @low;
+}}
+"
+            )
+        };
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let expected = "work 1\nwork 2\nwork 3\ndone\n";
+
+        for expected_code in [0i32, 17i32] {
+            let p = temp.dir.join(format!("worker_con_{expected_code}.zev"));
+            std::fs::write(&p, make_src(expected_code)).unwrap();
+            let (_, mir) = compile_to_mir_with_target(
+                &[p],
+                &[],
+                host_opts.hal_dir.as_deref(),
+                host_opts.board_module.as_deref(),
+                h_bits,
+                &h_name,
+            )
+            .unwrap();
+            let ll = zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &host_opts).unwrap();
+            let bin = runner::compile_host_llvm_binary(&temp, &ll, true).unwrap();
+
+            // 1. Stdin at /dev/null
+            let out_null = Command::new(&bin)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap();
+            let stdout_null = String::from_utf8_lossy(&out_null.stdout);
+            assert_eq!(
+                out_null.status.code(),
+                Some(expected_code),
+                "/dev/null exit mismatch; stdout={stdout_null:?}, stderr={:?}",
+                String::from_utf8_lossy(&out_null.stderr)
+            );
+            assert_eq!(stdout_null.replace('\r', ""), expected);
+
+            // 2. Stdin closed (`0<&-`)
+            let out_closed = Command::new("sh")
+                .args(["-c", "exec \"$1\" 0<&-", "_", bin.to_str().unwrap()])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap();
+            let stdout_closed = String::from_utf8_lossy(&out_closed.stdout);
+            assert_eq!(
+                out_closed.status.code(),
+                Some(expected_code),
+                "closed stdin exit mismatch; stdout={stdout_closed:?}, stderr={:?}",
+                String::from_utf8_lossy(&out_closed.stderr)
+            );
+            assert_eq!(stdout_closed.replace('\r', ""), expected);
+        }
+    }
+
+    #[test]
     fn item2_sim_user_idle_hook_busy_task_and_piped_eof_exit() {
         use std::io::Write;
         use std::process::{Command, Stdio};
 
         let temp = TempWorkDir::create("zevc-item2-sim-minor").unwrap();
 
-        // 1. User `sys.set_idle` coexists with `board.console_open()`, and piped non-TTY EOF
-        // exits cleanly with status 0 instead of running forever.
+        // 1. User `sys.set_idle` coexists with `board.console_open()`, and piped input
+        // handles EOF without interfering while the app exits cleanly via `sys.exit(0)`.
         let idle_src = "\
 import board;
 import std.io as io;
@@ -4772,7 +4865,7 @@ task con(io.DuplexStream port) {
                 bool saw_idle = hits > 0u32;
                 println(f\"reply len={len} idle={saw_idle}\");
                 io.stream_write(&port, \"ok\\n\");
-                len = 0;
+                sys.exit(0);
             } else if (b != 13u8 && len < line.len) {
                 line[len] = b;
                 len += 1;
