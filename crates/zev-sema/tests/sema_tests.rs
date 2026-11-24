@@ -2474,7 +2474,7 @@ fn wave2_floats_f32_f64_literals_coercion_ops_casts_and_errors() {
             if (!ok) {
                 error Disconnected;
             }
-            return ((f32)raw) * 3.3 / 4095.0;
+            return (raw as f32) * 3.3 / 4095.0;
         }
 
         f32 step_pid(*PidState st, f32 target, f32 measured) {
@@ -2485,13 +2485,13 @@ fn wave2_floats_f32_f64_literals_coercion_ops_casts_and_errors() {
             st.integral /= 1.0;
             st.integral %= 10.0f32;
 
-            f64 wide = (f64)err + KI * 2.5e1;
+            f64 wide = (err as f64) + KI * 2.5e1;
             st.accum64 = wide % 1.5;
 
             if (err >= -0.05 && err <= 0.05 && wide != 0.0 && !(err == 99.0)) {
                 return -0.0;
             }
-            return KP * err + st.integral + (f32)st.accum64;
+            return KP * err + st.integral + (st.accum64 as f32);
         }
 
         task control_loop() {
@@ -2503,7 +2503,7 @@ fn wave2_floats_f32_f64_literals_coercion_ops_casts_and_errors() {
                     1.65
                 };
                 f32 cmd = step_pid(&st, v1 + v2, weights[0]);
-                i32 pwm_ticks = (i32)(cmd * 1000.0);
+                i32 pwm_ticks = (cmd * 1000.0) as i32;
                 if (pwm_ticks > 0) {
                     duty_out.publish(cmd);
                     sample_q.post(cmd as f64);
@@ -2766,7 +2766,7 @@ fn wave2_monomorphize_sema_invariants_yield_cloning_and_dma_provenance() {
             loop {
                 []u8 half = rx_dma.wait_chunk();
                 SliceView<u8> v = make_view(half);
-                acc = smooth_step(acc, (f32)v.buf[0]);
+                acc = smooth_step(acc, v.buf[0] as f32);
                 noyield {
                     f32 fast = smooth_step(acc, 10.0f32);
                     filtered_out.publish(fast);
@@ -3521,7 +3521,7 @@ fn r2a_h4_h5_injective_mangling_and_monomorphization_cap() {
             Outer<Inner<u8>> o1 = Outer<Inner<u8>> { item: Inner<u8> { v: 9 } };
             Outer<Inner_u8> o2 = Outer<Inner_u8> { item: Inner_u8 { v: 10 } };
             Outer<GInner_L_u8_R> o3 = Outer<GInner_L_u8_R> { item: GInner_L_u8_R { v: 11 } };
-            sys.log_kv("ok=", (i32)(t1 + t2 + k1 + k2 + (usize)o1.item.v + (usize)o2.item.v + (usize)o3.item.v));
+            sys.log_kv("ok=", (t1 + t2 + k1 + k2 + (o1.item.v as usize) + (o2.item.v as usize) + (o3.item.v as usize)) as i32);
         }
     "#;
     let model = expect_ok(src);
@@ -3577,8 +3577,8 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
         const usize HDR = 2;
         const usize PAYLOAD = 4;
         const usize TOTAL = HDR + PAYLOAD;
-        const i8 SIGNED_WRAP = (i8)255;
-        const usize NINE = (usize)(SIGNED_WRAP + 10);
+        const i8 SIGNED_WRAP = 255 as i8;
+        const usize NINE = (SIGNED_WRAP + 10) as usize;
 
         struct Buf<usize N> {
             [N]u8 data;
@@ -3601,8 +3601,8 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
         }
 
         fn main() {
-            Buf<(usize)((u8)300)> b44;
-            Buf<(usize)(~((u8)0))> b255;
+            Buf<((300 as u8) as usize)> b44;
+            Buf<((~(0 as u8)) as usize)> b255;
             i32 v = first_elem([1000, 2000]);
             usize r = switch_and_shadow<7>(7);
 
@@ -3612,7 +3612,7 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
             []u8 fit9 = fmt_buf(raw9[0..NINE], f"123456789");
             println(fit);
             println(fit9);
-            sys.log_kv("v=", v + (i32)r + (i32)b44.data[0] + (i32)b255.data[0]);
+            sys.log_kv("v=", v + (r as i32) + (b44.data[0] as i32) + (b255.data[0] as i32));
         }
     "#;
     let prog = zev_parser::parse_str(src).unwrap();
@@ -3663,12 +3663,12 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
     );
 
     // 2. M11: Unsuffixed float literal out of finite `f32` range (`1e40`, `-1e40`) rejected on `f32` coercion,
-    //    while `f64` and explicit `(f32)1e40` cast pass!
+    //    while `f64` and explicit `1e40 as f32` cast pass!
     expect_ok(
         r#"
         fn main() {
             f64 big64 = 1e40;
-            f32 inf32 = (f32)1e40;
+            f32 inf32 = 1e40 as f32;
             if (big64 > 0.0 && inf32 > 0.0f32) {}
         }
         "#,
@@ -3731,7 +3731,7 @@ fn r2a_m7_m8_m9_m10_m11_m14_and_instantiation_notes() {
             return x;
         }
         fn main() {
-            u32 y = bad_generic((u32)42);
+            u32 y = bad_generic(42 as u32);
         }
         "#,
         DiagnosticKind::TypeMismatch,
@@ -3764,7 +3764,7 @@ fn r4_struct_fnptr_field_call_and_ptr_receiver_validation() {
             u32 r1 = bf.cb(32);
             u32 r2 = (bf.cb)(32);
             u32 r3 = pbf.cb(32);
-            sys.log_kv("sum=", (i32)(r1 + r2 + r3));
+            sys.log_kv("sum=", (r1 + r2 + r3) as i32);
         }
         "#,
     );
@@ -3891,7 +3891,7 @@ fn wave1_module_resolution_diamond_pub_extern_c_and_generics() {
         pub task uart_worker(*watch<u32> w) {
             loop {
                 u32 v = w.wait_change();
-                sys.log_kv("v=", (i32)v);
+                sys.log_kv("v=", v as i32);
             }
         }
         "#,
@@ -4106,7 +4106,7 @@ fn wave1_mmio_validation_and_e0031_enforcement() {
             r.brr[0] = 9600;
             r.brr[1] |= 0x10;
             r.tx[1] = 0x55;
-            sys.log_kv("st=", (i32)st);
+            sys.log_kv("st=", st as i32);
         }
 
         fn main() {
@@ -4196,7 +4196,7 @@ fn wave1_irq_boot_tree_attachment_shared_and_e0032_errors() {
             if (flag) { sys.log("a"); }
         }
         isr shared_b(u32 id) {
-            sys.log_kv("b=", (i32)id);
+            sys.log_kv("b=", id as i32);
         }
         isr simple_isr {}
 
@@ -5178,7 +5178,7 @@ fn sys_tick_and_set_putc_hooks_validation() {
         mmio TCB3 : TcbRegs @ 0x0AB0;
 
         fn uart_putc(u8 c) {
-            usize _unused = (usize)c;
+            usize _unused = c as usize;
         }
 
         isr systick_isr(*TcbRegs tcb) {
@@ -5247,7 +5247,7 @@ fn sys_tick_and_set_putc_hooks_validation() {
     expect_err_kind(
         r#"
         fn yielding_putc(u8 c) {
-            usize _u = (usize)c;
+            usize _u = c as usize;
             checkpoint();
         }
         fn main() {
@@ -5261,7 +5261,7 @@ fn sys_tick_and_set_putc_hooks_validation() {
     expect_err_kind(
         r#"
         irq IRQ0 = 1;
-        fn uart_putc(u8 c) { usize _u = (usize)c; }
+        fn uart_putc(u8 c) { usize _u = c as usize; }
         isr bad_isr() {
             sys.set_putc(uart_putc);
         }
@@ -5507,7 +5507,7 @@ fn regression_s_h4_s_h5_mmio_and_os_primitive_void_coercion_and_casts() {
         fn main() {
             *Regs p1 = DEV as *Regs;
             *Regs p2 = p1 as *Regs;
-            usize addr = (usize)DEV;
+            usize addr = DEV as usize;
             *signal sp = &sig as *signal;
             *byte_ring<16> bp1 = &br as *byte_ring<16>;
             *byte_ring bp2 = &br as *byte_ring;
@@ -5575,7 +5575,7 @@ fn regression_s_h6_byval_deref_vs_projection() {
             (*s).tx.push_byte(1);
             usize n = (*br).len();
             *u32 hp = &(*pkt).hdr;
-            sys.log_kv("v=", (v + *hp + (u32)n) as i32);
+            sys.log_kv("v=", (v + *hp + (n as u32)) as i32);
         }
 
         fn main() {
@@ -5778,7 +5778,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
             pub u32 pick_a() {
                 PrivA x = Shared;
                 PubA y = Common;
-                return (u32)x + (u32)y;
+                return (x as u32) + (y as u32);
             }
             "#,
         );
@@ -5789,7 +5789,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
             pub enum PubB { Shared, Common, ExtraB }
             pub u32 pick_b() {
                 PubB x = Shared;
-                return (u32)x;
+                return x as u32;
             }
             "#,
         );
@@ -5802,7 +5802,7 @@ fn regression_s_m1_s_m2_s_l2_module_enums_pub_visibility_and_extern_c() {
             enum RootMode { Shared = 1 }
             fn main() {
                 RootMode m = Shared;
-                u32 x = hal_init((u32)m + ma.pick_a() + mb.pick_b());
+                u32 x = hal_init((m as u32) + ma.pick_a() + mb.pick_b());
                 sys.log_kv("x=", x as i32);
             }
             "#,
@@ -5967,7 +5967,7 @@ fn regression_l_h1_shift_preserves_lhs_integer_type() {
             u8 c = 1u8 << 3u32;
             u16 d = 0x8000u16 >> 1usize;
             i8 e = (-8i8) >> 1u32;
-            sys.log_kv("a=", (a + b + (u32)c + (u32)d + (e as u32)) as i32);
+            sys.log_kv("a=", (a + b + (c as u32) + (d as u32) + (e as u32)) as i32);
         }
         "#,
     );
@@ -5981,7 +5981,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
         const usize ROM_LOOKUP_STACK = 32;
         irq IRQ_TIMER = 1;
 
-        fn uart_putc(u8 c) { usize _u = (usize)c; }
+        fn uart_putc(u8 c) { usize _u = c as usize; }
         u32 read_ms() { return 42; }
         fn on_exit(i32 code) { i32 _c = code; }
         fn on_fault() {}
@@ -6092,7 +6092,7 @@ fn explicit_sys_hooks_and_rom_call_validation() {
     // 6. Non-constant or negative `stack_bound` rejected -> InvalidOperation
     for bad_bound in [
         "fn call_it(usize dyn_sb) { u32 _x = sys.rom_call_u32(0x10usize, dyn_sb); } fn main() { call_it(32); }",
-        "fn main() { sys.rom_call_void(0x10usize, (usize)(-4i32)); }",
+        "fn main() { sys.rom_call_void(0x10usize, (-4i32) as usize); }",
         "fn main() { usize sb = 16; sys.rom_call_void(0x10usize, sb); }",
     ] {
         expect_err_kind(bad_bound, DiagnosticKind::InvalidOperation);
@@ -7158,6 +7158,27 @@ fn watch_single_writer_and_guarded_critical_cell_semantics() {
         "#,
     );
     assert!(ok_guarded.primitives.contains_key("shared_acc"));
+}
+
+#[test]
+fn retired_inbox_try_post_is_rejected_with_post_suggestion() {
+    let diags = expect_err_kind(
+        r#"
+        inbox<u32, 4> q;
+        fn main() {
+            q.try_post(1u32);
+        }
+        "#,
+        DiagnosticKind::UndefinedSymbol,
+    );
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.message.contains("try_post")
+                && d.message.contains(".post(")
+                && d.message.contains(".try_send(")),
+        "expected try_post removal diagnostic recommending .post(...) or .try_send(...), got: {diags:?}"
+    );
 }
 
 

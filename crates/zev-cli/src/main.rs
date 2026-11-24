@@ -2568,7 +2568,7 @@ irq IRQ_POOL  = 5;
 isr on_fq(*inbox<u32, 2> q, *watch<u32> sent) {
     u32 s = sent.read();
     if (s < 35u32 && !q.is_full()) {
-        q.try_post(s + 1u32, boost: @critical);
+        q.post(s + 1u32, boost: @critical);
         sent.publish(s + 1u32);
     }
 }
@@ -2865,7 +2865,7 @@ irq IRQ_WAIT_FEED = 2;
 isr on_feed(*inbox<u32, 8> q, *signal s, *watch<u32> seq_w) {
     u32 n = seq_w.read();
     if (n < 30u32 && !q.is_full()) {
-        q.try_post(n + 1u32, boost: @high);
+        q.post(n + 1u32, boost: @high);
         if ((n & 3u32) == 0u32) {
             s.notify(boost: @critical);
         }
@@ -2922,7 +2922,7 @@ fn main() {
     sys.fuzz_irqs(0x55AA_1234u32, 1u32 << 2);
     spawn multi_waiter() @normal;
     spawn pacer() @low;
-    hi_q.try_post(42u32);
+    hi_q.post(42u32);
     [1]u8 pkt = [0x5Au8];
     rx_ring.push(pkt[0..1]);
 }

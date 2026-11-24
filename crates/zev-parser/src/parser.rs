@@ -831,6 +831,50 @@ impl<'a> Parser<'a> {
             .with_hint(hint)
     }
 
+    fn trap_p0015(&self, span: Span, member_hint: Option<&str>) -> ParseError {
+        let hint = match member_hint {
+            Some(m) => format!(
+                "use `.{m}` instead of `->{m}`; Zev auto-dereferences pointers on `.` member and method access"
+            ),
+            None => "use `.` instead of `->`; Zev auto-dereferences pointers on `.` member and method access"
+                .to_string(),
+        };
+        self.err_at(
+            "retired `->` member access operator; use `.` instead (Zev auto-dereferences pointers on `.`)",
+            span,
+        )
+        .with_code("P0015")
+        .with_doc_topic("syntax")
+        .with_hint(hint)
+    }
+
+    fn trap_p0016(&self, span: Span, next_hint: Option<&str>) -> ParseError {
+        let hint = match next_hint {
+            Some(n) => format!("replace `::{n}` with `.{n}`; Zev uses `.` for module paths, enum variants, and member access"),
+            None => "replace `::` with `.`; Zev uses `.` for module paths, enum variants, and member access"
+                .to_string(),
+        };
+        self.err_at(
+            "retired `::` path separator; use `.` instead",
+            span,
+        )
+        .with_code("P0016")
+        .with_doc_topic("syntax")
+        .with_hint(hint)
+    }
+
+    fn trap_p0017(&self, ty_str: &str, span: Span) -> ParseError {
+        self.err_at(
+            format!("retired C-style cast `({ty_str})expr`; use postfix `expr as {ty_str}` instead"),
+            span,
+        )
+        .with_code("P0017")
+        .with_doc_topic("syntax")
+        .with_hint(format!(
+            "rewrite `({ty_str})expr` as `expr as {ty_str}`"
+        ))
+    }
+
     fn type_snippet(&self, span: Span) -> String {
         self.source
             .get(span.start as usize..span.end as usize)
@@ -1263,7 +1307,18 @@ impl<'a> Parser<'a> {
         let start = self.expect(&TokenKind::KwImport)?.span;
         let mut path = vec![self.parse_ident()?];
         let mut grouped = false;
-        while self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon) {
+        loop {
+            if self.at(&TokenKind::ColonColon) {
+                let cc_span = self.peek_span();
+                let next = match self.peek_n_kind(1) {
+                    TokenKind::Ident(s) => Some(s),
+                    _ => None,
+                };
+                return Err(self.trap_p0016(cc_span, next.as_deref()));
+            }
+            if !self.eat(&TokenKind::Dot) {
+                break;
+            }
             if self.at(&TokenKind::LBrace) {
                 grouped = true;
                 break;
@@ -1328,7 +1383,15 @@ impl<'a> Parser<'a> {
         self.expect(&TokenKind::KwImpl)?;
         let generic_params = self.parse_optional_generic_params()?;
         let target_name = self.parse_ident()?;
-        if self.at(&TokenKind::Dot) || self.at(&TokenKind::ColonColon) {
+        if self.at(&TokenKind::ColonColon) {
+            let cc_span = self.peek_span();
+            let next = match self.peek_n_kind(1) {
+                TokenKind::Ident(s) => Some(s),
+                _ => None,
+            };
+            return Err(self.trap_p0016(cc_span, next.as_deref()));
+        }
+        if self.at(&TokenKind::Dot) {
             return Err(self
                 .err_at(
                     format!(
@@ -2733,10 +2796,20 @@ impl<'a> Parser<'a> {
                             self.check_generic_lifetime_after_decl_name()?;
 
                             let mut segs = vec![first_id];
-                            while self.at(&TokenKind::Dot)
-                                || (self.at(&TokenKind::ColonColon)
-                                    && self.peek_n_kind(1) != TokenKind::Lt)
-                            {
+                            loop {
+                                if self.at(&TokenKind::ColonColon)
+                                    && self.peek_n_kind(1) != TokenKind::Lt
+                                {
+                                    let cc_span = self.peek_span();
+                                    let next = match self.peek_n_kind(1) {
+                                        TokenKind::Ident(s) => Some(s),
+                                        _ => None,
+                                    };
+                                    return Err(self.trap_p0016(cc_span, next.as_deref()));
+                                }
+                                if !self.at(&TokenKind::Dot) {
+                                    break;
+                                }
                                 self.bump();
                                 segs.push(self.parse_ident()?);
                             }
@@ -3703,7 +3776,7 @@ impl<'a> Parser<'a> {
             Err(e) => {
                 // Preserve specific type traps like `chan<...>` (`P0012`), `lease<...>` (`P0013`),
                 // or `&mut`/`'a` (`P0009`); map untyped / C-style `for (i = 0; ...)` or `for (let i ...)` to `P0008`.
-                if matches!(e.code, Some("P0009" | "P0012" | "P0013" | "P0014")) {
+                if matches!(e.code, Some("P0009" | "P0012" | "P0013" | "P0014" | "P0015" | "P0016" | "P0017")) {
                     return Err(e);
                 }
                 return Err(self.trap_p0008(start.merge(self.peek_span())));
@@ -3946,7 +4019,18 @@ impl<'a> Parser<'a> {
             TokenKind::Ident(_) => {
                 let first = self.parse_ident()?;
                 let mut rest = Vec::new();
-                while self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon) {
+                loop {
+                    if self.at(&TokenKind::ColonColon) {
+                        let cc_span = self.peek_span();
+                        let next = match self.peek_n_kind(1) {
+                            TokenKind::Ident(s) => Some(s),
+                            _ => None,
+                        };
+                        return Err(self.trap_p0016(cc_span, next.as_deref()));
+                    }
+                    if !self.eat(&TokenKind::Dot) {
+                        break;
+                    }
                     rest.push(self.parse_ident()?);
                 }
                 if rest.is_empty() {
@@ -4142,7 +4226,14 @@ impl<'a> Parser<'a> {
     fn parse_spawn_stmt(&mut self, mut attrs: Vec<Attr>, start: Span) -> Result<Stmt, ParseError> {
         self.expect(&TokenKind::KwSpawn)?;
         let first = self.parse_ident()?;
-        let (module, task) = if self.eat(&TokenKind::Dot) || self.eat(&TokenKind::ColonColon) {
+        let (module, task) = if self.at(&TokenKind::ColonColon) {
+            let cc_span = self.peek_span();
+            let next = match self.peek_n_kind(1) {
+                TokenKind::Ident(s) => Some(s),
+                _ => None,
+            };
+            return Err(self.trap_p0016(cc_span, next.as_deref()));
+        } else if self.eat(&TokenKind::Dot) {
             (Some(first), self.parse_ident()?)
         } else {
             (None, first)
@@ -4320,18 +4411,11 @@ impl<'a> Parser<'a> {
             _ => {}
         }
 
-        // Check prefix cast `(PrimType)expr` or `(*Type)expr`
+        // Trap C-style casts `(Type)expr` with `P0017` -> `expr as Type`.
         if self.at(&TokenKind::LParen) {
-            if let Some(ty) = self.try_parse_c_cast_type()? {
-                let inner = self.parse_unary_expr()?;
-                let span = start.merge(inner.span);
-                return Ok(Expr::new(
-                    ExprKind::Cast {
-                        expr: Box::new(inner),
-                        ty,
-                    },
-                    span,
-                ));
+            if let Some((ty, cast_span)) = self.try_parse_c_cast_type()? {
+                let ty_str = self.type_snippet(ty.span);
+                return Err(self.trap_p0017(&ty_str, cast_span));
             }
         }
 
@@ -4360,11 +4444,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Speculatively check if `(` starts a C-style cast involving a built-in `PrimType`
-    /// or a prefix pointer type `(*MyStruct)vp` (trapping `(MyStruct*)vp` as `P0014`).
-    fn try_parse_c_cast_type(&mut self) -> Result<Option<TypeExpr>, ParseError> {
+    /// Speculatively check if `(` starts a retired C-style cast involving a built-in `PrimType`
+    /// or a prefix pointer/type `(Type)expr` (trapping `(MyStruct*)vp` as `P0014`, and `(Type)expr` as `P0017`).
+    fn try_parse_c_cast_type(&mut self) -> Result<Option<(TypeExpr, Span)>, ParseError> {
         let cp = self.save();
-        self.bump(); // `(`
+        let lp = self.bump(); // `(`
         let ty = match self.parse_type() {
             Ok(t) if self.is_valid_c_cast_type(&t) => t,
             Err(e)
@@ -4380,11 +4464,37 @@ impl<'a> Parser<'a> {
                 return Ok(None);
             }
         };
-        if !self.eat(&TokenKind::RParen) || !self.can_start_unary_expr() {
+        if !self.eat(&TokenKind::RParen) {
             self.restore(cp);
             return Ok(None);
         }
-        Ok(Some(ty))
+        let rp_span = self.prev_span();
+        let is_cast = if type_contains_builtin_prim(&ty) {
+            self.can_start_unary_expr()
+        } else {
+            self.can_start_unambiguous_c_cast_operand()
+        };
+        if !is_cast {
+            self.restore(cp);
+            return Ok(None);
+        }
+        Ok(Some((ty, lp.span.merge(rp_span))))
+    }
+
+    fn can_start_unambiguous_c_cast_operand(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            TokenKind::Ident(_)
+                | TokenKind::Int { .. }
+                | TokenKind::FloatLit { .. }
+                | TokenKind::Duration(_, _)
+                | TokenKind::String(_)
+                | TokenKind::FormatString(_)
+                | TokenKind::KwTrue
+                | TokenKind::KwFalse
+                | TokenKind::Bang
+                | TokenKind::Tilde
+        )
     }
 
     fn is_valid_c_cast_type(&self, ty: &TypeExpr) -> bool {
@@ -4438,13 +4548,24 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary_expr()?;
 
         loop {
+            if self.at(&TokenKind::Arrow) {
+                let arrow_span = self.bump().span;
+                let member_hint = match self.peek_kind() {
+                    TokenKind::Ident(s) => Some(s),
+                    _ => None,
+                };
+                return Err(self.trap_p0015(arrow_span, member_hint.as_deref()));
+            }
+            if self.at(&TokenKind::ColonColon) && self.peek_n_kind(1) != TokenKind::Lt {
+                let cc_span = self.bump().span;
+                let next = match self.peek_kind() {
+                    TokenKind::Ident(s) => Some(s),
+                    _ => None,
+                };
+                return Err(self.trap_p0016(cc_span, next.as_deref()));
+            }
             match self.peek_kind() {
-                TokenKind::Dot
-                | TokenKind::Arrow
-                | TokenKind::ColonColon
-                    if !(self.at(&TokenKind::ColonColon)
-                        && self.peek_n_kind(1) == TokenKind::Lt) =>
-                {
+                TokenKind::Dot => {
                     let dot_tok = self.bump();
                     let field = self.parse_word_ident("field or method name")?;
                     // Trap `.await` (`P0003`) and `.match` (`P0005`)

@@ -181,10 +181,14 @@ pub fn advise_primitive_method(prim: &ResolvedOsPrimitive, method: &str) -> (Opt
 
         ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => {
             let valid = [
-                "post", "try_post", "send", "try_send", "recv", "try_recv", "len", "cap",
+                "post", "send", "try_send", "recv", "try_recv", "len", "cap",
                 "is_empty", "is_full",
             ];
             let direct = match method {
+                "try_post" => Some(format!(
+                    "`.post({} val)` (non-blocking `void`, ISR-safe) or `.try_send({} val) -> bool` (`try_post` was removed)",
+                    elem, elem
+                )),
                 "push" | "put" | "enqueue" | "write" | "publish" | "emit" | "notify" => {
                     Some(format!(
                         "`.post({} val)` (non-blocking, ISR-safe) or `.send({} val)` (task-only backpressured)",
