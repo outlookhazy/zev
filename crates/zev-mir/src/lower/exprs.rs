@@ -901,6 +901,7 @@ pub fn try_mir_expr_to_place(expr: &MirExpr) -> Option<MirPlace> {
             index,
             raw_elem_ty,
             is_slice,
+            ..
         } => {
             let base_place = try_mir_expr_to_place(base)?;
             Some(MirPlace::Index {
@@ -1181,6 +1182,7 @@ pub(super) fn coerce_expr_be<B: LowerBackend>(
                         )),
                         raw_elem_ty: raw_src_elem.clone(),
                         is_slice: false,
+                        in_bounds: false,
                     },
                     host_src_elem.clone(),
                 );
@@ -2756,6 +2758,7 @@ pub(super) fn finish_index(
                     index: Box::new(idx),
                     raw_elem_ty: *elem,
                     is_slice: true,
+                    in_bounds: false,
                 },
                 et,
             ))
@@ -2768,6 +2771,7 @@ pub(super) fn finish_index(
                     index: Box::new(idx),
                     raw_elem_ty: *elem,
                     is_slice: false,
+                    in_bounds: false,
                 },
                 et,
             ))
@@ -4900,6 +4904,7 @@ pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
                             )),
                             raw_elem_ty: raw_el_ty.clone(),
                             is_slice: true,
+                            in_bounds: false,
                         },
                         raw_el_ty,
                     );
@@ -5879,6 +5884,7 @@ pub(super) fn expand_array_debug_be<B: LowerBackend>(
                 )),
                 raw_elem_ty: elem_ty.clone(),
                 is_slice: false,
+                in_bounds: false,
             },
             elem_ty.host_value_type(),
         );

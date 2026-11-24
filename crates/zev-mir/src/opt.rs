@@ -2347,14 +2347,16 @@ fn mir_expr_eq(a: &MirExpr, b: &MirExpr) -> bool {
                 index: ia,
                 raw_elem_ty: rta,
                 is_slice: isa,
+                in_bounds: nba,
             },
             MirExprKind::Index {
                 base: bb,
                 index: ib,
                 raw_elem_ty: rtb,
                 is_slice: isb,
+                in_bounds: nbb,
             },
-        ) => isa == isb && rta == rtb && mir_expr_eq(ba, bb) && mir_expr_eq(ia, ib),
+        ) => isa == isb && nba == nbb && rta == rtb && mir_expr_eq(ba, bb) && mir_expr_eq(ia, ib),
         (
             MirExprKind::SubSlice {
                 base: ba,

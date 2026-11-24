@@ -9538,4 +9538,64 @@ fn main() {
             "loop-body local must be re-zeroed at its declaration:\n{summed_ll}"
         );
     }
+
+    #[test]
+    fn for_in_element_read_has_no_bounds_check() {
+        // The loop only enters its body with `idx < len`, so the element read needs no check of
+        // its own; an explicit index in the same function keeps its check.
+        let src = r#"
+fn total([]u16 xs) -> u32 {
+    u32 t = 0;
+    for (u16 x in xs) {
+        t += x as u32;
+    }
+    return t;
+}
+
+fn pick([]u16 xs, usize i) -> u16 {
+    return xs[i];
+}
+
+task walker() {
+    [4]u16 a = [1u16, 2u16, 3u16, 4u16];
+    loop {
+        u32 t = 0;
+        for (u16 x in a) {
+            t += x as u32;
+            delay(1ms);
+        }
+        t += total(a) + (pick(a, 1) as u32);
+        if (t == 0) {
+            sys.exit(1);
+        }
+        delay(1ms);
+    }
+}
+
+fn main() {
+    spawn walker() @normal;
+}
+"#;
+        let mir = compile_src_mir(src);
+        let ll = emit_llvm_ir_with_options(&mir, &CodegenOptions::default())
+            .expect("emit LLVM IR for for-in");
+        let body_of = |sym: &str| {
+            ll.split("\ndefine ")
+                .find(|f| f.contains(sym))
+                .unwrap_or_else(|| panic!("missing {sym}"))
+                .to_string()
+        };
+        assert!(
+            !body_of("@__syn_fn_total(").contains("@__syn_panic(i8 1)"),
+            "for-in over a slice parameter still bounds-checks its element read"
+        );
+        assert!(
+            !body_of("@__syn_task_step_walker(").contains("@__syn_panic(i8 1)"),
+            "for-in in a task body still bounds-checks its element read"
+        );
+        assert!(
+            body_of("@__syn_fn_pick(").contains("@__syn_panic(i8 1)"),
+            "an explicit index must keep its bounds check"
+        );
+    }
 }

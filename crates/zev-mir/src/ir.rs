@@ -1186,6 +1186,9 @@ pub enum MirExprKind {
         index: Box<MirExpr>,
         raw_elem_ty: MirType,
         is_slice: bool,
+        /// The compiler built this access so that the index is always in range (the element
+        /// read of a `for (x in seq)` loop), so no bounds check is emitted for it.
+        in_bounds: bool,
     },
     SubSlice {
         base: Box<MirExpr>,

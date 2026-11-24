@@ -732,6 +732,8 @@ impl<'a> DirectLowerCtx<'a> {
                         index: Box::new(MirExpr::new(MirExprKind::Var(idx_tmp), MirType::Usize)),
                         raw_elem_ty: seq_elem_ty.clone(),
                         is_slice: true,
+                        // `idx < len` holds on every path into the loop body.
+                        in_bounds: true,
                     },
                     seq_elem_ty.host_value_type(),
                 );
