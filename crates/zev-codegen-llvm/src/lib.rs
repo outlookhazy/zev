@@ -2242,8 +2242,7 @@ mod tests {
 
                 if (boots == 2) {
                     append_step(3);
-                    u32 seq_v = 0;
-                    critical { seq_v = seq_log.get(); }
+                    u32 seq_v = seq_log.get();
                     sys.log_kv("seq=", seq_v as i32);
                     sys.log_kv("after_seed=", param_seed as i32);
                     sys.log_kv("after_local=", local_acc as i32);
@@ -8662,5 +8661,105 @@ fn void_cb() {}
             compile_ll_to_obj(&ll2_path, &obj2_path, topts)
                 .unwrap_or_else(|e| panic!("{tname} seq LLVM obj build failed: {e:?}"));
         }
+    }
+
+    #[test]
+    fn pr23_guarded_get_irq_elision_and_isr_critical_omission() {
+        let src = r#"
+struct Pair {
+    u32 a;
+    u32 b;
+}
+
+guarded<Pair> isr_g = Pair { a: 1, b: 2 };
+guarded<Pair> task_g = Pair { a: 3, b: 4 };
+irq IRQ_T = 2;
+
+isr bump() {
+    Pair cur = isr_g.get();
+    critical {
+        isr_g.set(Pair { a: cur.a + 1u32, b: cur.b + 1u32 });
+    }
+}
+
+fn read_task_only() -> u32 {
+    Pair p = task_g.get();
+    return p.a + p.b;
+}
+
+fn read_contended_unlocked() -> u32 {
+    Pair p = isr_g.get();
+    return p.a + p.b;
+}
+
+fn read_contended_in_crit() -> u32 {
+    Pair p = Pair { a: 0, b: 0 };
+    critical {
+        p = isr_g.get();
+    }
+    return p.a + p.b;
+}
+
+task worker() {
+    loop {
+        u32 a = read_task_only();
+        u32 b = read_contended_unlocked();
+        u32 c = read_contended_in_crit();
+        if (a + b + c == 0u32) {
+            critical { task_g.set(Pair { a: 5, b: 6 }); }
+        }
+        delay(5ms);
+    }
+}
+
+fn main() {
+    IRQ_T.attach(bump);
+    spawn worker() @normal;
+}
+"#;
+        let mir = compile_src_mir(src);
+        let ll = emit_llvm_ir_with_options(&mir, &CodegenOptions::lm3s6965()).unwrap();
+
+        let extract_fn = |header: &str| -> String {
+            let start = ll
+                .find(header)
+                .unwrap_or_else(|| panic!("missing `{header}` in IR:\n{ll}"));
+            let rest = &ll[start..];
+            let end = rest.find("\n}\n").unwrap();
+            rest[..end + 3].to_string()
+        };
+
+        let task_fn = extract_fn("define i32 @__syn_fn_read_task_only()");
+        assert_eq!(
+            task_fn.matches("@__syn_crit_enter").count(),
+            0,
+            "task-only guarded.get() must elide IRQ masking:\n{task_fn}"
+        );
+
+        let unlocked_fn = extract_fn("define i32 @__syn_fn_read_contended_unlocked()");
+        assert_eq!(
+            unlocked_fn.matches("@__syn_crit_enter").count(),
+            1,
+            "ISR-contended unlocked guarded.get() must mask interrupts once:\n{unlocked_fn}"
+        );
+        assert_eq!(
+            unlocked_fn.matches("@__syn_crit_exit").count(),
+            1,
+            "ISR-contended unlocked guarded.get() must unmask interrupts once:\n{unlocked_fn}"
+        );
+
+        let in_crit_fn = extract_fn("define i32 @__syn_fn_read_contended_in_crit()");
+        assert_eq!(
+            in_crit_fn.matches("@__syn_crit_enter").count(),
+            1,
+            "guarded.get() inside critical must not emit redundant nested @__syn_crit_enter:\n{in_crit_fn}"
+        );
+
+        let isr_fn = extract_fn("define void @__syn_isr_bump()");
+        assert_eq!(
+            isr_fn.matches("@__syn_crit_enter").count(),
+            1,
+            "expected only the 1 enter from the explicit critical {{ set }} block; guarded.get() in ISR emits 0:\n{isr_fn}"
+        );
     }
 }

@@ -4535,19 +4535,6 @@ impl<'a> BodyChecker<'a> {
                             "'guarded.get()' does not accept 'timeout:' or 'boost:' arguments",
                         ));
                     }
-                    if !self.in_critical() {
-                        self.sema.emit(
-                            Diagnostic::new(
-                                DiagnosticKind::InvalidOperation,
-                                span,
-                                format!(
-                                    "'{}.get()' on `guarded<T>` may only be called inside a 'critical {{ ... }}' block",
-                                    source_key
-                                ),
-                            )
-                            .with_note("wrap multi-writer `guarded<T>` reads and writes in `critical { ... }` to prevent task/ISR races"),
-                        );
-                    }
                     ExprVal::scalar((**elem).clone(), span)
                 }
                 "set" => {
@@ -4569,7 +4556,7 @@ impl<'a> BodyChecker<'a> {
                                     source_key
                                 ),
                             )
-                            .with_note("wrap multi-writer `guarded<T>` reads and writes in `critical { ... }` to prevent task/ISR races"),
+                            .with_note("wrap multi-writer `guarded<T>` writes (`.set(...)`) in `critical { ... }` to prevent task/ISR races; `.get()` snapshots are allowed anywhere"),
                         );
                     }
                     ExprVal::scalar(Ty::void(), span)

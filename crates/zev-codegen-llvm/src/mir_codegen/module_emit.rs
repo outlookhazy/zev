@@ -5845,6 +5845,7 @@ entry:
         }
 
         let mut fb = FnIrBuilder::new(self, &isr.vars, None, &MirType::Void, &MirErrorSpec::None);
+        fb.in_isr = true;
         for (sidx, sd) in isr.state_vars.iter().enumerate() {
             fb.isr_state_ptrs
                 .insert(sd.var_id, format!("%__state_{sidx}"));
