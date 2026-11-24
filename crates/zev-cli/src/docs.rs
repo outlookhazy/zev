@@ -29,7 +29,7 @@ CORE MENTAL MODEL (5 RULES):
      unguarded `while (cond)` compute loops that auto-specialize direct clones in `noyield { ... }`),
      and `HardBlocking` (`wait { ... }`, `recv`, `send`, `wait`, `wait_change`, `wait_chunk`, `delay`).
   4. Strict Task/ISR Isolation: Zero mutable raw globals. Cross-task/ISR state goes exclusively through
-     static primitives: `watch<T>` (enforced single-writer), `guarded<T>` (multi-writer inside `critical`),
+     static primitives: `watch<T>` (enforced single-writer), `guarded<T>` (`.set()` in `critical`, `.get()` anywhere),
      unified `inbox<T, N>` (`.post`, `.send`, `.recv`), `signal`, `byte_ring<N>`, `wait_queue` + `std.sync`
      (`Semaphore`, `EventFlags`, `Latch`, `Barrier<N>`), `@dma_safe ping_pong<T, N>`, and
      `@dma_safe pool<T, K>` + `Lease<T>`.
@@ -492,7 +492,7 @@ values or static scheduler-aware OS primitives at module scope and pass pointers
 | Primitive | Purpose | Non-Blocking (ISR & Task Safe) | Yielding (Task-Only) |
 |---|---|---|---|
 | `watch<T> w = init;` | Enforced single-writer cell | `w.read() -> T`, `w.publish(v)` | `w.wait_change([timeout: d]) -> T` |
-| `guarded<T> g = init;` | Multi-writer (`critical` only) | `g.get() -> T`, `g.set(v)` (in `critical`) | *(not waitable; pair with `wait_queue`)* |
+| `guarded<T> g = init;` | Multi-writer (writes in `critical`, reads anywhere) | `g.get() -> T` (atomic snapshot), `g.set(v)` (in `critical`) | *(not waitable; pair with `wait_queue`)* |
 | `inbox<T, N> q;` | Unified bounded queue | `q.post(v [, boost: @prio])`, `q.try_send(v) -> bool`, `q.try_recv()` | `q.send(v [, timeout: d])`, `q.recv([timeout: d]) -> T` |
 | `byte_ring<N> r;` | Contiguous BipBuffer byte stream | `r.push(s [, boost:])`, `r.push_byte(b [, boost:])`, `r.grant_write(n)`, `r.commit_write(n [, boost:])`, `r.read_slice()`, `r.consume(n)`, `r.pop(dst)`, `r.try_pop_byte()`, `r.clear()` | `r.wait_read([timeout: d]) -> []u8` |
 | `signal s;` | Lightweight wakeup | `s.notify([boost: @prio])`, `s.try_wait() -> bool`, `s.clear()` | `s.wait([timeout: d])` |

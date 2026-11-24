@@ -1185,13 +1185,43 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let pty = format!("%prim.{}", sanitize_ident(&pk.mangle_name()));
                 let gptr = self.resolve_prim_ptr(target)?;
                 let ety = self.ctx.llvm_ty(elem_ty);
+                let contended = match target {
+                    MirPrimTarget::Global(name) => {
+                        self.ctx.vis.isr_contended_globals.contains(name)
+                    }
+                    MirPrimTarget::PtrExpr(_) => self.ctx.vis.is_prim_family_contended(&pk),
+                };
+                let need_mask = contended && !self.in_isr && self.crit_depth == 0;
+                let pm = if need_mask {
+                    let pm = self.next_tmp();
+                    self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
+                    Some(pm)
+                } else {
+                    None
+                };
                 let vp = self.next_tmp();
                 self.emit_line(format!(
                     "{vp} = getelementptr inbounds {pty}, ptr {gptr}, i32 0, i32 0"
                 ));
                 let v = self.next_tmp();
                 self.emit_line(format!("{v} = load volatile {ety}, ptr {vp}, align 1"));
-                Ok(SsaVal::new(ety, v))
+                if let Some(pm) = pm {
+                    self.emit_line(format!("{call_kw} void @__syn_crit_exit(i32 {pm})"));
+                }
+                if let MirType::EndianInt {
+                    bits,
+                    big_endian: true,
+                    ..
+                } = elem_ty
+                {
+                    let sw = self.next_tmp();
+                    self.emit_line(format!(
+                        "{sw} = call i{bits} @llvm.bswap.i{bits}(i{bits} {v})"
+                    ));
+                    Ok(SsaVal::new(ety, sw))
+                } else {
+                    Ok(SsaVal::new(ety, v))
+                }
             }
             MirPrimReadOp::WatchGen { target, elem_ty } => {
                 let pk = MirPrimKind::Watch {

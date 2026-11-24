@@ -7254,13 +7254,31 @@ fn watch_single_writer_and_guarded_critical_cell_semantics() {
         DiagnosticKind::GlobalIsolationViolation,
     );
 
-    // 7. Negative (`E0024`): `guarded<T>` `.get()`/`.set()` outside `critical { ... }`,
-    //    including inside helpers called from `critical`, ISRs, and inside `wait { ... }`.
-    for bad_guarded in [
+    // 7. Negative (`E0024`): `guarded<T>.set()` outside `critical { ... }`
+    //    (including inside helpers called from `critical`, or ISRs) and `.get()` as a `wait` arm,
+    //    while unlocked `.get()` snapshots are permitted in `fn`, `task`, and `isr`.
+    let _ok_unlocked_get = expect_ok(
         r#"
         guarded<u32> g = 0;
-        fn main() { u32 _x = g.get(); }
+        irq IRQ_G = 1;
+        isr g_isr() {
+            u32 _v = g.get();
+            critical { g.set(_v + 1); }
+        }
+        task t() {
+            loop {
+                u32 _cur = g.get();
+                delay(5ms);
+            }
+        }
+        fn main() {
+            IRQ_G.attach(g_isr);
+            u32 _boot = g.get();
+            spawn t() @normal;
+        }
         "#,
+    );
+    for bad_guarded in [
         r#"
         guarded<u32> g = 0;
         fn main() { g.set(1); }
@@ -7296,6 +7314,25 @@ fn watch_single_writer_and_guarded_critical_cell_semantics() {
     ] {
         expect_err_kind(bad_guarded, DiagnosticKind::InvalidOperation);
     }
+
+    // Check `watch<T>` multi-writer E0002 note suggests `inbox<T, N>` or `guarded<T>`.
+    let w_err = expect_err_kind(
+        r#"
+        watch<u32> w = 0;
+        task t1(*watch<u32> pw) { loop { pw.publish(1); delay(5ms); } }
+        task t2(*watch<u32> pw) { loop { pw.publish(2); delay(5ms); } }
+        fn main() {
+            spawn t1(&w) @normal;
+            spawn t2(&w) @normal;
+        }
+        "#,
+        DiagnosticKind::GlobalIsolationViolation,
+    );
+    let note_txt = w_err[0].note.as_deref().unwrap_or("");
+    assert!(
+        note_txt.contains("inbox") && note_txt.contains("guarded<T>"),
+        "expected E0002 watch note to mention inbox and guarded<T>, got: {note_txt}"
+    );
 
     // 8. Negative (`E0033`): escaping ISR `state` pointer via `guarded<*u32>.set(&x)` in `critical`.
     expect_err_kind(

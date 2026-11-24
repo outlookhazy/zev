@@ -498,6 +498,8 @@ pub(super) struct FnIrBuilder<'ctx, 'm> {
     pub(super) isr_state_ptrs: HashMap<VarId, String>,
     pub(super) ret_ty: MirType,
     pub(super) error_spec: MirErrorSpec,
+    pub(super) in_isr: bool,
+    pub(super) crit_depth: u32,
     pub(super) buf: String,
     pub(super) entry_allocas: String,
     pub(super) entry_alloca_insert_pos: Option<usize>,

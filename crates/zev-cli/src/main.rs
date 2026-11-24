@@ -3199,8 +3199,7 @@ task t_pool(*pool<u32, 1> p, *inbox<Lease<u32>, 1> rel_q, *signal rel_s, *guarde
 
 task t_pacer(*guarded<u32> dm) {
     loop {
-        u32 cur = 0u32;
-        critical { cur = dm.get(); }
+        u32 cur = dm.get();
         if (cur == 31u32) { break; }
         delay(1ms);
         critical { sys.nop(); }
@@ -3311,14 +3310,12 @@ task t_barrier_peer(u32 id, *sync.Barrier<3> b, *sync.Latch g, *guarded<u32> tri
 
 task t_pacer(*guarded<u32> dm, *guarded<u32> trips) {
     loop {
-        u32 cur = 0u32;
-        critical { cur = dm.get(); }
+        u32 cur = dm.get();
         if (cur == 31u32) { break; }
         delay(1ms);
         critical { sys.nop(); }
     }
-    u32 tr = 0u32;
-    critical { tr = trips.get(); }
+    u32 tr = trips.get();
     assert(tr == 5u32);
     println("std_sync_fuzz_ok");
     sys.exit(0);
@@ -4858,10 +4855,7 @@ task con(io.DuplexStream port) {
         for (usize i in 0..n) {
             u8 b = chunk[i];
             if (b == 10u8) {
-                u32 hits = 0u32;
-                critical {
-                    hits = idle_hits.get();
-                }
+                u32 hits = idle_hits.get();
                 bool saw_idle = hits > 0u32;
                 println(f\"reply len={len} idle={saw_idle}\");
                 io.stream_write(&port, \"ok\\n\");
@@ -6241,6 +6235,121 @@ fn main() {
         .unwrap();
         assert!(
             qres.stdout.contains("PR22_CORPUS_ALL_OK"),
+            "qemu stdout={:?}",
+            qres.stdout
+        );
+    }
+
+    #[test]
+    fn pr23_guarded_unlocked_multiword_snapshot_host_fuzz_and_qemu() {
+        let temp = TempWorkDir::create("pr23_guarded_read").unwrap();
+        let app_path = temp.dir.join("app.zev");
+        let src = r#"
+import board;
+
+struct Pair {
+    u32 a;
+    u32 b;
+}
+
+guarded<Pair> shared_pair = Pair { a: 1u32, b: ~1u32 };
+guarded<Pair> task_pair = Pair { a: 10u32, b: ~10u32 };
+irq IRQ_BUMP = 1;
+
+isr bump_isr(*guarded<Pair> p) {
+    Pair cur = p.get();
+    assert(cur.b == ~cur.a);
+    u32 na = cur.a + 1u32;
+    critical {
+        p.set(Pair { a: na, b: ~na });
+    }
+}
+
+task updater(*guarded<Pair> p, *guarded<Pair> tp) {
+    for (u32 i in 0..8) {
+        critical {
+            Pair cur = p.get();
+            u32 na = cur.a + 1u32;
+            p.set(Pair { a: na, b: ~na });
+            Pair tcur = tp.get();
+            u32 tna = tcur.a + 1u32;
+            tp.set(Pair { a: tna, b: ~tna });
+        }
+        delay(1ms);
+    }
+    loop { delay(20ms); }
+}
+
+task reader(*guarded<Pair> p, *guarded<Pair> tp) {
+    loop {
+        Pair s = p.get();
+        assert(s.b == ~s.a);
+        Pair ts = tp.get();
+        assert(ts.b == ~ts.a);
+        if (s.a >= 9u32 && ts.a >= 18u32) {
+            println(f"PR23_GUARDED_READ_OK a={s.a} ta={ts.a}");
+            sys.exit(0);
+        }
+        delay(1ms);
+    }
+}
+
+fn main() {
+    board.init();
+    IRQ_BUMP.attach(bump_isr(&shared_pair));
+    sys.fuzz_irqs(0xCAFE_1234u32, 1u32 << 1);
+    spawn updater(&shared_pair, &task_pair) @high;
+    spawn reader(&shared_pair, &task_pair) @normal;
+    sys.pend_irq(1u32);
+}
+"#;
+        std::fs::write(&app_path, src).unwrap();
+
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+        let out = std::process::Command::new(&host_bin).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "host failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            stdout.contains("PR23_GUARDED_READ_OK"),
+            "host stdout={stdout:?}"
+        );
+
+        let qemu_opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            std::slice::from_ref(&temp.dir),
+            qemu_opts.hal_dir.as_deref(),
+            qemu_opts.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("pr23_guarded_read.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts).unwrap();
+        let qres = zev_codegen_llvm::run_elf_in_qemu(
+            &qemu_build.elf_path,
+            &zev_codegen_llvm::QemuRunOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            qres.stdout.contains("PR23_GUARDED_READ_OK"),
             "qemu stdout={:?}",
             qres.stdout
         );

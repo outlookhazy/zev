@@ -15,6 +15,8 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
             isr_state_ptrs: HashMap::new(),
             ret_ty: ret_ty.clone(),
             error_spec: error_spec.clone(),
+            in_isr: false,
+            crit_depth: 0,
             buf: String::with_capacity(4096),
             entry_allocas: String::new(),
             entry_alloca_insert_pos: None,
@@ -2597,12 +2599,14 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 self.emit_line(format!("store i8 {value}, ptr @{sym}, align 1"));
             }
             MirStmt::EnterCritical => {
+                self.crit_depth += 1;
                 let call_kw = self.call_kw();
                 let pm = self.next_tmp();
                 self.emit_line(format!("{pm} = {call_kw} i32 @__syn_crit_enter()"));
                 self.emit_line(format!("store i32 {pm}, ptr %__crit_pm, align 4"));
             }
             MirStmt::ExitCritical => {
+                self.crit_depth = self.crit_depth.saturating_sub(1);
                 let call_kw = self.call_kw();
                 let pm = self.next_tmp();
                 self.emit_line(format!("{pm} = load i32, ptr %__crit_pm, align 4"));
@@ -3544,7 +3548,20 @@ impl<'ctx, 'm> FnIrBuilder<'ctx, 'm> {
                 let gptr = self.resolve_prim_ptr(target)?;
                 let ety = self.ctx.llvm_ty(elem_ty);
                 let vv = self.emit_expr(value)?;
-                let vc = self.coerce(vv, &ety, !value.ty.is_unsigned());
+                let mut vc = self.coerce(vv, &ety, !value.ty.is_unsigned());
+                if let MirType::EndianInt {
+                    bits,
+                    big_endian: true,
+                    ..
+                } = elem_ty
+                {
+                    let sw = self.next_tmp();
+                    self.emit_line(format!(
+                        "{sw} = call i{bits} @llvm.bswap.i{bits}(i{bits} {})",
+                        vc.repr
+                    ));
+                    vc = SsaVal::new(ety.clone(), sw);
+                }
                 let vp = self.next_tmp();
                 self.emit_line(format!(
                     "{vp} = getelementptr inbounds {pty}, ptr {gptr}, i32 0, i32 0"

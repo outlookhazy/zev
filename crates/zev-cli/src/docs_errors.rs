@@ -481,7 +481,7 @@ fn main() {
         code: "E0002",
         summary: "Task, ISR, or function violates global isolation, `watch<T>` single-writer, or `byte_ring` SPSC exclusivity",
         topic: "primitives",
-        why: "Hardware ISRs can preempt any cooperative task between instructions unless interrupts are masked, and raw shared variables have no wakeup discipline. Replacing raw shared globals with `watch<T>` (single-writer latest value), `guarded<T>` (multi-writer inside `critical { ... }`), or `inbox<Ev, N>` (MPSC event queue with optional `boost: @critical`) makes cross-context dataflow atomic and race-free.",
+        why: "Hardware ISRs can preempt any cooperative task between instructions unless interrupts are masked, and raw shared variables have no wakeup discipline. Replacing raw shared globals with `watch<T>` (single-writer latest value), `guarded<T>` (`.set()` in `critical { ... }`, `.get()` anywhere), or `inbox<Ev, N>` (MPSC event queue with optional `boost: @critical`) makes cross-context dataflow atomic and race-free.",
         bad_zev: "\
 bool overcurrent_latched = false;
 

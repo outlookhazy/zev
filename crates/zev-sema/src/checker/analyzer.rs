@@ -3780,7 +3780,7 @@ impl Analyzer {
                         )
                         .with_file(extra.file.clone())
                         .with_note(format!(
-                            "first writer '{}' called `publish` at {}; `watch<T>` is strictly single-writer — use `guarded<T>` inside `critical {{ ... }}` (paired with `wait_queue` if blocking wait is needed) or `inbox<T, N>` for multi-writer communication",
+                            "first writer '{}' called `publish` at {}; `watch<T>` is strictly single-writer — send updates to the owning task via an `inbox<T, N>` (which then publishes), or use `guarded<T>` with `.set(...)` in `critical {{ ... }}` (and `wait_queue` if blocking wait is needed)",
                             first.actor_desc, first.span
                         )),
                     );
@@ -3803,7 +3803,7 @@ impl Analyzer {
                         )
                         .with_file(extra.file.clone())
                         .with_note(format!(
-                            "ISR writer '{}' calls `publish` at {}; `watch<T>` is strictly single-writer — use `guarded<T>` inside `critical {{ ... }}` or publish before `irq.attach(...)`",
+                            "ISR writer '{}' calls `publish` at {}; `watch<T>` is strictly single-writer — send updates to a single owning task via `inbox<T, N>`, use `guarded<T>` (with `.set(...)` in `critical {{ ... }}`), or publish before `irq.attach(...)`",
                             isr_writer.actor_desc, isr_writer.span
                         )),
                     );
