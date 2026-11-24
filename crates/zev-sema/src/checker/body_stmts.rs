@@ -1508,11 +1508,27 @@ impl<'a> BodyChecker<'a> {
                             .is_some_and(|c| c.int_value == Some(0)),
                         _ => false,
                     };
+                    let const_ticks = match &period.kind {
+                        ExprKind::Literal(Literal::Int(v)) => Some(*v),
+                        ExprKind::Ident(id) => {
+                            self.sema.consts.get(&id.name).and_then(|c| c.int_value)
+                        }
+                        _ => None,
+                    };
                     if is_zero {
                         self.sema.emit(Diagnostic::new(
                             DiagnosticKind::InvalidDurationResolution,
                             period.span,
                             "periodic 'loop every' interval must be greater than 0",
+                        ));
+                    } else if const_ticks.is_some_and(|t| t > zev_ast::MAX_DURATION_TICKS) {
+                        self.sema.emit(Diagnostic::new(
+                            DiagnosticKind::InvalidDurationResolution,
+                            period.span,
+                            format!(
+                                "periodic 'loop every' interval exceeds the scheduler deadline horizon of {} ticks",
+                                zev_ast::MAX_DURATION_TICKS
+                            ),
                         ));
                     }
                 } else if pv.ty != Ty::Duration && !pv.ty.is_error() {

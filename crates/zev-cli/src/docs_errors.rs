@@ -738,9 +738,9 @@ fn main() {
     },
     ErrorDoc {
         code: "E0013",
-        summary: "Duration literal or period is zero, sub-tick (truncates to 0), or not an exact tick multiple",
+        summary: "Duration literal or period is zero, sub-tick (truncates to 0), not an exact tick multiple, or past the deadline horizon",
         topic: "tasks",
-        why: "The cooperative scheduler's default tick period is `1ms` (`1000us`). Writing `loop every 500us` on a `1ms` tick (or `loop every 0`) would silently truncate to `0` ticks or drift by 50%. Use `>= 1ms` multiples of the tick period (or sub-millisecond hardware timers/ISRs for microsecond waveforms).",
+        why: "The cooperative scheduler's default tick period is `1ms` (`1000us`). Writing `loop every 500us` on a `1ms` tick (or `loop every 0`) would silently truncate to `0` ticks or drift by 50%. Use `>= 1ms` multiples of the tick period (or sub-millisecond hardware timers/ISRs for microsecond waveforms). Deadlines are 32-bit tick counts compared with wrap-safe signed arithmetic, so a single duration is also capped at `2147483647` ticks (about 24.8 days at `1ms`); a longer wait would look already expired and fire immediately, so count shorter waits in a loop instead.",
         bad_zev: "\
 task fast_poll() {
     loop every 500us {

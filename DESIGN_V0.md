@@ -40,7 +40,7 @@ Where traditional embedded C relies on Duff's-device protothreads, manual state 
   2. **Soft-Yielding / Shareable:** Terminating compute/polling functions containing `checkpoint()` or unguarded `while (cond)` loops:
      - In normal cooperative `task` flow, compiles as a nested coroutine (`union`-packed child frame) so background compute shares the CPU smoothly.
      - Inside `noyield { ... }`, **auto-specializes a direct stack-only clone** (`{fn}__noyield`, `0 B` `.bss`, checkpoints stripped to no-ops) so the same library function runs in CPU registers without source duplication.
-     - Remains **statically forbidden** inside `critical { ... }`, `isr` handlers, `defer`, and `extern "C"` callbacks (`E0003`) so long compute or polling routines cannot stretch hardware interrupt-masked latency.
+     - Remains **statically forbidden** inside `critical { ... }` (`E0004`), `isr` handlers (`E0005`), `defer` (`E0003`), and `extern "C"` callbacks (`E0006`) so long compute or polling routines cannot stretch hardware interrupt-masked latency.
   3. **Hard-Blocking:** Awaits external time or events (`delay`, `wait { ... }`, `inbox.recv`/`send`, `watch.wait_change`, `signal.wait`, `ping_pong.wait_chunk`, `byte_ring.wait_read`, `pool.alloc`, `wait_queue.commit_wait`, `loop every`, or non-terminating `loop`); legal only in cooperative `task` flow (and sequential `main()`).
 - **Per-Task Non-Yielding Run Classification & Dual-Specialization Visibility:** `zevc ram` and `zevc check --json` report both `dual_specialized_functions` and per-task worst-case non-yielding run bounds (`max_run_kind`: `straight-line`, `bounded-for`, or `noyield-spin`, plus `max_run_blocks`) computed over intra-step MIR control-flow graphs and folded `Direct`/`Coroutine` callees.
 - **Explicit Atomicity Escape Hatches:**
@@ -121,7 +121,7 @@ Where traditional embedded C relies on Duff's-device protothreads, manual state 
     - `error BadCrc;` — typed `enum` failure (error enums contain only error variants, no `Ok`).
     - `error Timeout, bytes_read;` — typed failure *plus* partial progress value.
   - **Lowering ABI:** `NonYielding` (`Direct`) functions return LLVM `{ OkTy, i32 }` by value; yielding `Coroutine` functions return `i32` step status (`0` Done, `1` Blocked, `2` More) and write `{ OkTy, i32 }` into the static coroutine frame's `_ret` slot.
-  - Callers handle failure via `or <fallback>` or `catch ([ErrType err [, ValType partial]]) { ... }` (`E0012` rejects unhandled fallible calls).
+  - Callers handle failure via `or <fallback>` or `catch ([ErrType err [, ValType partial]]) { ... }` (`E0016` rejects unhandled fallible calls).
 - **Zero-Heap Streamable `f"..."` Formatting:**
   - **Compile-Time Unpacked Sink Writes & Static Fit Proof:** `f"..."` unpacks at compile time into chunk writes across `print`, `println`, `fmt_buf(dst, f"...") -> []u8 error FmtErr`, and `fmt_ring(tx, f"..." [, boost: @prio]) -> usize error FmtErr`, proving worst-case buffer fit at compile time (`E0028`) when all holes have statically bounded widths and returning `error Truncated, clamped_slice;` / `error Truncated, written_bytes;` when runtime slices exceed capacity.
   - **Call-Site Tiered Float Formatting:** `{temp}` / `{temp:.2}` calls a compact fixed-decimal converter while `{val:e}` calls a scientific float converter, allowing `ld.lld --gc-sections` to strip unused float formatting paths.
@@ -196,7 +196,7 @@ flowchart LR
 ## 5. Edge-Case & Systems Rules
 
 1. **Pointers & Slices Across Yields (Zero Lifetime Syntax):**
-   Whole-program scope-depth and lease-origin inference tracks temporary pointers and slices automatically. Local wrapper structs (e.g., `ByteReader` holding a DMA slice) work without `'a` annotations, while escaping a reference to an outer scope (`depth(dest) < depth(origin)`, `E0007`–`E0010`) or reading a leased DMA/ring slice past its next mutation (`E0011`) is a compile-time error.
+   Whole-program scope-depth and lease-origin inference tracks temporary pointers and slices automatically. Local wrapper structs (e.g., `ByteReader` holding a DMA slice) work without `'a` annotations, while escaping a reference to an outer scope (`depth(dest) < depth(origin)`, `E0008`–`E0010`) or reading a leased DMA/ring slice past its next mutation (`E0011`) is a compile-time error.
 2. **Task Lifecycle & Operating Modes (No External Task Killing):**
    There is no external `kill`/`stop` API that could abort a task mid-hardware-transaction. Tasks are permanent subsystem actors (`restart;` resets a task cleanly to entry; dormant tasks park on `inbox`/`signal`/`wait` at zero CPU cost), while mutually exclusive finite workflows (e.g., Calibration vs. DFU) are ordinary yielding `fn`s whose static local frames `union`-overlap automatically.
 3. **Timebase, Console Hooks & Automatic Sleep Locks:**
@@ -204,7 +204,7 @@ flowchart LR
 4. **Single-Core v0 Scheduler (`@core(N)` Reserved):**
    In v0, the cooperative scheduler executes all spawned tasks on a single core; `@core(N)` is parsed and preserved as spawn metadata in MIR/`zevc ram` for future multi-core targets.
 5. **C Interop (`extern "C"`):**
-   External C functions are implicitly `noyield`. Any function callback passed *into* C is statically enforced as `NonYielding` (`E0004`) so a stackless yield can never unwind through active C stack frames on the shared hardware stack.
+   External C functions are implicitly `noyield`. Any function callback passed *into* C is statically enforced as `NonYielding` (`E0006`) so a stackless yield can never unwind through active C stack frames on the shared hardware stack.
 
 ---
 

@@ -435,6 +435,31 @@ task w() {
 fn main() { spawn w() @normal; }
 "#;
 
+    e0013_delay_past_i32_tick_deadline_horizon_rejected(expect_err, DiagnosticKind::InvalidDurationResolution) => r#"
+task w() {
+    loop { delay(2147484s); }
+}
+fn main() { spawn w() @normal; }
+"#;
+
+    e0013_wait_timeout_past_u32_tick_range_rejected(expect_err, DiagnosticKind::InvalidDurationResolution) => r#"
+signal s;
+task w() {
+    loop {
+        s.wait(timeout: 5000000s) catch { continue; };
+    }
+}
+fn main() { spawn w() @normal; }
+"#;
+
+    e0013_const_loop_every_period_past_deadline_horizon_rejected(expect_err, DiagnosticKind::InvalidDurationResolution) => r#"
+const u32 PERIOD = 3000000000;
+task w() {
+    loop every PERIOD { checkpoint(); }
+}
+fn main() { spawn w() @normal; }
+"#;
+
     // ── E0014: ReturnMismatch ────────────────────────────────────────────────
     e0014_missing_return_on_else_branch_rejected(expect_err, DiagnosticKind::ReturnMismatch) => r#"
 u32 missing_else(bool c) {
@@ -1035,6 +1060,24 @@ fn bad_catch() {
 }
 fn main() { bad_catch(); }
 "#;
+}
+
+// ── `E0013` Deadline-Horizon Boundary (largest accepted durations) ──────────
+
+#[test]
+fn e0013_durations_at_the_i32_tick_deadline_horizon_accepted() {
+    expect_ok(
+        r#"
+const u32 PERIOD = 2147483647;
+task w() {
+    loop { delay(2147483647ms); }
+}
+task p() {
+    loop every PERIOD { checkpoint(); }
+}
+fn main() { spawn w() @normal; spawn p() @normal; }
+"#,
+    );
 }
 
 // ── Multi-File `E0030` Visibility & Forged Canonical Name Tests ─────────────

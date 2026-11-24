@@ -2885,7 +2885,9 @@ impl<'a> Monomorphizer<'a> {
                         return (lit_expr, ity);
                     }
                 }
-                if self.fn_templates.contains_key(&id.name) {
+                // Likewise a local shadows a same-named generic `fn` template, so only a bare
+                // reference that actually resolves to the template is an `E0029`.
+                if !scopes_contain(scopes, &id.name) && self.fn_templates.contains_key(&id.name) {
                     self.emit(
                         &env.file,
                         Diagnostic::new(
@@ -3764,8 +3766,9 @@ impl<'a> Monomorphizer<'a> {
         }
 
         // Extract target generic function name (`clamp(...)` or `mod::clamp::<f32>(...)`).
+        // A local (e.g. a `fn(...)` pointer) shadowing a generic template is an indirect call.
         let direct_fn_ident: Option<Ident> = match &callee.kind {
-            ExprKind::Ident(id) => Some(id.clone()),
+            ExprKind::Ident(id) if !scopes_contain(scopes, &id.name) => Some(id.clone()),
             ExprKind::Field { target, field } => {
                 if let ExprKind::Ident(base_id) = &target.kind {
                     if matches!(self.lookup_scope_ty(&base_id.name, env, scopes), InferTy::Unknown)

@@ -2160,6 +2160,26 @@ impl Analyzer {
             );
             return;
         }
+        let max_us = zev_ast::MAX_DURATION_TICKS.saturating_mul(self.tick_period_us);
+        if us > max_us {
+            self.emit(
+                Diagnostic::new(
+                    DiagnosticKind::InvalidDurationResolution,
+                    dur.span,
+                    format!(
+                        "duration '{}' exceeds the scheduler deadline horizon of {} ticks ({}s at the configured {}us tick)",
+                        dur,
+                        zev_ast::MAX_DURATION_TICKS,
+                        max_us / 1_000_000,
+                        self.tick_period_us
+                    ),
+                )
+                .with_note(
+                    "deadlines are 32-bit tick counts compared with wrap-safe signed arithmetic, so a longer wait would appear already expired and fire immediately; count shorter waits in a loop instead (e.g. `for (u32 day in 0..30) { delay(86400s); }`)",
+                ),
+            );
+            return;
+        }
         if us < self.tick_period_us {
             self.emit(
                 Diagnostic::new(
