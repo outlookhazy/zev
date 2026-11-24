@@ -112,6 +112,7 @@ pub(super) struct ModuleCtx<'a> {
     pub(super) rt_features: RuntimeIrFeatures,
     pub(super) hooks: ResolvedSysHooks,
     pub(super) rom_wrappers: BTreeSet<RomWrapperSpec>,
+    pub(super) seq_eq_elem_tys: BTreeSet<String>,
     pub(super) strings: Vec<String>,
     pub(super) string_dedup: HashMap<String, usize>,
     pub(super) const_blobs: Vec<String>,
@@ -303,6 +304,8 @@ pub fn emit_llvm_ir_with_options(
     module: &MirModule,
     opts: &CodegenOptions,
 ) -> Result<String, CodegenError> {
+    zev_mir::verify_yielding_fn_addr_candidates(module)
+        .map_err(|e| CodegenError::new("internal", e.message))?;
     let spec = opts.effective_spec()?;
     let nvic = if spec.isa == CpuIsa::ArmCortexM {
         build_nvic_map(&module.irq_vectors, &spec)?
@@ -354,6 +357,7 @@ pub fn emit_llvm_ir_with_options(
         rt_features,
         hooks: ResolvedSysHooks::default(),
         rom_wrappers: BTreeSet::new(),
+        seq_eq_elem_tys: BTreeSet::new(),
         strings: Vec::new(),
         string_dedup: HashMap::new(),
         const_blobs: Vec::new(),
@@ -415,9 +419,10 @@ pub fn emit_llvm_ir_with_options(
     // 5. Coroutine frame struct types + static task/boot frame globals
     ctx.emit_coroutine_frame_globals_ir(&mut out);
 
-    // 6. Struct `FromBytes` helpers + on-demand `formatted_enums` `.rodata` lookup helpers
+    // 6. Struct `FromBytes` helpers + on-demand `formatted_enums` `.rodata` + sequence compare helpers
     ctx.emit_from_bytes_helpers_ir(&mut out);
     ctx.emit_formatted_enum_names_ir(&mut out);
+    ctx.emit_seq_eq_helpers_ir(&mut out);
 
     // 7. `extern "C"` declarations + synthesized bare-metal `@syn_*` intrinsics
     ctx.emit_extern_fns_ir(&mut out);

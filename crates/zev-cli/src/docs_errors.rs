@@ -605,7 +605,7 @@ fn main() {
         topic: "yielding",
         why: "Zev tasks share a single hardware stack. If C code invokes a Zev callback while C stack frames are active on the stack, a stackless coroutine yield would unwind right through the active C frames. Callbacks passed to C must be strictly non-yielding.",
         bad_zev: "\
-extern \"C\" fn register_hook(fn() -> void cb);
+extern \"C\" fn register_hook(noyield fn() -> void cb);
 fn bad_hook() {
     checkpoint();
 }
@@ -613,7 +613,7 @@ fn main() {
     register_hook(bad_hook);
 }",
         good_zev: "\
-extern \"C\" fn register_hook(fn() -> void cb);
+extern \"C\" fn register_hook(noyield fn() -> void cb);
 signal hook_fired;
 
 fn fast_nonyielding_hook() {

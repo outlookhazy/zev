@@ -108,6 +108,37 @@ pub(super) fn resolve_irq_token_be<B: LowerBackend>(expr: &Expr, be: &B) -> Opti
     }
 }
 
+pub(super) fn lower_fn_addr_expr(
+    fn_name: &str,
+    sig: &FnSig,
+    expected: Option<&MirType>,
+    syms: &ModuleSymbols,
+) -> MirExpr {
+    let is_noyield_target = match expected {
+        Some(MirType::FnPtr { is_noyield, .. }) => *is_noyield,
+        Some(MirType::Ptr(inner)) if inner.is_void() => true,
+        _ => sig.is_extern_c,
+    };
+    let sig_key = canonical_mir_fnptr_sig(&sig.params, &sig.ret_ty, &sig.error_spec);
+    if is_noyield_target {
+        syms.record_lowered_noyield_candidate(sig_key, fn_name.to_string());
+    } else {
+        syms.record_lowered_plain_candidate(sig_key, fn_name.to_string());
+    }
+    let target = if sig.effect == MirFnEffect::SoftYielding && is_noyield_target {
+        format!("{fn_name}__noyield")
+    } else {
+        fn_name.to_string()
+    };
+    let out_ty = expected.cloned().unwrap_or_else(|| MirType::FnPtr {
+        is_noyield: is_noyield_target,
+        params: sig.params.clone(),
+        ret: Box::new(sig.ret_ty.clone()),
+        error_spec: Box::new(sig.error_spec.clone()),
+    });
+    MirExpr::new(MirExprKind::FnAddr(target), out_ty)
+}
+
 pub(super) fn lookup_mmio_reg<'s>(
     syms: &'s ModuleSymbols,
     layout_name: &str,
@@ -1004,6 +1035,22 @@ pub(super) fn coerce_expr_be<B: LowerBackend>(
     if &expr.ty == target_ty || target_ty.is_void() {
         return expr;
     }
+    if let (
+        MirType::FnPtr {
+            is_noyield: true,
+            params,
+            ret,
+            error_spec,
+        },
+        MirType::FnPtr {
+            is_noyield: false, ..
+        },
+    ) = (&expr.ty, target_ty)
+    {
+        be.syms()
+            .record_lowered_noyield_widening(canonical_mir_fnptr_sig(params, ret, error_spec));
+        return MirExpr::new(expr.kind, target_ty.clone());
+    }
     match (&expr.ty, target_ty) {
         (MirType::Array { elem, len }, MirType::Slice(dst_elem)) => {
             let elem = *elem.clone();
@@ -1288,6 +1335,20 @@ fn unify_array_mir_types(lhs: &MirType, rhs: &MirType) -> MirType {
         {
             MirType::F64
         }
+        (
+            MirType::FnPtr {
+                is_noyield: a,
+                params,
+                ret,
+                error_spec,
+            },
+            MirType::FnPtr { is_noyield: b, .. },
+        ) => MirType::FnPtr {
+            is_noyield: *a && *b,
+            params: params.clone(),
+            ret: ret.clone(),
+            error_spec: error_spec.clone(),
+        },
         _ => lhs.host_value_type(),
     }
 }
@@ -1425,15 +1486,7 @@ pub(super) fn lower_leaf_expr(
                 ));
             }
             if let Some(sig) = syms.fns.get(&id.name) {
-                let target = if sig.effect == MirFnEffect::SoftYielding {
-                    format!("{}__noyield", id.name)
-                } else {
-                    id.name.clone()
-                };
-                return Ok(MirExpr::new(
-                    MirExprKind::FnAddr(target),
-                    expected.cloned().unwrap_or(MirType::Usize),
-                ));
+                return Ok(lower_fn_addr_expr(&id.name, sig, expected, syms));
             }
             Err(MirLowerError {
                 message: format!("unresolved identifier `{}`", id.name),
@@ -1478,15 +1531,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                         ));
                     }
                     if let Some(sig) = be.syms().fns.get(&id.name) {
-                        let target = if sig.effect == MirFnEffect::SoftYielding {
-                            format!("{}__noyield", id.name)
-                        } else {
-                            id.name.clone()
-                        };
-                        return Ok(MirExpr::new(
-                            MirExprKind::FnAddr(target),
-                            expected.cloned().unwrap_or(MirType::Usize),
-                        ));
+                        return Ok(lower_fn_addr_expr(&id.name, sig, expected, be.syms()));
                     }
                 }
             } else if let Some(inst_name) =
@@ -1546,9 +1591,12 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             let op_expected = if is_cmp_or_logic { None } else { expected };
             let lhs_untyped_int_arr = is_eq_ne && is_pure_untyped_int_array_ast(lhs);
             let rhs_untyped_int_arr = is_eq_ne && is_pure_untyped_int_array_ast(rhs);
+            let lhs_bare_fn = is_eq_ne && ast_is_bare_fn_ref_be(lhs, be);
+            let rhs_bare_fn = is_eq_ne && ast_is_bare_fn_ref_be(rhs, be);
             let (l, r) = if !is_shift
                 && ((ast_is_untyped_int_lit(lhs) && !ast_is_untyped_int_lit(rhs))
-                    || (lhs_untyped_int_arr && !rhs_untyped_int_arr))
+                    || (lhs_untyped_int_arr && !rhs_untyped_int_arr)
+                    || (lhs_bare_fn && !rhs_bare_fn))
             {
                 let r = be.lower_sub(rhs, op_expected)?;
                 let lhs_exp = match &r.ty {
@@ -1587,9 +1635,17 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
         }
         ExprKind::Cast { expr: inner, ty } => {
             let target_ty = be.syms().resolve_type(ty);
-            let sub = be.lower_sub(inner, None)?;
+            let sub_exp = if matches!(target_ty, MirType::FnPtr { .. } | MirType::Ptr(_)) {
+                Some(&target_ty)
+            } else {
+                None
+            };
+            let sub = be.lower_sub(inner, sub_exp)?;
             if matches!(target_ty, MirType::PrimView(_)) {
                 return Ok(coerce_expr_if_needed(sub, &target_ty));
+            }
+            if matches!(target_ty, MirType::FnPtr { .. }) && sub.ty == target_ty {
+                return Ok(sub);
             }
             if matches!(&target_ty, MirType::Slice(elem) if **elem == MirType::U8)
                 && matches!(&sub.kind, MirExprKind::StringLit(_))
@@ -1945,6 +2001,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                 }
                 if let Some(vid) = be.scopes().lookup(&id.name) {
                     if let MirType::FnPtr {
+                        is_noyield,
                         params,
                         ret,
                         error_spec,
@@ -1953,6 +2010,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                         let fp_expr = MirExpr::new(
                             MirExprKind::Var(vid),
                             MirType::FnPtr {
+                                is_noyield,
                                 params: params.clone(),
                                 ret: ret.clone(),
                                 error_spec: error_spec.clone(),
@@ -1960,6 +2018,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                         );
                         return lower_indirect_fnptr_call_be(
                             fp_expr,
+                            is_noyield,
                             &params,
                             *ret,
                             &error_spec,
@@ -1970,6 +2029,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                 }
                 if let Some(cty) = be.syms().consts.get(&id.name).cloned() {
                     if let MirType::FnPtr {
+                        is_noyield,
                         params,
                         ret,
                         error_spec,
@@ -1978,6 +2038,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                         let fp_expr = MirExpr::new(MirExprKind::ConstRef(id.name.clone()), cty);
                         return lower_indirect_fnptr_call_be(
                             fp_expr,
+                            is_noyield,
                             &params,
                             *ret,
                             &error_spec,
@@ -2000,12 +2061,21 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
             }
             if let Ok(ce) = be.lower_sub(callee, None) {
                 if let MirType::FnPtr {
+                    is_noyield,
                     params,
                     ret,
                     error_spec,
                 } = ce.ty.clone()
                 {
-                    return lower_indirect_fnptr_call_be(ce, &params, *ret, &error_spec, args, be);
+                    return lower_indirect_fnptr_call_be(
+                        ce,
+                        is_noyield,
+                        &params,
+                        *ret,
+                        &error_spec,
+                        args,
+                        be,
+                    );
                 }
             }
             Err(MirLowerError {
@@ -2129,6 +2199,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                             .map(|f| (f.ty.clone(), st.packed))
                     }) {
                         if let MirType::FnPtr {
+                            is_noyield,
                             params,
                             ret,
                             error_spec,
@@ -2147,6 +2218,7 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
                             );
                             return lower_indirect_fnptr_call_be(
                                 fp_expr,
+                                is_noyield,
                                 &params,
                                 *ret,
                                 &error_spec,
@@ -2166,14 +2238,54 @@ pub(super) fn lower_common_expr<B: LowerBackend>(
     }
 }
 
+fn ast_is_bare_fn_ref_be<B: LowerBackend>(expr: &Expr, be: &B) -> bool {
+    let check_id = |id: &Ident| -> bool {
+        be.scopes().lookup(&id.name).is_none()
+            && !be.syms().consts.contains_key(&id.name)
+            && !be.syms().primitives.contains_key(&id.name)
+            && !be.syms().subsystems.contains_key(&id.name)
+            && !be.syms().mmio_instances.contains_key(&id.name)
+            && !be.syms().irqs.contains_key(&id.name)
+            && !be.syms().enums.contains_key(&id.name)
+            && be.syms().fns.contains_key(&id.name)
+    };
+    match &expr.kind {
+        ExprKind::Ident(id) => check_id(id),
+        ExprKind::Unary {
+            op: UnaryOp::AddrOf,
+            expr: inner,
+        } => matches!(&inner.kind, ExprKind::Ident(id) if check_id(id)),
+        _ => false,
+    }
+}
+
 pub(super) fn lower_indirect_fnptr_call_be<B: LowerBackend>(
     fp_expr: MirExpr,
+    is_noyield: bool,
     params: &[MirType],
     ret: MirType,
     error_spec: &MirErrorSpec,
     args: &[CallArg],
     be: &mut B,
 ) -> Result<MirExpr, MirLowerError> {
+    if !is_noyield && !be.in_noyield() {
+        let sig_key = canonical_mir_fnptr_sig(params, &ret, error_spec);
+        let has_yielding = be
+            .syms()
+            .plain_direct_candidates
+            .get(&sig_key)
+            .is_some_and(|cands| {
+                cands
+                    .iter()
+                    .any(|c| be.syms().fns.get(c).is_some_and(|s| s.is_yielding))
+            });
+        if has_yielding {
+            return Err(MirLowerError {
+                message: "yielding function-pointer calls in `fn main()` must appear after all `spawn` / `.attach` boot statements".to_string(),
+                span: args.first().map(|a| a.span).unwrap_or_else(Span::dummy),
+            });
+        }
+    }
     let fp_tmp = be.alloc_temp_be("fnptr_call", fp_expr.ty.clone());
     be.emit_stmt_be(MirStmt::Assign {
         target: MirPlace::Var(fp_tmp),
@@ -3576,8 +3688,38 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                         }
                         _ => {}
                     }
+                    let ny_fn_ty = |params: Vec<MirType>, ret: MirType| MirType::FnPtr {
+                        is_noyield: true,
+                        params,
+                        ret: Box::new(ret),
+                        error_spec: Box::new(MirErrorSpec::None),
+                    };
                     let mut largs = Vec::new();
                     for (idx, a) in args.iter().enumerate() {
+                        let dyn_exp = match (sys_method, idx) {
+                            (Some(SysMethod::SetPutc), 0) => {
+                                Some(ny_fn_ty(vec![MirType::U8], MirType::Void))
+                            }
+                            (Some(SysMethod::SetClockMs), 0) => {
+                                Some(ny_fn_ty(Vec::new(), MirType::U32))
+                            }
+                            (Some(SysMethod::SetExit), 0) => {
+                                Some(ny_fn_ty(vec![MirType::I32], MirType::Void))
+                            }
+                            (Some(SysMethod::SetFaultHandler), 0) => {
+                                Some(ny_fn_ty(Vec::new(), MirType::Void))
+                            }
+                            (Some(SysMethod::SetIdle), 0) => {
+                                Some(ny_fn_ty(vec![MirType::U32, MirType::U32], MirType::Void))
+                            }
+                            (Some(SysMethod::SetIrqRouter), 0) => {
+                                Some(ny_fn_ty(vec![MirType::U32, MirType::U32], MirType::Void))
+                            }
+                            (Some(SysMethod::SetIrqRouter), 1) => {
+                                Some(ny_fn_ty(vec![MirType::U32], MirType::Void))
+                            }
+                            _ => None,
+                        };
                         let exp = match (sys_method, idx) {
                             (Some(SysMethod::Log | SysMethod::LogKv | SysMethod::LogHex), 0) => {
                                 Some(&MirType::Str)
@@ -3589,7 +3731,7 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             | (Some(SysMethod::PendIrq), 0)
                             | (Some(SysMethod::FuzzIrqs), 0 | 1)
                             | (Some(SysMethod::TickBy), 0) => Some(&MirType::U32),
-                            _ => None,
+                            _ => dyn_exp.as_ref(),
                         };
                         let lowered = be.lower_sub(&a.value, exp)?;
                         let coerced = if let Some(ety) = exp {
@@ -4207,7 +4349,8 @@ pub(super) fn user_sink_chunk_scratch_needed(ch: &MirFmtChunk) -> usize {
         | MirFmtChunk::PaddedBytes { .. }
         | MirFmtChunk::PaddedStr { .. } => 0,
         MirFmtChunk::Bool(_) => 8,
-        MirFmtChunk::EnumName { .. } => 64,
+        MirFmtChunk::PaddedBool { .. } => 8,
+        MirFmtChunk::EnumName { .. } | MirFmtChunk::PaddedEnumName { .. } => 64,
         MirFmtChunk::Int { fmt, .. } => match fmt {
             MirIntFmt::Dec => 24,
             MirIntFmt::Hex { zero_pad_width, .. } => 16usize.max(usize::from(*zero_pad_width)),
@@ -4247,7 +4390,7 @@ pub(super) fn user_sink_scratch_cap(chunks: &[MirFmtChunk]) -> usize {
 
 pub(super) fn chunk_to_slice_or_scalar_be<B: LowerBackend>(
     ch: MirFmtChunk,
-    scratch: Option<(VarId, usize)>,
+    scratch: Option<(VarId, usize, VarId)>,
     be: &mut B,
 ) -> MirExpr {
     let slice_u8_ty = MirType::Slice(Box::new(MirType::U8));
@@ -4262,7 +4405,7 @@ pub(super) fn chunk_to_slice_or_scalar_be<B: LowerBackend>(
             }
         }
         scalar_ch => {
-            let (scratch_var, scratch_cap) =
+            let (scratch_var, scratch_cap, fmt_res_var) =
                 scratch.expect("scratch buffer allocated for scalar user-sink chunk");
             let buf_slice = MirExpr::new(
                 MirExprKind::ArrayToSlice {
@@ -4272,11 +4415,6 @@ pub(super) fn chunk_to_slice_or_scalar_be<B: LowerBackend>(
                 },
                 slice_u8_ty.clone(),
             );
-            let fmt_res_ty = MirType::Result {
-                ok: Box::new(slice_u8_ty.clone()),
-                err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
-            };
-            let fmt_res_var = be.alloc_temp_be("sink_fmt_res", fmt_res_ty);
             be.emit_stmt_be(MirStmt::FmtBuf {
                 dst_res: fmt_res_var,
                 buf: buf_slice,
@@ -4341,7 +4479,12 @@ pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
                 len: scratch_cap,
             },
         );
-        Some((sv, scratch_cap))
+        let fmt_res_ty = MirType::Result {
+            ok: Box::new(MirType::Slice(Box::new(MirType::U8))),
+            err: Some(Box::new(MirType::Enum("FmtErr".to_string()))),
+        };
+        let rv = be.alloc_temp_be("sink_fmt_res", fmt_res_ty);
+        Some((sv, scratch_cap, rv))
     } else {
         None
     };
@@ -4620,8 +4763,197 @@ pub(super) fn lower_user_sink_print_non_yielding_be<B: LowerBackend>(
                     be,
                 );
             }
-            MirFmtChunk::PaddedBytes { slice, pad } => {
-                let raw_slice = slice;
+            MirFmtChunk::PaddedBytes { slice, pad }
+            | MirFmtChunk::PaddedBool { value: slice, pad } => {
+                // Handled identically after optional bool formatting below.
+                let is_bool_pad = !matches!(&slice.ty, MirType::Slice(el) if **el == MirType::U8);
+                let raw_slice = if is_bool_pad {
+                    chunk_to_slice_or_scalar_be(MirFmtChunk::Bool(slice), scratch, be)
+                } else {
+                    slice
+                };
+                let s_var = be.alloc_temp_be("sink_pad_s", slice_u8_ty.clone());
+                be.emit_stmt_be(MirStmt::Assign {
+                    target: MirPlace::Var(s_var),
+                    op: MirAssignOp::Assign,
+                    value: raw_slice,
+                });
+                let slen = MirExpr::new(
+                    MirExprKind::SliceLen(Box::new(MirExpr::new(
+                        MirExprKind::Var(s_var),
+                        slice_u8_ty.clone(),
+                    ))),
+                    MirType::Usize,
+                );
+                let slen_var = be.alloc_temp_be("sink_pad_len", MirType::Usize);
+                be.emit_stmt_be(MirStmt::Assign {
+                    target: MirPlace::Var(slen_var),
+                    op: MirAssignOp::Assign,
+                    value: slen,
+                });
+                let w_lit =
+                    MirExpr::new(MirExprKind::IntLit(i128::from(pad.width)), MirType::Usize);
+                let rem_var = be.alloc_temp_be("sink_pad_rem", MirType::Usize);
+                be.emit_stmt_be(MirStmt::If {
+                    cond: MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Lt,
+                            lhs: Box::new(MirExpr::new(MirExprKind::Var(slen_var), MirType::Usize)),
+                            rhs: Box::new(w_lit.clone()),
+                        },
+                        MirType::Bool,
+                    ),
+                    then_body: vec![MirStmt::Assign {
+                        target: MirPlace::Var(rem_var),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Sub,
+                                lhs: Box::new(w_lit),
+                                rhs: Box::new(MirExpr::new(
+                                    MirExprKind::Var(slen_var),
+                                    MirType::Usize,
+                                )),
+                            },
+                            MirType::Usize,
+                        ),
+                    }],
+                    else_body: vec![MirStmt::Assign {
+                        target: MirPlace::Var(rem_var),
+                        op: MirAssignOp::Assign,
+                        value: MirExpr::new(MirExprKind::IntLit(0), MirType::Usize),
+                    }],
+                });
+                let emit_pad = |be: &mut B| {
+                    let fill_str = if pad.zero_pad {
+                        "0000000000000000"
+                    } else {
+                        "                "
+                    };
+                    let step_var = be.alloc_temp_be("sink_pad_step", MirType::Usize);
+                    let loop_cond_base = MirExpr::new(
+                        MirExprKind::Binary {
+                            op: MirBinOp::Gt,
+                            lhs: Box::new(MirExpr::new(MirExprKind::Var(rem_var), MirType::Usize)),
+                            rhs: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                        },
+                        MirType::Bool,
+                    );
+                    let loop_cond = if let Some(rv) = res_vid_opt {
+                        MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::LogicalAnd,
+                                lhs: Box::new(MirExpr::new(
+                                    MirExprKind::Unary {
+                                        op: MirUnaryOp::Not,
+                                        expr: Box::new(MirExpr::new(
+                                            MirExprKind::ResultIsErr(rv),
+                                            MirType::Bool,
+                                        )),
+                                    },
+                                    MirType::Bool,
+                                )),
+                                rhs: Box::new(loop_cond_base),
+                            },
+                            MirType::Bool,
+                        )
+                    } else {
+                        loop_cond_base
+                    };
+                    let mut pad_body = Vec::new();
+                    pad_body.push(MirStmt::If {
+                        cond: MirExpr::new(
+                            MirExprKind::Binary {
+                                op: MirBinOp::Gt,
+                                lhs: Box::new(MirExpr::new(
+                                    MirExprKind::Var(rem_var),
+                                    MirType::Usize,
+                                )),
+                                rhs: Box::new(MirExpr::new(
+                                    MirExprKind::IntLit(16),
+                                    MirType::Usize,
+                                )),
+                            },
+                            MirType::Bool,
+                        ),
+                        then_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(step_var),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(MirExprKind::IntLit(16), MirType::Usize),
+                        }],
+                        else_body: vec![MirStmt::Assign {
+                            target: MirPlace::Var(step_var),
+                            op: MirAssignOp::Assign,
+                            value: MirExpr::new(MirExprKind::Var(rem_var), MirType::Usize),
+                        }],
+                    });
+                    let pad_slice = MirExpr::new(
+                        MirExprKind::SubSlice {
+                            base: Box::new(MirExpr::new(
+                                MirExprKind::StringLit(fill_str.to_string()),
+                                slice_u8_ty.clone(),
+                            )),
+                            start: Box::new(MirExpr::new(MirExprKind::IntLit(0), MirType::Usize)),
+                            end: Box::new(MirExpr::new(MirExprKind::Var(step_var), MirType::Usize)),
+                            elem_ty: MirType::U8,
+                            base_is_array: false,
+                        },
+                        slice_u8_ty.clone(),
+                    );
+                    let wcall = MirExpr::new(
+                        MirExprKind::CallDirect {
+                            callee: target_callee.clone(),
+                            is_extern_c: sig.is_extern_c,
+                            args: vec![
+                                MirExpr::new(MirExprKind::Var(sink_ptr_var), sink_ptr_ty.clone()),
+                                pad_slice,
+                            ],
+                        },
+                        call_ret_ty.clone(),
+                    );
+                    if let Some(rv) = res_vid_opt {
+                        pad_body.push(MirStmt::Assign {
+                            target: MirPlace::Var(rv),
+                            op: MirAssignOp::Assign,
+                            value: wcall,
+                        });
+                    } else {
+                        pad_body.push(MirStmt::Expr(wcall));
+                    }
+                    pad_body.push(MirStmt::Assign {
+                        target: MirPlace::Var(rem_var),
+                        op: MirAssignOp::SubAssign,
+                        value: MirExpr::new(MirExprKind::Var(step_var), MirType::Usize),
+                    });
+                    be.emit_stmt_be(MirStmt::While {
+                        cond: loop_cond,
+                        body: pad_body,
+                    });
+                };
+                if pad.left_align {
+                    emit_slice_write(
+                        MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
+                        be,
+                    );
+                    emit_pad(be);
+                } else {
+                    emit_pad(be);
+                    emit_slice_write(
+                        MirExpr::new(MirExprKind::Var(s_var), slice_u8_ty.clone()),
+                        be,
+                    );
+                }
+            }
+            MirFmtChunk::PaddedEnumName {
+                enum_name,
+                value,
+                pad,
+            } => {
+                let raw_slice = chunk_to_slice_or_scalar_be(
+                    MirFmtChunk::EnumName { enum_name, value },
+                    scratch,
+                    be,
+                );
                 let s_var = be.alloc_temp_be("sink_pad_s", slice_u8_ty.clone());
                 be.emit_stmt_be(MirStmt::Assign {
                     target: MirPlace::Var(s_var),
@@ -5085,13 +5417,48 @@ pub(super) fn emit_fmt_value_be<B: LowerBackend>(
 
     match host_ty {
         MirType::Bool => {
-            chunks.push(MirFmtChunk::Bool(val));
+            if let FormatSpec::Padded {
+                align,
+                zero_pad,
+                width,
+                ..
+            } = spec
+            {
+                chunks.push(MirFmtChunk::PaddedBool {
+                    value: val,
+                    pad: MirPadSpec {
+                        left_align: align != Some(FormatAlign::Right),
+                        zero_pad: align.is_some() && zero_pad,
+                        width,
+                    },
+                });
+            } else {
+                chunks.push(MirFmtChunk::Bool(val));
+            }
         }
         MirType::Enum(ename) => {
-            chunks.push(MirFmtChunk::EnumName {
-                enum_name: ename,
-                value: val,
-            });
+            if let FormatSpec::Padded {
+                align,
+                zero_pad,
+                width,
+                ..
+            } = spec
+            {
+                chunks.push(MirFmtChunk::PaddedEnumName {
+                    enum_name: ename,
+                    value: val,
+                    pad: MirPadSpec {
+                        left_align: align != Some(FormatAlign::Right),
+                        zero_pad: align.is_some() && zero_pad,
+                        width,
+                    },
+                });
+            } else {
+                chunks.push(MirFmtChunk::EnumName {
+                    enum_name: ename,
+                    value: val,
+                });
+            }
         }
         MirType::Str => {
             if let FormatSpec::Padded {
@@ -5426,6 +5793,7 @@ pub(super) fn scan_stmt_formatted_enums(stmt: &MirStmt, out: &mut BTreeSet<Strin
             for ch in chunks {
                 match ch {
                     MirFmtChunk::EnumName { enum_name, .. }
+                    | MirFmtChunk::PaddedEnumName { enum_name, .. }
                     | MirFmtChunk::DebugSlice {
                         elem_ty: MirType::Enum(enum_name),
                         ..

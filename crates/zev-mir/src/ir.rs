@@ -1,7 +1,10 @@
 //! Core MIR data structures for coroutine state-machine tasks, yielding functions,
 //! OS primitives, hardware ISRs, and static frame layout.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use crate::ram::RamReport;
+use zev_ast::Span;
 
 /// Cooperative scheduler priority levels (`0` = highest urgency).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -92,6 +95,7 @@ pub enum MirType {
     MmioPtr(String),
     /// Function pointer type (with optional `error [E]` exit spec).
     FnPtr {
+        is_noyield: bool,
         params: Vec<MirType>,
         ret: Box<MirType>,
         error_spec: Box<MirErrorSpec>,
@@ -194,21 +198,23 @@ impl MirType {
             MirType::PrimView(vk) => vk.mangle_name(),
             MirType::MmioPtr(n) => format!("mmio_ptr_{n}"),
             MirType::FnPtr {
+                is_noyield,
                 params,
                 ret,
                 error_spec,
             } => {
+                let prefix = if *is_noyield { "nyfnptr" } else { "fnptr" };
                 let err_sfx = match error_spec.as_ref() {
                     MirErrorSpec::None => String::new(),
                     MirErrorSpec::Untyped => "_err".to_string(),
                     MirErrorSpec::Typed(e) => format!("_err_{}", e.mangle_name()),
                 };
                 if params.is_empty() {
-                    format!("fnptr_void_ret_{}{}", ret.mangle_name(), err_sfx)
+                    format!("{prefix}_void_ret_{}{}", ret.mangle_name(), err_sfx)
                 } else {
                     let ps: Vec<String> = params.iter().map(|p| p.mangle_name()).collect();
                     format!(
-                        "fnptr_{}_ret_{}{}",
+                        "{prefix}_{}_ret_{}{}",
                         ps.join("_"),
                         ret.mangle_name(),
                         err_sfx
@@ -257,7 +263,26 @@ impl MirType {
             MirType::Primitive(pk) => pk.display_name(),
             MirType::PrimView(vk) => vk.display_name(),
             MirType::MmioPtr(n) => format!("*{n}"),
-            MirType::FnPtr { .. } => "fn(...)".to_string(),
+            MirType::FnPtr {
+                is_noyield,
+                params,
+                ret,
+                error_spec,
+            } => {
+                let prefix = if *is_noyield { "noyield fn" } else { "fn" };
+                let p_strs: Vec<String> = params.iter().map(|p| p.display_name()).collect();
+                let ret_part = if ret.is_void() {
+                    String::new()
+                } else {
+                    format!(" -> {}", ret.display_name())
+                };
+                let err_part = match error_spec.as_ref() {
+                    MirErrorSpec::None => String::new(),
+                    MirErrorSpec::Untyped => " error".to_string(),
+                    MirErrorSpec::Typed(e) => format!(" error {}", e.display_name()),
+                };
+                format!("{prefix}({}){ret_part}{err_part}", p_strs.join(", "))
+            }
             MirType::Result { ok, err } => match err {
                 Some(e) => format!("{} error {}", ok.display_name(), e.display_name()),
                 None => format!("{} error", ok.display_name()),
@@ -648,6 +673,8 @@ pub enum MirFmtChunk {
     },
     /// Boolean value (`"true"` or `"false"`).
     Bool(MirExpr),
+    /// Padded/aligned boolean (`{flag:>6}`, `{flag:<6}`).
+    PaddedBool { value: MirExpr, pad: MirPadSpec },
     /// Null-terminated string literal or `*u8` pointer.
     Str(MirExpr),
     /// Padded/aligned NUL-terminated `*u8` / string literal (`{s:>8}`, `{s:<12}`).
@@ -658,6 +685,12 @@ pub enum MirFmtChunk {
     PaddedBytes { slice: MirExpr, pad: MirPadSpec },
     /// Enum variant name (`f"{err}"` -> `"BadCrc"`). `enum_name` is also recorded in `MirModule.formatted_enums`.
     EnumName { enum_name: String, value: MirExpr },
+    /// Padded/aligned enum variant name (`{mode:<9}`).
+    PaddedEnumName {
+        enum_name: String,
+        value: MirExpr,
+        pad: MirPadSpec,
+    },
     /// Debug-formatted primitive slice `[e0, e1, ...]` (`{slice:?}` or `{arr:?}`).
     DebugSlice { elem_ty: MirType, slice: MirExpr },
 }
@@ -1691,6 +1724,17 @@ pub struct MonomorphizedMirItem {
     pub size_64: usize,
 }
 
+/// Call-site summary for an indirect call through a function pointer (`fn(...)` / `noyield fn(...)`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectCallSiteMir {
+    pub caller: String,
+    pub span: Span,
+    pub signature: String,
+    pub is_noyield: bool,
+    pub candidates: Vec<String>,
+    pub yielding_candidates: Vec<String>,
+}
+
 /// Complete lowered MIR module ready for RAM reporting and LLVM backend emission.
 #[derive(Debug, Clone)]
 pub struct MirModule {
@@ -1712,6 +1756,9 @@ pub struct MirModule {
     pub spawned_tasks: Vec<MirSpawnInstance>,
     pub dual_specialized_fns: Vec<String>,
     pub monomorphized_instances: Vec<MonomorphizedMirItem>,
+    pub indirect_call_sites: Vec<IndirectCallSiteMir>,
+    /// Canonical plain `fn(...)` candidate sets derived from lowered `FnAddr` sites.
+    pub plain_fnptr_candidates: BTreeMap<String, BTreeSet<String>>,
     /// Sorted list of enum names referenced by `MirFmtChunk::EnumName` (for on-demand `.rodata` variant-name tables).
     pub formatted_enums: Vec<String>,
     pub boot: MirBootSequence,

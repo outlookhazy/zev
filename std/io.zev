@@ -93,7 +93,7 @@ pub fn writer_slice(*ByteWriter w) -> []u8 {
 pub struct DuplexStream {
     *byte_ring rx;
     *byte_ring tx;
-    fn(*byte_ring) flush;
+    noyield fn(*byte_ring) flush;
 }
 
 impl DuplexStream {

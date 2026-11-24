@@ -1771,6 +1771,7 @@ impl<'a> Monomorphizer<'a> {
                 params,
                 ret,
                 error_spec,
+                is_noyield,
             } => TypeKind::FnPtr {
                 params: params
                     .iter()
@@ -1783,6 +1784,7 @@ impl<'a> Monomorphizer<'a> {
                         ErrorSpec::Typed(et) => ErrorSpec::Typed(self.rewrite_type_expr(et, env)),
                     })
                 }),
+                is_noyield: *is_noyield,
             },
         };
         TypeExpr::new(kind, te.span)
@@ -1893,6 +1895,7 @@ impl<'a> Monomorphizer<'a> {
                 params,
                 ret,
                 error_spec,
+                is_noyield,
             } => {
                 let ps: Vec<String> = params.iter().map(|p| self.format_mangled_type(p)).collect();
                 let es = match error_spec.as_deref() {
@@ -1902,8 +1905,9 @@ impl<'a> Monomorphizer<'a> {
                         format!("_E_{}", self.format_mangled_type(et))
                     }
                 };
+                let prefix = if *is_noyield { "_NF" } else { "_F" };
                 format!(
-                    "_F{}_{}_T_{}{}",
+                    "{prefix}{}_{}_T_{}{}",
                     params.len(),
                     ps.join("__"),
                     self.format_mangled_type(ret),
@@ -1981,6 +1985,7 @@ impl<'a> Monomorphizer<'a> {
                 params,
                 ret,
                 error_spec,
+                is_noyield,
             } => {
                 let ps: Vec<String> = params.iter().map(|p| self.format_human_type(p)).collect();
                 let es = match error_spec.as_deref() {
@@ -1990,8 +1995,9 @@ impl<'a> Monomorphizer<'a> {
                         format!(" error {}", self.format_human_type(et))
                     }
                 };
+                let prefix = if *is_noyield { "noyield fn" } else { "fn" };
                 format!(
-                    "fn({}) -> {}{}",
+                    "{prefix}({}) -> {}{}",
                     ps.join(", "),
                     self.format_human_type(ret),
                     es
@@ -5290,6 +5296,7 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
             params,
             ret,
             error_spec,
+            is_noyield,
         } => {
             let ps: Vec<String> = params.iter().map(mangle_type_expr).collect();
             let es = match error_spec.as_deref() {
@@ -5297,8 +5304,9 @@ pub fn mangle_type_expr(te: &TypeExpr) -> String {
                 Some(ErrorSpec::Bare(_)) => "_E_bare".to_string(),
                 Some(ErrorSpec::Typed(et)) => format!("_E_{}", mangle_type_expr(et)),
             };
+            let prefix = if *is_noyield { "_NF" } else { "_F" };
             format!(
-                "_F{}_{}_T_{}{}",
+                "{prefix}{}_{}_T_{}{}",
                 params.len(),
                 ps.join("__"),
                 mangle_type_expr(ret),
@@ -5414,6 +5422,7 @@ fn type_mentions_generic_param(te: &TypeExpr, gp_names: &BTreeSet<String>) -> bo
             params,
             ret,
             error_spec,
+            ..
         } => {
             params
                 .iter()

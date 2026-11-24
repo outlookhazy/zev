@@ -566,11 +566,13 @@ fn collect_fmt_chunk_uses(chunk: &MirFmtChunk, uses: &mut BTreeSet<VarId>) {
         MirFmtChunk::Int { value, .. }
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
+        | MirFmtChunk::PaddedBool { value, .. }
         | MirFmtChunk::Str(value)
         | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
         | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::PaddedEnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => {
             collect_expr_uses(value, uses);
         }
@@ -1023,11 +1025,13 @@ fn collect_fmt_chunk_addr_of(chunk: &MirFmtChunk, out: &mut BTreeSet<VarId>) {
         MirFmtChunk::Int { value, .. }
         | MirFmtChunk::Float { value, .. }
         | MirFmtChunk::Bool(value)
+        | MirFmtChunk::PaddedBool { value, .. }
         | MirFmtChunk::Str(value)
         | MirFmtChunk::PaddedStr { cstr: value, .. }
         | MirFmtChunk::Bytes(value)
         | MirFmtChunk::PaddedBytes { slice: value, .. }
         | MirFmtChunk::EnumName { value, .. }
+        | MirFmtChunk::PaddedEnumName { value, .. }
         | MirFmtChunk::DebugSlice { slice: value, .. } => {
             collect_addr_of_vars(value, out);
         }

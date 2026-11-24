@@ -85,6 +85,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
         uses_fmt: false,
         uses_fmt_float_sci: false,
         uses_fmt_pad: false,
+        uses_fnptr: !module.indirect_call_sites.is_empty(),
         uses_rv_irqs: false,
         uses_sys_tick: false,
         uses_clock_hook: false,
@@ -101,6 +102,7 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 params,
                 ret,
                 error_spec,
+                ..
             } => {
                 for p in params {
                     scan_ty(p, feat);
@@ -436,7 +438,9 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                     scan_expr(v, feat);
                 }
                 MirFmtChunk::PaddedStr { cstr: v, .. }
-                | MirFmtChunk::PaddedBytes { slice: v, .. } => {
+                | MirFmtChunk::PaddedBytes { slice: v, .. }
+                | MirFmtChunk::PaddedBool { value: v, .. }
+                | MirFmtChunk::PaddedEnumName { value: v, .. } => {
                     feat.uses_fmt_pad = true;
                     scan_expr(v, feat);
                 }
@@ -542,6 +546,8 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                     MirIntrinsicOp::SysOp { method, args } => {
                         if matches!(method.as_str(), "tick" | "tick_ms" | "tick_by") {
                             feat.uses_sys_tick = true;
+                        } else if method == "__check_nonnull_fnptr" {
+                            feat.uses_fnptr = true;
                         }
                         for a in args {
                             scan_expr(a, feat);
@@ -751,6 +757,27 @@ pub(super) fn scan_module_runtime_features(module: &MirModule) -> RuntimeIrFeatu
                 }
             }
         }
+    }
+    if !feat.uses_fnptr
+        && (module
+            .isrs
+            .iter()
+            .any(|i| i.vars.iter().any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+            || module
+                .functions
+                .iter()
+                .any(|f| f.vars.iter().any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+            || module
+                .task_blueprints
+                .iter()
+                .any(|b| b.vars.iter().any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+            || module
+                .boot
+                .vars
+                .iter()
+                .any(|v| matches!(v.ty, MirType::FnPtr { .. })))
+    {
+        feat.uses_fnptr = true;
     }
     feat
 }
@@ -2042,7 +2069,9 @@ impl<'a> ModuleCtx<'a> {
             | MirFmtChunk::PaddedStr { cstr: value, .. }
             | MirFmtChunk::Bytes(value)
             | MirFmtChunk::PaddedBytes { slice: value, .. }
-            | MirFmtChunk::EnumName { value, .. } => self.scan_expr_for_prims(value),
+            | MirFmtChunk::PaddedBool { value, .. }
+            | MirFmtChunk::EnumName { value, .. }
+            | MirFmtChunk::PaddedEnumName { value, .. } => self.scan_expr_for_prims(value),
             MirFmtChunk::DebugSlice { slice, .. } => self.scan_expr_for_prims(slice),
             MirFmtChunk::Literal(_) => {}
         }
@@ -2057,8 +2086,15 @@ impl<'a> ModuleCtx<'a> {
             | MirExprKind::FieldAccess { base: e, .. }
             | MirExprKind::SliceLen(e)
             | MirExprKind::FromBytes { slice: e, .. } => self.scan_expr_for_prims(e),
+            MirExprKind::SeqEq {
+                lhs, rhs, elem_ty, ..
+            } => {
+                self.seq_eq_elem_tys
+                    .insert(self.llvm_ty(&elem_ty.host_value_type()));
+                self.scan_expr_for_prims(lhs);
+                self.scan_expr_for_prims(rhs);
+            }
             MirExprKind::Binary { lhs, rhs, .. }
-            | MirExprKind::SeqEq { lhs, rhs, .. }
             | MirExprKind::Index {
                 base: lhs,
                 index: rhs,
@@ -3718,6 +3754,47 @@ ok_bb:
             let _ = writeln!(out, "def:");
             let _ = writeln!(out, "  ret ptr @.str.{unk_idx}");
             let _ = writeln!(out, "}}\n");
+        }
+    }
+
+    pub(super) fn emit_seq_eq_helpers_ir(&self, out: &mut String) {
+        if self.seq_eq_elem_tys.is_empty() {
+            return;
+        }
+        let usize_ty = self.spec.isa.usize_llvm_ty();
+        let fn_sz = self.opts.fn_size_attrs();
+        let fn_as = self.fn_as();
+        let _ = writeln!(
+            out,
+            "; ── On-Demand Out-of-Line Sequence Equality Helpers ──"
+        );
+        for ety in &self.seq_eq_elem_tys {
+            let _ = writeln!(
+                out,
+                "define internal i8 @__syn_seq_eq_{ety}(ptr %pa, {usize_ty} %la, ptr %pb, {usize_ty} %lb){fn_as} nounwind noinline{fn_sz} {{\n\
+                 entry:\n\
+                 \x20 %len_eq = icmp eq {usize_ty} %la, %lb\n\
+                 \x20 br i1 %len_eq, label %loop, label %ret_ne\n\
+                 loop:\n\
+                 \x20 %i = phi {usize_ty} [ 0, %entry ], [ %next_i, %step ]\n\
+                 \x20 %more = icmp ult {usize_ty} %i, %la\n\
+                 \x20 br i1 %more, label %body, label %ret_eq\n\
+                 body:\n\
+                 \x20 %ep_a = getelementptr {ety}, ptr %pa, {usize_ty} %i\n\
+                 \x20 %ep_b = getelementptr {ety}, ptr %pb, {usize_ty} %i\n\
+                 \x20 %va = load {ety}, ptr %ep_a, align 1\n\
+                 \x20 %vb = load {ety}, ptr %ep_b, align 1\n\
+                 \x20 %el_eq = icmp eq {ety} %va, %vb\n\
+                 \x20 br i1 %el_eq, label %step, label %ret_ne\n\
+                 step:\n\
+                 \x20 %next_i = add {usize_ty} %i, 1\n\
+                 \x20 br label %loop\n\
+                 ret_eq:\n\
+                 \x20 ret i8 1\n\
+                 ret_ne:\n\
+                 \x20 ret i8 0\n\
+                 }}\n"
+            );
         }
     }
 

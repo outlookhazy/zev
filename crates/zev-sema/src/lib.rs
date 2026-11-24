@@ -40,8 +40,8 @@ pub use monomorphize::{
 };
 pub use provenance::{LeaseEnv, LeaseToken, Provenance};
 pub use types::{
-    EnumInfo, FieldInfo, NamespaceKind, PrimitiveKind, ResolvedErrorSpec, ResolvedOsPrimitive,
-    StructInfo, Ty,
+    EnumInfo, FieldInfo, FnPtrKind, NamespaceKind, PrimitiveKind, ResolvedErrorSpec,
+    ResolvedOsPrimitive, StructInfo, Ty,
 };
 
 use zev_ast::Program;

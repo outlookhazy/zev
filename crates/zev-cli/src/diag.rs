@@ -20,6 +20,19 @@ pub struct TaskRunSummary {
     pub max_run_blocks: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndirectCallSiteSummary {
+    pub caller: String,
+    pub file: String,
+    pub line: usize,
+    pub col: usize,
+    pub signature: String,
+    pub is_noyield: bool,
+    pub candidates: Vec<String>,
+    pub frame_bytes_32: usize,
+    pub frame_bytes_64: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct JsonDiag {
     pub code: Option<String>,
@@ -247,6 +260,7 @@ pub fn render_check_json_ok(
     )
 }
 
+#[cfg(test)]
 pub fn render_check_json_ok_with_tasks(
     files: usize,
     spawned_tasks: usize,
@@ -255,6 +269,29 @@ pub fn render_check_json_ok_with_tasks(
     dual_specialized: &[String],
     monomorphized: &[MonomorphizedInstance],
     task_runs: &[TaskRunSummary],
+) -> String {
+    render_check_json_ok_full(
+        files,
+        spawned_tasks,
+        primitives,
+        tick_period_us,
+        dual_specialized,
+        monomorphized,
+        task_runs,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_check_json_ok_full(
+    files: usize,
+    spawned_tasks: usize,
+    primitives: usize,
+    tick_period_us: u64,
+    dual_specialized: &[String],
+    monomorphized: &[MonomorphizedInstance],
+    task_runs: &[TaskRunSummary],
+    indirect_call_sites: &[IndirectCallSiteSummary],
 ) -> String {
     let mut sorted: Vec<&str> = dual_specialized.iter().map(String::as_str).collect();
     sorted.sort_unstable();
@@ -318,8 +355,37 @@ pub fn render_check_json_ok_with_tasks(
     }
     runs_json.push(']');
 
+    let mut sites_json = String::from("[");
+    for (idx, s) in indirect_call_sites.iter().enumerate() {
+        if idx > 0 {
+            sites_json.push_str(", ");
+        }
+        let mut cands_json = String::from("[");
+        for (ci, c) in s.candidates.iter().enumerate() {
+            if ci > 0 {
+                cands_json.push_str(", ");
+            }
+            let _ = write!(cands_json, "\"{}\"", json_escape(c));
+        }
+        cands_json.push(']');
+        let _ = write!(
+            sites_json,
+            "{{\"caller\": \"{}\", \"file\": \"{}\", \"line\": {}, \"col\": {}, \"signature\": \"{}\", \"is_noyield\": {}, \"candidates\": {}, \"frame_bytes_32\": {}, \"frame_bytes_64\": {}}}",
+            json_escape(&s.caller),
+            json_escape(&s.file),
+            s.line,
+            s.col,
+            json_escape(&s.signature),
+            s.is_noyield,
+            cands_json,
+            s.frame_bytes_32,
+            s.frame_bytes_64,
+        );
+    }
+    sites_json.push(']');
+
     format!(
-        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"dual_specialized_functions\": {dual_json}, \"monomorphized_instances\": {mono_json}, \"task_runs\": {runs_json}, \"diagnostics\": []}}"
+        "{{\"ok\": true, \"files\": {files}, \"spawned_tasks\": {spawned_tasks}, \"primitives\": {primitives}, \"tick_period_us\": {tick_period_us}, \"dual_specialized_functions\": {dual_json}, \"monomorphized_instances\": {mono_json}, \"task_runs\": {runs_json}, \"indirect_call_sites\": {sites_json}, \"diagnostics\": []}}"
     )
 }
 
@@ -401,7 +467,7 @@ mod tests {
         let empty_json = render_check_json_ok(1, 2, 3, 1000, &[], &[]);
         assert_eq!(
             empty_json,
-            "{\"ok\": true, \"files\": 1, \"spawned_tasks\": 2, \"primitives\": 3, \"tick_period_us\": 1000, \"dual_specialized_functions\": [], \"monomorphized_instances\": [], \"task_runs\": [], \"diagnostics\": []}"
+            "{\"ok\": true, \"files\": 1, \"spawned_tasks\": 2, \"primitives\": 3, \"tick_period_us\": 1000, \"dual_specialized_functions\": [], \"monomorphized_instances\": [], \"task_runs\": [], \"indirect_call_sites\": [], \"diagnostics\": []}"
         );
         assert_eq!(
             format_check_human_ok(1, 2, 3, 1000, &[], &[]),

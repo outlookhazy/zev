@@ -8549,11 +8549,11 @@ fn main() {
                 return a + b;
             }
             struct Handlers {
-                fn([]u8) -> u32 sum;
-                fn(u32, u32) -> u32 add;
+                noyield fn([]u8) -> u32 sum;
+                noyield fn(u32, u32) -> u32 add;
             }
             task sh() {
-                fn([]u8) -> u32 h = sum_while;
+                noyield fn([]u8) -> u32 h = sum_while;
                 Handlers tbl = Handlers { sum: sum_while, add: add_chk };
                 u32 a = h("AB");
                 u32 b = (tbl.sum)("CD");
@@ -8929,5 +8929,225 @@ fn main() {
             proof.format_table()
         );
         assert!(proof.within_budget, "{}", proof.format_table());
+    }
+
+    #[test]
+    fn item9_stack_high_water_proof_yielding_and_nonyielding_fnptrs() {
+        let root = repo_root();
+        let targets = [
+            (
+                "lm3s6965_evb",
+                32u64,
+                r#"
+import chip.lm3s6965 as hw;
+isr tick_isr(*watch<u32> w) { state u32 c = 0; c += 1; w.publish(c); }
+fn attach_board_isr(*watch<u32> w) { hw.IRQ_UART0.attach(tick_isr(w)); }
+"#,
+            ),
+            (
+                "esp32c6_pico",
+                64u64,
+                r#"
+import chip.esp32c6 as hw;
+isr tick_isr(*watch<u32> w) { state u32 c = 0; c += 1; w.publish(c); }
+fn attach_board_isr(*watch<u32> w) { hw.IRQ_USB_DEVICE.attach(tick_isr(w)); }
+"#,
+            ),
+            (
+                "arduino_uno",
+                2u64,
+                r#"
+import chip.atmega328p as hw;
+isr tick_isr(*watch<u32> w) { state u32 c = 0; c += 1; w.publish(c); }
+fn attach_board_isr(*watch<u32> w) { hw.IRQ_TIMER0_COMPA.attach(tick_isr(w)); }
+"#,
+            ),
+        ];
+
+        for (board_name, hw_oh, isr_part) in targets {
+            let full_src = format!(
+                r#"
+enum CmdErr {{
+    Failed,
+}}
+
+byte_ring<64> rx_ring;
+byte_ring<64> tx_ring;
+watch<u32> ticks = 0;
+
+struct Hook {{
+    noyield fn(*byte_ring) flush;
+}}
+
+struct Cmd {{
+    []u8 name;
+    fn(*Hook, u32) -> u32 error CmdErr run;
+}}
+
+fn flush_byte(*byte_ring tx) {{
+    u8 _b = tx.try_pop_byte() catch {{ 0u8 }};
+}}
+
+fn child_leaf(u32 v) -> u32 {{
+    delay(2ms);
+    return v + 7u32;
+}}
+
+fn cmd_heavy(*Hook hk, u32 x) -> u32 error CmdErr {{
+    [16]u8 scratch;
+    scratch[0] = (x & 0xFFu32) as u8;
+    (hk.flush)(&tx_ring);
+    u32 r = child_leaf(x + (scratch[0] as u32));
+    if (r == 0u32) {{
+        error Failed;
+    }}
+    return r;
+}}
+
+fn cmd_light(*Hook hk, u32 x) -> u32 error CmdErr {{
+    (hk.flush)(&tx_ring);
+    return x + 1u32;
+}}
+
+const [2]Cmd CMDS = [
+    Cmd {{ name: "heavy", run: cmd_heavy }},
+    Cmd {{ name: "light", run: cmd_light }},
+];
+
+{isr_part}
+
+task shell_loop() {{
+    Hook hk = Hook {{ flush: flush_byte }};
+    u32 idx = 0u32;
+    loop {{
+        []u8 _c = rx_ring.wait_read();
+        rx_ring.consume(_c.len);
+        u32 _v = (CMDS[(idx & 1u32) as usize].run)(&hk, idx) catch {{ 0u32 }};
+        idx += 1u32;
+    }}
+}}
+
+fn main() {{
+    attach_board_isr(&ticks);
+    spawn shell_loop() @normal;
+}}
+"#
+            );
+            let spec = TargetSpec::resolve(None, Some(board_name)).expect("board spec");
+            let opts = CodegenOptions::from_spec(spec.clone());
+            let prog = zev_parser::parse_str_named(&full_src, "item9_stack.zev")
+                .expect("parse item9 stack test");
+            let aopts = zev_sema::AnalyzeOptions {
+                include_dirs: vec![root.clone()],
+                hal_dir: spec.hal_dir.clone(),
+                board_module: spec.board_module.clone(),
+                target_ptr_bits: spec.isa.ptr_bits(),
+                target_name: spec.chip_name.clone(),
+                ..zev_sema::AnalyzeOptions::default()
+            };
+            let (mono_progs, _) =
+                zev_sema::analyze_and_monomorphize_named_programs(&[(&prog, None)], &aopts)
+                    .into_result()
+                    .unwrap_or_else(|d| panic!("{board_name} sema failed: {d:#?}"));
+            let mir = zev_mir::lower_programs(&mono_progs)
+                .unwrap_or_else(|e| panic!("{board_name} MIR failed: {e:?}"));
+            let proof =
+                analyze_hardware_stack_high_water(&mir, &opts).expect("stack high-water proof");
+            assert!(
+                !proof.has_cycle,
+                "{board_name}: unexpected cycle in stack proof:\n{}",
+                proof.format_table()
+            );
+            assert!(
+                proof.within_budget,
+                "{board_name}: over budget:\n{}",
+                proof.format_table()
+            );
+            assert_eq!(proof.isr_hw_overhead_bytes, hw_oh);
+            assert!(proof.sched_task_stack_bytes > 0);
+            assert!(proof.worst_isr_stack_bytes >= hw_oh);
+        }
+    }
+
+    #[test]
+    fn pr28_item3_safety_net_rejects_missing_yielding_fn_addr_candidate_before_codegen() {
+        let src = r#"
+fn slow(u32 n) -> u32 {
+    delay(2ms);
+    return n + 1u32;
+}
+inbox<fn(u32) -> u32, 2> q;
+task t() {
+    fn(u32) -> u32 p = q.recv();
+    println(f"r={p(4u32)}");
+    sys.exit(0);
+}
+fn main() {
+    q.post(slow);
+    spawn t() @normal;
+}
+"#;
+        let prog = zev_parser::parse_str_named(src, "pr28_safety.zev").expect("parse");
+        let opts = CodegenOptions::lm3s6965();
+        let spec = opts.effective_spec().expect("spec");
+        let aopts = zev_sema::AnalyzeOptions {
+            hal_dir: spec.hal_dir.clone(),
+            board_module: spec.board_module.clone(),
+            target_ptr_bits: spec.isa.ptr_bits(),
+            target_name: spec.chip_name.clone(),
+            ..zev_sema::AnalyzeOptions::default()
+        };
+        let (mono_progs, _) =
+            zev_sema::analyze_and_monomorphize_named_programs(&[(&prog, None)], &aopts)
+                .into_result()
+                .expect("sema");
+        let mir = zev_mir::lower_programs(&mono_progs).expect("lower MIR");
+        assert!(zev_mir::verify_yielding_fn_addr_candidates(&mir).is_ok());
+        assert!(emit_llvm_ir_with_options(&mir, &opts).is_ok());
+
+        // Trip 1: remove `slow` from canonical plain_fnptr_candidates -> MIR safety net and LLVM codegen refuse.
+        let mut missing_plain = mir.clone();
+        missing_plain.plain_fnptr_candidates.clear();
+        let mir_err1 = zev_mir::verify_yielding_fn_addr_candidates(&missing_plain)
+            .expect_err("safety net must reject missing plain candidate");
+        assert!(
+            mir_err1.message.contains("internal compiler error")
+                && mir_err1.message.contains("slow"),
+            "unexpected safety net error: {}",
+            mir_err1.message
+        );
+        let cg_err1 = emit_llvm_ir_with_options(&missing_plain, &opts)
+            .expect_err("codegen must refuse to emit IR when safety net fails");
+        assert!(
+            cg_err1.to_string().contains("internal compiler error"),
+            "unexpected codegen error: {cg_err1}"
+        );
+
+        // Trip 2: remove `slow` from site yielding_candidates -> MIR safety net and LLVM codegen refuse.
+        let mut missing_site = mir;
+        assert!(!missing_site.indirect_call_sites.is_empty());
+        for s in &mut missing_site.indirect_call_sites {
+            s.yielding_candidates.clear();
+        }
+        assert!(zev_mir::verify_yielding_fn_addr_candidates(&missing_site).is_err());
+        let cg_err2 = emit_llvm_ir_with_options(&missing_site, &opts)
+            .expect_err("codegen must refuse missing indirect call site yielding candidate");
+        assert!(
+            cg_err2.to_string().contains("internal compiler error"),
+            "unexpected codegen error: {cg_err2}"
+        );
+
+        // Zero-cost check: programs without fn pointers emit neither @__syn_panic_fnptr nor case 5.
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .unwrap();
+        let demo_path = root.join("examples/portable_controller_demo.zev");
+        let pc_mir = compile_example_mir(&[demo_path]);
+        let pc_ll = emit_llvm_ir(&pc_mir).expect("emit portable_controller_demo");
+        assert!(
+            !pc_ll.contains("@__syn_panic_fnptr"),
+            "non-fnptr program should not emit @__syn_panic_fnptr"
+        );
     }
 }
