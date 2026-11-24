@@ -1,12 +1,63 @@
 // Host Simulator Board Support Package (`board` target for `zevc run`)
 
 import hal.{adc, gpio, i2c, pwm, spi};
+import std.io as io;
 
 pub const []u8 BOARD_NAME = "host_sim";
 pub const bool EXIT_ON_DONE = true;
 
 pub const gpio.Pin PIN_USER_OUT = gpio.Pin { port: 0u8, pin: 13u8, active_low: false };
 pub const gpio.Pin PIN_BUTTON   = gpio.Pin { port: 0u8, pin: 0u8,  active_low: false };
+
+irq IRQ_SIM_CONSOLE = 30;
+
+byte_ring<128> console_rx;
+byte_ring<128> console_tx;
+
+extern "C" fn __zev_sim_poll_stdin(i32 timeout_ms) -> i32;
+extern "C" fn __zev_sim_read_stdin_byte() -> i32;
+extern "C" fn __zev_sim_putc(u8 b);
+extern "C" fn __zev_sim_flush_stdout();
+
+isr sim_console_rx_isr(*byte_ring rx) {
+    for (usize _i in 0..64) {
+        i32 ch = __zev_sim_read_stdin_byte();
+        if (ch < 0) {
+            break;
+        }
+        bool _ok = rx.push_byte(ch as u8, boost: @high);
+    }
+}
+
+fn sim_console_idle(u32 _ms, u32 _depth) {
+    if (__zev_sim_poll_stdin(1) != 0) {
+        sys.pend_irq(IRQ_SIM_CONSOLE);
+    }
+}
+
+fn sim_console_flush(*byte_ring tx) {
+    u32 sent = 0u32;
+    for (usize _i in 0..128) {
+        u8 b = tx.try_pop_byte() catch {
+            break;
+        };
+        __zev_sim_putc(b);
+        sent += 1u32;
+    }
+    if (sent > 0u32) {
+        __zev_sim_flush_stdout();
+    }
+}
+
+pub fn console_open() -> io.DuplexStream {
+    IRQ_SIM_CONSOLE.attach(sim_console_rx_isr(&console_rx));
+    sys.set_idle(sim_console_idle);
+    return io.DuplexStream {
+        rx: &console_rx,
+        tx: &console_tx,
+        flush: sim_console_flush,
+    };
+}
 
 pub fn init() {
     PIN_USER_OUT.set_low();

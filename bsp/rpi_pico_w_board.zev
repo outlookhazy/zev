@@ -6,6 +6,21 @@
 import chip.rp2040 as hw;
 import bsp.rpi_pico_w as bsp;
 import hal.{adc, gpio, i2c, pwm, spi};
+import std.io as io;
+
+fn pico_console_flush(*byte_ring tx) {
+    if (!tx.is_empty()) {
+        bsp.usb_kick_tx();
+    }
+}
+
+pub fn console_open() -> io.DuplexStream {
+    return io.DuplexStream {
+        rx: &usb_rx,
+        tx: &usb_tx,
+        flush: pico_console_flush,
+    };
+}
 
 pub const []u8 BOARD_NAME = "rpi_pico_w";
 pub const bool EXIT_ON_DONE = false;

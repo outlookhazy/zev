@@ -688,7 +688,82 @@ fn emit_host_linux_hal_ir(out: &mut String, sz: &str) {
         out,
         r#"; ── Host Linux x86_64 Simulation Runtime Hooks ──
 declare i32 @putchar(i32) nounwind
+declare i32 @fflush(ptr) nounwind
+declare i32 @poll(ptr, i64, i32) nounwind
+declare i64 @read(i32, ptr, i64) nounwind
 declare void @exit(i32) noreturn nounwind
+
+@__syn_sim_stdin_eof = internal global i8 0, align 1
+
+define i32 @__zev_sim_poll_stdin(i32 %timeout_ms) nounwind{sz} {{
+entry:
+  %eof = load i8, ptr @__syn_sim_stdin_eof, align 1
+  %is_eof = icmp ne i8 %eof, 0
+  br i1 %is_eof, label %ret0, label %do_poll
+do_poll:
+  %pfd = alloca {{ i32, i16, i16 }}, align 4
+  %fdp = getelementptr {{ i32, i16, i16 }}, ptr %pfd, i32 0, i32 0
+  store i32 0, ptr %fdp, align 4
+  %evp = getelementptr {{ i32, i16, i16 }}, ptr %pfd, i32 0, i32 1
+  store i16 1, ptr %evp, align 2
+  %revp = getelementptr {{ i32, i16, i16 }}, ptr %pfd, i32 0, i32 2
+  store i16 0, ptr %revp, align 2
+  %rc = call i32 @poll(ptr %pfd, i64 1, i32 %timeout_ms)
+  %pos = icmp sgt i32 %rc, 0
+  br i1 %pos, label %chk_rev, label %ret0
+chk_rev:
+  %rev = load i16, ptr %revp, align 2
+  %has_in = and i16 %rev, 1
+  %ok_in = icmp ne i16 %has_in, 0
+  br i1 %ok_in, label %ret1, label %chk_hup
+chk_hup:
+  %has_hup = and i16 %rev, 24
+  %is_hup = icmp ne i16 %has_hup, 0
+  br i1 %is_hup, label %set_eof, label %ret0
+set_eof:
+  store i8 1, ptr @__syn_sim_stdin_eof, align 1
+  br label %ret0
+ret1:
+  ret i32 1
+ret0:
+  ret i32 0
+}}
+
+define i32 @__zev_sim_read_stdin_byte() nounwind{sz} {{
+entry:
+  %ready = call i32 @__zev_sim_poll_stdin(i32 0)
+  %has = icmp ne i32 %ready, 0
+  br i1 %has, label %do_read, label %ret_neg
+do_read:
+  %buf = alloca i8, align 1
+  %n = call i64 @read(i32 0, ptr %buf, i64 1)
+  %got1 = icmp eq i64 %n, 1
+  br i1 %got1, label %ret_byte, label %chk_zero
+chk_zero:
+  %is_zero = icmp eq i64 %n, 0
+  br i1 %is_zero, label %mark_eof, label %ret_neg
+mark_eof:
+  store i8 1, ptr @__syn_sim_stdin_eof, align 1
+  br label %ret_neg
+ret_byte:
+  %b = load i8, ptr %buf, align 1
+  %bz = zext i8 %b to i32
+  ret i32 %bz
+ret_neg:
+  ret i32 -1
+}}
+
+define void @__zev_sim_putc(i8 %c) nounwind{sz} {{
+entry:
+  call void @__syn_uart_putc(i8 %c)
+  ret void
+}}
+
+define void @__zev_sim_flush_stdout() nounwind{sz} {{
+entry:
+  %r = call i32 @fflush(ptr null)
+  ret void
+}}
 
 @__syn_host_in_boot = global i8 1, align 1
 @__syn_host_spin_polls = global i32 0, align 4

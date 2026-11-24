@@ -3,6 +3,8 @@ mod diag;
 mod docs;
 mod docs_errors;
 mod runner;
+mod script_runner;
+mod serial;
 mod svd;
 
 use cli::{parse_args, Command, HELP_TEXT};
@@ -773,6 +775,33 @@ fn resolve_project_build_inputs(
     })
 }
 
+fn resolve_monitor_port(board: Option<&str>, port: Option<&str>) -> Result<String, String> {
+    if let Some(p) = port {
+        return Ok(p.to_string());
+    }
+    let manifest = discover_manifest_for_inputs(&[])?;
+    let (mdir, mboard, mport) = match manifest {
+        Some((dir, m)) => (Some(dir), m.board, m.port),
+        None => (None, None, None),
+    };
+    if board.is_none() {
+        if let Some(p) = mport {
+            return Ok(p);
+        }
+    }
+    let eff_board = board.map(str::to_string).or(mboard);
+    let Some(bname) = eff_board else {
+        return Err(
+            "no serial port specified: pass `--port <dev>`, `--board <name>`, or set `port`/`board` in `zev.toml`"
+                .to_string(),
+        );
+    };
+    let spec = resolve_target_spec_for_inputs(&[], mdir.as_deref(), None, Some(&bname))?;
+    spec.default_port.ok_or_else(|| {
+        format!("board `{bname}` does not declare `[run].default_port`; pass `--port <dev>`")
+    })
+}
+
 fn print_target_build_summary(
     spec: &zev_codegen_llvm::TargetSpec,
     res: &zev_codegen_llvm::TargetBuildArtifact,
@@ -1003,6 +1032,9 @@ fn main() -> ExitCode {
             include_dirs,
             sanitize,
             max_ticks,
+            script,
+            cmds,
+            script_timeout_ms,
             run_args,
         } => {
             let mut opts = zev_codegen_llvm::CodegenOptions::host_linux();
@@ -1014,6 +1046,18 @@ fn main() -> ExitCode {
             if let Some(ticks) = max_ticks {
                 opts.max_ticks = ticks.min(i32::MAX as u64) as u32;
             }
+            let scripted = script.is_some() || !cmds.is_empty();
+            let script_cmds = if scripted {
+                match script_runner::collect_script_commands(script.as_deref(), &cmds) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
             match compile_to_mir_with_target(
                 &files,
@@ -1025,12 +1069,53 @@ fn main() -> ExitCode {
             ) {
                 Ok((_, mir)) => match zev_codegen_llvm::emit_llvm_ir_with_options(&mir, &opts) {
                     Ok(ll_src) => {
-                        match runner::compile_and_run_host_llvm(&ll_src, sanitize, &run_args) {
-                            Ok(0) => ExitCode::SUCCESS,
-                            Ok(code) => ExitCode::from((code.clamp(1, 255)) as u8),
-                            Err(err) => {
-                                eprintln!("error: {err}");
-                                ExitCode::FAILURE
+                        if scripted {
+                            let temp = match TempWorkDir::create("zevc-run-script") {
+                                Ok(t) => t,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                            let bin_path =
+                                match runner::compile_host_llvm_binary(&temp, &ll_src, sanitize) {
+                                    Ok(p) => p,
+                                    Err(err) => {
+                                        eprintln!("error: {err}");
+                                        return ExitCode::FAILURE;
+                                    }
+                                };
+                            let mut child =
+                                match runner::spawn_host_llvm_binary(&bin_path, &run_args) {
+                                    Ok(c) => c,
+                                    Err(err) => {
+                                        eprintln!("error: {err}");
+                                        return ExitCode::FAILURE;
+                                    }
+                                };
+                            let timeout = std::time::Duration::from_millis(
+                                script_timeout_ms
+                                    .unwrap_or(script_runner::DEFAULT_SCRIPT_TIMEOUT_MS),
+                            );
+                            match script_runner::run_script_on_child(
+                                &mut child,
+                                &script_cmds,
+                                timeout,
+                            ) {
+                                Ok(()) => ExitCode::SUCCESS,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    ExitCode::FAILURE
+                                }
+                            }
+                        } else {
+                            match runner::compile_and_run_host_llvm(&ll_src, sanitize, &run_args) {
+                                Ok(0) => ExitCode::SUCCESS,
+                                Ok(code) => ExitCode::from((code.clamp(1, 255)) as u8),
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    ExitCode::FAILURE
+                                }
                             }
                         }
                     }
@@ -1212,7 +1297,23 @@ fn main() -> ExitCode {
             port,
             opt_level,
             output,
+            monitor,
+            script,
+            cmds,
+            script_timeout_ms,
         } => {
+            let scripted = script.is_some() || !cmds.is_empty();
+            let script_cmds = if scripted {
+                match script_runner::collect_script_commands(script.as_deref(), &cmds) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let built = match resolve_project_build_inputs(
                 &files,
                 &include_dirs,
@@ -1286,7 +1387,46 @@ fn main() -> ExitCode {
                         Ok(flash_out) => {
                             print!("{flash_out}");
                             drop(temp_holder);
-                            ExitCode::SUCCESS
+                            if !monitor && !scripted {
+                                return ExitCode::SUCCESS;
+                            }
+                            let serial_dev = built
+                                .port
+                                .as_deref()
+                                .filter(|p| !Path::new(p).is_dir())
+                                .or(built.spec.default_port.as_deref());
+                            let Some(dev_path) = serial_dev else {
+                                eprintln!(
+                                    "error: `{target_label}` does not declare a serial port for `--monitor`/`--script`; pass `--port <dev>`"
+                                );
+                                return ExitCode::from(2);
+                            };
+                            let sp = match serial::wait_for_serial_port(
+                                dev_path,
+                                std::time::Duration::from_secs(5),
+                            ) {
+                                Ok(s) => s,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    return ExitCode::FAILURE;
+                                }
+                            };
+                            let post_res = if scripted {
+                                let timeout = std::time::Duration::from_millis(
+                                    script_timeout_ms
+                                        .unwrap_or(script_runner::DEFAULT_SCRIPT_TIMEOUT_MS),
+                                );
+                                script_runner::run_script_on_serial(&sp, &script_cmds, timeout)
+                            } else {
+                                serial::run_interactive_monitor_on(dev_path, sp)
+                            };
+                            match post_res {
+                                Ok(()) => ExitCode::SUCCESS,
+                                Err(err) => {
+                                    eprintln!("error: {err}");
+                                    ExitCode::FAILURE
+                                }
+                            }
                         }
                         Err(err) => {
                             eprintln!("error: {err}");
@@ -1296,6 +1436,49 @@ fn main() -> ExitCode {
                 }
                 Err(err) => {
                     eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Monitor {
+            board,
+            port,
+            script,
+            cmds,
+            script_timeout_ms,
+        } => {
+            let scripted = script.is_some() || !cmds.is_empty();
+            let script_cmds = if scripted {
+                match script_runner::collect_script_commands(script.as_deref(), &cmds) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let eff_port = match resolve_monitor_port(board.as_deref(), port.as_deref()) {
+                Ok(p) => p,
+                Err(err) => {
+                    eprintln!("error: {err}");
+                    return ExitCode::from(2);
+                }
+            };
+            let res = if scripted {
+                let timeout = std::time::Duration::from_millis(
+                    script_timeout_ms.unwrap_or(script_runner::DEFAULT_SCRIPT_TIMEOUT_MS),
+                );
+                serial::open_serial_115200(&eff_port)
+                    .and_then(|sp| script_runner::run_script_on_serial(&sp, &script_cmds, timeout))
+            } else {
+                serial::run_interactive_monitor(&eff_port)
+            };
+            match res {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("error: {err}");
                     ExitCode::FAILURE
                 }
             }
@@ -1343,12 +1526,27 @@ fn main() -> ExitCode {
             include_dirs,
             max_ticks,
             opt_level,
+            script,
+            cmds,
+            script_timeout_ms,
         } => {
             let mut opts = zev_codegen_llvm::CodegenOptions::lm3s6965();
             opts.opt_level = opt_level;
             if let Some(ticks) = max_ticks {
                 opts.max_ticks = ticks.min(u32::MAX as u64) as u32;
             }
+            let scripted = script.is_some() || !cmds.is_empty();
+            let script_cmds = if scripted {
+                match script_runner::collect_script_commands(script.as_deref(), &cmds) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let (target_ptr_bits, target_name) = target_info_from_llvm_opts(Some(&opts));
             match compile_to_mir_with_target(
                 &files,
@@ -1368,23 +1566,85 @@ fn main() -> ExitCode {
                     };
                     let elf_path = temp.dir.join("firmware.elf");
                     let qemu_opts = zev_codegen_llvm::QemuRunOptions::default();
-                    match zev_codegen_llvm::run_qemu_cortex_m(&mir, &elf_path, &opts, &qemu_opts) {
-                        Ok(res) => {
-                            if !res.exec.stdout.is_empty() {
-                                print!("{}", res.exec.stdout);
+                    if scripted {
+                        let build = match zev_codegen_llvm::build_elf(&mir, &elf_path, &opts) {
+                            Ok(b) => b,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
                             }
-                            if !res.exec.stderr.is_empty() {
-                                eprint!("{}", res.exec.stderr);
+                        };
+                        let mut child = match zev_codegen_llvm::spawn_elf_in_qemu(
+                            &build.elf_path,
+                            &qemu_opts,
+                            true,
+                        ) {
+                            Ok(c) => c,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
                             }
-                            if res.exec.exit_code == 0 {
-                                ExitCode::SUCCESS
-                            } else {
-                                ExitCode::from((res.exec.exit_code.clamp(1, 255)) as u8)
+                        };
+                        let timeout = std::time::Duration::from_millis(
+                            script_timeout_ms.unwrap_or(script_runner::DEFAULT_SCRIPT_TIMEOUT_MS),
+                        );
+                        match script_runner::run_script_on_child(&mut child, &script_cmds, timeout)
+                        {
+                            Ok(()) => ExitCode::SUCCESS,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                ExitCode::FAILURE
                             }
                         }
-                        Err(err) => {
-                            eprintln!("error: {err}");
-                            ExitCode::FAILURE
+                    } else if max_ticks.is_none() && serial::stdin_is_tty() {
+                        let build = match zev_codegen_llvm::build_elf(&mir, &elf_path, &opts) {
+                            Ok(b) => b,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        let _tty_guard = serial::InteractiveTtyGuard::enter(true);
+                        let mut child = match zev_codegen_llvm::spawn_elf_in_qemu(
+                            &build.elf_path,
+                            &qemu_opts,
+                            false,
+                        ) {
+                            Ok(c) => c,
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                return ExitCode::FAILURE;
+                            }
+                        };
+                        match child.wait() {
+                            Ok(st) if st.success() => ExitCode::SUCCESS,
+                            Ok(st) => ExitCode::from((st.code().unwrap_or(1).clamp(1, 255)) as u8),
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                ExitCode::FAILURE
+                            }
+                        }
+                    } else {
+                        match zev_codegen_llvm::run_qemu_cortex_m(
+                            &mir, &elf_path, &opts, &qemu_opts,
+                        ) {
+                            Ok(res) => {
+                                if !res.exec.stdout.is_empty() {
+                                    print!("{}", res.exec.stdout);
+                                }
+                                if !res.exec.stderr.is_empty() {
+                                    eprint!("{}", res.exec.stderr);
+                                }
+                                if res.exec.exit_code == 0 {
+                                    ExitCode::SUCCESS
+                                } else {
+                                    ExitCode::from((res.exec.exit_code.clamp(1, 255)) as u8)
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!("error: {err}");
+                                ExitCode::FAILURE
+                            }
                         }
                     }
                 }
@@ -4120,5 +4380,172 @@ fn main() {
             stderr_d.contains("defaulted to 'i32'") && stderr_d.contains("pick<u32>(3, 4)"),
             "Fix D defaulted diagnostic mismatch:\n{stderr_d}"
         );
+    }
+
+    #[test]
+    fn item2_host_and_qemu_run_same_script_and_report_ok_err_timeout() {
+        let temp = TempWorkDir::create("zevc-item2-script").unwrap();
+        let src = "\
+import board;
+import std.io as io;
+
+fn slice_eq([]u8 a, []u8 b) -> bool {
+    if (a.len != b.len) {
+        return false;
+    }
+    for (usize i in 0..a.len) {
+        if (a[i] != b[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+task echo_loop(io.DuplexStream port) {
+    [64]u8 line;
+    usize len = 0;
+    loop {
+        []u8 chunk = port.rx.wait_read();
+        usize n = chunk.len;
+        usize idx = 0;
+        while (idx < n) {
+            u8 b = chunk[idx];
+            idx += 1;
+            if (b == 13u8) {
+                continue;
+            }
+            if (b == 10u8) {
+                []u8 cmd = line[0..len];
+                if (slice_eq(cmd, \"ping\")) {
+                    io.stream_write(&port, \"pong\\nok\\n\");
+                } else if (slice_eq(cmd, \"fail\")) {
+                    io.stream_write(&port, \"err BadCmd\\n\");
+                } else if (slice_eq(cmd, \"hang\")) {
+                } else {
+                    io.stream_write(&port, \"err Unknown\\n\");
+                }
+                len = 0;
+            } else if (len < line.len) {
+                line[len] = b;
+                len += 1;
+            }
+        }
+        port.rx.consume(n);
+    }
+}
+
+fn main() {
+    board.init();
+    io.DuplexStream port = board.console_open();
+    spawn echo_loop(port) @normal;
+}
+";
+        let app_path = temp.dir.join("console_app.zev");
+        std::fs::write(&app_path, src).unwrap();
+
+        let ok_script = temp.dir.join("ok.script");
+        std::fs::write(&ok_script, "# comment\n\nping\nping\n").unwrap();
+        let ok_cmds = script_runner::collect_script_commands(Some(&ok_script), &[]).unwrap();
+        assert_eq!(ok_cmds, vec!["ping".to_string(), "ping".to_string()]);
+
+        let timeout = std::time::Duration::from_millis(3_000);
+        let short_timeout = std::time::Duration::from_millis(300);
+
+        // 1. Host simulator (`zevc run --sanitize` equivalent)
+        let host_opts = zev_codegen_llvm::CodegenOptions::host_linux();
+        let (h_bits, h_name) = target_info_from_llvm_opts(Some(&host_opts));
+        let (_, host_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            host_opts.hal_dir.as_deref(),
+            host_opts.board_module.as_deref(),
+            h_bits,
+            &h_name,
+        )
+        .unwrap();
+        let host_ll = zev_codegen_llvm::emit_llvm_ir_with_options(&host_mir, &host_opts).unwrap();
+        let host_bin = runner::compile_host_llvm_binary(&temp, &host_ll, true).unwrap();
+
+        let mut host_transcript = Vec::new();
+        let mut child_ok = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+        script_runner::run_script_on_child_to(
+            &mut child_ok,
+            &ok_cmds,
+            timeout,
+            &mut host_transcript,
+        )
+        .expect("host scripted ok run should succeed");
+        let host_out = String::from_utf8_lossy(&host_transcript);
+        assert!(host_out.contains("pong\nok\n"), "host_out={host_out:?}");
+
+        let mut host_err_transcript = Vec::new();
+        let mut child_err = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+        let err_res = script_runner::run_script_on_child_to(
+            &mut child_err,
+            &["fail".to_string()],
+            timeout,
+            &mut host_err_transcript,
+        )
+        .unwrap_err();
+        assert!(err_res.contains("err BadCmd"), "err_res={err_res}");
+
+        let mut host_to_transcript = Vec::new();
+        let mut child_to = runner::spawn_host_llvm_binary(&host_bin, &[]).unwrap();
+        let to_res = script_runner::run_script_on_child_to(
+            &mut child_to,
+            &["hang".to_string()],
+            short_timeout,
+            &mut host_to_transcript,
+        )
+        .unwrap_err();
+        assert!(to_res.contains("timed out"), "to_res={to_res}");
+
+        // 2. QEMU (`zevc run-qemu` equivalent with exact same script)
+        let qemu_opts_cg = zev_codegen_llvm::CodegenOptions::lm3s6965();
+        let (q_bits, q_name) = target_info_from_llvm_opts(Some(&qemu_opts_cg));
+        let (_, qemu_mir) = compile_to_mir_with_target(
+            std::slice::from_ref(&app_path),
+            &[],
+            qemu_opts_cg.hal_dir.as_deref(),
+            qemu_opts_cg.board_module.as_deref(),
+            q_bits,
+            &q_name,
+        )
+        .unwrap();
+        let elf_path = temp.dir.join("console_qemu.elf");
+        let qemu_build = zev_codegen_llvm::build_elf(&qemu_mir, &elf_path, &qemu_opts_cg).unwrap();
+        let q_run_opts = zev_codegen_llvm::QemuRunOptions::default();
+
+        let mut qemu_transcript = Vec::new();
+        let mut q_ok =
+            zev_codegen_llvm::spawn_elf_in_qemu(&qemu_build.elf_path, &q_run_opts, true).unwrap();
+        script_runner::run_script_on_child_to(&mut q_ok, &ok_cmds, timeout, &mut qemu_transcript)
+            .expect("qemu scripted ok run should succeed");
+        let qemu_out = String::from_utf8_lossy(&qemu_transcript);
+        assert!(qemu_out.contains("pong\nok\n"), "qemu_out={qemu_out:?}");
+
+        let mut qemu_err_transcript = Vec::new();
+        let mut q_err =
+            zev_codegen_llvm::spawn_elf_in_qemu(&qemu_build.elf_path, &q_run_opts, true).unwrap();
+        let q_err_res = script_runner::run_script_on_child_to(
+            &mut q_err,
+            &["fail".to_string()],
+            timeout,
+            &mut qemu_err_transcript,
+        )
+        .unwrap_err();
+        assert!(q_err_res.contains("err BadCmd"), "q_err_res={q_err_res}");
+
+        let mut qemu_to_transcript = Vec::new();
+        let mut q_to =
+            zev_codegen_llvm::spawn_elf_in_qemu(&qemu_build.elf_path, &q_run_opts, true).unwrap();
+        let q_to_res = script_runner::run_script_on_child_to(
+            &mut q_to,
+            &["hang".to_string()],
+            short_timeout,
+            &mut qemu_to_transcript,
+        )
+        .unwrap_err();
+        assert!(q_to_res.contains("timed out"), "q_to_res={q_to_res}");
     }
 }

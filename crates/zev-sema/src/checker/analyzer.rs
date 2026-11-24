@@ -1820,6 +1820,8 @@ impl Analyzer {
                 callees: Vec::new(),
                 yielding_callees: Vec::new(),
                 return_param_origins: Vec::new(),
+                return_endpoint: None,
+                return_field_endpoints: BTreeMap::new(),
                 span: f.span,
             },
         );
@@ -2354,6 +2356,8 @@ impl Analyzer {
             checker.finish_lexical_block(false, f.name.span);
         }
         let ret_origins: Vec<usize> = checker.return_param_origins.into_iter().collect();
+        let ret_ep = checker.return_endpoint;
+        let ret_field_eps = checker.return_field_endpoints;
         let boot_steps = checker.boot_steps;
         let irq_nodes = checker
             .boot_block_stack
@@ -2379,6 +2383,8 @@ impl Analyzer {
             .insert(f.name.name.clone(), irq_nodes);
         if let Some(info) = self.functions.get_mut(&f.name.name) {
             info.return_param_origins = ret_origins;
+            info.return_endpoint = ret_ep;
+            info.return_field_endpoints = ret_field_eps;
         }
     }
 

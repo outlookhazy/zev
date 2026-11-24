@@ -432,6 +432,8 @@ struct ScanAcc {
     direct_watch_reads: BTreeSet<String>,
     ptr_watch_read_elems: HashSet<MirType>,
     addr_taken_prims: BTreeSet<String>,
+    referenced_prims: BTreeSet<String>,
+    referenced_subsystems: BTreeSet<String>,
     isr_contended_globals: BTreeSet<String>,
     isr_contended_prim_mangles: BTreeSet<String>,
     isr_fnptr_sigs: Vec<(Vec<MirType>, MirType)>,
@@ -583,6 +585,7 @@ impl<'a> ScanCtx<'a> {
         }
         match target {
             MirPrimTarget::Global(name) => {
+                self.acc.referenced_prims.insert(name.clone());
                 if in_isr {
                     self.record_isr_prim_global(name, Some(kind));
                 }
@@ -649,11 +652,13 @@ impl<'a> ScanCtx<'a> {
             | MirExprKind::SysQuery(_) => {}
             MirExprKind::GlobalPrimAddr(name) => {
                 self.acc.addr_taken_prims.insert(name.clone());
+                self.acc.referenced_prims.insert(name.clone());
                 if in_isr {
                     self.record_isr_prim_global(name, None);
                 }
             }
             MirExprKind::SubsystemAddr(name) => {
+                self.acc.referenced_subsystems.insert(name.clone());
                 if in_isr {
                     self.acc.isr_contended_globals.insert(name.clone());
                 }
@@ -1448,6 +1453,121 @@ impl<'a> ScanCtx<'a> {
         }
         self.cur_vars = prev_vars;
     }
+
+    fn visit_non_prim_roots(&mut self, module: &'a MirModule, callees: &mut BTreeSet<String>) {
+        for c in &module.consts {
+            self.visit_expr(&c.init, false, callees);
+        }
+        for bp in &module.task_blueprints {
+            let prev_vars = self.cur_vars;
+            self.cur_vars = Some(&bp.vars);
+            self.visit_blocks(&bp.blocks, false, callees);
+            self.cur_vars = prev_vars;
+        }
+        for step in &module.boot.steps {
+            match step {
+                MirBootStep::Stmt(s) => self.visit_stmt(s, false, callees),
+                MirBootStep::RunYieldingFn { args, .. }
+                | MirBootStep::SpawnActivate { args, .. } => {
+                    for a in args {
+                        self.visit_expr(a, false, callees);
+                    }
+                }
+            }
+        }
+        for sp in &module.spawned_tasks {
+            for a in &sp.init_args {
+                self.visit_expr(a, false, callees);
+            }
+        }
+    }
+
+    fn visit_irq_vectors_and_isrs(
+        &mut self,
+        module: &'a MirModule,
+        isr_queue: &mut VecDeque<String>,
+    ) {
+        for vec in &module.irq_vectors {
+            for b in &vec.bindings {
+                for barg in &b.baked_args {
+                    match barg {
+                        MirBakedArg::PrimAddr(name) => {
+                            self.acc.addr_taken_prims.insert(name.clone());
+                            self.acc.referenced_prims.insert(name.clone());
+                            self.record_isr_prim_global(name, None);
+                        }
+                        MirBakedArg::SubsystemPath {
+                            root,
+                            root_struct,
+                            field_chain,
+                        } => {
+                            self.acc.referenced_subsystems.insert(root.clone());
+                            self.acc.isr_contended_globals.insert(root.clone());
+                            let path_key = if field_chain.is_empty() {
+                                root.clone()
+                            } else {
+                                let chain: Vec<&str> =
+                                    field_chain.iter().map(|(f, _)| f.as_str()).collect();
+                                format!("{root}.{}", chain.join("."))
+                            };
+                            self.acc.isr_contended_globals.insert(path_key);
+                            let mut cur_ty = MirType::Struct(root_struct.clone());
+                            for (fname, fstruct) in field_chain {
+                                let sname = match &cur_ty {
+                                    MirType::Struct(s) => s.as_str(),
+                                    _ => fstruct.as_str(),
+                                };
+                                if let Some(st) = self.structs.get(sname) {
+                                    if let Some(fld) = st.fields.iter().find(|f| &f.name == fname) {
+                                        cur_ty = fld.ty.clone();
+                                        continue;
+                                    }
+                                }
+                                cur_ty = MirType::Struct(fstruct.clone());
+                            }
+                            let mut seen_structs = BTreeSet::new();
+                            self.record_prim_types_in_ty(&cur_ty, &mut seen_structs);
+                        }
+                        MirBakedArg::MmioAddr(_) => {}
+                        MirBakedArg::Const(expr) => {
+                            let mut c = BTreeSet::new();
+                            self.visit_expr(expr, true, &mut c);
+                            for callee in c {
+                                isr_queue.push_back(callee);
+                            }
+                        }
+                    }
+                }
+                for sv in &b.state_vars {
+                    let mut c = BTreeSet::new();
+                    self.visit_expr(&sv.init, true, &mut c);
+                    for callee in c {
+                        isr_queue.push_back(callee);
+                    }
+                }
+            }
+        }
+
+        for isr in &module.isrs {
+            let mut seen_structs = BTreeSet::new();
+            for v in &isr.vars {
+                self.record_prim_types_in_ty(&v.ty, &mut seen_structs);
+            }
+            let prev_vars = self.cur_vars;
+            self.cur_vars = Some(&isr.vars);
+            let mut isr_callees = BTreeSet::new();
+            for sv in &isr.state_vars {
+                self.visit_expr(&sv.init, true, &mut isr_callees);
+            }
+            for stmt in &isr.body {
+                self.visit_stmt(stmt, true, &mut isr_callees);
+            }
+            self.cur_vars = prev_vars;
+            for callee in isr_callees {
+                isr_queue.push_back(callee);
+            }
+        }
+    }
 }
 
 fn fnptr_sig_matches(func: &MirFunction, params: &[MirType], ret: &MirType) -> bool {
@@ -1487,116 +1607,16 @@ pub fn analyze_visibility(module: &MirModule) -> VisibilityReport {
 
     // 2. Scan constants, primitive initializers, task blueprints, spawned init args, and boot sequence (non-ISR).
     let mut dummy_callees = BTreeSet::new();
-    for c in &module.consts {
-        ctx.visit_expr(&c.init, false, &mut dummy_callees);
-    }
+    ctx.visit_non_prim_roots(module, &mut dummy_callees);
     for p in &module.primitives {
         if let Some(init) = &p.init {
             ctx.visit_expr(init, false, &mut dummy_callees);
         }
     }
-    for bp in &module.task_blueprints {
-        let prev_vars = ctx.cur_vars;
-        ctx.cur_vars = Some(&bp.vars);
-        ctx.visit_blocks(&bp.blocks, false, &mut dummy_callees);
-        ctx.cur_vars = prev_vars;
-    }
-    for step in &module.boot.steps {
-        match step {
-            MirBootStep::Stmt(s) => ctx.visit_stmt(s, false, &mut dummy_callees),
-            MirBootStep::RunYieldingFn { args, .. } | MirBootStep::SpawnActivate { args, .. } => {
-                for a in args {
-                    ctx.visit_expr(a, false, &mut dummy_callees);
-                }
-            }
-        }
-    }
-    for sp in &module.spawned_tasks {
-        for a in &sp.init_args {
-            ctx.visit_expr(a, false, &mut dummy_callees);
-        }
-    }
 
     // 3. Scan `MirIrqVector` `baked_args` & state initializers, plus all ISR bodies + transitive callees.
     let mut isr_queue: VecDeque<String> = VecDeque::new();
-    for vec in &module.irq_vectors {
-        for b in &vec.bindings {
-            for barg in &b.baked_args {
-                match barg {
-                    MirBakedArg::PrimAddr(name) => {
-                        ctx.acc.addr_taken_prims.insert(name.clone());
-                        ctx.record_isr_prim_global(name, None);
-                    }
-                    MirBakedArg::SubsystemPath {
-                        root,
-                        root_struct,
-                        field_chain,
-                    } => {
-                        ctx.acc.isr_contended_globals.insert(root.clone());
-                        let path_key = if field_chain.is_empty() {
-                            root.clone()
-                        } else {
-                            let chain: Vec<&str> =
-                                field_chain.iter().map(|(f, _)| f.as_str()).collect();
-                            format!("{root}.{}", chain.join("."))
-                        };
-                        ctx.acc.isr_contended_globals.insert(path_key);
-                        let mut cur_ty = MirType::Struct(root_struct.clone());
-                        for (fname, fstruct) in field_chain {
-                            let sname = match &cur_ty {
-                                MirType::Struct(s) => s.as_str(),
-                                _ => fstruct.as_str(),
-                            };
-                            if let Some(st) = ctx.structs.get(sname) {
-                                if let Some(fld) = st.fields.iter().find(|f| &f.name == fname) {
-                                    cur_ty = fld.ty.clone();
-                                    continue;
-                                }
-                            }
-                            cur_ty = MirType::Struct(fstruct.clone());
-                        }
-                        let mut seen_structs = BTreeSet::new();
-                        ctx.record_prim_types_in_ty(&cur_ty, &mut seen_structs);
-                    }
-                    MirBakedArg::MmioAddr(_) => {}
-                    MirBakedArg::Const(expr) => {
-                        let mut c = BTreeSet::new();
-                        ctx.visit_expr(expr, true, &mut c);
-                        for callee in c {
-                            isr_queue.push_back(callee);
-                        }
-                    }
-                }
-            }
-            for sv in &b.state_vars {
-                let mut c = BTreeSet::new();
-                ctx.visit_expr(&sv.init, true, &mut c);
-                for callee in c {
-                    isr_queue.push_back(callee);
-                }
-            }
-        }
-    }
-
-    for isr in &module.isrs {
-        let mut seen_structs = BTreeSet::new();
-        for v in &isr.vars {
-            ctx.record_prim_types_in_ty(&v.ty, &mut seen_structs);
-        }
-        let prev_vars = ctx.cur_vars;
-        ctx.cur_vars = Some(&isr.vars);
-        let mut isr_callees = BTreeSet::new();
-        for sv in &isr.state_vars {
-            ctx.visit_expr(&sv.init, true, &mut isr_callees);
-        }
-        for stmt in &isr.body {
-            ctx.visit_stmt(stmt, true, &mut isr_callees);
-        }
-        ctx.cur_vars = prev_vars;
-        for callee in isr_callees {
-            isr_queue.push_back(callee);
-        }
-    }
+    ctx.visit_irq_vectors_and_isrs(module, &mut isr_queue);
 
     for callee in ctx.acc.sys_isr_callbacks.clone() {
         isr_queue.push_back(callee);
@@ -5080,9 +5100,62 @@ pub fn fold_singletons(module: &mut MirModule) {
     module.visibility.singleton_bytes_saved_64 = singleton_bytes_saved_64;
 }
 
-/// Prune `MirFunction`s, `dual_specialized_fns`, and monomorphized `Fn` entries not reachable from
-/// boot, tasks, ISRs, IRQ vectors, consts, or primitives (no-op on fragment-only test modules).
+/// Prune unreferenced imported-module OS primitives and subsystems when lowering from a real `main` entry.
+fn prune_unused_imported_globals(module: &mut MirModule) {
+    let (live_prims, live_subsystems) = {
+        let mut ctx = ScanCtx::new(module);
+        let mut dummy_callees = BTreeSet::new();
+        for f in &module.functions {
+            ctx.visit_function(f, false, &mut dummy_callees);
+        }
+        ctx.visit_non_prim_roots(module, &mut dummy_callees);
+        let mut isr_queue = VecDeque::new();
+        ctx.visit_irq_vectors_and_isrs(module, &mut isr_queue);
+
+        let mut scanned_prim_inits = BTreeSet::new();
+        for p in &module.primitives {
+            if !p.name.contains("__") {
+                ctx.acc.referenced_prims.insert(p.name.clone());
+            }
+        }
+        loop {
+            let mut progressed = false;
+            let live_now = ctx.acc.referenced_prims.clone();
+            for p in &module.primitives {
+                if live_now.contains(&p.name) && scanned_prim_inits.insert(p.name.clone()) {
+                    if let Some(init) = &p.init {
+                        ctx.visit_expr(init, false, &mut dummy_callees);
+                        progressed = true;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        (ctx.acc.referenced_prims, ctx.acc.referenced_subsystems)
+    };
+    module
+        .primitives
+        .retain(|p| !p.name.contains("__") || live_prims.contains(&p.name));
+    module
+        .subsystems
+        .retain(|s| !s.name.contains("__") || live_subsystems.contains(&s.name));
+}
+
+/// Prune `MirFunction`s, `dual_specialized_fns`, unattached ISRs, unused imported globals, and
+/// monomorphized `Fn` entries not reachable from boot, tasks, ISRs, IRQ vectors, consts, or
+/// primitives (no-op on fragment-only test modules).
 pub fn prune_unreachable_functions(module: &mut MirModule) {
+    if module.boot.from_main_entry {
+        let attached_isrs: BTreeSet<String> = module
+            .irq_vectors
+            .iter()
+            .flat_map(|v| v.bindings.iter().map(|b| b.isr_name.clone()))
+            .collect();
+        module.isrs.retain(|isr| attached_isrs.contains(&isr.name));
+    }
+
     if module.boot.steps.is_empty()
         && module.boot.boot_yielding_callees.is_empty()
         && module.spawned_tasks.is_empty()
@@ -5090,6 +5163,9 @@ pub fn prune_unreachable_functions(module: &mut MirModule) {
         && module.isrs.is_empty()
         && module.irq_vectors.is_empty()
     {
+        if module.boot.from_main_entry {
+            prune_unused_imported_globals(module);
+        }
         return;
     }
 
@@ -5232,6 +5308,9 @@ pub fn prune_unreachable_functions(module: &mut MirModule) {
         item.kind == crate::ir::MonomorphizedItemKind::Struct
             || reachable.contains(&item.mangled_name)
     });
+    if module.boot.from_main_entry {
+        prune_unused_imported_globals(module);
+    }
 }
 
 #[cfg(test)]
@@ -5263,6 +5342,7 @@ mod tests {
             formatted_enums: vec![],
             boot: MirBootSequence {
                 present: true,
+                from_main_entry: false,
                 vars: vec![],
                 steps: vec![],
                 boot_yielding_callees: vec![],
@@ -8043,5 +8123,102 @@ mod tests {
         );
         assert!(mir.dual_specialized_fns.is_empty());
         assert!(mir.monomorphized_instances.is_empty());
+    }
+
+    #[test]
+    fn prune_unreachable_functions_drops_unused_imported_console_globals_on_main_entry() {
+        let mut mir = empty_module();
+        mir.boot.from_main_entry = true;
+
+        let make_ring = |name: &str| MirPrimitive {
+            name: name.to_string(),
+            kind: MirPrimKind::ByteRing { cap: 64 },
+            dma_safe: false,
+            init: None,
+            sleep_lock_bit: None,
+            dead_stripped: false,
+            irq_mask_elided: false,
+        };
+        mir.primitives.push(make_ring("board__console_rx"));
+        mir.primitives.push(make_ring("board__console_tx"));
+        mir.primitives.push(MirPrimitive {
+            name: "board__used_sig".to_string(),
+            kind: MirPrimKind::Signal,
+            dma_safe: false,
+            init: None,
+            sleep_lock_bit: None,
+            dead_stripped: false,
+            irq_mask_elided: false,
+        });
+        mir.primitives.push(MirPrimitive {
+            name: "app_watch".to_string(),
+            kind: MirPrimKind::Watch {
+                elem: Box::new(MirType::U32),
+            },
+            dma_safe: false,
+            init: None,
+            sleep_lock_bit: None,
+            dead_stripped: false,
+            irq_mask_elided: false,
+        });
+        mir.subsystems.push(MirSubsystemGlobal {
+            name: "board__unused_sub".to_string(),
+            struct_name: "UnusedSub".to_string(),
+            dma_safe: false,
+        });
+        mir.isrs.push(MirIsr {
+            name: "board__console_rx_isr".to_string(),
+            params: vec![],
+            state_vars: vec![],
+            vars: vec![],
+            body: vec![MirStmt::PrimOp(MirPrimNonBlockingOp::ByteRingClear {
+                target: MirPrimTarget::Global("board__console_rx".to_string()),
+                cap: 64,
+            })],
+        });
+        mir.functions.push(MirFunction {
+            name: "board__console_open".to_string(),
+            params: vec![],
+            ret_ty: MirType::Void,
+            error_spec: MirErrorSpec::None,
+            manual_yield: false,
+            is_yielding: false,
+            vars: vec![],
+            body: MirFnBody::Direct(vec![
+                MirStmt::Expr(MirExpr::new(
+                    MirExprKind::GlobalPrimAddr("board__console_rx".to_string()),
+                    MirType::Usize,
+                )),
+                MirStmt::Expr(MirExpr::new(
+                    MirExprKind::GlobalPrimAddr("board__console_tx".to_string()),
+                    MirType::Usize,
+                )),
+                MirStmt::Return(None),
+            ]),
+        });
+        mir.boot
+            .steps
+            .push(MirBootStep::Stmt(Box::new(MirStmt::PrimOp(
+                MirPrimNonBlockingOp::SignalNotify {
+                    target: MirPrimTarget::Global("board__used_sig".to_string()),
+                    boost: None,
+                },
+            ))));
+
+        prune_unreachable_functions(&mut mir);
+
+        assert!(mir.isrs.is_empty(), "unattached console ISR must be pruned");
+        assert!(
+            mir.functions
+                .iter()
+                .all(|f| f.name != "board__console_open"),
+            "unused board__console_open must be pruned"
+        );
+        let kept_prims: BTreeSet<&str> = mir.primitives.iter().map(|p| p.name.as_str()).collect();
+        assert!(!kept_prims.contains("board__console_rx"));
+        assert!(!kept_prims.contains("board__console_tx"));
+        assert!(kept_prims.contains("board__used_sig"));
+        assert!(kept_prims.contains("app_watch"));
+        assert!(mir.subsystems.is_empty());
     }
 }

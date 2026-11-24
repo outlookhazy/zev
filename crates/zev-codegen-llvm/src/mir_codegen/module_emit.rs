@@ -1400,7 +1400,7 @@ impl<'a> ModuleCtx<'a> {
             "; ── Explicit `sys.*` Hook Wrappers (Zero-RAM when Unconditional/Unset) ──"
         );
         let putc_fallback = if self.spec.isa == CpuIsa::HostX86_64Linux {
-            "  %z = zext i8 %c to i32\n  %r = call i32 @putchar(i32 %z)\n  ret void"
+            "  %z = zext i8 %c to i32\n  %r = call i32 @putchar(i32 %z)\n  %is_nl = icmp eq i8 %c, 10\n  br i1 %is_nl, label %flush_nl, label %done\nflush_nl:\n  %rf = call i32 @fflush(ptr null)\n  br label %done\ndone:\n  ret void"
         } else if self.spec.isa == CpuIsa::ArmCortexM
             && self.spec.semihosting
             && self.spec.has_thumb2
@@ -5636,6 +5636,17 @@ entry:
         let fn_as = self.fn_as();
         let _ = writeln!(out, "; ── Genuine External \"C\" FFI Declarations ──");
         for ext in &self.module.extern_fns {
+            if self.spec.isa == CpuIsa::HostX86_64Linux
+                && matches!(
+                    ext.name.as_str(),
+                    "__zev_sim_poll_stdin"
+                        | "__zev_sim_read_stdin_byte"
+                        | "__zev_sim_putc"
+                        | "__zev_sim_flush_stdout"
+                )
+            {
+                continue;
+            }
             let ret = self.llvm_ty(&ext.ret_ty);
             let mut ps: Vec<String> = ext.params.iter().map(|(_, t)| self.llvm_ty(t)).collect();
             if ext.variadic {

@@ -26,11 +26,11 @@ pub use toolchain::{
     flash_target_image, inspect_elf_sizes, inspect_elf_symbols, link_obj_to_elf,
     objcopy_elf_to_avr_bin, objcopy_elf_to_avr_nano_every_bin, objcopy_elf_to_esp32c6_bin,
     objcopy_elf_to_rp2040_uf2, optimize_ll_with_opt, pack_rp2040_uf2, pack_uf2,
-    parse_llvm_major_version, require_llvm_tool, run_elf_in_qemu, synthesize_linker_script,
-    synthesize_target_linker_script, verify_ll_with_opt, AvrImageResult, CodegenError,
-    CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit, Esp32C6ImageResult,
-    QemuExecOutput, QemuRunOptions, QemuRunResult, Rp2040ImageResult, TargetArch,
-    TargetBuildArtifact, MIN_LLVM_MAJOR,
+    parse_llvm_major_version, require_llvm_tool, run_elf_in_qemu, spawn_elf_in_qemu,
+    synthesize_linker_script, synthesize_target_linker_script, verify_ll_with_opt, AvrImageResult,
+    CodegenError, CodegenOptions, ElfBuildResult, ElfSectionSizes, ElfSymbolAudit,
+    Esp32C6ImageResult, QemuExecOutput, QemuRunOptions, QemuRunResult, Rp2040ImageResult,
+    TargetArch, TargetBuildArtifact, MIN_LLVM_MAJOR,
 };
 
 /// Legacy constant retained for external integration test compatibility (values now live in `chips/esp32c6.toml`).
@@ -3360,6 +3360,7 @@ mod tests {
         mir.irq_vectors = irq_vectors;
         mir.boot = MirBootSequence {
             present: true,
+            from_main_entry: false,
             vars: boot_vars,
             steps: boot_steps,
             boot_yielding_callees: vec![],
@@ -3692,6 +3693,7 @@ mod tests {
         }];
         mir.boot = MirBootSequence {
             present: true,
+            from_main_entry: false,
             vars: vec![
                 mk_var(0, "r0", try_recv_res_ty.clone(), VarRole::CompilerTemp),
                 mk_var(1, "r1", try_recv_res_ty, VarRole::CompilerTemp),

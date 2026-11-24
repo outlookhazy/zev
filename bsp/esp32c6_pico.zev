@@ -1,6 +1,48 @@
 // Waveshare ESP32-C6-Pico Board Support Package (100% Pure .zev)
 import chip.esp32c6 as hw;
 import hal.{adc, gpio, i2c, pwm, spi};
+import std.io as io;
+
+byte_ring<64>  console_rx;
+byte_ring<128> console_tx;
+
+isr usb_console_rx_isr(*byte_ring rx, *hw.UsbDeviceRegs usb) {
+    usb.int_clr = 4u32;
+    for (u32 i in 0..64) {
+        if ((usb.ep1_conf & 4u32) == 0u32) {
+            break;
+        }
+        u8 b = (usb.ep1 & 0xFFu32) as u8;
+        bool _ok = rx.push_byte(b, boost: @high);
+    }
+}
+
+fn esp_console_flush(*byte_ring tx) {
+    u32 sent = 0u32;
+    for (u32 i in 0..128) {
+        if ((hw.USB_DEVICE.ep1_conf & 2u32) == 0u32) {
+            break;
+        }
+        u8 b = tx.try_pop_byte() catch {
+            break;
+        };
+        hw.USB_DEVICE.ep1 = b as u32;
+        sent += 1u32;
+    }
+    if (sent > 0u32) {
+        usb_tx_flush();
+    }
+}
+
+pub fn console_open() -> io.DuplexStream {
+    enable_usb_rx_irq();
+    hw.IRQ_USB_DEVICE.attach(usb_console_rx_isr(&console_rx, hw.USB_DEVICE));
+    return io.DuplexStream {
+        rx: &console_rx,
+        tx: &console_tx,
+        flush: esp_console_flush,
+    };
+}
 
 pub const []u8 BOARD_NAME = "esp32c6_pico";
 pub const bool EXIT_ON_DONE = false;

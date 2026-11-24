@@ -3,6 +3,7 @@
 [board]
 name = "arduino_uno"
 chip = "atmega328p"
+board_module = "bsp/arduino_uno"
 
 [memory]
 usable_flash_size = 32256

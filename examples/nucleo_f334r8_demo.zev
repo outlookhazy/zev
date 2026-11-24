@@ -971,6 +971,9 @@ fn main() {
     hw.IRQ_DMA1_CH5.attach(usart1_dma_isr(&gps_dma));
     hw.IRQ_TIM2.attach(tim2_isr(&tim2_q, &pin_watch));
     hw.IRQ_USART2.attach(usart2_rx_isr(&console_rx, hw.USART2));
+    critical {
+        hw.USART2.cr1 = hw.USART2.cr1 | (1u32 << 5) | (1u32 << 2);
+    }
 
     spawn gps_nmea_worker(&gps_dma, &gps_watch) @high;
     spawn cli_worker(&console_rx, &sup_inbox) @normal;

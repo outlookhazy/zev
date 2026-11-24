@@ -1600,6 +1600,7 @@ pub enum MirBootStep {
 #[derive(Debug, Clone)]
 pub struct MirBootSequence {
     pub present: bool,
+    pub from_main_entry: bool,
     pub vars: Vec<MirVar>,
     pub steps: Vec<MirBootStep>,
     /// Static frames required only during `main()` sequential boot for `RunYieldingFn` calls.

@@ -2425,8 +2425,8 @@ impl<'a> BodyChecker<'a> {
             ty: fn_info.ret_ty.clone(),
             error_spec: fn_info.error_spec.clone(),
             prov: ret_prov,
-            endpoint_name: None,
-            field_endpoints: BTreeMap::new(),
+            endpoint_name: fn_info.return_endpoint.clone(),
+            field_endpoints: fn_info.return_field_endpoints.clone(),
             span,
         }
     }

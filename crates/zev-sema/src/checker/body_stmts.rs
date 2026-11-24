@@ -31,6 +31,8 @@ impl<'a> BodyChecker<'a> {
             boot_steps: Vec::new(),
             boot_block_stack: vec![Vec::new()],
             return_param_origins: BTreeSet::new(),
+            return_endpoint: None,
+            return_field_endpoints: BTreeMap::new(),
             recorded_boosts: Vec::new(),
             proven_infallible_spans: BTreeSet::new(),
             last_struct_lit_fields: BTreeMap::new(),
@@ -1091,6 +1093,21 @@ impl<'a> BodyChecker<'a> {
                                     },
                                 ) {
                                     self.check_coerced_expr(e, ret_ty);
+                                }
+                                if let Some(ep) = &val.endpoint_name {
+                                    if ep != "<anon_endpoint>"
+                                        && !ep.starts_with("param:")
+                                        && self.return_endpoint.is_none()
+                                    {
+                                        self.return_endpoint = Some(ep.clone());
+                                    }
+                                }
+                                for (k, v) in &val.field_endpoints {
+                                    if v != "<anon_endpoint>" && !v.starts_with("param:") {
+                                        self.return_field_endpoints
+                                            .entry(k.clone())
+                                            .or_insert_with(|| v.clone());
+                                    }
                                 }
                                 if ret_ty.contains_reference(&self.sema.structs) {
                                     let ret_prov = self

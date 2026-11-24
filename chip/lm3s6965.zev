@@ -22,9 +22,14 @@ pub mmio TimerRegs {
 }
 
 pub mmio UartRegs {
-    @rw  u32 dr  @ 0x000;
-    @ro  u32 fr  @ 0x018;
-    @w1c u32 icr @ 0x044;
+    @rw  u32 dr   @ 0x000;
+    @ro  u32 fr   @ 0x018;
+    @rw  u32 lcrh @ 0x02C;
+    @rw  u32 ctl  @ 0x030;
+    @rw  u32 im   @ 0x038;
+    @ro  u32 ris  @ 0x03C;
+    @ro  u32 mis  @ 0x040;
+    @w1c u32 icr  @ 0x044;
 }
 
 pub mmio NvicRegs {

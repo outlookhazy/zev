@@ -93,8 +93,13 @@ pub fn writer_slice(*ByteWriter w) -> []u8 {
 pub struct DuplexStream {
     *byte_ring rx;
     *byte_ring tx;
+    fn(*byte_ring) flush;
 }
 
 pub fn stream_write(*DuplexStream s, []u8 data) -> usize {
-    return s.tx.push(data);
+    usize n = s.tx.push(data);
+    if (n > 0) {
+        (s.flush)(s.tx);
+    }
+    return n;
 }
