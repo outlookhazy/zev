@@ -114,6 +114,7 @@ Where traditional embedded C relies on Duff's-device protothreads, manual state 
 - **Wire-Exact Layout:** `packed struct` with explicit wire-endian fields (`u16be`, `u16le`, `u32be`, `u32le`, `u64be`, `u64le`) decoded safely via `Type.from_bytes(slice)`.
 - **Monomorphized `<T>` / `<T, usize N>` Generics (No Ad-Hoc Overloading, No Trait Hierarchies):**
   - User `.zev` `struct`s (`FixedVec<T, usize N>`) and `fn`s (`clamp<T>(...)`) may declare `<T>` and `<T, usize N>` parameters monomorphized before MIR lowering (`E0029` on invalid instantiations), with concrete instantiations reported in `zevc ram` and `zevc check --json`.
+  - `<...>` disambiguation is purely syntactic: after `ident` or `module.ident` in expression position, `<...>` commits as generic arguments only when immediately followed by `(` (a call) or `{` where struct literals are allowed; otherwise `<` parses as a comparison (parenthesize multi-arg comparisons inside calls such as `f((a < b), (c > (d)))`). Expression-position const-generic arguments allow literals (integer/bool/negated integer), identifiers, and parenthesized expressions (`(expr)`), while type position allows arbitrary constant expressions (`FixedVec<u32, N + 1>`). At statement start, `Name<...> ident` is always parsed as a declaration. No `::<...>` turbofish is used.
   - C++-style ad-hoc function overloading and user-defined trait hierarchies / `'a` lifetime annotations are omitted.
 - **Distinct `return` vs. `error` Exit Paths:**
   - `return val;` represents normal completion (`status == 0` plus `val`).

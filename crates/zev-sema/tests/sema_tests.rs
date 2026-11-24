@@ -2588,8 +2588,8 @@ fn wave2_monomorphize_generic_structs_fns_inference_mangling_and_attrs() {
             };
             // Call-site inference deducing BOTH `T = u32` and `usize N = 8` through `*FixedVec<u32, 8>`!
             bool ok1 = vec_push(&nums, 42);
-            // Turbofish `::<...>` explicit call!
-            u32 c_u32 = clamp::<u32>(nums.data[0], 10, 100);
+            // Explicit `<...>` call!
+            u32 c_u32 = clamp<u32>(nums.data[0], 10, 100);
             // Explicit `<f32>` AND inferred `clamp(x, -1.0, 1.0)` with contextual unsuffixed float literals!
             f32 duty = 1.5f32;
             f32 c1 = clamp<f32>(duty, 0.0, 1.0);
@@ -2951,7 +2951,7 @@ fn wave2_generic_instantiation_errors_e0029() {
             "infinite const-growing generic fn instantiation (> 32 depth)",
             r#"
             fn grow_n<usize N>() {
-                grow_n<N + 1>();
+                grow_n<(N + 1)>();
             }
             fn main() {
                 grow_n<0>();
@@ -4479,7 +4479,7 @@ u32 secret_helper() { return 7; }
     std::fs::write(tmp.join("sub.zev"), mod_src).expect("write sub.zev");
 
     // Valid use: `Ring<u8, 4>` inside `sub.zev` where `pub struct Ring<T, usize N>` sees `N`,
-    // `sub.Kind.Alpha` & `sub.MODE_A` in `switch`, and `sub.take2(sub.A < b, sub.C > (d + 1))`.
+    // `sub.Kind.Alpha` & `sub.MODE_A` in `switch`, and parenthesized `sub.take2((sub.A < b), (sub.C > (d + 1)))`.
     let main_ok = r#"
 import sub;
 fn main() {
@@ -4496,22 +4496,14 @@ fn main() {
     }
     u32 b = 20;
     u32 d = 10;
-    bool ok = sub.take2(sub.A < b, sub.C > (d + 1));
+    bool ok = sub.take2((sub.A < b), (sub.C > (d + 1)));
     if (ok && r.head == 0) { x = 11; }
 }
 "#;
     let main_path = tmp.join("main.zev");
     std::fs::write(&main_path, main_ok).expect("write main.zev");
-    let gens = zev_sema::collect_import_aware_generic_names(
-        &[(main_ok, Some(main_path.as_path()))],
-        &[],
-    );
-    let parsed_ok = zev_parser::parse_str_named_with_generics(
-        main_ok,
-        main_path.to_str().unwrap(),
-        Some(&gens),
-    )
-    .expect("parse main_ok");
+    let parsed_ok = zev_parser::parse_str_named(main_ok, main_path.to_str().unwrap())
+        .expect("parse main_ok");
     let out_ok = analyze_and_monomorphize_named_programs(
         &[(&parsed_ok, main_path.to_str())],
         &AnalyzeOptions::default(),
@@ -6528,13 +6520,7 @@ fn board_module_and_hal_target_binding_across_four_targets() {
     ];
 
     for (label, hal_dir, board_module) in targets {
-        let generics = zev_sema::collect_import_aware_generic_names_with_targets(
-            &[(demo_src.as_str(), Some(demo_path.as_path()))],
-            std::slice::from_ref(&root),
-            hal_dir,
-            board_module,
-        );
-        let prog = zev_parser::parse_str_named_with_generics(&demo_src, &demo_label, Some(&generics))
+        let prog = zev_parser::parse_str_named(&demo_src, &demo_label)
             .unwrap_or_else(|e| panic!("parse failed for {label}: {e:#?}"));
         let aopts = AnalyzeOptions {
             include_dirs: vec![root.clone()],
@@ -6564,14 +6550,8 @@ fn main() {
     assert(board.BOARD_NAME.len == bsp.BOARD_NAME.len);
 }
 "#;
-    let diamond_generics = zev_sema::collect_import_aware_generic_names_with_targets(
-        &[(diamond_src, None)],
-        std::slice::from_ref(&root),
-        Some("hal/stm32f3"),
-        Some("bsp/nucleo_f334r8"),
-    );
     let diamond_prog =
-        zev_parser::parse_str_named_with_generics(diamond_src, "diamond.zev", Some(&diamond_generics))
+        zev_parser::parse_str_named(diamond_src, "diamond.zev")
             .expect("parse diamond import");
     let diamond_opts = AnalyzeOptions {
         include_dirs: vec![root],
@@ -6602,13 +6582,7 @@ fn main() {
         ("emb_esp32c6", Some("hal/esp32c6"), Some("bsp/esp32c6_pico")),
         ("emb_rp2040", Some("hal/rp2040"), Some("bsp/rpi_pico_w_board")),
     ] {
-        let g = zev_sema::collect_import_aware_generic_names_with_targets(
-            &[(emb_src, None)],
-            &[],
-            hal_dir,
-            board_module,
-        );
-        let p = zev_parser::parse_str_named_with_generics(emb_src, "embedded.zev", Some(&g))
+        let p = zev_parser::parse_str_named(emb_src, "embedded.zev")
             .unwrap_or_else(|e| panic!("parse embedded {label}: {e:#?}"));
         let o = AnalyzeOptions {
             include_dirs: Vec::new(),
@@ -7158,6 +7132,65 @@ fn watch_single_writer_and_guarded_critical_cell_semantics() {
         "#,
     );
     assert!(ok_guarded.primitives.contains_key("shared_acc"));
+}
+
+#[test]
+fn syntactic_generics_comparison_confusion_advises_parentheses() {
+    for bad in [
+        r#"
+        fn check_pair(bool a, bool b) {}
+        fn main() {
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            check_pair(a < b, c > (d));
+        }
+        "#,
+        r#"
+        struct Pair { u32 a; }
+        fn check_pair(bool a, bool b) {}
+        fn main() {
+            Pair s = Pair { a: 1 };
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            check_pair(s.a < b, c > (d));
+        }
+        "#,
+        r#"
+        const u32 A = 1;
+        fn check_pair(bool a, bool b) {}
+        fn main() {
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            check_pair(A < b, c > (d));
+        }
+        "#,
+    ] {
+        let diags = expect_err_kind(bad, DiagnosticKind::GenericInstantiationError);
+        assert!(
+            diags.iter().any(|d| d
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("parenthesize") && n.contains("(a < b)"))),
+            "expected parenthesization note for:\n{bad}\ngot:\n{diags:?}"
+        );
+    }
+
+    expect_ok(
+        r#"
+        fn check_pair(bool a, bool b) {}
+        fn main() {
+            u32 a = 1;
+            u32 b = 2;
+            u32 c = 3;
+            u32 d = 4;
+            check_pair((a < b), (c > (d)));
+        }
+        "#,
+    );
 }
 
 #[test]

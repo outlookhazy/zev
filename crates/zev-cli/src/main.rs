@@ -11,7 +11,7 @@ use diag::{
     render_check_json_ok_with_tasks, JsonDiag, SourceFile, TaskRunSummary,
 };
 use runner::TempWorkDir;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use zev_ast::Program;
@@ -73,51 +73,36 @@ fn load_and_check_detailed_with_includes_and_targets(
         source_files.push((display, path.clone(), sf));
     }
 
-    let generic_roots: Vec<(&str, Option<&Path>)> = source_files
-        .iter()
-        .map(|(_, path, sf)| (sf.src.as_str(), Some(path.as_path())))
-        .collect();
-    let all_generics: BTreeSet<String> = zev_sema::collect_import_aware_generic_names_with_targets(
-        &generic_roots,
-        include_dirs,
-        hal_dir,
-        board_module,
-    );
-
     let mut loaded: Vec<(String, SourceFile, Program)> = Vec::with_capacity(source_files.len());
     let mut by_name: HashMap<String, usize> = HashMap::with_capacity(source_files.len());
 
     for (display, _, sf) in source_files {
-        match zev_parser::parse_str_named_with_generics(&sf.src, &display, Some(&all_generics)) {
+        match zev_parser::parse_str_named(&sf.src, &display) {
             Ok(prog) => {
                 let idx = loaded.len();
                 by_name.insert(display.clone(), idx);
                 loaded.push((display, sf, prog));
             }
-            Err(pes) => {
-                let mut human = String::new();
-                let mut json_diags = Vec::with_capacity(pes.len());
-                for pe in pes {
-                    let (line, col) = sf.line_col(pe.span.start as usize);
-                    let topic = pe.doc_topic.unwrap_or("syntax");
-                    let doc_cmd = pe.doc_command();
-                    human.push_str(&sf.format_rich_span_error(
-                        pe.span,
-                        pe.code,
-                        &pe.message,
-                        pe.hint.as_deref(),
-                        Some(topic),
-                    ));
-                    json_diags.push(JsonDiag {
-                        code: pe.code.map(str::to_string),
-                        file: display.clone(),
-                        line,
-                        col,
-                        message: pe.message,
-                        help: pe.hint,
-                        doc_cmd,
-                    });
-                }
+            Err(pe) => {
+                let (line, col) = sf.line_col(pe.span.start as usize);
+                let topic = pe.doc_topic.unwrap_or("syntax");
+                let doc_cmd = pe.doc_command();
+                let human = sf.format_rich_span_error(
+                    pe.span,
+                    pe.code,
+                    &pe.message,
+                    pe.hint.as_deref(),
+                    Some(topic),
+                );
+                let json_diags = vec![JsonDiag {
+                    code: pe.code.map(str::to_string),
+                    file: display.clone(),
+                    line,
+                    col,
+                    message: pe.message,
+                    help: pe.hint,
+                    doc_cmd,
+                }];
                 return Err(CheckFailure {
                     human: human.trim_end().to_string(),
                     json_diags,
@@ -2045,7 +2030,7 @@ bool check_window(bool lo_ok, bool hi_ok) {
 fn main() {
     FixedVec<u32, 4> buf = FixedVec<u32, 4> { data: [1, 2, 3, 4], len: 4 };
     u32 x = scale_add<u32, 4>(buf.data[0]);
-    bool ok = check_window(A < B, C > (D + 1));
+    bool ok = check_window((A < B), (C > (D + 1)));
     if (ok && x == 1) {
         return;
     }
@@ -2054,8 +2039,24 @@ fn main() {
         let temp = TempWorkDir::create("zevc-multifile-gen").unwrap();
         let lib_path = temp.dir.join("lib.zev");
         let app_path = temp.dir.join("app.zev");
+        let unparen_path = temp.dir.join("unparen.zev");
         std::fs::write(&lib_path, lib_src).unwrap();
         std::fs::write(&app_path, app_src).unwrap();
+        std::fs::write(
+            &unparen_path,
+            "fn main() { bool ok = check_window(A < B, C > (D + 1)); }\n",
+        )
+        .unwrap();
+
+        let Err(unparen_err) = load_and_check_detailed(&[lib_path.clone(), unparen_path]) else {
+            panic!("expected unparenthesized check_window(A < B, C > (D + 1)) to fail sema");
+        };
+        assert!(unparen_err.human.contains("error[E0029]"), "human=\n{}", unparen_err.human);
+        assert!(
+            unparen_err.human.contains("parenthesize"),
+            "expected parenthesization note, got:\n{}",
+            unparen_err.human
+        );
 
         // Pass `app_path` twice to also verify canonical input path deduplication (no E0021!)
         let bundle = load_and_check_detailed(&[lib_path, app_path.clone(), app_path])

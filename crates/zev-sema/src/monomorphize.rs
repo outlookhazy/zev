@@ -1192,20 +1192,22 @@ impl<'a> Monomorphizer<'a> {
         env: &SubstEnv,
         span: Span,
     ) -> Option<Vec<ResolvedGenArg>> {
+        const PAREN_CMP_NOTE: &str = "if `<` and `>` were intended as comparisons rather than generic arguments, parenthesize them: e.g. `f((a < b), (c > (d)))`";
         if gargs.len() != gparams.len() {
-            self.emit(
-                &env.file,
-                Diagnostic::new(
-                    DiagnosticKind::GenericInstantiationError,
-                    span,
-                    format!(
-                        "'{}' expects {} generic argument(s), found {}",
-                        target_name,
-                        gparams.len(),
-                        gargs.len()
-                    ),
+            let mut diag = Diagnostic::new(
+                DiagnosticKind::GenericInstantiationError,
+                span,
+                format!(
+                    "'{}' expects {} generic argument(s), found {}",
+                    target_name,
+                    gparams.len(),
+                    gargs.len()
                 ),
             );
+            if gargs.len() >= 2 {
+                diag = diag.with_note(PAREN_CMP_NOTE);
+            }
+            self.emit(&env.file, diag);
             return None;
         }
 
@@ -1227,7 +1229,8 @@ impl<'a> Monomorphizer<'a> {
                                         "expected type argument for generic parameter '{}' of '{}', found constant '{}'",
                                         gp.name.name, target_name, id.name
                                     ),
-                                ),
+                                )
+                                .with_note(PAREN_CMP_NOTE),
                             );
                             return None;
                         }
@@ -1259,7 +1262,8 @@ impl<'a> Monomorphizer<'a> {
                                 "expected type argument for generic parameter '{}' of '{}', found constant expression",
                                 gp.name.name, target_name
                             ),
-                        ),
+                        )
+                        .with_note(PAREN_CMP_NOTE),
                     );
                     return None;
                 }
@@ -1276,7 +1280,8 @@ impl<'a> Monomorphizer<'a> {
                                     "generic parameter 'usize {}' of '{}' requires a non-negative compile-time constant expression",
                                     gp.name.name, target_name
                                 ),
-                            ),
+                            )
+                            .with_note(PAREN_CMP_NOTE),
                         );
                         return None;
                     }
@@ -1310,7 +1315,8 @@ impl<'a> Monomorphizer<'a> {
                                         "non-constant or unknown 'usize' generic argument '{}' for parameter '{}' of '{}'",
                                         id.name, gp.name.name, target_name
                                     ),
-                                ),
+                                )
+                                .with_note(PAREN_CMP_NOTE),
                             );
                             return None;
                         }
@@ -3790,7 +3796,9 @@ impl<'a> Monomorphizer<'a> {
             });
         }
 
-        // Extract target generic function name (`clamp(...)` or `mod::clamp::<f32>(...)`).
+        const PAREN_CMP_NOTE: &str = "if `<` and `>` were intended as comparisons rather than generic arguments, parenthesize them: e.g. `f((a < b), (c > (d)))`";
+
+        // Extract target generic function name (`clamp(...)` or `mod.clamp<f32>(...)`).
         // A local (e.g. a `fn(...)` pointer) shadowing a generic template is an indirect call.
         let direct_fn_ident: Option<Ident> = match &callee.kind {
             ExprKind::Ident(id) if !scopes_contain(scopes, &id.name) => Some(id.clone()),
@@ -3886,7 +3894,8 @@ impl<'a> Monomorphizer<'a> {
                         } else {
                             format!("unknown generic function '{}'", fn_id.name)
                         },
-                    ),
+                    )
+                    .with_note(PAREN_CMP_NOTE),
                 );
             }
 
@@ -3939,6 +3948,19 @@ impl<'a> Monomorphizer<'a> {
                     InferTy::Concrete(ret_te),
                 );
             }
+        } else if !generic_args.is_empty() {
+            self.emit(
+                &env.file,
+                Diagnostic::new(
+                    DiagnosticKind::GenericInstantiationError,
+                    span,
+                    format!(
+                        "cannot apply generic arguments `<...>` ({} argument(s)) to non-generic expression",
+                        generic_args.len()
+                    ),
+                )
+                .with_note(PAREN_CMP_NOTE),
+            );
         }
 
         let (r_callee, _) = self.rewrite_expr(callee, env, scopes, None);

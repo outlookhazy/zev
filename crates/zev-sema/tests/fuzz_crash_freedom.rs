@@ -1,7 +1,7 @@
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use zev_parser::{collect_declared_generic_names, parse_str, parse_str_named_with_generics};
+use zev_parser::{parse_str, parse_str_named};
 use zev_sema::analyze_and_monomorphize_programs;
 use zev_sema::checker::AnalyzeOptions;
 
@@ -64,8 +64,7 @@ fn exercise_frontend(label: &str, src: &str) {
     let opts = AnalyzeOptions::default();
     let res = catch_unwind(AssertUnwindSafe(|| {
         let _ = parse_str(src);
-        let generics = collect_declared_generic_names(src);
-        if let Ok(prog) = parse_str_named_with_generics(src, "<fuzz>", Some(&generics)) {
+        if let Ok(prog) = parse_str_named(src, "<fuzz>") {
             let _ = analyze_and_monomorphize_programs(&[prog], &opts);
         }
     }));
