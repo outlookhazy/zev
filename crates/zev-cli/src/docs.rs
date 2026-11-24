@@ -35,7 +35,7 @@ CORE MENTAL MODEL (5 RULES):
      `@dma_safe pool<T, K>` + `Lease<T>`.
   5. Dual-Exit Errors, `defer`, Zero-Heap `f\"...\"` & Defined Safety: Normal exit `return val;`, failure
      `error [E [, v]];` (`or`/`catch`). Out-of-bounds indices/subslices/MMIO arrays and div/rem by zero
-     trap deterministically (`@__syn_panic`), `INT_MIN / -1` evaluates to `INT_MIN` (`% -1` -> `0`), and
+     trap deterministically (`sys.set_fault_handler`), `INT_MIN / -1` evaluates to `INT_MIN` (`% -1` -> `0`), and
      constant overshifts fail at compile time while variable shifts mask by `(bit_width - 1)`.
 
 ROSETTA STONE (FOREIGN HABIT -> IDIOMATIC ZEV):
@@ -56,6 +56,7 @@ ROSETTA STONE (FOREIGN HABIT -> IDIOMATIC ZEV):
   RAII Drop guard                         | `defer cs_high();` or `defer { ... }` (LIFO on return/error)
 
 SHARDED TOPIC GUIDES (`zevc doc <topic>`):
+  zevc doc tutorial     Step-by-step walkthrough: `main()`, `task`, `watch`/`inbox`, `isr`, `ram`, boards
   zevc doc syntax       Types (`f32`/`f64`), `<T, usize N>` generics, `packed struct`, `switch`, `for`/`defer`
   zevc doc errors       Dual-exit `error`, partial progress, `fmt_buf -> []u8 error FmtErr`, `catch` / `or`
   zevc doc tasks        Boot-Tree `spawn` (<= 32), immortal `task` + `restart;`, `loop every`, run bounds
@@ -72,6 +73,96 @@ ERROR CODE EXPLAINERS (`zevc doc <code>` or `zevc doc --list`):
 ";
 
 pub const TOPIC_DOCS: &[TopicDoc] = &[
+    TopicDoc {
+        name: "tutorial",
+        aliases: &["guide", "getting-started", "walkthrough", "quickstart"],
+        summary: "Step-by-step walkthrough from `fn main()` simulation to `task`, `isr`, `ram`, and hardware builds",
+        body: "\
+# Zev Topic Guide: `tutorial`
+
+## Step 1 — Minimal Host Simulation (`zevc run --sanitize`)
+Every Zev program starts sequentially inside `fn main()`. Test pure computation first using `zevc check hello.zev`
+and `zevc run --sanitize hello.zev` (compiles via LLVM 23 with AddressSanitizer + UBSan and exits via `sys.exit(0)`):
+```zev
+fn scale_mv(u16 raw) -> u32 {
+    return ((raw as u32) * 3300u32) / 4095u32;
+}
+
+fn main() {
+    u32 mv = scale_mv(2048u16);
+    println(f\"sample={mv}mV\");
+    sys.exit(0);
+}
+```
+
+## Step 2 — Spawning a Periodic `task` & Reading Telemetry (`watch<T>`)
+Move concurrent work into immortal `task` blueprints instantiated from `main()`'s boot tree via `spawn`.
+Cross-task state uses scheduler-tracked primitives instead of raw globals: a `watch<T>` has one enforced writer
+and any number of readers (`loop every 10ms` stays drift-free without catch-up bursts):
+```zev
+watch<u32> tick_count = 0;
+
+task blinker() {
+    u32 n = 0;
+    loop every 10ms {
+        n += 1;
+        tick_count.publish(n);
+    }
+}
+
+task monitor() {
+    loop every 25ms {
+        u32 cur = tick_count.read();
+        println(f\"count={cur}\");
+        if (cur >= 3u32) {
+            sys.exit(0);
+        }
+    }
+}
+
+fn main() {
+    spawn blinker() @high;
+    spawn monitor() @low;
+}
+```
+Run `zevc ram app.zev` to inspect each spawned task's static `.bss` frame size and worst-case non-yielding run bound.
+
+## Step 3 — Wiring an Interrupt (`isr` + `irq.attach`) & Multi-Source `wait { ... }`
+Hardware `isr` handlers stay fast and non-blocking (`E0005` forbids yields), waking consumer tasks via `inbox<T, N>`
+or `signal` (`boost: @high` temporarily elevates the waking task for that single turn):
+```zev
+irq IRQ_BTN = 6;
+inbox<u8, 4> btn_q;
+
+isr btn_isr(*inbox<u8, 4> q) {
+    state u8 clicks = 0;
+    clicks += 1;
+    q.post(clicks, boost: @high);
+}
+
+task controller() {
+    loop {
+        wait {
+            u8 c = btn_q.recv() => { println(f\"click={c}\"); sys.exit(0); }
+            timeout 50ms => { println(\"idle\"); }
+        }
+    }
+}
+
+fn main() {
+    IRQ_BTN.attach(btn_isr(&btn_q));
+    spawn controller() @normal;
+    sys.pend_irq(6);
+}
+```
+
+## Step 4 — Building for Real Boards & `zev.toml`
+Use `import board;` and `hal.*` for portable firmware, then target hardware boards cleanly:
+- `zevc ram --board nucleo_f334r8 app.zev` — verify exact flash/RAM `.bss` + static call-stack bounds.
+- `zevc build --board nucleo_f334r8 app.zev -o app.bin` — emit `.bin` / `.uf2` / `.elf` with zero heap symbols.
+- Put `[project]` defaults (`entry`, `board`, `port`, `opt_level`) in `zev.toml` to run `zevc build` / `zevc flash` directly.
+",
+    },
     TopicDoc {
         name: "syntax",
         aliases: &[
@@ -90,7 +181,7 @@ pub const TOPIC_DOCS: &[TopicDoc] = &[
 - Compound: fat slices `[]u8` (`.len`, `buf[i]`, `buf[0..5]`), pointers `*i32 p` / `*u8`, arrays `[16]u8`
 - Defined Arithmetic & Conversions: integer `+`/`-`/`*` wrap in two's complement; constant shifts outside
   `0..bit_width` fail at compile time (`E0024`) while variable shifts mask by `(bit_width - 1)`; `/`/`%` by `0`
-  and out-of-bounds indexing/subslicing trap via `@__syn_panic`; uninitialized locals zero-initialize.
+  and out-of-bounds indexing/subslicing trap deterministically (`sys.set_fault_handler`); uninitialized locals zero-initialize.
 - Lossless Integer Coercion & Destination-Typed Arithmetic: implicit integer conversions are strictly
   lossless (unsigned -> wider unsigned / strictly wider signed; signed -> wider signed; wire-endian
   `u16be`/`u32le`... <-> same-width native). Narrowing and signed<->unsigned require explicit `as`.
@@ -323,7 +414,7 @@ fn main() {
    `critical`, `isr`, `defer`, and `extern \"C\"` callbacks (`E0003`–`E0006`).
 - Cycles in the call graph containing any yielding function are rejected (`E0012`).
 - **Defined Runtime Traps**: Out-of-bounds `a[i]`, sub-slice `a[s..e]`, MMIO array `regs.arr[i]`, and integer
-  `x / 0` or `x % 0` trap deterministically via `@__syn_panic` (`sys.set_fault_handler`), while signed
+  `x / 0` or `x % 0` trap deterministically (invoking any registered `sys.set_fault_handler` before halt), while signed
   `INT_MIN / -1` evaluates to `INT_MIN` and `INT_MIN % -1` evaluates to `0`.
 
 ## 2. Explicit Atomicity Brakes (`noyield`, `critical`, `@manual_yield`)
@@ -492,7 +583,7 @@ loop {
 ## 2. Zero-`'a` Scope-Depth & Lease Provenance Rules (`E0008`..`E0011`, `E0034`)
 Zev requires **zero `'a` lifetime annotations**—`zev-sema` tracks origin depth and lease generation
 (including across `for (u8 b in half)` loops):
-- **ALLOWED**: Bounds-checked sub-slicing (`half[0..5]`, trapping via `@__syn_panic` if out of range), wrapping in local structs (`ByteReader{ buf: half, pos: 0 }`),
+- **ALLOWED**: Bounds-checked sub-slicing (`half[0..5]`, trapping cleanly if out of range), wrapping in local structs (`ByteReader{ buf: half, pos: 0 }`),
   bounded `for (u8 b in half)` iteration, and passing slices/wrappers **downward** into helper functions.
 - **REJECTED (`E0008`/`E0009`)**: Escaping an inner-scope slice/`b.get()` pointer upward or to an outer scope.
 - **REJECTED (`E0011`)**: Reading `half` (or a `b.get()` pointer) AFTER a second `wait_chunk()` or moving/releasing `b`!
@@ -871,8 +962,12 @@ mod tests {
 
     #[test]
     fn all_topics_and_aliases_resolve() {
-        assert_eq!(TOPIC_DOCS.len(), 8);
+        assert_eq!(TOPIC_DOCS.len(), 9);
         for topic in [
+            "tutorial",
+            "guide",
+            "getting-started",
+            "walkthrough",
             "syntax",
             "errors",
             "tasks",
@@ -1185,5 +1280,26 @@ mod tests {
             }
         }
         assert!(total_cited >= 40, "expected at least 40 cited codes, found {total_cited}");
+    }
+
+    #[test]
+    fn user_docs_and_readme_do_not_leak_internal_syn_symbols() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let readme = std::fs::read_to_string(root.join("README.md")).expect("read README.md");
+        assert!(
+            !readme.contains("@__syn_"),
+            "README.md must not leak internal @__syn_* compiler symbols"
+        );
+        assert!(
+            !PRIMER_DOC.contains("@__syn_"),
+            "PRIMER_DOC must not leak internal @__syn_* compiler symbols"
+        );
+        for t in TOPIC_DOCS {
+            assert!(
+                !t.body.contains("@__syn_"),
+                "zevc doc {} must not leak internal @__syn_* compiler symbols",
+                t.name
+            );
+        }
     }
 }
