@@ -472,7 +472,7 @@ mod tests {
                         i++;
                         continue;
                     }
-                    acc = (acc << 4) ^ (data[i] as u32) ^ (u32)0xA5;
+                    acc = (acc << 4) ^ (data[i] as u32) ^ 0xA5u32;
                     i++;
                 }
 
@@ -962,6 +962,76 @@ mod tests {
     }
 
     #[test]
+    fn trap_p0015_p0016_p0017_retired_syntax() {
+        let assert_trap = |src: &str, code: &str, want_help_substr: &str| {
+            let err = parse_str(src).expect_err(&format!("expected {code} for:\n{src}"));
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains(code),
+                "expected code {code} for:\n{src}\ngot:\n{msg}"
+            );
+            assert!(
+                msg.contains(want_help_substr),
+                "expected help containing {want_help_substr:?} for:\n{src}\ngot:\n{msg}"
+            );
+        };
+
+        // P0015: C-style `->` member access
+        assert_trap(
+            "struct Foo { u32 x; }\nu32 f(*Foo p) { return p->x; }",
+            "P0015",
+            "use `.`",
+        );
+
+        // P0016: `::` module/enum/path/import/spawn/switch separator (keeping `::<` until turbofish item)
+        assert_trap("import hal::gpio;", "P0016", "use `.`");
+        assert_trap(
+            "enum Mode { Idle, Active }\nfn f() { Mode m = Mode::Idle; }",
+            "P0016",
+            "use `.`",
+        );
+        assert_trap(
+            "impl hw::Gpio { fn set() {} }",
+            "P0016",
+            "use `.`",
+        );
+        assert_trap(
+            "fn f(Mode m) { switch (m) { Mode::Idle => {} _ => {} } }",
+            "P0016",
+            "use `.`",
+        );
+        assert_trap(
+            "fn main() { spawn hw::worker(); }",
+            "P0016",
+            "use `.`",
+        );
+
+        // P0017: C-style casts (excluding `(Foo*)p`, which keeps P0014)
+        assert_trap("fn f(u32 v) { u16 x = (u16)v; }", "P0017", "as");
+        assert_trap("fn f() { f32 x = (f32)10; }", "P0017", "as");
+        assert_trap("fn f(u32 v) { i32 x = (i32)-1; }", "P0017", "as");
+        assert_trap(
+            "struct Foo { u32 x; }\nfn f(*void p) { *Foo f = (*Foo)p; }",
+            "P0017",
+            "as",
+        );
+        assert_trap(
+            "struct Foo { u32 x; }\nfn f(*void p) { *Foo f = (*Foo)p; }",
+            "P0017",
+            "P0017",
+        );
+        // `(Foo*)p` continues to trigger P0014
+        assert_trap(
+            "struct Foo { u32 x; }\nfn f(*void p) { *Foo f = (Foo*)p; }",
+            "P0014",
+            "*Foo",
+        );
+        // Valid calls on grouped fields still parse
+        parse_str("fn main(*Box bf) { (bf.cb)(32); }")
+            .unwrap_or_else(|e| panic!("unexpected parse failure for indirect call:\n{e}"));
+    }
+
+    #[test]
     fn parses_pool_dma_slot_and_linear_lease_types() {
         let src = r#"
 struct DmaSubsys {
@@ -1358,7 +1428,7 @@ pub import chip.stm32f3.{rcc, tim};
                 f64 d = 1_000e+2f64;
                 f32 e = 42f32;
                 f32 neg = -0.5;
-                f32 casted = (f32)10 + (a as f32);
+                f32 casted = (10 as f32) + (a as f32);
 
                 [8]u8 arr = [0, 1, 2, 3, 4, 5, 6, 7];
                 []u8 sl = arr[0..4];
@@ -1609,7 +1679,7 @@ pub import chip.stm32f3.{rcc, tim};
         let src = concat!(
             "fn log_it(f32 t, u32 v, CmdFrame pkt) {\n",
             "    println(f\"temp={t:.2} hex={v:04x} HEX={v:X} bin={v:08b} sci={t:e} sci2={t:.3e} pkt={pkt:?} {{brace}}\");\n",
-            "    println(f\"nested={CmdFrame { op: 1 }:?} path={hw::REG:02x}\");\n",
+            "    println(f\"nested={CmdFrame { op: 1 }:?} path={hw.REG:02x}\");\n",
             "}\n",
         );
 
@@ -1699,7 +1769,7 @@ pub import chip.stm32f3.{rcc, tim};
             other => panic!("expected Call stmt, got {other:?}"),
         }
 
-        // Second `println(f"nested={CmdFrame { op: 1 }:?} path={hw::CONST:02x}")`
+        // Second `println(f"nested={CmdFrame { op: 1 }:?} path={hw.CONST:02x}")`
         match &stmts[1].kind {
             StmtKind::Expr(Expr {
                 kind: ExprKind::Call { args, .. },
@@ -2517,16 +2587,16 @@ struct Box<T, usize N> {
 }
 
 fn test(*void vp, *i32 a) {
-    *MyStruct p1 = (*MyStruct)vp;
-    *mod_m.MyStruct p3 = (*mod_m.MyStruct)vp;
-    *Box<u32, 4> p5 = (*Box<u32, 4>)vp;
+    *MyStruct p1 = vp as *MyStruct;
+    *mod_m.MyStruct p3 = vp as *mod_m.MyStruct;
+    *Box<u32, 4> p5 = vp as *Box<u32, 4>;
 
     i32 s1 = (*a) - 1;
     i32 s2 = (*a) * 2;
     i32 s3 = (*a) + 3;
 }
 "#;
-        let prog = parse_str(src).expect("prefix struct/generic/path ptr casts must parse");
+        let prog = parse_str(src).expect("prefix struct/generic/path ptr `as` casts must parse");
         let f = match &prog.items[3].kind {
             ItemKind::Fn(f) => f,
             other => panic!("expected Fn, got {other:?}"),
@@ -2543,6 +2613,15 @@ fn test(*void vp, *i32 a) {
                 ),
                 "stmt {idx} must parse as Cast"
             );
+        }
+        for c_cast_stmt in [
+            "struct MyStruct { u32 x; }\nfn test(*void vp) { *MyStruct p1 = (*MyStruct)vp; }",
+            "import lib.mod_m as mod_m;\nfn test(*void vp) { *mod_m.MyStruct p3 = (*mod_m.MyStruct)vp; }",
+            "struct Box<T, usize N> { [N]T arr; }\nfn test(*void vp) { *Box<u32, 4> p5 = (*Box<u32, 4>)vp; }",
+        ] {
+            let err = parse_str(c_cast_stmt).expect_err("retired C-style pointer cast must fail with P0017");
+            let msg = format!("{err:?}");
+            assert!(msg.contains("P0017"), "expected P0017, got:\n{msg}");
         }
         for (idx, expected_op) in [(3usize, BinaryOp::Sub), (4, BinaryOp::Mul), (5, BinaryOp::Add)] {
             assert!(

@@ -3021,7 +3021,7 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                 let m = method.name.as_str();
                 match recv_kind {
                     LoweredPrimReceiver::InboxView(view, elem) => {
-                        if matches!(m, "post" | "try_post") {
+                        if m == "post" {
                             let v = if let Some(first) = first_positional_arg(args) {
                                 be.lower_sub(first, Some(&elem))?
                             } else {
@@ -3100,7 +3100,7 @@ pub(super) fn try_lower_nonblocking_call_or_method<B: LowerBackend>(
                             value: coerce_expr_if_needed(v, &elem),
                         })));
                     }
-                    ("post" | "try_post", MirPrimKind::Inbox { elem, cap }) => {
+                    ("post", MirPrimKind::Inbox { elem, cap }) => {
                         let v = if let Some(first) = first_positional_arg(args) {
                             be.lower_sub(first, Some(&elem))?
                         } else {

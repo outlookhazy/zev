@@ -10,7 +10,7 @@ pub struct ErrorDoc {
 }
 
 pub const ERROR_DOCS: &[ErrorDoc] = &[
-    // ── Parser Foreign-Idiom Traps (P0001..P0014) ───────────────────────────
+    // ── Parser Foreign-Idiom Traps (P0001..P0017) ───────────────────────────
     ErrorDoc {
         code: "P0001",
         summary: "Foreign `let` / `var` / `mut` variable binding instead of explicit C-style `Type name`",
@@ -375,6 +375,65 @@ fn main() {
     [16]u8 buf = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
     u32 val = buf[0] as u32;
     step(&val);
+}",
+    },
+    ErrorDoc {
+        code: "P0015",
+        summary: "Retired C `->` member access used instead of auto-dereferencing `.`",
+        topic: "syntax",
+        why: "Zev automatically dereferences pointer receivers (`*Struct`, `*watch<T>`, `*byte_ring`) on `.` field reads/writes and method calls. C-style `ptr->field` or `ptr->method()` is retired in favor of uniform `.`.",
+        bad_zev: "\
+struct Pair { u32 a; }
+fn inc(*Pair p) {
+    p->a += 1;
+}
+fn main() {}",
+        good_zev: "\
+struct Pair { u32 a; }
+fn inc(*Pair p) {
+    p.a += 1;
+}
+fn main() {
+    Pair v = Pair { a: 4 };
+    inc(&v);
+}",
+    },
+    ErrorDoc {
+        code: "P0016",
+        summary: "Retired `::` path separator used instead of `.`",
+        topic: "syntax",
+        why: "Zev uses `.` uniformly for module paths (`mod.Item`), enum variants (`Mode.Active` or unqualified `Active`), and type names (`mod.Packet`). Double-colon `::` path syntax is trapped and rejected.",
+        bad_zev: "\
+enum Mode { Idle, Active }
+fn main() {
+    Mode m = Mode::Active;
+}",
+        good_zev: "\
+enum Mode { Idle, Active }
+fn main() {
+    Mode m = Mode.Active;
+    if (m == Active) {
+        return;
+    }
+}",
+    },
+    ErrorDoc {
+        code: "P0017",
+        summary: "Retired C-style `(Type)expr` cast used instead of postfix `expr as Type`",
+        topic: "syntax",
+        why: "C-style prefix casts `(Type)expr` introduce expression/pointer ambiguity and low-precedence surprises. Zev uses explicit postfix `expr as Type` everywhere.",
+        bad_zev: "\
+fn main() {
+    u32 big = 300;
+    u8 low = (u8)big;
+}",
+        good_zev: "\
+fn main() {
+    u32 big = 300;
+    u8 low = big as u8;
+    if (low == 44u8) {
+        return;
+    }
 }",
     },
 

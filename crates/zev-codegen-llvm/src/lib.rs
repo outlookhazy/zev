@@ -977,7 +977,7 @@ mod tests {
                 loop {
                     u8 v = cmd_q.recv();
                     critical {
-                        latest.set((u16)v);
+                        latest.set(v as u16);
                     }
                 }
             }
@@ -2064,7 +2064,7 @@ mod tests {
             enum UnformattedSecret { HiddenA, HiddenB }
 
             fn main() {
-                Mode m = Mode::Armed;
+                Mode m = Mode.Armed;
                 f32 v = 3.14159f32;
                 println(f"mode={m} v={v}");
                 sys.exit(0);
@@ -2160,7 +2160,7 @@ mod tests {
 
                 TelemetryPkt pkt = TelemetryPkt {
                     id: 7,
-                    mode: Mode::Armed,
+                    mode: Mode.Armed,
                     pos: Vec2 { x: 1.5f32, y: -2.25f32 },
                 };
                 [3]i32 samples = [-10, 0, 25];
@@ -2226,7 +2226,7 @@ mod tests {
 
             task logger() {
                 [32]u8 ok_buf;
-                Mode m = Mode::Active;
+                Mode m = Mode.Active;
                 f32 v = 12.34f32;
                 []u8 msg = fmt_buf(ok_buf, f"m={m} v={v:.1}") catch {
                     sys.exit(2);
@@ -7186,7 +7186,7 @@ watch<u32> beats = 0;
 task flooder() {
     u32 seq = 1u32;
     loop {
-        flood_q.try_post(seq);
+        flood_q.post(seq);
         seq += 1u32;
         delay(2ms);
     }
@@ -7232,8 +7232,8 @@ task consumer() {
 }
 
 fn main() {
-    prio_hi.try_post(111u32);
-    prio_lo.try_post(222u32);
+    prio_hi.post(111u32);
+    prio_lo.post(222u32);
     spawn consumer() @normal;
     spawn flooder() @normal;
 }

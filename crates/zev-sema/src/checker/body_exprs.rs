@@ -3843,11 +3843,11 @@ impl<'a> BodyChecker<'a> {
             },
 
             ResolvedOsPrimitive::Inbox { elem, .. } | ResolvedOsPrimitive::InboxUnsized { elem } => match m {
-                "post" | "try_post" => {
+                "post" => {
                     self.expect_single_elem(m, &pos_vals, elem, span);
                     if elem.is_linear_lease() {
                         if let Some((av, ae, asp)) = pos_vals.first() {
-                            self.consume_lease_value(ae, av, if m == "post" { "inbox.post" } else { "inbox.try_post" }, *asp);
+                            self.consume_lease_value(ae, av, "inbox.post", *asp);
                         }
                     }
                     ExprVal::scalar(Ty::void(), span)

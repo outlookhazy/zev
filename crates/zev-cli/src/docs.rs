@@ -2,7 +2,7 @@
 //!
 //! Designed so an AI coding agent or embedded systems engineer can learn idiomatic Zev
 //! in 1 tool call (`zevc doc`), drill into focused ~60-line topic guides (`zevc doc <topic>`),
-//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0014`, `E0001`..`E0034`).
+//! or inspect any parser/verifier error code (`zevc doc P0001`..`P0017`, `E0001`..`E0034`).
 
 use crate::docs_errors::{ErrorDoc, ERROR_DOCS};
 use std::fmt::Write;
@@ -66,7 +66,7 @@ SHARDED TOPIC GUIDES (`zevc doc <topic>`):
   zevc doc targets      `zevc check [--json]`, `ram --board`, `import-svd`, `run --sanitize`, `run-qemu`, ESP32-C6, AVR, RP2040
 
 ERROR CODE EXPLAINERS (`zevc doc <code>` or `zevc doc --list`):
-  Parser Traps   : P0001..P0014  (rewrites for `let`, `->`, `async`, `select`, `for(;;)`, bare `every`, `chan`, `lease`, postfix `*`/`[]`)
+  Parser Traps   : P0001..P0017  (rewrites for `let`, `->`, `async`, `select`, `for(;;)`, `every`, `chan`, `lease`, postfix `*`/`[]`, `->`/`:`/`(T)x` casts)
   Static Verifier: E0001..E0034  (isolation, 3-tier yields, DMA/linear `Lease<T>`, `modules`, `mmio`, `irq.attach`, `state`)
 ================================================================================
 ";
@@ -763,7 +763,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
         }
     }
 
-    // 2. Error code match (`P0001`..`P0014`, `E0001`..`E0034`, case-insensitive)
+    // 2. Error code match (`P0001`..`P0017`, `E0001`..`E0034`, case-insensitive)
     let upper = q.to_ascii_uppercase();
     for err_doc in ERROR_DOCS {
         if err_doc.code == upper {
@@ -772,7 +772,7 @@ pub fn lookup_doc(query: Option<&str>, list_all: bool) -> Result<String, String>
     }
 
     Err(format!(
-        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0014 / E0001..E0034 codes)"
+        "unknown documentation topic or error code `{q}` (run `zevc doc --list` to see all 8 topics and P0001..P0017 / E0001..E0034 codes)"
     ))
 }
 
@@ -786,13 +786,13 @@ mod tests {
         assert!(primer.contains("ROSETTA STONE"));
         assert!(primer.contains("zevc doc syntax"));
         assert!(primer.contains("zevc doc runtime"));
-        assert!(primer.contains("P0001..P0014"));
+        assert!(primer.contains("P0001..P0017"));
         assert!(primer.contains("E0001..E0034"));
 
         let list = lookup_doc(None, true).unwrap();
         assert!(list.contains("runtime"));
         assert!(list.contains("P0001"));
-        assert!(list.contains("P0014"));
+        assert!(list.contains("P0017"));
         assert!(list.contains("E0001"));
         assert!(list.contains("E0034"));
     }
@@ -935,7 +935,7 @@ mod tests {
 
     #[test]
     fn all_error_codes_resolve_and_bad_and_good_snippets_verify() {
-        for n in 1..=14 {
+        for n in 1..=17 {
             let code = format!("P{n:04}");
             let lower = code.to_ascii_lowercase();
             let doc = lookup_doc(Some(&lower), false)
@@ -950,7 +950,7 @@ mod tests {
             assert!(doc.contains(&code));
         }
 
-        assert_eq!(ERROR_DOCS.len(), 48);
+        assert_eq!(ERROR_DOCS.len(), 51);
         for e in ERROR_DOCS {
             // 1. Every GOOD snippet must parse, monomorphize & pass zev-sema, AND lower cleanly
             //    through zev-mir and zev-codegen-llvm (both Cortex-M and host x86_64 LLVM IR)!

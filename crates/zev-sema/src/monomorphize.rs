@@ -3550,7 +3550,7 @@ impl<'a> Monomorphizer<'a> {
                             (
                                 OsPrimitiveType::Inbox { .. }
                                 | OsPrimitiveType::InboxUnsized { .. },
-                                "try_post" | "try_send" | "is_empty" | "is_full",
+                                "try_send" | "is_empty" | "is_full",
                             ) => {
                                 out_ty = InferTy::Concrete(TypeExpr::new(
                                     TypeKind::Prim(PrimType::Bool),
